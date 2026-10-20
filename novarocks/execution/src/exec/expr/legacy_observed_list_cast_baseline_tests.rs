@@ -88,7 +88,7 @@ pub(super) fn actual(
     target: DataType,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let array = crate::exec::chunk::normalize_execution_array(&array)?;
     let target = FunctionValueType::new(target, true).data_type().clone();
     let ty = FunctionValueType::new(array.data_type().clone(), true);
@@ -224,19 +224,26 @@ fn observed_list_cast_original_exact_dtype_remains_original_arc_identity() {
     }
 }
 #[test]
-fn observed_list_cast_original_nonnullable_child_constructor_panic_is_preserved() {
+fn observed_list_cast_nonnullable_child_refusal_keeps_original_arrow_error() {
     let target = DataType::List(Arc::new(Field::new("element", DataType::Int32, false)));
     for (policy, allow) in modes() {
-        let panic = std::panic::catch_unwind(|| actual(input(true), target.clone(), policy, allow))
-            .unwrap_err();
-        let text = panic
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| panic.downcast_ref::<&str>().copied())
-            .unwrap();
-        assert_eq!(
-            text,
-            "called `Result::unwrap()` on an `Err` value: InvalidArgumentError(\"Non-nullable field of ListArray \\\"item\\\" cannot contain nulls\")"
-        );
+        let failure = actual(input(true), target.clone(), policy, allow).unwrap_err();
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        let mut source: &(dyn std::error::Error + 'static) = &failure;
+        loop {
+            if let Some(arrow::error::ArrowError::InvalidArgumentError(message)) =
+                source.downcast_ref::<arrow::error::ArrowError>()
+            {
+                assert_eq!(
+                    message,
+                    r#"Non-nullable field of ListArray "item" cannot contain nulls"#
+                );
+                break;
+            }
+            source = source
+                .source()
+                .expect("original nonnullable list constructor refusal must survive");
+        }
     }
 }

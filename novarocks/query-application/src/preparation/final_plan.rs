@@ -758,7 +758,7 @@ mod tests {
                 let mut events = self.events.lock().unwrap();
                 let at = events.len();
                 events.push((phase, units));
-                match self.refusal {
+                match self.refusal.clone() {
                     Some((stop, cause)) if stop == at => Err(cause),
                     Some((stop, _)) if at > stop => panic!("callback after originating refusal"),
                     _ => Ok(()),
@@ -803,14 +803,16 @@ mod tests {
             for at in 0..trace.len() {
                 let control = Control {
                     events: Default::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let error =
                     CompletedPhysicalPlanCandidate::for_program(plan.as_ref().clone(), &control)
                         .unwrap_err();
                 assert_eq!(
                     error,
-                    compiler_error(novarocks_sql::compiler::SqlCompileError::from(cause))
+                    compiler_error(novarocks_sql::compiler::SqlCompileError::from(
+                        cause.clone()
+                    ))
                 );
                 assert_eq!(*control.events.lock().unwrap(), trace[..=at]);
             }

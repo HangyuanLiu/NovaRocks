@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{Array, ArrayRef, MapArray};
 use novarocks_functions::{
     Selection,
@@ -26,12 +26,14 @@ pub fn eval_map_values<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let map_arr = arena.eval(args[0], chunk)?;
-    let map = map_arr
-        .as_any()
-        .downcast_ref::<MapArray>()
-        .ok_or_else(|| format!("map_values expects MapArray, got {:?}", map_arr.data_type()))?;
+    let map = map_arr.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+        crate::exec::expr::expression_contract(format_args!(
+            "map_values expects MapArray, got {:?}",
+            map_arr.data_type()
+        ))
+    })?;
     let field = super::common::output_list_field(
         arena.data_type(expr),
         map.values().data_type(),
@@ -42,7 +44,7 @@ pub fn eval_map_values<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         MapPart::Values,
         field,
         Selection::all(map.len()),
-        |_, row| Ok::<_, String>(row),
+        |_, row| Ok::<_, crate::runtime::fragment::ExecutionFailure>(row),
         None,
         |_, _, _| Ok(()),
         || map.nulls().cloned(),
@@ -50,8 +52,10 @@ pub fn eval_map_values<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         &mut |_| Ok(()),
     )
     .map_err(|e| match e {
-        ProjectionFailure::Data(s) | ProjectionFailure::Control(s) => s,
-        ProjectionFailure::Take(s) => format!("map_values: failed to reorder values: {s}"),
+        ProjectionFailure::Control(cause) => cause,
+        ProjectionFailure::Domain(cause) => {
+            crate::runtime::fragment::ExecutionFailure::from_domain(cause)
+        }
     })?;
-    Ok((super::common::cast_output(out, arena.data_type(expr), "map_values"))?)
+    super::common::cast_output(out, arena.data_type(expr), "map_values")
 }

@@ -34,8 +34,10 @@ impl KernelEvaluationControl for LegacyControl {
         ))
     }
 }
-pub(super) fn legacy_error(e: impl Into<BasicStateError>) -> String {
-    e.into().into_legacy_message()
+fn source_failure(
+    source: impl Into<BasicStateError>,
+) -> crate::runtime::fragment::ExecutionFailure {
+    crate::runtime::fragment::ExecutionFailure::from_domain(source.into())
 }
 fn operation(kind: &AggKind) -> BasicOperation {
     use BasicOperation::*;
@@ -217,7 +219,7 @@ pub(super) fn update(
     states: &[AggStatePtr],
     input: &AggInputView,
     state_scale: Option<i8>,
-) -> Result<(), String> {
+) -> crate::runtime::fragment::ExecutionResult<()> {
     let core = core(spec);
     let mut w = EvaluationCheckpoints::new(&LegacyControl);
     let pair = if matches!(
@@ -225,14 +227,22 @@ pub(super) fn update(
         AggKind::CovarPop | AggKind::CovarSamp | AggKind::Corr
     ) {
         let AggInputView::Any(array) = input else {
-            return Err("covar/corr batch input type mismatch".to_owned());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "covar/corr batch input type mismatch",
+            ));
         };
         let a = array
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| "covar/corr expects struct input".to_owned())?;
+            .ok_or_else(|| {
+                crate::exec::expr::agg::views::aggregate_input_contract(
+                    "covar/corr expects struct input",
+                )
+            })?;
         if a.num_columns() != 2 {
-            return Err("covar/corr expects 2 arguments".to_owned());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "covar/corr expects 2 arguments",
+            ));
         }
         for a in a.columns() {
             if !matches!(
@@ -244,9 +254,8 @@ pub(super) fn update(
                     | DataType::Float32
                     | DataType::Float64
             ) {
-                return Err(format!(
-                    "covar/corr unsupported input type: {:?}",
-                    a.data_type()
+                return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                    format_args!("covar/corr unsupported input type: {:?}", a.data_type()),
                 ));
             }
         }
@@ -264,29 +273,29 @@ pub(super) fn update(
                     row,
                     &mut w,
                 )
-                .map_err(legacy_error)?,
+                .map_err(source_failure)?,
                 novarocks_functions::builtin::aggregate_basic::read_basic_value(
                     a.column(1).as_ref(),
                     row,
                     &mut w,
                 )
-                .map_err(legacy_error)?,
+                .map_err(source_failure)?,
             )
         } else {
-            (raw_value(input, row, &mut w).map_err(legacy_error)?, None)
+            (raw_value(input, row, &mut w).map_err(source_failure)?, None)
         };
         core.update(&mut s, first, second, state_scale, &mut w)
-            .map_err(legacy_error)?;
+            .map_err(source_failure)?;
         store(spec, p, s);
     }
-    w.finish_result(Ok(())).map_err(legacy_error)
+    w.finish_result(Ok(())).map_err(source_failure)
 }
 pub(super) fn merge(
     spec: &AggSpec,
     offset: usize,
     states: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> crate::runtime::fragment::ExecutionResult<()> {
     let core = core(spec);
     let mut w = EvaluationCheckpoints::new(&LegacyControl);
     for (row, &base) in states.iter().enumerate() {
@@ -311,52 +320,56 @@ pub(super) fn merge(
                 if a.is_null(row) {
                     None
                 } else {
-                    Some(core.decode_state(*a, row, &mut w).map_err(legacy_error)?)
+                    Some(core.decode_state(*a, row, &mut w).map_err(source_failure)?)
                 }
             }
             AggInputView::Binary(a) => {
                 if a.is_null(row) {
                     None
                 } else {
-                    Some(core.decode_state(*a, row, &mut w).map_err(legacy_error)?)
+                    Some(core.decode_state(*a, row, &mut w).map_err(source_failure)?)
                 }
             }
             AggInputView::Utf8(v) => {
                 if let Some(text) = v.value_at(row) {
-                    Some(core.decode_text(&text, &mut w).map_err(legacy_error)?)
+                    Some(core.decode_text(&text, &mut w).map_err(source_failure)?)
                 } else {
                     None
                 }
             }
             AggInputView::Any(a) => core
                 .decode_optional(a.as_ref(), row, &mut w)
-                .map_err(legacy_error)?,
+                .map_err(source_failure)?,
             _ => unreachable!("validated basic aggregate merge carrier"),
         };
         if let Some(incoming) = incoming {
             let p = unsafe { (base as *mut u8).add(offset) };
             let mut s = load(spec, p);
-            core.merge_state(&mut s, incoming).map_err(legacy_error)?;
+            core.merge_state(&mut s, incoming).map_err(source_failure)?;
             store(spec, p, s);
         }
     }
-    w.finish_result(Ok(())).map_err(legacy_error)
+    w.finish_result(Ok(())).map_err(source_failure)
 }
 pub(super) fn build(
     spec: &AggSpec,
     offset: usize,
     states: &[AggStatePtr],
     intermediate: bool,
-) -> Result<ArrayRef, String> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     if !intermediate {
         match (&spec.kind, &spec.output_type) {
             (AggKind::AvgDecimal128, DataType::Decimal128(..))
             | (AggKind::AvgDecimal256, DataType::Decimal256(..)) => {}
             (AggKind::AvgDecimal128, t) => {
-                return Err(format!("decimal output type mismatch: {:?}", t));
+                return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                    format_args!("decimal output type mismatch: {:?}", t),
+                ));
             }
             (AggKind::AvgDecimal256, t) => {
-                return Err(format!("decimal256 output type mismatch: {:?}", t));
+                return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                    format_args!("decimal256 output type mismatch: {:?}", t),
+                ));
             }
             _ => {}
         }
@@ -366,8 +379,16 @@ pub(super) fn build(
         && spec.input_arg_type.is_none()
     {
         match spec.kind {
-            AggKind::AvgDecimal128 => return Err("avg decimal arg scale missing".to_owned()),
-            AggKind::AvgDecimal256 => return Err("avg decimal256 arg scale missing".to_owned()),
+            AggKind::AvgDecimal128 => {
+                return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                    "avg decimal arg scale missing",
+                ));
+            }
+            AggKind::AvgDecimal256 => {
+                return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                    "avg decimal256 arg scale missing",
+                ));
+            }
             _ => {}
         }
     }
@@ -379,5 +400,5 @@ pub(super) fn build(
             intermediate,
             &LegacyControl,
         )
-        .map_err(legacy_error)
+        .map_err(source_failure)
 }

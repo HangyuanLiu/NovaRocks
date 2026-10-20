@@ -267,7 +267,7 @@ impl SqlFunctionCatalog for RefusePresence {
     ) -> Result<novarocks_functions::PureOverloadDeclaration<'a>, FunctionSpecializationFailure>
     {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        Err(FunctionSpecializationFailure::Control(self.cause))
+        Err(FunctionSpecializationFailure::Control(self.cause.clone()))
     }
     fn resolve_scalar_signature(
         &self,
@@ -329,7 +329,7 @@ fn sql_presence_candidate_declared_owner_control_is_first_cause_without_later_ad
         let calls = Arc::new(AtomicUsize::new(0));
         let original = RefusePresence {
             original: builtin_sql_function_catalog().snapshot(),
-            cause,
+            cause: cause.clone(),
             calls: Arc::clone(&calls),
         };
         let args = [argument(DataType::Utf8)];

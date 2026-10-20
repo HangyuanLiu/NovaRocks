@@ -19,6 +19,7 @@
 //! The test allocator measures real blocks; it grants no invocation capacity.
 use super::*;
 use crate::exec::pipeline::operator::Operator;
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::runtime_state::RuntimeState;
 use arrow::array::{ArrayRef, Int64Array};
 use novarocks_functions as f;
@@ -134,7 +135,7 @@ struct CountMergeSource {
     activations: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
 }
-impl Operator for CountMergeSource {
+impl OperatorLifecycle for CountMergeSource {
     fn name(&self) -> &str {
         "original_count_merge_overflow"
     }
@@ -165,6 +166,14 @@ impl Operator for CountMergeSource {
         Ok(())
     }
 }
+impl crate::exec::pipeline::shape::SourceKernel for CountMergeSource {
+    fn poll_output(
+        &mut self,
+        _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
+        panic!("the activation failure must prevent payload work");
+    }
+}
 impl Drop for CountMergeSource {
     fn drop(&mut self) {
         self.drops.fetch_add(1, Ordering::AcqRel);
@@ -186,16 +195,18 @@ fn original_count_overflow_real_driver_owner_stops_without_replay_and_releases_b
         None,
         None,
     ));
-    let completion = FragmentCompletion::new(1);
+    let completion = FragmentCompletion::new(1, runtime.error_state());
     let task = DriverTask::new(
         PipelineDriver::new(
             1,
-            vec![Box::new(CountMergeSource {
-                handle: prepare_final(),
-                ledger: ledger.clone(),
-                activations: activations.clone(),
-                drops: drops.clone(),
-            })],
+            vec![Box::new(crate::exec::pipeline::shape::Source::new(
+                CountMergeSource {
+                    handle: prepare_final(),
+                    ledger: ledger.clone(),
+                    activations: activations.clone(),
+                    drops: drops.clone(),
+                },
+            ))],
             None,
             Vec::new(),
             runtime,
@@ -209,7 +220,12 @@ fn original_count_overflow_real_driver_owner_stops_without_replay_and_releases_b
     let error = completion
         .wait_timeout(
             Duration::from_secs(5),
-            "COUNT host test timed out".to_owned(),
+            novarocks_functions::KernelFailure::Internal(
+                novarocks_functions::KernelDiagnostic::new(
+                    &("COUNT host test timed out".to_owned()),
+                ),
+            )
+            .into(),
         )
         .unwrap_err();
     assert!(

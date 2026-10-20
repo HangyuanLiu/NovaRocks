@@ -18,6 +18,7 @@
 //!
 //! This sorter is a small-limit specialization for ROW_NUMBER topn.
 
+use super::operation_failure::{self as failure, Operation};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
@@ -96,7 +97,9 @@ impl TopNHeapKernel {
             return Ok(());
         }
         if self.order_by.is_empty() {
-            return Err("topn sorter requires at least one order-by key".into());
+            return Err(failure::contract(
+                "topn sorter requires at least one order-by key",
+            ));
         }
 
         let owner = creation.begin(&chunk)?;
@@ -148,7 +151,7 @@ impl TopNHeapKernel {
             .as_ref()
             .expect("row converter initialized")
             .convert_columns(&key_columns)
-            .map_err(|e| e.to_string())?;
+            .map_err(|source| failure::arrow(Operation::EncodeRows, source))?;
 
         for row_idx in 0..chunk.len() {
             let entry = TopNHeapEntry {

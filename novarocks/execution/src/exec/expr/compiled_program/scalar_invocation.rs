@@ -239,20 +239,9 @@ impl FrameFailure for crate::runtime::fragment::ExecutionFailure {
     }
     fn finish<T>(work: &mut super::Work<'_, '_>, result: Result<T, Self>) -> Result<T, Self> {
         match result {
-            Err(error) => {
-                if let crate::runtime::fragment::ExecutionFailureCause::Kernel(cause) =
-                    error.cause()
-                {
-                    // Keep the original Kernel footer policy; the existing
-                    // Work author decides whether completion may run.
-                    match work.finish::<()>(Err(cause.clone())) {
-                        Err(final_cause) if &final_cause != cause => Err(final_cause.into()),
-                        _ => Err(error),
-                    }
-                } else {
-                    Err(error)
-                }
-            }
+            // Preserve the original local occurrence; no reconstruction or
+            // additional checkpoint can replace a failed Frame's result.
+            Err(error) => Err(error),
             Ok(value) => work.finish(Ok(value)).map_err(Into::into),
         }
     }

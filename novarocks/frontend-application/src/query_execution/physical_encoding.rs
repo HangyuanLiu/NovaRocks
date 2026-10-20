@@ -1332,10 +1332,10 @@ mod tests {
                 if phase == CompilePhase::Encode
                     && Some(self.encode_checkpoints.fetch_add(1, Ordering::SeqCst)) == self.tail_at
                 {
-                    return Err(self.tail_error);
+                    return Err(self.tail_error.clone());
                 }
                 if phase == CompilePhase::Validate
-                    && let Some(error) = self.earlier_error
+                    && let Some(error) = self.earlier_error.clone()
                 {
                     return Err(error);
                 }
@@ -1364,7 +1364,7 @@ mod tests {
                 encode_checkpoints: AtomicUsize::new(0),
                 checkpoints: Mutex::new(Vec::new()),
                 tail_at: None,
-                tail_error: error,
+                tail_error: error.clone(),
                 earlier_error: None,
             };
             encode_completed_plan(
@@ -1405,7 +1405,7 @@ mod tests {
                 encode_checkpoints: AtomicUsize::new(0),
                 checkpoints: Mutex::new(Vec::new()),
                 tail_at: Some(encode_checkpoints - 1),
-                tail_error: error,
+                tail_error: error.clone(),
                 earlier_error: None,
             };
             assert!(matches!(
@@ -1444,7 +1444,7 @@ mod tests {
                 } else {
                     CompileControlError::ResourceExhausted
                 },
-                earlier_error: Some(error),
+                earlier_error: Some(error.clone()),
             };
             assert!(matches!(
                 encode_completed_plan(

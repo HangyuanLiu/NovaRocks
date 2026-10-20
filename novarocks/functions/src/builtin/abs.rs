@@ -169,12 +169,8 @@ pub(super) fn evaluate_abs<'a>(
         work.flush()?;
         let addresses = UInt64Array::from(addresses);
         work.flush()?;
-        let compact =
-            arrow_select::take::take(array.as_ref(), &addresses, None).map_err(|error| {
-                KernelFailure::Operational(crate::KernelDiagnostic::new(&format!(
-                    "ABS selected gather failed: {error}"
-                )))
-            })?;
+        let compact = arrow_select::take::take(array.as_ref(), &addresses, None)
+            .map_err(|source| AbsError::gather(source).into_kernel())?;
         work.flush()?;
         compact
     };
@@ -186,10 +182,7 @@ pub(super) fn evaluate_abs<'a>(
             AbsObservation::OpaqueBoundary => work.flush(),
         },
     )
-    .map_err(|error| match error {
-        AbsError::Kernel(error) => error,
-        AbsError::Legacy(error) => KernelFailure::Operational(crate::KernelDiagnostic::new(&error)),
-    })?;
+    .map_err(AbsError::into_kernel)?;
     work.finish()?;
     SelectedValues::try_new(selection, target.data_type(), values, Box::default())
         .map_err(|_| internal("ABS compact output violates its selected contract"))
@@ -545,7 +538,7 @@ mod tests {
         let mut wrong_shape = instance(physical(DataType::Int8, false));
         assert!(matches!(
             wrong_shape.evaluate(selection, &arguments, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
     }
 

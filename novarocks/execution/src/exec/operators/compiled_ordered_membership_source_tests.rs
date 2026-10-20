@@ -204,7 +204,14 @@ fn compiled_ordered_source_checked_component_membership_keeps_full_ordinal_gate_
     )
     .err()
     .expect("a Utf8 root is not the declared Int64 membership key");
-    assert!(wrong.contains("not its membership type Int64"), "{wrong}");
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(&wrong).class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert!(
+        wrong.detail().contains("not its membership type Int64"),
+        "{wrong}"
+    );
     let members = Arc::new(
         CompiledRuntimeFilterConsumers::try_new_at_ordinals(
             "Scan",
@@ -231,15 +238,20 @@ fn compiled_ordered_source_checked_component_membership_keeps_full_ordinal_gate_
         consumer._control.clone(),
     );
     let mut operator = factory.create(1, 0);
+    let turn = TurnWork::new(std::num::NonZeroU64::MIN, DEFAULT_TURN_WORK_UNITS);
+    operator.bind_poll_budget(turn.poll_budget());
     operator.set_mem_tracker(consumer.tracker.clone());
     operator.set_construction_factory(consumer._creation.clone());
     operator.set_fragment_event_sink(consumer.effects.clone());
     operator.prepare().unwrap();
+    let tracker = consumer.tracker.clone();
+    let runtime_error = consumer.state.error_state();
     let mut case = SourceCase {
         consumer,
         source,
         _factory: factory,
-        operator,
+        operator: OperatorInstance::new(0, operator, Some(tracker), runtime_error),
+        turn,
     };
     case.push_original();
     let stopped = Arc::new(AtomicBool::new(false));
@@ -353,7 +365,8 @@ fn compiled_ordered_source_checked_component_membership_keeps_full_ordinal_gate_
         case.operator.pending_finish(),
         Some(FinishWatch::Notify(_))
     ));
-    ticket.end(Ok(()));
+    ticket.end(novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited);
+    case.poll_exit();
     assert!(case.operator.pending_finish().is_none());
     assert!(case.source.pages.operations.is_exited());
     let data = output.columns()[1].to_data();

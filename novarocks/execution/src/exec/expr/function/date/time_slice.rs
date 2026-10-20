@@ -16,7 +16,7 @@
 // under the License.
 use super::common::{extract_datetime_array, extract_i64_array};
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{Array, ArrayRef, StringArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_functions::builtin::calendar_slice::{CalendarSliceDomain, evaluate_legacy_slice};
@@ -27,14 +27,19 @@ fn eval_time_slice_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     date_output: bool,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     let name = if date_output {
         "date_slice"
     } else {
         "time_slice"
     };
     if !matches!(args.len(), 3 | 4) {
-        return Err((format!("{name} expects value, count, unit and optional boundary")).into());
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(format_args!(
+                "{name} expects value, count, unit and optional boundary"
+            ))
+            .into(),
+        );
     }
     let output_type = if date_output {
         DataType::Date32
@@ -42,7 +47,12 @@ fn eval_time_slice_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         DataType::Timestamp(TimeUnit::Microsecond, None)
     };
     if arena.data_type(expr) != Some(&output_type) {
-        return Err((format!("{name} result type differs from its frozen temporal domain")).into());
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(format_args!(
+                "{name} result type differs from its frozen temporal domain"
+            ))
+            .into(),
+        );
     }
     // SQL materializes temporal coercions before binding.
     let dt_arr = arena.eval(args[0], chunk)?;
@@ -55,23 +65,30 @@ fn eval_time_slice_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     };
     if dt_arr.data_type() != &output_type || interval_arr.data_type() != &DataType::Int32 {
         return Err(
-            (format!("{name} arguments differ from their frozen temporal/INT32 domains")).into(),
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(format_args!(
+                "{name} arguments differ from their frozen temporal/INT32 domains"
+            ))
+            .into(),
         );
     }
     let dts = extract_datetime_array(&dt_arr)?;
-    let interval_values = extract_i64_array(&interval_arr, "time_slice")
-        .map_err(|_| "time_slice expects int interval".to_string())?;
+    let interval_values = extract_i64_array(&interval_arr, "time_slice")?;
     let unit_arr = unit_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "time_slice expects unit string".to_string())?;
+        .ok_or_else(|| {
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "time_slice expects unit string",
+            )
+        })?;
     let boundary_arr = boundary_arr
         .as_ref()
         .map(|array| {
-            array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| format!("{name} expects boundary string"))
+            array.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                novarocks_functions::builtin::calendar_parts_shared::part_contract(format_args!(
+                    "{name} expects boundary string"
+                ))
+            })
         })
         .transpose()?;
     for length in [interval_values.len(), unit_arr.len()]
@@ -79,10 +96,15 @@ fn eval_time_slice_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         .chain(boundary_arr.map(|array| array.len()))
     {
         if length != 1 && length != dts.len() {
-            return Err((format!("{name} argument lengths differ")).into());
+            return Err(
+                novarocks_functions::builtin::calendar_parts_shared::part_contract(format_args!(
+                    "{name} argument lengths differ"
+                ))
+                .into(),
+            );
         }
     }
-    Ok((evaluate_legacy_slice(
+    evaluate_legacy_slice(
         if date_output {
             CalendarSliceDomain::Date
         } else {
@@ -92,7 +114,8 @@ fn eval_time_slice_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         &interval_values,
         unit_arr,
         boundary_arr,
-    ))?)
+    )
+    .map_err(Into::into)
 }
 
 pub fn eval_time_slice<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -100,8 +123,8 @@ pub fn eval_time_slice<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_time_slice_inner(arena, expr, args, chunk, false))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_time_slice_inner(arena, expr, args, chunk, false)
 }
 
 pub fn eval_date_slice<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -109,6 +132,6 @@ pub fn eval_date_slice<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_time_slice_inner(arena, expr, args, chunk, true))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_time_slice_inner(arena, expr, args, chunk, true)
 }

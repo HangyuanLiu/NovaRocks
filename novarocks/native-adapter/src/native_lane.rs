@@ -613,9 +613,10 @@ pub(crate) fn admitted_connector_service(
                 .map_err(|error| {
                     std::io::Error::new(error.kind(), "native dial admission refused")
                 })?;
-            let io = connector.connect().await.map_err(|failure| {
-                std::io::Error::other(format!("native transport connector failed: {failure}"))
-            })?;
+            let io = connector
+                .connect()
+                .await
+                .map_err(|failure| std::io::Error::other(failure))?;
             let io: novarocks_native_trust::BoxedNativeIo = match dial {
                 Some(dial) => Box::new(novarocks_native_trust::OwnedNativeIo::with_guard(
                     io,

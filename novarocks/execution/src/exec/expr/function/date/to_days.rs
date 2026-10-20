@@ -16,17 +16,26 @@
 // under the License.
 use super::common::extract_date_array;
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{ArrayRef, Int64Array};
 use novarocks_functions::calendar_julian::day_number_from_date;
 use std::sync::Arc;
 
 pub fn eval_to_days<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Int64)?;
+    if args.len() != 1 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "to_days has an incompatible argument count",
+            )
+            .into(),
+        );
+    }
     let arr = arena.eval(args[0], chunk)?;
     let dates = extract_date_array(&arr)?;
     let mut out = Vec::with_capacity(dates.len());

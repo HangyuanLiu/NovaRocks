@@ -37,7 +37,10 @@ fn list(
         valid.map(NullBuffer::from),
     ))
 }
-fn raw(columns: Vec<ArrayRef>, output: Option<DataType>) -> Result<ArrayRef, String> {
+fn raw(
+    columns: Vec<ArrayRef>,
+    output: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let slots = (0..columns.len())
         .map(|i| SlotId::new(i as u32 + 1))
         .collect::<Vec<_>>();
@@ -87,7 +90,7 @@ fn original_array_append_null_parent_skips_target_but_null_target_is_appended() 
     );
 }
 #[test]
-fn original_array_append_planned_field_metadata_and_legacy_nonlist_output_fallback() {
+fn array_append_keeps_planned_field_metadata_and_rejects_a_nonlist_target() {
     let f = Arc::new(
         Field::new("source", DataType::Int32, true)
             .with_metadata(HashMap::from([("source-tag".into(), "kept".into())])),
@@ -99,10 +102,10 @@ fn original_array_append_planned_field_metadata_and_legacy_nonlist_output_fallba
         None,
     );
     let target: ArrayRef = Arc::new(Int32Array::from(vec![2]));
-    for output in [None, Some(DataType::Int64)] {
-        let out = raw(vec![a.clone(), target.clone()], output).unwrap();
-        assert_eq!(out.data_type(), &DataType::List(f.clone()));
-    }
+    let out = raw(vec![a.clone(), target.clone()], None).unwrap();
+    assert_eq!(out.data_type(), &DataType::List(f.clone()));
+    let refusal = raw(vec![a.clone(), target.clone()], Some(DataType::Int64)).unwrap_err();
+    assert_frozen_target(&refusal);
     let planned = Arc::new(
         Field::new("planned", DataType::Int64, true)
             .with_metadata(HashMap::from([("planned-tag".into(), "kept".into())])),
@@ -137,7 +140,7 @@ fn original_array_append_full_default_arrow_cast_failure_and_list_admission() {
     let a: ArrayRef = Arc::new(Int32Array::from(vec![1]));
     let t: ArrayRef = Arc::new(StringArray::from(vec!["x"]));
     assert_eq!(
-        raw(vec![a, t], None).unwrap_err(),
+        (raw(vec![a, t], None).unwrap_err()).to_string(),
         "array_append expects ListArray, got Int32"
     );
     let field = Arc::new(Field::new("item", DataType::Int32, true));
@@ -148,15 +151,35 @@ fn original_array_append_full_default_arrow_cast_failure_and_list_admission() {
         vec![0, 1],
         None,
     );
-    let cause = arrow::compute::cast(&target, &DataType::Int32)
-        .unwrap_err()
-        .to_string();
+    let cause = arrow::compute::cast(&target, &DataType::Int32).unwrap_err();
+    let refusal = raw(vec![a, target], None).unwrap_err();
+    assert_original_arrow(&refusal, &cause);
+}
+
+pub(super) fn assert_original_arrow(
+    error: &crate::runtime::fragment::ExecutionFailure,
+    expected: &arrow::error::ArrowError,
+) {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    let mut source: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(original) = source.downcast_ref::<arrow::error::ArrowError>() {
+            assert_eq!(original.to_string(), expected.to_string());
+            break;
+        }
+        source = source
+            .source()
+            .expect("original collection cast refusal must survive its envelope");
+    }
+}
+pub(super) fn assert_frozen_target(error: &crate::runtime::fragment::ExecutionFailure) {
+    use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
     assert_eq!(
-        raw(vec![a, target.clone()], None).unwrap_err(),
-        format!(
-            "array_append failed to cast target type {:?} -> Int32: {}",
-            target.data_type(),
-            cause
+        error.failure_fact(),
+        FailureFact::new(
+            FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::ExpressionContract.reason()
         )
     );
 }

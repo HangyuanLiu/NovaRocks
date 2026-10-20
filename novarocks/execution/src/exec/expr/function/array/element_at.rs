@@ -16,16 +16,18 @@
 // under the License.
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprArena, ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef};
+use novarocks_functions::KernelFailure;
 use novarocks_functions::builtin::array_access_core::{
     AccessFailure, ArrayAccessInputs, lookup_observed,
 };
-use std::convert::Infallible;
-fn legacy_error(error: AccessFailure<Infallible>) -> String {
+fn access_error(error: AccessFailure<KernelFailure>) -> ExecutionFailure {
     match error {
-        AccessFailure::Data(message) => message,
-        AccessFailure::Control(never) => match never {},
+        AccessFailure::Operation(cause) | AccessFailure::Control(cause) => {
+            ExecutionFailure::from(cause)
+        }
     }
 }
 pub fn eval_element_at<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -33,7 +35,12 @@ pub fn eval_element_at<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if !matches!(args.len(), 2 | 3) {
+        return Err(expression_contract(
+            "element_at array requires 2 or 3 prepared arguments",
+        ));
+    }
     let arr = arena.eval(args[0], chunk)?;
     let subscript_arr = arena.eval(args[1], chunk)?;
     let check_arr = if args.len() == 3 {
@@ -41,17 +48,24 @@ pub fn eval_element_at<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     } else {
         None
     };
-    let mut observer = |_| Ok::<(), Infallible>(());
+    let mut observer = |_| Ok::<(), KernelFailure>(());
     let inputs = ArrayAccessInputs::new(arr, subscript_arr, check_arr, &mut observer)
-        .map_err(legacy_error)?;
-    inputs.validate_legacy_lengths()?;
-    Ok((lookup_observed(
+        .map_err(access_error)?;
+    inputs.validate_direct_lengths()?;
+    lookup_observed(
         &inputs,
         novarocks_functions::Selection::all(inputs.list().len()),
-        |_, row| Ok::<_, Infallible>(inputs.legacy_rows(row)),
+        |_, row| Ok::<_, KernelFailure>(inputs.direct_rows(row)),
         arena.data_type(expr),
-        |_, _| Ok::<(), Infallible>(()),
+        |values, indices| {
+            novarocks_functions::selected_copy::preflight_original_take(
+                values,
+                novarocks_functions::selected_copy::CopyIndexView::UInt32(indices),
+                |_| Ok(()),
+            )
+            .map_err(novarocks_functions::selected_copy::CopyError::into_kernel)
+        },
         &mut observer,
     )
-    .map_err(legacy_error))?)
+    .map_err(access_error)
 }

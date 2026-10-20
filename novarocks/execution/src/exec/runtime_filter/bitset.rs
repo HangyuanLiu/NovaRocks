@@ -165,15 +165,24 @@ impl RuntimeBitsetFilter {
         }
     }
 
-    pub fn merge_from(&mut self, other: &RuntimeBitsetFilter) -> Result<(), String> {
+    pub fn merge_from(
+        &mut self,
+        other: &RuntimeBitsetFilter,
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         if self.filter_id != other.filter_id || self.ltype != other.ltype {
-            return Err("runtime bitset filter metadata mismatch".to_string());
+            return Err(crate::exec::runtime_filter::failure::contract(
+                "runtime bitset filter metadata mismatch",
+            ));
         }
         if self.min_value != other.min_value || self.max_value != other.max_value {
-            return Err("runtime bitset filter range mismatch".to_string());
+            return Err(crate::exec::runtime_filter::failure::contract(
+                "runtime bitset filter range mismatch",
+            ));
         }
         if self.bitset.len() != other.bitset.len() {
-            return Err("runtime bitset filter size mismatch".to_string());
+            return Err(crate::exec::runtime_filter::failure::contract(
+                "runtime bitset filter size mismatch",
+            ));
         }
         self.has_null |= other.has_null;
         self.size = self.size.saturating_add(other.size);
@@ -185,7 +194,10 @@ impl RuntimeBitsetFilter {
     }
 
     #[allow(dead_code)]
-    pub fn filter_chunk(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+    pub fn filter_chunk(
+        &self,
+        chunk: Chunk,
+    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
         if self.is_empty() {
             return Ok(Some(chunk));
         }
@@ -208,7 +220,9 @@ impl RuntimeBitsetFilter {
         }
         let mask = BooleanArray::from(keep);
         let filtered_batch =
-            filter_record_batch(&chunk.record_batch(), &mask).map_err(|e| e.to_string())?;
+            filter_record_batch(&chunk.record_batch(), &mask).map_err(|source| {
+                crate::exec::runtime_filter::failure::arrow("filter batch", source)
+            })?;
         Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
     }
 
@@ -216,7 +230,7 @@ impl RuntimeBitsetFilter {
         &self,
         array: &ArrayRef,
         chunk: Chunk,
-    ) -> Result<Option<Chunk>, String> {
+    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
         if self.is_empty() {
             return Ok(Some(chunk));
         }
@@ -224,7 +238,9 @@ impl RuntimeBitsetFilter {
             return Ok(Some(chunk));
         }
         if array.len() != chunk.len() {
-            return Err("runtime bitset filter array length mismatch".to_string());
+            return Err(crate::exec::runtime_filter::failure::contract(
+                "runtime bitset filter array length mismatch",
+            ));
         }
         let len = chunk.len();
         let mut keep = vec![true; len];
@@ -238,7 +254,9 @@ impl RuntimeBitsetFilter {
         }
         let mask = BooleanArray::from(keep);
         let filtered_batch =
-            filter_record_batch(&chunk.record_batch(), &mask).map_err(|e| e.to_string())?;
+            filter_record_batch(&chunk.record_batch(), &mask).map_err(|source| {
+                crate::exec::runtime_filter::failure::arrow("filter batch", source)
+            })?;
         Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
     }
 
@@ -246,7 +264,7 @@ impl RuntimeBitsetFilter {
         &self,
         array: &ArrayRef,
         keep: &mut [bool],
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         if self.is_empty() {
             return Ok(());
         }
@@ -262,7 +280,7 @@ pub fn maybe_build_runtime_bitset_filter(
     size: u64,
     arrays: &[ArrayRef],
     min_max: RuntimeMinMaxFilter,
-) -> Result<Option<RuntimeBitsetFilter>, String> {
+) -> Result<Option<RuntimeBitsetFilter>, crate::runtime::fragment::ExecutionFailure> {
     if arrays.is_empty() || size == 0 {
         return Ok(None);
     }
@@ -333,10 +351,14 @@ fn is_decimal_bitset_ltype(ltype: &RuntimeFilterType) -> bool {
     )
 }
 
-fn decimal_value_for_bitset(arr: &Decimal128Array, index: usize) -> Result<i64, String> {
+fn decimal_value_for_bitset(
+    arr: &Decimal128Array,
+    index: usize,
+) -> Result<i64, crate::runtime::fragment::ExecutionFailure> {
     let value = arr.value(index);
-    i64::try_from(value)
-        .map_err(|_| format!("runtime bitset decimal value out of i64 range: {}", value))
+    i64::try_from(value).map_err(|source| {
+        crate::exec::runtime_filter::failure::narrow("bitset decimal i64", value, source)
+    })
 }
 
 fn should_use_bitset(bitset_memory_usage: usize, bloom_memory_usage: usize) -> bool {
@@ -350,7 +372,7 @@ fn should_use_bitset(bitset_memory_usage: usize, bloom_memory_usage: usize) -> b
 fn scan_bitset_build_stats(
     ltype: &RuntimeFilterType,
     arrays: &[ArrayRef],
-) -> Result<Option<(bool, i64, i64)>, String> {
+) -> Result<Option<(bool, i64, i64)>, crate::runtime::fragment::ExecutionFailure> {
     let mut has_null = false;
     let mut has_value = false;
     let mut min_value = i64::MAX;
@@ -371,7 +393,11 @@ fn scan_bitset_build_stats(
                 let arr = array
                     .as_any()
                     .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| "runtime bitset build type mismatch for Boolean".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bitset build type mismatch for Boolean",
+                        )
+                    })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         has_null = true;
@@ -381,10 +407,11 @@ fn scan_bitset_build_stats(
                 }
             }
             DataType::Int8 if *ltype == RuntimeFilterType::Int8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int8Array>()
-                    .ok_or_else(|| "runtime bitset build type mismatch for Int8".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bitset build type mismatch for Int8",
+                    )
+                })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         has_null = true;
@@ -394,10 +421,11 @@ fn scan_bitset_build_stats(
                 }
             }
             DataType::Int16 if *ltype == RuntimeFilterType::Int16 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int16Array>()
-                    .ok_or_else(|| "runtime bitset build type mismatch for Int16".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bitset build type mismatch for Int16",
+                    )
+                })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         has_null = true;
@@ -407,10 +435,11 @@ fn scan_bitset_build_stats(
                 }
             }
             DataType::Int32 if *ltype == RuntimeFilterType::Int32 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| "runtime bitset build type mismatch for Int32".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bitset build type mismatch for Int32",
+                    )
+                })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         has_null = true;
@@ -420,10 +449,11 @@ fn scan_bitset_build_stats(
                 }
             }
             DataType::Int64 if *ltype == RuntimeFilterType::Int64 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| "runtime bitset build type mismatch for Int64".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bitset build type mismatch for Int64",
+                    )
+                })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         has_null = true;
@@ -436,7 +466,11 @@ fn scan_bitset_build_stats(
                 let arr = array
                     .as_any()
                     .downcast_ref::<Date32Array>()
-                    .ok_or_else(|| "runtime bitset build type mismatch for Date32".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bitset build type mismatch for Date32",
+                        )
+                    })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         has_null = true;
@@ -450,7 +484,9 @@ fn scan_bitset_build_stats(
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
                     .ok_or_else(|| {
-                        "runtime bitset build type mismatch for Decimal128".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bitset build type mismatch for Decimal128",
+                        )
                     })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
@@ -461,10 +497,12 @@ fn scan_bitset_build_stats(
                 }
             }
             _ => {
-                return Err(format!(
-                    "runtime bitset build unsupported type mapping: ltype={:?} data_type={:?}",
-                    ltype,
-                    array.data_type()
+                return Err(crate::exec::runtime_filter::failure::contract(
+                    format_args!(
+                        "runtime bitset build unsupported type mapping: ltype={:?} data_type={:?}",
+                        ltype,
+                        array.data_type()
+                    ),
                 ));
             }
         }
@@ -482,7 +520,7 @@ fn fill_bitset_from_arrays(
     min_value: i64,
     max_value: i64,
     bitset: &mut [u8],
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let mut set_value = |value: i64| {
         if value < min_value || value > max_value {
             return;
@@ -502,7 +540,11 @@ fn fill_bitset_from_arrays(
                 let arr = array
                     .as_any()
                     .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| "runtime bitset build type mismatch for Boolean".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bitset build type mismatch for Boolean",
+                        )
+                    })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         continue;
@@ -511,10 +553,11 @@ fn fill_bitset_from_arrays(
                 }
             }
             DataType::Int8 if *ltype == RuntimeFilterType::Int8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int8Array>()
-                    .ok_or_else(|| "runtime bitset build type mismatch for Int8".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bitset build type mismatch for Int8",
+                    )
+                })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         continue;
@@ -523,10 +566,11 @@ fn fill_bitset_from_arrays(
                 }
             }
             DataType::Int16 if *ltype == RuntimeFilterType::Int16 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int16Array>()
-                    .ok_or_else(|| "runtime bitset build type mismatch for Int16".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bitset build type mismatch for Int16",
+                    )
+                })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         continue;
@@ -535,10 +579,11 @@ fn fill_bitset_from_arrays(
                 }
             }
             DataType::Int32 if *ltype == RuntimeFilterType::Int32 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int32Array>()
-                    .ok_or_else(|| "runtime bitset build type mismatch for Int32".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bitset build type mismatch for Int32",
+                    )
+                })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         continue;
@@ -547,10 +592,11 @@ fn fill_bitset_from_arrays(
                 }
             }
             DataType::Int64 if *ltype == RuntimeFilterType::Int64 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| "runtime bitset build type mismatch for Int64".to_string())?;
+                let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bitset build type mismatch for Int64",
+                    )
+                })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         continue;
@@ -562,7 +608,11 @@ fn fill_bitset_from_arrays(
                 let arr = array
                     .as_any()
                     .downcast_ref::<Date32Array>()
-                    .ok_or_else(|| "runtime bitset build type mismatch for Date32".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bitset build type mismatch for Date32",
+                        )
+                    })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
                         continue;
@@ -575,7 +625,9 @@ fn fill_bitset_from_arrays(
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
                     .ok_or_else(|| {
-                        "runtime bitset build type mismatch for Decimal128".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bitset build type mismatch for Decimal128",
+                        )
                     })?;
                 for i in 0..arr.len() {
                     if arr.is_null(i) {
@@ -585,10 +637,12 @@ fn fill_bitset_from_arrays(
                 }
             }
             _ => {
-                return Err(format!(
-                    "runtime bitset build unsupported type mapping: ltype={:?} data_type={:?}",
-                    ltype,
-                    array.data_type()
+                return Err(crate::exec::runtime_filter::failure::contract(
+                    format_args!(
+                        "runtime bitset build unsupported type mapping: ltype={:?} data_type={:?}",
+                        ltype,
+                        array.data_type()
+                    ),
                 ));
             }
         }
@@ -602,10 +656,12 @@ fn apply_bitset_filter(
     has_null: bool,
     array: ArrayRef,
     keep: &mut [bool],
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let len = array.len();
     if keep.len() != len {
-        return Err("runtime bitset filter selection size mismatch".to_string());
+        return Err(crate::exec::runtime_filter::failure::contract(
+            "runtime bitset filter selection size mismatch",
+        ));
     }
     let min_value = filter.min_value;
     let max_value = filter.max_value;
@@ -627,7 +683,11 @@ fn apply_bitset_filter(
             let arr = array
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "runtime bitset filter type mismatch for Boolean".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bitset filter type mismatch for Boolean",
+                    )
+                })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -641,10 +701,11 @@ fn apply_bitset_filter(
             }
         }
         DataType::Int8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "runtime bitset filter type mismatch for Int8".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                crate::exec::runtime_filter::failure::contract(
+                    "runtime bitset filter type mismatch for Int8",
+                )
+            })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -657,10 +718,11 @@ fn apply_bitset_filter(
             }
         }
         DataType::Int16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "runtime bitset filter type mismatch for Int16".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
+                crate::exec::runtime_filter::failure::contract(
+                    "runtime bitset filter type mismatch for Int16",
+                )
+            })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -673,10 +735,11 @@ fn apply_bitset_filter(
             }
         }
         DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "runtime bitset filter type mismatch for Int32".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                crate::exec::runtime_filter::failure::contract(
+                    "runtime bitset filter type mismatch for Int32",
+                )
+            })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -689,10 +752,11 @@ fn apply_bitset_filter(
             }
         }
         DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "runtime bitset filter type mismatch for Int64".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                crate::exec::runtime_filter::failure::contract(
+                    "runtime bitset filter type mismatch for Int64",
+                )
+            })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -708,7 +772,11 @@ fn apply_bitset_filter(
             let arr = array
                 .as_any()
                 .downcast_ref::<Date32Array>()
-                .ok_or_else(|| "runtime bitset filter type mismatch for Date32".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bitset filter type mismatch for Date32",
+                    )
+                })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -724,7 +792,11 @@ fn apply_bitset_filter(
             let arr = array
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "runtime bitset filter type mismatch for Decimal128".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bitset filter type mismatch for Decimal128",
+                    )
+                })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -742,7 +814,9 @@ fn apply_bitset_filter(
                     .as_any()
                     .downcast_ref::<TimestampSecondArray>()
                     .ok_or_else(|| {
-                        "runtime bitset filter type mismatch for TimestampSecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bitset filter type mismatch for TimestampSecond",
+                        )
                     })?;
                 for (i, keep) in keep.iter_mut().enumerate().take(len) {
                     if !*keep {
@@ -761,7 +835,9 @@ fn apply_bitset_filter(
                     .as_any()
                     .downcast_ref::<TimestampMillisecondArray>()
                     .ok_or_else(|| {
-                        "runtime bitset filter type mismatch for TimestampMillisecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bitset filter type mismatch for TimestampMillisecond",
+                        )
                     })?;
                 for (i, keep) in keep.iter_mut().enumerate().take(len) {
                     if !*keep {
@@ -780,7 +856,9 @@ fn apply_bitset_filter(
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .ok_or_else(|| {
-                        "runtime bitset filter type mismatch for TimestampMicrosecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bitset filter type mismatch for TimestampMicrosecond",
+                        )
                     })?;
                 for (i, keep) in keep.iter_mut().enumerate().take(len) {
                     if !*keep {
@@ -798,7 +876,9 @@ fn apply_bitset_filter(
                     .as_any()
                     .downcast_ref::<TimestampNanosecondArray>()
                     .ok_or_else(|| {
-                        "runtime bitset filter type mismatch for TimestampNanosecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bitset filter type mismatch for TimestampNanosecond",
+                        )
                     })?;
                 for (i, keep) in keep.iter_mut().enumerate().take(len) {
                     if !*keep {
@@ -814,9 +894,8 @@ fn apply_bitset_filter(
             }
         },
         _ => {
-            return Err(format!(
-                "unsupported runtime bitset filter type: {:?}",
-                ltype
+            return Err(crate::exec::runtime_filter::failure::contract(
+                format_args!("unsupported runtime bitset filter type: {:?}", ltype),
             ));
         }
     }

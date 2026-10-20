@@ -39,7 +39,11 @@ fn chunk(columns: Vec<ArrayRef>) -> Chunk {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     Chunk::new_with_chunk_schema(batch, schema)
 }
-fn eval(name: &'static str, columns: Vec<ArrayRef>, result: DataType) -> Result<ArrayRef, String> {
+fn eval(
+    name: &'static str,
+    columns: Vec<ArrayRef>,
+    result: DataType,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut arena = ExprArena::default();
     let args = columns
         .iter()
@@ -112,7 +116,7 @@ fn legacy_sec_to_time_baseline_saturated_extremes_sign_and_unit_boundaries() {
     assert_eq!(result.to_data(), StringArray::from(expected).to_data());
 }
 #[test]
-fn legacy_sec_to_time_baseline_nulls_empty_and_ignored_requested_carrier() {
+fn sec_to_time_null_empty_and_frozen_utf8_result_are_consistent() {
     for requested in [DataType::Utf8, DataType::Date32, DataType::Int64] {
         let result = eval(
             "sec_to_time",
@@ -121,13 +125,16 @@ fn legacy_sec_to_time_baseline_nulls_empty_and_ignored_requested_carrier() {
                 None,
                 Some(i64::MIN),
             ]))],
-            requested,
-        )
-        .unwrap();
-        assert_eq!(
-            result.to_data(),
-            StringArray::from(vec![Some("00:00:01"), None, Some("-839:59:59")]).to_data()
+            requested.clone(),
         );
+        if requested == DataType::Utf8 {
+            assert_eq!(
+                result.unwrap().to_data(),
+                StringArray::from(vec![Some("00:00:01"), None, Some("-839:59:59")]).to_data()
+            );
+        } else {
+            assert_frozen_calendar_contract(result.unwrap_err());
+        }
     }
     let result = eval(
         "sec_to_time",
@@ -147,10 +154,14 @@ fn legacy_sec_to_time_baseline_raw_wrong_carriers_fail_even_when_null() {
         Arc::new(Date32Array::from(vec![None])),
         Arc::new(StringArray::from(vec![Some("00:00:01")])),
     ] {
-        assert_eq!(
-            eval("sec_to_time", vec![array], DataType::Utf8).unwrap_err(),
-            "sec_to_time expects int"
-        );
+        let failure = eval("sec_to_time", vec![array], DataType::Utf8).unwrap_err();
+        let crate::runtime::fragment::ExecutionFailureCause::Kernel(
+            novarocks_functions::KernelFailure::InvalidProgram(detail),
+        ) = failure.cause()
+        else {
+            panic!("wrong carrier must remain an outer prepared contract failure: {failure:?}");
+        };
+        assert_eq!(detail.message(), "sec_to_time expects int");
     }
 }
 #[test]
@@ -186,5 +197,18 @@ fn legacy_sec_to_time_baseline_extra_child_is_ignored_and_missing_child_panics()
             &data
         )))
         .is_err()
+    );
+}
+
+fn assert_frozen_calendar_contract(failure: crate::runtime::fragment::ExecutionFailure) {
+    use novarocks_failure_contract::{
+        FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+    };
+    assert_eq!(
+        failure.failure_fact(),
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(274).unwrap())
+        )
     );
 }

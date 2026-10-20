@@ -33,11 +33,19 @@ pub enum RenderErrorKind {
     DepthLimit,
     ArithmeticOverflow,
     Cancelled,
+    InvalidValue,
+    InvalidUtf8,
+    InvalidJson,
+    InvalidVariant,
+    CursorInvariant,
+    WorkStackLimit,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RenderError {
     pub kind: RenderErrorKind,
     pub output_ordinal: Option<u32>,
+    /// Actual extent at the producer, in bytes/items/depth as named by kind.
+    pub required: Option<u64>,
 }
 impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -80,4 +88,63 @@ pub trait BoundedMysqlTextEncoder: Send {
     fn step(&mut self, output: &mut [u8]) -> Result<RenderTurn, RenderError>;
     fn cancel(&mut self);
     fn scratch_capacity_bytes(&self) -> usize;
+}
+
+impl novarocks_failure_contract::FailureProjection for RenderError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        let (class, code) = match self.kind {
+            RenderErrorKind::SchemaMismatch => (FailureClass::Invariant, 100),
+            RenderErrorKind::UnsupportedCarrier => (FailureClass::Invariant, 101),
+            RenderErrorKind::UnsupportedPresentation => (FailureClass::Data, 102),
+            RenderErrorKind::RowTooLarge => (FailureClass::Representation, 103),
+            RenderErrorKind::ElementLimit => (FailureClass::Resource, 104),
+            RenderErrorKind::DepthLimit => (FailureClass::Resource, 105),
+            RenderErrorKind::ArithmeticOverflow => (FailureClass::Resource, 106),
+            RenderErrorKind::Cancelled => (FailureClass::Control, 107),
+            RenderErrorKind::InvalidValue => (FailureClass::Data, 108),
+            RenderErrorKind::InvalidUtf8 => (FailureClass::Data, 109),
+            RenderErrorKind::InvalidJson => (FailureClass::Data, 110),
+            RenderErrorKind::InvalidVariant => (FailureClass::Data, 111),
+            RenderErrorKind::CursorInvariant => (FailureClass::Invariant, 112),
+            RenderErrorKind::WorkStackLimit => (FailureClass::Resource, 113),
+        };
+        let fact = FailureFact::new(
+            class,
+            FailureReason::new(domain::RESULT, std::num::NonZeroU16::new(code).unwrap()),
+        );
+        match self.kind {
+            RenderErrorKind::RowTooLarge => fact.with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::MinimumUnit,
+                layout: RepresentationLayout {
+                    domain: domain::RESULT,
+                    code: std::num::NonZeroU16::new(1001).unwrap(),
+                },
+                required: self.required,
+                extent_limit: Some(
+                    novarocks_result_contract::RootProfileV1::ROW_PAYLOAD_BYTES.into(),
+                ),
+                representable_prefix: None,
+            }),
+            RenderErrorKind::ElementLimit
+            | RenderErrorKind::DepthLimit
+            | RenderErrorKind::WorkStackLimit => fact.with_resource(ResourceFacts {
+                dimension: ResourceDimension::Items,
+                request_scope: Some(ResourceScope::Request),
+                constraint_scope: Some(ResourceScope::Request),
+                requested: self.required,
+                required_growth: None,
+                limit: Some(if self.kind == RenderErrorKind::ElementLimit {
+                    novarocks_result_contract::RootProfileV1::MAX_ELEMENTS_PER_ROW
+                } else if self.kind == RenderErrorKind::DepthLimit {
+                    novarocks_result_contract::RootProfileV1::MAX_DEPTH
+                } else {
+                    196
+                } as u64),
+                live: None,
+                committed: None,
+            }),
+            _ => fact,
+        }
+    }
 }

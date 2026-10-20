@@ -19,7 +19,7 @@ use super::common::{
     to_timestamp_value,
 };
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{Array, ArrayRef, Date32Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::{Local, NaiveDate, NaiveDateTime};
@@ -31,9 +31,18 @@ fn eval_to_date_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "to_date requires one argument",
+            )
+            .into(),
+        );
+    }
     let arr = arena.eval(args[0], chunk)?;
-    Ok((novarocks_functions::builtin::calendar_to_date::evaluate_legacy_to_date(&arr))?)
+    novarocks_functions::builtin::calendar_to_date::evaluate_legacy_to_date(&arr)
+        .map_err(Into::into)
 }
 
 #[inline]
@@ -43,11 +52,17 @@ fn eval_to_datetime_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     timezone_aware: bool,
-) -> Result<ArrayRef, __Eval::Error> {
-    let output_type = arena
-        .data_type(expr)
-        .cloned()
-        .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    if !(1..=2).contains(&args.len()) {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "timestamp conversion requires one or two arguments",
+            )
+            .into(),
+        );
+    }
+    let output_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+    super::common::require_frozen_type(arena.arena(), expr, &output_type)?;
 
     if args.len() == 1 {
         let arr = arena.eval(args[0], chunk)?;
@@ -59,12 +74,12 @@ fn eval_to_datetime_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 | DataType::FixedSizeBinary(16)
         ) {
             let rows = arr.len();
-            return Ok((novarocks_functions::builtin::calendar_extended_shared::evaluate_legacy_calendar(
+            return novarocks_functions::builtin::calendar_extended_shared::evaluate_legacy_calendar(
                 novarocks_functions::builtin::calendar_extended_shared::CalendarOperation::Timestamp,
                 &[arr],
                 &output_type,
                 rows,
-            ))?);
+            ).map_err(Into::into);
         }
 
         let values = extract_i64_array(&arr, "to_datetime")?;
@@ -82,7 +97,7 @@ fn eval_to_datetime_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 out.push(None);
                 continue;
             };
-            out.push(to_timestamp_value(dt, &output_type).ok());
+            out.push(to_timestamp_value(dt, TimeUnit::Microsecond).ok());
         }
         return Ok(Arc::new(TimestampMicrosecondArray::from(out)) as ArrayRef);
     }
@@ -112,7 +127,7 @@ fn eval_to_datetime_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             continue;
         };
 
-        out.push(to_timestamp_value(dt, &output_type).ok());
+        out.push(to_timestamp_value(dt, TimeUnit::Microsecond).ok());
     }
     Ok(Arc::new(TimestampMicrosecondArray::from(out)) as ArrayRef)
 }
@@ -148,11 +163,32 @@ pub enum TeraToken {
 }
 
 #[inline]
-fn invalid_tera_format_error(fmt: &str) -> String {
-    format!("The format parameter {} is invalid format", fmt)
+pub(super) fn invalid_date_format(fmt: &str) -> DateFormatFailure {
+    DateFormatFailure(
+        novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+            "The format parameter {fmt} is invalid format"
+        )),
+    )
 }
 
-pub fn compile_tera_format(fmt: &str) -> Result<Vec<TeraToken>, String> {
+/// Format grammar errors belong to this parser, independently of SQL transport.
+#[derive(Debug)]
+pub struct DateFormatFailure(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for DateFormatFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for DateFormatFailure {}
+impl novarocks_failure_contract::FailureProjection for DateFormatFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &novarocks_functions::DataFailureReason::InvalidValue,
+        )
+    }
+}
+
+pub fn compile_tera_format(fmt: &str) -> Result<Vec<TeraToken>, DateFormatFailure> {
     let bytes = fmt.as_bytes();
     let mut i = 0usize;
     let mut out = Vec::with_capacity(bytes.len());
@@ -211,7 +247,7 @@ pub fn compile_tera_format(fmt: &str) -> Result<Vec<TeraToken>, String> {
 
         let b = bytes[i];
         if b.is_ascii_alphabetic() {
-            return Err(invalid_tera_format_error(fmt));
+            return Err(invalid_date_format(fmt));
         }
         out.push(TeraToken::Literal(b));
         i += 1;
@@ -221,12 +257,12 @@ pub fn compile_tera_format(fmt: &str) -> Result<Vec<TeraToken>, String> {
         .iter()
         .any(|t| matches!(t, TeraToken::Year4 | TeraToken::Year2))
     {
-        return Err(invalid_tera_format_error(fmt));
+        return Err(invalid_date_format(fmt));
     }
     Ok(out)
 }
 
-fn compile_joda_format(fmt: &str) -> Result<Vec<TeraToken>, String> {
+fn compile_joda_format(fmt: &str) -> Result<Vec<TeraToken>, DateFormatFailure> {
     let bytes = fmt.as_bytes();
     let mut i = 0usize;
     let mut out = Vec::with_capacity(bytes.len());
@@ -275,7 +311,7 @@ fn compile_joda_format(fmt: &str) -> Result<Vec<TeraToken>, String> {
 
         let b = bytes[i];
         if b.is_ascii_alphabetic() {
-            return Err(invalid_tera_format_error(fmt));
+            return Err(invalid_date_format(fmt));
         }
         out.push(TeraToken::Literal(b));
         i += 1;
@@ -285,7 +321,7 @@ fn compile_joda_format(fmt: &str) -> Result<Vec<TeraToken>, String> {
         .iter()
         .any(|t| matches!(t, TeraToken::Year4 | TeraToken::Year2))
     {
-        return Err(invalid_tera_format_error(fmt));
+        return Err(invalid_date_format(fmt));
     }
     Ok(out)
 }
@@ -471,30 +507,41 @@ pub fn parse_tera_datetime(input: &str, tokens: &[TeraToken]) -> Option<NaiveDat
 
 pub fn eval_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_to_date_inner(arena, args, chunk))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &DataType::Date32)?;
+    eval_to_date_inner(arena, args, chunk)
 }
 
 pub fn eval_to_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_to_date_inner(arena, args, chunk))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &DataType::Date32)?;
+    eval_to_date_inner(arena, args, chunk)
 }
 
 pub fn eval_to_tera_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &DataType::Date32)?;
+    if !(1..=2).contains(&args.len()) {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "to_tera_date requires one or two arguments",
+            )
+            .into(),
+        );
+    }
     if args.len() == 1 {
-        return Ok((eval_to_date_inner(arena, args, chunk))?);
+        return eval_to_date_inner(arena, args, chunk);
     }
 
     let value_arr = arena.eval(args[0], chunk)?;
@@ -502,7 +549,11 @@ pub fn eval_to_tera_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let fmt_arr = fmt_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "to_tera_date expects string format".to_string())?;
+        .ok_or_else(|| {
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "to_tera_date expects string format",
+            )
+        })?;
     let mut fmt_cache: HashMap<String, Vec<TeraToken>> = HashMap::new();
 
     let out = if let Some(values) = value_arr.as_any().downcast_ref::<StringArray>() {
@@ -514,7 +565,11 @@ pub fn eval_to_tera_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             }
             let fmt = fmt_arr.value(i);
             if !fmt_cache.contains_key(fmt) {
-                fmt_cache.insert(fmt.to_string(), compile_tera_format(fmt)?);
+                fmt_cache.insert(
+                    fmt.to_string(),
+                    compile_tera_format(fmt)
+                        .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?,
+                );
             }
             let tokens = fmt_cache
                 .get(fmt)
@@ -539,7 +594,11 @@ pub fn eval_to_tera_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             }
             let fmt = fmt_arr.value(i);
             if !fmt_cache.contains_key(fmt) {
-                fmt_cache.insert(fmt.to_string(), compile_tera_format(fmt)?);
+                fmt_cache.insert(
+                    fmt.to_string(),
+                    compile_tera_format(fmt)
+                        .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?,
+                );
             }
             out.push((*date).map(naive_to_date32));
         }
@@ -553,15 +612,15 @@ pub fn eval_to_tera_timestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_timestamp_with_custom_format(
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_timestamp_with_custom_format(
         arena,
         expr,
         args,
         chunk,
         "to_tera_timestamp expects string format",
         compile_tera_format,
-    ))?)
+    )
 }
 
 pub fn eval_str_to_jodatime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -569,15 +628,15 @@ pub fn eval_str_to_jodatime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_timestamp_with_custom_format(
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_timestamp_with_custom_format(
         arena,
         expr,
         args,
         chunk,
         "str_to_jodatime expects string format",
         compile_joda_format,
-    ))?)
+    )
 }
 
 fn eval_timestamp_with_custom_format<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -586,10 +645,23 @@ fn eval_timestamp_with_custom_format<__Eval: crate::exec::expr::ExprEvaluation +
     args: &[ExprId],
     chunk: &Chunk,
     fmt_error: &'static str,
-    compile_fn: fn(&str) -> Result<Vec<TeraToken>, String>,
-) -> Result<ArrayRef, __Eval::Error> {
+    compile_fn: fn(&str) -> Result<Vec<TeraToken>, DateFormatFailure>,
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    if !(1..=2).contains(&args.len()) {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "custom timestamp conversion requires one or two arguments",
+            )
+            .into(),
+        );
+    }
+    super::common::require_frozen_type(
+        arena.arena(),
+        expr,
+        &DataType::Timestamp(TimeUnit::Microsecond, None),
+    )?;
     if args.len() == 1 {
-        return Ok((eval_to_datetime_inner(arena, expr, args, chunk, true))?);
+        return eval_to_datetime_inner(arena, expr, args, chunk, true);
     }
 
     let value_arr = arena.eval(args[0], chunk)?;
@@ -597,11 +669,9 @@ fn eval_timestamp_with_custom_format<__Eval: crate::exec::expr::ExprEvaluation +
     let fmt_arr = fmt_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| fmt_error.to_string())?;
-    let output_type = arena
-        .data_type(expr)
-        .cloned()
-        .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
+        .ok_or_else(|| {
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(fmt_error)
+        })?;
     let mut fmt_cache: HashMap<String, Vec<TeraToken>> = HashMap::new();
 
     let out = if let Some(values) = value_arr.as_any().downcast_ref::<StringArray>() {
@@ -613,7 +683,11 @@ fn eval_timestamp_with_custom_format<__Eval: crate::exec::expr::ExprEvaluation +
             }
             let fmt = fmt_arr.value(i);
             if !fmt_cache.contains_key(fmt) {
-                fmt_cache.insert(fmt.to_string(), compile_fn(fmt)?);
+                fmt_cache.insert(
+                    fmt.to_string(),
+                    compile_fn(fmt)
+                        .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?,
+                );
             }
             let parsed = parse_tera_datetime(
                 values.value(i),
@@ -621,7 +695,7 @@ fn eval_timestamp_with_custom_format<__Eval: crate::exec::expr::ExprEvaluation +
                     .get(fmt)
                     .expect("format cache must contain validated format"),
             );
-            let ts = parsed.and_then(|dt| to_timestamp_value(dt, &output_type).ok());
+            let ts = parsed.and_then(|dt| to_timestamp_value(dt, TimeUnit::Microsecond).ok());
             out.push(ts);
         }
         out
@@ -635,9 +709,13 @@ fn eval_timestamp_with_custom_format<__Eval: crate::exec::expr::ExprEvaluation +
             }
             let fmt = fmt_arr.value(i);
             if !fmt_cache.contains_key(fmt) {
-                fmt_cache.insert(fmt.to_string(), compile_fn(fmt)?);
+                fmt_cache.insert(
+                    fmt.to_string(),
+                    compile_fn(fmt)
+                        .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?,
+                );
             }
-            let ts = (*dt).and_then(|dt| to_timestamp_value(dt, &output_type).ok());
+            let ts = (*dt).and_then(|dt| to_timestamp_value(dt, TimeUnit::Microsecond).ok());
             out.push(ts);
         }
         out
@@ -650,8 +728,8 @@ pub fn eval_to_datetime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_to_datetime_inner(arena, expr, args, chunk, true))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_to_datetime_inner(arena, expr, args, chunk, true)
 }
 
 pub fn eval_to_datetime_ntz<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -659,14 +737,20 @@ pub fn eval_to_datetime_ntz<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     use novarocks_functions::builtin::calendar_extended_shared::{
         CalendarOperation, evaluate_legacy_calendar,
     };
-    let output_type = arena
-        .data_type(expr)
-        .cloned()
-        .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
+    if !(1..=2).contains(&args.len()) {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "timestamp conversion requires one or two arguments",
+            )
+            .into(),
+        );
+    }
+    let output_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+    super::common::require_frozen_type(arena.arena(), expr, &output_type)?;
     let source = arena.eval(args[0], chunk)?;
     if args.len() == 1
         && matches!(
@@ -678,23 +762,25 @@ pub fn eval_to_datetime_ntz<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         )
     {
         let rows = source.len();
-        return Ok((evaluate_legacy_calendar(
+        return evaluate_legacy_calendar(
             CalendarOperation::Timestamp,
             &[source],
             &output_type,
             rows,
-        ))?);
+        )
+        .map_err(Into::into);
     }
     if args.len() == 1 {
         let values = extract_i64_array(&source, "to_datetime")?;
         let rows = values.len();
         let source: ArrayRef = Arc::new(arrow::array::Int64Array::from(values));
-        return Ok((evaluate_legacy_calendar(
+        return evaluate_legacy_calendar(
             CalendarOperation::EpochNtz,
             &[source],
             &output_type,
             rows,
-        ))?);
+        )
+        .map_err(Into::into);
     }
     let scale = arena.eval(args[1], chunk)?;
     let values = extract_i64_array(&source, "to_datetime")?;
@@ -702,12 +788,13 @@ pub fn eval_to_datetime_ntz<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let rows = values.len();
     let source: ArrayRef = Arc::new(arrow::array::Int64Array::from(values));
     let scale: ArrayRef = Arc::new(arrow::array::Int64Array::from(scales));
-    Ok((evaluate_legacy_calendar(
+    evaluate_legacy_calendar(
         CalendarOperation::EpochNtz,
         &[source, scale],
         &output_type,
         rows,
-    ))?)
+    )
+    .map_err(Into::into)
 }
 
 pub fn eval_timestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -715,6 +802,6 @@ pub fn eval_timestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_to_datetime_inner(arena, expr, args, chunk, true))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_to_datetime_inner(arena, expr, args, chunk, true)
 }

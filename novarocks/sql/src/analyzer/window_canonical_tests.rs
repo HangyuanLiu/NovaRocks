@@ -367,7 +367,7 @@ impl PureCompileControl for Trace {
         let mut calls = self.calls.lock().unwrap();
         let at = calls.len();
         calls.push((phase, units));
-        if let Some((index, cause)) = self.refusal
+        if let Some((index, cause)) = self.refusal.clone()
             && at == index
         {
             return Err(cause);
@@ -466,7 +466,7 @@ fn window_canonical_sole_helper_keeps_success_and_ordinary_control_prefixes() {
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Trace {
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     ..Trace::default()
                 };
                 let error = bind(
@@ -484,7 +484,7 @@ fn window_canonical_sole_helper_keeps_success_and_ordinary_control_prefixes() {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum WindowFault {
     Control(usize, CompileControlError),
     StaleRebound,
@@ -541,7 +541,7 @@ impl SqlFunctionCatalog for FaultCatalog {
         control: &dyn PureCompileControl,
     ) -> Result<ResolvedFunctionBinding, FunctionBindingError> {
         let at = self.windows.fetch_add(1, Ordering::SeqCst);
-        if let WindowFault::Control(index, cause) = self.fault
+        if let WindowFault::Control(index, cause) = self.fault.clone()
             && at == index
         {
             // A retry delegates successfully, exposing a swallowed refusal.
@@ -614,7 +614,7 @@ fn window_canonical_exact_rebind_and_catalog_first_control_cause_never_retry() {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let functions = FaultCatalog::new(WindowFault::Control(at, cause));
+            let functions = FaultCatalog::new(WindowFault::Control(at, cause.clone()));
             let error = analyze(
                 "SELECT lead(v,off64) OVER () FROM source",
                 &SourceCatalog {
@@ -802,7 +802,7 @@ fn window_wide_rebound_gate_observes_original_nested_source_and_terminal_control
                 CompileControlError::ResourceExhausted,
             ] {
                 let refused = Trace {
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     ..Trace::default()
                 };
                 let error = bind(

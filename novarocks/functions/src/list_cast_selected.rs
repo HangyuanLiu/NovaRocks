@@ -55,11 +55,7 @@ pub(crate) fn profile(source: &FunctionValueType, result: &FunctionValueType) ->
         )
 }
 fn copy_error(error: CopyError) -> KernelFailure {
-    match error {
-        CopyError::Control(cause) => cause,
-        CopyError::Extent => KernelFailure::ResourceExhausted,
-        other => internal(&format!("selected List CAST copy: {other}")),
-    }
+    error.into_kernel()
 }
 fn reserve<T>(
     len: usize,
@@ -201,9 +197,7 @@ pub(crate) fn evaluate<'a>(
             )
             .map_err(|cause| match cause {
                 ListCastError::Host(cause) => cause,
-                ListCastError::Data(message) => internal(&format!(
-                    "prepared List CAST violated its checked carrier: {message}"
-                )),
+                ListCastError::Domain(cause) => KernelFailure::from_domain(cause),
             })?;
         let mut errors = reserve::<RowDataError>(inherited.len(), &work)?;
         for error in inherited {

@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::construction_failure::{
+    ChunkConstructionFailure, ChunkObservationFailure, ChunkViolation,
+};
+use novarocks_functions::array_projection::{ArrayProjectionFailure, ArrayProjectionOperation};
 use std::sync::Arc;
 
 use arrow::array::ArrayRef;
@@ -65,14 +69,14 @@ pub fn dictionary_hydration_required_observed<E, K, W>(
     mut work: W,
 ) -> Result<bool, E>
 where
-    E: From<String>,
+    E: From<ChunkConstructionFailure>,
     K: FnMut(SlotId, usize, &[ArrayPathStep], &DataType) -> bool,
     W: FnMut(usize, &[ArrayPathStep], &DataType) -> Result<(), E>,
 {
     if !chunk.chunk_schema().is_typed() {
-        return Err(E::from(
-            "typed hydration demand requires explicit value bindings".into(),
-        ));
+        return Err(E::from(ChunkConstructionFailure::source(
+            ChunkViolation::HydrationBinding,
+        )));
     }
     for (index, (slot, array)) in chunk
         .chunk_schema()
@@ -106,18 +110,25 @@ fn dictionary_demand<E, K, W>(
     nodes: &mut usize,
 ) -> Result<bool, E>
 where
-    E: From<String>,
+    E: From<ChunkConstructionFailure>,
     K: FnMut(SlotId, usize, &[ArrayPathStep], &DataType) -> bool,
     W: FnMut(usize, &[ArrayPathStep], &DataType) -> Result<(), E>,
 {
     work(occurrence, path, source)?;
-    *nodes = nodes
-        .checked_add(1)
-        .ok_or_else(|| E::from("hydration demand node count overflow".into()))?;
-    if *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES
-        || path.len() >= novarocks_type_contract::MAX_VALUE_TYPE_DEPTH
-    {
-        return Err(E::from("hydration demand exceeds the value profile".into()));
+    *nodes = nodes.checked_add(1).ok_or_else(|| {
+        E::from(ChunkConstructionFailure::from(
+            novarocks_type_contract::ValueTypeError::TooManyNodes,
+        ))
+    })?;
+    if *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
+        return Err(E::from(ChunkConstructionFailure::from(
+            novarocks_type_contract::ValueTypeError::TooManyNodes,
+        )));
+    }
+    if path.len() >= novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+        return Err(E::from(ChunkConstructionFailure::from(
+            novarocks_type_contract::ValueTypeError::TooDeep,
+        )));
     }
     if matches!(source, DataType::Dictionary(_, _)) && !keep(slot, occurrence, path, source) {
         return Ok(true);
@@ -153,14 +164,14 @@ where
         }
         DataType::Map(entries, _) => {
             let DataType::Struct(fields) = entries.data_type() else {
-                return Err(E::from(
-                    "hydration demand Map entries are not a Struct".into(),
-                ));
+                return Err(E::from(ChunkConstructionFailure::source(
+                    ChunkViolation::HydrationMapEntries,
+                )));
             };
             if fields.len() != 2 {
-                return Err(E::from(
-                    "hydration demand Map entries have invalid arity".into(),
-                ));
+                return Err(E::from(ChunkConstructionFailure::source(
+                    ChunkViolation::HydrationMapArity,
+                )));
             }
             Ok(child(fields[0].data_type(), ArrayPathStep::MapKey)?
                 || child(fields[1].data_type(), ArrayPathStep::MapValue)?)
@@ -188,7 +199,7 @@ pub fn hydrate_dictionary_columns_observed<E, K, F>(
     observe: F,
 ) -> Result<Chunk, E>
 where
-    E: From<String>,
+    E: From<ChunkConstructionFailure>,
     K: FnMut(SlotId, usize, &[ArrayPathStep], &DataType) -> bool,
     F: for<'a> FnMut(usize, &[ArrayPathStep], ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
@@ -208,15 +219,15 @@ pub fn hydrate_dictionary_columns_owned_observed<E, K, F, R>(
     mut request: R,
 ) -> Result<Chunk, E>
 where
-    E: From<String>,
+    E: From<ChunkConstructionFailure>,
     K: FnMut(SlotId, usize, &[ArrayPathStep], &DataType) -> bool,
     F: for<'a> FnMut(usize, &[ArrayPathStep], ArrayNormalizationStep<'a>) -> Result<(), E>,
     R: FnMut(std::alloc::Layout) -> Result<(), E>,
 {
     if !chunk.chunk_schema().is_typed() {
-        return Err(E::from(
-            "observed typed hydration requires an explicit typed chunk".into(),
-        ));
+        return Err(E::from(ChunkConstructionFailure::source(
+            ChunkViolation::HydrationBinding,
+        )));
     }
     if !dictionary_hydration_required_observed(chunk, &mut keep_encoded, |index, path, source| {
         observe(index, path, ArrayNormalizationStep::InspectType(source))
@@ -238,15 +249,21 @@ where
     let channels = chunk.columns().len();
     if channels != 0 {
         request(
-            std::alloc::Layout::array::<ArrayRef>(channels)
-                .map_err(|_| E::from("hydration column scaffold request overflow".into()))?,
+            std::alloc::Layout::array::<ArrayRef>(channels).map_err(|source| {
+                E::from(ChunkConstructionFailure::array_request::<ArrayRef>(
+                    channels, source,
+                ))
+            })?,
         )?;
     }
     let mut columns = Vec::with_capacity(chunk.columns().len());
     if channels != 0 {
         request(
-            std::alloc::Layout::array::<ChunkSlotSchema>(channels)
-                .map_err(|_| E::from("hydration slot scaffold request overflow".into()))?,
+            std::alloc::Layout::array::<ChunkSlotSchema>(channels).map_err(|source| {
+                E::from(ChunkConstructionFailure::array_request::<ChunkSlotSchema>(
+                    channels, source,
+                ))
+            })?,
         )?;
     }
     let mut slots = Vec::with_capacity(chunk.columns().len());
@@ -272,8 +289,9 @@ where
         }
         changed = true;
         let field = rebuild_field(slot.field(), target.as_ref(), slot.name(), &mut |step| {
-            observe(index, &[], step)
-        })?;
+            observe(index, &[], step).map_err(ChunkObservationFailure::Caller)
+        })
+        .map_err(ChunkObservationFailure::into_caller)?;
         let slot = slot
             .with_field_typed(field, storage.clone())
             .map_err(E::from)?;
@@ -287,7 +305,7 @@ where
                     | ArrayNormalizationStep::ValidateStringWrapper { path, .. } => path,
                     _ => &[],
                 };
-                observe(index, path, step)
+                observe(index, path, step).map_err(ChunkObservationFailure::Caller)
             },
             true,
             &mut |source, path, decoded, observe| {
@@ -302,7 +320,8 @@ where
                     observe,
                 )
             },
-        )?;
+        )
+        .map_err(ChunkObservationFailure::into_caller)?;
         columns.push(column);
         slots.push(slot);
     }
@@ -339,7 +358,7 @@ fn hydration_target<'a, E, K, F>(
     observe: &mut F,
 ) -> Result<Cow<'a, DataType>, E>
 where
-    E: From<String>,
+    E: From<ChunkConstructionFailure>,
     K: FnMut(SlotId, usize, &[ArrayPathStep], &DataType) -> bool,
     F: for<'b> FnMut(usize, &[ArrayPathStep], ArrayNormalizationStep<'b>) -> Result<(), E>,
 {
@@ -352,9 +371,9 @@ where
         return Ok(Cow::Borrowed(source));
     }
     if path.len() >= novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(E::from(
-            "dictionary hydration exceeds its structural path profile".into(),
-        ));
+        return Err(E::from(ChunkConstructionFailure::from(
+            novarocks_type_contract::ValueTypeError::TooDeep,
+        )));
     }
     let mut next = [ArrayPathStep::ListItem; novarocks_type_contract::MAX_VALUE_TYPE_DEPTH];
     next[..path.len()].copy_from_slice(path);
@@ -403,8 +422,9 @@ where
             return Ok(field.clone());
         }
         rebuild_field(field, target.as_ref(), field.name(), &mut |step| {
-            observe(occurrence, child_path, step)
+            observe(occurrence, child_path, step).map_err(ChunkObservationFailure::Caller)
         })
+        .map_err(ChunkObservationFailure::into_caller)
     };
     let target = match source {
         DataType::List(field) => DataType::List(field_target(field, ArrayPathStep::ListItem)?),
@@ -430,14 +450,14 @@ where
         ),
         DataType::Map(entries, ordered) => {
             let DataType::Struct(fields) = entries.data_type() else {
-                return Err(E::from(
-                    "dictionary hydration Map entries are not a Struct".into(),
-                ));
+                return Err(E::from(ChunkConstructionFailure::source(
+                    ChunkViolation::HydrationMapEntries,
+                )));
             };
             if fields.len() != 2 {
-                return Err(E::from(
-                    "dictionary hydration Map entries have invalid arity".into(),
-                ));
+                return Err(E::from(ChunkConstructionFailure::source(
+                    ChunkViolation::HydrationMapArity,
+                )));
             }
             let target = DataType::Struct(
                 vec![
@@ -447,8 +467,9 @@ where
                 .into(),
             );
             let entries = rebuild_field(entries, &target, entries.name(), &mut |step| {
-                observe(occurrence, path, step)
-            })?;
+                observe(occurrence, path, step).map_err(ChunkObservationFailure::Caller)
+            })
+            .map_err(ChunkObservationFailure::into_caller)?;
             DataType::Map(entries, *ordered)
         }
         DataType::Union(fields, mode) => DataType::Union(
@@ -459,7 +480,14 @@ where
                     .map(|(id, field)| field_target(field, ArrayPathStep::UnionField(id)))
                     .collect::<Result<Vec<_>, _>>()?,
             )
-            .map_err(|error| E::from(format!("dictionary hydration Union fields: {error}")))?,
+            .map_err(|error| {
+                E::from(ChunkConstructionFailure::from(
+                    ArrayProjectionFailure::Arrow {
+                        operation: ArrayProjectionOperation::RebuildUnionFields,
+                        source: error,
+                    },
+                ))
+            })?,
             *mode,
         ),
         DataType::RunEndEncoded(ends, values) => DataType::RunEndEncoded(
@@ -467,9 +495,9 @@ where
             field_target(values, ArrayPathStep::RunEndValue)?,
         ),
         _ => {
-            return Err(E::from(
-                "dictionary hydration encountered an invalid container".into(),
-            ));
+            return Err(E::from(ChunkConstructionFailure::source(
+                ChunkViolation::HydrationContainer,
+            )));
         }
     };
     if &target == source {
@@ -483,24 +511,21 @@ where
     dead_code,
     reason = "Retained as a focused invariant helper for dictionary hydration callers."
 )]
-pub(crate) fn assert_no_dictionary(batch: &RecordBatch) -> Result<(), String> {
-    for (idx, field) in batch.schema().fields().iter().enumerate() {
-        if contains_dictionary(field.data_type()) {
-            return Err(format!(
-                "dictionary column must be hydrated before flat boundary: column {} field {} has type {:?}",
-                idx,
-                field.name(),
-                field.data_type()
-            ));
-        }
-        if let Some(column) = batch.columns().get(idx)
-            && contains_dictionary(column.data_type())
+pub(crate) fn assert_no_dictionary(batch: &RecordBatch) -> Result<(), ChunkConstructionFailure> {
+    for (index, field) in batch.schema().fields().iter().enumerate() {
+        if contains_dictionary(field.data_type())
+            || batch
+                .columns()
+                .get(index)
+                .is_some_and(|column| contains_dictionary(column.data_type()))
         {
-            return Err(format!(
-                "dictionary column must be hydrated before flat boundary: column {} field {} has array type {:?}",
-                idx,
-                field.name(),
-                column.data_type()
+            return Err(ChunkConstructionFailure::source(
+                ChunkViolation::FlatDictionary {
+                    column: index,
+                    field: novarocks_failure_contract::BoundedDetail::truncating_display(
+                        field.name(),
+                    ),
+                },
             ));
         }
     }
@@ -512,19 +537,19 @@ pub(crate) fn assert_no_dictionary(batch: &RecordBatch) -> Result<(), String> {
     dead_code,
     reason = "Retained for connector paths that require explicit dictionary hydration."
 )]
-pub(crate) fn hydrate_dictionary_columns(chunk: &Chunk) -> Result<Chunk, String> {
+pub(crate) fn hydrate_dictionary_columns(chunk: &Chunk) -> Result<Chunk, ChunkConstructionFailure> {
     hydrate_dictionary_columns_except(chunk, |_, _| false)
 }
 
 pub fn hydrate_dictionary_columns_except(
     chunk: &Chunk,
     keep_encoded: impl Fn(SlotId, &DataType) -> bool,
-) -> Result<Chunk, String> {
+) -> Result<Chunk, ChunkConstructionFailure> {
     let mut changed = false;
     let mut columns = Vec::with_capacity(chunk.columns().len());
     let mut slots = Vec::with_capacity(chunk.chunk_schema().slots().len());
 
-    for (idx, ((column, field), slot)) in chunk
+    for (_idx, ((column, field), slot)) in chunk
         .columns()
         .iter()
         .zip(chunk.schema().fields().iter())
@@ -538,11 +563,11 @@ pub fn hydrate_dictionary_columns_except(
                 let value_type = value_type.as_ref().clone();
                 let flat_slot =
                     slot.with_type_and_nullable(value_type.clone(), field.is_nullable())?;
-                let flat = cast(column.as_ref(), &value_type).map_err(|e| {
-                    format!(
-                        "hydrate dictionary chunk column {} to value type {:?} failed: {e}",
-                        idx, value_type
-                    )
+                let flat = cast(column.as_ref(), &value_type).map_err(|source| {
+                    ChunkConstructionFailure::from(ArrayProjectionFailure::Arrow {
+                        operation: ArrayProjectionOperation::DecodeDictionary,
+                        source,
+                    })
                 })?;
                 columns.push(flat);
                 slots.push(flat_slot);
@@ -572,8 +597,12 @@ pub fn hydrate_dictionary_columns_except(
             ChunkSchema::try_new_with_schema_metadata(slots, actual_schema.metadata().clone())?
         },
     );
-    let batch = RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns)
-        .map_err(|e| format!("build hydrated chunk record batch failed: {e}"))?;
+    let batch =
+        RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns).map_err(|source| {
+            ChunkConstructionFailure::source(super::construction_failure::ChunkRecordBatchFailure(
+                source,
+            ))
+        })?;
     Chunk::try_new_with_chunk_schema(batch, chunk_schema)
 }
 
@@ -1046,9 +1075,12 @@ mod tests {
 
         let err = assert_no_dictionary(&batch).expect_err("dictionary batch should fail");
 
-        assert!(err.contains("status"), "error should identify field: {err}");
         assert!(
-            err.contains("Dictionary"),
+            err.to_string().contains("status"),
+            "error should identify field: {err}"
+        );
+        assert!(
+            err.to_string().contains("Dictionary"),
             "error should identify dictionary type: {err}"
         );
     }
@@ -1133,7 +1165,7 @@ mod typed_tests {
             array,
         );
         let mut decoded = Vec::new();
-        let flat = hydrate_dictionary_columns_observed::<String, _, _>(
+        let flat = hydrate_dictionary_columns_observed::<ChunkConstructionFailure, _, _>(
             &source,
             storage.clone(),
             |slot, occurrence, path, _| {
@@ -1169,7 +1201,7 @@ mod typed_tests {
         assert_eq!(json.value(0), "{}");
         assert!(json.is_null(1));
         assert!(assert_no_dictionary(source.record_batch()).is_err());
-        let preserved = hydrate_dictionary_columns_observed::<String, _, _>(
+        let preserved = hydrate_dictionary_columns_observed::<ChunkConstructionFailure, _, _>(
             &source,
             storage,
             |_, _, path, _| path == [ArrayPathStep::StructField(0)],
@@ -1249,7 +1281,7 @@ mod typed_tests {
             array,
         );
         source.attach_connector_output_memory(token).unwrap();
-        let flat = hydrate_dictionary_columns_observed::<String, _, _>(
+        let flat = hydrate_dictionary_columns_observed::<ChunkConstructionFailure, _, _>(
             &source,
             ValueTypeStorageLifetime::pure(),
             |_, _, _, _| false,
@@ -1258,7 +1290,12 @@ mod typed_tests {
         .unwrap();
         let clone = flat.clone();
         let slice = flat
-            .slice_typed_observed::<String, _>(1, 1, ValueTypeStorageLifetime::pure(), |_| Ok(()))
+            .slice_typed_observed::<crate::runtime::fragment::ExecutionFailure, _>(
+                1,
+                1,
+                ValueTypeStorageLifetime::pure(),
+                |_| Ok(()),
+            )
             .unwrap();
         drop(source);
         drop(flat);
@@ -1282,7 +1319,7 @@ mod typed_tests {
             DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0, 1, 0]), inner).unwrap();
         let key_pointer = outer.keys().values().as_ptr();
         let source: ArrayRef = Arc::new(outer);
-        let target = hydration_target::<String, _, _>(
+        let target = hydration_target::<ChunkConstructionFailure, _, _>(
             source.data_type(),
             SlotId::new(4),
             0,
@@ -1292,7 +1329,7 @@ mod typed_tests {
         )
         .unwrap();
         let mut paths = Vec::new();
-        let result = rebuild_array_mode::<String, _>(
+        let result = rebuild_array_mode::<ChunkConstructionFailure, _>(
             &source,
             target.as_ref(),
             &mut |step| {
@@ -1312,12 +1349,13 @@ mod typed_tests {
         assert_eq!(array.keys().values().as_ptr(), key_pointer);
         assert_eq!(array.values().data_type(), &DataType::Utf8);
         let plain = DataType::Utf8;
-        let error = rebuild_array_mode::<String, _>(
+        let refusal = ChunkConstructionFailure::source(ChunkViolation::HydrationContainer);
+        let error = rebuild_array_mode::<ChunkConstructionFailure, _>(
             &source,
             &plain,
             &mut |step| {
                 if matches!(step, ArrayNormalizationStep::DecodeDictionary { .. }) {
-                    Err("decode refused".into())
+                    Err(refusal.clone())
                 } else {
                     Ok(())
                 }
@@ -1325,7 +1363,7 @@ mod typed_tests {
             true,
         )
         .unwrap_err();
-        assert_eq!(error, "decode refused");
+        assert_eq!(error, refusal);
         assert!(
             matches!(source.data_type(), DataType::Dictionary(_, values) if matches!(values.as_ref(), DataType::Dictionary(_, _)))
         );

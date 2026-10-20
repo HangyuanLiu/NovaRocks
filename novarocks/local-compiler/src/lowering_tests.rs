@@ -619,7 +619,7 @@ impl PureCompileControl for RefusingControl {
         };
         if stop {
             *refused = true;
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -638,7 +638,7 @@ fn actual_fragment_lowering_entry_control_is_typed_without_retry() {
     let functions = rng_subset();
     let source = package(&functions, 2);
     for cause in causes() {
-        let control = RefusingControl::new(cause, Stop::Entry);
+        let control = RefusingControl::new(cause.clone(), Stop::Entry);
         let result = compile_fragment(providers(source.clone()), &functions, options(1), &control);
         assert!(matches!(result, Err(FragmentCompileError::Control(actual)) if actual == cause));
         assert_eq!(
@@ -653,7 +653,7 @@ fn wide_actual_rand_project_observes_interior_quantum_and_returns_no_partial_pro
     let functions = rng_subset();
     let source = package(&functions, 320);
     for cause in causes() {
-        let control = RefusingControl::new(cause, Stop::Quantum);
+        let control = RefusingControl::new(cause.clone(), Stop::Quantum);
         let result = compile_fragment(providers(source.clone()), &functions, options(1), &control);
         assert!(matches!(result, Err(FragmentCompileError::Control(actual)) if actual == cause));
         let trace = control.trace.lock().unwrap();
@@ -678,7 +678,7 @@ fn physical_dop_domain_refusal_observes_ordinary_error_tail() {
         ))
     ));
     for cause in causes() {
-        let control = RefusingControl::new(cause, Stop::Positive);
+        let control = RefusingControl::new(cause.clone(), Stop::Positive);
         let result = compile_fragment(providers(source.clone()), &functions, options(2), &control);
         assert!(matches!(result, Err(FragmentCompileError::Control(actual)) if actual == cause));
         assert_eq!(control.trace.lock().unwrap().last().unwrap().1, 1);
@@ -780,7 +780,7 @@ fn every_actual_small_fragment_callback_preserves_primary_control_and_exact_pref
     assert!(successful.iter().any(|(_, units)| *units > 0));
     for index in 1..=successful.len() {
         for cause in causes() {
-            let control = RefusingControl::new(cause, Stop::Call(index));
+            let control = RefusingControl::new(cause.clone(), Stop::Call(index));
             let result =
                 compile_fragment(providers(source.clone()), &functions, options(1), &control);
             assert!(

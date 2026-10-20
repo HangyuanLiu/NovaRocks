@@ -225,7 +225,7 @@ fn lower_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCreationFa
         ExpressionsCompileError::Control(cause) => FragmentCompileError::Control(cause),
         error => FragmentCompileError::Owner {
             phase: "sink expressions",
-            error: Box::new(error),
+            error: novarocks_failure_contract::SharedFailureCause::new(error),
         },
     })?;
     let arena = Arc::new(arena);
@@ -451,6 +451,6 @@ fn partition_flow<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
 fn sink_error(error: novarocks_local_program::StaticSinkError) -> FragmentCompileError {
     FragmentCompileError::Owner {
         phase: "stream sink",
-        error: Box::new(error),
+        error: novarocks_failure_contract::SharedFailureCause::new(error),
     }
 }

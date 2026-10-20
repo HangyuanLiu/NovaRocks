@@ -22,7 +22,7 @@
 use super::aggregate_n_core::NCodecResources;
 use crate::KernelFailure;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
-use crate::aggregate_scalar::{ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::ScalarWork;
 use crate::kernel_control::{internal, invalid};
 use crate::opaque_memory::{OpaqueReservation, OpaqueRetainedCharge};
 
@@ -71,13 +71,7 @@ impl BoundNCodecResources<'_> {
     }
 }
 fn flush(work: &mut ScalarWork<'_, '_>) -> Result<(), KernelFailure> {
-    match work.flush() {
-        Ok(()) => Ok(()),
-        Err(ScalarStateError::Kernel(cause)) => Err(cause),
-        Err(_) => Err(internal(
-            "min_n/max_n codec flush returned a non-control failure",
-        )),
-    }
+    work.flush()
 }
 impl NCodecResources for BoundNCodecResources<'_> {
     type Lease = NCodecLease;
@@ -129,7 +123,8 @@ impl NCodecResources for BoundNCodecResources<'_> {
     }
 }
 
-pub(super) const LEGACY_TEXT_UPPER: usize = 192;
+// A typed outer source's safe detail is bounded before the host formats its stage.
+pub(super) const DIAGNOSTIC_TEXT_MAX: usize = novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES;
 /// Two actual checkpoint/cause diagnostics plus one original error String.
 pub(super) fn operation_prefix_bytes() -> Result<usize, KernelFailure> {
     crate::MAX_ROW_ERROR_MESSAGE_BYTES
@@ -202,18 +197,6 @@ impl super::aggregate_n_core::NSortResources for BoundNSortResources<'_> {
         }
         .reserve(NLibraryBudgetPolicyV1::sort(len)?)
     }
-    fn before_comparison(
-        &mut self,
-        _work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Option<Self::Lease>, KernelFailure> {
-        // Both original discarded diagnostic literals are at most39 bytes.
-        BoundNCodecResources {
-            charge: self.charge,
-            allocator: self.allocator,
-        }
-        .reserve(39)
-        .map(Some)
-    }
 }
 
 #[derive(Default)]
@@ -228,7 +211,7 @@ impl NEmissionGeometry {
         &mut self,
         core: &super::aggregate_n_core::NState<HostAggregateAllocator>,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), KernelFailure> {
         use crate::aggregate_scalar::TrackedAggScalarValue as V;
         self.rows = add(self.rows, 1)?;
         self.values = add(self.values, core.values.len())?;

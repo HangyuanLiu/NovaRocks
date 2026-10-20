@@ -18,27 +18,15 @@
 //! Actual host-admitted scope around the sole original scalar builder.
 
 use crate::aggregate_host_allocator::HostAggregateAllocator;
-use crate::aggregate_scalar::{ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::ScalarWork;
 use crate::arrow_result_custody::retain_result_backing;
 use crate::kernel_input::EvaluationCheckpoints;
-use crate::opaque_memory::{OpaqueReservation, OpaqueRetainedCharge};
+use crate::opaque_memory::OpaqueRetainedCharge;
 use crate::scalar_output_resources::ScalarOutputResources;
 use crate::{AggregateStateAllocator, KernelFailure};
 use arrow_array::ArrayRef;
 use std::sync::Arc;
 
-pub(crate) enum ScalarOutputFailure {
-    Kernel(KernelFailure),
-    OriginalData {
-        message: String,
-        reservation: OpaqueReservation,
-    },
-}
-impl From<KernelFailure> for ScalarOutputFailure {
-    fn from(cause: KernelFailure) -> Self {
-        Self::Kernel(cause)
-    }
-}
 /// The preflight facts remain available for the original read-back stage.
 /// They do not become an authorization for another operation.
 pub(crate) struct LeasedScalarOutput {
@@ -52,36 +40,16 @@ pub(crate) fn with_scalar_output_operation(
     host: Arc<dyn AggregateStateAllocator>,
     allocator: &HostAggregateAllocator,
     work: &mut EvaluationCheckpoints<'_>,
-    compute: impl FnOnce(&mut ScalarWork<'_, '_>) -> Result<ArrayRef, ScalarStateError>,
-) -> Result<LeasedScalarOutput, ScalarOutputFailure> {
-    let bytes = resources
-        .operation_upper_bound()
-        .map_err(|cause| match cause {
-            ScalarStateError::Kernel(cause) => ScalarOutputFailure::Kernel(cause),
-            _ => unreachable!("resource facts have no value-data failure"),
-        })?;
+    compute: impl FnOnce(&mut ScalarWork<'_, '_>) -> Result<ArrayRef, KernelFailure>,
+) -> Result<LeasedScalarOutput, KernelFailure> {
+    let bytes = resources.operation_upper_bound()?;
     let charge = OpaqueRetainedCharge::try_new(host)?;
     work.flush()?;
     // Actual host refusal precedes the original copy/builder; all seven typed
     // causes return unchanged. Layout/stock facts alone never mint a grant.
     let mut reservation = charge.reserve_operation(bytes)?;
     work.flush()?;
-    let result = compute(&mut ScalarWork::new(Some(work)));
-    let values = match result {
-        Ok(values) => values,
-        Err(ScalarStateError::Kernel(cause)) => return Err(cause.into()),
-        Err(ScalarStateError::OutputAllocation(_)) => {
-            return Err(KernelFailure::ResourceExhausted.into());
-        }
-        Err(ScalarStateError::Legacy(message)) => {
-            // Preserve admission through the last actual original diagnostic
-            // Drop. There is no new allocation, footer or host request here.
-            return Err(ScalarOutputFailure::OriginalData {
-                message,
-                reservation,
-            });
-        }
-    };
+    let values = compute(&mut ScalarWork::new(Some(work)))?;
     let values = retain_result_backing(values, charge, &mut reservation, allocator.clone(), work)?;
     Ok(LeasedScalarOutput {
         values: values.values,

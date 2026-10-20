@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::exec::expr::expression_contract;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 
 pub fn eval_array_struct_subfield<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -23,14 +25,18 @@ pub fn eval_array_struct_subfield<__Eval: crate::exec::expr::ExprEvaluation + ?S
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(expression_contract(
+            "array_struct_subfield requires exactly two prepared arguments",
+        ));
+    }
     let input = arena.eval(args[0], chunk)?;
     let field_name_arr = arena.eval(args[1], chunk)?;
-    Ok(
-        (novarocks_functions::builtin::array_struct_subfield_core::project(
-            &input,
-            &field_name_arr,
-            arena.data_type(expr),
-        ))?,
+    novarocks_functions::builtin::array_struct_subfield_core::project(
+        &input,
+        &field_name_arr,
+        arena.data_type(expr),
     )
+    .map_err(ExecutionFailure::from)
 }

@@ -63,7 +63,7 @@ impl PureCompileControl for Control {
         };
         if target
             && (!self.positive_only || units > 0)
-            && let Some(failure) = self.failure
+            && let Some(failure) = self.failure.clone()
         {
             Err(failure)
         } else {
@@ -371,7 +371,7 @@ fn wrapper_entry_control_rejection_never_calls_read_or_write_private_hook() {
         CompileControlError::ResourceExhausted,
     ] {
         let compiler = Compiler::normal();
-        let control = compiler.control(Some(failure), false, Target::Wrapper);
+        let control = compiler.control(Some(failure.clone()), false, Target::Wrapper);
         assert!(
             matches!(ConnectorReadProgramRecipe::try_compile_with_provider(&frozen,&compiler,&control),
             Err(ConnectorReadProgramCompileError::Control(actual)) if actual==failure)
@@ -379,7 +379,7 @@ fn wrapper_entry_control_rejection_never_calls_read_or_write_private_hook() {
         assert_eq!(compiler.calls.hooks.load(Ordering::Relaxed), 0);
         assert_eq!(*control.work.lock().unwrap(), [(false, 0)]);
         let compiler = Compiler::normal();
-        let control = compiler.control(Some(failure), false, Target::Wrapper);
+        let control = compiler.control(Some(failure.clone()), false, Target::Wrapper);
         assert!(
             matches!(ConnectorWriteRecipe::try_compile_with_provider(&original,&compiler,&control),
             Err(ConnectorWriteRecipeCompileError::Control(actual)) if actual==failure)
@@ -399,7 +399,7 @@ fn private_hook_entry_and_positive_quantum_controls_remain_outer_typed_control()
     ] {
         for positive_only in [false, true] {
             let compiler = Compiler::normal();
-            let control = compiler.control(Some(failure), positive_only, Target::Hook);
+            let control = compiler.control(Some(failure.clone()), positive_only, Target::Hook);
             assert!(
                 matches!(ConnectorReadProgramRecipe::try_compile_with_provider(&frozen,&compiler,&control),
                 Err(ConnectorReadProgramCompileError::Control(actual)) if actual==failure)
@@ -413,7 +413,7 @@ fn private_hook_entry_and_positive_quantum_controls_remain_outer_typed_control()
                 assert_eq!(*work, [(false, 0), (false, 0), (true, 0)]);
             }
             let compiler = Compiler::normal();
-            let control = compiler.control(Some(failure), positive_only, Target::Hook);
+            let control = compiler.control(Some(failure.clone()), positive_only, Target::Hook);
             assert!(
                 matches!(ConnectorWriteRecipe::try_compile_with_provider(&original,&compiler,&control),
                 Err(ConnectorWriteRecipeCompileError::Control(actual)) if actual==failure)
@@ -510,7 +510,7 @@ fn public_writer_field_comparison_observes_midwork_control_after_private_hook_su
         CompileControlError::ResourceExhausted,
     ] {
         let compiler = Compiler::normal();
-        let control = compiler.control(Some(failure), true, Target::Wrapper);
+        let control = compiler.control(Some(failure.clone()), true, Target::Wrapper);
         assert!(
             matches!(ConnectorWriteRecipe::try_compile_with_provider(&original,&compiler,&control),
             Err(ConnectorWriteRecipeCompileError::Control(actual)) if actual==failure)
@@ -738,7 +738,7 @@ fn wide_nested_writer_comparison_preserves_positive_quantum_control_without_a_fo
         CompileControlError::ResourceExhausted,
     ] {
         let compiler = Compiler::normal();
-        let control = compiler.control(Some(failure), true, Target::Wrapper);
+        let control = compiler.control(Some(failure.clone()), true, Target::Wrapper);
         assert!(
             matches!(ConnectorWriteRecipe::try_compile_with_provider(&original,&compiler,&control),
             Err(ConnectorWriteRecipeCompileError::Control(actual)) if actual==failure)

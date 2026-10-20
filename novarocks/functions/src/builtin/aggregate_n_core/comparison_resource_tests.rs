@@ -39,7 +39,11 @@ unsafe impl Allocator for TestAllocator {
     }
 }
 impl ScalarStateAllocator for TestAllocator {
-    fn scalar_allocation_error(&self, _: &str) -> ScalarStateError {
+    fn scalar_allocation_error<E: crate::allocation_failure::AllocationRefusalSource>(
+        &self,
+        _: &str,
+        _source: E,
+    ) -> crate::KernelFailure {
         KernelFailure::ResourceExhausted.into()
     }
 }
@@ -292,7 +296,7 @@ fn comparison_admission_refusal_preserves_every_first_cause_and_skips_later_work
                 &mut ScalarWork::new(Some(&mut checkpoints)),
             )
             .unwrap_err();
-        assert!(matches!(error, ScalarStateError::Kernel(actual) if actual == cause));
+        assert_eq!(error, cause);
         assert_eq!(
             trace.state.lock().unwrap().events,
             [
@@ -324,7 +328,7 @@ fn original_comparator_control_refusal_releases_inner_then_outer_without_footer(
                 &mut ScalarWork::new(Some(&mut checkpoints)),
             )
             .unwrap_err();
-        assert!(matches!(error, ScalarStateError::Kernel(actual) if actual == cause));
+        assert_eq!(error, cause);
         assert_eq!(checks(&trace), [0, 256]);
         let state = trace.state.lock().unwrap();
         assert!(!state.sort && !state.comparison);

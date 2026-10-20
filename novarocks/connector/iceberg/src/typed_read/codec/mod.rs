@@ -95,7 +95,7 @@ where
         }
         ConnectorCodecError::new(
             ConnectorFieldPath::root("provider_payload"),
-            error.kind(),
+            error.kind().clone(),
             format!("{}: {}", error.path(), error.detail()),
         )
     }

@@ -207,12 +207,7 @@ pub(super) fn evaluate_string_concat<'a>(
             || work.step(),
         )
     })();
-    if matches!(
-        &result,
-        Err(KernelFailure::Cancelled
-            | KernelFailure::DeadlineExceeded
-            | KernelFailure::ResourceExhausted)
-    ) {
+    if result.as_ref().is_err_and(KernelFailure::is_interruption) {
         return result;
     }
     work.finish()?;

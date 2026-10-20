@@ -73,20 +73,7 @@ pub(super) fn from_original_metadata(
 pub(super) fn pure_error(error: Failure) -> ConnectorError {
     match error {
         PureProviderCompileError::Provider(cause) => cause,
-        PureProviderCompileError::Control(cause) => ConnectorError::new(
-            match cause {
-                novarocks_type_contract::CompileControlError::Cancelled => {
-                    ConnectorErrorKind::Cancelled
-                }
-                novarocks_type_contract::CompileControlError::DeadlineExceeded => {
-                    ConnectorErrorKind::DeadlineExceeded
-                }
-                novarocks_type_contract::CompileControlError::ResourceExhausted => {
-                    ConnectorErrorKind::ResourceExhausted
-                }
-            },
-            "COW pure declaration construction was interrupted",
-        ),
+        PureProviderCompileError::Control(cause) => ConnectorError::compile_interruption(cause),
     }
 }
 

@@ -36,7 +36,7 @@ impl PureCompileControl for CompileControl {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push(units);
-        if let Some((at, cause)) = self.refusal
+        if let Some((at, cause)) = self.refusal.clone()
             && trace.len() == at + 1
         {
             Err(cause)
@@ -824,7 +824,7 @@ fn compile_boundaries_preserve_original_causes_and_full_temporal_identity() {
     ] {
         for refused in 0..trace.len() {
             let control = CompileControl {
-                refusal: Some((refused, cause)),
+                refusal: Some((refused, cause.clone())),
                 ..CompileControl::default()
             };
             let error = PreparedComparisonRecipe::try_new(
@@ -834,7 +834,7 @@ fn compile_boundaries_preserve_original_causes_and_full_temporal_identity() {
                 &control,
             )
             .unwrap_err();
-            assert_eq!(error.control_error(), Some(cause));
+            assert_eq!(error.control_error(), Some(cause.clone()));
             assert!(error.source().is_some());
             assert_eq!(*control.trace.lock().unwrap(), trace[..=refused]);
         }
@@ -859,13 +859,13 @@ fn compile_boundaries_preserve_original_causes_and_full_temporal_identity() {
     ] {
         for refused in 0..trace.len() {
             let control = CompileControl {
-                refusal: Some((refused, cause)),
+                refusal: Some((refused, cause.clone())),
                 ..CompileControl::default()
             };
             let error =
                 PreparedComparisonRecipe::try_new(ComparisonOperator::Eq, &wide, &wide, &control)
                     .unwrap_err();
-            assert_eq!(error.control_error(), Some(cause));
+            assert_eq!(error.control_error(), Some(cause.clone()));
             assert_eq!(*control.trace.lock().unwrap(), trace[..=refused]);
         }
     }

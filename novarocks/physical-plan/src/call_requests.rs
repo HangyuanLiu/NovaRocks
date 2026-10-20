@@ -141,7 +141,19 @@ impl fmt::Display for CallRequestError {
         write!(f, "invalid original call requests: {self:?}")
     }
 }
-impl std::error::Error for CallRequestError {}
+impl std::error::Error for CallRequestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Binding(source) => Some(source),
+            Self::Calls(source) => Some(source),
+            Self::Structure(source) => Some(source),
+            Self::ConstructionResource(source) => Some(source),
+            Self::ConstructionTree(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<CompileControlError> for CallRequestError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)

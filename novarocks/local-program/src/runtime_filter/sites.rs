@@ -182,7 +182,7 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[derive(Clone, Debug, Eq, PartialEq)]
     enum Refusal {
         Layout(LayoutResourceError),
         Host,
@@ -228,7 +228,7 @@ mod tests {
         }
         fn request_layout(&mut self, layout: Layout) -> Result<(), Refusal> {
             self.calls += 1;
-            if let Some(cause) = self.stop {
+            if let Some(cause) = self.stop.clone() {
                 return Err(Refusal::Control(cause));
             }
             if layout.size() > self.remaining {
@@ -402,7 +402,7 @@ mod tests {
                     let mut scope = Scope::new(exits.clone(), held.clone());
                     let entries = scope.prepaid($entry(exits.clone()));
                     scope.remaining = 0;
-                    scope.stop = cause;
+                    scope.stop = cause.clone();
                     let result = $collection::try_from_vec_observed(
                         entries,
                         scope.storage_lifetime(),

@@ -594,6 +594,7 @@ struct Counts {
     intermediate: AtomicUsize,
     final_emit: AtomicUsize,
     data_published: AtomicUsize,
+    outer_published: AtomicUsize,
 }
 #[derive(Clone, Debug, Default)]
 enum Emit {
@@ -653,7 +654,7 @@ impl PureCompileControl for CompileControl {
         assert!(work <= 256);
         self.seen.lock().unwrap().push(work);
         if !self.positive || work > 0 {
-            self.failure.map_or(Ok(()), Err)
+            self.failure.clone().map_or(Ok(()), Err)
         } else {
             Ok(())
         }
@@ -973,6 +974,7 @@ impl Kernel {
         if let Some((at, error)) = &self.behavior.row_failure
             && *at == ordinal
         {
+            self.counts.outer_published.store(1, Ordering::SeqCst);
             return Err(error.clone());
         }
         Ok(())
@@ -997,6 +999,7 @@ impl Kernel {
         }
         match &self.behavior.emit {
             Emit::Grow(Some(error)) | Emit::Failure(error) => {
+                self.counts.outer_published.store(1, Ordering::SeqCst);
                 if self.behavior.lossless {
                     self.counts.data_published.store(1, Ordering::Relaxed);
                 }
@@ -1595,13 +1598,14 @@ fn typed_failures_after_success_prefix_consume_frame_and_cleanup_all_slots_once(
 }
 
 #[test]
-fn retained_error_growth_and_emission_growth_faults_drop_slots_without_masking_controls() {
+fn retained_growth_checks_success_and_drops_slots_without_masking_any_outer_error() {
     let runtime = RuntimeControl::default();
     let values = value_array();
     let args = [EvaluatedArgument::Column(&values)];
     for failure in [
         None,
         Some(operational()),
+        Some(actual_aggregate_scalar_source()),
         Some(KernelFailure::Cancelled),
         Some(KernelFailure::DeadlineExceeded),
         Some(KernelFailure::ResourceExhausted),
@@ -1641,12 +1645,7 @@ fn retained_error_growth_and_emission_growth_faults_drop_slots_without_masking_c
             assert_eq!(frame.rows_processed(), 0);
             assert_eq!(frame.run(&runtime), Err(KernelFailure::InstanceFailed));
             drop(frame);
-            if let Some(
-                error @ (KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted),
-            ) = &failure
-            {
+            if let Some(error) = &failure {
                 assert_eq!(result, Err(error.clone()));
             } else {
                 assert!(matches!(result, Err(KernelFailure::Internal(_))));
@@ -1659,12 +1658,7 @@ fn retained_error_growth_and_emission_growth_faults_drop_slots_without_masking_c
             let handle = prepared_handle(&owner, phase);
             let slots = [handle.initialize_in(&mut storage.0, &runtime).unwrap()];
             let result = handle.emit(&slots, &[0], 1, &runtime);
-            if let Some(
-                error @ (KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted),
-            ) = &failure
-            {
+            if let Some(error) = &failure {
                 assert_eq!(result.unwrap_err(), *error);
             } else {
                 assert!(matches!(result, Err(KernelFailure::Internal(_))));
@@ -1696,7 +1690,7 @@ fn emission_capacity_and_carrier_faults_are_checked_on_actual_erased_results() {
             );
             assert!(matches!(
                 handle.emit(&slots, &[0], 1, &runtime),
-                Err(KernelFailure::Internal(_))
+                Err(ref cause) if crate::kernel_control::test_contract::output(cause)
             ));
         }
         for failure in failures() {
@@ -1959,7 +1953,7 @@ fn handle_compile_and_initialization_control_failures_never_publish_invalid_slot
             .specialize(AggregateKernelPhase::Single)
             .into_prepared();
         assert!(
-            matches!(PreparedAggregateHandle::from_typed(typed.clone(),&CompileControl{failure:Some(compile),..CompileControl::default()}),Err(actual) if actual==failure)
+            matches!(PreparedAggregateHandle::from_typed(typed.clone(),&CompileControl{failure:Some(compile.clone()),..CompileControl::default()}),Err(KernelFailure::CompileControl(actual)) if actual==compile)
         );
         assert_eq!(owner.counts.create.load(Ordering::Relaxed), 0);
         let handle =
@@ -2083,7 +2077,7 @@ fn empty_frames_skip_private_preparation_are_one_shot_and_phase_mismatch_rejects
 }
 
 #[test]
-fn immutable_policy_drift_after_create_or_mutation_is_internal_with_primary_control_preserved() {
+fn immutable_policy_drift_checks_success_and_preserves_every_originating_error() {
     let runtime = RuntimeControl::default();
     let mut storage = Storage::new();
     let mut owner = Owner::new(0, false);
@@ -2100,6 +2094,7 @@ fn immutable_policy_drift_after_create_or_mutation_is_internal_with_primary_cont
         for failure in [
             None,
             Some(operational()),
+            Some(actual_aggregate_scalar_source()),
             Some(KernelFailure::Cancelled),
             Some(KernelFailure::DeadlineExceeded),
             Some(KernelFailure::ResourceExhausted),
@@ -2134,12 +2129,7 @@ fn immutable_policy_drift_after_create_or_mutation_is_internal_with_primary_cont
                     .unwrap()
             };
             let result = frame.run(&runtime);
-            if let Some(
-                error @ (KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted),
-            ) = failure
-            {
+            if let Some(error) = failure {
                 assert_eq!(result, Err(error));
             } else {
                 assert!(matches!(result, Err(KernelFailure::Internal(_))));
@@ -2576,4 +2566,126 @@ fn owned_state_column_unpublished_block_is_released_on_initialization_failure() 
             owner.counts.drop.load(Ordering::Relaxed)
         );
     }
+}
+
+fn actual_aggregate_scalar_source() -> KernelFailure {
+    let source = crate::aggregate_scalar::build_scalar_array(
+        &DataType::Boolean,
+        vec![Some(crate::aggregate_scalar::AggScalarValue::Int64(1))],
+        &mut crate::aggregate_scalar::ScalarWork::new(None),
+    )
+    .unwrap_err();
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&source);
+    assert_eq!(
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert_eq!(fact.reason().code(), 315);
+    assert!(matches!(&source, KernelFailure::Source(_)));
+    source
+}
+
+struct CancelAfterOuter {
+    counts: Arc<Counts>,
+    callbacks_after_outer: AtomicUsize,
+}
+impl KernelEvaluationControl for CancelAfterOuter {
+    fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+        if self.counts.outer_published.load(Ordering::SeqCst) != 0 {
+            self.callbacks_after_outer.fetch_add(1, Ordering::SeqCst);
+            Err(KernelFailure::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+    fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+        panic!("no aggregate wait")
+    }
+}
+
+#[test]
+fn actual_scalar_source_survives_owned_emission_growth_and_late_cancel() {
+    for phase in [AggregateKernelPhase::Partial, AggregateKernelPhase::Final] {
+        let source = actual_aggregate_scalar_source();
+        let mut owner = Owner::new(0, false);
+        owner.behavior.emit = Emit::Grow(Some(source.clone()));
+        let handle = prepared_handle(&owner, phase);
+        let allocator = Arc::new(OrderedAllocator {
+            backing: CountingAllocator::default(),
+            counts: owner.counts.clone(),
+        });
+        let state = crate::OwnedAggregateState::try_new(
+            handle.clone(),
+            allocator.clone(),
+            &RuntimeControl::default(),
+        )
+        .unwrap();
+        let late = CancelAfterOuter {
+            counts: owner.counts.clone(),
+            callbacks_after_outer: AtomicUsize::new(0),
+        };
+        let actual = state.emit_evaluation(1, &late).unwrap_err();
+        // Kernel Source equality is the original shared occurrence identity.
+        assert_eq!(actual, EvaluationFailure::Kernel(source));
+        assert_eq!(late.callbacks_after_outer.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            owner.counts.intermediate.load(Ordering::Relaxed)
+                + owner.counts.final_emit.load(Ordering::Relaxed),
+            1
+        );
+        assert!(state.retained_heap_bytes() > 0);
+        assert_eq!(allocator.backing.allocated.load(Ordering::Relaxed), 1);
+        assert_eq!(allocator.backing.released.load(Ordering::Relaxed), 0);
+        drop(state);
+        assert_eq!(owner.counts.drop.load(Ordering::Relaxed), 1);
+        assert_eq!(owner.counts.drop_saw_live_owner.load(Ordering::Relaxed), 1);
+        assert_eq!(allocator.backing.released.load(Ordering::Relaxed), 1);
+        drop(handle);
+        assert_eq!(owner.counts.kernel_drop.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn actual_scalar_source_owned_merge_grows_once_and_preserves_real_destruction() {
+    let source = actual_aggregate_scalar_source();
+    let mut owner = Owner::new(1, false);
+    owner.behavior.row_growth = true;
+    owner.behavior.row_failure = Some((0, source.clone()));
+    let handle = prepared_handle(&owner, AggregateKernelPhase::Final);
+    let allocator = Arc::new(OrderedAllocator {
+        backing: CountingAllocator::default(),
+        counts: owner.counts.clone(),
+    });
+    let runtime = RuntimeControl::default();
+    let mut state =
+        crate::OwnedAggregateState::try_new(handle.clone(), allocator.clone(), &runtime).unwrap();
+    let values = value_array();
+    let contract = handle.contract().clone();
+    let input = SelectedAggregateMergeInput::try_new(
+        &contract,
+        Selection::all(5),
+        EvaluatedArgument::Column(&values),
+        &runtime,
+    )
+    .unwrap();
+    let late = CancelAfterOuter {
+        counts: owner.counts.clone(),
+        callbacks_after_outer: AtomicUsize::new(0),
+    };
+    let mut frame = state
+        .prepare_merge_batch_evaluation(&[0; 5], input, &runtime)
+        .unwrap();
+    assert_eq!(frame.run(&late), Err(EvaluationFailure::Kernel(source)));
+    assert_eq!(frame.rows_processed(), 0);
+    assert_eq!(frame.run(&late), Err(KernelFailure::InstanceFailed.into()));
+    assert_eq!(owner.counts.merge.load(Ordering::Relaxed), 1);
+    assert_eq!(late.callbacks_after_outer.load(Ordering::SeqCst), 0);
+    drop(frame);
+    assert!(state.retained_heap_bytes() > 0);
+    assert_eq!(allocator.backing.released.load(Ordering::Relaxed), 0);
+    drop(state);
+    assert_eq!(owner.counts.drop.load(Ordering::Relaxed), 1);
+    assert_eq!(owner.counts.drop_saw_live_owner.load(Ordering::Relaxed), 1);
+    assert_eq!(allocator.backing.allocated.load(Ordering::Relaxed), 1);
+    assert_eq!(allocator.backing.released.load(Ordering::Relaxed), 1);
 }

@@ -647,7 +647,7 @@ mod tests {
                 assert!(at <= refusal, "callback after primary refusal");
             }
             trace.push((phase, units));
-            match self.failure {
+            match self.failure.clone() {
                 Some((refusal, cause)) if at == refusal => Err(cause),
                 _ => Ok(()),
             }
@@ -680,7 +680,7 @@ mod tests {
         assert!(trace.iter().all(|(_, n)| *n <= 256));
         for at in 0..trace.len() {
             for cause in CAUSES {
-                let control = Control::refusing(at, cause);
+                let control = Control::refusing(at, cause.clone());
                 assert!(
                     matches!(full(field,source,limits,&control),Err(TypeCodecError::Control(actual)) if actual==cause)
                 );
@@ -848,7 +848,7 @@ mod tests {
         let trace = control.trace();
         for at in 0..trace.len() {
             for cause in CAUSES {
-                let control = Control::refusing(at, cause);
+                let control = Control::refusing(at, cause.clone());
                 assert!(
                     matches!(run(cap, &control), Err(TypeCodecError::Control(actual)) if actual == cause)
                 );

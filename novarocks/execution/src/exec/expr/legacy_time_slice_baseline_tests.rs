@@ -59,7 +59,11 @@ fn count(v: Vec<Option<i32>>) -> ArrayRef {
 fn text(v: Vec<Option<&str>>) -> ArrayRef {
     Arc::new(StringArray::from(v))
 }
-fn eval(name: &'static str, columns: Vec<ArrayRef>, result: DataType) -> Result<ArrayRef, String> {
+fn eval(
+    name: &'static str,
+    columns: Vec<ArrayRef>,
+    result: DataType,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let fields = columns
         .iter()
         .enumerate()
@@ -98,7 +102,7 @@ fn run(
     n: Vec<Option<i32>>,
     unit: Vec<Option<&str>>,
     boundary: Option<Vec<Option<&str>>>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut cols = vec![temporal(date, values), count(n), text(unit)];
     if let Some(b) = boundary {
         cols.push(text(b));
@@ -236,7 +240,7 @@ fn original_slice_validates_all_control_inputs_before_sql_null_temporal() {
             ),
         ] {
             assert_eq!(
-                run(date, vec![None], vec![n], vec![u], Some(vec![b])).unwrap_err(),
+                (run(date, vec![None], vec![n], vec![u], Some(vec![b])).unwrap_err()).to_string(),
                 expected
             );
         }
@@ -248,14 +252,15 @@ fn original_slice_validates_all_control_inputs_before_sql_null_temporal() {
         );
     }
     assert_eq!(
-        run(
+        (run(
             true,
             vec![None],
             vec![Some(1)],
             vec![Some("millisecond")],
             Some(vec![None])
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "can't use time_slice for date with time(hour/minute/second)"
     );
 }
@@ -268,14 +273,15 @@ fn original_slice_before_origin_invalid_payload_and_positive_int32_overflow_are_
             "0000-12-31 23:59:59"
         };
         assert_eq!(
-            run(
+            (run(
                 date,
                 vec![Some(before)],
                 vec![Some(1)],
                 vec![Some("day")],
                 None
             )
-            .unwrap_err(),
+            .unwrap_err())
+            .to_string(),
             "time used with time_slice can't before 0001-01-01 00:00:00"
         );
         let input = if date {
@@ -339,11 +345,12 @@ fn original_slice_exact_arity_type_and_string_errors_are_frozen() {
         };
         let source = temporal(date, vec![Some(value)]);
         assert_eq!(
-            eval(name, vec![source.clone(), count(vec![Some(1)])], ty.clone()).unwrap_err(),
+            (eval(name, vec![source.clone(), count(vec![Some(1)])], ty.clone()).unwrap_err())
+                .to_string(),
             format!("{name} expects value, count, unit and optional boundary")
         );
         assert_eq!(
-            eval(
+            (eval(
                 name,
                 vec![
                     source.clone(),
@@ -352,11 +359,12 @@ fn original_slice_exact_arity_type_and_string_errors_are_frozen() {
                 ],
                 DataType::Int64
             )
-            .unwrap_err(),
+            .unwrap_err())
+            .to_string(),
             format!("{name} result type differs from its frozen temporal domain")
         );
         assert_eq!(
-            eval(
+            (eval(
                 name,
                 vec![
                     source.clone(),
@@ -365,20 +373,22 @@ fn original_slice_exact_arity_type_and_string_errors_are_frozen() {
                 ],
                 ty.clone()
             )
-            .unwrap_err(),
+            .unwrap_err())
+            .to_string(),
             format!("{name} arguments differ from their frozen temporal/INT32 domains")
         );
         assert_eq!(
-            eval(
+            (eval(
                 name,
                 vec![source.clone(), count(vec![Some(1)]), count(vec![Some(1)])],
                 ty.clone()
             )
-            .unwrap_err(),
+            .unwrap_err())
+            .to_string(),
             "time_slice expects unit string"
         );
         assert_eq!(
-            eval(
+            (eval(
                 name,
                 vec![
                     source,
@@ -388,7 +398,8 @@ fn original_slice_exact_arity_type_and_string_errors_are_frozen() {
                 ],
                 ty
             )
-            .unwrap_err(),
+            .unwrap_err())
+            .to_string(),
             format!("{name} expects boundary string")
         );
     }

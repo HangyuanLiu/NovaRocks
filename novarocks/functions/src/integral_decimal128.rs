@@ -16,7 +16,8 @@
 // under the License.
 
 //! Original Types integral -> Decimal128 conversion and Execution policy projection.
-//! Observation grants no allocation. Raw legacy entrypoints retain full errors/panics.
+//! Observation grants no allocation. Valid negative scales do not require an oversized factor.
+use crate::decimal128_rescale::{DecimalCastFailure, decimal_contract};
 use crate::decimal128_rescale::{DecimalRescaleError, DecimalRescaleObservation};
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -28,6 +29,7 @@ use std::{convert::Infallible, sync::Arc};
 struct Factors {
     up: Option<i128>,
     down: Option<i128>,
+    zero: bool,
 }
 fn observe<E>(
     observer: &mut dyn FnMut(DecimalRescaleObservation) -> Result<(), E>,
@@ -35,28 +37,34 @@ fn observe<E>(
 ) -> Result<(), DecimalRescaleError<E>> {
     observer(event).map_err(DecimalRescaleError::Host)
 }
-fn factors(scale: i8) -> Result<Factors, String> {
-    // Original i8 negation remains unchecked; -128 preserves the host panic.
+fn factors(scale: i8) -> Result<Factors, DecimalCastFailure> {
     let up = if scale > 0 {
         Some(
-            crate::legacy_decimal::checked_pow10_i128((scale as u32) as usize)
-                .ok_or_else(|| "decimal scale overflow while casting integral".to_string())?,
+            crate::legacy_decimal::checked_pow10_i128(scale as usize)
+                .ok_or_else(|| decimal_contract("invalid frozen Decimal128 integral cast scale"))?,
         )
     } else {
         None
     };
-    let down = if scale < 0 {
+    let down = if (-38..0).contains(&scale) {
         Some(
-            crate::legacy_decimal::checked_pow10_i128(((-scale) as u32) as usize)
-                .ok_or_else(|| "decimal scale overflow while casting integral".to_string())?,
+            crate::legacy_decimal::checked_pow10_i128(scale.unsigned_abs() as usize)
+                .expect("negative scale magnitude at most 38 has an i128 power of ten"),
         )
     } else {
         None
     };
-    Ok(Factors { up, down })
+    Ok(Factors {
+        up,
+        down,
+        zero: scale < -38,
+    })
 }
 /// One original per-value conversion, also the author of static endpoint facts.
 fn converted(mut value: i128, precision: u8, factors: Factors) -> Option<i128> {
+    if factors.zero {
+        return Some(0);
+    }
     if let Some(factor) = factors.up {
         value = value.checked_mul(factor)?;
     } else if let Some(factor) = factors.down {
@@ -72,14 +80,18 @@ fn raw<T>(
     f: impl FnOnce(
         &mut dyn FnMut(DecimalRescaleObservation) -> Result<(), Infallible>,
     ) -> Result<T, DecimalRescaleError<Infallible>>,
-) -> Result<T, String> {
+) -> Result<T, DecimalCastFailure> {
     match f(&mut |_| Ok(())) {
         Ok(out) => Ok(out),
-        Err(DecimalRescaleError::Data(message)) => Err(message),
+        Err(DecimalRescaleError::Domain(message)) => Err(message),
         Err(DecimalRescaleError::Host(never)) => match never {},
     }
 }
-pub fn relaxed_legacy(source: &ArrayRef, precision: u8, scale: i8) -> Result<ArrayRef, String> {
+pub fn relaxed_legacy(
+    source: &ArrayRef,
+    precision: u8,
+    scale: i8,
+) -> Result<ArrayRef, DecimalCastFailure> {
     raw(|observe| relaxed_observed(source, precision, scale, observe))
 }
 pub fn relaxed_observed<E>(
@@ -101,28 +113,27 @@ pub fn relaxed_observed<E>(
             DataType::Int8 => source
                 .as_any()
                 .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "failed to downcast to Int8Array".to_string())?
+                .ok_or_else(|| decimal_contract("failed to downcast to Int8Array"))?
                 .value(row) as i128,
             DataType::Int16 => source
                 .as_any()
                 .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "failed to downcast to Int16Array".to_string())?
+                .ok_or_else(|| decimal_contract("failed to downcast to Int16Array"))?
                 .value(row) as i128,
             DataType::Int32 => source
                 .as_any()
                 .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "failed to downcast to Int32Array".to_string())?
+                .ok_or_else(|| decimal_contract("failed to downcast to Int32Array"))?
                 .value(row) as i128,
             DataType::Int64 => source
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "failed to downcast to Int64Array".to_string())?
+                .ok_or_else(|| decimal_contract("failed to downcast to Int64Array"))?
                 .value(row) as i128,
             other => {
-                return Err(format!(
-                    "integral to DECIMAL cast unsupported source type: {:?}",
-                    other
-                )
+                return Err(decimal_contract(format_args!(
+                    "integral to DECIMAL cast unsupported source type: {other:?}"
+                ))
                 .into());
             }
         };
@@ -134,7 +145,7 @@ pub fn relaxed_observed<E>(
     observe(observer, DecimalRescaleObservation::OpaqueBoundary)?;
     let wide = Decimal128Array::from(values)
         .with_precision_and_scale(38, scale)
-        .map_err(|e| e.to_string())?;
+        .map_err(DecimalCastFailure::Arrow)?;
     observe(observer, DecimalRescaleObservation::OpaqueBoundary)?;
     crate::decimal128_rescale::retag_observed(&wide, precision, scale, observer)
 }
@@ -144,7 +155,7 @@ pub fn evaluate_legacy(
     scale: i8,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, DecimalCastFailure> {
     raw(|observe| evaluate_observed(source, precision, scale, policy, allow, observe))
 }
 pub fn evaluate_observed<E>(
@@ -155,16 +166,9 @@ pub fn evaluate_observed<E>(
     _allow: bool,
     observer: &mut dyn FnMut(DecimalRescaleObservation) -> Result<(), E>,
 ) -> Result<ArrayRef, DecimalRescaleError<E>> {
-    let target = DataType::Decimal128(precision, scale);
     let casted = match relaxed_observed(source, precision, scale, observer) {
         Ok(casted) => casted,
-        Err(DecimalRescaleError::Data(message)) => {
-            return Err(DecimalRescaleError::Data(format!(
-                "CAST failed: from {:?} to {:?}: {message}",
-                source.data_type(),
-                target
-            )));
-        }
+        Err(DecimalRescaleError::Domain(cause)) => return Err(DecimalRescaleError::Domain(cause)),
         Err(DecimalRescaleError::Host(cause)) => return Err(DecimalRescaleError::Host(cause)),
     };
     let casted = crate::decimal128_rescale::enforce_precision_observed(casted, observer)?;
@@ -174,11 +178,7 @@ pub fn evaluate_observed<E>(
     // Original ALLOW rule applies only when the original source is Decimal;
     // integral sources retain the separately frozen policy, regardless of ALLOW.
     if overflow && policy == DecimalOverflowPolicy::ReportError {
-        return Err(
-            "Expr evaluate meet error: The numeric type cast involving decimal overflows"
-                .to_string()
-                .into(),
-        );
+        return Err(DecimalCastFailure::NumericOverflow.into());
     }
     // Original non-finite sanitizer returns Decimal128 unchanged.
     Ok(casted)
@@ -196,7 +196,7 @@ fn endpoints(source: &DataType) -> Option<(i128, i128)> {
 /// their row loop (or panic); they need explicit invocation-data/host handling.
 pub fn selected_shape_supported(source: &DataType, target: &DataType) -> bool {
     endpoints(source).is_some()
-        && matches!(target,DataType::Decimal128(p,s) if (1..=38).contains(p) && *s>=-38 && *s<=*p as i8)
+        && matches!(target,DataType::Decimal128(p,s) if (1..=38).contains(p) && *s<=*p as i8)
 }
 pub fn can_overflow(source: &DataType, target: &DataType) -> bool {
     if !selected_shape_supported(source, target) {

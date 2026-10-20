@@ -27,16 +27,16 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
-use crate::exec::chunk::Chunk;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::exec::pipeline::schedule::observer::Observable;
+use crate::exec::pipeline::shape::{Source, SourceKernel, SourceRead};
+use crate::exec::pipeline::step::{NextStep, StepResult, WaitFact, WaitReason};
 use std::sync::Arc;
 
 use crate::exec::operators::local_exchanger::LocalExchanger;
-use crate::runtime::runtime_state::RuntimeState;
 use tracing::debug;
 
 /// Factory for local-exchange source operators that drain local partition queues.
@@ -83,7 +83,7 @@ impl OperatorFactory for LocalExchangeSourceFactory {
         // also its consumer identity in the exchanger.
         let consumer = driver_id.max(0) as usize;
         let partition = consumer % self.partition_count;
-        Box::new(LocalExchangeSourceOperator {
+        Box::new(Source::new(LocalExchangeSourceOperator {
             name: self.name.clone(),
             owner_node_id: self.owner_node_id,
             driver_id,
@@ -92,7 +92,7 @@ impl OperatorFactory for LocalExchangeSourceFactory {
             exchanger: Arc::clone(&self.exchanger),
             finished: false,
             blocked_empty: false,
-        })
+        }))
     }
 
     fn is_source(&self) -> bool {
@@ -120,21 +120,14 @@ impl LocalExchangeSourceOperator {
     }
 }
 
-impl Operator for LocalExchangeSourceOperator {
+impl OperatorLifecycle for LocalExchangeSourceOperator {
     fn name(&self) -> &str {
         &self.name
     }
 
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.finish();
+        Ok(())
     }
 
     fn close(&mut self) -> ExecutionResult<()> {
@@ -147,37 +140,18 @@ impl Operator for LocalExchangeSourceOperator {
     }
 }
 
-impl ProcessorOperator for LocalExchangeSourceOperator {
-    fn need_input(&self) -> bool {
-        false
-    }
-
-    fn has_output(&self) -> bool {
+impl SourceKernel for LocalExchangeSourceOperator {
+    fn poll_output(
+        &mut self,
+        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<StepResult> {
         if self.finished {
-            return false;
+            return Ok(StepResult::new(None, NextStep::Finished, 0));
         }
-        if let Some((buffered, remaining)) =
-            self.exchanger.partition_buffered_chunks(self.partition)
-        {
-            if buffered > 0 {
-                return true;
-            }
-            return remaining == 0;
-        }
-        !self.exchanger.is_done(self.partition)
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-        Err("local exchange source operator does not accept input"
-            .to_string()
-            .into())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if self.finished {
-            return Ok(None);
-        }
-        if let Some(chunk) = self.exchanger.pop_chunk(self.partition) {
+        let observable = self.exchanger.source_observable();
+        let observed_generation = observable.generation();
+        let read = self.exchanger.next_chunk(self.partition);
+        if let SourceRead::Chunk(chunk) = read {
             if self.blocked_empty {
                 if let Some((buffered, remaining)) =
                     self.exchanger.partition_buffered_chunks(self.partition)
@@ -194,9 +168,9 @@ impl ProcessorOperator for LocalExchangeSourceOperator {
                 }
                 self.blocked_empty = false;
             }
-            return Ok(Some(chunk));
+            return Ok(StepResult::new(Some(chunk), NextStep::Runnable, 0));
         }
-        if self.exchanger.is_done(self.partition) {
+        if matches!(read, SourceRead::Finished) {
             self.finish();
             let stats = self.exchanger.stats_snapshot();
             if let Some(part) = stats
@@ -218,7 +192,7 @@ impl ProcessorOperator for LocalExchangeSourceOperator {
                     stats.remaining_producers
                 );
             }
-            return Ok(None);
+            return Ok(StepResult::new(None, NextStep::Finished, 0));
         }
         if !self.blocked_empty {
             if let Some((buffered, remaining)) =
@@ -236,18 +210,15 @@ impl ProcessorOperator for LocalExchangeSourceOperator {
             }
             self.blocked_empty = true;
         }
-        Ok(None)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        self.finish();
-        Ok(())
-    }
-
-    fn source_observable(&self) -> Option<Arc<Observable>> {
-        if self.finished {
-            return None;
-        }
-        Some(self.exchanger.source_observable())
+        Ok(StepResult::new(
+            None,
+            NextStep::Wait(WaitFact {
+                reason: WaitReason::Input,
+                observable,
+                observed_generation,
+                deadline: None,
+            }),
+            0,
+        ))
     }
 }

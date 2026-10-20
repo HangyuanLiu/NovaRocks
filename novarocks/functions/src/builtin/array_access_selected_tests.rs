@@ -67,7 +67,7 @@ impl PureCompileControl for Compile {
             assert!(at <= stop)
         }
         t.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -269,10 +269,11 @@ fn array_element_every_actual_compile_callback_preserves_three_causes_and_named_
                 CompileControlError::Cancelled,
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
+                CompileControlError::from_domain(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
             ] {
                 let c = Compile {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let error = prepared(&types, &c).err().unwrap();
                 let actual = match error {

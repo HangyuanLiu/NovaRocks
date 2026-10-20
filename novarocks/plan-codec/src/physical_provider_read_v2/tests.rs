@@ -45,7 +45,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
-        let stop = *self.stop.lock().unwrap();
+        let stop = self.stop.lock().unwrap().clone();
         if let Some((stop, _)) = stop {
             assert!(at <= stop, "callback after refusal");
         }
@@ -547,9 +547,15 @@ fn provider_read_namespace_every_actual_callback_three_causes_success_ordinary_a
         for at in 0..positive.len() {
             for cause in CAUSES {
                 let refusing = Control::default();
-                let outcome = run(&refusing, Some((at, cause)), decode, bad_version, bad_kind);
+                let outcome = run(
+                    &refusing,
+                    Some((at, cause.clone())),
+                    decode,
+                    bad_version,
+                    bad_kind,
+                );
                 assert!(
-                    matches!(outcome,Err(Error::Control(c)) if c==cause),
+                    matches!(&outcome,Err(Error::Control(c)) if c==&cause),
                     "{outcome:?}"
                 );
                 assert_eq!(trace(&refusing), positive[..=at]);
@@ -579,7 +585,7 @@ fn provider_read_namespace_real_wide_original_quantum_and_lookup_tail_keep_exact
         .position(|(_, units)| *units == 256)
         .expect("genuine read namespace quantum");
     for cause in CAUSES {
-        ctrl.arm(Some((at, cause)));
+        ctrl.arm(Some((at, cause.clone())));
         assert!(
             matches!(encode_provider_reads(&inputs,&b,&p,SOURCE,limits()),Err(Error::Control(c)) if c==cause)
         );
@@ -593,7 +599,7 @@ fn provider_read_namespace_real_wide_original_quantum_and_lookup_tail_keep_exact
     let lookup = trace(&ctrl);
     for stop in 0..lookup.len() {
         for cause in CAUSES {
-            ctrl.arm(Some((stop, cause)));
+            ctrl.arm(Some((stop, cause.clone())));
             assert!(matches!(encoded.read(u32::MAX),Err(Error::Control(c)) if c==cause));
             assert_eq!(trace(&ctrl), lookup[..=stop]);
         }
@@ -612,7 +618,7 @@ fn provider_read_namespace_real_wide_original_quantum_and_lookup_tail_keep_exact
         .position(|(_, units)| *units == 256)
         .expect("genuine receiving quantum");
     for cause in CAUSES {
-        ctrl.arm(Some((at, cause)));
+        ctrl.arm(Some((at, cause.clone())));
         assert!(
             matches!(decode_provider_reads(&defs,&db,&dp,SOURCE,limits()),Err(Error::Control(c)) if c==cause)
         );

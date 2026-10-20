@@ -750,7 +750,7 @@ mod tests {
     struct Fail(CompileControlError);
     impl PureCompileControl for Fail {
         fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-            Err(self.0)
+            Err(self.0.clone())
         }
     }
     #[test]
@@ -771,13 +771,13 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             assert!(
-                matches!(owner.resolve(request(&arguments), &Fail(error)), Err(FunctionBindingError::Control(actual)) if actual == error)
+                matches!(owner.resolve(request(&arguments), &Fail(error.clone())), Err(FunctionBindingError::Control(actual)) if actual == error)
             );
             assert!(
-                matches!(owner.validate_and_refine(input, &Fail(error)), Err(FunctionEffectOwnerError::Control(actual)) if actual == error)
+                matches!(owner.validate_and_refine(input, &Fail(error.clone())), Err(FunctionEffectOwnerError::Control(actual)) if actual == error)
             );
             assert!(
-                matches!(specialize_scalar(&owner, input, selected.clone(), ScopedExpressionEffects::pure_value(test_context()), &Fail(error)), Err(FunctionSpecializationFailure::Control(actual)) if actual == error)
+                matches!(specialize_scalar(&owner, input, selected.clone(), ScopedExpressionEffects::pure_value(test_context()), &Fail(error.clone())), Err(FunctionSpecializationFailure::Control(actual)) if actual == error)
             );
         }
     }

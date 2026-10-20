@@ -40,8 +40,8 @@ use novarocks_fs::FileReadContext;
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
     BudgetConsume, ConnectorPageStream, ConnectorPollBudget, ConnectorPreparationControl,
-    ConnectorPreparationProgress, ConnectorSourceOperations, OwnedConnectorPageStream,
-    PageSourceMetrics, SourcePage,
+    ConnectorPreparationExit, ConnectorPreparationProgress, ConnectorSourceOperations,
+    OwnedConnectorPageStream, PageSourceMetrics, SourcePage,
 };
 
 use super::super::delete_manager::DeleteEvaluationMode;
@@ -270,11 +270,24 @@ impl ConnectorPageStream for IcebergParquetPageStream {
         let successor_control = this.successor_control;
         let pending = this.pending_preparation_control;
         Box::pin(async move {
-            successor_control.wait_drained().await;
-            if let Some(control) = &pending {
-                control.wait_drained().await;
+            let preparation = async {
+                let successor = successor_control.wait_drained();
+                let promoted = async {
+                    match &pending {
+                        Some(control) => control.wait_drained().await,
+                        None => ConnectorPreparationExit::Exited,
+                    }
+                };
+                futures::future::join(successor, promoted).await
+            };
+            let ((successor, promoted), exited) = futures::future::join(preparation, exited).await;
+            if matches!(successor, ConnectorPreparationExit::Unresolved(_))
+                || matches!(promoted, ConnectorPreparationExit::Unresolved(_))
+            {
+                // The original watcher/source receipt already reported cleanup
+                // and health. This body never turns unknown work into Err exit.
+                return futures::future::pending().await;
             }
-            let exited = exited.await;
             reader?;
             exited
         })
@@ -329,7 +342,12 @@ impl ConnectorPageStream for IcebergPartitionOnlyPageStream {
         }
         Box::pin(async move {
             if let Some(control) = &pending {
-                control.wait_drained().await;
+                if matches!(
+                    control.wait_drained().await,
+                    ConnectorPreparationExit::Unresolved(_)
+                ) {
+                    return futures::future::pending().await;
+                }
             }
             Ok(())
         })
@@ -362,7 +380,14 @@ impl SplitOperations {
         });
         async move {
             match exited {
-                Some(exited) => exited.await,
+                Some(exited) => match exited.await {
+                    novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited => {
+                        Ok(())
+                    }
+                    novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Unresolved => {
+                        futures::future::pending().await
+                    }
+                },
                 None => Ok(()),
             }
         }

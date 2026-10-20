@@ -1373,7 +1373,8 @@ fn test_array_generate_datetime_null_step_errors() {
         .expect_err("NULL datetime step must error");
 
     assert!(
-        err.contains("array_generate requires step parameter must be a constant integer"),
+        err.to_string()
+            .contains("array_generate requires step parameter must be a constant integer"),
         "err={err}"
     );
 }
@@ -2593,7 +2594,10 @@ fn test_element_at_out_of_bounds_errors_with_check() {
     );
 
     let err = eval_element_at(&arena, expr, &[arr, idx_oob, check_true], &chunk).unwrap_err();
-    assert!(err.contains("Array subscript must be less than or equal to array length"));
+    assert!(
+        err.to_string()
+            .contains("Array subscript must be less than or equal to array length")
+    );
 }
 
 // ---------------------------------------------------------------------------

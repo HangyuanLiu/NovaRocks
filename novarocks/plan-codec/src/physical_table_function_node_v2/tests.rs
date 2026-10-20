@@ -58,7 +58,7 @@ struct Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
-        let (active, stop) = *self.state.lock().unwrap();
+        let (active, stop) = self.state.lock().unwrap().clone();
         if !active {
             return Ok(());
         }
@@ -722,7 +722,7 @@ fn prefixes(control: &Control, mut invoke: impl FnMut() -> Result<(), Error>, su
     assert!(!trace.is_empty());
     for at in 0..trace.len() {
         for cause in CAUSES {
-            control.arm(Some((at, cause)));
+            control.arm(Some((at, cause.clone())));
             assert!(matches!(invoke(),Err(Error::Control(actual)) if actual==cause));
             assert_eq!(control.trace(), trace[..=at]);
         }
@@ -775,7 +775,7 @@ fn wide_actual_counts_have_real_quantum_and_numeric_refusal_has_no_late_callback
             let quantum = trace.iter().position(|(_, units)| *units == 256).unwrap();
             for at in [0, quantum, trace.len() - 1] {
                 for cause in CAUSES {
-                    control.arm(Some((at, cause)));
+                    control.arm(Some((at, cause.clone())));
                     let result = if receive {
                         decode(&wire, read, functions, node_limits()).map(|_| ())
                     } else {
@@ -1005,7 +1005,7 @@ fn table_caller_owned_known_root_requests_win_at_pending255_and_wide_is_actual()
             let quantum = trace.iter().position(|(_, u)| *u == 256).unwrap();
             for at in [0, quantum, trace.len() - 1] {
                 for cause in CAUSES {
-                    control.arm(Some((at, cause)));
+                    control.arm(Some((at, cause.clone())));
                     let result = if receive {
                         caller_table_decode(
                             &wire,

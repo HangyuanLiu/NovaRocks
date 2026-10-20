@@ -42,7 +42,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         let ordinal = trace.len();
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == ordinal => Err(cause),
             _ => Ok(()),
         }
@@ -318,7 +318,7 @@ fn union_flow_every_actual_small_control_prefix_preserves_all_three_first_causes
             CompileControlError::ResourceExhausted,
         ] {
             let control = Control {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..Control::default()
             };
             let mut records = Records::sparse();

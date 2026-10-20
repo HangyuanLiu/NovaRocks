@@ -22,31 +22,9 @@ use arrow_array::{Array, ArrayRef, Int64Array, StringArray};
 use arrow_schema::DataType;
 use chrono::{NaiveTime, Timelike};
 use std::{sync::Arc, time::Duration};
-#[derive(Debug)]
-pub enum TimeTextError {
-    Legacy(String),
-    /// Original Arrow fallback verdict applies to its entire invocation.
-    InvocationData(String),
-    Kernel(KernelFailure),
-}
-impl From<KernelFailure> for TimeTextError {
-    fn from(e: KernelFailure) -> Self {
-        Self::Kernel(e)
-    }
-}
-impl TimeTextError {
-    pub fn into_legacy(self) -> String {
-        match self {
-            Self::Legacy(s) | Self::InvocationData(s) => s,
-            Self::Kernel(
-                KernelFailure::Internal(d)
-                | KernelFailure::InvalidProgram(d)
-                | KernelFailure::Operational(d),
-            ) => d.message().to_owned(),
-            Self::Kernel(e) => e.to_string(),
-        }
-    }
-}
+#[path = "calendar_time_text_failure.rs"]
+mod failure;
+pub use failure::{DurationCastError, TimeTextDataFailure, TimeTextError};
 pub struct LegacyControl;
 impl KernelEvaluationControl for LegacyControl {
     fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
@@ -87,7 +65,9 @@ pub fn parse_hms_duration_to_seconds(raw: &str) -> Option<i64> {
     {
         return None;
     }
-    Some(hour * 3600 + minute * 60 + second)
+    hour.checked_mul(3600)?
+        .checked_add(minute * 60)?
+        .checked_add(second)
 }
 
 pub fn duration_strings(
@@ -146,7 +126,7 @@ pub fn datetime_seconds(
 ) -> Result<Vec<Option<i64>>, TimeTextError> {
     work.flush()?;
     let reader =
-        DateInput::raw(array.as_ref()).map_err(|e| TimeTextError::Legacy(e.legacy_message()))?;
+        DateInput::raw(array.as_ref()).map_err(|e| TimeTextError::from(e.into_kernel()))?;
     work.flush()?;
     let mut out = Vec::with_capacity(array.len());
     work.flush()?;
@@ -164,9 +144,10 @@ pub fn sec_to_time_source(
     array: &ArrayRef,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<Vec<Option<i64>>, TimeTextError> {
-    let source = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-        TimeTextError::Legacy("sec_to_time source for time_to_sec must be int".into())
-    })?;
+    let source = array
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| TimeTextError::contract("sec_to_time source for time_to_sec must be int"))?;
     work.flush()?;
     let mut out = Vec::with_capacity(source.len());
     work.flush()?;
@@ -223,7 +204,7 @@ pub fn format_argument(
             array
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| TimeTextError::Legacy("time_format expects string".into()))?,
+                .ok_or_else(|| TimeTextError::contract("time_format expects string"))?,
             work,
         ),
         DataType::Null => {
@@ -232,7 +213,7 @@ pub fn format_argument(
             work.flush()?;
             Ok(out)
         }
-        _ => Err(TimeTextError::Legacy("time_format expects time".into())),
+        _ => Err(TimeTextError::contract("time_format expects time")),
     }
 }
 pub fn format_time_pattern_observed(
@@ -281,18 +262,28 @@ pub fn format_output(
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<ArrayRef, TimeTextError> {
     if seconds.len() != rows && seconds.len() != 1 {
-        return Err(TimeTextError::Legacy(
-            "time_format argument length mismatch".into(),
+        return Err(TimeTextError::contract(
+            "time_format argument length mismatch",
         ));
     }
     if fmt.len() != rows && fmt.len() != 1 {
-        return Err(TimeTextError::Legacy(
-            "time_format format length mismatch".into(),
+        return Err(TimeTextError::contract(
+            "time_format format length mismatch",
         ));
     }
     work.flush()?;
-    let mut out = Vec::with_capacity(rows);
+    std::alloc::Layout::array::<Option<String>>(rows)
+        .map_err(|source| TimeTextError::backing::<Option<String>>(rows, source))?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(rows).map_err(|source| {
+        KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+            "reserve TIME text output",
+            source,
+        ))
+    })?;
     work.flush()?;
+    let mut total = 0_u128;
+    let mut largest = 0_u128;
     for i in 0..rows {
         work.step()?;
         let time_v = if seconds.len() == 1 {
@@ -309,11 +300,17 @@ pub fn format_output(
             out.push(None);
             continue;
         };
-        out.push(Some(format_time_pattern_observed(
-            fmt.value(frow),
-            seconds,
-            work,
-        )?));
+        let value = format_time_pattern_observed(fmt.value(frow), seconds, work)?;
+        total += value.len() as u128;
+        largest = largest.max(value.len() as u128);
+        if total > i32::MAX as u128 {
+            return Err(TimeTextError::Extent {
+                required: total,
+                largest,
+                prefix: i,
+            });
+        }
+        out.push(Some(value));
     }
     work.flush()?;
     let array = Arc::new(StringArray::from(out)) as ArrayRef;
@@ -333,16 +330,43 @@ pub fn seconds_output(
 pub fn duration_cast_source(
     array: &ArrayRef,
     work: &mut EvaluationCheckpoints<'_>,
-) -> Result<Option<Vec<Option<i64>>>, TimeTextError> {
+) -> Result<Vec<Option<i64>>, DurationCastError> {
     if let Some(source) = array.as_any().downcast_ref::<StringArray>() {
-        return duration_strings(source, work).map(Some);
+        return duration_strings(source, work).map_err(Into::into);
     }
     work.flush()?;
-    let source = arrow_cast::cast(array, &DataType::Utf8)
-        .map_err(|e| TimeTextError::InvocationData(e.to_string()))?;
+    let source = arrow_cast::cast(array, &DataType::Utf8).map_err(|source| {
+        // This concrete cast delegates supported temporal values to Arrow's
+        // value formatter. Its CastError means a value cannot be formatted;
+        // it is distinct from unsupported source types and capacity failures.
+        if matches!(
+            array.data_type(),
+            DataType::Date32
+                | DataType::Date64
+                | DataType::Timestamp(_, _)
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+        ) && matches!(source, arrow_schema::ArrowError::CastError(_))
+        {
+            DurationCastError::Data(TimeTextDataFailure::new(source))
+        } else if matches!(
+            array.data_type(),
+            DataType::LargeUtf8 | DataType::LargeBinary
+        ) && matches!(source, arrow_schema::ArrowError::ComputeError(_))
+        {
+            // Pinned Large->small byte-container cast only produces this
+            // ComputeError when an existing offset cannot enter i32.
+            DurationCastError::Outer(TimeTextError::OffsetNarrow(source))
+        } else {
+            DurationCastError::Outer(TimeTextError::Arrow(source))
+        }
+    })?;
     work.flush()?;
-    match source.as_any().downcast_ref::<StringArray>() {
-        Some(source) => duration_strings(source, work).map(Some),
-        None => Ok(None),
-    }
+    let source = source
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            TimeTextError::contract("TIME UTF8 cast returned an incompatible carrier")
+        })?;
+    duration_strings(source, work).map_err(Into::into)
 }

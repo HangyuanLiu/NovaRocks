@@ -474,7 +474,7 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
             let tracker =
                 crate::runtime::mem_tracker::MemTracker::new_root("json-object-actual-frame");
             tracker.install_limit_once(8 * 1024 * 1024).unwrap();
-            let host = crate::exec::operators::compiled_aggregate::expression_allocation_host(
+            let host = crate::runtime::tracked_state_allocator::expression_allocation_host(
                 tracker.clone(),
             );
             let mut frame = CompiledExpressionInstance::try_new_with_allocator(
@@ -549,7 +549,7 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                 ScalarInvocationActivation::Activated,
                 ScalarInvocationActivation::ValidateOnly,
             ] {
-                let host = crate::exec::operators::compiled_aggregate::expression_allocation_host(
+                let host = crate::runtime::tracked_state_allocator::expression_allocation_host(
                     tracker.clone(),
                 );
                 let mut empty = CompiledExpressionInstance::try_new_with_allocator(
@@ -641,8 +641,13 @@ fn c16_p1_json_object_differential_unsupported_null_carriers_and_suppressed_nest
                         result_type: &result_type,
                         rows: 3,
                     };
+                    let raw_refusal = raw_call.evaluate_legacy(None).unwrap_err();
+                    assert!(
+                        raw_refusal.original().is_none(),
+                        "Chunk fixture ingress precedes the evaluator"
+                    );
                     assert_eq!(
-                        raw_call.evaluate_legacy(None).unwrap_err(),
+                        raw_refusal.to_string(),
                         "view carriers are not supported by the current execution engine"
                     );
                     let spec = if view_is_key {
@@ -658,7 +663,12 @@ fn c16_p1_json_object_differential_unsupported_null_carriers_and_suppressed_nest
                         result_type: &result_type,
                         rows: 3,
                     };
-                    assert_eq!(pooled_call.evaluate_legacy(None).unwrap_err(), expected);
+                    let pooled_refusal = pooled_call.evaluate_legacy(None).unwrap_err();
+                    assert_eq!(
+                        pooled_refusal.original().unwrap().0.class(),
+                        novarocks_failure_contract::FailureClass::Invariant
+                    );
+                    assert_eq!(pooled_refusal.to_string(), expected);
                     let summary = assert_scalar_matches_v1(spec);
                     assert_eq!(summary.result_type, result_type);
                     assert_eq!(summary.selections, 6);

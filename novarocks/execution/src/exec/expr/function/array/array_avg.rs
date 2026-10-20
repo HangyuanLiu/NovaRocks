@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, ListArray,
@@ -63,31 +65,32 @@ where
     out
 }
 
-fn pow10_i128(exp: u32) -> Result<i128, String> {
+fn pow10_i128(exp: u32) -> ExecutionResult<i128> {
     10_i128
         .checked_pow(exp)
-        .ok_or_else(|| "array_avg decimal scale overflow".to_string())
+        .ok_or_else(|| super::common::numeric_failure("array_avg decimal scale overflow"))
 }
 
-fn div_round_half_up_i128(numerator: i128, denominator: i128) -> Result<i128, String> {
+fn div_round_half_up_i128(numerator: i128, denominator: i128) -> ExecutionResult<i128> {
     if denominator == 0 {
-        return Err("array_avg division by zero".to_string());
+        return Err(expression_contract("array_avg division by zero"));
     }
-    let quotient = numerator / denominator;
-    let remainder = numerator % denominator;
+    let quotient = numerator
+        .checked_div(denominator)
+        .ok_or_else(|| super::common::numeric_failure("array_avg decimal division overflow"))?;
+    let remainder = numerator
+        .checked_rem(denominator)
+        .ok_or_else(|| super::common::numeric_failure("array_avg decimal remainder overflow"))?;
     if remainder == 0 {
         return Ok(quotient);
     }
 
-    let twice_remainder = remainder
-        .abs()
-        .checked_mul(2)
-        .ok_or_else(|| "array_avg decimal rounding overflow".to_string())?;
-    if twice_remainder < denominator.abs() {
+    if remainder.unsigned_abs() < denominator.unsigned_abs().div_ceil(2) {
         return Ok(quotient);
     }
-
-    Ok(quotient + numerator.signum())
+    quotient
+        .checked_add(numerator.signum() * denominator.signum())
+        .ok_or_else(|| super::common::numeric_failure("array_avg decimal rounding overflow"))
 }
 
 fn avg_decimal_rows(
@@ -96,7 +99,7 @@ fn avg_decimal_rows(
     chunk_len: usize,
     input_scale: i8,
     output_scale: i8,
-) -> Result<Vec<Option<i128>>, String> {
+) -> ExecutionResult<Vec<Option<i128>>> {
     let offsets = list.value_offsets();
     let mut out = Vec::with_capacity(chunk_len);
     for row in 0..chunk_len {
@@ -108,8 +111,9 @@ fn avg_decimal_rows(
 
         let start = offsets[row_idx] as usize;
         let end = offsets[row_idx + 1] as usize;
-        let count =
-            i128::try_from(end - start).map_err(|_| "array_avg count overflow".to_string())?;
+        let count = i128::try_from(end - start).map_err(|source| {
+            super::common::numeric_conversion_failure("array_avg count", source)
+        })?;
         let mut sum = 0_i128;
         let mut has_value = false;
         for idx in start..end {
@@ -117,9 +121,9 @@ fn avg_decimal_rows(
                 continue;
             }
             has_value = true;
-            sum = sum
-                .checked_add(values.value(idx))
-                .ok_or_else(|| "array_avg decimal accumulation overflow".to_string())?;
+            sum = sum.checked_add(values.value(idx)).ok_or_else(|| {
+                super::common::numeric_failure("array_avg decimal accumulation overflow")
+            })?;
         }
 
         if count == 0 || !has_value {
@@ -128,16 +132,16 @@ fn avg_decimal_rows(
         }
 
         let (numerator, denominator) = if output_scale >= input_scale {
-            let factor = pow10_i128(u32::from((output_scale - input_scale) as u8))?;
-            let numerator = sum
-                .checked_mul(factor)
-                .ok_or_else(|| "array_avg decimal rescale overflow".to_string())?;
+            let factor = pow10_i128((i16::from(output_scale) - i16::from(input_scale)) as u32)?;
+            let numerator = sum.checked_mul(factor).ok_or_else(|| {
+                super::common::numeric_failure("array_avg decimal rescale overflow")
+            })?;
             (numerator, count)
         } else {
-            let factor = pow10_i128(u32::from((input_scale - output_scale) as u8))?;
-            let denominator = count
-                .checked_mul(factor)
-                .ok_or_else(|| "array_avg decimal rescale overflow".to_string())?;
+            let factor = pow10_i128((i16::from(input_scale) - i16::from(output_scale)) as u32)?;
+            let denominator = count.checked_mul(factor).ok_or_else(|| {
+                super::common::numeric_failure("array_avg decimal rescale overflow")
+            })?;
             (sum, denominator)
         };
         out.push(Some(div_round_half_up_i128(numerator, denominator)?));
@@ -150,12 +154,20 @@ pub fn eval_array_avg<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "array_avg has an invalid prepared argument count",
+        ));
+    }
     let arr = arena.eval(args[0], chunk)?;
-    let list = arr
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| format!("array_avg expects ListArray, got {:?}", arr.data_type()))?;
+    let list = arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+        expression_contract(format_args!(
+            "array_avg expects ListArray, got {:?}",
+            arr.data_type()
+        ))
+    })?;
+    super::common::validate_rows(list.len(), chunk.len(), "array_avg input")?;
     let values = list.values();
 
     let out = match values.data_type() {
@@ -231,7 +243,12 @@ pub fn eval_array_avg<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let avgs = avg_decimal_rows(list, values, chunk.len(), *scale, out_scale)?;
             let out = Decimal128Array::from(avgs)
                 .with_precision_and_scale(out_precision, out_scale)
-                .map_err(|e| e.to_string())?;
+                .map_err(|source| {
+                    crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+                        "array_avg decimal metadata",
+                        source,
+                    )
+                })?;
             Arc::new(out) as ArrayRef
         }
         arrow::datatypes::DataType::FixedSizeBinary(width)
@@ -258,8 +275,67 @@ pub fn eval_array_avg<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 |a, idx| a.value(idx),
             ))) as ArrayRef
         }
-        other => return Err((format!("array_avg unsupported element type: {:?}", other)).into()),
+        other => {
+            return Err(expression_contract(format_args!(
+                "array_avg unsupported element type: {:?}",
+                other
+            )));
+        }
     };
 
     Ok((super::common::cast_output(out, arena.data_type(expr), "array_avg"))?)
+}
+
+#[cfg(test)]
+mod numeric_properties {
+    use super::*;
+    use arrow::array::{Decimal128Builder, ListBuilder};
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn half_up_keeps_negative_ties_and_all_supported_integer_extremes() {
+        for (n, d, expected) in [
+            (5, 2, 3),
+            (-5, 2, -3),
+            (4, 3, 1),
+            (-4, 3, -1),
+            (i128::MIN, 1, i128::MIN),
+            (i128::MAX, i128::MAX, 1),
+            (i128::MIN, i128::MAX, -1),
+        ] {
+            assert_eq!(div_round_half_up_i128(n, d).unwrap(), expected);
+        }
+        assert_eq!(
+            div_round_half_up_i128(i128::MIN, -1)
+                .unwrap_err()
+                .failure_fact(),
+            novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+        );
+        assert_eq!(
+            div_round_half_up_i128(1, 0)
+                .unwrap_err()
+                .failure_fact()
+                .class(),
+            FailureClass::Invariant
+        );
+    }
+    #[test]
+    fn decimal_average_preserves_null_element_denominator_and_null_rows() {
+        let mut b =
+            ListBuilder::new(Decimal128Builder::new().with_data_type(DataType::Decimal128(10, 2)));
+        b.values().append_value(500);
+        b.values().append_null();
+        b.append(true);
+        b.append(false);
+        b.append(true);
+        let list = b.finish();
+        let values = list
+            .values()
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(
+            avg_decimal_rows(&list, values, 3, 2, 2).unwrap(),
+            vec![Some(250), None, None]
+        );
+    }
 }

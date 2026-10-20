@@ -353,7 +353,10 @@ fn project_original_compile_and_schema_aliases_keep_tagged_origin_to_cross_threa
         let binding = binding(64 << 20);
         let tracker = construction_tracker();
         let bytes = source(ty.clone(), 512);
-        let owner = TestPreparationControl::new(Duration::from_millis(1));
+        let owner = TestPreparationControl::new(
+            preparation_identity(binding.execution()),
+            Duration::from_millis(1),
+        );
         let loan = owner.loan();
         let mut journal = ProjectMetadataJournal::default();
         let compiled = compile(&bytes, &binding, &tracker, &loan, &mut journal);
@@ -512,12 +515,15 @@ fn project_original_schema_host_preserves_capacity_and_worker_stop_before_body()
         preparation_memory::{PreparationMemoryRefusal, PreparationMemoryStop},
         preparation_metadata::PreparationMetadataFailure,
     };
-    use novarocks_worker::PreparationStop;
+    use novarocks_worker::TestPreparationIntent;
     let _ = novarocks_server_application::memory_observation::snapshot();
     let binding = binding(64 << 20);
     let tracker = construction_tracker();
     let bytes = source(json(), 512);
-    let owner = TestPreparationControl::new(Duration::from_millis(1));
+    let owner = TestPreparationControl::new(
+        preparation_identity(binding.execution()),
+        Duration::from_millis(1),
+    );
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
     let first = compile(&bytes, &binding, &tracker, &loan, &mut journal);
@@ -545,7 +551,7 @@ fn project_original_schema_host_preserves_capacity_and_worker_stop_before_body()
     ));
     assert!(journal.capacity.is_some());
     assert!(journal.body.settlement.is_none());
-    assert!(owner.stop(PreparationStop::Abort(
+    assert!(owner.stop(TestPreparationIntent::Abort(
         novarocks_execution_contract::AbortCause::QueryFailed
     )));
     let error = prepare_project_metadata_for_test(
@@ -583,7 +589,10 @@ fn project_original_schema_host_preserves_real_qualified_shared_shortage_before_
     let binding = binding(TOTAL);
     let tracker = construction_tracker();
     let bytes = source(json(), 512);
-    let owner = TestPreparationControl::new(Duration::from_millis(1));
+    let owner = TestPreparationControl::new(
+        preparation_identity(binding.execution()),
+        Duration::from_millis(1),
+    );
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
     let compiled = compile(&bytes, &binding, &tracker, &loan, &mut journal);
@@ -670,4 +679,16 @@ fn project_original_schema_host_preserves_real_qualified_shared_shortage_before_
     assert!(journal.capacity.is_none());
     drop(filler);
     drop(ready);
+}
+
+fn preparation_identity(
+    execution: novarocks_types::identity::QueryExecutionId,
+) -> novarocks_execution_contract::TaskIdentity {
+    use novarocks_types::identity::{BackendProcessId, StageId, TaskId};
+    novarocks_execution_contract::TaskIdentity::new(
+        execution,
+        StageId::new(1).unwrap(),
+        TaskId::new(1).unwrap(),
+        BackendProcessId::new_v7(),
+    )
 }

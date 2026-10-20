@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::exec::expr::expression_contract;
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{Array, ArrayRef, ListBuilder, StringArray, StringBuilder};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -25,16 +27,19 @@ pub fn eval_json_keys<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     if args.len() != 1 {
-        return Err((format!("json_keys expects 1 argument, got {}", args.len())).into());
+        return Err(expression_contract(format_args!(
+            "json_keys expects 1 argument, got {}",
+            args.len()
+        )));
     }
 
     let input = arena.eval(args[0], chunk)?;
     let arr = input
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "json_keys expects VARCHAR input".to_string())?;
+        .ok_or_else(|| expression_contract("json_keys expects VARCHAR input"))?;
 
     let mut builder = ListBuilder::new(StringBuilder::new());
     for row in 0..chunk.len() {
@@ -63,14 +68,7 @@ pub fn eval_json_keys<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     if let Some(target_type) = arena.data_type(expr)
         && out.data_type() != target_type
     {
-        out = crate::exec::expr::cast::cast_with_special_rules(&out, target_type).map_err(|e| {
-            format!(
-                "json_keys failed to cast output {:?} -> {:?}: {}",
-                out.data_type(),
-                target_type,
-                e
-            )
-        })?;
+        out = crate::exec::expr::cast::cast_with_special_rules(&out, target_type)?;
     }
     Ok(out)
 }

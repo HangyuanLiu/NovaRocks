@@ -125,7 +125,7 @@ impl PureCompileControl for Refuse {
             0,
             "no callback after first cause"
         );
-        Err(self.cause)
+        Err(self.cause.clone())
     }
 }
 #[test]
@@ -141,7 +141,7 @@ fn e08s1_environment_contract_frontier_preserves_three_compile_causes_and_origin
         CompileControlError::ResourceExhausted,
     ] {
         let c = Refuse {
-            cause,
+            cause: cause.clone(),
             calls: AtomicUsize::new(0),
         };
         original

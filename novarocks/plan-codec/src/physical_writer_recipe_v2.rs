@@ -73,7 +73,20 @@ impl fmt::Display for E {
         }
     }
 }
-impl std::error::Error for E {}
+impl std::error::Error for WriterRecipeCodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::ConstructionResource(source) => Some(source),
+            Self::Provider(source) => Some(source),
+            Self::Binding(source) => Some(source),
+            Self::Payload(source) => Some(source),
+            Self::Type(source) => Some(source),
+            Self::Index(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<CompileControlError> for E {
     fn from(e: CompileControlError) -> Self {
         Self::Control(e)
@@ -1111,7 +1124,7 @@ mod resource_tests {
             let mut trace = self.trace.lock().unwrap();
             trace.push(units);
             if trace.len() == 2
-                && let Some(cause) = self.cause
+                && let Some(cause) = self.cause.clone()
             {
                 return Err(cause);
             }

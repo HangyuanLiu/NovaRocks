@@ -63,7 +63,7 @@ impl KernelEvaluationControl for Control {
 
 fn evaluator(program: &Arc<LocalProgram>) -> CompiledExpressionInstance {
     let tracker = MemTracker::new_root("input-source-custody-host");
-    let host = crate::exec::operators::compiled_aggregate::expression_allocation_host(tracker);
+    let host = crate::runtime::tracked_state_allocator::expression_allocation_host(tracker);
     CompiledExpressionInstance::try_new_with_allocator(
         Arc::clone(program),
         site(),
@@ -468,7 +468,7 @@ fn input_source_additional_buffer_ledger_survives_actual_frame_and_last_alias() 
     let tracker = MemTracker::new_root("frame-complete-additional-buffer-ledger");
     tracker.install_limit_once(64 << 20).unwrap();
     let mut input = input_chunk(&program, vec![Some(11), Some(42), Some(7)]);
-    input.try_transfer_to_typed(&tracker).unwrap();
+    input.try_transfer_to(&tracker).unwrap();
     let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
         crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(), tracker.clone(), Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
     ).unwrap();
@@ -476,7 +476,7 @@ fn input_source_additional_buffer_ledger_survives_actual_frame_and_last_alias() 
         .begin_typed_construction(input.chunk_schema())
         .unwrap();
     let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
-        crate::exec::operators::compiled_aggregate::expression_allocation_host(tracker.clone());
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
     let filtered = input
         .filter_ordered_scan_controlled(
             &BooleanArray::from(vec![true, false, true]),
@@ -611,7 +611,7 @@ fn compiled_canonical_empty_result_keeps_its_own_creator_independent_of_equal_so
     );
     let tracker = MemTracker::new_root("canonical-empty-result-custody");
     let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
-        crate::exec::operators::compiled_aggregate::expression_allocation_host(tracker.clone());
+        crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
     let result =
         super::input_source::retain_result_type(raw, &canonical, Some(&host), &Control).unwrap();
     assert_eq!(result.len(), 0);

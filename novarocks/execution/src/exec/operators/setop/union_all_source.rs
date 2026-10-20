@@ -27,16 +27,17 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
-use crate::exec::chunk::Chunk;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::exec::pipeline::schedule::observer::Observable;
+use crate::exec::pipeline::shape::{Source, SourceKernel, SourceRead, SourceStart};
+use crate::exec::pipeline::step::{NextStep, StepResult, WaitFact, WaitReason};
 
 use super::union_all_shared::UnionAllSharedState;
+#[cfg(test)]
 use crate::runtime::runtime_state::RuntimeState;
-use std::sync::Arc;
 
 /// Factory for UNION ALL source operators that emit merged branch chunk streams.
 pub struct UnionAllSourceFactory {
@@ -63,11 +64,11 @@ impl OperatorFactory for UnionAllSourceFactory {
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
         // UNION ALL fan-in owns a single-consumer shared queue: only the
         // pipeline-local driver 0 drains it.
-        Box::new(UnionAllSourceOperator {
+        Box::new(Source::new(UnionAllSourceOperator {
             name: self.name.clone(),
             state: self.state.clone(),
-            finished: driver_id != 0,
-        })
+            active: driver_id == 0,
+        }))
     }
 
     fn is_source(&self) -> bool {
@@ -78,69 +79,43 @@ impl OperatorFactory for UnionAllSourceFactory {
 struct UnionAllSourceOperator {
     name: String,
     state: UnionAllSharedState,
-    finished: bool,
+    active: bool,
 }
 
-impl Operator for UnionAllSourceOperator {
+impl OperatorLifecycle for UnionAllSourceOperator {
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
 }
 
-impl ProcessorOperator for UnionAllSourceOperator {
-    fn need_input(&self) -> bool {
-        false
-    }
-
-    fn has_output(&self) -> bool {
-        if self.finished {
-            return false;
+impl SourceKernel for UnionAllSourceOperator {
+    fn start(&self) -> SourceStart {
+        if self.active {
+            SourceStart::Ready
+        } else {
+            SourceStart::Finished
         }
-        self.state.has_buffered() || self.state.remaining_producers() == 0
     }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-        Err("union all source operator does not accept input"
-            .to_string()
-            .into())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if self.finished {
-            return Ok(None);
-        }
-
-        let chunk = self.state.pop_chunk();
-        if let Some(chunk) = chunk {
-            return Ok(Some(chunk));
-        }
-        if self.state.remaining_producers() == 0 {
-            self.finished = true;
-        }
-        Ok(None)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        Ok(())
-    }
-
-    fn source_observable(&self) -> Option<Arc<Observable>> {
-        if self.finished {
-            return None;
-        }
-        Some(self.state.observable())
+    fn poll_output(
+        &mut self,
+        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<StepResult> {
+        let observable = self.state.observable();
+        let observed_generation = observable.generation();
+        let (output, next) = match self.state.next_chunk() {
+            SourceRead::Chunk(chunk) => (Some(chunk), NextStep::Runnable),
+            SourceRead::Finished => (None, NextStep::Finished),
+            SourceRead::Pending => (
+                None,
+                NextStep::Wait(WaitFact {
+                    reason: WaitReason::Input,
+                    observable,
+                    observed_generation,
+                    deadline: None,
+                }),
+            ),
+        };
+        Ok(StepResult::new(output, next, 0))
     }
 }
 
@@ -174,35 +149,55 @@ mod tests {
     }
 
     #[test]
+    fn last_producer_publication_is_delivered_before_source_eos() {
+        use crate::exec::pipeline::step_context::{StepContext, TurnWork};
+        use std::num::NonZeroU64;
+        let state = RuntimeState::default();
+        let shared = UnionAllSharedState::new(2, 7);
+        let mut source = UnionAllSourceFactory::new(shared.clone(), 7).create(1, 0);
+        let control = state.error_state();
+        let mut work = TurnWork::new(NonZeroU64::new(1).unwrap(), 8);
+        let mut context = StepContext::new(&control, &mut work);
+        let source = source.as_mut();
+        let waiting = source.drive(&mut context).unwrap();
+        assert!(waiting.output.is_none());
+        let NextStep::Wait(wait) = waiting.next else {
+            panic!("an empty live source must wait");
+        };
+        shared.producer_finished();
+        assert!(matches!(
+            source.drive(&mut context).unwrap().next,
+            NextStep::Wait(_)
+        ));
+        // Publication and last-producer close precede any wait registration.
+        // The frozen generation must still force a poll of the retained row.
+        shared.push_chunk(shared.queue_mem_tracker(&state).as_ref(), one_row_chunk());
+        shared.producer_finished();
+        assert!(wait.is_ready());
+        let data = source.drive(&mut context).unwrap();
+        assert_eq!(data.output.unwrap().len(), 1);
+        assert!(matches!(data.next, NextStep::Runnable));
+        let eos = source.drive(&mut context).unwrap();
+        assert!(eos.output.is_none());
+        assert!(matches!(eos.next, NextStep::Finished));
+        assert!(source.drive(&mut context).unwrap().output.is_none());
+    }
+
+    #[test]
     fn non_zero_source_driver_does_not_drain_shared_queue() {
         let state = RuntimeState::default();
         let shared = UnionAllSharedState::new(1, 7);
-        shared.push_chunk(&state, one_row_chunk());
+        shared.push_chunk(shared.queue_mem_tracker(&state).as_ref(), one_row_chunk());
 
         let factory = UnionAllSourceFactory::new(shared.clone(), 7);
         let mut inactive = factory.create(2, 1);
-        let inactive_source = inactive
-            .as_processor_mut()
-            .expect("inactive source processor");
-        assert!(!inactive_source.has_output());
-        assert!(
-            inactive_source
-                .pull_chunk(&state)
-                .expect("inactive source pull")
-                .is_none()
-        );
+        let idle = inactive.drive_for_test(&state).unwrap();
+        assert!(idle.output.is_none());
+        assert!(matches!(idle.next, NextStep::Finished));
 
         let mut active = factory.create(2, 0);
-        let active_source = active.as_processor_mut().expect("active source processor");
-        assert!(active_source.has_output());
-        assert_eq!(
-            active_source
-                .pull_chunk(&state)
-                .expect("active source pull")
-                .expect("active source chunk")
-                .record_batch()
-                .num_rows(),
-            1
-        );
+        let step = active.drive_for_test(&state).unwrap();
+        assert_eq!(step.output.expect("active source chunk").len(), 1);
+        assert!(!matches!(step.next, NextStep::Finished));
     }
 }

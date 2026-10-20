@@ -67,7 +67,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         trace.push(units);
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -561,7 +561,7 @@ fn prefixes(
         for cause in CAUSES {
             let c = Control {
                 trace: Mutex::new(vec![]),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(f(&c),Err(Error::Control(actual)) if actual==cause),
@@ -1489,7 +1489,7 @@ fn sealed_namespace_queries_keep_every_original_control_prefix_and_ordinary_tail
             for cause in CAUSES {
                 let control = Control {
                     trace: Mutex::new(vec![]),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 assert!(matches!(invoke(&control), Err(Error::Control(actual)) if actual == cause));
                 assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
@@ -1531,7 +1531,7 @@ fn namespace_real_wide_lists_and_definitions_reject_original_quantum_without_rep
             for cause in CAUSES {
                 let c = Control {
                     trace: Mutex::new(vec![]),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 assert!(
                     matches!(f.run(&c,SOURCE,limits(),true),Err(Error::Control(actual)) if actual==cause)

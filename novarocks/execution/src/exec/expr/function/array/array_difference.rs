@@ -15,20 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 pub fn eval_array_difference<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "array_difference requires exactly one argument",
+        ));
+    }
     let arr = arena.eval(args[0], chunk)?;
-    Ok(
-        (novarocks_functions::builtin::array_difference_core::difference(
-            &arr,
-            arena.data_type(expr),
-            chunk.len(),
-        ))?,
+    novarocks_functions::builtin::array_difference_core::difference(
+        &arr,
+        arena.data_type(expr),
+        chunk.len(),
     )
+    .map_err(ExecutionFailure::from)
 }

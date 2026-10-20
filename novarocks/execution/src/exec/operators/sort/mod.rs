@@ -43,6 +43,10 @@ use std::sync::Arc;
 
 use novarocks_types::largeint;
 
+mod key_failure;
+mod operation_failure;
+pub(crate) use key_failure::SortKeyFailure;
+
 mod chunks_sorter_heap_sort;
 mod chunks_sorter_topn;
 pub(super) mod creation;
@@ -181,8 +185,8 @@ pub(crate) fn normalize_sort_batch_for_schema(
 }
 
 #[cfg(test)]
-pub(crate) fn normalize_sort_key_array(values: &ArrayRef) -> Result<ArrayRef, String> {
-    normalize_sort_key_array_body::<String>(
+pub(crate) fn normalize_sort_key_array(values: &ArrayRef) -> Result<ArrayRef, SortKeyFailure> {
+    normalize_sort_key_array_body::<SortKeyFailure>(
         values,
         SortKeyDeclaration::LegacyExpansion,
         &mut |_| Ok(()),
@@ -226,32 +230,30 @@ enum SortKeyDeclaration<'a> {
     LegacyExpansion,
 }
 impl<'a> SortKeyDeclaration<'a> {
-    fn child(self, index: usize) -> Result<Self, String> {
+    fn child(self, index: usize) -> Result<Self, SortKeyFailure> {
         match self {
             Self::Value(value) => value
                 .child_type_at(index)
                 .map(Self::Value)
-                .ok_or_else(|| "typed sort key is missing a declared semantic child".to_owned()),
+                .ok_or_else(|| SortKeyFailure::MissingChild { index }),
             Self::MapEntries(key, _) if index == 0 => Ok(Self::Value(key)),
             Self::MapEntries(_, value) if index == 1 => Ok(Self::Value(value)),
-            Self::MapEntries(..) => {
-                Err("typed Map sort key has an undeclared entries child".to_owned())
-            }
+            Self::MapEntries(..) => Err(SortKeyFailure::MapChild { index }),
             #[cfg(test)]
             Self::LegacyExpansion => Ok(Self::LegacyExpansion),
         }
     }
-    fn map_entries(self) -> Result<Self, String> {
+    fn map_entries(self) -> Result<Self, SortKeyFailure> {
         match self {
             Self::Value(value) => match value.kind() {
                 novarocks_type_contract::ValueKind::Map { key, value } => {
                     Ok(Self::MapEntries(key, value))
                 }
-                _ => Err("typed Map sort key has no complete Map declaration".to_owned()),
+                _ => Err(SortKeyFailure::MapDeclaration),
             },
             #[cfg(test)]
             Self::LegacyExpansion => Ok(Self::LegacyExpansion),
-            _ => Err("typed Map sort key has a physical wrapper as its declaration".to_owned()),
+            _ => Err(SortKeyFailure::MapWrapper),
         }
     }
     fn is_largeint(self, _carrier: &DataType) -> bool {
@@ -269,14 +271,12 @@ impl<'a> SortKeyDeclaration<'a> {
 /// The original key normalization body with observations before its real
 /// public structure constructors. Existing decoded payload algorithms stay
 /// here; their allocator/accounting is not replaced by this header observer.
-pub(crate) fn normalize_sort_key_array_observed<E: From<String>>(
+pub(crate) fn normalize_sort_key_array_observed<E: From<SortKeyFailure>>(
     values: &ArrayRef,
     declared: Option<&novarocks_type_contract::ValueTypeRef>,
     observe: &mut impl FnMut(SortKeyConstruction<'_>) -> Result<(), E>,
 ) -> Result<ArrayRef, E> {
-    let declared = declared.ok_or_else(|| {
-        E::from("typed sort key is missing its complete value declaration".to_owned())
-    })?;
+    let declared = declared.ok_or_else(|| E::from(SortKeyFailure::MissingDeclaration))?;
     novarocks_type_contract::validate_value_layout_observed::<SortKeyTypeCheckFailure<E>>(
         declared,
         values.data_type(),
@@ -285,13 +285,13 @@ pub(crate) fn normalize_sort_key_array_observed<E: From<String>>(
         },
     )
     .map_err(|cause| match cause {
-        SortKeyTypeCheckFailure::Declaration(error) => E::from(error.to_string()),
+        SortKeyTypeCheckFailure::Declaration(error) => E::from(SortKeyFailure::Type(error)),
         SortKeyTypeCheckFailure::Observer(error) => error,
     })?;
     normalize_sort_key_array_body(values, SortKeyDeclaration::Value(declared), observe)
 }
 
-fn normalize_sort_key_array_body<E: From<String>>(
+fn normalize_sort_key_array_body<E: From<SortKeyFailure>>(
     values: &ArrayRef,
     declaration: SortKeyDeclaration<'_>,
     observe: &mut impl FnMut(SortKeyConstruction<'_>) -> Result<(), E>,
@@ -306,7 +306,7 @@ fn normalize_sort_key_array_body<E: From<String>>(
             let list = values
                 .as_any()
                 .downcast_ref::<ListArray>()
-                .ok_or_else(|| "LIST sort key is not ListArray".to_string())?;
+                .ok_or_else(|| E::from(SortKeyFailure::PhysicalWrapper("ListArray")))?;
             let normalized_values =
                 normalize_sort_key_array_body(list.values(), declaration.child(0)?, observe)?;
             if normalized_values.data_type() == list.values().data_type() {
@@ -335,7 +335,7 @@ fn normalize_sort_key_array_body<E: From<String>>(
             let list = values
                 .as_any()
                 .downcast_ref::<LargeListArray>()
-                .ok_or_else(|| "LARGE LIST sort key is not LargeListArray".to_owned())?;
+                .ok_or_else(|| E::from(SortKeyFailure::PhysicalWrapper("LargeListArray")))?;
             let normalized_values =
                 normalize_sort_key_array_body(list.values(), declaration.child(0)?, observe)?;
             if normalized_values.data_type() == list.values().data_type() {
@@ -363,7 +363,7 @@ fn normalize_sort_key_array_body<E: From<String>>(
             let list = values
                 .as_any()
                 .downcast_ref::<FixedSizeListArray>()
-                .ok_or_else(|| "FIXED LIST sort key is not FixedSizeListArray".to_owned())?;
+                .ok_or_else(|| E::from(SortKeyFailure::PhysicalWrapper("FixedSizeListArray")))?;
             let normalized_values =
                 normalize_sort_key_array_body(list.values(), declaration.child(0)?, observe)?;
             if normalized_values.data_type() == list.values().data_type() {
@@ -390,7 +390,7 @@ fn normalize_sort_key_array_body<E: From<String>>(
             let struct_arr = values
                 .as_any()
                 .downcast_ref::<StructArray>()
-                .ok_or_else(|| "STRUCT sort key is not StructArray".to_string())?;
+                .ok_or_else(|| E::from(SortKeyFailure::PhysicalWrapper("StructArray")))?;
             let mut changed = false;
             observe(SortKeyConstruction::ArrayTable(struct_arr.num_columns()))?;
             let mut normalized_columns = Vec::with_capacity(struct_arr.num_columns());
@@ -432,7 +432,7 @@ fn normalize_sort_key_array_body<E: From<String>>(
             let map = values
                 .as_any()
                 .downcast_ref::<MapArray>()
-                .ok_or_else(|| "MAP sort key is not MapArray".to_string())?;
+                .ok_or_else(|| E::from(SortKeyFailure::PhysicalWrapper("MapArray")))?;
             observe(SortKeyConstruction::ArrayTable(map.entries().num_columns()))?;
             observe(SortKeyConstruction::ArrayHeader(map.entries().data_type()))?;
             let entries = Arc::new(map.entries().clone()) as ArrayRef;
@@ -445,7 +445,7 @@ fn normalize_sort_key_array_body<E: From<String>>(
             let normalized_entries = normalized_entries
                 .as_any()
                 .downcast_ref::<StructArray>()
-                .ok_or_else(|| "normalized MAP entries sort key is not StructArray".to_string())?
+                .ok_or_else(|| E::from(SortKeyFailure::PhysicalWrapper("StructArray entries")))?
                 .clone();
             observe(SortKeyConstruction::Field {
                 source: entries_field,
@@ -476,13 +476,11 @@ fn normalize_sort_key_array_body<E: From<String>>(
     let array = values
         .as_any()
         .downcast_ref::<FixedSizeBinaryArray>()
-        .ok_or_else(|| "LARGEINT sort key is not FixedSizeBinaryArray".to_string())?;
+        .ok_or_else(|| E::from(SortKeyFailure::PhysicalWrapper("FixedSizeBinaryArray")))?;
     if array.value_length() != largeint::LARGEINT_BYTE_WIDTH {
-        return Err(E::from(format!(
-            "LARGEINT sort key width mismatch: expected {}, got {}",
-            largeint::LARGEINT_BYTE_WIDTH,
-            array.value_length()
-        )));
+        return Err(E::from(SortKeyFailure::LargeIntWidth {
+            actual: array.value_length(),
+        }));
     }
 
     let mut decoded = Vec::with_capacity(array.len());
@@ -491,7 +489,12 @@ fn normalize_sort_key_array_body<E: From<String>>(
         if array.is_null(row) {
             decoded.push(None);
         } else {
-            decoded.push(Some(largeint::i128_from_be_bytes(array.value(row))?));
+            decoded.push(Some(i128::from_be_bytes(
+                array
+                    .value(row)
+                    .try_into()
+                    .expect("validated FixedSizeBinary16 value width"),
+            )));
         }
     }
 
@@ -501,7 +504,7 @@ fn normalize_sort_key_array_body<E: From<String>>(
     observe(SortKeyConstruction::BufferAdoption)?;
     let decimal = Decimal128Array::from(decoded)
         .with_precision_and_scale(38, 0)
-        .map_err(|e| format!("normalize LARGEINT sort key failed: {e}"))?;
+        .map_err(|source| E::from(SortKeyFailure::Arrow(source)))?;
     Ok(Arc::new(decimal) as ArrayRef)
 }
 
@@ -685,7 +688,8 @@ mod tests {
         values: &ArrayRef,
         ty: &novarocks_type_contract::ValueTypeRef,
     ) -> ArrayRef {
-        normalize_sort_key_array_observed::<String>(values, Some(ty), &mut |_| Ok(())).unwrap()
+        normalize_sort_key_array_observed::<SortKeyFailure>(values, Some(ty), &mut |_| Ok(()))
+            .unwrap()
     }
     fn actual_sort_order(values: ArrayRef) -> Vec<u32> {
         let indices = lexsort_to_indices(
@@ -808,11 +812,11 @@ mod tests {
         use novarocks_type_contract::{ValueKind, ValueLogicalType};
         #[derive(Debug)]
         enum Failure {
-            Declaration(String),
+            Declaration(SortKeyFailure),
             Caller(Arc<u32>),
         }
-        impl From<String> for Failure {
-            fn from(value: String) -> Self {
+        impl From<SortKeyFailure> for Failure {
+            fn from(value: SortKeyFailure) -> Self {
                 Self::Declaration(value)
             }
         }
@@ -822,9 +826,10 @@ mod tests {
             seen += 1;
             Ok(())
         });
-        assert!(
-            matches!(missing,Err(Failure::Declaration(message)) if message.contains("missing its complete value declaration"))
-        );
+        assert!(matches!(
+            missing,
+            Err(Failure::Declaration(SortKeyFailure::MissingDeclaration))
+        ));
         assert_eq!(seen, 0);
         let declared = semantic(ValueKind::Nominal(ValueLogicalType::LargeInt));
         let mut total = 0;

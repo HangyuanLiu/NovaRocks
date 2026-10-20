@@ -56,7 +56,7 @@ impl PureCompileControl for Control {
         assert!(n <= 256);
         let mut calls = self.calls.lock().unwrap();
         calls.push(n);
-        if let Some((at, cause)) = self.refuse
+        if let Some((at, cause)) = self.refuse.clone()
             && calls.len() == at
         {
             return Err(cause);
@@ -383,7 +383,7 @@ fn sql_dependency_binding_host_abort_original_three_control_causes_have_no_tail(
         CompileControlError::ResourceExhausted,
     ] {
         for at in 1..=count {
-            let control = Control::new(Some((at, cause)));
+            let control = Control::new(Some((at, cause.clone())));
             let error = workflow(&control, false, false, &mut |_| {
                 Ok::<_, AdmissionRefusal<Infallible>>(())
             })

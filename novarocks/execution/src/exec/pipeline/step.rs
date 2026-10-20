@@ -42,6 +42,15 @@ pub struct WaitFact {
     pub deadline: Option<DriverBlockDeadline>,
 }
 
+impl WaitFact {
+    pub(crate) fn is_ready(&self) -> bool {
+        self.observable.generation() != self.observed_generation
+            || self
+                .deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline.at())
+    }
+}
+
 impl std::fmt::Debug for WaitFact {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WaitFact")
@@ -80,8 +89,41 @@ pub enum NextStep {
     Finished,
 }
 
+/// Root capacity is acquired before invoking the upstream producer. Busy
+/// advances existing receiver work; Wait names the exact capacity event.
+pub enum UpstreamPull {
+    Busy,
+    Uncovered,
+    Root(crate::runtime::fragment::io::RootInputPermit),
+    Wait(WaitFact),
+}
+
+/// No output can coexist with unpublished workspace under the same grant.
+/// A completed call lets the driver destroy scratch before moving its output
+/// and grant together, or returning an unused grant.
+pub enum RootStep {
+    Complete(StepResult),
+    Pending(RootPending),
+}
+#[derive(Clone, Debug)]
+pub enum RootPending {
+    Runnable,
+    Yield,
+    Wait(WaitFact),
+}
+impl RootPending {
+    pub fn next(&self) -> NextStep {
+        match self {
+            Self::Runnable => NextStep::Runnable,
+            Self::Yield => NextStep::Yield,
+            Self::Wait(wait) => NextStep::Wait(wait.clone()),
+        }
+    }
+}
+
 /// The moved output is the only output delivered by this call. Further rows
 /// remain in the operator continuation and require another output-ready step.
+#[derive(Debug)]
 pub struct StepResult {
     pub output: Option<Chunk>,
     pub next: NextStep,

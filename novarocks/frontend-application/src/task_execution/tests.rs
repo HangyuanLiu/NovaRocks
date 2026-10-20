@@ -561,7 +561,7 @@ impl TaskOperationSink for BackpressureOnceSink {
 
 /// One available runtime-filter contribution, shaped as a backend's release
 /// acknowledgement carries it.
-fn fixture_runtime_filter_contribution()
+pub(crate) fn fixture_runtime_filter_contribution()
 -> novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry {
     use novarocks_proto_models::novarocks as wire;
     novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry::parse(
@@ -2639,7 +2639,13 @@ fn a_terminal_task_discards_never_sent_updates_and_converges_what_is_in_flight()
         TaskState::Failing,
         Some(TerminationDetail::Failed(
             novarocks_execution::task_execution::TaskFailure::new(
-                novarocks_execution::task_execution::TaskFailureCategory::Execution,
+                novarocks_execution_contract::failure::FailureFact::new(
+                    novarocks_execution_contract::failure::FailureClass::Data,
+                    novarocks_execution_contract::failure::FailureReason::new(
+                        std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                        std::num::NonZeroU16::new(1).unwrap(),
+                    ),
+                ),
                 novarocks_execution::task_execution::SafeDetail::truncating("scan failed"),
             ),
         )),
@@ -2650,7 +2656,13 @@ fn a_terminal_task_discards_never_sent_updates_and_converges_what_is_in_flight()
         TaskState::Failed,
         Some(TerminationDetail::Failed(
             novarocks_execution::task_execution::TaskFailure::new(
-                novarocks_execution::task_execution::TaskFailureCategory::Execution,
+                novarocks_execution_contract::failure::FailureFact::new(
+                    novarocks_execution_contract::failure::FailureClass::Data,
+                    novarocks_execution_contract::failure::FailureReason::new(
+                        std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                        std::num::NonZeroU16::new(1).unwrap(),
+                    ),
+                ),
                 novarocks_execution::task_execution::SafeDetail::truncating("scan failed"),
             ),
         )),
@@ -4301,7 +4313,13 @@ fn production_close_reducer_explores_normal_drain_and_backpressure() {
     eprintln!("production drain exploration: traces=24 exact_closes={delivered}");
 
     let failure = TerminationDetail::Failed(novarocks_execution::task_execution::TaskFailure::new(
-        novarocks_execution::task_execution::TaskFailureCategory::Execution,
+        novarocks_execution_contract::failure::FailureFact::new(
+            novarocks_execution_contract::failure::FailureClass::Data,
+            novarocks_execution_contract::failure::FailureReason::new(
+                std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                std::num::NonZeroU16::new(1).unwrap(),
+            ),
+        ),
         novarocks_execution::task_execution::SafeDetail::truncating("exploration failure"),
     ));
     for close_first in [false, true] {
@@ -4706,7 +4724,13 @@ fn a_task_failure_latches_once_and_withholds_client_completion() {
 
     let leaf = harness.stage_tasks(1)[0];
     let failure = TerminationDetail::Failed(novarocks_execution::task_execution::TaskFailure::new(
-        novarocks_execution::task_execution::TaskFailureCategory::Execution,
+        novarocks_execution_contract::failure::FailureFact::new(
+            novarocks_execution_contract::failure::FailureClass::Data,
+            novarocks_execution_contract::failure::FailureReason::new(
+                std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                std::num::NonZeroU16::new(1).unwrap(),
+            ),
+        ),
         novarocks_execution::task_execution::SafeDetail::truncating("first cause"),
     ));
     harness.publish(leaf, TaskState::Running, None, false);
@@ -5123,10 +5147,7 @@ fn an_initial_establish_rejection_remains_a_pre_ready_infrastructure_fact() {
 
     assert!(matches!(
         error,
-        TaskExecutionError::PreReadyEstablishRejected {
-            backend,
-            outcome: OperationOutcome::InvalidStateOrRequest,
-        } if backend == context.backend_process_id()
+        TaskExecutionError::PreReadyEstablishRejected{context: rejected_context,operation_id,rejection} if rejection.outcome()==OperationOutcome::InvalidStateOrRequest && rejected_context == context && operation_id == establish.operation_id()
     ));
     assert!(owner.is_released());
 }
@@ -6342,6 +6363,128 @@ fn the_two_start_gates_are_observations_of_acknowledgements_not_of_sending() {
     );
 }
 
+/// The real RemoteTask may recover missing observation versions, but an
+/// already accepted Task cause is not a missing-event inference. It survives
+/// that gap, with only the explicit live derived-peer refinement exception.
+#[test]
+fn remote_task_catch_up_preserves_accepted_causes_and_allows_only_derived_refinement() {
+    use super::remote_task::RemoteTask;
+    use novarocks_execution_contract::{SafeDetail, TaskFailure};
+    use novarocks_query_application::coordination::StatusObservation;
+    let original = || {
+        TerminationDetail::Failed(TaskFailure::new(
+            novarocks_execution_contract::failure::FailureFact::new(
+                novarocks_execution_contract::failure::FailureClass::Data,
+                novarocks_execution_contract::failure::FailureReason::new(
+                    std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                    std::num::NonZeroU16::new(1).unwrap(),
+                ),
+            ),
+            SafeDetail::new("original source").unwrap(),
+        ))
+    };
+    for (held_cause, proposed, legal) in [
+        (
+            TerminationDetail::Canceled(CancelReason::UpstreamNoLongerNeeded),
+            original(),
+            false,
+        ),
+        (
+            TerminationDetail::Canceled(CancelReason::UpstreamNoLongerNeeded),
+            TerminationDetail::Aborted(AbortCause::LeaseExpired),
+            false,
+        ),
+        (
+            TerminationDetail::Canceled(CancelReason::UpstreamNoLongerNeeded),
+            TerminationDetail::Canceled(CancelReason::UpstreamNoLongerNeeded),
+            true,
+        ),
+        (
+            TerminationDetail::Aborted(AbortCause::QueryFailed),
+            original(),
+            false,
+        ),
+        (
+            original(),
+            TerminationDetail::Failed(TaskFailure::new(
+                novarocks_execution_contract::failure::FailureFact::new(
+                    novarocks_execution_contract::failure::FailureClass::Data,
+                    novarocks_execution_contract::failure::FailureReason::new(
+                        std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                        std::num::NonZeroU16::new(1).unwrap(),
+                    ),
+                ),
+                SafeDetail::new("another source").unwrap(),
+            )),
+            false,
+        ),
+        (
+            TerminationDetail::Aborted(AbortCause::PeerTaskFailed),
+            original(),
+            true,
+        ),
+        (
+            TerminationDetail::Aborted(AbortCause::PeerTaskFailed),
+            TerminationDetail::Canceled(CancelReason::UpstreamNoLongerNeeded),
+            false,
+        ),
+    ] {
+        let processes = backends(1);
+        let schedule = chain_schedule(&[0], &[0]);
+        let graph = build_graph(&schedule, &chain_edges(), &processes, 64).unwrap();
+        let (_, seeds) = graph.into_seeds();
+        let seed = seeds.into_values().next().unwrap();
+        let identity = seed.identity();
+        let mut task = RemoteTask::new(seed, Vec::new()).unwrap();
+        let state_for = |cause: &TerminationDetail, terminal| match (cause, terminal) {
+            (TerminationDetail::Canceled(_), false) => TaskState::Canceling,
+            (TerminationDetail::Canceled(_), true) => TaskState::Canceled,
+            (TerminationDetail::Aborted(_), false) => TaskState::Aborting,
+            (TerminationDetail::Aborted(_), true) => TaskState::Aborted,
+            (TerminationDetail::Failed(_), false) => TaskState::Failing,
+            (TerminationDetail::Failed(_), true) => TaskState::Failed,
+        };
+        let held = TaskStatus::try_new(
+            identity,
+            TaskStatusVersion::new(2).unwrap(),
+            state_for(&held_cause, false),
+            Some(held_cause),
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            task.observe_status(&held).unwrap(),
+            StatusObservation::Accept
+        );
+        let later = TaskStatus::try_new(
+            identity,
+            TaskStatusVersion::new(9).unwrap(),
+            state_for(&proposed, true),
+            Some(proposed),
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        if legal {
+            assert_eq!(
+                task.observe_status(&later).unwrap(),
+                StatusObservation::Accept
+            );
+            assert_eq!(task.status(), Some(&later));
+            assert!(task.is_terminal());
+        } else {
+            assert!(matches!(
+                task.observe_status(&later),
+                Err(TaskExecutionError::Observation(
+                    StatusObservation::ConclusionOverwrite
+                ))
+            ));
+            assert_eq!(task.status(), Some(&held));
+            assert_eq!(task.cursor().current_version(), Some(held.version()));
+            assert!(!task.is_terminal());
+        }
+    }
+}
+
 #[test]
 fn a_status_several_versions_ahead_is_adopted_rather_than_called_an_illegal_jump() {
     // A subscription's catch-up replays only the latest version per cursor, so
@@ -7087,8 +7230,19 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
         .expect("the original receipt closes the in-flight exact replay");
     assert_eq!(closed.acknowledgements, 1);
     assert!(
-        round.execution().context_released(exact_context),
+        round
+            .execution()
+            .owner(exact_context)
+            .unwrap()
+            .is_released(),
         "a definitive actor Abort receipt is positive context closure evidence"
+    );
+    assert!(
+        round
+            .execution()
+            .context_convergence_receipt(exact_context)
+            .is_none(),
+        "a replayed Abort receipt settles control without manufacturing actual Worker exit"
     );
     ack_handle.publish(OperationAcknowledgement::transport_unknown(
         operation_id,
@@ -7463,8 +7617,11 @@ fn round_waiting_on_creates(
     (round, status, acks, creates)
 }
 
-#[test]
-fn completed_convergence_releases_after_delayed_upstream_terminal_status() {
+pub(crate) fn manifest_normal_release_ack_regression_fixture() -> (
+    TaskRoundForTest,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    OperationIntent,
+) {
     let harness = Harness::new(&[0], &[0], 64);
     let sink = Arc::clone(&harness.sink);
     let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
@@ -7634,8 +7791,14 @@ fn completed_convergence_releases_after_delayed_upstream_terminal_status() {
         round.execution().attempt_drain_facts()
     );
     assert_eq!(releases.len(), 1, "the drained context must be released");
-    let release = &releases[0];
-    let OperationIntent::ReleaseQueryContext(request) = release else {
+    (round, acks, releases.pop().expect("one original Release"))
+}
+
+#[test]
+fn completed_convergence_releases_after_delayed_upstream_terminal_status() {
+    let (mut round, acks, release) = manifest_normal_release_ack_regression_fixture();
+    let context = *round.execution().graph().contexts().next().unwrap();
+    let OperationIntent::ReleaseQueryContext(request) = &release else {
         unreachable!("the operation was selected by kind");
     };
     acks.publish(OperationAcknowledgement::new(
@@ -7654,8 +7817,32 @@ fn completed_convergence_releases_after_delayed_upstream_terminal_status() {
     round.turn().expect("the release acknowledgement settles");
     assert!(
         round.attempt_drained(),
-        "the exact context closure drains the attempt"
+        "the logical lifecycle operations drained"
     );
+    assert!(
+        round
+            .execution()
+            .context_convergence_receipt(context)
+            .is_none()
+    );
+    assert!(
+        !round.execution().worker_contexts_stopped(),
+        "Task terminals, output exit and Release ACK do not prove actual Worker exit"
+    );
+    let receipt = novarocks_execution_contract::QueryContextConvergenceReceipt::new(
+        context,
+        novarocks_execution_contract::QueryContextConvergenceVersion::FIRST,
+        novarocks_execution_contract::QueryContextConvergenceState::WorkerStoppedAndContextFenced,
+    );
+    round
+        .execution_mut()
+        .apply_covered_entries(vec![covered_frame(
+            context,
+            1,
+            CoveredStatusStreamFact::ContextConvergence(receipt),
+        )])
+        .unwrap();
+    assert!(round.execution().worker_contexts_stopped());
 }
 
 #[test]
@@ -7826,7 +8013,13 @@ fn root_pending_failure_refines_at_the_same_status_version() {
         .expect("the chain has a non-root task");
     let authoritative =
         TerminationDetail::Failed(novarocks_execution::task_execution::TaskFailure::new(
-            novarocks_execution::task_execution::TaskFailureCategory::Execution,
+            novarocks_execution_contract::failure::FailureFact::new(
+                novarocks_execution_contract::failure::FailureClass::Data,
+                novarocks_execution_contract::failure::FailureReason::new(
+                    std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                    std::num::NonZeroU16::new(1).unwrap(),
+                ),
+            ),
             novarocks_execution::task_execution::SafeDetail::new("originating failure")
                 .expect("safe detail"),
         ));
@@ -7908,7 +8101,13 @@ fn finished_root_projection_is_refined_by_a_later_attempt_failure() {
 
     let authoritative =
         TerminationDetail::Failed(novarocks_execution::task_execution::TaskFailure::new(
-            novarocks_execution::task_execution::TaskFailureCategory::Execution,
+            novarocks_execution_contract::failure::FailureFact::new(
+                novarocks_execution_contract::failure::FailureClass::Data,
+                novarocks_execution_contract::failure::FailureReason::new(
+                    std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                    std::num::NonZeroU16::new(1).unwrap(),
+                ),
+            ),
             novarocks_execution::task_execution::SafeDetail::new("late upstream failure")
                 .expect("safe detail"),
         ));
@@ -8300,6 +8499,18 @@ fn root_success_seal_stops_ordinary_pumps_in_its_own_turn() {
         fn name(&self) -> &'static str {
             "ordinary-input-after-seal"
         }
+        fn begin_close(&mut self) {}
+        fn close_turn(&mut self) -> Result<usize, TaskExecutionError> {
+            Ok(0)
+        }
+        fn is_closed(&self) -> bool {
+            true
+        }
+        fn take_close_unresolved(
+            &mut self,
+        ) -> Option<crate::task_execution::round::PumpCloseUnresolved> {
+            None
+        }
         fn drive(&mut self, _: &mut QueryTaskExecution) -> Result<usize, TaskExecutionError> {
             panic!("ordinary input pump ran after the accepted root success cut");
         }
@@ -8627,7 +8838,13 @@ fn covered_exhaustion_result_exception_preserves_accepted_failure_before_seal() 
     );
 
     let failure = TerminationDetail::Failed(novarocks_execution::task_execution::TaskFailure::new(
-        novarocks_execution::task_execution::TaskFailureCategory::Execution,
+        novarocks_execution_contract::failure::FailureFact::new(
+            novarocks_execution_contract::failure::FailureClass::Data,
+            novarocks_execution_contract::failure::FailureReason::new(
+                std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                std::num::NonZeroU16::new(1).unwrap(),
+            ),
+        ),
         novarocks_execution::task_execution::SafeDetail::new("accepted deep-leaf failure").unwrap(),
     ));
     status.publish(StatusEvent::Published(
@@ -8815,7 +9032,7 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
     }
 }
 
-pub(super) fn manifest_terminal_regression_fixture() -> (
+pub(crate) fn manifest_terminal_regression_fixture() -> (
     TaskRoundForTest,
     crate::native::task_transport::TaskAckIntakeHandle,
 ) {
@@ -9314,7 +9531,13 @@ fn preparation_failure_in_create_ack_freezes_admission_before_any_stream_repeat(
         };
         let failure = TerminationDetail::Failed(
             novarocks_execution::task_execution::TaskFailure::new_in_phase(
-                novarocks_execution::task_execution::TaskFailureCategory::Protocol,
+                novarocks_execution_contract::failure::FailureFact::new(
+                    novarocks_execution_contract::failure::FailureClass::Invariant,
+                    novarocks_execution_contract::failure::FailureReason::new(
+                        std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                        std::num::NonZeroU16::new(3).unwrap(),
+                    ),
+                ),
                 novarocks_execution::task_execution::SafeDetail::truncating("preparation failed"),
                 novarocks_execution::task_execution::TaskFailurePhase::Preparation,
             ),
@@ -9519,7 +9742,13 @@ fn revoked_result_originator_fact_wins_and_success_seal_is_never_allowed() {
     round.turn().unwrap();
     assert!(registered.try_recv().unwrap().is_ok());
     let failure = TerminationDetail::Failed(novarocks_execution::task_execution::TaskFailure::new(
-        novarocks_execution::task_execution::TaskFailureCategory::Execution,
+        novarocks_execution_contract::failure::FailureFact::new(
+            novarocks_execution_contract::failure::FailureClass::Data,
+            novarocks_execution_contract::failure::FailureReason::new(
+                std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                std::num::NonZeroU16::new(1).unwrap(),
+            ),
+        ),
         novarocks_execution::task_execution::SafeDetail::new(
             "original upstream array length error",
         )

@@ -66,9 +66,15 @@ pub trait StatusIntakeWake: std::fmt::Debug + Send + Sync {
 pub struct CondvarWake {
     woken: Mutex<bool>,
     signal: Condvar,
+    async_signal: tokio::sync::Notify,
 }
 
 impl CondvarWake {
+    /// The same original wake also follows its owner into async residual
+    /// supervision. Register before inspecting state to retain a racing wake.
+    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.async_signal.notified()
+    }
     /// Blocks until something wakes this, or `timeout` elapses.
     ///
     /// A wake that arrived while the caller was working is consumed here
@@ -94,6 +100,16 @@ impl StatusIntakeWake for CondvarWake {
         *woken = true;
         drop(woken);
         self.signal.notify_all();
+        self.async_signal.notify_one();
+    }
+}
+
+impl std::task::Wake for CondvarWake {
+    fn wake(self: Arc<Self>) {
+        StatusIntakeWake::wake(self.as_ref());
+    }
+    fn wake_by_ref(self: &Arc<Self>) {
+        StatusIntakeWake::wake(self.as_ref());
     }
 }
 
@@ -903,8 +919,7 @@ impl Drop for ObservationIntakeRunner<'_> {
 mod observation_tests {
     use super::*;
     use novarocks_execution::task_execution::{
-        SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts, TaskState,
-        TaskStatusVersion, TerminationDetail,
+        SafeDetail, TaskFailure, TaskOutputFacts, TaskState, TaskStatusVersion, TerminationDetail,
     };
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
@@ -1098,7 +1113,13 @@ mod observation_tests {
             TaskStatusVersion::new(2).unwrap(),
             TaskState::Failed,
             Some(TerminationDetail::Failed(TaskFailure::new(
-                TaskFailureCategory::Execution,
+                novarocks_execution_contract::failure::FailureFact::new(
+                    novarocks_execution_contract::failure::FailureClass::Data,
+                    novarocks_execution_contract::failure::FailureReason::new(
+                        std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                        std::num::NonZeroU16::new(1).unwrap(),
+                    ),
+                ),
                 SafeDetail::truncating("pending failure"),
             ))),
             TaskOutputFacts::default(),

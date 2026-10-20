@@ -220,11 +220,22 @@ unsafe impl Allocator for HostAggregateAllocator {
 }
 
 impl crate::aggregate_scalar::ScalarStateAllocator for HostAggregateAllocator {
-    fn scalar_allocation_error(
+    fn scalar_allocation_error<E: crate::allocation_failure::AllocationRefusalSource>(
         &self,
         _operation: &str,
-    ) -> crate::aggregate_scalar::ScalarStateError {
-        crate::aggregate_scalar::ScalarStateError::Kernel(self.take_failure())
+        source: E,
+    ) -> crate::KernelFailure {
+        if source.allocator_refusal() == Some(true) {
+            self.take_recorded_failure().unwrap_or_else(|| {
+                crate::KernelFailure::from_domain(
+                    crate::allocation_failure::AllocationRefusal::new(_operation, source),
+                )
+            })
+        } else {
+            crate::KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+                _operation, source,
+            ))
+        }
     }
 }
 

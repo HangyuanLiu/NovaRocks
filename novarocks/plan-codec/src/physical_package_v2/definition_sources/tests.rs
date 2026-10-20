@@ -68,7 +68,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         trace.push(units);
-        if let Some((stop, cause)) = *self.stop.lock().unwrap()
+        if let Some((stop, cause)) = self.stop.lock().unwrap().clone()
             && stop == at
         {
             return Err(cause);
@@ -1688,7 +1688,7 @@ fn every_actual_callback_preserves_three_primary_causes_without_footer() {
         for at in 0..trace.len() {
             for cause in CAUSES {
                 let c = Control {
-                    stop: Mutex::new(Some((at, cause))),
+                    stop: Mutex::new(Some((at, cause.clone()))),
                     ..Default::default()
                 };
                 assert!(
@@ -1817,7 +1817,7 @@ fn equal_foreign_package_is_ordinary_and_keeps_each_prior_callback_cause() {
     for at in 0..trace.len() {
         for cause in CAUSES {
             let c = Control {
-                stop: Mutex::new(Some((at, cause))),
+                stop: Mutex::new(Some((at, cause.clone()))),
                 ..Default::default()
             };
             assert!(

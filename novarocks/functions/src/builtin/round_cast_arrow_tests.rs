@@ -306,7 +306,7 @@ fn borrowed_prepare_preserves_original_control_at_entry_quantum_and_tail() {
             let mut calls = self.calls.lock().unwrap();
             let at = calls.len();
             calls.push(units);
-            if let Some((when, error)) = self.refusal
+            if let Some((when, error)) = self.refusal.clone()
                 && at == when
             {
                 return Err(error);
@@ -363,9 +363,12 @@ fn borrowed_prepare_preserves_original_control_at_entry_quantum_and_tail() {
         for (at, _) in calls.iter().enumerate() {
             let control = Refusal {
                 calls: Mutex::new(Vec::new()),
-                refusal: Some((at, error)),
+                refusal: Some((at, error.clone())),
             };
-            assert_eq!(drive(&control).unwrap_err().control_error(), Some(error));
+            assert_eq!(
+                drive(&control).unwrap_err().control_error(),
+                Some(error.clone())
+            );
             assert_eq!(control.calls.lock().unwrap().len(), at + 1);
         }
     }

@@ -29,7 +29,7 @@ fn original_result(
     value: ArrayRef,
     key: ArrayRef,
     running: bool,
-) -> Result<Option<ArrayRef>, String> {
+) -> crate::runtime::fragment::ExecutionResult<Option<ArrayRef>> {
     let value_type = value.data_type().clone();
     let key_type = key.data_type().clone();
     let rows = value.len();
@@ -268,8 +268,12 @@ fn by_window_original_nan_second_key_is_whole_call_data_in_full_and_running_fram
         let values: ArrayRef = Arc::new(Int32Array::from(vec![7, 8]));
         let keys: ArrayRef = Arc::new(arrow::array::Float64Array::from(vec![1.0, f64::NAN]));
         let actual = original_result(values, keys, running).unwrap_err();
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(actual.failure_fact().class(), FailureClass::Data);
+        assert_eq!(actual.failure_fact().reason().code(), 40);
+        assert!(std::error::Error::source(&actual).is_some());
         assert_eq!(
-            actual,
+            actual.to_string(),
             "window function #0: update aggregate state: float comparison is not ordered"
         );
     }

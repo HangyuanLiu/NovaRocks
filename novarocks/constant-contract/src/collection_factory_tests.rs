@@ -40,7 +40,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         trace.push(units);
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -260,7 +260,7 @@ fn prefixes(invoke: impl Fn(&Control) -> Result<ConstantValue, ConstantError>, o
     if ordinary {
         assert!(matches!(
             result,
-            Err(ConstantError::Invalid(_) | ConstantError::Type(_) | ConstantError::Arrow(_))
+            Err(ConstantError::Invalid(_) | ConstantError::Type(_) | ConstantError::Source(_))
         ));
     } else {
         assert!(result.is_ok());
@@ -275,7 +275,7 @@ fn prefixes(invoke: impl Fn(&Control) -> Result<ConstantValue, ConstantError>, o
         for cause in CAUSES {
             let control = Control {
                 trace: Default::default(),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(invoke(&control), Err(ConstantError::Control(actual)) if actual == cause)
@@ -403,7 +403,7 @@ fn collection_factory_policy_limits_return_without_a_later_callback_or_tail() {
     for cause in CAUSES {
         let control = Control {
             trace: Default::default(),
-            stop: Some((0, cause)),
+            stop: Some((0, cause.clone())),
         };
         assert!(
             matches!(ConstantValue::from_int32_list(field.clone(), ty.clone(), &[7], p, PHASE, &control), Err(ConstantError::Control(actual)) if actual == cause)
@@ -522,7 +522,7 @@ fn collection_factory_long_unicode_bytes_and_wide_list_have_actual_quantum_obser
         for cause in CAUSES {
             let control = Control {
                 trace: Default::default(),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(ConstantValue::from_utf8_map(field.clone(), ty.clone(), &input, policy(), PHASE, &control), Err(ConstantError::Control(actual)) if actual == cause)

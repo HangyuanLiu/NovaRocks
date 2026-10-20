@@ -23,7 +23,7 @@ fn union() -> Original {
 }
 #[test]
 fn legacy_percentile_union_baseline_binary_update_merge_and_empty_state() {
-    let one = percentile::encode_single_value(3.);
+    let one = percentile::encode_single_value(3.).expect("percentile codec fixture");
     let mut state = union();
     state
         .update_packed(Arc::new(BinaryArray::from(vec![
@@ -52,7 +52,10 @@ fn legacy_percentile_union_baseline_binary_update_merge_and_empty_state() {
     empty
         .update_packed(Arc::new(BinaryArray::from(Vec::<Option<&[u8]>>::new())))
         .unwrap();
-    assert_eq!(empty.bytes(), percentile::encode_empty_state());
+    assert_eq!(
+        empty.bytes(),
+        percentile::encode_empty_state().expect("percentile codec fixture")
+    );
 }
 #[test]
 fn legacy_percentile_union_baseline_struct_root_null_is_ignored_and_rate_first() {
@@ -75,7 +78,7 @@ fn legacy_percentile_union_baseline_struct_root_null_is_ignored_and_rate_first()
     assert_eq!(state.count(), 2.);
     let mut invalid = union();
     assert_eq!(
-        invalid.update(vec![one(None), one(Some(2.))]).unwrap_err(),
+        (invalid.update(vec![one(None), one(Some(2.))]).unwrap_err()).to_string(),
         "percentile_approx: percentile parameter must be between 0 and 1, got 2"
     );
     assert_eq!(invalid.count(), 0.);
@@ -85,7 +88,7 @@ fn legacy_percentile_union_baseline_empty_struct_shape_error_before_rows() {
     for length in [0, 1] {
         let empty = Arc::new(StructArray::new_empty_fields(length, None)) as ArrayRef;
         assert_eq!(
-            union().update_packed(empty).unwrap_err(),
+            (union().update_packed(empty).unwrap_err()).to_string(),
             "percentile_approx: percentile_approx expects STRUCT(value, quantile[, compression]) input"
         );
         let child = floats(vec![None; length]);
@@ -95,7 +98,7 @@ fn legacy_percentile_union_baseline_empty_struct_shape_error_before_rows() {
             None,
         )) as ArrayRef;
         assert_eq!(
-            union().update_packed(input).unwrap_err(),
+            (union().update_packed(input).unwrap_err()).to_string(),
             "percentile_approx: percentile_approx expects STRUCT(value, quantile[, compression]) input"
         );
     }
@@ -104,18 +107,18 @@ fn legacy_percentile_union_baseline_empty_struct_shape_error_before_rows() {
 fn legacy_percentile_union_baseline_unsupported_null_carrier_and_prefix_mutation() {
     let bad = Arc::new(UInt32Array::from(vec![None::<u32>])) as ArrayRef;
     assert_eq!(
-        union().update_packed(bad.clone()).unwrap_err(),
+        (union().update_packed(bad.clone()).unwrap_err()).to_string(),
         "percentile_approx: unsupported percentile payload type UInt32"
     );
     assert_eq!(
-        union().merge(bad).unwrap_err(),
+        (union().merge(bad).unwrap_err()).to_string(),
         "percentile_approx_merge: unsupported percentile payload type UInt32"
     );
-    let good = percentile::encode_single_value(3.);
+    let good = percentile::encode_single_value(3.).expect("percentile codec fixture");
     let mut state = union();
     let input = Arc::new(BinaryArray::from(vec![good.as_slice(), &[0xA2, 4][..]])) as ArrayRef;
     assert_eq!(
-        state.update_packed(input).unwrap_err(),
+        (state.update_packed(input).unwrap_err()).to_string(),
         "percentile state payload too short"
     );
     assert_eq!(
@@ -126,16 +129,16 @@ fn legacy_percentile_union_baseline_unsupported_null_carrier_and_prefix_mutation
 }
 #[test]
 fn legacy_percentile_union_baseline_original_bounded_v4_and_no_magic_check() {
-    let mut old = percentile::encode_empty_state();
+    let mut old = percentile::encode_empty_state().expect("percentile codec fixture");
     old[1] = 3;
     for bytes in [&[][..], old.as_slice(), b"bad".as_slice()] {
         assert_eq!(
-            union().update_packed(bin(bytes)).unwrap_err(),
+            (union().update_packed(bin(bytes)).unwrap_err()).to_string(),
             "bounded percentile aggregate requires state version 4"
         );
     }
     // Preserve the original aggregate decoder quirk; scalar decoder differs.
-    let mut bytes = percentile::encode_empty_state();
+    let mut bytes = percentile::encode_empty_state().expect("percentile codec fixture");
     bytes[0] = b'P';
     let text = String::from_utf8(bytes.clone()).unwrap();
     for input in [
@@ -147,6 +150,9 @@ fn legacy_percentile_union_baseline_original_bounded_v4_and_no_magic_check() {
         let mut state = union();
         state.update_packed(input).unwrap();
         assert_eq!(state.count(), 0.);
-        assert_eq!(state.bytes(), percentile::encode_empty_state());
+        assert_eq!(
+            state.bytes(),
+            percentile::encode_empty_state().expect("percentile codec fixture")
+        );
     }
 }

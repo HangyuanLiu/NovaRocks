@@ -69,10 +69,15 @@ impl BroadcastJoinSharedState {
         self.dep.name()
     }
 
-    pub(crate) fn set_build(&self, artifact: Arc<JoinBuildArtifact>) -> Result<(), String> {
+    pub(crate) fn set_build(
+        &self,
+        artifact: Arc<JoinBuildArtifact>,
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         let mut guard = self.build.lock().expect("broadcast join build lock");
         if guard.is_some() {
-            return Err("broadcast join build already set".to_string());
+            return Err(super::build_state::build_contract(
+                "broadcast join build already set",
+            ));
         }
         *guard = Some(artifact);
         self.dep.set_ready();
@@ -96,7 +101,7 @@ impl BroadcastJoinSharedState {
     pub(crate) fn merge_build_matched(
         &self,
         local_flags: Vec<bool>,
-    ) -> Result<Option<Vec<bool>>, String> {
+    ) -> Result<Option<Vec<bool>>, crate::runtime::fragment::ExecutionFailure> {
         let mut guard = self
             .build_match_merge
             .lock()
@@ -117,7 +122,11 @@ impl JoinBuildSinkState for BroadcastJoinSharedState {
         self.dep.name()
     }
 
-    fn set_build(&self, _partition: usize, artifact: Arc<JoinBuildArtifact>) -> Result<(), String> {
+    fn set_build(
+        &self,
+        _partition: usize,
+        artifact: Arc<JoinBuildArtifact>,
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         BroadcastJoinSharedState::set_build(self, artifact)
     }
 }
@@ -140,7 +149,7 @@ mod tests {
             .expect_err("length mismatch");
 
         assert_eq!(
-            err,
+            err.detail(),
             "join build match merge length mismatch: local=1 merged=2"
         );
     }

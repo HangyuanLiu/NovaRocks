@@ -228,7 +228,7 @@ mod tests {
         fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             let mut calls = self.calls.lock().unwrap();
             calls.push(units);
-            if let Some((at, error)) = self.refusal {
+            if let Some((at, error)) = self.refusal.clone() {
                 if calls.len() == at {
                     return Err(error);
                 }
@@ -308,7 +308,7 @@ mod tests {
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    refusal: Some((at, error)),
+                    refusal: Some((at, error.clone())),
                     ..control()
                 };
                 assert!(

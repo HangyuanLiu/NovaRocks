@@ -29,7 +29,7 @@ pub fn eval_sleep<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     arena.require_runtime_binding()?;
     arena.check_runtime_error()?;
     let input = arena.eval(args[0], chunk)?;
@@ -64,7 +64,10 @@ pub fn eval_sleep<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         eval_sleep_array!(arr, "Int64");
     }
 
-    Err((format!("sleep expects integer input, got {:?}", input.data_type())).into())
+    Err(crate::exec::expr::expression_contract(format_args!(
+        "sleep expects integer input, got {:?}",
+        input.data_type()
+    )))
 }
 
 #[cfg(test)]
@@ -76,6 +79,7 @@ mod tests {
     use arrow::array::BooleanArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_failure_contract::FailureProjection;
     use novarocks_types::SlotId;
 
     fn input(values: Vec<Option<i64>>) -> (ExprArena, ExprId, Chunk) {
@@ -102,8 +106,13 @@ mod tests {
         for values in [vec![Some(60)], vec![None], vec![Some(0)]] {
             let (arena, arg, chunk) = input(values);
             assert_eq!(
-                eval_sleep(&arena, arg, &[arg], &chunk).unwrap_err(),
-                "SLEEP requires an exact fragment runtime binding"
+                eval_sleep(&arena, arg, &[arg], &chunk)
+                    .unwrap_err()
+                    .failure_fact(),
+                crate::runtime::fragment::ExecutionFailure::from_domain(
+                    crate::runtime::runtime_state::RuntimeBindingFailure::MissingExecutionRuntime
+                )
+                .failure_fact()
             );
         }
     }
@@ -133,12 +142,15 @@ mod tests {
             std::thread::yield_now();
         }
         let entered_sleep = stopped.waiting_count() == 1;
-        stopped.set_error("exact fragment cancelled".to_string());
-        stopped.set_error("later failure".to_string());
+        let first = crate::runtime::fragment::ExecutionFailure::from(
+            novarocks_functions::KernelFailure::Cancelled,
+        );
+        stopped.set_error(first.clone());
+        stopped.set_error(novarocks_functions::KernelFailure::ResourceExhausted);
         let result = rx
             .recv_timeout(Duration::from_secs(2))
             .expect("SLEEP must physically return after cancellation");
-        assert_eq!(result.unwrap_err(), "exact fragment cancelled");
+        assert!(result.unwrap_err().same_occurrence(&first));
         thread.join().unwrap();
         assert!(
             entered_sleep,
@@ -150,9 +162,10 @@ mod tests {
         assert!(eval_sleep(&sibling, arg, &[arg], &chunk).is_ok());
         let (mut already_stopped, arg, chunk) = input(vec![Some(60)]);
         already_stopped.bind_runtime_error(stopped);
-        assert_eq!(
-            eval_sleep(&already_stopped, arg, &[arg], &chunk).unwrap_err(),
-            "exact fragment cancelled"
+        assert!(
+            eval_sleep(&already_stopped, arg, &[arg], &chunk)
+                .unwrap_err()
+                .same_occurrence(&first)
         );
     }
 }

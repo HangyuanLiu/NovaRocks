@@ -32,18 +32,86 @@ use arrow_array::{Array, ArrayRef, StringArray};
 use arrow_schema::DataType;
 use std::{sync::Arc, time::Duration};
 
-#[derive(Clone, Copy)]
-pub(super) struct CalendarInput<'call, 'batch> {
+/// A raw required call may stop with its actual row error. Selected execution
+/// instantiates the same computation with Infallible and keeps row errors in
+/// SelectedValues, so a row error cannot enter its outer KernelFailure channel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CalendarFailure<E> {
+    Outer(KernelFailure),
+    Row(E),
+}
+pub type RawCalendarFailure = CalendarFailure<crate::RowDataError>;
+impl<E> From<KernelFailure> for CalendarFailure<E> {
+    fn from(source: KernelFailure) -> Self {
+        Self::Outer(source)
+    }
+}
+impl CalendarFailure<std::convert::Infallible> {
+    pub(super) fn into_kernel(self) -> KernelFailure {
+        match self {
+            Self::Outer(source) => source,
+            Self::Row(never) => match never {},
+        }
+    }
+}
+impl<E: std::fmt::Display> std::fmt::Display for CalendarFailure<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Outer(source) => source.fmt(f),
+            Self::Row(source) => source.fmt(f),
+        }
+    }
+}
+impl<E: std::error::Error + 'static> std::error::Error for CalendarFailure<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Outer(source) => Some(source),
+            Self::Row(source) => Some(source),
+        }
+    }
+}
+impl<E: novarocks_failure_contract::FailureProjection> novarocks_failure_contract::FailureProjection
+    for CalendarFailure<E>
+{
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        match self {
+            Self::Outer(source) => source.failure_fact(),
+            Self::Row(source) => source.failure_fact(),
+        }
+    }
+}
+pub(super) fn finish_calendar_result<T, E>(
+    work: crate::kernel_input::EvaluationCheckpoints<'_>,
+    result: Result<T, CalendarFailure<E>>,
+) -> Result<T, CalendarFailure<E>> {
+    match result {
+        // The raw required row failed at this point. It has no diagnostic
+        // journal/sentinel and no optional callback after its first cause.
+        Err(CalendarFailure::Row(source)) => Err(CalendarFailure::Row(source)),
+        Err(CalendarFailure::Outer(source)) => work
+            .finish_result(Err(source))
+            .map_err(CalendarFailure::Outer),
+        Ok(output) => work
+            .finish_result(Ok(output))
+            .map_err(CalendarFailure::Outer),
+    }
+}
+pub(super) struct CalendarInput<'call, 'batch, E = std::convert::Infallible> {
     pub types: &'call [FunctionArgumentType],
     pub carrier: &'call DataType,
     pub target: &'call FunctionValueType,
     pub arguments: &'batch [EvaluatedArgument<'batch>],
     pub selected: Selection<'batch>,
-    pub row_error_boundary: Option<&'call dyn Fn(usize, &str) -> Result<(), KernelFailure>>,
-    pub carrier_error_boundary: Option<&'call dyn Fn(CalendarCarrierError<'_>) -> KernelFailure>,
+    pub row_error_port: Option<&'call dyn Fn(usize, &str) -> Result<crate::RowDataError, E>>,
     pub legacy: bool,
 }
-impl<'call, 'batch> CalendarInput<'call, 'batch> {
+impl<E> Copy for CalendarInput<'_, '_, E> {}
+impl<E> Clone for CalendarInput<'_, '_, E> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'call, 'batch, E> CalendarInput<'call, 'batch, E> {
     pub fn arguments(self) -> &'batch [EvaluatedArgument<'batch>] {
         self.arguments
     }
@@ -54,19 +122,17 @@ impl<'call, 'batch> CalendarInput<'call, 'batch> {
         self,
         ordinal: usize,
         message: &str,
-    ) -> Result<crate::RowDataError, KernelFailure> {
-        if let Some(boundary) = self.row_error_boundary {
-            boundary(ordinal, message)?;
+    ) -> Result<crate::RowDataError, CalendarFailure<E>> {
+        match self.row_error_port {
+            Some(port) => port(ordinal, message).map_err(CalendarFailure::Row),
+            None => Ok(crate::RowDataError::new(ordinal, message)),
         }
-        Ok(crate::RowDataError::new(ordinal, message))
     }
     pub(super) fn carrier_error(self, error: CalendarCarrierError<'_>) -> KernelFailure {
-        if let Some(boundary) = self.carrier_error_boundary {
-            boundary(error)
-        } else {
-            crate::kernel_control::invalid(&error.legacy_message())
-        }
+        error.into_kernel()
     }
+}
+impl<'call, 'batch> CalendarInput<'call, 'batch> {
     pub fn owner(input: ScalarCallInput<'call, 'batch>) -> Self {
         Self {
             types: &input.contract().selected().argument_types,
@@ -75,8 +141,7 @@ impl<'call, 'batch> CalendarInput<'call, 'batch> {
             arguments: input.arguments(),
             selected: input.selection(),
             legacy: false,
-            row_error_boundary: None,
-            carrier_error_boundary: None,
+            row_error_port: None,
         }
     }
 }
@@ -168,7 +233,7 @@ pub fn evaluate_legacy_calendar(
     arguments: &[ArrayRef],
     output_type: &DataType,
     rows: usize,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, RawCalendarFailure> {
     let types: Vec<_> = arguments
         .iter()
         .map(|array| {
@@ -178,9 +243,9 @@ pub fn evaluate_legacy_calendar(
                 novarocks_type_contract::ValueLogicalType::Physical,
             )
             .map(FunctionArgumentType::Value)
-            .map_err(|error| error.to_string())
+            .map_err(KernelFailure::from)
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, KernelFailure>>()?;
     let arguments_view: Vec<_> = arguments
         .iter()
         .map(|argument| {
@@ -212,12 +277,6 @@ pub fn evaluate_legacy_calendar(
             "legacy calendar row out of bounds"
         );
     }
-    let target = FunctionValueType::try_with_logical_type(
-        output_type.clone(),
-        true,
-        novarocks_type_contract::ValueLogicalType::Physical,
-    )
-    .map_err(|error| error.to_string())?;
     let carrier = if matches!(
         operation,
         CalendarOperation::Timestamp
@@ -234,39 +293,22 @@ pub fn evaluate_legacy_calendar(
     } else {
         output_type.clone()
     };
-    // Legacy errors terminate its batch before a later row can compute or panic.
-    // This callback projects the same row failure without choosing another algorithm.
-    let row_failure = std::cell::RefCell::new(None);
-    let row_error_boundary = |ordinal: usize, message: &str| {
-        let message = if matches!(
-            operation,
-            CalendarOperation::NextDay | CalendarOperation::PreviousDay
-        ) {
-            let tokens = arguments[1]
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| crate::kernel_control::invalid("next_day expects string"))?;
-            format!(
-                "{} not supported in {} dow_string backend",
-                tokens.value(ordinal),
-                if matches!(operation, CalendarOperation::NextDay) {
-                    "next_day"
-                } else {
-                    "previous_day"
-                }
-            )
-        } else {
-            message.to_string()
-        };
-        *row_failure.borrow_mut() = Some(message);
-        Err(crate::kernel_control::internal(
-            "legacy calendar row failure",
+    if carrier != *output_type {
+        return Err(super::calendar_parts_shared::part_contract(format_args!(
+            "calendar operation requires normalized result carrier {carrier:?}, got {output_type:?}"
         ))
-    };
-    let carrier_error_boundary = |error: CalendarCarrierError<'_>| {
-        *row_failure.borrow_mut() = Some(error.legacy_message());
-        crate::kernel_control::internal("legacy calendar carrier failure")
-    };
+        .into());
+    }
+    let target = FunctionValueType::try_with_logical_type(
+        output_type.clone(),
+        true,
+        novarocks_type_contract::ValueLogicalType::Physical,
+    )
+    .map_err(KernelFailure::from)?;
+    let row_error_port =
+        |ordinal: usize, message: &str| -> Result<crate::RowDataError, crate::RowDataError> {
+            Err(crate::RowDataError::new(ordinal, message))
+        };
     let output = calendar_extended::evaluate_calendar_input(
         operation.operation(),
         CalendarInput {
@@ -276,64 +318,43 @@ pub fn evaluate_legacy_calendar(
             arguments: &arguments_view,
             selected: Selection::all(rows),
             legacy: true,
-            row_error_boundary: Some(&row_error_boundary),
-            carrier_error_boundary: Some(&carrier_error_boundary),
+            row_error_port: Some(&row_error_port),
         },
         &LegacyControl,
-    )
-    .map_err(|error| {
-        row_failure
-            .take()
-            .unwrap_or_else(|| legacy_kernel_error(error))
-    })?;
+    )?;
     Ok(Arc::clone(output.values()))
 }
 
-fn legacy_kernel_error(error: KernelFailure) -> String {
-    match error {
-        KernelFailure::InvalidProgram(message)
-        | KernelFailure::Internal(message)
-        | KernelFailure::Operational(message) => message.message().to_string(),
-        other => other.to_string(),
-    }
-}
 pub fn legacy_extract_datetimes(
     array: &ArrayRef,
-) -> Result<Vec<Option<chrono::NaiveDateTime>>, String> {
+) -> Result<Vec<Option<chrono::NaiveDateTime>>, KernelFailure> {
     let reader = calendar_extended::DateInput::raw(array.as_ref())
-        .map_err(CalendarCarrierError::legacy_message)?;
+        .map_err(CalendarCarrierError::into_kernel)?;
     let mut work = crate::kernel_input::EvaluationCheckpoints::new(&LegacyControl);
     let mut values = Vec::with_capacity(array.len());
     for row in 0..array.len() {
         let value = if array.is_null(row) {
             None
         } else {
-            reader.read(row, &mut work).map_err(legacy_kernel_error)?
+            reader.read(row, &mut work)?
         };
         values.push(value);
     }
     Ok(values)
 }
-pub fn legacy_extract_dates(array: &ArrayRef) -> Result<Vec<Option<chrono::NaiveDate>>, String> {
+pub fn legacy_extract_dates(
+    array: &ArrayRef,
+) -> Result<Vec<Option<chrono::NaiveDate>>, KernelFailure> {
     if !matches!(
         array.data_type(),
         DataType::Date32 | DataType::Timestamp(_, _) | DataType::Utf8
     ) {
-        return Err(format!(
-            "unsupported date input type: {:?}",
-            array.data_type()
-        ));
+        return Err(CalendarCarrierError::UnsupportedDate(array.data_type()).into_kernel());
     }
     Ok(legacy_extract_datetimes(array)?
         .into_iter()
         .map(|date| date.map(|date| date.date()))
         .collect())
-}
-pub fn legacy_to_timestamp_value(
-    date: chrono::NaiveDateTime,
-    output: &DataType,
-) -> Result<i64, String> {
-    calendar_extended::timestamp_value_for_type(date, output)
 }
 pub fn legacy_mysql_format_to_chrono(format: &str) -> String {
     super::calendar_extended_format::mysql_format_to_chrono(
@@ -365,16 +386,20 @@ mod legacy_projection_tests {
     use chrono::Datelike;
 
     #[test]
-    fn raw_timestamp_units_keep_requested_values_in_the_legacy_microsecond_carrier() {
+    fn raw_timestamp_inputs_keep_real_units_and_refuse_an_unnormalized_result() {
         let inputs: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(vec!["second", "second"])),
             Arc::new(
                 TimestampNanosecondArray::from(vec![-1, 1_234_567_890]).with_timezone("+08:00"),
             ),
         ];
-        let requested = DataType::Timestamp(TimeUnit::Second, Some("UTC".into()));
-        let output =
-            evaluate_legacy_calendar(CalendarOperation::Trunc, &inputs, &requested, 2).unwrap();
+        let output = evaluate_legacy_calendar(
+            CalendarOperation::Trunc,
+            &inputs,
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+            2,
+        )
+        .unwrap();
         assert_eq!(
             output.data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, None)
@@ -386,20 +411,18 @@ mod legacy_projection_tests {
                 .unwrap()
                 .iter()
                 .collect::<Vec<_>>(),
-            vec![Some(-1), Some(1)]
+            vec![Some(-1_000_000), Some(1_000_000)]
         );
-        let output =
-            evaluate_legacy_calendar(CalendarOperation::Trunc, &inputs, &DataType::Int64, 2)
-                .unwrap();
-        assert_eq!(
-            output
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap()
-                .iter()
-                .collect::<Vec<_>>(),
-            vec![None, None]
-        );
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        for requested in [
+            DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
+            DataType::Int64,
+        ] {
+            let error = evaluate_legacy_calendar(CalendarOperation::Trunc, &inputs, &requested, 2)
+                .unwrap_err();
+            assert!(matches!(error, CalendarFailure::Outer(_)));
+            assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        }
     }
 
     #[test]
@@ -458,7 +481,7 @@ mod legacy_projection_tests {
     }
 
     #[test]
-    fn str_to_date_projects_the_single_parse_result_with_its_original_clock_and_carrier() {
+    fn str_to_date_projects_the_single_parse_result_into_its_frozen_carrier() {
         let inputs: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(vec!["1970-01-01 00:01:30", "bad"])),
             Arc::new(StringArray::from(vec!["%Y-%m-%d %H:%i:%s", "%Y-%m-%d"])),
@@ -478,7 +501,7 @@ mod legacy_projection_tests {
         let output = evaluate_legacy_calendar(
             CalendarOperation::StrToDate,
             &inputs,
-            &DataType::Timestamp(TimeUnit::Second, None),
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
             2,
         )
         .unwrap();
@@ -489,7 +512,7 @@ mod legacy_projection_tests {
                 .unwrap()
                 .iter()
                 .collect::<Vec<_>>(),
-            vec![Some(90), None]
+            vec![Some(90_000_000), None]
         );
     }
 
@@ -520,7 +543,8 @@ mod legacy_projection_tests {
                 &DataType::Date32,
                 1
             )
-            .unwrap_err(),
+            .unwrap_err()
+            .to_string(),
             "monday not supported in previous_day dow_string backend"
         );
         let format: ArrayRef = Arc::new(StringArray::from(vec!["%Y-%m-%d %H:%i:%s.%f%"]));
@@ -552,9 +576,17 @@ mod legacy_projection_tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             evaluate_legacy_calendar(CalendarOperation::Trunc, &inputs, &DataType::Date32, 2)
         }));
+        let CalendarFailure::Row(error) = result.unwrap().unwrap_err() else {
+            panic!("the first actual row error must precede the later row's work");
+        };
+        assert_eq!(error.selected_ordinal(), 0);
         assert_eq!(
-            result.unwrap().unwrap_err(),
+            error.message(),
             "format value must in {microsecond, millisecond, second, minute, hour, day, month, year, week, quarter}"
+        );
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&error).class(),
+            novarocks_failure_contract::FailureClass::Data,
         );
         let inputs: Vec<ArrayRef> = vec![
             Arc::new(StringArray::from(vec!["week"])),
@@ -573,10 +605,10 @@ mod legacy_projection_tests {
 }
 
 /// Validate only the original raw input carrier before another child conversion.
-pub fn legacy_validate_datetime_source(array: &ArrayRef) -> Result<(), String> {
+pub fn legacy_validate_datetime_source(array: &ArrayRef) -> Result<(), KernelFailure> {
     calendar_extended::DateInput::raw(array.as_ref())
         .map(|_| ())
-        .map_err(CalendarCarrierError::legacy_message)
+        .map_err(CalendarCarrierError::into_kernel)
 }
 
 #[cfg(test)]
@@ -585,8 +617,17 @@ mod carrier_diagnostic_tests {
     use arrow_array::{Int64Array, StructArray};
     use arrow_schema::Field;
 
+    fn assert_extraction_contract(error: KernelFailure, expected: &str) {
+        use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureProjection};
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            error.to_string(),
+            BoundedDetail::truncating(expected).as_str()
+        );
+        assert!(error.to_string().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
+    }
     #[test]
-    fn legacy_carrier_admission_retains_the_complete_nested_type_diagnostic() {
+    fn raw_carrier_admission_bounds_the_diagnostic_and_retains_its_contract_fact() {
         let fields = (0..16)
             .map(|index| {
                 Arc::new(Field::new(
@@ -605,29 +646,31 @@ mod carrier_diagnostic_tests {
         ));
         let expected = format!("unsupported datetime input type: {:?}", source.data_type());
         assert!(expected.len() > 4096);
-        assert_eq!(legacy_extract_datetimes(&source).unwrap_err(), expected);
-        assert_eq!(
+        assert_extraction_contract(legacy_extract_datetimes(&source).unwrap_err(), &expected);
+        assert_extraction_contract(
             legacy_validate_datetime_source(&source).unwrap_err(),
-            expected
+            &expected,
         );
         let units: ArrayRef = Arc::new(StringArray::from(vec!["day"]));
-        assert_eq!(
-            evaluate_legacy_calendar(
-                CalendarOperation::Trunc,
-                &[units, Arc::clone(&source)],
-                &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
-                1
-            )
-            .unwrap_err(),
-            expected
-        );
+        let CalendarFailure::Outer(error) = evaluate_legacy_calendar(
+            CalendarOperation::Trunc,
+            &[units, Arc::clone(&source)],
+            &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            1,
+        )
+        .unwrap_err() else {
+            panic!("a frozen carrier failure cannot enter the row channel");
+        };
+        assert_extraction_contract(error, &expected);
         let expected_date = format!("unsupported date input type: {:?}", source.data_type());
-        assert_eq!(legacy_extract_dates(&source).unwrap_err(), expected_date);
-        assert_eq!(
+        assert_extraction_contract(legacy_extract_dates(&source).unwrap_err(), &expected_date);
+        let CalendarFailure::Outer(error) =
             evaluate_legacy_calendar(CalendarOperation::LastDay, &[source], &DataType::Date32, 1)
-                .unwrap_err(),
-            expected_date
-        );
+                .unwrap_err()
+        else {
+            panic!("a frozen date carrier cannot enter the row channel");
+        };
+        assert_extraction_contract(error, &expected_date);
     }
 }
 
@@ -653,4 +696,35 @@ pub fn legacy_epoch_utc_datetime(
     micros: u32,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     super::calendar_epoch_ntz::epoch_utc_datetime(seconds, micros)
+}
+
+#[cfg(test)]
+mod frozen_result_tests {
+    use super::*;
+    use arrow_array::{Date32Array, Int64Array};
+    use arrow_schema::TimeUnit;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn raw_calendar_cannot_return_a_different_carrier_or_relabel_timestamp_units() {
+        let dates: ArrayRef = Arc::new(Date32Array::from(vec![0]));
+        let months: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let error = evaluate_legacy_calendar(
+            CalendarOperation::MonthsShift(1),
+            &[dates.clone(), months],
+            &DataType::Date32,
+            1,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CalendarFailure::Outer(_)));
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        let error = evaluate_legacy_calendar(
+            CalendarOperation::Timestamp,
+            &[dates],
+            &DataType::Timestamp(TimeUnit::Second, None),
+            1,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CalendarFailure::Outer(_)));
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    }
 }

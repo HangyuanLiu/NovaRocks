@@ -46,11 +46,11 @@ impl Original {
     fn ptr(&mut self) -> *mut u8 {
         (&mut *self.slot as *mut usize).cast()
     }
-    fn update(&mut self, a: ArrayRef) -> Result<(), String> {
+    fn update(&mut self, a: ArrayRef) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         let rows = vec![self.ptr() as AggStatePtr; a.len()];
         HllRawAgg.update_batch(&self.spec, 0, &rows, &AggInputView::Any(&a))
     }
-    fn merge(&mut self, a: ArrayRef) -> Result<(), String> {
+    fn merge(&mut self, a: ArrayRef) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         let rows = vec![self.ptr() as AggStatePtr; a.len()];
         HllRawAgg.merge_batch(&self.spec, 0, &rows, &AggInputView::Any(&a))
     }
@@ -118,18 +118,18 @@ fn original_hll_payload_aggregate_names_output_state_and_missing_argument() {
             );
             assert_eq!(spec.intermediate_type, DataType::Binary);
         }
-        assert_eq!(
-            HllRawAgg
+        crate::exec::expr::agg::functions::common::assert_plan_contract(
+            &(HllRawAgg
                 .build_spec_from_type(
                     &AggFunction {
                         name: name.into(),
                         ..Default::default()
                     },
                     None,
-                    false
+                    false,
                 )
-                .unwrap_err(),
-            "hll_raw expects exactly one argument"
+                .unwrap_err()),
+            &"hll_raw expects exactly one argument",
         );
     }
 }
@@ -177,12 +177,12 @@ fn original_hll_payload_aggregate_malformed_first_failure_mutation_and_full_mess
                 Some(vec![1, 1, 1, 0, 0, 0, 0, 0, 0, 0]),
             ]) {
                 let mut s = Original::new(name, a.data_type());
-                assert_eq!(s.update(a).unwrap_err(), message);
+                assert_eq!((s.update(a).unwrap_err()).to_string(), message);
                 assert_eq!(s.bytes(true), Some(vec![0]));
             }
             for a in arrays(&[Some(payload.clone())]) {
                 let mut s = Original::new(name, a.data_type());
-                assert_eq!(s.merge(a).unwrap_err(), message);
+                assert_eq!((s.merge(a).unwrap_err()).to_string(), message);
                 // The original materializes and marks the group before decoder failure.
                 assert_eq!(s.bytes(true), Some(vec![0]));
             }
@@ -258,8 +258,8 @@ fn original_hll_payload_aggregate_unsupported_carrier_error_precedes_null_and_em
                 let a = new_null_array(&ty, rows);
                 let expected =
                     format!("hll aggregate expects HLL/BINARY payload input, got {ty:?}");
-                assert_eq!(s.update(a.clone()).unwrap_err(), expected);
-                assert_eq!(s.merge(a).unwrap_err(), expected);
+                assert_eq!((s.update(a.clone()).unwrap_err()).to_string(), expected);
+                assert_eq!((s.merge(a).unwrap_err()).to_string(), expected);
                 assert!(s.output(false).is_null(0));
             }
         }

@@ -70,7 +70,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -450,7 +450,7 @@ fn string_substring_index_required_child_errors_and_wrong_canonical_shapes_fail_
         let mut kernel = instance("substring_index", 3);
         assert!(matches!(
             kernel.evaluate(selection, &arguments, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
         let after = Control::default();
         assert_eq!(
@@ -467,7 +467,7 @@ fn string_substring_index_required_child_errors_and_wrong_canonical_shapes_fail_
     ];
     assert!(matches!(
         instance("substring_index", 3).evaluate(selection, &arguments, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let mut types = sources(3);
     types[0] = types[0]
@@ -486,7 +486,7 @@ fn string_substring_index_required_child_errors_and_wrong_canonical_shapes_fail_
         ScalarEvaluationInstance::instantiate(prepared)
             .unwrap()
             .evaluate(selection, &arguments, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
 }
 
@@ -859,7 +859,7 @@ fn string_substring_index_compile_success_and_ordinary_tail_preserve_all_callbac
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let actual = prepared_for_test_with_control(
                     "substring_index",

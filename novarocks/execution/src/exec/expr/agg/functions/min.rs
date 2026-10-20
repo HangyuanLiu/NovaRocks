@@ -29,7 +29,7 @@ use super::common;
 
 pub(super) struct MinAgg;
 
-fn min_spec_from_type(data_type: &DataType) -> Result<AggSpec, String> {
+fn min_spec_from_type(data_type: &DataType) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
     let (kind, output_type, intermediate_type) = match data_type {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
             (AggKind::MinInt, data_type.clone(), data_type.clone())
@@ -60,7 +60,14 @@ fn min_spec_from_type(data_type: &DataType) -> Result<AggSpec, String> {
             DataType::Decimal256(*precision, *scale),
             DataType::Decimal256(*precision, *scale),
         ),
-        other => return Err(format!("min unsupported input type: {:?}", other)),
+        other => {
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "min unsupported input type: {:?}",
+                    other
+                )),
+            );
+        }
     };
     Ok(AggSpec {
         kind,
@@ -77,8 +84,10 @@ impl AggregateFunction for MinAgg {
         _func: &AggFunction,
         input_type: Option<&DataType>,
         _input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let data_type = input_type.ok_or_else(|| "min input type missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let data_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract("min input type missing")
+        })?;
         min_spec_from_type(data_type)
     }
 
@@ -120,52 +129,59 @@ impl AggregateFunction for MinAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         match spec.kind {
             AggKind::MinInt => {
-                let arr = array
-                    .as_ref()
-                    .ok_or_else(|| "int input missing".to_string())?;
+                let arr = array.as_ref().ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract("int input missing")
+                })?;
                 Ok(AggInputView::Int(IntArrayView::new(arr)?))
             }
             AggKind::MinFloat => {
-                let arr = array
-                    .as_ref()
-                    .ok_or_else(|| "float input missing".to_string())?;
+                let arr = array.as_ref().ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract("float input missing")
+                })?;
                 Ok(AggInputView::Float(FloatArrayView::new(arr)?))
             }
             AggKind::MinBool => {
-                let arr = array
-                    .as_ref()
-                    .ok_or_else(|| "bool input missing".to_string())?;
-                let view = arr
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
+                let arr = array.as_ref().ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract("bool input missing")
+                })?;
+                let view = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract(
+                        "failed to downcast to BooleanArray",
+                    )
+                })?;
                 Ok(AggInputView::Bool(view))
             }
             AggKind::MinUtf8
             | AggKind::MinDate32
             | AggKind::MinTimestamp
             | AggKind::MinDecimal128 => {
-                let arr = array
-                    .as_ref()
-                    .ok_or_else(|| "utf8 input missing".to_string())?;
+                let arr = array.as_ref().ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract("utf8 input missing")
+                })?;
                 Ok(AggInputView::Utf8(Utf8ArrayView::new(arr)?))
             }
             AggKind::MinLargeInt => {
-                let arr = array
-                    .as_ref()
-                    .ok_or_else(|| "largeint input missing".to_string())?;
+                let arr = array.as_ref().ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract(
+                        "largeint input missing",
+                    )
+                })?;
                 Ok(AggInputView::Any(arr))
             }
             AggKind::MinDecimal256 => {
-                let arr = array
-                    .as_ref()
-                    .ok_or_else(|| "decimal256 input missing".to_string())?;
+                let arr = array.as_ref().ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract(
+                        "decimal256 input missing",
+                    )
+                })?;
                 Ok(AggInputView::Any(arr))
             }
-            _ => Err("min input type mismatch".to_string()),
+            _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "min input type mismatch",
+            )),
         }
     }
 
@@ -173,7 +189,7 @@ impl AggregateFunction for MinAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         self.build_input_view(spec, array)
     }
 
@@ -209,10 +225,12 @@ impl AggregateFunction for MinAgg {
         spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         if matches!(spec.kind, AggKind::MinUtf8) {
             let tracker = tracker.ok_or_else(|| {
-                "allocation-tracked min UTF-8 state requires a memory tracker".to_string()
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "allocation-tracked min UTF-8 state requires a memory tracker",
+                )
             })?;
             unsafe {
                 ptr.cast::<common::TrackedUtf8State>()
@@ -252,7 +270,7 @@ impl AggregateFunction for MinAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         match spec.kind {
             AggKind::MinInt => update_min_int(offset, state_ptrs, input),
             AggKind::MinFloat => update_min_float(offset, state_ptrs, input),
@@ -263,7 +281,11 @@ impl AggregateFunction for MinAgg {
             AggKind::MinLargeInt => update_min_largeint(offset, state_ptrs, input),
             AggKind::MinDecimal128 => update_min_decimal128(offset, state_ptrs, input),
             AggKind::MinDecimal256 => update_min_decimal256(offset, state_ptrs, input),
-            _ => Err("min update kind mismatch".to_string()),
+            _ => Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "min update kind mismatch",
+                ),
+            ),
         }
     }
 
@@ -273,7 +295,7 @@ impl AggregateFunction for MinAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         self.update_batch(spec, offset, state_ptrs, input)
     }
 
@@ -283,7 +305,7 @@ impl AggregateFunction for MinAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         let target_type = if output_intermediate {
             &spec.intermediate_type
         } else {
@@ -305,7 +327,11 @@ impl AggregateFunction for MinAgg {
             AggKind::MinDecimal256 => {
                 common::build_decimal256_array(offset, group_states, target_type)
             }
-            _ => Err("min output kind mismatch".to_string()),
+            _ => Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "min output kind mismatch",
+                ),
+            ),
         }
     }
 }
@@ -314,7 +340,7 @@ fn build_min_int_array(
     output_type: &DataType,
     offset: usize,
     group_states: &[AggStatePtr],
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut values = Vec::with_capacity(group_states.len());
     for &base in group_states {
         let state = unsafe { &*((base as *mut u8).add(offset) as *const I64State) };
@@ -331,7 +357,7 @@ fn build_min_float_array(
     output_type: &DataType,
     offset: usize,
     group_states: &[AggStatePtr],
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut values = Vec::with_capacity(group_states.len());
     for &base in group_states {
         let state = unsafe { &*((base as *mut u8).add(offset) as *const F64State) };
@@ -348,7 +374,7 @@ fn update_min_int(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     match input {
         AggInputView::Int(view) => {
             for (row, &base) in state_ptrs.iter().enumerate() {
@@ -362,7 +388,9 @@ fn update_min_int(
             }
             Ok(())
         }
-        _ => Err("min int input type mismatch".to_string()),
+        _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "min int input type mismatch",
+        )),
     }
 }
 
@@ -370,7 +398,7 @@ fn update_min_float(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     match input {
         AggInputView::Float(view) => {
             for (row, &base) in state_ptrs.iter().enumerate() {
@@ -384,7 +412,9 @@ fn update_min_float(
             }
             Ok(())
         }
-        _ => Err("min float input type mismatch".to_string()),
+        _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "min float input type mismatch",
+        )),
     }
 }
 
@@ -392,7 +422,7 @@ fn update_min_bool(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     match input {
         AggInputView::Bool(view) => {
             for (row, &base) in state_ptrs.iter().enumerate() {
@@ -407,7 +437,9 @@ fn update_min_bool(
             }
             Ok(())
         }
-        _ => Err("min bool input type mismatch".to_string()),
+        _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "min bool input type mismatch",
+        )),
     }
 }
 
@@ -415,7 +447,7 @@ fn update_min_utf8(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     match input {
         AggInputView::Utf8(Utf8ArrayView::Utf8(arr)) => {
             for (row, &base) in state_ptrs.iter().enumerate() {
@@ -437,8 +469,12 @@ fn update_min_utf8(
             }
             Ok(())
         }
-        AggInputView::Utf8(_) => Err("min utf8 input type mismatch".to_string()),
-        _ => Err("min utf8 input type mismatch".to_string()),
+        AggInputView::Utf8(_) => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "min utf8 input type mismatch",
+        )),
+        _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "min utf8 input type mismatch",
+        )),
     }
 }
 
@@ -446,7 +482,7 @@ fn update_min_date32(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     match input {
         AggInputView::Utf8(Utf8ArrayView::Date32(arr)) => {
             for (row, &base) in state_ptrs.iter().enumerate() {
@@ -462,8 +498,12 @@ fn update_min_date32(
             }
             Ok(())
         }
-        AggInputView::Utf8(_) => Err("min date32 input type mismatch".to_string()),
-        _ => Err("min date32 input type mismatch".to_string()),
+        AggInputView::Utf8(_) => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "min date32 input type mismatch",
+        )),
+        _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "min date32 input type mismatch",
+        )),
     }
 }
 
@@ -471,7 +511,7 @@ fn update_min_timestamp(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     match input {
         AggInputView::Utf8(view) => {
             for (row, &base) in state_ptrs.iter().enumerate() {
@@ -488,7 +528,11 @@ fn update_min_timestamp(
                     Utf8ArrayView::TimestampNanosecond(arr, _) => {
                         (!arr.is_null(row)).then(|| arr.value(row))
                     }
-                    _ => return Err("min timestamp input type mismatch".to_string()),
+                    _ => {
+                        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                            "min timestamp input type mismatch",
+                        ));
+                    }
                 };
                 if let Some(v) = v {
                     let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut I64State) };
@@ -500,7 +544,9 @@ fn update_min_timestamp(
             }
             Ok(())
         }
-        _ => Err("min timestamp input type mismatch".to_string()),
+        _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "min timestamp input type mismatch",
+        )),
     }
 }
 
@@ -508,7 +554,7 @@ fn update_min_decimal128(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     match input {
         AggInputView::Utf8(Utf8ArrayView::Decimal128(arr, _)) => {
             for (row, &base) in state_ptrs.iter().enumerate() {
@@ -524,8 +570,12 @@ fn update_min_decimal128(
             }
             Ok(())
         }
-        AggInputView::Utf8(_) => Err("min decimal input type mismatch".to_string()),
-        _ => Err("min decimal input type mismatch".to_string()),
+        AggInputView::Utf8(_) => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "min decimal input type mismatch",
+        )),
+        _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "min decimal input type mismatch",
+        )),
     }
 }
 
@@ -533,9 +583,11 @@ fn update_min_largeint(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let AggInputView::Any(array) = input else {
-        return Err("min largeint input type mismatch".to_string());
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "min largeint input type mismatch",
+        ));
     };
     let arr = largeint::as_fixed_size_binary_array(array, "min largeint input")?;
     for (row, &base) in state_ptrs.iter().enumerate() {
@@ -556,14 +608,20 @@ fn update_min_decimal256(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let AggInputView::Any(array) = input else {
-        return Err("min decimal256 input type mismatch".to_string());
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "min decimal256 input type mismatch",
+        ));
     };
     let arr = array
         .as_any()
         .downcast_ref::<arrow::array::Decimal256Array>()
-        .ok_or_else(|| "min decimal256 input type mismatch".to_string())?;
+        .ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "min decimal256 input type mismatch",
+            )
+        })?;
     for (row, &base) in state_ptrs.iter().enumerate() {
         if arr.is_null(row) {
             continue;
@@ -759,7 +817,33 @@ mod tests {
         let error = MinAgg
             .update_batch(&spec, 0, &[state_ptr], &rejected_view)
             .unwrap_err();
-        assert!(error.contains("ResourceExhausted"));
+        {
+            use novarocks_failure_contract::{FailureClass, FailureProjection};
+            use std::error::Error;
+            let fact = error.failure_fact();
+            assert_eq!(fact.class(), FailureClass::Resource);
+            assert_eq!(fact.reason().code(), 169);
+            let resource = fact.resource().unwrap();
+            assert_eq!(resource.requested, Some(6));
+            assert_eq!(
+                resource.limit, None,
+                "the container erased the tracker constraint"
+            );
+            assert_eq!(resource.committed, None);
+            let mut source = error.source();
+            let mut real_refusal = false;
+            while let Some(actual) = source {
+                real_refusal |= actual
+                    .is::<novarocks_functions::allocation_failure::AllocationRefusal<
+                        allocator_api2::collections::TryReserveError,
+                    >>();
+                source = actual.source();
+            }
+            assert!(
+                real_refusal,
+                "the original allocator-api2 refusal remains the source"
+            );
+        }
         assert_eq!(tracker.current(), 5);
 
         let output = MinAgg.build_array(&spec, 0, &[state_ptr], false).unwrap();

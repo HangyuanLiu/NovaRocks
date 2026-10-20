@@ -254,9 +254,13 @@ fn pure_differential_n_logical_largeint_freezes_full_legacy_metadata_drift() {
                             } => {
                                 assert_eq!(actual, name);
                                 let expected = format!(
-                                    "bind aggregate `{name}`: aggregate `{name}` resolved signature drift: planned=ResolvedAggregateSignature {{ overload: AggregateOverloadIdentity(\"builtin.aggregate/{name}/derived-v1\"), argument_types: [FixedSizeBinary(16), {n:?}], intermediate_type: Binary, output_type: List(Field {{ data_type: FixedSizeBinary(16), nullable: true, metadata: {{\"nr_logical_type\": \"largeint\"}} }}), state_format: AggregateStateFormatId(\"novarocks/{name}/state-v1\") }}, local=ResolvedAggregateSignature {{ overload: AggregateOverloadIdentity(\"builtin.aggregate/{name}/derived-v1\"), argument_types: [FixedSizeBinary(16), {n:?}], intermediate_type: Binary, output_type: List(Field {{ data_type: FixedSizeBinary(16), nullable: true }}), state_format: AggregateStateFormatId(\"novarocks/{name}/state-v1\") }}"
+                                    "aggregate `{name}` resolved signature drift: planned=ResolvedAggregateSignature {{ overload: AggregateOverloadIdentity(\"builtin.aggregate/{name}/derived-v1\"), argument_types: [FixedSizeBinary(16), {n:?}], intermediate_type: Binary, output_type: List(Field {{ data_type: FixedSizeBinary(16), nullable: true, metadata: {{\"nr_logical_type\": \"largeint\"}} }}), state_format: AggregateStateFormatId(\"novarocks/{name}/state-v1\") }}, local=ResolvedAggregateSignature {{ overload: AggregateOverloadIdentity(\"builtin.aggregate/{name}/derived-v1\"), argument_types: [FixedSizeBinary(16), {n:?}], intermediate_type: Binary, output_type: List(Field {{ data_type: FixedSizeBinary(16), nullable: true }}), state_format: AggregateStateFormatId(\"novarocks/{name}/state-v1\") }}"
                                 );
-                                assert_eq!(reason, expected);
+                                let bounded = novarocks_failure_contract::BoundedDetail::truncating(
+                                    &expected,
+                                );
+                                assert_eq!(reason, bounded.as_str());
+                                assert!(reason.len() <= 512);
                             }
                             other => panic!(
                                 "expected frozen logical LARGEINT legacy metadata drift: {other}"

@@ -23,8 +23,11 @@ use arrow::compute::take;
 use arrow::datatypes::{DataType, Int32Type};
 
 use crate::exec::chunk::{Chunk, ChunkSchema};
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::function::FunctionKind;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use novarocks_functions::array_projection::{ArrayProjectionFailure, ArrayProjectionOperation};
 use novarocks_types::SlotId;
 
 pub fn is_supported_i32_string_dictionary(data_type: &DataType) -> bool {
@@ -69,17 +72,17 @@ pub fn try_peel_dict_expr<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr_id: ExprId,
     chunk: &Chunk,
-) -> Result<Option<ArrayRef>, __Eval::Error> {
-    Ok((try_peel_dict_expr_with(
+) -> ExecutionResult<Option<ArrayRef>> {
+    try_peel_dict_expr_with(
         arena,
         expr_id,
         chunk,
-        |slot, values| -> Result<Chunk, __Eval::Error> {
+        |slot, values| -> Result<Chunk, ExecutionFailure> {
             Ok(dict_values_chunk_for_source(chunk, slot, values)?)
         },
         |_| Ok(()),
         |_, _| Ok(()),
-    ))?)
+    )
 }
 
 pub(crate) struct OwnedDictionaryPeel {
@@ -340,7 +343,11 @@ fn validate_peel_source_bindings<__Eval: crate::exec::expr::ExprEvaluation + ?Si
             let actual = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                 source_binding.clone_observed(work)?,
             )
-            .map_err(|error| ConstructionFailure::InvalidSource(error.to_string()))?;
+            .map_err(|source| {
+                ConstructionFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(
+                    source,
+                ))
+            })?;
             if !actual.fits_physical_binding_observed(expected, work)? {
                 return Err(ConstructionFailure::InvalidSource(
                     "dictionary peel source differs from its complete expression declaration"
@@ -367,7 +374,7 @@ fn validate_peel_source_bindings<__Eval: crate::exec::expr::ExprEvaluation + ?Si
 
 fn try_peel_dict_expr_with<
     __Eval: crate::exec::expr::ExprEvaluation + ?Sized,
-    CallbackError: Into<__Eval::Error>,
+    CallbackError: Into<ExecutionFailure>,
 >(
     arena: &__Eval,
     expr_id: ExprId,
@@ -375,7 +382,7 @@ fn try_peel_dict_expr_with<
     mut value_port: impl FnMut(SlotId, ArrayRef) -> Result<Chunk, CallbackError>,
     mut rewrap: impl FnMut(&DictionaryArray<Int32Type>) -> Result<(), CallbackError>,
     mut expand: impl FnMut(&ArrayRef, &DictionaryArray<Int32Type>) -> Result<(), CallbackError>,
-) -> Result<Option<ArrayRef>, __Eval::Error> {
+) -> Result<Option<ArrayRef>, ExecutionFailure> {
     let Some(source_slot) = peel_source_slot(arena, expr_id) else {
         return Ok(None);
     };
@@ -392,12 +399,12 @@ fn try_peel_dict_expr_with<
         .as_any()
         .downcast_ref::<DictionaryArray<Int32Type>>()
         .ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "dictionary peel expected Dictionary(Int32, Utf8), got {:?}",
                 source.data_type()
-            )
+            ))
         })
-        .map_err(__Eval::Error::from)?;
+        .map_err(ExecutionFailure::from)?;
     if dict.values().null_count() > 0 {
         return Ok(None);
     }
@@ -408,13 +415,22 @@ fn try_peel_dict_expr_with<
     if new_values.data_type() == &DataType::Utf8 && new_values.null_count() == 0 {
         rewrap(dict).map_err(Into::into)?;
         let peeled = DictionaryArray::<Int32Type>::try_new(dict.keys().clone(), new_values)
-            .map_err(|e| __Eval::Error::from(format!("dictionary peel rewrap failed: {e}")))?;
+            .map_err(|source| {
+                ExecutionFailure::from_domain(ArrayProjectionFailure::Arrow {
+                    operation: ArrayProjectionOperation::RebuildDictionary,
+                    source,
+                })
+            })?;
         return Ok(Some(Arc::new(peeled) as ArrayRef));
     }
 
     expand(&new_values, dict).map_err(Into::into)?;
-    let expanded = take(new_values.as_ref(), dict.keys(), None)
-        .map_err(|e| __Eval::Error::from(format!("dictionary peel take failed: {e}")))?;
+    let expanded = take(new_values.as_ref(), dict.keys(), None).map_err(|source| {
+        ExecutionFailure::from_domain(ArrayProjectionFailure::Arrow {
+            operation: ArrayProjectionOperation::DecodeDictionary,
+            source,
+        })
+    })?;
     Ok(Some(expanded))
 }
 
@@ -422,11 +438,13 @@ fn dict_values_chunk_for_source(
     chunk: &Chunk,
     source_slot: SlotId,
     values: ArrayRef,
-) -> Result<Chunk, String> {
-    let source_slot_schema = chunk
-        .chunk_schema()
-        .slot(source_slot)
-        .ok_or_else(|| format!("slot id {} missing from chunk schema", source_slot))?;
+) -> ExecutionResult<Chunk> {
+    let source_slot_schema = chunk.chunk_schema().slot(source_slot).ok_or_else(|| {
+        expression_contract(format_args!(
+            "slot id {} missing from chunk schema",
+            source_slot
+        ))
+    })?;
     let value_field = source_slot_schema
         .field()
         .clone()
@@ -434,7 +452,7 @@ fn dict_values_chunk_for_source(
         .with_nullable(values.is_nullable());
     let value_slot = source_slot_schema.with_field(value_field)?;
     let value_schema = Arc::new(ChunkSchema::try_new(vec![value_slot])?);
-    Chunk::try_new_with_columns(value_schema, vec![values])
+    Ok(Chunk::try_new_with_columns(value_schema, vec![values])?)
 }
 
 fn peel_source_slot<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(

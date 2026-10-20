@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_functions::builtin::calendar_extended_shared::{
@@ -27,26 +27,29 @@ pub fn eval_convert_tz<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    let output_type = super::common::frozen_type(arena.arena(), expr)?.clone();
     let date = arena.eval(args[0], chunk)?;
     let from = arena.eval(args[1], chunk)?;
     let to = arena.eval(args[2], chunk)?;
     legacy_validate_datetime_source(&date)?;
-    from.as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "convert_tz expects string".to_string())?;
-    to.as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "convert_tz expects string".to_string())?;
-    let output_type = arena
-        .data_type(expr)
-        .cloned()
-        .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
+    from.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        novarocks_functions::builtin::calendar_parts_shared::part_contract(
+            "convert_tz expects string",
+        )
+    })?;
+    to.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        novarocks_functions::builtin::calendar_parts_shared::part_contract(
+            "convert_tz expects string",
+        )
+    })?;
+
     let rows = date.len();
-    Ok((evaluate_legacy_calendar(
+    evaluate_legacy_calendar(
         CalendarOperation::ConvertTz,
         &[date, from, to],
         &output_type,
         rows,
-    ))?)
+    )
+    .map_err(Into::into)
 }

@@ -184,10 +184,24 @@ fn normalize_terminal_cancellation(
     error: QueryExecutionError,
     reason: Option<QueryCancellationReason>,
 ) -> QueryExecutionError {
+    // An already selected execution input is authoritative at the renderer.
+    // A local cancellation view cannot replace its fact, site or safe detail.
+    if error.execution_failure().is_some() {
+        return error;
+    }
     match error.kind() {
-        QueryExecutionErrorKind::DeadlineExceeded => {
-            QueryExecutionError::new(QueryExecutionErrorKind::DeadlineExceeded, "query timed out")
-        }
+        QueryExecutionErrorKind::DeadlineExceeded => match reason {
+            Some(
+                reason @ (QueryCancellationReason::DeadlineExceeded { .. }
+                | QueryCancellationReason::FrontendDrainDeadlineExceeded { .. }),
+            ) => cancelled_query_result_delivery(reason),
+            // A legacy actor kind alone is not an accepted Query deadline;
+            // preserve it rather than borrowing a different late cancellation.
+            _ => QueryExecutionError::new(
+                QueryExecutionErrorKind::DeadlineExceeded,
+                "query timed out",
+            ),
+        },
         QueryExecutionErrorKind::Cancelled => match reason {
             Some(reason) => cancelled_query_result_delivery(reason),
             None => error,
@@ -199,45 +213,17 @@ fn normalize_terminal_cancellation(
 pub(crate) fn cancelled_query_result_delivery(
     reason: QueryCancellationReason,
 ) -> QueryExecutionError {
-    let message = match reason {
-        QueryCancellationReason::DeadlineExceeded { timeout_ms } => {
-            format!("query timed out after {timeout_ms} ms")
-        }
-        QueryCancellationReason::ExecutionCancellationRequested => {
-            "Query execution cancellation was requested".to_string()
-        }
-        QueryCancellationReason::ExecutionOwnerDropped => {
-            "Query execution protocol owner was dropped".to_string()
-        }
-        QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms } => format!(
-            "FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded after {timeout_ms} ms"
-        ),
-        QueryCancellationReason::ExplicitKill { .. } => {
-            "Query execution was interrupted".to_string()
-        }
-        QueryCancellationReason::ExplicitKillConnection { .. } => {
-            "Query execution was interrupted because the connection was killed".to_string()
-        }
-        QueryCancellationReason::ClientDisconnected => {
-            "Query execution was interrupted because the client disconnected".to_string()
-        }
-        QueryCancellationReason::ServerShutdown => {
-            "Query execution was interrupted because the server is shutting down".to_string()
-        }
-    };
-    QueryExecutionError::new(QueryExecutionErrorKind::Cancelled, message)
+    QueryExecutionError::from_execution(
+        novarocks_query_application::session_outcome::cancellation_failure_input(reason),
+    )
 }
 
 pub(crate) fn governed_cancelled_query_result_delivery(
     reason: novarocks_workload_control::CancellationReason,
 ) -> QueryExecutionError {
-    let message = match reason {
-        novarocks_workload_control::CancellationReason::FrontendDrainDeadlineExceeded => {
-            "FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded".to_string()
-        }
-        reason => format!("MySQL result delivery cancelled: {reason:?}"),
-    };
-    QueryExecutionError::new(QueryExecutionErrorKind::Cancelled, message)
+    QueryExecutionError::from_execution(
+        novarocks_query_application::session_outcome::governed_cancellation_failure_input(reason),
+    )
 }
 
 fn invalid_data_error(message: impl Into<String>) -> io::Error {
@@ -377,12 +363,169 @@ pub(crate) mod streaming_result_tests {
     }
 
     #[test]
+    fn selected_execution_input_survives_late_cancel_and_deadline_normalization() {
+        use novarocks_execution_contract::{
+            SafeDetail,
+            failure::{FailureClass, FailureFact, FailureProjection, FailureReason},
+        };
+        use novarocks_query_application::{
+            api::{ExecutionFailureInput, ExecutionFailureSite},
+            execution_error::QueryFailureReason,
+        };
+        use std::num::NonZeroU16;
+        let facts = [
+            FailureFact::new(
+                FailureClass::Resource,
+                FailureReason::new(
+                    NonZeroU16::new(u16::MAX).unwrap(),
+                    NonZeroU16::new(7).unwrap(),
+                ),
+            ),
+            QueryFailureReason::Cancelled.failure_fact(),
+            QueryFailureReason::DeadlineExceeded.failure_fact(),
+        ];
+        for fact in facts {
+            let input = ExecutionFailureInput::new(
+                fact,
+                SafeDetail::new("original accepted diagnostic").unwrap(),
+                ExecutionFailureSite::Coordinator,
+            );
+            let original = QueryExecutionError::from_execution(input.clone());
+            let rendered = normalize_terminal_cancellation(
+                original.clone(),
+                Some(QueryCancellationReason::ClientDisconnected),
+            );
+            assert_eq!(rendered, original);
+            assert_eq!(rendered.execution_failure(), Some(&input));
+            let payload = crate::relay_result_writer::error_payload(&rendered, 4096);
+            assert!(
+                std::str::from_utf8(&payload[9..])
+                    .unwrap()
+                    .ends_with("original accepted diagnostic")
+            );
+            let service =
+                novarocks_query_application::session_outcome::governed_query_execution_error(
+                    rendered,
+                );
+            assert_eq!(service.execution_failure(), Some(&input));
+        }
+    }
+
+    #[test]
     fn deadline_delivery_cancellation_keeps_the_statement_timeout_message() {
         let error = cancelled_query_result_delivery(QueryCancellationReason::DeadlineExceeded {
             timeout_ms: 1_000,
         });
-        assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
+        assert_eq!(error.kind(), QueryExecutionErrorKind::DeadlineExceeded);
         assert_eq!(error.to_string(), "query timed out after 1000 ms");
+    }
+
+    #[test]
+    fn accepted_query_and_work_cancellation_packets_keep_domain_fact_and_wire_contract() {
+        use novarocks_execution_contract::failure::FailureProjection;
+        use novarocks_query_application::{
+            api::ExecutionFailureSite, execution_error::QueryFailureReason,
+        };
+        use novarocks_user_error::ErrorPhase;
+        let cases = [
+            (
+                cancelled_query_result_delivery(QueryCancellationReason::ExplicitKill {
+                    requester_connection_id: 3_090_001,
+                }),
+                QueryFailureReason::Cancelled,
+                QueryExecutionErrorKind::Cancelled,
+                "query.execution.cancelled",
+                "Query execution was interrupted",
+            ),
+            (
+                cancelled_query_result_delivery(QueryCancellationReason::DeadlineExceeded {
+                    timeout_ms: 1_000,
+                }),
+                QueryFailureReason::DeadlineExceeded,
+                QueryExecutionErrorKind::DeadlineExceeded,
+                "query.execution.deadline_exceeded",
+                "query timed out after 1000 ms",
+            ),
+            (
+                cancelled_query_result_delivery(
+                    QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms: 2_000 },
+                ),
+                QueryFailureReason::DeadlineExceeded,
+                QueryExecutionErrorKind::DeadlineExceeded,
+                "query.execution.deadline_exceeded",
+                "FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded after 2000 ms",
+            ),
+            (
+                governed_cancelled_query_result_delivery(CancellationReason::ExplicitKill {
+                    requester_connection_id: 3_090_001,
+                }),
+                QueryFailureReason::Cancelled,
+                QueryExecutionErrorKind::Cancelled,
+                "query.execution.cancelled",
+                "Query execution was interrupted",
+            ),
+            (
+                governed_cancelled_query_result_delivery(CancellationReason::DeadlineExceeded),
+                QueryFailureReason::DeadlineExceeded,
+                QueryExecutionErrorKind::DeadlineExceeded,
+                "query.execution.deadline_exceeded",
+                "query deadline exceeded",
+            ),
+            (
+                governed_cancelled_query_result_delivery(
+                    CancellationReason::FrontendDrainDeadlineExceeded,
+                ),
+                QueryFailureReason::DeadlineExceeded,
+                QueryExecutionErrorKind::DeadlineExceeded,
+                "query.execution.deadline_exceeded",
+                "FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded",
+            ),
+        ];
+        for (error, reason, kind, code, detail) in cases {
+            let input = error
+                .execution_failure()
+                .expect("accepted cancellation has its domain input");
+            assert_eq!(input.fact(), reason.failure_fact());
+            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+            assert_eq!(input.detail().as_str(), detail);
+            assert_eq!(input.descriptor().descriptor.phase, ErrorPhase::Execution);
+            assert_eq!(error.kind(), kind);
+            let payload = crate::relay_result_writer::error_payload(&error, 4096);
+            assert_eq!(payload[0], 0xff);
+            assert_eq!(u16::from_le_bytes([payload[1], payload[2]]), 1317);
+            assert_eq!(payload[3], b'#');
+            assert_eq!(&payload[4..9], b"70100");
+            assert_eq!(
+                std::str::from_utf8(&payload[9..]).unwrap(),
+                format!("[{code}] {detail}")
+            );
+            assert!(
+                !std::str::from_utf8(&payload[9..])
+                    .unwrap()
+                    .contains("3090001")
+            );
+        }
+    }
+
+    #[test]
+    fn observed_query_deadline_normalizes_only_its_accepted_deadline_reason() {
+        use novarocks_execution_contract::failure::FailureProjection;
+        use novarocks_query_application::execution_error::QueryFailureReason;
+        let error = normalize_terminal_cancellation(
+            QueryExecutionError::new(QueryExecutionErrorKind::DeadlineExceeded, "actor deadline"),
+            Some(QueryCancellationReason::DeadlineExceeded { timeout_ms: 1_000 }),
+        );
+        assert_eq!(
+            error.execution_failure().unwrap().fact(),
+            QueryFailureReason::DeadlineExceeded.failure_fact()
+        );
+        let payload = crate::relay_result_writer::error_payload(&error, 4096);
+        assert_eq!(u16::from_le_bytes([payload[1], payload[2]]), 1317);
+        assert_eq!(&payload[4..9], b"70100");
+        assert_eq!(
+            &payload[9..],
+            b"[query.execution.deadline_exceeded] query timed out after 1000 ms"
+        );
     }
 
     #[test]
@@ -466,6 +609,15 @@ pub(crate) mod streaming_result_tests {
         .await;
         assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
         assert_eq!(error.to_string(), "Query execution was interrupted");
+        // This path used the original QueryControl cancellation and completed
+        // its real stream/schema/resource owners before encoding the same ERR.
+        let payload = crate::relay_result_writer::error_payload(&error, 4096);
+        assert_eq!(u16::from_le_bytes([payload[1], payload[2]]), 1317);
+        assert_eq!(&payload[4..9], b"70100");
+        assert_eq!(
+            &payload[9..],
+            b"[query.execution.cancelled] Query execution was interrupted"
+        );
     }
 
     #[tokio::test]

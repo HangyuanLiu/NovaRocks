@@ -529,10 +529,17 @@ fn bitmap_union_int_owner_merge_whole_long_original_data_actual_domain_and_latch
     };
     let expected = format!(
         "{}",
-        AggregateFailureStage::Merge
-            .message(&crate::bitmap_value::decode_bitmap(long.as_bytes()).unwrap_err())
+        AggregateFailureStage::Merge.message(&format_args!(
+            "bitmap string contains invalid value: {long}"
+        ))
     );
     assert_eq!(data.message(), expected);
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(&data),
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &crate::DataFailureReason::InvalidEncoding
+        )
+    );
     assert!(data.message().len() > 512);
     assert_eq!(data.input_rows(), &rows);
     assert_eq!(data.state_indices(), &[0, 1]);
@@ -718,7 +725,7 @@ struct CompileRefusal(CompileControlError);
 impl PureCompileControl for CompileRefusal {
     fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
-        Err(self.0)
+        Err(self.0.clone())
     }
 }
 #[test]
@@ -776,7 +783,7 @@ fn bitmap_union_int_owner_original_profile_admission_and_compile_three_causes() 
             CompileControlError::ResourceExhausted,
         ] {
             assert!(
-                matches!(declaration.admit_selected_profile_observed(&bound.selected,1,&CompileRefusal(cause)),Err(FunctionBindingError::Control(actual)) if actual==cause)
+                matches!(declaration.admit_selected_profile_observed(&bound.selected,1,&CompileRefusal(cause.clone())),Err(FunctionBindingError::Control(actual)) if actual==cause)
             );
         }
     }
@@ -791,7 +798,7 @@ fn bitmap_union_int_owner_original_profile_admission_and_compile_three_causes() 
         CompileControlError::ResourceExhausted,
     ] {
         assert!(
-            matches!(k.clone_for_local_phase(Arc::clone(&k.contract),&CompileRefusal(cause)),Err(actual) if actual==compile_failure(cause))
+            matches!(k.clone_for_local_phase(Arc::clone(&k.contract),&CompileRefusal(cause.clone())),Err(actual) if actual==compile_failure(cause))
         );
     }
 }
@@ -1209,7 +1216,7 @@ fn bitmap_agg_owner_original_profile_admission_and_compile_three_causes() {
             CompileControlError::ResourceExhausted,
         ] {
             assert!(
-                matches!(declaration.admit_selected_profile_observed(&bound.selected,1,&CompileRefusal(cause)),Err(FunctionBindingError::Control(actual)) if actual==cause)
+                matches!(declaration.admit_selected_profile_observed(&bound.selected,1,&CompileRefusal(cause.clone())),Err(FunctionBindingError::Control(actual)) if actual==cause)
             );
         }
     }
@@ -1224,7 +1231,7 @@ fn bitmap_agg_owner_original_profile_admission_and_compile_three_causes() {
         CompileControlError::ResourceExhausted,
     ] {
         assert!(
-            matches!(k.clone_for_local_phase(Arc::clone(&k.contract),&CompileRefusal(cause)),Err(actual) if actual==compile_failure(cause))
+            matches!(k.clone_for_local_phase(Arc::clone(&k.contract),&CompileRefusal(cause.clone())),Err(actual) if actual==compile_failure(cause))
         );
     }
 }

@@ -79,12 +79,12 @@ fn observe_bytes(text: &str, work: &mut EvaluationCheckpoints<'_>) -> Result<(),
 }
 enum RowValue {
     Value(String),
-    Error(String),
+    Error(super::string_failure::RegexSyntax),
 }
 
 /// The original single-capture body: compiling precedes the signed-to-usize cast.
 fn extract_one<'a>(
-    patterns: &mut PatternMemo<'a, Regex, regex::Error>,
+    patterns: &mut PatternMemo<'a, Regex, Arc<regex::Error>>,
     source: &StringArray,
     patterns_array: &'a StringArray,
     indices: &IndexValues<'_>,
@@ -94,15 +94,16 @@ fn extract_one<'a>(
     let pattern = patterns_array.value(rows[1]);
     observe_bytes(pattern, work)?;
     work.flush()?;
-    let compiled = patterns.get_or_compile(pattern, Regex::new);
+    let compiled =
+        patterns.get_or_compile(pattern, |pattern| Regex::new(pattern).map_err(Arc::new));
     work.flush()?;
     let re = match compiled {
         Ok(re) => re,
         Err(error) => {
             work.flush()?;
-            let message = error.to_string();
+            let source = super::string_failure::regex_syntax(error)?;
             work.flush()?;
-            return Ok(RowValue::Error(message));
+            return Ok(RowValue::Error(source));
         }
     };
     let idx = indices.value(rows[2]) as usize;
@@ -120,7 +121,7 @@ fn extract_one<'a>(
 
 /// The original all-captures body: a negative group masks even invalid regex.
 fn extract_all<'a>(
-    patterns: &mut PatternMemo<'a, Regex, regex::Error>,
+    patterns: &mut PatternMemo<'a, Regex, Arc<regex::Error>>,
     source: &StringArray,
     patterns_array: &'a StringArray,
     group: i64,
@@ -137,15 +138,16 @@ fn extract_all<'a>(
     let pattern = patterns_array.value(rows[1]);
     observe_bytes(pattern, work)?;
     work.flush()?;
-    let compiled = patterns.get_or_compile(pattern, Regex::new);
+    let compiled =
+        patterns.get_or_compile(pattern, |pattern| Regex::new(pattern).map_err(Arc::new));
     work.flush()?;
     let re = match compiled {
         Ok(re) => re,
         Err(error) => {
             work.flush()?;
-            let message = error.to_string();
+            let source = super::string_failure::regex_syntax(error)?;
             work.flush()?;
-            return Ok(RowValue::Error(message));
+            return Ok(RowValue::Error(source));
         }
     };
     let mut matches = Vec::new();
@@ -182,9 +184,7 @@ fn extract_all<'a>(
         Ok(json) => Ok(RowValue::Value(json)),
         Err(error) => {
             work.flush()?;
-            let message = error.to_string();
-            work.flush()?;
-            Ok(RowValue::Error(message))
+            Err(super::string_failure::json(error))
         }
     }
 }
@@ -268,11 +268,15 @@ pub(super) fn evaluate_selected<'a>(
                         }
                         valid = true;
                     }
-                    RowValue::Error(message) => {
+                    RowValue::Error(source) => {
+                        let message = source.to_string();
                         observe_bytes(&message, &mut work)?;
                         if let Some(boundary) = input.error_boundary {
                             work.flush()?;
-                            boundary(&message)?;
+                            boundary(
+                                ordinal,
+                                super::string_failure::StringDataError::Regex(&source),
+                            )?;
                             work.flush()?;
                         }
                         work.flush()?;
@@ -309,7 +313,7 @@ pub(super) fn evaluate_selected<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::string_extended::{StringOperation, evaluate_legacy};
+    use super::super::string_extended::{StringOperation, evaluate_required};
     use super::*;
     use crate::{EvaluatedArgument, Selection};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -410,12 +414,12 @@ mod tests {
                 Some(1),
             ])) as ArrayRef,
         ];
-        let one = evaluate_legacy(StringOperation::RegexpExtract, &arrays, 4).unwrap();
+        let one = evaluate_required(StringOperation::RegexpExtract, &arrays, 4).unwrap();
         assert_eq!(
             one.to_data(),
             StringArray::from(vec![Some(""), Some(""), Some(""), Some("a")]).to_data()
         );
-        let all = evaluate_legacy(StringOperation::RegexpExtractAll, &arrays, 4).unwrap();
+        let all = evaluate_required(StringOperation::RegexpExtractAll, &arrays, 4).unwrap();
         assert_eq!(
             all.to_data(),
             StringArray::from(vec![Some("[]"), Some("[]"), Some("[]"), Some("[\"a\"]")]).to_data()
@@ -438,10 +442,10 @@ mod tests {
             StringOperation::RegexpExtract,
             StringOperation::RegexpExtractAll,
         ] {
-            assert_eq!(
-                evaluate_legacy(op, &arrays, 2).unwrap_err().as_bytes(),
-                expected.as_bytes()
-            );
+            let failure = evaluate_required(op, &arrays, 2).unwrap_err();
+            let original = super::super::string_failure::original_source::<regex::Error>(&failure);
+            assert_eq!(original.to_string().as_bytes(), expected.as_bytes());
+            assert!(failure.to_string().len() <= crate::MAX_ROW_ERROR_MESSAGE_BYTES);
         }
         let arguments = arrays.each_ref().map(EvaluatedArgument::Column);
         for all in [false, true] {

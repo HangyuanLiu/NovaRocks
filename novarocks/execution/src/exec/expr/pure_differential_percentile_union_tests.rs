@@ -45,7 +45,8 @@ fn pure_differential_percentile_union_binary_phases_null_slice_and_distinct() {
                 Some(
                     novarocks_functions::approx_percentile_core::encode_single_value(
                         (i % 17) as f64,
-                    ),
+                    )
+                    .expect("percentile codec fixture"),
                 )
             }
         })
@@ -63,7 +64,8 @@ fn pure_differential_percentile_union_binary_phases_null_slice_and_distinct() {
 }
 #[test]
 fn pure_differential_percentile_union_all_payload_carriers_and_original_invalid_formats() {
-    let good = novarocks_functions::approx_percentile_core::encode_empty_state();
+    let good = novarocks_functions::approx_percentile_core::encode_empty_state()
+        .expect("percentile codec fixture");
     let mut old = good.clone();
     old[1] = 3;
     for bytes in [good, old, vec![0xA2, 4], Vec::new(), b"bad".to_vec()] {
@@ -78,7 +80,8 @@ fn pure_differential_percentile_union_all_payload_carriers_and_original_invalid_
             Some(bytes.as_slice()),
         ])));
     }
-    let mut ascii = novarocks_functions::approx_percentile_core::encode_empty_state();
+    let mut ascii = novarocks_functions::approx_percentile_core::encode_empty_state()
+        .expect("percentile codec fixture");
     ascii[0] = b'P';
     let ascii = String::from_utf8(ascii).unwrap();
     for text in [ascii.as_str(), "", "bad"] {
@@ -170,7 +173,8 @@ fn pure_differential_percentile_union_unsupported_any_carriers_null_empty_full_m
 }
 #[test]
 fn pure_differential_percentile_union_actual_constant_pool_ordinal_and_broadcast() {
-    let bytes = novarocks_functions::approx_percentile_core::encode_single_value(3.);
+    let bytes = novarocks_functions::approx_percentile_core::encode_single_value(3.)
+        .expect("percentile codec fixture");
     let value = super::constant(
         novarocks_type_contract::FunctionValueType::new(DataType::Binary, false),
         Arc::new(BinaryArray::from(vec![bytes.as_slice()])),
@@ -186,7 +190,8 @@ fn pure_differential_percentile_union_actual_constant_pool_ordinal_and_broadcast
 #[test]
 fn pure_differential_percentile_union_nonzero_actual_constant_ordinal() {
     use arrow::array::Array;
-    let bytes = novarocks_functions::approx_percentile_core::encode_single_value(3.);
+    let bytes = novarocks_functions::approx_percentile_core::encode_single_value(3.)
+        .expect("percentile codec fixture");
     let values: ArrayRef = Arc::new(BinaryArray::from(vec![None, Some(bytes.as_slice()), None]));
     let ty = novarocks_type_contract::FunctionValueType::new(DataType::Binary, true);
     let pool = novarocks_functions::ConstantPool::try_new(

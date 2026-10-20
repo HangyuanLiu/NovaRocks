@@ -24,6 +24,7 @@
 mod catalog;
 mod codec;
 mod error;
+mod failure_projection;
 mod identity;
 mod metadata_materialization_copy;
 mod mutation;

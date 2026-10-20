@@ -25,6 +25,10 @@
 //! re-derived from the incoming batch. This is array code only; the legacy
 //! Repeat operator is not reused because it re-derives its output schema.
 
+use crate::exec::fragment::error::{
+    FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
+};
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use std::sync::Arc;
 
 use arrow::array::Int64Array;
@@ -32,10 +36,15 @@ use arrow::datatypes::{DataType, SchemaRef};
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
 
 use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{Transform, TransformKernel},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
 use crate::runtime::fragment::ExecutionResult;
-use crate::runtime::runtime_state::RuntimeState;
 
 pub struct CompiledRepeatProcessorFactory {
     name: String,
@@ -50,12 +59,15 @@ pub struct CompiledRepeatProcessorFactory {
 }
 
 impl CompiledRepeatProcessorFactory {
-    pub(crate) fn try_new(program: &LocalProgram, node: ProgramNodeId) -> Result<Self, String> {
+    pub(crate) fn try_new(program: &LocalProgram, node: ProgramNodeId) -> ExecutionResult<Self> {
         let nodes = program.graph().nodes();
         let at = node.index();
-        let graph_node = nodes
-            .get(at)
-            .ok_or_else(|| format!("compiled Repeat node {at} is absent"))?;
+        let graph_node = nodes.get(at).ok_or_else(|| {
+            program_binding_failure(
+                PlanBindingKind::MissingAssignment,
+                format!("compiled Repeat node {at} is absent"),
+            )
+        })?;
         let ProgramNodeKind::Repeat {
             input,
             null_slot_ids,
@@ -64,14 +76,27 @@ impl CompiledRepeatProcessorFactory {
             repeat_times,
         } = graph_node.kind()
         else {
-            return Err(format!("compiled local node {at} is not a Repeat"));
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!("compiled local node {at} is not a Repeat"),
+            ));
         };
         let input_layout = nodes
             .get(input.index())
-            .ok_or_else(|| format!("compiled Repeat at local node {at} has no input"))?
+            .ok_or_else(|| {
+                program_binding_failure(
+                    PlanBindingKind::MissingAssignment,
+                    format!("compiled Repeat at local node {at} has no input"),
+                )
+            })?
             .output_layout();
         let output_layout = graph_node.output_layout();
-        let invalid = |what: &str| format!("compiled Repeat at local node {at} {what}");
+        let invalid = |what: &str| {
+            program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!("compiled Repeat at local node {at} {what}"),
+            )
+        };
         let width = input_layout.slots().len();
         if *repeat_times == 0
             || null_slot_ids.len() != *repeat_times
@@ -102,8 +127,9 @@ impl CompiledRepeatProcessorFactory {
                         .borrowed()
                         .same_physical_binding_ignoring_root_nullability_observed(
                             output.borrowed(),
-                            || Ok::<(), String>(()),
-                        )?
+                            || Ok::<(), std::convert::Infallible>(()),
+                        )
+                        .unwrap_or_else(|never| match never {})
                 {
                     return Err(invalid(
                         "changes a passthrough channel's complete value binding",
@@ -158,7 +184,7 @@ impl OperatorFactory for CompiledRepeatProcessorFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(CompiledRepeatProcessor {
+        Box::new(Transform::hydrating(CompiledRepeatProcessor {
             name: self.name.clone(),
             input_schema: Arc::clone(&self.input),
             input_layout: self.input_layout.clone(),
@@ -169,9 +195,7 @@ impl OperatorFactory for CompiledRepeatProcessorFactory {
             grouping_values: Arc::clone(&self.grouping_values),
             input: None,
             next_set: 0,
-            finishing: false,
-            finished: false,
-        })
+        }))
     }
 }
 
@@ -186,8 +210,6 @@ struct CompiledRepeatProcessor {
     grouping_values: Arc<[Vec<i64>]>,
     input: Option<ChunkBatchProjection>,
     next_set: usize,
-    finishing: bool,
-    finished: bool,
 }
 
 impl CompiledRepeatProcessor {
@@ -204,18 +226,21 @@ impl CompiledRepeatProcessor {
         super::repeat_processor::repeat_output_columns_owned(
             input,
             self.prepared_output()?,
-            self.null_ordinals[set].iter().copied().map(Ok::<_, String>),
+            self.null_ordinals[set]
+                .iter()
+                .copied()
+                .map(Ok::<_, crate::runtime::fragment::ExecutionFailure>),
             self.grouping_values[set]
                 .iter()
                 .copied()
-                .map(Ok::<_, String>),
+                .map(Ok::<_, crate::runtime::fragment::ExecutionFailure>),
             factory.as_ref(),
             |value, rows| Arc::new(Int64Array::from_value(value, rows)),
         )
     }
 }
 
-impl Operator for CompiledRepeatProcessor {
+impl OperatorLifecycle for CompiledRepeatProcessor {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -240,34 +265,35 @@ impl Operator for CompiledRepeatProcessor {
     fn name(&self) -> &str {
         &self.name
     }
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.input = None;
+        Ok(())
     }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.input = None;
+        Ok(())
     }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn cancel(&mut self) {
+        self.input = None;
     }
 }
-
-impl ProcessorOperator for CompiledRepeatProcessor {
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.input.is_none()
-    }
-    fn has_output(&self) -> bool {
-        self.input.is_some()
-    }
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+impl InputEncodingPolicy for CompiledRepeatProcessor {}
+impl TransformKernel for CompiledRepeatProcessor {
+    fn apply(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
         self.prepared_output()?;
-        if self.input.is_some() {
-            return Err("compiled Repeat received input while expanding".into());
-        }
         if chunk.is_empty() {
-            return Ok(());
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
         }
         if chunk.record_batch().schema().as_ref() != self.input_schema.as_ref() {
-            return Err("compiled Repeat input differs from its frozen input port".into());
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                "compiled Repeat input differs from its frozen input port",
+            ));
         }
         let factory = self
             .construction
@@ -280,34 +306,28 @@ impl ProcessorOperator for CompiledRepeatProcessor {
             |ordinal| self.input_layout.value_binding_at(ordinal),
             factory.as_ref(),
         )?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         self.input = Some(chunk.into_batch_projection());
         self.next_set = 0;
-        Ok(())
+        Ok(StepResult::new(None, NextStep::Runnable, rows))
     }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+    fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         let Some(input) = self.input.as_ref() else {
-            if self.finishing {
-                self.finished = true;
-            }
-            return Ok(None);
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
         };
         let source = input.clone().into_chunk();
         let output = self.expand(&source, self.next_set)?;
         self.next_set += 1;
-        if self.next_set == self.grouping_values.len() {
+        let next = if self.next_set == self.grouping_values.len() {
             self.input = None;
-            if self.finishing {
-                self.finished = true;
-            }
-        }
-        Ok(Some(output))
+            NextStep::NeedInput
+        } else {
+            NextStep::Runnable
+        };
+        Ok(StepResult::new(Some(output), next, 0))
     }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         self.prepared_output()?;
-        self.finishing = true;
-        if self.input.is_none() {
-            self.finished = true;
-        }
-        Ok(())
+        Ok(StepResult::new(None, NextStep::Finished, 0))
     }
 }

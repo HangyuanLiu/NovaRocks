@@ -188,7 +188,7 @@ impl FunctionBindingResolver for Owner {
         request: FunctionBindingRequest<'_>,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<(), FunctionBindingError> {
-        if let Some(error) = *self.binding_failure.lock().unwrap() {
+        if let Some(error) = self.binding_failure.lock().unwrap().clone() {
             return Err(error.into());
         }
         self.declaration.effect_declaration(&selected.overload)?;
@@ -516,7 +516,7 @@ impl PureCompileControl for CompileControl {
         assert_eq!(phase, CompilePhase::FunctionSpecialization);
         assert!(work <= 256);
         if !self.positive || work > 0 {
-            self.failure.map_or(Ok(()), Err)
+            self.failure.clone().map_or(Ok(()), Err)
         } else {
             Ok(())
         }
@@ -1571,7 +1571,7 @@ fn registered_metadata_cannot_hide_different_owner_effect_source_and_control_typ
                 &owner.frozen(&selected),
                 scalar_options(),
                 &CompileControl {
-                    failure: Some(failure),
+                    failure: Some(failure.clone()),
                     positive,
                 },
             );
@@ -1827,7 +1827,7 @@ fn selected_owner_control_remains_a_top_level_specialization_failure() {
                 )
                 .unwrap(),
         );
-        *owner.binding_failure.lock().unwrap() = Some(error);
+        *owner.binding_failure.lock().unwrap() = Some(error.clone());
         let parameters = SemanticParameters::default();
         let uses = [Some(ExpressionUseId::new(1))];
         let function = id(FUNCTION);

@@ -20,8 +20,9 @@
 use super::aggregate_mann_whitney_core::{MannStateExtents, MannWhitneyState};
 use super::aggregate_mann_whitney_resources::{MannEmissionResources, MannSourceParams};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
-use crate::aggregate_scalar::{ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::ScalarWork;
 use crate::arrow_result_custody::{FlatByteKind, retain_result_backing_direct};
+use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::opaque_memory::OpaqueRetainedCharge;
@@ -47,10 +48,8 @@ pub(super) trait MannEmissionAccess {
     fn extents(&self) -> Result<MannStateExtents, KernelFailure>;
     fn with_core(
         &self,
-        operation: impl FnOnce(
-            &mut MannWhitneyState<HostAggregateAllocator>,
-        ) -> Result<(), ScalarStateError>,
-    ) -> Result<(), ScalarStateError>;
+        operation: impl FnOnce(&mut MannWhitneyState<HostAggregateAllocator>) -> Result<(), MannFailure>,
+    ) -> Result<(), MannFailure>;
 }
 
 fn resource_failure(cause: ScalarResourceError) -> KernelFailure {
@@ -61,16 +60,8 @@ fn resource_failure(cause: ScalarResourceError) -> KernelFailure {
     }
 }
 
-fn core_failure(cause: ScalarStateError) -> KernelFailure {
-    match cause {
-        ScalarStateError::Kernel(cause) => cause,
-        // The original serialize/render authors have no data/allocation-error
-        // branch. Do not turn a future unknown producer into clipped Data.
-        ScalarStateError::Legacy(message) | ScalarStateError::OutputAllocation(message) => {
-            drop(message);
-            internal("Mann-Whitney emission reached an unqualified core failure")
-        }
-    }
+fn core_failure(cause: MannFailure) -> KernelFailure {
+    cause.into_kernel_failure()
 }
 
 /// Production supplies the framework's borrowed TypedStateIter in exact order.
@@ -126,11 +117,23 @@ where
         return Err(invalid("Mann-Whitney emission loans use another host authority").into());
     }
     let mut resources = MannEmissionResources::new(kind, rows);
+    let mut binary_offset = 0;
     for state in states.clone() {
         work.step()?;
         state.validate_host(host)?;
+        let extents = state.extents()?;
+        if kind == FlatByteKind::Binary {
+            let (_, bytes) =
+                super::aggregate_mann_whitney_failure::wire_geometry(extents.sample_lengths)?;
+            binary_offset =
+                crate::aggregate_scalar::checked_binary_output_offset(binary_offset, bytes)?;
+        } else if extents.initialized {
+            super::aggregate_mann_whitney_failure::storage_count::<(f64, usize)>(
+                extents.sample_lengths[0] as u128 + extents.sample_lengths[1] as u128,
+            )?;
+        }
         resources
-            .add_state(state.extents()?, source)
+            .add_state(extents, source)
             .map_err(resource_failure)?;
     }
     let facts = resources.finish(source).map_err(resource_failure)?;
@@ -159,7 +162,7 @@ where
                         let bytes = core.serialize_with_work(&mut scalar_work)?;
                         scalar_work.flush()?;
                         builder.append_value(bytes);
-                        scalar_work.flush()
+                        scalar_work.flush().map_err(Into::into)
                     })
                     .map_err(core_failure)?;
             }
@@ -173,6 +176,7 @@ where
         FlatByteKind::Utf8 => {
             work.flush()?;
             let mut builder = StringBuilder::new();
+            let mut output_offset = 0;
             work.flush()?;
             for state in states {
                 work.step()?;
@@ -185,9 +189,13 @@ where
                         } else {
                             let value = core.build_result_with_work(&mut scalar_work)?;
                             scalar_work.flush()?;
+                            output_offset = crate::aggregate_scalar::checked_utf8_output_offset(
+                                output_offset,
+                                value.len(),
+                            )?;
                             builder.append_value(value);
                         }
-                        scalar_work.flush()
+                        scalar_work.flush().map_err(Into::into)
                     })
                     .map_err(core_failure)?;
             }

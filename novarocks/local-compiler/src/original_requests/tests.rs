@@ -43,7 +43,7 @@ impl PureCompileControl for Control {
             assert!(trace.len() < at, "callback after original refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((at, cause)) if trace.len() == at => Err(cause),
             _ => Ok(()),
         }
@@ -136,7 +136,7 @@ fn prefixes(source: &PhysicalCallRequest, pools: &ConstantPools, ordinary: bool)
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(materialize(source, pools, &control), Err(ExpressionLoweringError::Control(actual)) if actual == cause)

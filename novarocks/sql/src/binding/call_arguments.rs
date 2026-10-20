@@ -190,12 +190,9 @@ fn capture_call_arguments_with<I: IntoIterator>(
                 ));
             }
             work.flush()?;
-            let argument = author(expression, work.control());
-            if let Err(LogicalCallArgumentCaptureError::Control(cause)) = &argument {
-                return Err(LogicalCallArgumentCaptureError::Control(*cause));
-            }
+            let argument = author(expression, work.control())?;
             work.step()?;
-            arguments.push(argument?);
+            arguments.push(argument);
         }
         let exact_count = arguments.len() == selected_count;
         work.step()?;
@@ -217,11 +214,7 @@ fn capture_call_arguments_with<I: IntoIterator>(
             constant_policy,
         })
     })();
-    if matches!(&result, Err(LogicalCallArgumentCaptureError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    work.finish_result(result, LogicalCallArgumentCaptureError::from)
 }
 
 #[cfg(test)]

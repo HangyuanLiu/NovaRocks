@@ -57,7 +57,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after the original refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -255,7 +255,7 @@ fn prefixes(
     for at in positions {
         for cause in CAUSES {
             let refused = Control {
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(matches!(invoke(source,expressions,pools,&refused),
@@ -803,7 +803,7 @@ fn scalar_requests_lambda_preserves_full_static_signature_and_observes_actual_pa
             {
                 for cause in CAUSES {
                     let refused = Control {
-                        refusal: Some((at, cause)),
+                        refusal: Some((at, cause.clone())),
                         ..Control::default()
                     };
                     assert!(
@@ -858,7 +858,7 @@ fn scalar_requests_every_small_source_and_installed_owner_callback_preserves_ori
         for at in 0..trace.len() {
             for cause in CAUSES {
                 let refused = Control {
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 let error = prepare(

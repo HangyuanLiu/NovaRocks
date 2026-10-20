@@ -159,12 +159,12 @@ fn parametric_binding_loan_retains_the_original_fixed_author_and_control() {
     ] {
         for at in 1..=prefix.len() {
             let stop = Trace {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Default::default()
             };
             assert_eq!(
                 author.select_at_overload_observed(&overload, request(&args), &stop),
-                Err(FunctionBindingError::Control(cause)),
+                Err(FunctionBindingError::Control(cause.clone())),
             );
             assert_eq!(*stop.calls.lock().unwrap(), prefix[..at]);
         }
@@ -212,7 +212,7 @@ impl PureCompileControl for Trace {
         let mut calls = self.calls.lock().unwrap();
         calls.push((phase, units));
         let at = calls.len();
-        if let Some((stop, cause)) = self.stop {
+        if let Some((stop, cause)) = self.stop.clone() {
             assert!(at <= stop, "observation after the primary refusal");
             if at == stop {
                 return Err(cause);
@@ -223,26 +223,52 @@ impl PureCompileControl for Trace {
 }
 fn every_prefix<T>(call: impl Fn(&Trace) -> Result<T, FunctionBindingError>) {
     let baseline = Trace::default();
-    let _ = call(&baseline);
+    let baseline_error = call(&baseline).err();
     let trace = baseline.calls.lock().unwrap().clone();
-    assert!(trace.len() >= 2);
-    assert_eq!(trace.first().unwrap().1, 0);
-    assert!(trace.iter().any(|(_, units)| *units > 0));
+    assert_eq!(
+        trace.first(),
+        Some(&(CompilePhase::FunctionSpecialization, 0))
+    );
+    if baseline_error.is_none() {
+        // Successful work still observes its original positive completion tail.
+        assert!(trace.len() >= 2);
+        assert!(trace.iter().any(|(_, units)| *units > 0));
+    }
     for cause in [
         CompileControlError::Cancelled,
         CompileControlError::DeadlineExceeded,
         CompileControlError::ResourceExhausted,
+        CompileControlError::from_domain(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        ),
     ] {
         for at in 1..=trace.len() {
             let control = Trace {
                 calls: Mutex::new(Vec::new()),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(call(&control), Err(FunctionBindingError::Control(actual)) if actual == cause)
             );
             assert_eq!(*control.calls.lock().unwrap(), trace[..at]);
         }
+    }
+    if let Some(original) = baseline_error {
+        assert!(
+            !matches!(&original, FunctionBindingError::Control(_)),
+            "an unarmed baseline must supply the real semantic refusal"
+        );
+        let late = Trace {
+            calls: Mutex::default(),
+            stop: Some((trace.len() + 1, CompileControlError::Cancelled)),
+        };
+        let actual = call(&late).err().expect("the original semantic refusal");
+        assert_eq!(actual, original);
+        assert_eq!(
+            *late.calls.lock().unwrap(),
+            trace,
+            "a real semantic error cannot trigger a new completion callback"
+        );
     }
 }
 
@@ -530,7 +556,7 @@ fn parametric_exact_actual_control_prefixes_cover_success_failure_and_nested_met
         ] {
             let control = Trace {
                 calls: Mutex::new(Vec::new()),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert_eq!(
                 catalog.validate_frozen_selection(
@@ -900,7 +926,7 @@ fn parametric_state_law_is_authored_per_overload_in_declaration_and_every_select
 }
 
 #[test]
-fn parametric_state_law_preserves_ordinary_tail_and_original_author_control_without_after() {
+fn parametric_state_law_keeps_its_semantic_failure_and_original_author_control_without_after() {
     let family = Arc::new(StateLawFamily::default());
     let catalog = catalog_from(family.clone());
     let args = [argument(DataType::Int64, true)];
@@ -1017,7 +1043,7 @@ fn fixed_binding_carrier_shares_actual_author_and_keeps_field_prefix() {
     ] {
         let stop = Trace {
             calls: Mutex::new(Vec::new()),
-            stop: Some((1, cause)),
+            stop: Some((1, cause.clone())),
         };
         assert!(
             matches!(original.validate_selected(&selected.selected,wrong,&stop), Err(FunctionBindingError::Control(actual)) if actual==cause)

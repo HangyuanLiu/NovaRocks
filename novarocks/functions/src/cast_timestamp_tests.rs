@@ -39,7 +39,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -682,7 +682,7 @@ fn timestamp_compile_all_actual_callbacks_keep_original_three_causes_and_ordinar
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let error = PreparedCastRecipe::try_new(
                     CastOperation::Carrier,

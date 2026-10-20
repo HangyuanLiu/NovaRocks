@@ -108,14 +108,18 @@ impl SqlConstantEvaluator for ExecutionConstantEvaluator {
             };
             let root = arena.push_typed(root_node, request.result_type.data_type().clone());
             if let Some(source) = request.regexp_count_pattern_source {
-                arena.set_regexp_count_pattern_source(root, source)?;
+                arena
+                    .set_regexp_count_pattern_source(root, source)
+                    .map_err(SqlConstantEvaluationError::from_domain)?;
             }
             work.flush()?;
             let chunk = single_row_chunk()?;
             work.flush()?;
             // This staged adapter reuses the legacy runtime. Its opaque
             // internal loops/allocations are not a pure-kernel or MEM proof.
-            let output = arena.eval(root, &chunk)?;
+            let output = arena
+                .eval(root, &chunk)
+                .map_err(SqlConstantEvaluationError::from_domain)?;
             work.flush()?;
             if output.len() != 1 {
                 return Err(format!(
@@ -301,15 +305,16 @@ fn legacy_value_type_supported(
 /// Constant folding never reads a slot, so the chunk carries no columns; the
 /// explicit row count is what makes every literal kernel materialize a
 /// length-1 array.
-fn single_row_chunk() -> Result<Chunk, String> {
+fn single_row_chunk() -> Result<Chunk, SqlConstantEvaluationError> {
     let chunk_schema = Arc::new(ChunkSchema::empty());
     let batch = RecordBatch::try_new_with_options(
         chunk_schema.arrow_schema_ref(),
         Vec::new(),
         &RecordBatchOptions::new().with_row_count(Some(1)),
     )
-    .map_err(|error| format!("constant folding failed to build a 1-row chunk: {error}"))?;
+    .map_err(novarocks_functions::ConstantError::arrow_validation)?;
     Chunk::try_new_with_chunk_schema(batch, chunk_schema)
+        .map_err(SqlConstantEvaluationError::from_domain)
 }
 
 /// Maps one SQL fold node onto the execution expression it must reuse.

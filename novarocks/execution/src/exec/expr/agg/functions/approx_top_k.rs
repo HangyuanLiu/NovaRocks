@@ -59,14 +59,17 @@ fn update_one(
     state: &mut ApproxTopKState,
     value: Option<TrackedAggScalarValue>,
     count: i64,
-) -> Result<(), String> {
+) -> crate::runtime::fragment::ExecutionResult<()> {
     novarocks_functions::approx_top_k_core::update_one(&mut state.0, value, count)
+        .map_err(Into::into)
 }
-fn enforce_counter_limit(state: &mut ApproxTopKState) {
-    novarocks_functions::approx_top_k_core::enforce_counter_limit(&mut state.0)
+fn enforce_counter_limit(
+    state: &mut ApproxTopKState,
+) -> crate::runtime::fragment::ExecutionResult<()> {
+    novarocks_functions::approx_top_k_core::enforce_counter_limit(&mut state.0).map_err(Into::into)
 }
-fn serialize_state(state: &ApproxTopKState) -> Vec<u8> {
-    novarocks_functions::approx_top_k_core::serialize_state(&state.0)
+fn serialize_state(state: &ApproxTopKState) -> crate::runtime::fragment::ExecutionResult<Vec<u8>> {
+    novarocks_functions::approx_top_k_core::serialize_state(&state.0).map_err(Into::into)
 }
 #[cfg(test)]
 struct DecodedTopKEntry {
@@ -300,13 +303,14 @@ fn output_topk_array(
     output_type: &DataType,
     offset: usize,
     group_states: &[AggStatePtr],
-) -> Result<ArrayRef, String> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     novarocks_functions::approx_top_k_core::output_topk_array(
         output_type,
         group_states.iter().map(|&base| unsafe {
             &(*((base as *mut u8).add(offset) as *const ApproxTopKState)).0
         }),
     )
+    .map_err(Into::into)
 }
 impl AggregateFunction for ApproxTopKAgg {
     fn build_spec_from_type(
@@ -314,14 +318,22 @@ impl AggregateFunction for ApproxTopKAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let input_type = input_type.ok_or_else(|| "approx_top_k input type missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let input_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "approx_top_k input type missing",
+            )
+        })?;
         if input_is_intermediate {
             let output_type = func
                 .types
                 .as_ref()
                 .and_then(|t| t.output_type.clone())
-                .ok_or_else(|| "approx_top_k output type missing".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(
+                        "approx_top_k output type missing",
+                    )
+                })?;
             let intermediate_type = func
                 .types
                 .as_ref()
@@ -340,7 +352,11 @@ impl AggregateFunction for ApproxTopKAgg {
             .types
             .as_ref()
             .and_then(|t| t.output_type.clone())
-            .ok_or_else(|| "approx_top_k output type missing".to_string())?;
+            .ok_or_else(|| {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "approx_top_k output type missing",
+                )
+            })?;
         let intermediate_type = func
             .types
             .as_ref()
@@ -373,10 +389,10 @@ impl AggregateFunction for ApproxTopKAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "approx_top_k input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("approx_top_k input missing")
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -384,14 +400,17 @@ impl AggregateFunction for ApproxTopKAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "approx_top_k merge input missing".to_string())?;
-        let binary = arr
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| "approx_top_k merge input must be BinaryArray".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "approx_top_k merge input missing",
+            )
+        })?;
+        let binary = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "approx_top_k merge input must be BinaryArray",
+            )
+        })?;
         Ok(AggInputView::Binary(binary))
     }
 
@@ -405,9 +424,11 @@ impl AggregateFunction for ApproxTopKAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let tracker = tracker.ok_or_else(|| {
-            "allocation-tracked approx_top_k requires an aggregate memory tracker".to_string()
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "allocation-tracked approx_top_k requires an aggregate memory tracker",
+            )
         })?;
         unsafe {
             std::ptr::write(ptr as *mut ApproxTopKState, ApproxTopKState::new(tracker));
@@ -436,9 +457,11 @@ impl AggregateFunction for ApproxTopKAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("approx_top_k input view mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "approx_top_k input view mismatch",
+            ));
         };
 
         novarocks_functions::approx_top_k_core::check_update_array(array)?;
@@ -455,9 +478,11 @@ impl AggregateFunction for ApproxTopKAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Binary(array) = input else {
-            return Err("approx_top_k merge input view mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "approx_top_k merge input view mismatch",
+            ));
         };
         for (row, &base) in state_ptrs.iter().enumerate() {
             if array.is_null(row) {
@@ -476,14 +501,14 @@ impl AggregateFunction for ApproxTopKAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         if output_intermediate {
-            let mut builder = BinaryBuilder::new();
+            let mut builder = novarocks_functions::aggregate_scalar::BinaryResultBuilder::new();
             for &base in group_states {
                 let state = unsafe { &*((base as *mut u8).add(offset) as *const ApproxTopKState) };
-                builder.append_value(serialize_state(state));
+                builder.append_value(serialize_state(state)?)?;
             }
-            return Ok(Arc::new(builder.finish()));
+            return Ok(Arc::new(builder.finish()?));
         }
         output_topk_array(&spec.output_type, offset, group_states)
     }
@@ -525,7 +550,7 @@ mod retained_bytes_tests {
         assert!(state.counts.values().any(|entry| entry.count == 2));
 
         state.counter_num = 1;
-        enforce_counter_limit(&mut state);
+        enforce_counter_limit(&mut state).unwrap();
         assert_eq!(state.counts.len(), 1);
         assert!(tracker.current() < before_evict);
         drop(state);
@@ -544,7 +569,7 @@ mod retained_bytes_tests {
             update_one(&mut source, value, 1).unwrap();
         }
         let (_, counter_num, entries) =
-            deserialize_state(&serialize_state(&source)).expect("decode summary");
+            deserialize_state(&serialize_state(&source).unwrap()).expect("decode summary");
         let mut merged = ApproxTopKState::new(tracker.clone());
         merged.initialized = true;
         merged.k = 2;

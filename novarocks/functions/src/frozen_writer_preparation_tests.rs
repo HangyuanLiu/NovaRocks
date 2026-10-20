@@ -35,7 +35,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -199,22 +199,15 @@ fn frozen_writer_preparation_preserves_each_original_control_prefix_without_tail
         ] {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             let failure = prepare_frozen_writer_aggregate(&source.catalog, source.loan(), &control)
                 .unwrap_err();
             match failure {
                 FunctionSpecializationFailure::Control(actual) => assert_eq!(actual, cause),
-                FunctionSpecializationFailure::Kernel(actual) => assert_eq!(
-                    actual,
-                    match cause {
-                        CompileControlError::Cancelled => crate::KernelFailure::Cancelled,
-                        CompileControlError::DeadlineExceeded =>
-                            crate::KernelFailure::DeadlineExceeded,
-                        CompileControlError::ResourceExhausted =>
-                            crate::KernelFailure::ResourceExhausted,
-                    }
-                ),
+                FunctionSpecializationFailure::Kernel(actual) => {
+                    assert_eq!(actual, crate::KernelFailure::CompileControl(cause.clone()))
+                }
                 other => panic!("originating control changed category: {other:?}"),
             }
             assert_eq!(control.trace.into_inner().unwrap().len(), stop + 1);
@@ -454,7 +447,7 @@ fn frozen_writer_checked_preserves_each_actual_control_prefix_without_tail() {
         ] {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             let mut scope = RefusingScope::default();
             let failure = original_preparation_error(
@@ -469,16 +462,9 @@ fn frozen_writer_checked_preserves_each_actual_control_prefix_without_tail() {
             );
             match failure {
                 FunctionSpecializationFailure::Control(actual) => assert_eq!(actual, cause),
-                FunctionSpecializationFailure::Kernel(actual) => assert_eq!(
-                    actual,
-                    match cause {
-                        CompileControlError::Cancelled => crate::KernelFailure::Cancelled,
-                        CompileControlError::DeadlineExceeded =>
-                            crate::KernelFailure::DeadlineExceeded,
-                        CompileControlError::ResourceExhausted =>
-                            crate::KernelFailure::ResourceExhausted,
-                    }
-                ),
+                FunctionSpecializationFailure::Kernel(actual) => {
+                    assert_eq!(actual, crate::KernelFailure::CompileControl(cause.clone()))
+                }
                 other => panic!("originating checked control changed category: {other:?}"),
             }
             assert_eq!(control.trace.into_inner().unwrap().len(), stop + 1);

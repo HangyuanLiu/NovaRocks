@@ -17,7 +17,8 @@
 //! Exact selected addressing for the ONE original MAP_SIZE core.
 use super::{
     array_literal_core::CollectionObservation,
-    map_size_core::{MapSizeFailure, count_observed, map_input},
+    collection_offset_count::OffsetCountFailure,
+    map_size_core::{count_observed, map_input},
 };
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallContract,
@@ -27,7 +28,7 @@ use crate::{
 };
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
-use std::{alloc::Layout, cell::RefCell};
+use std::cell::RefCell;
 pub(super) fn validate_profile(
     contract: &ScalarCallContract,
     mut observe: impl FnMut() -> Result<(), KernelFailure>,
@@ -66,19 +67,9 @@ pub(super) fn evaluate<'a>(
         let [argument] = input.arguments() else {
             return Err(invalid("map_size requires one evaluated argument"));
         };
-        let map = map_input(argument.array().as_ref()).map_err(|text| internal(&text))?;
+        let map = map_input(argument.array().as_ref())?;
         work.borrow_mut().step()?;
         let selection = input.selection();
-        // Real original Vec<Option<i32>> and final Int32 carrier representability only.
-        Layout::array::<Option<i32>>(selection.len())
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
-        Layout::array::<i32>(selection.len()).map_err(|_| KernelFailure::ResourceExhausted)?;
-        let bitmap = selection
-            .len()
-            .checked_add(7)
-            .ok_or(KernelFailure::ResourceExhausted)?
-            / 8;
-        Layout::array::<u8>(bitmap).map_err(|_| KernelFailure::ResourceExhausted)?;
         let mut observer = |event| match event {
             CollectionObservation::Step => work.borrow_mut().step(),
             CollectionObservation::OpaqueBoundary => work.borrow_mut().flush(),
@@ -97,8 +88,7 @@ pub(super) fn evaluate<'a>(
             &mut observer,
         )
         .map_err(|failure| match failure {
-            MapSizeFailure::Control(cause) => cause,
-            MapSizeFailure::Data(text) => internal(&text),
+            OffsetCountFailure::Control(cause) | OffsetCountFailure::Operation(cause) => cause,
         })?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,

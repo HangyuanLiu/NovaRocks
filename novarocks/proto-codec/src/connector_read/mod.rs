@@ -138,7 +138,7 @@ pub(crate) fn exact_bytes(
 
 /// Re-root a nested error under this message's path without rebuilding it.
 pub(crate) fn nest(path: FieldPath, error: ProtocolError) -> ProtocolError {
-    let kind = error.kind();
+    let kind = error.kind().clone();
     let detail = error.detail().to_owned();
     let nested = path.append_segments(error.path().segments().iter().skip(1).cloned());
     ProtocolError::new(nested, kind, detail)

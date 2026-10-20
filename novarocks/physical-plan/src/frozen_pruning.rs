@@ -166,7 +166,7 @@ impl FrozenFragmentPruning {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FrozenPruningError {
     Control(CompileControlError),
     ResourceSource(&'static str),
@@ -181,7 +181,15 @@ impl fmt::Display for FrozenPruningError {
         write!(f, "invalid frozen pruning declarations: {self:?}")
     }
 }
-impl std::error::Error for FrozenPruningError {}
+impl std::error::Error for FrozenPruningError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Structure(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<CompileControlError> for FrozenPruningError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)

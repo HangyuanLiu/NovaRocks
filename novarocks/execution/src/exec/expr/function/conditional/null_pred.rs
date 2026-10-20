@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{ArrayRef, BooleanArray};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
@@ -25,7 +26,7 @@ pub fn eval_is_null<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     child: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let array = arena.eval(child, chunk)?;
     let len = array.len();
 
@@ -65,7 +66,7 @@ pub fn eval_is_not_null<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     child: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let array = arena.eval(child, chunk)?;
     let len = array.len();
 

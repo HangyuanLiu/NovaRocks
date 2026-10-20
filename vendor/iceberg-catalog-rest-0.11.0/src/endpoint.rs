@@ -114,14 +114,18 @@ impl Display for Endpoint {
 
 impl Serialize for Endpoint {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: Serializer {
+    where
+        S: Serializer,
+    {
         serializer.collect_str(self)
     }
 }
 
 impl<'de> Deserialize<'de> for Endpoint {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         struct EndpointVisitor;
 
         impl Visitor<'_> for EndpointVisitor {
@@ -132,7 +136,9 @@ impl<'de> Deserialize<'de> for Endpoint {
             }
 
             fn visit_str<E>(self, v: &str) -> Result<Endpoint, E>
-            where E: DeError {
+            where
+                E: DeError,
+            {
                 Endpoint::from_str(v).map_err(E::custom)
             }
         }

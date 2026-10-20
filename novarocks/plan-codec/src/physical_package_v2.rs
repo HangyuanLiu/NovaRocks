@@ -87,7 +87,16 @@ impl fmt::Display for PackageWireError {
         }
     }
 }
-impl std::error::Error for PackageWireError {}
+impl std::error::Error for PackageWireError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::ResourceModel(source) => Some(source),
+            Self::Protobuf(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// Immutable projection of this exact byte slice under the generated root
 /// model. It cannot be retargeted to another input or another caller control.

@@ -102,9 +102,6 @@ impl From<ConstantReferenceError> for CallRequestCodecError {
             | ConstantReferenceError::Constant(
                 novarocks_constant_contract::ConstantError::Control(cause),
             ) => Self::Control(cause),
-            ConstantReferenceError::Constant(
-                novarocks_constant_contract::ConstantError::Limit(_),
-            ) => Self::Control(CompileControlError::ResourceExhausted),
             other => Self::Constant(other),
         }
     }
@@ -177,12 +174,12 @@ impl fmt::Display for CallRequestCodecError {
 impl std::error::Error for CallRequestCodecError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Control(error) => Some(error),
-            Self::Type(error) => Some(error),
-            Self::Constant(error) => Some(error),
-            Self::Requests(error) => Some(error),
-            Self::Semantics(error) => Some(error),
-            Self::InvalidShape(_) => None,
+            Self::Control(source) => Some(source),
+            Self::Type(source) => Some(source),
+            Self::Constant(source) => Some(source),
+            Self::Requests(source) => Some(source),
+            Self::Semantics(source) => Some(source),
+            _ => None,
         }
     }
 }

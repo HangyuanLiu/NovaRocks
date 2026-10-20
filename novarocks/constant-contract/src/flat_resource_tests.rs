@@ -57,7 +57,7 @@ impl PureCompileControl for Control {
             assert!(at <= refusal, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.failure {
+        match self.failure.clone() {
             Some((refusal, cause)) if at == refusal => Err(cause),
             _ => Ok(()),
         }
@@ -120,7 +120,7 @@ fn prefixes(
 ) {
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(
                 matches!(preflight_flat_pool_resources(field,ty,input,bound,PHASE,&control),Err(ConstantError::Control(actual)) if actual==cause)
             );

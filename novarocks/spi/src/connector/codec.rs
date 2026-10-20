@@ -110,7 +110,7 @@ impl fmt::Display for ConnectorFieldPath {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorCodecErrorKind {
     MissingField,
     InvalidEnum,
@@ -129,6 +129,8 @@ pub struct ConnectorCodecError {
     path: ConnectorFieldPath,
     kind: ConnectorCodecErrorKind,
     detail: Arc<str>,
+    resource: Option<novarocks_failure_contract::ResourceFacts>,
+    contract: Option<ConnectorCodecContractError>,
 }
 
 impl ConnectorCodecError {
@@ -146,6 +148,8 @@ impl ConnectorCodecError {
             path,
             kind,
             detail: Arc::from(bound_detail(detail.as_ref())),
+            resource: None,
+            contract: None,
         }
     }
 
@@ -153,8 +157,8 @@ impl ConnectorCodecError {
         &self.path
     }
 
-    pub const fn kind(&self) -> ConnectorCodecErrorKind {
-        self.kind
+    pub const fn kind(&self) -> &ConnectorCodecErrorKind {
+        &self.kind
     }
 
     pub fn detail(&self) -> &str {
@@ -162,8 +166,8 @@ impl ConnectorCodecError {
     }
 
     /// Preserve the exact caller control failure across codec diagnostic paths.
-    pub const fn compile_control_error(&self) -> Option<CompileControlError> {
-        match self.kind {
+    pub const fn compile_control_error(&self) -> Option<&CompileControlError> {
+        match &self.kind {
             ConnectorCodecErrorKind::CompileControl(error) => Some(error),
             _ => None,
         }
@@ -194,17 +198,55 @@ impl Error for ConnectorCodecError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.kind {
             ConnectorCodecErrorKind::CompileControl(error) => Some(error),
-            _ => None,
+            _ => self
+                .contract
+                .as_ref()
+                .map(|error| error as &(dyn Error + 'static)),
         }
+    }
+}
+
+impl novarocks_failure_contract::FailureProjection for ConnectorCodecError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        if let Some(error) = self.compile_control_error() {
+            return error.failure_fact();
+        }
+        if let Some(error) = self.contract.as_ref() {
+            return error.failure_fact();
+        }
+        // Codec owns these format/support facts. Provider prose never selects
+        // a class, quantity, stop intent, or retry permission.
+        let (code, class) = match &self.kind {
+            ConnectorCodecErrorKind::MissingField => (160, FailureClass::Invariant),
+            ConnectorCodecErrorKind::InvalidEnum => (161, FailureClass::Invariant),
+            ConnectorCodecErrorKind::InvalidValue => (162, FailureClass::Invariant),
+            ConnectorCodecErrorKind::DuplicateField => (163, FailureClass::Invariant),
+            ConnectorCodecErrorKind::UnknownField => (164, FailureClass::Invariant),
+            ConnectorCodecErrorKind::InconsistentFields => (165, FailureClass::Invariant),
+            ConnectorCodecErrorKind::Unsupported => (166, FailureClass::Dependency),
+            ConnectorCodecErrorKind::Capacity => (167, FailureClass::Resource),
+            ConnectorCodecErrorKind::VersionMismatch => (168, FailureClass::Invariant),
+            ConnectorCodecErrorKind::CompileControl(error) => return error.failure_fact(),
+        };
+        let fact = FailureFact::new(
+            class,
+            FailureReason::new(domain::CONNECTOR, std::num::NonZeroU16::new(code).unwrap()),
+        );
+        self.resource
+            .map_or(fact, |resource| fact.with_resource(resource))
     }
 }
 
 impl From<CompileControlError> for ConnectorCodecError {
     fn from(error: CompileControlError) -> Self {
+        let detail = Arc::from(error.to_string());
         Self {
             path: ConnectorFieldPath::root("connector_payload"),
             kind: ConnectorCodecErrorKind::CompileControl(error),
-            detail: Arc::from(error.to_string()),
+            detail,
+            resource: None,
+            contract: None,
         }
     }
 }
@@ -233,7 +275,9 @@ impl From<ConnectorCodecContractError> for ConnectorCodecError {
                 ConnectorCodecErrorKind::VersionMismatch,
             ),
         };
-        Self::new(path, kind, error.to_string())
+        let mut result = Self::new(path, kind, error.to_string());
+        result.contract = Some(error);
+        result
     }
 }
 
@@ -572,6 +616,7 @@ impl ConnectorDecodeLedger {
             bytes,
             self.limits.max_raw_bytes,
             "raw bytes",
+            novarocks_failure_contract::ResourceDimension::Bytes,
         )
     }
 
@@ -581,11 +626,18 @@ impl ConnectorDecodeLedger {
             bytes,
             self.limits.max_retained_bytes,
             "retained bytes",
+            novarocks_failure_contract::ResourceDimension::Bytes,
         )
     }
 
     pub fn charge_items(&mut self, items: usize) -> Result<(), ConnectorCodecError> {
-        charge(&mut self.items, items, self.limits.max_items, "items")
+        charge(
+            &mut self.items,
+            items,
+            self.limits.max_items,
+            "items",
+            novarocks_failure_contract::ResourceDimension::Items,
+        )
     }
 
     pub fn charge_scalar(&mut self, bytes: usize) -> Result<(), ConnectorCodecError> {
@@ -594,12 +646,26 @@ impl ConnectorDecodeLedger {
             bytes,
             self.limits.max_scalar_bytes,
             "scalar bytes",
+            novarocks_failure_contract::ResourceDimension::Bytes,
         )
     }
 
     pub fn check_depth(&self, depth: usize) -> Result<(), ConnectorCodecError> {
         if depth > self.limits.max_depth {
-            return Err(capacity("nesting depth"));
+            let mut error = capacity(
+                "nesting depth",
+                novarocks_failure_contract::ResourceDimension::Positions,
+                depth,
+                0,
+                self.limits.max_depth,
+            );
+            // This API checks an absolute depth, not a charge against the
+            // current ledger depth. Do not invent committed/growth values.
+            if let Some(resource) = &mut error.resource {
+                resource.committed = None;
+                resource.required_growth = None;
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -650,23 +716,42 @@ fn charge(
     amount: usize,
     maximum: usize,
     subject: &'static str,
+    dimension: novarocks_failure_contract::ResourceDimension,
 ) -> Result<(), ConnectorCodecError> {
     let next = current
         .checked_add(amount)
-        .ok_or_else(|| capacity(subject))?;
+        .ok_or_else(|| capacity(subject, dimension, amount, *current, maximum))?;
     if next > maximum {
-        return Err(capacity(subject));
+        return Err(capacity(subject, dimension, amount, *current, maximum));
     }
     *current = next;
     Ok(())
 }
 
-fn capacity(subject: &'static str) -> ConnectorCodecError {
-    ConnectorCodecError::new(
+fn capacity(
+    subject: &'static str,
+    dimension: novarocks_failure_contract::ResourceDimension,
+    requested: usize,
+    committed: usize,
+    limit: usize,
+) -> ConnectorCodecError {
+    use novarocks_failure_contract::{ResourceFacts, ResourceScope};
+    let mut error = ConnectorCodecError::new(
         ConnectorFieldPath::root("connector_payload"),
         ConnectorCodecErrorKind::Capacity,
         format!("connector {subject} exceed the decode budget"),
-    )
+    );
+    error.resource = Some(ResourceFacts {
+        request_scope: Some(ResourceScope::Request),
+        constraint_scope: Some(ResourceScope::Request),
+        dimension,
+        requested: u64::try_from(requested).ok(),
+        required_growth: u64::try_from(requested).ok(),
+        limit: u64::try_from(limit).ok(),
+        live: None,
+        committed: u64::try_from(committed).ok(),
+    });
+    error
 }
 
 #[cfg(test)]
@@ -703,23 +788,23 @@ mod tests {
         assert_eq!(ledger.scalar_bytes(), 6);
         assert_eq!(
             ledger.charge_raw(1).unwrap_err().kind(),
-            ConnectorCodecErrorKind::Capacity
+            &ConnectorCodecErrorKind::Capacity
         );
         assert_eq!(
             ledger.charge_retained(1).unwrap_err().kind(),
-            ConnectorCodecErrorKind::Capacity
+            &ConnectorCodecErrorKind::Capacity
         );
         assert_eq!(
             ledger.charge_items(1).unwrap_err().kind(),
-            ConnectorCodecErrorKind::Capacity
+            &ConnectorCodecErrorKind::Capacity
         );
         assert_eq!(
             ledger.charge_scalar(1).unwrap_err().kind(),
-            ConnectorCodecErrorKind::Capacity
+            &ConnectorCodecErrorKind::Capacity
         );
         assert_eq!(
             ledger.check_depth(4).unwrap_err().kind(),
-            ConnectorCodecErrorKind::Capacity
+            &ConnectorCodecErrorKind::Capacity
         );
     }
 
@@ -729,8 +814,41 @@ mod tests {
         let mut ledger = ConnectorDecodeLedger::new(limits);
         ledger.charge_raw(7).unwrap();
         let checkpoint = ledger.checkpoint();
-        assert!(ledger.charge_raw(2).is_err());
+        use novarocks_failure_contract::{
+            FailureClass, FailureProjection, ResourceDimension, ResourceScope,
+        };
+        let refusal = ledger.charge_raw(2).expect_err("7 + 2 exceeds 8");
+        let fact = refusal.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        let resource = fact.resource().expect("known ledger quantities");
+        assert_eq!(resource.dimension, ResourceDimension::Bytes);
+        assert_eq!(resource.request_scope, Some(ResourceScope::Request));
+        assert_eq!(resource.constraint_scope, Some(ResourceScope::Request));
+        assert_eq!(
+            (
+                resource.requested,
+                resource.required_growth,
+                resource.committed,
+                resource.limit,
+                resource.live
+            ),
+            (Some(2), Some(2), Some(7), Some(8), None)
+        );
         assert_eq!(ledger.raw_bytes(), 7);
+        let depth = ledger
+            .check_depth(9)
+            .expect_err("absolute depth exceeds 8")
+            .failure_fact()
+            .resource()
+            .unwrap();
+        assert_eq!(
+            (depth.dimension, depth.requested, depth.limit),
+            (ResourceDimension::Positions, Some(9), Some(8))
+        );
+        assert_eq!(
+            (depth.committed, depth.required_growth, depth.live),
+            (None, None, None)
+        );
         ledger.charge_scalar(4).unwrap();
         ledger.rollback(checkpoint);
         assert_eq!(ledger.scalar_bytes(), 0);
@@ -762,7 +880,7 @@ mod tests {
                 )
                 .unwrap_err()
                 .kind(),
-            ConnectorCodecErrorKind::InconsistentFields
+            &ConnectorCodecErrorKind::InconsistentFields
         );
         assert_eq!(
             expected
@@ -774,7 +892,7 @@ mod tests {
                 )
                 .unwrap_err()
                 .kind(),
-            ConnectorCodecErrorKind::InconsistentFields
+            &ConnectorCodecErrorKind::InconsistentFields
         );
         assert_eq!(
             expected
@@ -786,7 +904,7 @@ mod tests {
                 )
                 .unwrap_err()
                 .kind(),
-            ConnectorCodecErrorKind::VersionMismatch
+            &ConnectorCodecErrorKind::VersionMismatch
         );
     }
 
@@ -821,7 +939,7 @@ mod tests {
             let mut level = ledger.enter_depth().unwrap();
             assert_eq!(
                 level.ledger().enter_depth().unwrap_err().kind(),
-                ConnectorCodecErrorKind::Capacity
+                &ConnectorCodecErrorKind::Capacity
             );
         }
         ledger.enter_depth().unwrap();
@@ -836,6 +954,54 @@ mod tests {
         assert!(error.detail().len() <= MAX_CONNECTOR_CODEC_ERROR_DETAIL_BYTES);
     }
 
+    #[test]
+    fn codec_projection_preserves_control_contract_and_unknown_provider_quantities() {
+        use novarocks_failure_contract::{FailureClass, FailureEvidence, FailureProjection};
+        for original in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let codec = ConnectorCodecError::from(original.clone())
+                .with_path(ConnectorFieldPath::root("scan"));
+            assert_eq!(codec.failure_fact(), original.failure_fact());
+            assert_eq!(
+                codec
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<CompileControlError>(),
+                Some(&original)
+            );
+        }
+        let original = ConnectorCodecContractError::CatalogMismatch;
+        let codec = ConnectorCodecError::from(original).with_path(ConnectorFieldPath::root("scan"));
+        assert_eq!(codec.failure_fact(), original.failure_fact());
+        assert_eq!(
+            codec
+                .source()
+                .unwrap()
+                .downcast_ref::<ConnectorCodecContractError>(),
+            Some(&original)
+        );
+        let unknown = ConnectorCodecError::new(
+            ConnectorFieldPath::root("provider"),
+            ConnectorCodecErrorKind::Capacity,
+            "cancelled deadline overflow",
+        );
+        assert_eq!(unknown.failure_fact().class(), FailureClass::Resource);
+        assert_eq!(
+            unknown.failure_fact().evidence(),
+            FailureEvidence::Originating
+        );
+        assert_eq!(unknown.failure_fact().resource(), None);
+        let invalid = ConnectorCodecError::new(
+            ConnectorFieldPath::root("provider"),
+            ConnectorCodecErrorKind::InvalidValue,
+            "out of memory",
+        );
+        assert_eq!(invalid.failure_fact().class(), FailureClass::Invariant);
+    }
+
     struct CompileOwner {
         calls: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
         failure_at: Option<(usize, CompileControlError)>,
@@ -844,7 +1010,7 @@ mod tests {
         fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             let mut calls = self.calls.lock().unwrap();
             calls.push((phase, units));
-            if let Some((index, error)) = self.failure_at
+            if let Some((index, error)) = self.failure_at.clone()
                 && calls.len() == index
             {
                 return Err(error);
@@ -867,7 +1033,7 @@ mod tests {
         ] {
             let owner = CompileOwner {
                 calls: Default::default(),
-                failure_at: Some((1, cause)),
+                failure_at: Some((1, cause.clone())),
             };
             let expected = header(ConnectorCodecCategory::ReadTable, 1);
             let mut ledger = compile_ledger();
@@ -876,8 +1042,11 @@ mod tests {
                     Ok(_) => panic!("entry control failure must refuse decoding"),
                     Err(error) => error,
                 };
-            assert_eq!(error.kind(), ConnectorCodecErrorKind::CompileControl(cause));
-            assert_eq!(error.compile_control_error(), Some(cause));
+            assert_eq!(
+                error.kind(),
+                &ConnectorCodecErrorKind::CompileControl(cause.clone())
+            );
+            assert_eq!(error.compile_control_error(), Some(&cause));
             assert_eq!(ledger.raw_bytes(), 0);
             assert_eq!(ledger.items(), 0);
             assert_eq!(
@@ -923,7 +1092,7 @@ mod tests {
         ] {
             let owner = CompileOwner {
                 calls: Default::default(),
-                failure_at: Some((2, cause)),
+                failure_at: Some((2, cause.clone())),
             };
             let expected = header(ConnectorCodecCategory::ReadTable, 1);
             let mut ledger = compile_ledger();
@@ -943,16 +1112,16 @@ mod tests {
                     .observe_compile_step()
                     .unwrap_err()
                     .compile_control_error(),
-                Some(cause)
+                Some(&cause)
             );
             assert_eq!(
                 context
                     .flush_compile_control()
                     .unwrap_err()
                     .compile_control_error(),
-                Some(cause)
+                Some(&cause)
             );
-            assert_eq!(first.compile_control_error(), Some(cause));
+            assert_eq!(first.compile_control_error(), Some(&cause));
             assert_eq!(
                 *owner.calls.lock().unwrap(),
                 vec![
@@ -968,7 +1137,7 @@ mod tests {
         let cause = CompileControlError::DeadlineExceeded;
         let owner = CompileOwner {
             calls: Default::default(),
-            failure_at: Some((2, cause)),
+            failure_at: Some((2, cause.clone())),
         };
         let expected = header(ConnectorCodecCategory::ReadTable, 1);
         let mut ledger = compile_ledger();
@@ -978,7 +1147,7 @@ mod tests {
             context.observe_compile_step().unwrap();
         }
         let error = context.flush_compile_control().unwrap_err();
-        assert_eq!(error.compile_control_error(), Some(cause));
+        assert_eq!(error.compile_control_error(), Some(&cause));
         assert_eq!(
             *owner.calls.lock().unwrap(),
             vec![
@@ -995,17 +1164,17 @@ mod tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let error = ConnectorCodecError::from(cause)
+            let error = ConnectorCodecError::from(cause.clone())
                 .with_path(ConnectorFieldPath::root("columns").index(17));
             assert_eq!(error.path().to_string(), "columns[17]");
-            assert_eq!(error.compile_control_error(), Some(cause));
+            assert_eq!(error.compile_control_error(), Some(&cause));
             let mut too_deep = ConnectorFieldPath::root("root");
             for _ in 0..MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH {
                 too_deep = too_deep.field("child");
             }
             let bounded_error = error.clone().with_path(too_deep);
             assert_eq!(bounded_error.path().to_string(), "connector_payload");
-            assert_eq!(bounded_error.compile_control_error(), Some(cause));
+            assert_eq!(bounded_error.compile_control_error(), Some(&cause));
             assert_eq!(
                 error
                     .source()

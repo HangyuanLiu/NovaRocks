@@ -67,7 +67,7 @@ impl PureCompileControl for Control {
             assert!(at <= refusal, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.fail {
+        match self.fail.clone() {
             Some((refusal, cause)) if at == refusal => Err(cause),
             _ => Ok(()),
         }
@@ -108,7 +108,7 @@ fn prefixes(
 ) {
     for at in positions {
         for cause in CAUSES {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(
                 matches!(preflight_flat_record_batch(meta, body, field, bound, &verifier(), &control),
                 Err(TypeCodecError::Control(actual)) if actual == cause)

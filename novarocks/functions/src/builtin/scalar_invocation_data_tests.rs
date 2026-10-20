@@ -213,9 +213,9 @@ fn scalar_whole_data_private_original_string_move_clone_and_last_drop_keep_actua
     let pointer = message.as_ptr();
     let cap = message.capacity();
     let attempts = host.attempts();
-    let data = slot.publish_original(message);
+    let data = slot.publish_original(crate::DataFailureReason::InvalidValue, message);
     assert_eq!(data.message().as_ptr(), pointer);
-    assert_eq!(data.0.original.get().unwrap().capacity(), cap);
+    assert_eq!(data.0.original.get().unwrap().1.capacity(), cap);
     assert!(Arc::ptr_eq(data.contract(), &original_contract));
     let copy = data.clone();
     assert!(data.same_backing(&copy));
@@ -260,8 +260,14 @@ fn scalar_whole_data_private_domain_preserves_explicit_empty_sparse_and_first_pu
             1024,
         )
         .unwrap();
-        let first = slot.publish_original(String::from("original whole-call Data"));
-        let repeated = slot.publish_original(String::from("later must not replace first Data"));
+        let first = slot.publish_original(
+            crate::DataFailureReason::InvalidValue,
+            String::from("original whole-call Data"),
+        );
+        let repeated = slot.publish_original(
+            crate::DataFailureReason::NumericOutOfRange,
+            String::from("later must not replace first Data"),
+        );
         assert!(first.same_backing(&repeated));
         assert_eq!(first.batch_rows(), selection.batch_rows());
         assert_eq!(first.source_len(), selection.len());
@@ -270,6 +276,8 @@ fn scalar_whole_data_private_domain_preserves_explicit_empty_sparse_and_first_pu
         }
         assert_eq!(first.source_row(selection.len()), None);
         assert_eq!(first.message(), "original whole-call Data");
+        assert_eq!(first.reason(), crate::DataFailureReason::InvalidValue);
+        assert_eq!(repeated.reason(), first.reason());
     }
     drop(allocator);
     host.released();
@@ -425,7 +433,10 @@ fn scalar_whole_data_private_data_and_seven_kernel_causes_end_instance_without_f
         1024,
     )
     .unwrap();
-    let data = slot.publish_original(String::from("original invoked-empty whole-call Data"));
+    let data = slot.publish_original(
+        crate::DataFailureReason::InvalidValue,
+        String::from("original invoked-empty whole-call Data"),
+    );
     let mut latch = ScalarInvocationLatch::default();
     let result = latch.execute::<()>(
         || Err(ScalarInvocationFailure::Data(data.clone())),

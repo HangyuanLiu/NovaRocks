@@ -69,7 +69,7 @@ impl PureCompileControl for Compile {
             assert!(at <= stop)
         }
         t.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -343,7 +343,7 @@ fn collection_every_actual_compile_checkpoint_preserves_three_causes_and_ordinar
             ] {
                 let c = Compile {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let error = prepared(op, &types, &c).err().unwrap();
                 let actual = match error {
@@ -490,6 +490,9 @@ fn uninhabited_key_map_lookup_returns_typed_null_for_column_scalar_and_compact_p
 
 #[test]
 fn uninhabited_key_map_does_not_erase_probe_errors_or_accept_wrong_frozen_carrier() {
+    use crate::EvaluationContractError;
+    use novarocks_failure_contract::FailureProjection;
+
     let value = FunctionValueType::new(DataType::Int32, false);
     let map = empty_uninhabited_map(&value, 1);
     let probe: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>]));
@@ -503,23 +506,35 @@ fn uninhabited_key_map_does_not_erase_probe_errors_or_accept_wrong_frozen_carrie
     let wrong_probe: ArrayRef = Arc::new(Int32Array::from(vec![1]));
     let short_probe: ArrayRef = Arc::new(StringArray::from(Vec::<Option<&str>>::new()));
     let wrong_map = empty_uninhabited_map(&FunctionValueType::new(DataType::Utf8, false), 1);
-    for args in [
-        [
-            EvaluatedArgument::Column(&map),
-            EvaluatedArgument::SelectedColumn(&failed),
-        ],
-        [
-            EvaluatedArgument::Column(&map),
-            EvaluatedArgument::Column(&wrong_probe),
-        ],
-        [
-            EvaluatedArgument::Column(&map),
-            EvaluatedArgument::Column(&short_probe),
-        ],
-        [
-            EvaluatedArgument::Column(&wrong_map),
-            EvaluatedArgument::SelectedColumn(&failed),
-        ],
+    for (args, expected_contract) in [
+        (
+            [
+                EvaluatedArgument::Column(&map),
+                EvaluatedArgument::SelectedColumn(&failed),
+            ],
+            Some(EvaluationContractError::ArgumentRowErrors),
+        ),
+        (
+            [
+                EvaluatedArgument::Column(&map),
+                EvaluatedArgument::Column(&wrong_probe),
+            ],
+            None,
+        ),
+        (
+            [
+                EvaluatedArgument::Column(&map),
+                EvaluatedArgument::Column(&short_probe),
+            ],
+            Some(EvaluationContractError::ArgumentLength),
+        ),
+        (
+            [
+                EvaluatedArgument::Column(&wrong_map),
+                EvaluatedArgument::SelectedColumn(&failed),
+            ],
+            None,
+        ),
     ] {
         let prepared = prepared(
             Operation::MapLookup,
@@ -531,10 +546,23 @@ fn uninhabited_key_map_does_not_erase_probe_errors_or_accept_wrong_frozen_carrie
         )
         .unwrap();
         let mut kernel = ScalarEvaluationInstance::instantiate(prepared).unwrap();
-        assert!(matches!(
-            kernel.evaluate(Selection::all(1), &args, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
-        ));
+        let failure = kernel
+            .evaluate(Selection::all(1), &args, &Control::default())
+            .unwrap_err();
+        match expected_contract {
+            Some(expected) => {
+                crate::kernel_control::test_contract::exact(&failure, expected);
+                assert_eq!(failure.failure_fact(), expected.failure_fact());
+                assert_eq!(failure.to_string(), expected.to_string());
+            }
+            None => {
+                let expected = KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                    "evaluated argument differs from its exact selected type",
+                ));
+                assert_eq!(failure.failure_fact(), expected.failure_fact());
+                assert_eq!(failure, expected);
+            }
+        }
         let after = Control::default();
         assert_eq!(
             kernel.evaluate(Selection::all(0), &[], &after).unwrap_err(),

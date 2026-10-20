@@ -87,21 +87,29 @@ fn by_copy_joint_actual_chunk_refusal_releases_original_input_without_output() {
     let source = SourceBackingOwner::try_from_owned(original, host.clone(), &control).unwrap();
     // Policy is installed from the actual constructor bill after that separate
     // original input owner was admitted. No guessed metadata ordinal or wallet.
-    copy_tracker
-        .install_limit_once(copy_tracker.current() + 1)
-        .unwrap();
-    assert!(matches!(
-        take_copy_in(
-            array,
-            CopyIndices::UInt32(Arc::new(UInt32Array::from(vec![1_u32, 0]))),
-            source,
-            host,
-            &control
-        ),
-        Err(CopyOperationError::Control(
-            novarocks_functions::KernelFailure::ResourceExhausted
-        ))
-    ));
+    let limit = copy_tracker.current() + 1;
+    copy_tracker.install_limit_once(limit).unwrap();
+    let refusal = take_copy_in(
+        array,
+        CopyIndices::UInt32(Arc::new(UInt32Array::from(vec![1_u32, 0]))),
+        source,
+        host,
+        &control,
+    )
+    .err()
+    .expect("the real copy must refuse");
+    let CopyOperationError::Control(cause) = refusal else {
+        panic!("the real copy allocator must refuse before output");
+    };
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&cause);
+    assert_eq!(
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Resource
+    );
+    let resource = fact.resource().expect("the actual copy capacity source");
+    assert_eq!(resource.limit, Some(limit as u64));
+    assert!(resource.requested.unwrap() > 1);
+    assert!(resource.committed.unwrap() > limit as u64);
     assert_eq!(input_tracker.current(), 0);
     assert_eq!(copy_tracker.current(), 0);
     assert_eq!(query.current(), 0);

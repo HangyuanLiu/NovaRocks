@@ -46,7 +46,6 @@ trait DiagnosticPolicy {
         errors: &mut Vec<ValidationError>,
         error: ValidationError,
     ) -> Result<(), Self::Error>;
-    fn sentinel(&mut self, errors: &mut Vec<ValidationError>) -> Result<(), Self::Error>;
     fn finish(
         &mut self,
         errors: Vec<ValidationError>,
@@ -73,15 +72,7 @@ impl DiagnosticPolicy for PlainDiagnostic {
         errors.push(error);
         Ok(())
     }
-    fn sentinel(&mut self, errors: &mut Vec<ValidationError>) -> Result<(), Self::Error> {
-        let error = ValidationError::categorized_core(
-            ValidationErrorCategory::StructuralInvariant,
-            "validation",
-            "additional validation errors were truncated",
-            self,
-        )?;
-        self.append(errors, error)
-    }
+
     fn finish(
         &mut self,
         errors: Vec<ValidationError>,
@@ -165,51 +156,7 @@ impl DiagnosticPolicy for CallerDiagnostic<'_, '_> {
         self.work.step()?;
         Ok(())
     }
-    fn sentinel(&mut self, errors: &mut Vec<ValidationError>) -> Result<(), Self::Error> {
-        let path = "validation";
-        let message = "additional validation errors were truncated";
-        let captured = push_growth(errors)?;
-        if let Some(prepaid) = self.prepaid {
-            if prepaid.growth != Some(captured) {
-                return Err(ControlResourceError::SourceModel(
-                    "diagnostic collector source changed",
-                ));
-            }
-        } else {
-            self.resources.work(5)?; // Two constructions, their cleanup and one push.
-            // The sentinel's two spellings AND the actual collector growth are
-            // already known at this header. Admit them together before observing
-            // or making any part of the original owned sentinel operation.
-            self.resources.buffer::<u8>(path.len(), 1)?;
-            self.resources.buffer::<u8>(message.len(), 1)?;
-            if let Some(layout) = captured.requested_backing {
-                self.resources.layout(layout, 1)?;
-            }
-        }
-        (self.admit)(&self.resources.facts())?;
-        reserve_for_push_in::<_, ControlResourceError>(
-            errors,
-            &mut |facts| {
-                if *facts != captured {
-                    return Err(ControlResourceError::SourceModel(
-                        "diagnostic collector source changed",
-                    ));
-                }
-                // This is the same prepaid actual request, not another prefix sum.
-                (self.admit)(&self.resources.facts()).map_err(Into::into)
-            },
-            self.work,
-        )?;
-        let (path, message) = self.copy_spellings(path, message)?;
-        let error = ValidationError::from_spellings(
-            ValidationErrorCategory::StructuralInvariant,
-            path,
-            message,
-        );
-        errors.push(error);
-        self.work.step()?;
-        Ok(())
-    }
+
     fn finish(
         &mut self,
         errors: Vec<ValidationError>,
@@ -412,7 +359,13 @@ impl fmt::Display for ValidationError {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValidationErrors(Box<[ValidationError]>);
+pub struct ValidationErrors {
+    errors: Box<[ValidationError]>,
+    // Observed causes survive payload clipping. Diagnostic limits are not
+    // producer defects and must never manufacture a StructuralInvariant.
+    observed_categories: u8,
+    diagnostics_truncated: bool,
+}
 
 pub const MAX_VALIDATION_ERRORS: usize = 128;
 
@@ -426,7 +379,8 @@ pub const MAX_VALIDATION_ERRORS: usize = 128;
 /// caller did not supply.
 #[derive(Default)]
 pub(crate) struct ValidationContext {
-    pub(crate) errors: Vec<ValidationError>,
+    errors: Vec<ValidationError>,
+    observed_categories: u8,
     pub(crate) truncated: bool,
     pub(crate) limits: PlanLimits,
     construction_only: bool,
@@ -440,6 +394,7 @@ impl ValidationContext {
     pub(crate) const fn with_limits(limits: PlanLimits) -> Self {
         Self {
             errors: Vec::new(),
+            observed_categories: 0,
             truncated: false,
             limits,
             construction_only: false,
@@ -505,8 +460,7 @@ impl ValidationContext {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), ControlResourceError> {
         let needs_push = self.errors.len() < MAX_VALIDATION_ERRORS;
-        let needs_sentinel = !needs_push && !self.truncated;
-        let growth = if needs_push || needs_sentinel {
+        let growth = if needs_push {
             Some(push_growth(&self.errors)?)
         } else {
             None
@@ -527,11 +481,6 @@ impl ValidationContext {
         }
         if needs_push {
             resources.work(1)?;
-        }
-        if needs_sentinel {
-            resources.buffer::<u8>("validation".len(), 1)?;
-            resources.buffer::<u8>("additional validation errors were truncated".len(), 1)?;
-            resources.work(5)?;
         }
         admit(&resources.facts())?;
         work.flush()?;
@@ -576,10 +525,11 @@ impl ValidationContext {
         error: ValidationError,
         policy: &mut P,
     ) -> Result<(), P::Error> {
+        self.observed_categories |= category_bit(error.category());
         if self.errors.len() < MAX_VALIDATION_ERRORS {
             policy.append(&mut self.errors, error)?;
         } else {
-            self.mark_truncated_core(policy)?;
+            self.truncated = true;
         }
         Ok(())
     }
@@ -588,31 +538,10 @@ impl ValidationContext {
         self.errors.len() >= MAX_VALIDATION_ERRORS
     }
 
+    /// A display/coverage fact only. No semantic failure or allocation is
+    /// introduced when the bounded diagnostic payload has filled up.
     pub(crate) fn mark_truncated(&mut self) {
-        self.mark_truncated_core(&mut PlainDiagnostic)
-            .unwrap_or_else(|never| match never {});
-    }
-
-    pub(crate) fn mark_truncated_in(
-        &mut self,
-        resources: &mut ControlResourceCounter,
-        admit: &mut DiagnosticAdmission<'_>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), ControlResourceError> {
-        self.mark_truncated_core(&mut CallerDiagnostic {
-            resources,
-            admit,
-            work,
-            prepaid: None,
-        })
-    }
-
-    fn mark_truncated_core<P: DiagnosticPolicy>(&mut self, policy: &mut P) -> Result<(), P::Error> {
-        if !self.truncated {
-            self.truncated = true;
-            policy.sentinel(&mut self.errors)?;
-        }
-        Ok(())
+        self.truncated = true;
     }
 
     pub(crate) fn into_vec(self) -> Vec<ValidationError> {
@@ -628,14 +557,28 @@ impl std::ops::Deref for ValidationContext {
     }
 }
 
+fn category_bit(category: ValidationErrorCategory) -> u8 {
+    match category {
+        ValidationErrorCategory::StructuralInvariant => 1,
+        ValidationErrorCategory::UnsupportedCapability => 2,
+        ValidationErrorCategory::ResourceLimit => 4,
+    }
+}
+
 impl ValidationErrors {
+    /// Retained cause payloads only; truncation is separate metadata.
     pub fn errors(&self) -> &[ValidationError] {
-        &self.0
+        &self.errors
     }
 
-    /// True when at least one error carries `category`.
+    pub const fn diagnostics_truncated(&self) -> bool {
+        self.diagnostics_truncated
+    }
+
+    /// True when an observed cause carries `category`, including a cause whose
+    /// payload was clipped. This makes no claim about checks not executed.
     pub fn has(&self, category: ValidationErrorCategory) -> bool {
-        self.0.iter().any(|error| error.category() == category)
+        self.observed_categories & category_bit(category) != 0
     }
 
     /// True when every error is a violated contract invariant. A worker seeing
@@ -643,11 +586,7 @@ impl ValidationErrors {
     /// no raised limit can make the same plan succeed, so it must not be
     /// reported as a capability or capacity refusal.
     pub fn is_producer_defect(&self) -> bool {
-        !self.0.is_empty()
-            && self
-                .0
-                .iter()
-                .all(|error| error.category() == ValidationErrorCategory::StructuralInvariant)
+        self.observed_categories == category_bit(ValidationErrorCategory::StructuralInvariant)
     }
 
     pub(crate) fn from_collector(errors: ValidationContext) -> Self {
@@ -678,7 +617,13 @@ impl ValidationErrors {
         errors: ValidationContext,
         policy: &mut P,
     ) -> Result<Self, P::Error> {
-        Ok(Self(policy.finish(errors.into_vec())?))
+        let observed_categories = errors.observed_categories;
+        let diagnostics_truncated = errors.truncated;
+        Ok(Self {
+            errors: policy.finish(errors.into_vec())?,
+            observed_categories,
+            diagnostics_truncated,
+        })
     }
 }
 
@@ -686,11 +631,14 @@ impl fmt::Display for ValidationErrors {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "physical plan has {} validation error(s)",
-            self.0.len()
+            "physical plan retains {} validation error(s)",
+            self.errors.len()
         )?;
-        for error in &self.0 {
+        for error in &self.errors {
             write!(formatter, "; {error}")?;
+        }
+        if self.diagnostics_truncated {
+            formatter.write_str("; additional validation diagnostics were truncated")?;
         }
         Ok(())
     }

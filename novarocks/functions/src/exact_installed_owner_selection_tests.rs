@@ -40,7 +40,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -215,14 +215,29 @@ fn prefixes(
     success: bool,
 ) {
     let baseline = Control::default();
-    assert_eq!(call(&baseline).is_ok(), success);
+    let original = call(&baseline);
+    assert_eq!(original.is_ok(), success);
     let trace = baseline.trace.lock().unwrap().clone();
     assert_eq!(trace.first(), Some(&0));
-    assert!(trace.len() >= 2);
+    if success {
+        assert!(trace.len() >= 2);
+        assert!(trace.iter().any(|units| *units > 0));
+    } else {
+        // A semantic refusal can precede the first flush. Do not manufacture
+        // an outer footer; an armed later callback must not replace the cause.
+        for cause in CAUSES {
+            let control = Control {
+                trace: Mutex::new(vec![]),
+                refusal: Some((trace.len(), cause)),
+            };
+            assert_eq!(call(&control).unwrap_err(), *original.as_ref().unwrap_err());
+            assert_eq!(*control.trace.lock().unwrap(), trace);
+        }
+    }
     for stop in 0..trace.len() {
         for cause in CAUSES {
             let control = Control {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..Control::default()
             };
             assert!(
@@ -679,7 +694,7 @@ fn installed_exact_actual_small_prefixes_and_wide_collection_quantum_preserve_fi
     for stop in [0, quantum, trace.len() - 1] {
         for cause in CAUSES {
             let control = Control {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..Control::default()
             };
             assert!(

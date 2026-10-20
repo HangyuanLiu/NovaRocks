@@ -17,32 +17,50 @@
 
 //! Bounds-checked primitives for execution-owned filter payloads.
 
-fn require(data: &[u8], offset: usize, width: usize) -> Result<(), String> {
+fn require(
+    data: &[u8],
+    offset: usize,
+    width: usize,
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     if data.len() < offset.saturating_add(width) {
-        return Err("runtime filter data truncated".to_string());
+        return Err(crate::exec::runtime_filter::failure::contract(
+            "runtime filter data truncated",
+        ));
     }
     Ok(())
 }
 
-pub(super) fn read_u8(data: &[u8], offset: &mut usize) -> Result<u8, String> {
+pub(super) fn read_u8(
+    data: &[u8],
+    offset: &mut usize,
+) -> Result<u8, crate::runtime::fragment::ExecutionFailure> {
     require(data, *offset, 1)?;
     let value = data[*offset];
     *offset += 1;
     Ok(value)
 }
 
-pub(super) fn read_i8(data: &[u8], offset: &mut usize) -> Result<i8, String> {
+pub(super) fn read_i8(
+    data: &[u8],
+    offset: &mut usize,
+) -> Result<i8, crate::runtime::fragment::ExecutionFailure> {
     Ok(read_u8(data, offset)? as i8)
 }
 
-pub(super) fn read_i16_le(data: &[u8], offset: &mut usize) -> Result<i16, String> {
+pub(super) fn read_i16_le(
+    data: &[u8],
+    offset: &mut usize,
+) -> Result<i16, crate::runtime::fragment::ExecutionFailure> {
     require(data, *offset, 2)?;
     let value = i16::from_le_bytes([data[*offset], data[*offset + 1]]);
     *offset += 2;
     Ok(value)
 }
 
-pub(super) fn read_i32_le(data: &[u8], offset: &mut usize) -> Result<i32, String> {
+pub(super) fn read_i32_le(
+    data: &[u8],
+    offset: &mut usize,
+) -> Result<i32, crate::runtime::fragment::ExecutionFailure> {
     require(data, *offset, 4)?;
     let value = i32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap());
     *offset += 4;
@@ -50,17 +68,26 @@ pub(super) fn read_i32_le(data: &[u8], offset: &mut usize) -> Result<i32, String
 }
 
 #[allow(dead_code, reason = "Retained for runtime-filter codec compatibility.")]
-pub(super) fn read_u32_le(data: &[u8], offset: &mut usize) -> Result<u32, String> {
+pub(super) fn read_u32_le(
+    data: &[u8],
+    offset: &mut usize,
+) -> Result<u32, crate::runtime::fragment::ExecutionFailure> {
     Ok(read_i32_le(data, offset)? as u32)
 }
 
-pub(super) fn read_i64_le(data: &[u8], offset: &mut usize) -> Result<i64, String> {
+pub(super) fn read_i64_le(
+    data: &[u8],
+    offset: &mut usize,
+) -> Result<i64, crate::runtime::fragment::ExecutionFailure> {
     require(data, *offset, 8)?;
     let value = i64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
     *offset += 8;
     Ok(value)
 }
 
-pub(super) fn read_u64_le(data: &[u8], offset: &mut usize) -> Result<u64, String> {
+pub(super) fn read_u64_le(
+    data: &[u8],
+    offset: &mut usize,
+) -> Result<u64, crate::runtime::fragment::ExecutionFailure> {
     Ok(read_i64_le(data, offset)? as u64)
 }

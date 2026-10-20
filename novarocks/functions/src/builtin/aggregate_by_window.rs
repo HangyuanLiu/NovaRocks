@@ -21,13 +21,11 @@
 
 use super::aggregate_by::ByKernel;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
-use crate::aggregate_scalar::{self as scalar, ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::{self as scalar, ScalarWork};
 use crate::kernel_control::{KernelControlObservation, compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::opaque_memory::OpaqueRetainedCharge;
-use crate::scalar_output_operation::{
-    LeasedScalarOutput, ScalarOutputFailure, with_scalar_output_operation,
-};
+use crate::scalar_output_operation::{LeasedScalarOutput, with_scalar_output_operation};
 use crate::scalar_output_resources::ScalarOutputResources;
 use crate::window_invocation_data::{
     WindowDataSlot, WindowEvaluationFailure, WindowInvocationContext, WindowInvocationPhase,
@@ -98,31 +96,8 @@ fn observed<T>(
         }
     }
 }
-fn scalar_resource_failure(cause: ScalarStateError) -> WindowEvaluationFailure {
-    match cause {
-        ScalarStateError::Kernel(cause) => cause.into(),
-        _ => unreachable!("resource-only graph facts do not compute value Data"),
-    }
-}
-fn project_original(
-    slot: &WindowDataSlot,
-    phase: WindowInvocationPhase,
-    frame: Option<crate::WindowFrameOrigin>,
-    row: Option<usize>,
-    cause: ScalarOutputFailure,
-) -> WindowEvaluationFailure {
-    match cause {
-        ScalarOutputFailure::Kernel(cause) => cause.into(),
-        ScalarOutputFailure::OriginalData {
-            message,
-            reservation,
-        } => match frame {
-            Some(origin) => slot
-                .publish_frame(phase, origin, row, message, reservation)
-                .into(),
-            None => slot.publish(phase, None, row, message, reservation).into(),
-        },
-    }
+fn scalar_resource_failure(cause: KernelFailure) -> WindowEvaluationFailure {
+    cause.into()
 }
 
 // The original update never renders a payload value in its Data message. This
@@ -372,19 +347,28 @@ impl TrackedByWindow {
                                 &mut ScalarWork::new(Some(row_work)),
                             ) {
                                 Ok(()) => Ok(()),
-                                Err(ScalarStateError::Kernel(cause)) => Err(cause.into()),
-                                Err(ScalarStateError::OutputAllocation(_)) => {
-                                    Err(KernelFailure::ResourceExhausted.into())
+                                // This is already an unmaskable whole computation.
+                                // Preserve its source and the actual window invocation
+                                // facts under the original pre-granted diagnostic lease.
+                                Err(cause)
+                                    if {
+                                        use novarocks_failure_contract::{
+                                            FailureClass, FailureProjection,
+                                        };
+                                        cause.failure_fact().class() == FailureClass::Data
+                                    } =>
+                                {
+                                    Err(slot
+                                        .publish_frame_source(
+                                            WindowInvocationPhase::FrameUpdate,
+                                            frame_origin,
+                                            Some(row),
+                                            cause,
+                                            reservation,
+                                        )
+                                        .into())
                                 }
-                                Err(ScalarStateError::Legacy(message)) => Err(slot
-                                    .publish_frame(
-                                        WindowInvocationPhase::FrameUpdate,
-                                        frame_origin,
-                                        Some(row),
-                                        message,
-                                        reservation,
-                                    )
-                                    .into()),
+                                Err(cause) => Err(cause.into()),
                             }
                         });
                         result?;
@@ -404,17 +388,10 @@ impl TrackedByWindow {
                         |scalar_work| {
                             self.aggregate
                                 .build_final_scalar(std::iter::once(&state), scalar_work)
+                                .map_err(Into::into)
                         },
                     );
-                    output.map_err(|cause| {
-                        project_original(
-                            &slot,
-                            WindowInvocationPhase::FrameFinal,
-                            Some(frame_origin),
-                            None,
-                            cause,
-                        )
-                    })
+                    output.map_err(WindowEvaluationFailure::from)
                 })();
                 // Same original destruction author: every initialized state is
                 // destroyed before inspecting the frame result or reading it.
@@ -422,15 +399,7 @@ impl TrackedByWindow {
                 let output = result?;
                 output_values
                     .push_original_read(&output.values, 0, output.resources, work)
-                    .map_err(|cause| {
-                        project_original(
-                            &slot,
-                            WindowInvocationPhase::FrameScalarRead,
-                            Some(frame_origin),
-                            None,
-                            cause,
-                        )
-                    })?;
+                    .map_err(WindowEvaluationFailure::from)?;
                 work.step()?;
             }
             let resources = ScalarOutputResources::from_owned(
@@ -459,22 +428,12 @@ impl TrackedByWindow {
                             values,
                             scalar_work,
                         )
+                        .map_err(Into::into)
                     }
                 },
             );
             drop(staging_charge);
-            let output = output.map_err(|cause| {
-                project_original(
-                    &slot,
-                    match input {
-                        ByWindowInput::Partition(_) => WindowInvocationPhase::PartitionAssembly,
-                        ByWindowInput::Invocation(_) => WindowInvocationPhase::InvocationAssembly,
-                    },
-                    None,
-                    None,
-                    cause,
-                )
-            })?;
+            let output = output.map_err(WindowEvaluationFailure::from)?;
             work.flush()?;
             Ok(Box::new(ByPartition {
                 output: Some(output),
@@ -572,15 +531,7 @@ impl WindowKernelPartition for ByPartition<'_> {
                         .ok_or_else(|| invalid("tracked BY output Selection ordinal is absent"))?;
                     staging
                         .push_original_read(&out.values, row, out.resources, work)
-                        .map_err(|cause| {
-                            project_original(
-                                &self.data_slot,
-                                WindowInvocationPhase::OutputEmission,
-                                None,
-                                Some(row),
-                                cause,
-                            )
-                        })?;
+                        .map_err(WindowEvaluationFailure::from)?;
                     work.step()?;
                 }
                 let resources = ScalarOutputResources::from_owned(
@@ -601,20 +552,11 @@ impl WindowKernelPartition for ByPartition<'_> {
                             values,
                             scalar_work,
                         )
+                        .map_err(Into::into)
                     },
                 );
                 drop(staging_charge);
-                values
-                    .map_err(|cause| {
-                        project_original(
-                            &self.data_slot,
-                            WindowInvocationPhase::OutputEmission,
-                            None,
-                            None,
-                            cause,
-                        )
-                    })?
-                    .values
+                values.map_err(WindowEvaluationFailure::from)?.values
             };
             SelectedValues::try_new(
                 selection,

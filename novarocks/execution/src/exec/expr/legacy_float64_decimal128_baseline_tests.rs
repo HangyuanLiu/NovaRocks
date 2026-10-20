@@ -34,7 +34,7 @@ pub(super) fn actual(
     s: i8,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     super::legacy_decimal128_rescale_baseline_tests::actual(
         a,
         DataType::Decimal128(p, s),
@@ -45,7 +45,11 @@ pub(super) fn actual(
 pub(super) fn modes() -> [(DecimalOverflowPolicy, bool); 4] {
     super::legacy_decimal128_rescale_baseline_tests::modes()
 }
-fn project(a: &ArrayRef, p: u8, s: i8) -> Result<ArrayRef, String> {
+fn project(
+    a: &ArrayRef,
+    p: u8,
+    s: i8,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     super::cast_array_to_target(a, &DataType::Decimal128(p, s))
 }
 #[test]
@@ -124,7 +128,7 @@ fn legacy_float64_decimal128_original_relaxed_target_precision_and_signed_scale(
             let result = actual(a.clone(), p, s, policy, allow);
             if p == 1 && policy == DecimalOverflowPolicy::ReportError {
                 assert_eq!(
-                    result.unwrap_err(),
+                    (result.unwrap_err()).to_string(),
                     "Expr evaluate meet error: The numeric type cast involving decimal overflows"
                 );
             } else {
@@ -143,10 +147,10 @@ fn legacy_float64_decimal128_original_scale_error_precedes_null_and_empty() {
     for s in [-39, -127] {
         let bare = format!("decimal scale overflow while casting float to DECIMAL: scale={s}");
         for a in [input(vec![]), input(vec![None]), input(vec![Some(0.0)])] {
-            assert_eq!(project(&a, 38, s).unwrap_err(), bare);
+            assert_eq!((project(&a, 38, s).unwrap_err()).to_string(), bare);
             for (policy, allow) in modes() {
                 assert_eq!(
-                    actual(a.clone(), 38, s, policy, allow).unwrap_err(),
+                    (actual(a.clone(), 38, s, policy, allow).unwrap_err()).to_string(),
                     format!("CAST failed: from Float64 to Decimal128(38, {s}): {bare}")
                 );
             }

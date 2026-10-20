@@ -70,7 +70,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -429,7 +429,7 @@ fn string_split_part_required_child_errors_and_wrong_canonical_shapes_fail_and_l
         let mut kernel = instance("split_part", 3);
         assert!(matches!(
             kernel.evaluate(selection, &arguments, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
         let after = Control::default();
         assert_eq!(
@@ -446,7 +446,7 @@ fn string_split_part_required_child_errors_and_wrong_canonical_shapes_fail_and_l
     ];
     assert!(matches!(
         instance("split_part", 3).evaluate(selection, &arguments, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let mut types = sources(3);
     types[0] = types[0]
@@ -465,7 +465,7 @@ fn string_split_part_required_child_errors_and_wrong_canonical_shapes_fail_and_l
         ScalarEvaluationInstance::instantiate(prepared)
             .unwrap()
             .evaluate(selection, &arguments, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
 }
 
@@ -834,7 +834,7 @@ fn string_split_part_compile_success_and_ordinary_tail_preserve_all_callback_cau
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let actual = prepared_for_test_with_control(
                     "split_part",

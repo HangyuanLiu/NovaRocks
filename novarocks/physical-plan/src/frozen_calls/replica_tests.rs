@@ -39,7 +39,7 @@ impl PureCompileControl for ReplicaControl {
             assert!(at <= stop, "callback after original control refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -96,7 +96,7 @@ fn prefixes(
         for cause in CAUSES {
             let control = ReplicaControl {
                 trace: Mutex::new(vec![]),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(call(&control), Err(FrozenCallError::Control(actual)) if actual == cause),

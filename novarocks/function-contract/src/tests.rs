@@ -42,7 +42,7 @@ impl PureCompileControl for Control {
             assert!(trace.len() < at, "callback after original refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((at, cause)) if trace.len() == at => Err(cause),
             _ => Ok(()),
         }
@@ -64,11 +64,11 @@ fn every_prefix(
         for at in 1..=trace.len() {
             let refused = Control {
                 trace: Mutex::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert_eq!(
                 operation(&refused),
-                Err(FunctionBindingError::Control(cause))
+                Err(FunctionBindingError::Control(cause.clone()))
             );
             assert_eq!(*refused.trace.lock().unwrap(), trace[..at]);
         }
@@ -479,22 +479,90 @@ fn selected_type_matching_keeps_value_nullability_covariance_but_lambda_exactnes
     every_prefix(|control| matches(&lambda, &widened_lambda, control), false);
     assert_eq!(
         FunctionBindingError::from(ConstantError::Limit("original extent")),
-        FunctionBindingError::Control(CompileControlError::ResourceExhausted)
+        FunctionBindingError::Constant(ConstantError::Limit("original extent"))
     );
     assert_eq!(
         FunctionBindingError::from(ConstantError::Invalid("original invalid value")),
-        FunctionBindingError::InvalidBinding("original invalid value".into())
+        FunctionBindingError::Constant(ConstantError::Invalid("original invalid value"))
     );
     for cause in CAUSES {
         assert_eq!(
-            FunctionBindingError::from(ConstantError::Control(cause)),
+            FunctionBindingError::from(ConstantError::Control(cause.clone())),
             FunctionBindingError::Control(cause)
         );
     }
     let type_error = ValueTypeError::TooDeep;
-    let text = type_error.to_string();
     assert_eq!(
         FunctionBindingError::from(type_error),
-        FunctionBindingError::InvalidBinding(text.into())
+        FunctionBindingError::ValueType(type_error)
+    );
+}
+
+#[test]
+fn binding_value_type_refusals_keep_the_original_domain_source_and_fact() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    for source in [
+        ValueTypeError::InvalidType("memory exhausted"),
+        ValueTypeError::UnknownLogicalMetadata,
+        ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::LargeInt),
+        ValueTypeError::TooDeep,
+        ValueTypeError::TooManyNodes,
+    ] {
+        let expected = source.failure_fact();
+        let error = FunctionBindingError::from(source);
+        assert_eq!(error.failure_fact(), expected);
+        assert_eq!(
+            error.source().unwrap().downcast_ref::<ValueTypeError>(),
+            Some(&source)
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("invalid function binding: {source}")
+        );
+    }
+    assert_eq!(
+        FunctionBindingError::from(ValueTypeError::TooDeep)
+            .failure_fact()
+            .class(),
+        FailureClass::Resource
+    );
+    assert_eq!(
+        FunctionBindingError::from(ValueTypeError::InvalidType("ResourceExhausted"))
+            .failure_fact()
+            .class(),
+        FailureClass::Invariant
+    );
+}
+
+#[test]
+fn binding_constant_refusals_preserve_source_and_policy_is_not_control() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    for original in [
+        ConstantError::Limit("original constant owner policy"),
+        ConstantError::Type(ValueTypeError::TooDeep),
+        ConstantError::Invalid("cancelled"),
+    ] {
+        let expected = original.failure_fact();
+        let error = FunctionBindingError::from(original.clone());
+        assert_eq!(error.failure_fact(), expected);
+        assert_eq!(
+            error.source().unwrap().downcast_ref::<ConstantError>(),
+            Some(&original)
+        );
+        assert_eq!(error.control_error(), None);
+    }
+    assert_eq!(
+        FunctionBindingError::from(ConstantError::Limit("cancelled"))
+            .failure_fact()
+            .class(),
+        FailureClass::Resource
+    );
+    assert_eq!(
+        FunctionBindingError::from(ConstantError::Invalid("memory exhausted"))
+            .failure_fact()
+            .class(),
+        FailureClass::Invariant
     );
 }

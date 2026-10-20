@@ -168,7 +168,9 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(result) = job.try_take() {
-                    break result.and_then(|value| value.try_transform(|slot, _| slot));
+                    break result
+                        .expect("real CPU completion")
+                        .try_transform(|slot, _| slot);
                 }
                 tokio::task::yield_now().await;
             }
@@ -250,7 +252,7 @@ mod tests {
         let cancellation = QueryCancellationSource::new();
         let kind = RootOutputKind::InternalFacts(InternalResultDomain::StatisticsArtifactV1);
         let reply = RetainedRootReply::try_new(
-            RootResultReply {
+            novarocks_execution_contract::root_result::RootReadResponse::Reply(RootResultReply {
                 root_task: TaskIdentity::new(
                     QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).unwrap()).unwrap(),
                     StageId::new(1).unwrap(),
@@ -271,7 +273,7 @@ mod tests {
                     )
                     .unwrap(),
                 ),
-            },
+            }),
             binding.window_alias(),
             1024,
         )

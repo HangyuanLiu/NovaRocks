@@ -16,6 +16,7 @@
 // under the License.
 mod assert_true;
 mod coalesce;
+mod failure;
 mod if_func;
 mod ifnull;
 mod null_pred;

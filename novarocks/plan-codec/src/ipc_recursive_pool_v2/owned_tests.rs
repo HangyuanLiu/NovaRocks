@@ -67,7 +67,7 @@ fn parent_recursive_complete_children_and_all_real_prefixes() {
     let baseline = control.trace();
     for at in 0..baseline.len() {
         for cause in CAUSES {
-            let control = controller(Some((at, cause)));
+            let control = controller(Some((at, cause.clone())));
             assert!(
                 matches!(run(&source,&control),Err(TypeCodecError::Control(actual))if actual==cause)
             );
@@ -107,7 +107,7 @@ fn parent_recursive_wide_actual_quantum_and_exact_complete_replay() {
         .expect("actual owned initialization quantum");
     for at in [0, quantum, baseline.len() - 1] {
         for cause in CAUSES {
-            let control = controller(Some((at, cause)));
+            let control = controller(Some((at, cause.clone())));
             assert!(
                 matches!(run(&source,&control),Err(TypeCodecError::Control(actual))if actual==cause)
             );

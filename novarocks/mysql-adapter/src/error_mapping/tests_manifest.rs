@@ -33,14 +33,37 @@ fn every_active_manifest_descriptor_has_exactly_one_adapter_wire_mapping() {
         .chain(ANALYZE_ERROR_CODE_DESCRIPTORS)
         .chain(DML_ADMISSION_ERROR_CODE_DESCRIPTORS)
         .chain(SESSION_ERROR_CODE_DESCRIPTORS)
+        .chain(novarocks_query_application::execution_error::EXECUTION_ERROR_CODE_DESCRIPTORS)
         .filter(|descriptor| descriptor.status == ErrorCodeStatus::Active)
         .map(|descriptor| descriptor.code.as_str())
         .collect::<BTreeSet<_>>();
-    assert_eq!(descriptor_codes.len(), 31);
+    assert_eq!(
+        descriptor_codes.len(),
+        31 + novarocks_query_application::execution_error::EXECUTION_ERROR_CODE_DESCRIPTORS.len()
+    );
     for code in descriptor_codes {
         assert!(
             error_kind_for_domain_code(code).is_some(),
             "active descriptor `{code}` must have one MySQL wire mapping"
         );
+    }
+}
+
+#[test]
+fn execution_registry_preserves_exact_errno_and_sqlstate() {
+    use novarocks_query_application::execution_error::{
+        EXECUTION_ERROR_CODE_DESCRIPTORS, execution_descriptor_for_code,
+    };
+    for entry in EXECUTION_ERROR_CODE_DESCRIPTORS {
+        let expected = execution_descriptor_for_code(entry.code).unwrap();
+        let actual = error_kind_for_domain_code(entry.code.as_str()).unwrap();
+        assert_eq!(actual as u16, expected.errno, "{}", entry.code);
+        assert_eq!(
+            actual.sqlstate().as_slice(),
+            expected.sqlstate.as_bytes(),
+            "{}",
+            entry.code
+        );
+        assert_eq!(entry.phase, novarocks_user_error::ErrorPhase::Execution);
     }
 }

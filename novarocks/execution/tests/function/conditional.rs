@@ -94,7 +94,7 @@ fn assert_true_reports_false() {
     let condition = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Boolean);
 
     let err = eval_assert_true(&arena, &[condition], &chunk).unwrap_err();
-    assert!(err.contains("assert_true failed"));
+    assert!(err.to_string().contains("assert_true failed"));
 }
 
 #[test]
@@ -104,7 +104,7 @@ fn assert_true_reports_null() {
     let condition = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Boolean);
 
     let err = eval_assert_true(&arena, &[condition], &chunk).unwrap_err();
-    assert!(err.contains("null"));
+    assert!(err.to_string().contains("null"));
 }
 
 #[test]
@@ -118,7 +118,7 @@ fn assert_true_uses_custom_message() {
     );
 
     let err = eval_assert_true(&arena, &[condition, message], &chunk).unwrap_err();
-    assert_eq!(err, "custom assert");
+    assert_eq!((err).to_string(), "custom assert");
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn join_delta_shape_assertion_rejects_net_two() {
 
     let err = eval_assert_true(&arena, &[condition, message], &chunk).unwrap_err();
 
-    assert_eq!(err, "join delta per-key net change exceeds 1");
+    assert_eq!((err).to_string(), "join delta per-key net change exceeds 1");
 }
 
 // ---------------------------------------------------------------------------

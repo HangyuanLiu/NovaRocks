@@ -88,8 +88,8 @@ struct Port<'w, 'c> {
 }
 impl ScalarReadFailureSink for Port<'_, '_> {
     type Error = JsonObjectFailure<KernelFailure>;
-    fn read_data(&mut self, failure: ScalarReadFailure<'_>) -> Self::Error {
-        JsonObjectFailure::OriginalData(failure.to_string())
+    fn read_contract(&mut self, failure: ScalarReadFailure<'_>) -> Self::Error {
+        JsonObjectFailure::Outer(failure.into_kernel())
     }
     fn observe(&mut self, event: ScalarReadObservation) -> Result<(), Self::Error> {
         match event {
@@ -200,10 +200,10 @@ pub(super) fn evaluate<'a>(
                 Ok(values) => values,
                 Err(JsonObjectFailure::OriginalData(message)) => {
                     return Err(ScalarInvocationFailure::Data(
-                        slot.publish_original(message),
+                        slot.publish_original(message.reason(), message.to_string()),
                     ));
                 }
-                Err(JsonObjectFailure::Control(cause)) => {
+                Err(JsonObjectFailure::Outer(cause) | JsonObjectFailure::Control(cause)) => {
                     return Err(ScalarInvocationFailure::Kernel(cause));
                 }
             };

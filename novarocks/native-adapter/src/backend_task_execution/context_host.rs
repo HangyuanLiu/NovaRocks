@@ -63,7 +63,6 @@ use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
 use novarocks_proto_codec::lifecycle::QueryTerminationReason;
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_proto_models::novarocks as proto;
-use novarocks_spi::connector::ConnectorMaterializationErrorClass;
 use novarocks_spi::connector::{
     CatalogProperties, ConnectorExecutionRoleBinding, ConnectorStorageResolver,
 };
@@ -461,17 +460,10 @@ impl NativeQueryContextHost {
             .copied()
     }
 
-    /// Looks up a context the owner says is active.
-    ///
-    /// The two absences are different facts and are reported as such. A missing
-    /// record is *either* a release that completed between the owner's
-    /// classification and this call — the owner drops its lock in between — or a
-    /// real disagreement about which contexts exist; this host cannot tell them
-    /// apart, and calling an ordinary race an invariant violation would make
-    /// `Internal` mean nothing. A record that is present and released can only
-    /// be a pre-materialize marker, and the owner cannot have called a context
-    /// with one of those `Active` — so that one really is an invariant
-    /// violation.
+    /// Observe the exact context's facts without holding the registry lock.
+    /// Absence alone cannot distinguish a completed release from an admission
+    /// disagreement. A retained Arc can also observe release after lookup;
+    /// its released flag is direct stop evidence, not an invariant failure.
     fn active_context(
         &self,
         context: QueryContextRef,
@@ -482,18 +474,9 @@ impl NativeQueryContextHost {
             .unwrap_or_else(|error| error.into_inner())
             .get(context)
             .map(Arc::clone)
-            .ok_or_else(|| {
-                HostRejection::new(
-                    TaskFailureCategory::Execution,
-                    "the query context holds no shared facts: it was released, or it was never \
-                     materialized",
-                )
-            })?;
+            .ok_or_else(|| context_facts_rejection(ContextFactsFailure::Unavailable(context)))?;
         if installed.is_released() {
-            return Err(internal(
-                "query context is active but its shared facts were released before they were \
-                 installed",
-            ));
+            return Err(context_facts_rejection(ContextFactsFailure::Released));
         }
         Ok(installed)
     }
@@ -607,10 +590,7 @@ impl NativeQueryContextHost {
         );
         self.queries.publish_resource_snapshot();
         resources.map_err(|error| {
-            HostRejection::new(
-                TaskFailureCategory::ResourceExhausted,
-                format!("query context could not establish execution resources: {error}"),
-            )
+            HostRejection::from_domain(super::execution_host::failure_category(&error), error)
         })?;
         self.still_establishing(installed)?;
 
@@ -650,8 +630,8 @@ impl NativeQueryContextHost {
     ) -> Result<Option<DecodedRuntimeFilterContribution>, HostRejection> {
         if contribution.participant_id == 0 {
             if contribution.lifecycle.is_some() || contribution.install.is_some() {
-                return Err(protocol(
-                    "runtime filter contribution names no participant but carries an install",
+                return Err(context_facts_rejection(
+                    ContextFactsFailure::InstallWithoutParticipant,
                 ));
             }
             return Ok(None);
@@ -672,7 +652,10 @@ impl NativeQueryContextHost {
                 if installed.is_released() {
                     cancelled_establish()
                 } else {
-                    internal(&format!("established query resources are absent: {error}"))
+                    HostRejection::from_domain(
+                        super::execution_host::failure_category(&error),
+                        error,
+                    )
                 }
             })?;
         let creator = crate::native_type_construction::NativeTypeConstruction::try_with_control(
@@ -929,8 +912,8 @@ impl QueryContextHost for NativeQueryContextHost {
                     return Err(cancelled_establish());
                 }
                 Some(_) => {
-                    return Err(internal(
-                        "query context shared facts are already materialized",
+                    return Err(context_facts_rejection(
+                        ContextFactsFailure::AlreadyMaterialized,
                     ));
                 }
                 None => {
@@ -1022,10 +1005,8 @@ impl QueryContextHost for NativeQueryContextHost {
             // only drop them as a whole query, so a replacement that removes
             // one catalog has no representation here — and applying it as an
             // addition would silently keep the removed catalog resolvable.
-            QueryContextDomainUpdate::CatalogBinding { .. } => Err(protocol(
-                "a catalog binding advance cannot be applied: this backend releases catalog \
-                 leases only for a whole query, so a replacement that drops a catalog has no \
-                 representation",
+            QueryContextDomainUpdate::CatalogBinding { .. } => Err(context_facts_rejection(
+                ContextFactsFailure::CatalogReplacementUnsupported,
             )),
             QueryContextDomainUpdate::SharedDynamicFilter { payload, .. } => {
                 let contribution = runtime_filter_install(payload.as_ref())?;
@@ -1035,8 +1016,8 @@ impl QueryContextHost for NativeQueryContextHost {
                     // either says the participant should be removed, which a
                     // sealed participant cannot represent, or says nothing at
                     // all.
-                    return Err(protocol(
-                        "a shared dynamic filter advance carries no participant install",
+                    return Err(context_facts_rejection(
+                        ContextFactsFailure::EmptyFilterAdvance,
                     ));
                 };
                 {
@@ -1083,40 +1064,25 @@ fn decoded_contribution(
 ) -> Result<Option<DecodedRuntimeFilterContribution>, HostRejection> {
     if contribution.participant_id == 0 {
         if contribution.lifecycle.is_some() || contribution.install.is_some() {
-            return Err(protocol(
-                "runtime filter contribution names no participant but carries an install",
+            return Err(context_facts_rejection(
+                ContextFactsFailure::InstallWithoutParticipant,
             ));
         }
         return Ok(None);
     }
     decode_runtime_filter_contribution_with_type_creator(execution_id, contribution, creator)
         .map(Some)
-        .map_err(|cause| match cause.construction_cause() {
-            Some(cause) => context_type_construction_rejection(cause),
-            None => protocol(&format!("runtime filter contribution is invalid: {cause}")),
+        .map_err(|cause| {
+            HostRejection::from_domain(super::execution_host::failure_category(&cause), cause)
         })
 }
 
 fn context_type_construction_rejection(
     cause: &crate::native_type_construction::NativeTypeConstructionError,
 ) -> HostRejection {
-    use crate::native_type_construction::NativeTypeConstructionError as E;
-    use novarocks_type_contract::CompileControlError as C;
-    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
-    let category = match cause {
-        E::Funding(cause) => match cause.as_ref() {
-            super::TypeMaterializationRefusal::Stopped(_) => TaskFailureCategory::Execution,
-            _ => TaskFailureCategory::ResourceExhausted,
-        },
-        E::Control(C::Cancelled | C::DeadlineExceeded) => TaskFailureCategory::Execution,
-        E::Resource(LayoutResourceError::SourceModel) => TaskFailureCategory::Internal,
-        E::Control(C::ResourceExhausted) | E::Capacity(_) | E::Resource(_) => {
-            TaskFailureCategory::ResourceExhausted
-        }
-    };
-    HostRejection::new(
-        category,
-        format!("runtime filter type construction failed: {cause}"),
+    HostRejection::from_domain(
+        super::execution_host::failure_category(cause),
+        novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(cause.clone()),
     )
 }
 
@@ -1218,23 +1184,13 @@ fn close_participant(context: QueryContextRef, participant: &Arc<RuntimeFilterPa
     }
 }
 
-/// A shared-facts install that was retired while it ran.
-///
-/// None of the five failure categories names "the owner abandoned this attempt
-/// underneath me". `Execution` is the closest true statement — the install did
-/// not complete at runtime — and the detail carries the rest.
+/// The context owner already retired this install attempt.
 fn cancelled_establish() -> HostRejection {
-    HostRejection::new(
-        TaskFailureCategory::Execution,
-        "the query context was released while its shared facts were being installed",
-    )
+    retired_install(None)
 }
 
 fn sealed_participant() -> HostRejection {
-    protocol(
-        "a runtime filter participant is already installed for this query context and is sealed \
-         for the attempt",
-    )
+    context_facts_rejection(ContextFactsFailure::SealedParticipant)
 }
 
 /// One backend is about to build at least one catalog runtime for this
@@ -1263,74 +1219,159 @@ fn emit_catalog_install_started(
     ));
 }
 
-/// Maps a catalog install failure onto this protocol's categories.
-///
-/// The match is exhaustive on purpose: a new connector error class must be
-/// classified here rather than folded into whatever the last arm happened to
-/// be.
+/// Materialization owns classification and the original Connector source.
+/// A concurrent context retirement is an observation, not a new Task cause.
 fn catalog_rejection(installed: &InstalledContext, error: CatalogManagerError) -> HostRejection {
     if installed.is_released() {
-        // The manager reports its own cancellation, which is true and says
-        // nothing about who cancelled it. This host is the one that did, so it
-        // reports that rather than passing along a message a reader would have
-        // to work backwards from.
-        return cancelled_establish();
+        return retired_install(Some(error));
     }
-    let category = match &error {
-        // This process was composed without the factory the definition needs,
-        // or with a contradictory one. Neither is something a peer sent.
-        CatalogManagerError::InvalidConfiguration(_) => TaskFailureCategory::Internal,
-        // Two queries claim one catalog handle with different definitions. The
-        // handle is a content version, so this is illegal content.
-        CatalogManagerError::ConflictingProperties { .. } => TaskFailureCategory::Protocol,
-        CatalogManagerError::MaterializationFailed { class, .. } => match class {
-            ConnectorMaterializationErrorClass::InvalidDefinition => TaskFailureCategory::Protocol,
-            ConnectorMaterializationErrorClass::ResourceExhausted => {
-                TaskFailureCategory::ResourceExhausted
-            }
-            ConnectorMaterializationErrorClass::Internal => TaskFailureCategory::Internal,
-            ConnectorMaterializationErrorClass::Authentication
-            | ConnectorMaterializationErrorClass::Unavailable
-            | ConnectorMaterializationErrorClass::Timeout
-            | ConnectorMaterializationErrorClass::Cancelled => TaskFailureCategory::Execution,
-        },
-    };
-    HostRejection::new(category, safe_detail(&error.to_string()))
+    HostRejection::from_domain(super::execution_host::failure_category(&error), error)
 }
 
-/// Maps a runtime-filter contract refusal onto this protocol's categories.
-///
-/// The match is exhaustive on purpose: a new contract failure class must be
-/// classified here rather than folded into whichever arm happened to be last.
 fn runtime_filter_rejection(error: RuntimeFilterContractError) -> HostRejection {
-    let category = match error.code() {
-        // Illegal content in a contribution, install, session binding, or
-        // terminal projection. A peer sent it, so it is a protocol failure.
-        RuntimeFilterContractErrorCode::InvalidContract => TaskFailureCategory::Protocol,
-        // The participant that would answer is gone. Nothing about the
-        // request was wrong, so this describes this attempt's own progress.
-        RuntimeFilterContractErrorCode::ParticipantClosed => TaskFailureCategory::Execution,
+    HostRejection::from_domain(super::execution_host::failure_category(&error), error)
+}
+
+#[derive(Debug)]
+struct RetiredContextInstall(Option<CatalogManagerError>);
+impl fmt::Display for RetiredContextInstall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the query context was released while its shared facts were being installed")
+    }
+}
+impl std::error::Error for RetiredContextInstall {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.as_ref().map(|error| error as _)
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for RetiredContextInstall {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        FailureFact::stop_observation(FailureReason::new(
+            domain::NATIVE,
+            std::num::NonZeroU16::new(810).unwrap(),
+        ))
+    }
+}
+fn retired_install(source: Option<CatalogManagerError>) -> HostRejection {
+    let cause = RetiredContextInstall(source);
+    let detail = novarocks_execution_contract::SafeDetail::truncating_display(&cause);
+    HostRejection::from_domain_with_detail(TaskFailureCategory::Execution, cause, detail)
+}
+
+/// Facts owned by this query-context materialization boundary. Foreign codec,
+/// Connector and memory causes use their own projection and source chain.
+#[derive(Debug)]
+enum ContextFactsFailure {
+    Unavailable(QueryContextRef),
+    Released,
+    AlreadyMaterialized,
+    InstallWithoutParticipant,
+    CatalogReplacementUnsupported,
+    EmptyFilterAdvance,
+    SealedParticipant,
+    TaskContextUnavailable(QueryExecutionId),
+    QueryOptionsMissing,
+    FilterCarrier(DomainVersion),
+    FilterParticipantUnavailable(QueryExecutionId),
+    StorageContextUnavailable(QueryExecutionId),
+}
+impl fmt::Display for ContextFactsFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(context) => write!(f, "query context {context} holds no shared facts"),
+            Self::Released => f.write_str("the query context released its shared facts"),
+            Self::AlreadyMaterialized => f.write_str("query context shared facts are already materialized"),
+            Self::InstallWithoutParticipant => f.write_str("runtime filter contribution names no participant but carries an install"),
+            Self::CatalogReplacementUnsupported => f.write_str("a catalog binding replacement cannot be applied because catalog leases are released only for a whole query"),
+            Self::EmptyFilterAdvance => f.write_str("a shared dynamic filter advance carries no participant install"),
+            Self::SealedParticipant => f.write_str("a runtime filter participant is already installed and sealed for this attempt"),
+            Self::TaskContextUnavailable(execution) => write!(f, "task of {execution:?} has no established query context"),
+            Self::QueryOptionsMissing => f.write_str("active query context has no installed query options"),
+            Self::FilterCarrier(version) => write!(f, "task dynamic filter version {} is not a codec-produced runtime filter envelope", version.get()),
+            Self::FilterParticipantUnavailable(execution) => write!(f, "task dynamic filter for {execution:?} has no installed participant"),
+            Self::StorageContextUnavailable(execution) => write!(f, "no established query context holds storage credentials for {execution:?}"),
+        }
+    }
+}
+impl std::error::Error for ContextFactsFailure {}
+impl novarocks_execution_contract::failure::FailureProjection for ContextFactsFailure {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let (class, code) = match self {
+            Self::Unavailable(_) => (FailureClass::Dependency, 9001),
+            Self::Released => {
+                return FailureFact::stop_observation(FailureReason::new(
+                    domain::NATIVE,
+                    std::num::NonZeroU16::new(9002).unwrap(),
+                ));
+            }
+            Self::AlreadyMaterialized => (FailureClass::Invariant, 9003),
+            Self::InstallWithoutParticipant => (FailureClass::Invariant, 9004),
+            Self::CatalogReplacementUnsupported => (FailureClass::Invariant, 9005),
+            Self::EmptyFilterAdvance => (FailureClass::Invariant, 9006),
+            Self::SealedParticipant => (FailureClass::Invariant, 9007),
+            Self::TaskContextUnavailable(_) => (FailureClass::Dependency, 9008),
+            Self::QueryOptionsMissing => (FailureClass::Invariant, 9009),
+            Self::FilterCarrier(_) => (FailureClass::Invariant, 9010),
+            Self::FilterParticipantUnavailable(_) => (FailureClass::Dependency, 9011),
+            Self::StorageContextUnavailable(_) => (FailureClass::Dependency, 9012),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+fn context_facts_rejection(source: ContextFactsFailure) -> HostRejection {
+    let detail = novarocks_execution_contract::SafeDetail::truncating_display(&source);
+    // The operation refusal verdict is separate from the Task cause's
+    // neutral classification. This adapter owns this local policy vocabulary.
+    let category = match &source {
+        ContextFactsFailure::InstallWithoutParticipant
+        | ContextFactsFailure::CatalogReplacementUnsupported
+        | ContextFactsFailure::EmptyFilterAdvance
+        | ContextFactsFailure::SealedParticipant => TaskFailureCategory::Protocol,
+        ContextFactsFailure::AlreadyMaterialized
+        | ContextFactsFailure::QueryOptionsMissing
+        | ContextFactsFailure::FilterCarrier(_) => TaskFailureCategory::Internal,
+        ContextFactsFailure::Unavailable(_)
+        | ContextFactsFailure::Released
+        | ContextFactsFailure::TaskContextUnavailable(_)
+        | ContextFactsFailure::FilterParticipantUnavailable(_)
+        | ContextFactsFailure::StorageContextUnavailable(_) => TaskFailureCategory::Execution,
     };
-    HostRejection::new(category, safe_detail(error.detail()))
+    HostRejection::from_domain_with_detail(category, source, detail)
 }
 
-/// Strips control characters out of a detail this host did not write.
-///
-/// Connector and codec messages end up in a task's status and in logs.
-/// `SafeDetail` bounds their length; this bounds what they can inject. It is
-/// not a secret filter: catalog definitions and vended material never travel
-/// through these strings, and a rejection that describes a credential says only
-/// what was wrong with its scope.
-fn safe_detail(value: &str) -> String {
-    value.chars().filter(|c| !c.is_control()).collect()
+#[derive(Debug)]
+struct DynamicFilterNotAccepted {
+    version: DomainVersion,
+    status: i32,
+    detail: novarocks_execution_contract::failure::BoundedDetail,
 }
-
-fn internal(detail: &str) -> HostRejection {
-    HostRejection::new(TaskFailureCategory::Internal, detail)
+impl std::fmt::Display for DynamicFilterNotAccepted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "task dynamic filter version {} received status {}: {}",
+            self.version.get(),
+            self.status,
+            self.detail
+        )
+    }
 }
-
-fn protocol(detail: &str) -> HostRejection {
-    HostRejection::new(TaskFailureCategory::Protocol, detail)
+impl std::error::Error for DynamicFilterNotAccepted {}
+impl novarocks_execution_contract::failure::FailureProjection for DynamicFilterNotAccepted {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        // The response says only that delivery was not accepted. It cannot
+        // prove Task cancellation, a capacity quantity, or recovery authority.
+        FailureFact::new(
+            FailureClass::Dependency,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(9541).unwrap()),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -2023,6 +2064,14 @@ mod tests {
             .join()
             .expect("the establishing thread must not panic")
             .expect_err("a released context cannot finish establishing");
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureEvidence, FailureProjection,
+        };
+        assert_eq!(rejection.failure_fact().class(), FailureClass::Control);
+        assert_eq!(
+            rejection.failure_fact().evidence(),
+            FailureEvidence::StopObservation
+        );
         assert_eq!(rejection.category(), TaskFailureCategory::Execution);
         assert!(
             rejection.detail().as_str().contains("released"),
@@ -2074,7 +2123,10 @@ mod tests {
                 .is_none()
         );
         match fixture.host.runtime_filter_session(execution, finst, true) {
-            Err(refusal) => assert_eq!(refusal.category(), TaskFailureCategory::Protocol),
+            Err(refusal) => assert_eq!(
+                refusal.code(),
+                novarocks_worker::RuntimeFilterContractErrorCode::InvalidContract
+            ),
             Ok(_) => panic!("a task that binds a filter has nothing to bind to"),
         }
     }
@@ -2113,9 +2165,12 @@ mod tests {
                 &BTreeSet::from([3]),
             ) {
                 Err(refusal) => {
-                    assert_eq!(refusal.category(), TaskFailureCategory::Protocol);
+                    assert_eq!(
+                        refusal.code(),
+                        novarocks_worker::RuntimeFilterContractErrorCode::InvalidContract
+                    );
                     assert!(
-                        refusal.detail().as_str().contains("runtime filters {3}"),
+                        refusal.detail().contains("runtime filters {3}"),
                         "the refusal names the program's bindings: {refusal}"
                     );
                 }
@@ -2136,8 +2191,42 @@ mod tests {
         let context = context(1);
         let execution = context.query_execution_id();
 
+        let assert_refusal = |refusal: novarocks_worker::HostRejection| {
+            use novarocks_execution_contract::failure::{
+                FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+            };
+            let expected = FailureFact::new(
+                FailureClass::Dependency,
+                FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(9012).unwrap()),
+            );
+            assert_eq!(refusal.category(), TaskFailureCategory::Execution);
+            assert_eq!(refusal.failure_fact(), expected);
+            let author =
+                crate::backend_test_support::find_source::<super::ContextFactsFailure>(&refusal)
+                    .expect("the storage lookup's original domain cause remains local");
+            assert!(
+                matches!(author, super::ContextFactsFailure::StorageContextUnavailable(actual)
+                if *actual == execution)
+            );
+            assert_eq!(author.failure_fact(), expected);
+            let detail =
+                format!("no established query context holds storage credentials for {execution:?}");
+            assert_eq!(author.to_string(), detail);
+            assert_eq!(refusal.detail().as_str(), detail);
+            assert!(!refusal.detail().as_str().contains("access-key"));
+            let carrier = crate::backend_test_support::find_source::<
+                novarocks_execution::runtime::fragment::ExecutionFailure,
+            >(&refusal)
+            .expect("the host retains its exact typed execution carrier");
+            assert_eq!(carrier.failure_fact(), expected);
+            assert_eq!(carrier.detail(), detail);
+            assert_eq!(
+                carrier.safe_detail().as_str(),
+                "Dependency failure (reason 13:9012)"
+            );
+        };
         match TaskQueryContextFacts::storage_resolver(fixture.host.as_ref(), execution) {
-            Err(refusal) => assert_eq!(refusal.category(), TaskFailureCategory::Protocol),
+            Err(refusal) => assert_refusal(refusal),
             Ok(_) => panic!("an unestablished context holds no credentials"),
         }
 
@@ -2153,10 +2242,7 @@ mod tests {
 
         fixture.host.release(context);
         match TaskQueryContextFacts::storage_resolver(fixture.host.as_ref(), execution) {
-            Err(refusal) => {
-                assert_eq!(refusal.category(), TaskFailureCategory::Protocol);
-                assert!(!refusal.detail().as_str().contains("access-key"));
-            }
+            Err(refusal) => assert_refusal(refusal),
             Ok(_) => panic!("a released context holds no credentials either"),
         }
     }
@@ -2746,6 +2832,7 @@ mod tests {
             Arc::new(TaskStatusSource::new()),
             Arc::new(ProcessMonotonicClock::new()),
             METRIC_PUBLISH_MIN_INTERVAL,
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
         ));
         owner.release_to_observers();
         (Arc::clone(&owner), TaskStatusReporter::new(owner))
@@ -2810,10 +2897,7 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
         execution: QueryExecutionId,
     ) -> Result<QueryContextOptions, HostRejection> {
         let context = self.context_for_execution(execution).ok_or_else(|| {
-            HostRejection::new(
-                TaskFailureCategory::Execution,
-                format!("task of {execution:?} has no established query context"),
-            )
+            context_facts_rejection(ContextFactsFailure::TaskContextUnavailable(execution))
         })?;
         let installed = self.active_context(context)?;
         let facts = installed
@@ -2821,17 +2905,12 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if facts.released {
-            return Err(HostRejection::new(
-                TaskFailureCategory::Execution,
-                "the query context released its query options before task preparation",
-            ));
+            return Err(context_facts_rejection(ContextFactsFailure::Released));
         }
-        facts.query_options.clone().ok_or_else(|| {
-            HostRejection::new(
-                TaskFailureCategory::Internal,
-                "active query context has no installed query options",
-            )
-        })
+        facts
+            .query_options
+            .clone()
+            .ok_or_else(|| context_facts_rejection(ContextFactsFailure::QueryOptionsMissing))
     }
 
     fn runtime_filter_session(
@@ -2839,23 +2918,23 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
         execution: QueryExecutionId,
         fragment_instance_id: UniqueId,
         expects_bindings: bool,
-    ) -> Result<Option<RuntimeFilterSessionRef>, HostRejection> {
+    ) -> Result<Option<RuntimeFilterSessionRef>, novarocks_worker::RuntimeFilterContractError> {
         let Some(participant) = self.participant_for_execution(execution) else {
             // A query that installs no filter on this backend is the ordinary
             // case; a task whose plan binds one and finds none is not, because
             // it would otherwise read unfiltered and call that success.
             return if expects_bindings {
-                Err(protocol(&format!(
-                    "task of {execution:?} binds a runtime filter but its query context installed \
+                Err(
+                    novarocks_worker::RuntimeFilterContractError::invalid_contract(format!(
+                        "task of {execution:?} binds a runtime filter but its query context installed \
                      none on this backend"
-                )))
+                    )),
+                )
             } else {
                 Ok(None)
             };
         };
-        participant
-            .session_for_fragment(execution, fragment_instance_id, expects_bindings)
-            .map_err(|error| protocol(&format!("runtime filter session refused: {error}")))
+        participant.session_for_fragment(execution, fragment_instance_id, expects_bindings)
     }
 
     fn runtime_filter_session_for_bindings(
@@ -2863,22 +2942,22 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
         execution: QueryExecutionId,
         fragment_instance_id: UniqueId,
         bindings: &BTreeSet<u32>,
-    ) -> Result<Option<RuntimeFilterSessionRef>, HostRejection> {
+    ) -> Result<Option<RuntimeFilterSessionRef>, novarocks_worker::RuntimeFilterContractError> {
         let Some(participant) = self.participant_for_execution(execution) else {
             // As for a plan-tree task: no participant hosts nothing, which is
             // the ordinary answer only for a program that binds nothing.
             return if bindings.is_empty() {
                 Ok(None)
             } else {
-                Err(protocol(&format!(
-                    "task of {execution:?} binds runtime filters {bindings:?} but its query \
+                Err(
+                    novarocks_worker::RuntimeFilterContractError::invalid_contract(format!(
+                        "task of {execution:?} binds runtime filters {bindings:?} but its query \
                      context installed none on this backend"
-                )))
+                    )),
+                )
             };
         };
-        participant
-            .session_for_fragment_bindings(execution, fragment_instance_id, bindings)
-            .map_err(|error| protocol(&format!("runtime filter session refused: {error}")))
+        participant.session_for_fragment_bindings(execution, fragment_instance_id, bindings)
     }
 
     fn runtime_filter_event_sink(
@@ -2959,27 +3038,19 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
         payload: &Arc<dyn CodecOwnedContent>,
     ) -> Result<(), HostRejection> {
         let envelope = stored_message::<filter::RuntimeFilterEnvelope>(payload.as_ref())
-            .ok_or_else(|| {
-                internal(&format!(
-                    "task dynamic filter version {} is not a codec-produced runtime filter \
-                     envelope",
-                    version.get()
-                ))
-            })?
+            .ok_or_else(|| context_facts_rejection(ContextFactsFailure::FilterCarrier(version)))?
             .clone();
         let participant = self.participant_for_execution(execution).ok_or_else(|| {
-            protocol(&format!(
-                "task dynamic filter for {execution:?} has no installed participant to accept it"
-            ))
+            context_facts_rejection(ContextFactsFailure::FilterParticipantUnavailable(execution))
         })?;
         // The one decoder that turns a wire envelope into a backend one lives
         // in the runtime-filter transport. Reusing it is what keeps this from
         // becoming a second authority over the same wire shape.
-        let response = novarocks_native_adapter::runtime_filter_rpc::handle_runtime_filter_envelope(
+        let response = novarocks_native_adapter::runtime_filter_rpc::handle_runtime_filter_envelope_typed(
             participant as Arc<dyn novarocks_native_adapter::runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress>,
             envelope,
         )
-        .map_err(|status| protocol(&format!("task dynamic filter was refused: {status}")))?;
+        .map_err(|source| HostRejection::from_domain(super::execution_host::failure_category(&source), source))?;
         // A duplicate is a legal answer to a replayed push; only a rejection
         // or an unknown status means the filter did not land.
         let accepted = matches!(
@@ -2988,11 +3059,17 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
                 | filter::RuntimeFilterAcceptStatus::Duplicate)
         );
         if !accepted {
-            return Err(protocol(&format!(
-                "task dynamic filter version {} was not accepted: {}",
-                version.get(),
-                response.rejection_reason
-            )));
+            let source = DynamicFilterNotAccepted {
+                version,
+                status: response.accept_status,
+                detail: novarocks_execution_contract::failure::BoundedDetail::truncating(
+                    &response.rejection_reason,
+                ),
+            };
+            return Err(HostRejection::from_domain(
+                super::execution_host::failure_category(&source),
+                source,
+            ));
         }
         Ok(())
     }
@@ -3001,30 +3078,40 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
         &self,
         execution: QueryExecutionId,
         handle: &CatalogHandle,
-    ) -> Result<ConnectorExecutionReadBinding, String> {
+    ) -> Result<ConnectorExecutionReadBinding, novarocks_worker::CatalogExecutionAccessError> {
         let runtime = self
             .catalog_manager
             .resolve_for_query(execution, handle)
-            .ok_or_else(|| missing_catalog_lease(handle))?;
-        runtime
-            .read()
-            .cloned()
-            .ok_or_else(|| missing_catalog_capability(handle, "read"))
+            .ok_or_else(
+                || novarocks_worker::CatalogExecutionAccessError::LeaseUnavailable {
+                    catalog: handle.clone(),
+                },
+            )?;
+        runtime.read().cloned().ok_or_else(|| {
+            novarocks_worker::CatalogExecutionAccessError::ReadUnavailable {
+                catalog: handle.clone(),
+            }
+        })
     }
 
     fn catalog_write_execution(
         &self,
         execution: QueryExecutionId,
         handle: &CatalogHandle,
-    ) -> Result<ConnectorExecutionWriteBinding, String> {
+    ) -> Result<ConnectorExecutionWriteBinding, novarocks_worker::CatalogExecutionAccessError> {
         let runtime = self
             .catalog_manager
             .resolve_for_query(execution, handle)
-            .ok_or_else(|| missing_catalog_lease(handle))?;
-        runtime
-            .write()
-            .cloned()
-            .ok_or_else(|| missing_catalog_capability(handle, "write"))
+            .ok_or_else(
+                || novarocks_worker::CatalogExecutionAccessError::LeaseUnavailable {
+                    catalog: handle.clone(),
+                },
+            )?;
+        runtime.write().cloned().ok_or_else(|| {
+            novarocks_worker::CatalogExecutionAccessError::WriteUnavailable {
+                catalog: handle.clone(),
+            }
+        })
     }
 
     fn storage_resolver(
@@ -3037,28 +3124,9 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
         self.context_for_execution(execution)
             .and_then(|context| self.storage_resolver_for_context(context))
             .ok_or_else(|| {
-                protocol(&format!(
-                    "no established query context on this backend holds storage credentials for \
-                     {execution:?}"
-                ))
+                context_facts_rejection(ContextFactsFailure::StorageContextUnavailable(execution))
             })
     }
-}
-
-fn missing_catalog_lease(handle: &CatalogHandle) -> String {
-    format!(
-        "no query-leased catalog runtime exists for {}@{}",
-        handle.catalog_name().as_str(),
-        handle.version().short_hex()
-    )
-}
-
-fn missing_catalog_capability(handle: &CatalogHandle, capability: &str) -> String {
-    format!(
-        "catalog runtime for {}@{} has no typed {capability} capability",
-        handle.catalog_name().as_str(),
-        handle.version().short_hex()
-    )
 }
 
 /// Folds a running fragment's runtime-filter evidence into the participant

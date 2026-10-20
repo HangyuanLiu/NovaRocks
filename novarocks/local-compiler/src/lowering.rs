@@ -73,9 +73,10 @@ pub struct LocalCompileOptions {
 
 #[derive(Debug)]
 pub enum FragmentCompileError {
+    ArrayProjection(novarocks_functions::array_projection::ArrayProjectionFailure),
     ProjectMetadataRequest(novarocks_type_contract::MetadataRequestError),
     ProjectMetadataHost {
-        error: Box<dyn Error + Send + Sync>,
+        error: novarocks_failure_contract::SharedFailureCause,
     },
     Control(CompileControlError),
     Unsupported {
@@ -85,7 +86,7 @@ pub enum FragmentCompileError {
     Invalid(&'static str),
     Owner {
         phase: &'static str,
-        error: Box<dyn Error + Send + Sync>,
+        error: novarocks_failure_contract::SharedFailureCause,
     },
 }
 impl FragmentCompileError {
@@ -106,6 +107,7 @@ impl fmt::Display for FragmentCompileError {
             Self::ProjectMetadataRequest(error) => write!(f, "Project metadata request: {error}"),
             Self::ProjectMetadataHost { error } => write!(f, "Project metadata host: {error}"),
             Self::Control(error) => error.fmt(f),
+            Self::ArrayProjection(error) => error.fmt(f),
             Self::Unsupported { node, feature } => {
                 write!(f, "unsupported local lowering at {node:?}: {feature}")
             }
@@ -118,19 +120,17 @@ impl Error for FragmentCompileError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::ProjectMetadataRequest(error) => Some(error),
-            Self::ProjectMetadataHost { error } => Some(error.as_ref()),
+            Self::ProjectMetadataHost { error } => Some(error),
             Self::Control(error) => Some(error),
-            Self::Owner { error, .. } => Some(error.as_ref()),
+            Self::ArrayProjection(error) => Some(error),
+            Self::Owner { error, .. } => Some(error),
             _ => None,
         }
     }
 }
-impl From<String> for FragmentCompileError {
-    fn from(message: String) -> Self {
-        Self::Owner {
-            phase: "array projection",
-            error: Box::new(std::io::Error::other(message)),
-        }
+impl From<novarocks_functions::array_projection::ArrayProjectionFailure> for FragmentCompileError {
+    fn from(source: novarocks_functions::array_projection::ArrayProjectionFailure) -> Self {
+        Self::ArrayProjection(source)
     }
 }
 impl From<CompileControlError> for FragmentCompileError {
@@ -142,7 +142,29 @@ impl From<novarocks_type_contract::ValueTypeError> for FragmentCompileError {
     fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
         Self::Owner {
             phase: "value type",
-            error: Box::new(error),
+            error: novarocks_failure_contract::SharedFailureCause::new(error),
+        }
+    }
+}
+impl From<novarocks_functions::ConstantError> for FragmentCompileError {
+    fn from(error: novarocks_functions::ConstantError) -> Self {
+        match error {
+            novarocks_functions::ConstantError::Control(cause) => Self::Control(cause),
+            original => Self::Owner {
+                phase: "constant",
+                error: novarocks_failure_contract::SharedFailureCause::new(original),
+            },
+        }
+    }
+}
+impl From<novarocks_physical_plan::ConstantReferenceError> for FragmentCompileError {
+    fn from(error: novarocks_physical_plan::ConstantReferenceError) -> Self {
+        match error {
+            novarocks_physical_plan::ConstantReferenceError::Control(cause) => Self::Control(cause),
+            original => Self::Owner {
+                phase: "constant reference",
+                error: novarocks_failure_contract::SharedFailureCause::new(original),
+            },
         }
     }
 }
@@ -154,7 +176,7 @@ macro_rules! owner_error {
                     $ty::Control(error) => Self::Control(error),
                     error => Self::Owner {
                         phase: $phase,
-                        error: Box::new(error),
+                        error: novarocks_failure_contract::SharedFailureCause::new(error),
                     },
                 }
             }
@@ -169,7 +191,7 @@ impl From<ChannelLoweringError> for FragmentCompileError {
             ChannelLoweringError::Join(error) => error,
             error => Self::Owner {
                 phase: "input channels",
-                error: Box::new(error),
+                error: novarocks_failure_contract::SharedFailureCause::new(error),
             },
         }
     }
@@ -182,7 +204,7 @@ impl From<RepeatLoweringError> for FragmentCompileError {
             RepeatLoweringError::Invalid(message) => Self::Invalid(message),
             error => Self::Owner {
                 phase: "Repeat",
-                error: Box::new(error),
+                error: novarocks_failure_contract::SharedFailureCause::new(error),
             },
         }
     }
@@ -194,7 +216,7 @@ impl From<UnpivotLoweringError> for FragmentCompileError {
             UnpivotLoweringError::Invalid(m) => Self::Invalid(m),
             e => Self::Owner {
                 phase: "Unpivot",
-                error: Box::new(e),
+                error: novarocks_failure_contract::SharedFailureCause::new(e),
             },
         }
     }
@@ -213,7 +235,7 @@ impl From<ProgramRootBindingError> for FragmentCompileError {
             }
             error => Self::Owner {
                 phase: "root correspondence",
-                error: Box::new(error),
+                error: novarocks_failure_contract::SharedFailureCause::new(error),
             },
         }
     }

@@ -122,11 +122,7 @@ impl FunctionCallContract {
             Ok((parameters, temporal_source))
         })();
         let (parameters, temporal_source) = match result {
-            Err(
-                error @ (KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted),
-            ) => return Err(error),
+            Err(error) if error.is_interruption() => return Err(error),
             result => {
                 work.finish().map_err(compile_failure)?;
                 result?

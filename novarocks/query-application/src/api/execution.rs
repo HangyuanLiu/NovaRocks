@@ -17,9 +17,7 @@
 
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
-use novarocks_workload_control::{
-    CancellationReason, WorkCancellationRequester, WorkError, WorkOwner,
-};
+use novarocks_workload_control::{CancellationReason, WorkCancellationRequester, WorkOwner};
 
 #[cfg(test)]
 use super::NativeExecutionContractError;
@@ -116,31 +114,54 @@ pub enum QueryExecutionErrorKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryExecutionError {
-    kind: QueryExecutionErrorKind,
-    message: Arc<str>,
+enum QueryExecutionErrorBody {
+    Application {
+        kind: QueryExecutionErrorKind,
+        message: Arc<str>,
+    },
+    Execution(crate::execution_error::ExecutionFailureInput),
 }
-
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryExecutionError {
+    body: QueryExecutionErrorBody,
+}
 impl QueryExecutionError {
+    /// Application/control errors with no domain execution conclusion.
     pub fn new(kind: QueryExecutionErrorKind, message: impl Into<Arc<str>>) -> Self {
         Self {
-            kind,
-            message: message.into(),
+            body: QueryExecutionErrorBody::Application {
+                kind,
+                message: message.into(),
+            },
         }
     }
-
-    pub const fn kind(&self) -> QueryExecutionErrorKind {
-        self.kind
+    pub fn from_execution(input: crate::execution_error::ExecutionFailureInput) -> Self {
+        Self {
+            body: QueryExecutionErrorBody::Execution(input),
+        }
     }
-
+    pub fn execution_failure(&self) -> Option<&crate::execution_error::ExecutionFailureInput> {
+        match &self.body {
+            QueryExecutionErrorBody::Execution(input) => Some(input),
+            QueryExecutionErrorBody::Application { .. } => None,
+        }
+    }
+    pub fn kind(&self) -> QueryExecutionErrorKind {
+        match &self.body {
+            QueryExecutionErrorBody::Application { kind, .. } => *kind,
+            QueryExecutionErrorBody::Execution(input) => input.error_kind(),
+        }
+    }
     pub fn message(&self) -> &str {
-        &self.message
+        match &self.body {
+            QueryExecutionErrorBody::Application { message, .. } => message,
+            QueryExecutionErrorBody::Execution(input) => input.detail().as_str(),
+        }
     }
 }
-
 impl fmt::Display for QueryExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
+        formatter.write_str(self.message())
     }
 }
 
@@ -194,14 +215,15 @@ impl ExecutionControl for WorkCancellationRequester {
     fn request_cancel(&self) -> Result<(), QueryExecutionError> {
         self.request(CancellationReason::Requested)
             .map_err(|error| {
-                let kind = if matches!(error, WorkError::Released) {
-                    QueryExecutionErrorKind::Rejected
-                } else {
-                    QueryExecutionErrorKind::Failed
-                };
-                QueryExecutionError::new(
-                    kind,
-                    format!("request governed logical execution cancellation: {error}"),
+                use novarocks_execution_contract::failure::FailureProjection;
+                QueryExecutionError::from_execution(
+                    crate::execution_error::ExecutionFailureInput::new(
+                        error.failure_fact(),
+                        novarocks_execution_contract::SafeDetail::truncating(
+                            "query workload control refused the cancellation request",
+                        ),
+                        crate::execution_error::ExecutionFailureSite::Coordinator,
+                    ),
                 )
             })
     }
@@ -312,5 +334,49 @@ mod tests {
         drop(handle);
         work.owner.complete();
         work.business.release();
+    }
+
+    #[tokio::test]
+    async fn cancellation_refusal_retains_the_actual_released_work_fact() {
+        use crate::execution_error::ExecutionFailureSite;
+        use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let scope = work.owner.scope();
+        let requester = work.owner.cancellation_requester();
+        work.owner.complete();
+        work.business.release();
+        scope.wait_released().await;
+        let original = requester
+            .request(CancellationReason::Requested)
+            .unwrap_err();
+        assert!(matches!(
+            original,
+            novarocks_workload_control::WorkError::Released
+        ));
+        let error = ExecutionControl::request_cancel(&requester).unwrap_err();
+        let input = error
+            .execution_failure()
+            .expect("original Work fact must survive the control boundary");
+        assert_eq!(input.fact(), original.failure_fact());
+        assert_eq!(input.fact().evidence(), FailureEvidence::StopObservation);
+        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+        assert_eq!(
+            input.detail().as_str(),
+            "query workload control refused the cancellation request"
+        );
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+        assert!(control.next_control().is_none());
     }
 }

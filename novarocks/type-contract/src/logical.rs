@@ -952,7 +952,7 @@ mod tests {
             let mut calls = self.calls.lock().unwrap();
             let ordinal = calls.len();
             calls.push((phase, units));
-            match self.refusal {
+            match self.refusal.clone() {
                 Some((at, error)) if at == ordinal => Err(error),
                 _ => Ok(()),
             }
@@ -1015,11 +1015,11 @@ mod tests {
                 for at in 0..trace.len() {
                     let control = IdentityControl {
                         calls: Default::default(),
-                        refusal: Some((at, cause)),
+                        refusal: Some((at, cause.clone())),
                     };
                     assert_eq!(
                         run_identity(&actual, &expected, &control),
-                        Err(IdentityFailure::Control(cause))
+                        Err(IdentityFailure::Control(cause.clone()))
                     );
                     assert_eq!(control.calls.into_inner().unwrap(), trace[..=at]);
                 }

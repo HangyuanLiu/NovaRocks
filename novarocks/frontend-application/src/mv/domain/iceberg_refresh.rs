@@ -3084,7 +3084,15 @@ fn reconcile_published_lake_projection(
 }
 
 fn refresh_connector_preparation_error(error: ConnectorError) -> RefreshError {
+    if error.kind() == ConnectorErrorKind::Interrupted {
+        return RefreshError::compile_interruption(
+            novarocks_type_contract::CompileControlError::Source(
+                novarocks_failure_contract::SharedFailureCause::new(error),
+            ),
+        );
+    }
     match error.kind() {
+        ConnectorErrorKind::Interrupted => unreachable!("caller interruption returned above"),
         ConnectorErrorKind::Unavailable
         | ConnectorErrorKind::DeadlineExceeded
         | ConnectorErrorKind::ResourceExhausted

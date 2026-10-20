@@ -307,7 +307,7 @@ fn operational_lambda_projector_preserves_every_actual_small_control_prefix() {
             CompileControlError::ResourceExhausted,
         ] {
             let control = Control {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..Control::default()
             };
             assert!(matches!(operational_arguments(&owner, &receipt, &control),

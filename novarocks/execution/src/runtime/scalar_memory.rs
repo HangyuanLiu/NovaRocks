@@ -505,3 +505,22 @@ pub mod test_support {
         RuntimeScalarFrameForTest, RuntimeScalarWrapperForTest, RuntimeScalarWrapperReceiptForTest,
     };
 }
+
+impl novarocks_failure_contract::FailureProjection for RuntimeScalarMemoryRefusal {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        match self {
+            Self::MissingQueryMemory => FailureFact::new(
+                FailureClass::Invariant,
+                ExecutionReason::ScalarMissingQueryMemory.reason(),
+            ),
+            Self::SharedShortage(cause) => {
+                novarocks_memory_failure::ShortageFailureProjection::new(cause).failure_fact()
+            }
+            Self::Capacity(cause) => {
+                novarocks_memory_failure::CapacityFailureProjection::new(cause).failure_fact()
+            }
+        }
+    }
+}

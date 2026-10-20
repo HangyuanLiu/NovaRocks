@@ -49,7 +49,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -419,7 +419,7 @@ fn aggregate_capture_every_original_control_prefix_preserves_same_source_revisio
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert!(
@@ -527,7 +527,7 @@ fn aggregate_immutable_channel_substitution_renews_only_returned_revision_and_ke
     );
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum SubstitutionFailure {
     Ordinary(&'static str),
     Control(CompileControlError),
@@ -551,7 +551,7 @@ fn aggregate_immutable_substitution_failures_short_circuit_without_changing_sour
                 Some(CompileControlError::ResourceExhausted),
             ] {
                 let control = Control {
-                    refusal: cause.map(|cause| (usize::from(fail_order), cause)),
+                    refusal: cause.clone().map(|cause| (usize::from(fail_order), cause)),
                     ..Control::default()
                 };
                 let events = std::cell::RefCell::new(Vec::new());

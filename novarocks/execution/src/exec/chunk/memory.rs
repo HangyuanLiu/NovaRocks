@@ -23,6 +23,45 @@ use novarocks_spi::connector::ConnectorOutputMemoryToken;
 
 use crate::runtime::mem_tracker::MemTracker;
 
+use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, ExecutionResult};
+use crate::runtime::mem_tracker::MemoryAccountingFailure;
+
+#[derive(Debug)]
+enum ChunkChargeFailure {
+    NativeSplit { requested: i64, charged: i64 },
+    ConnectorSplit { requested: u64, reserved: u64 },
+}
+impl std::fmt::Display for ChunkChargeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NativeSplit { requested, charged } => write!(
+                f,
+                "chunk accounting split of {requested} bytes exceeds source charge of {charged} bytes"
+            ),
+            Self::ConnectorSplit {
+                requested,
+                reserved,
+            } => write!(
+                f,
+                "connector output accounting transfer of {requested} bytes exceeds source reservation of {reserved} bytes"
+            ),
+        }
+    }
+}
+impl std::error::Error for ChunkChargeFailure {}
+impl novarocks_failure_contract::FailureProjection for ChunkChargeFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        let reason = match self {
+            Self::NativeSplit { .. } => ExecutionReason::ChunkSplitExceedsCharge,
+            Self::ConnectorSplit { .. } => ExecutionReason::ChunkSplitExceedsReservation,
+        };
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            reason.reason(),
+        )
+    }
+}
+
 /// Estimate RecordBatch size by summing unique buffers inside the batch.
 ///
 /// NOTE: Scheme S (per-batch accounting).
@@ -144,7 +183,7 @@ impl ChunkMemoryLease {
         tracker: Option<&Arc<MemTracker>>,
         bytes: usize,
         connector_retained_bytes: usize,
-    ) -> Result<Option<TransferredChunkBytes>, String> {
+    ) -> ExecutionResult<Option<TransferredChunkBytes>> {
         match &self.owner {
             ChunkMemoryLeaseOwner::Native(accounting) => {
                 let Some(tracker) = tracker else {
@@ -154,7 +193,7 @@ impl ChunkMemoryLease {
                     return Ok(None);
                 }
                 let bytes = i64::try_from(bytes)
-                    .map_err(|_| "chunk accounting split exceeds i64 range".to_string())?;
+                    .map_err(|_| MemoryAccountingFailure::BytesOutOfRange { requested: bytes })?;
                 if bytes == 0 {
                     return Ok(Some(TransferredChunkBytes::empty(Arc::clone(tracker))));
                 }
@@ -163,12 +202,15 @@ impl ChunkMemoryLease {
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
                 if bytes > state.bytes {
-                    return Err(format!(
-                        "chunk accounting split of {bytes} bytes exceeds source charge of {} bytes",
-                        state.bytes
+                    return Err(ExecutionFailure::from_domain(
+                        ChunkChargeFailure::NativeSplit {
+                            requested: bytes,
+                            charged: state.bytes,
+                        },
                     ));
                 }
-                MemTracker::try_transfer_charge(&state.tracker, tracker, bytes)?;
+                MemTracker::try_transfer_charge_typed(&state.tracker, tracker, bytes)
+                    .map_err(MemoryAccountingFailure::Limit)?;
                 state.bytes -= bytes;
                 Ok(Some(TransferredChunkBytes::native(
                     bytes,
@@ -182,16 +224,20 @@ impl ChunkMemoryLease {
                 if Arc::strong_count(output_memory) != 1 {
                     return Ok(None);
                 }
-                let shared_bytes = u64::try_from(connector_retained_bytes).map_err(|_| {
-                    "connector output accounting split exceeds u64 range".to_string()
-                })?;
+                const {
+                    assert!(std::mem::size_of::<usize>() <= std::mem::size_of::<u64>());
+                }
+                let shared_bytes = connector_retained_bytes as u64;
                 let reserved_bytes = output_memory
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .bytes();
                 if shared_bytes > reserved_bytes {
-                    return Err(format!(
-                        "connector output accounting transfer of {shared_bytes} bytes exceeds source reservation of {reserved_bytes} bytes"
+                    return Err(ExecutionFailure::from_domain(
+                        ChunkChargeFailure::ConnectorSplit {
+                            requested: shared_bytes,
+                            reserved: reserved_bytes,
+                        },
                     ));
                 }
                 // Keep the complete reservation: Arrow projections can share
@@ -256,7 +302,7 @@ impl TransferredChunkBytes {
 
     /// Finalize a connector projection after the source `Chunk` has been
     /// dropped and any newly allocated buffers have been charged.
-    pub(crate) fn release_unshared_connector_bytes(&mut self) -> Result<(), String> {
+    pub(crate) fn release_unshared_connector_bytes(&mut self) -> ExecutionResult<()> {
         let TransferredChunkBytesOwner::Connector {
             _output_memory,
             retained_bytes,
@@ -268,9 +314,8 @@ impl TransferredChunkBytes {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .shrink_to(*retained_bytes)
-            .map_err(|error| {
-                format!("shrink connector output accounting after projection: {error}")
-            })
+            .map_err(|cause| crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(
+                crate::runtime::fragment::connector_failure::ConnectorOperation::ShrinkOutputReservation, cause).into())
     }
 }
 

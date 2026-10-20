@@ -40,7 +40,7 @@ impl PureCompileControl for Control {
         let mut t = self.trace.lock().unwrap();
         let at = t.len();
         t.push((p, n));
-        if let Some((i, c)) = self.failure
+        if let Some((i, c)) = self.failure.clone()
             && i == at
         {
             Err(c)
@@ -266,7 +266,7 @@ fn every_actual_control_success_and_ordinary_callback_preserves_caller_scope_fir
     assert!(baseline.0.is_ok());
     for at in 0..baseline.1.len() {
         for cause in CAUSES {
-            let (out, trace) = encode(&f, &r, Some((at, cause)));
+            let (out, trace) = encode(&f, &r, Some((at, cause.clone())));
             assert!(matches!(out,Err(ControlCodecError::Control(c))if c==cause));
             assert_eq!(trace, baseline.1[..=at]);
         }
@@ -286,7 +286,7 @@ fn every_actual_control_success_and_ordinary_callback_preserves_caller_scope_fir
         }
         for at in 0..baseline.1.len() {
             for cause in CAUSES {
-                let (out, trace) = decode(&f, &raw, Some((at, cause)));
+                let (out, trace) = decode(&f, &raw, Some((at, cause.clone())));
                 assert!(matches!(out,Err(ControlCodecError::Control(c))if c==cause));
                 assert_eq!(trace, baseline.1[..=at]);
             }

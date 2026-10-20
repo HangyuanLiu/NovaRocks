@@ -334,7 +334,10 @@ USE ${case_db};
 select array_generate("2025-10-01", "abc", 1);
 
 -- query 59
--- @expect_error=array_generate requires step parameter must be non-negative
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
 USE ${case_db};
 select array_generate("2025-10-01", "2025-10-05",interval -1 day);
 
@@ -427,7 +430,10 @@ USE ${case_db};
 select array_generate("2025-10-01 14:28:32.800000", "2025-10-01 14:28:31",interval 500000 MICROSECOND);
 
 -- query 82
--- @expect_error=array_generate requires step parameter must be non-negative
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.invalid_data
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.invalid_data]
 USE ${case_db};
 select array_generate("2025-10-05", "2025-10-01",interval -1 day);
 

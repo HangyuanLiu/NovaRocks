@@ -60,7 +60,7 @@ fn original_subfield_array_and_or_preserve_first_data_before_decisive_or_invalid
             };
             let root = arena.push_typed(node, DataType::Boolean);
             assert_eq!(
-                arena.eval(root, &chunk).unwrap_err(),
+                (arena.eval(root, &chunk).unwrap_err()).to_string(),
                 "__array_struct_subfield field 'chosen' does not exist"
             );
         }
@@ -79,7 +79,7 @@ fn original_subfield_array_if_condition_data_precedes_both_branches_but_unused_b
         DataType::Int32,
     );
     assert_eq!(
-        arena.eval(failing, &chunk).unwrap_err(),
+        (arena.eval(failing, &chunk).unwrap_err()).to_string(),
         "__array_struct_subfield field 'chosen' does not exist"
     );
     let condition = arena.push_typed(

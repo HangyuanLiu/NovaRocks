@@ -220,11 +220,11 @@ fn byte_offset_and_payload_extents_refuse_overflow_without_large_allocations() {
         assert!(guarded_interleave_extent(&ty, maximum / width - 1).is_ok());
         assert!(matches!(
             guarded_interleave_extent(&ty, maximum / width),
-            Err(CopyError::Extent)
+            Err(CopyError::Extent(_))
         ));
         assert!(matches!(
             guarded_interleave_extent(&ty, usize::MAX),
-            Err(CopyError::Extent)
+            Err(CopyError::Extent(_))
         ));
         for rows in [0, 1, 511, 512, 513] {
             guarded_interleave_extent(&ty, rows).unwrap();
@@ -233,13 +233,13 @@ fn byte_offset_and_payload_extents_refuse_overflow_without_large_allocations() {
     byte_interleave_payload_extent(i32::MAX as usize, false).unwrap();
     assert!(matches!(
         byte_interleave_payload_extent(i32::MAX as usize + 1, false),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
     byte_interleave_payload_extent(i32::MAX as usize + 1, true).unwrap();
     byte_interleave_payload_extent(isize::MAX as usize, true).unwrap();
     assert!(matches!(
         byte_interleave_payload_extent(isize::MAX as usize + 1, true),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
 }
 

@@ -402,14 +402,7 @@ pub(crate) fn function_argument(
             },
         })
     })();
-    if matches!(
-        result,
-        Err(novarocks_functions::FunctionBindingError::Control(_))
-    ) {
-        return result;
-    }
-    work.finish()?;
-    result
+    work.finish_result(result, novarocks_functions::FunctionBindingError::from)
 }
 
 fn converse_window_bound(bound: &WindowBound) -> WindowBound {

@@ -78,16 +78,7 @@ pub(super) fn prepare(
         work.flush().map_err(compile_failure)?;
         Ok(prepared)
     })();
-    if matches!(
-        &result,
-        Err(KernelFailure::Cancelled
-            | KernelFailure::DeadlineExceeded
-            | KernelFailure::ResourceExhausted)
-    ) {
-        return result;
-    }
-    work.finish().map_err(compile_failure)?;
-    result
+    work.finish_result(result, compile_failure)
 }
 
 struct CountPartition {
@@ -110,16 +101,7 @@ fn observed<T>(
         control.checkpoint(0)?;
         let mut work = EvaluationCheckpoints::new(&control);
         let result = operation(&mut work, &control);
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
-            return result;
-        }
-        work.finish()?;
-        result
+        work.finish_result(result)
     })();
     control.finish(result)
 }
@@ -197,7 +179,7 @@ impl PreparedWindowKernel for PreparedCountWindow {
             )
             .map_err(|error| match error {
                 core::CountVisitError::Control(cause) => cause,
-                core::CountVisitError::Invalid(message) => internal(message),
+                core::CountVisitError::Invalid(source) => KernelFailure::from_domain(source),
             })?;
             work.flush()?;
             let counts = counts.into_boxed_slice();

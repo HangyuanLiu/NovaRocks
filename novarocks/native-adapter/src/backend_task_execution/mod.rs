@@ -42,6 +42,9 @@ mod compiled_package;
 mod context_host;
 pub(crate) mod execution_host;
 mod preparation_memory_control;
+#[cfg(novarocks_dev_controls)]
+mod prepared_exit_control;
+pub(crate) mod prepared_owner;
 mod project_materialization;
 #[cfg(novarocks_dev_controls)]
 mod task_update_replay_gate;

@@ -781,7 +781,7 @@ mod tests {
     struct FailCompile(CompileControlError);
     impl PureCompileControl for FailCompile {
         fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-            Err(self.0)
+            Err(self.0.clone())
         }
     }
     #[test]
@@ -812,16 +812,16 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             assert!(
-                matches!(owner.resolve(request(&args),&FailCompile(error)),Err(FunctionBindingError::Control(actual)) if actual==error)
+                matches!(owner.resolve(request(&args),&FailCompile(error.clone())),Err(FunctionBindingError::Control(actual)) if actual==error)
             );
             assert!(
-                matches!(owner.validate_and_refine(input,&FailCompile(error)),Err(FunctionEffectOwnerError::Control(actual)) if actual==error)
+                matches!(owner.validate_and_refine(input,&FailCompile(error.clone())),Err(FunctionEffectOwnerError::Control(actual)) if actual==error)
             );
             assert!(
-                matches!(specialize_scalar(&owner,input,selected.clone(),ScopedExpressionEffects::pure_value(context()),&FailCompile(error)),Err(FunctionSpecializationFailure::Control(actual)) if actual==error)
+                matches!(specialize_scalar(&owner,input,selected.clone(),ScopedExpressionEffects::pure_value(context()),&FailCompile(error.clone())),Err(FunctionSpecializationFailure::Control(actual)) if actual==error)
             );
             assert!(
-                matches!(specialize_frozen_scalar(&owner,input,selected.clone(),&facts,ScopedExpressionEffects::pure_value(context()),&FailCompile(error)),Err(FunctionSpecializationFailure::Control(actual)) if actual==error)
+                matches!(specialize_frozen_scalar(&owner,input,selected.clone(),&facts,ScopedExpressionEffects::pure_value(context()),&FailCompile(error.clone())),Err(FunctionSpecializationFailure::Control(actual)) if actual==error)
             );
         }
     }
@@ -837,7 +837,7 @@ mod tests {
             let mut calls = self.calls.lock().unwrap();
             let index = calls.len();
             calls.push(units);
-            if let Some((at, error)) = self.refusal
+            if let Some((at, error)) = self.refusal.clone()
                 && at == index
             {
                 return Err(error);
@@ -881,7 +881,7 @@ mod tests {
             for at in 0..calls.len() {
                 let control = TraceControl {
                     calls: Mutex::new(Vec::new()),
-                    refusal: Some((at, error)),
+                    refusal: Some((at, error.clone())),
                 };
                 assert!(
                     matches!(owner.resolve(request,&control),Err(FunctionBindingError::Control(actual)) if actual==error)

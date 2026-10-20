@@ -49,7 +49,15 @@ impl fmt::Display for DomainCodecError {
         }
     }
 }
-impl std::error::Error for DomainCodecError {}
+impl std::error::Error for DomainCodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Protocol(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<CompileControlError> for DomainCodecError {
     fn from(e: CompileControlError) -> Self {
         Self::Control(e)
@@ -58,7 +66,7 @@ impl From<CompileControlError> for DomainCodecError {
 impl From<ProtocolError> for DomainCodecError {
     fn from(e: ProtocolError) -> Self {
         match e.kind() {
-            ProtocolErrorKind::CompileControl(c) => Self::Control(c),
+            ProtocolErrorKind::CompileControl(c) => Self::Control(c.clone()),
             _ => Self::Protocol(e),
         }
     }
@@ -334,3 +342,17 @@ pub fn decode_domain_observed(
 
 #[cfg(test)]
 mod tests;
+
+impl novarocks_execution_contract::failure::FailureProjection for DomainCodecError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        match self {
+            Self::Control(source) => source.failure_fact(),
+            Self::Protocol(source) => source.failure_fact(),
+            Self::SourceModel(_) => FailureFact::new(
+                FailureClass::Invariant,
+                FailureReason::new(domain::PROTOCOL, std::num::NonZeroU16::new(11).unwrap()),
+            ),
+        }
+    }
+}

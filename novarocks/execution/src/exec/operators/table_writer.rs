@@ -33,7 +33,70 @@
 //!
 //! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
-use crate::runtime::fragment::ExecutionResult;
+use crate::exec::pipeline::operator::OperatorLifecycle;
+use crate::exec::pipeline::writer_failure::WriterFailure;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+fn writer_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    WriterFailure::FrozenContract {
+        detail: novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    }
+    .into()
+}
+fn writer_connector(source: novarocks_spi::connector::ConnectorError) -> ExecutionFailure {
+    use crate::runtime::fragment::connector_failure::{ConnectorCallFailure, ConnectorOperation};
+    ConnectorCallFailure::new(ConnectorOperation::ValidateWriteRelation, source).into()
+}
+fn writer_arrow(source: arrow::error::ArrowError) -> ExecutionFailure {
+    ExecutionFailure::from_domain(WriterArrowFailure(source))
+}
+#[derive(Debug)]
+struct WriterArrowFailure(arrow::error::ArrowError);
+impl std::fmt::Display for WriterArrowFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "table writer output: {}", self.0)
+    }
+}
+impl std::error::Error for WriterArrowFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for WriterArrowFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        let (class, reason) = match self.0 {
+            arrow::error::ArrowError::MemoryError(_) => {
+                (FailureClass::Resource, ExecutionReason::WriterArrowMemory)
+            }
+            arrow::error::ArrowError::OffsetOverflowError(required) => {
+                return FailureFact::new(
+                    FailureClass::Representation,
+                    ExecutionReason::WriterArrowOffset.reason(),
+                )
+                .with_representation(RepresentationFacts {
+                    boundary: RepresentationBoundary::SingleOutput,
+                    layout: RepresentationLayout {
+                        domain: domain::EXECUTION,
+                        code: std::num::NonZeroU16::new(7).unwrap(),
+                    },
+                    required: u64::try_from(required).ok(),
+                    extent_limit: None,
+                    representable_prefix: None,
+                });
+            }
+            arrow::error::ArrowError::IoError(..) | arrow::error::ArrowError::ExternalError(_) => (
+                FailureClass::Unexpected,
+                ExecutionReason::WriterArrowUnexpected,
+            ),
+            _ => (FailureClass::Invariant, ExecutionReason::WriterArrow),
+        };
+        FailureFact::new(class, reason.reason())
+    }
+}
 
 use std::collections::VecDeque;
 use std::mem::size_of;
@@ -73,10 +136,19 @@ use crate::exec::node::table_writer::{
 use crate::exec::operators::AggregateProcessorFactory;
 use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::pipeline::async_writer::{AsyncWriterOwner, AsyncWriterQueueConfig};
-use crate::exec::pipeline::operator::{FinishWatch, Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{FinishWatch, InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
+use crate::exec::pipeline::{
+    input::{PreparedInput, RawInput},
+    shape::{
+        ControlStep, HydrateInput, Transform, TransformKernel, TransformStart, child::ChildStep,
+    },
+    step::{AdmissionNext, NextStep, StepResult, WaitFact, WaitReason},
+    step_context::StepContext,
+};
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
+use crate::runtime::observable::ObserverSubscription;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::RuntimeState;
 
@@ -183,18 +255,16 @@ impl TableWriterOperatorFactory {
         partial_output_layout: novarocks_local_program::StaticLayout,
         error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
         binding: &TableWriterRuntimeBinding,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         if binding.execution.catalog_handle() != binding.handle.binding().catalog_handle() {
-            return Err(
-                "table writer catalog handle does not match its query-leased write execution"
-                    .to_string(),
-            );
+            return Err(writer_contract(
+                "table writer catalog handle does not match its query-leased write execution",
+            ));
         }
         if projection.schema().as_ref() != expected_schema.as_ref() {
-            return Err(
-                "table writer input projection does not produce the expected writer schema"
-                    .to_string(),
-            );
+            return Err(writer_contract(
+                "table writer input projection does not produce the expected writer schema",
+            ));
         }
         let local_partial_source = prepared_partials.map(|calls| LocalPreparedWriterPartial {
             calls,
@@ -241,12 +311,11 @@ impl TableWriterOperatorFactory {
         writer_multiplex_schema: WriterMultiplexRelationTemplate,
         partial_aggregate_factory: Option<Arc<dyn OperatorFactory>>,
         binding: &TableWriterRuntimeBinding,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         if binding.execution.catalog_handle() != binding.handle.binding().catalog_handle() {
-            return Err(
-                "table writer catalog handle does not match its query-leased write execution"
-                    .to_string(),
-            );
+            return Err(writer_contract(
+                "table writer catalog handle does not match its query-leased write execution",
+            ));
         }
         let name = if node_id >= 0 {
             format!("TABLE_WRITER (id={node_id})")
@@ -282,7 +351,7 @@ impl TableWriterOperatorFactory {
     fn for_test_fixture(
         node: &WriterFixture,
         function_set: Arc<SealedExecutionFunctionSet>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let name = if node.node_id >= 0 {
             format!("TABLE_WRITER (id={})", node.node_id)
         } else {
@@ -327,7 +396,7 @@ fn build_partial_aggregate_factory(
     calls: &[crate::exec::node::table_write_aggregate::WriterPartialAggregateCall],
     writer_multiplex_schema: &WriterMultiplexRelationSchema,
     function_set: Arc<SealedExecutionFunctionSet>,
-) -> Result<Option<AggregateProcessorFactory>, String> {
+) -> ExecutionResult<Option<AggregateProcessorFactory>> {
     build_partial_aggregate_factory_core(
         node_id,
         calls,
@@ -335,7 +404,6 @@ fn build_partial_aggregate_factory(
         function_set,
         None,
     )
-    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -371,38 +439,33 @@ fn build_partial_aggregate_factory_core(
     })?;
     for call in calls {
         if call.resolved.argument_types.len() != 1 {
-            return Err(format!(
+            return Err(writer_contract(format_args!(
                 "writer partial aggregate {} requires exactly one planned input type, got {}",
                 call.function_name,
                 call.resolved.argument_types.len()
-            )
-            .into());
+            )));
         }
         let input_type = call
             .resolved
             .argument_types
             .first()
-            .ok_or_else(|| "writer partial aggregate input type is missing".to_string())?
+            .ok_or_else(|| writer_contract("writer partial aggregate input type is missing"))?
             .clone();
         let input = if owner.is_some() {
             let frozen = call.frozen.as_ref().ok_or_else(|| {
-                "writer partial aggregate lacks its complete frozen selection".to_owned()
+                writer_contract("writer partial aggregate lacks its complete frozen selection")
             })?;
             let [novarocks_type_contract::FunctionArgumentType::Value(value)] =
                 frozen.selected().argument_types.as_slice()
             else {
-                return Err(
-                    "writer partial aggregate frozen input is not one complete scalar"
-                        .to_owned()
-                        .into(),
-                );
+                return Err(writer_contract(
+                    "writer partial aggregate frozen input is not one complete scalar",
+                ));
             };
             if value.data_type() != &input_type {
-                return Err(
-                    "writer partial aggregate frozen input differs from its resolved layout"
-                        .to_owned()
-                        .into(),
-                );
+                return Err(writer_contract(
+                    "writer partial aggregate frozen input differs from its resolved layout",
+                ));
             }
             arena.push_value_typed(ExprNode::SlotId(call.input_slot_id), value.clone())
         } else {
@@ -426,22 +489,22 @@ fn build_partial_aggregate_factory_core(
             .slot(call.intermediate_slot_id)
             .cloned()
             .ok_or_else(|| {
-                format!(
+                writer_contract(format_args!(
                     "writer partial aggregate output slot {} is absent from the multiplex schema",
                     call.intermediate_slot_id
-                )
+                ))
             })?;
         if let Some(owner) = owner {
             let frozen = call.frozen.as_ref().ok_or_else(|| {
-                "writer partial aggregate lacks its complete frozen selection".to_owned()
+                writer_contract("writer partial aggregate lacks its complete frozen selection")
             })?;
             let selected = frozen.selected().aggregate.as_ref().ok_or_else(|| {
-                "writer partial frozen selection has no aggregate signature".to_owned()
+                writer_contract("writer partial frozen selection has no aggregate signature")
             })?;
             let actual = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                 output_slot.typed_binding().clone(),
             )
-            .map_err(|error| error.to_string())?;
+            .map_err(ExecutionFailure::from_domain)?;
             if selected.intermediate_type.data_type() != &call.resolved.intermediate_type
                 || !actual.same_physical_binding_ignoring_root_nullability_observed(
                     &selected.intermediate_type,
@@ -456,10 +519,18 @@ fn build_partial_aggregate_factory_core(
                     },
                 )?
             {
-                return Err(format!("writer partial aggregate output slot {} type mismatch: relation={:?}, frozen={:?}",call.intermediate_slot_id,actual,selected.intermediate_type).into());
+                return Err(writer_contract(format_args!(
+                    "writer partial aggregate output slot {} type mismatch: relation={:?}, frozen={:?}",
+                    call.intermediate_slot_id, actual, selected.intermediate_type
+                )));
             }
         } else if output_slot.data_type() != &call.resolved.intermediate_type {
-            return Err(format!("writer partial aggregate output slot {} type mismatch: relation={:?}, resolved={:?}",call.intermediate_slot_id,output_slot.data_type(),call.resolved.intermediate_type).into());
+            return Err(writer_contract(format_args!(
+                "writer partial aggregate output slot {} type mismatch: relation={:?}, resolved={:?}",
+                call.intermediate_slot_id,
+                output_slot.data_type(),
+                call.resolved.intermediate_type
+            )));
         }
         output_slots.push(output_slot);
     }
@@ -511,7 +582,7 @@ fn build_partial_aggregate_factory_core(
 }
 
 impl TableWriterOperatorFactory {
-    fn create_operator(&self, dop: i32, driver_id: i32) -> TableWriterOperator {
+    fn create_operator(&self, dop: i32, driver_id: i32) -> TableWriterStep {
         let plan = &self.plan;
         let physical = plan
             .physical_template
@@ -549,24 +620,17 @@ impl TableWriterOperatorFactory {
             .as_ref()
             .map(|factory| factory.create(dop, driver_id));
         let readiness_observable = Arc::new(Observable::new());
-        forward_observable(&writer.observable(), &readiness_observable);
-        if let Some(partial) = partial_aggregate.as_ref()
-            && let Some(processor) = partial.as_processor_ref()
-        {
-            if let Some(observable) = processor.sink_observable() {
-                forward_observable(&observable, &readiness_observable);
-            }
-            if let Some(observable) = processor.source_observable() {
-                forward_observable(&observable, &readiness_observable);
-            }
-        }
-        TableWriterOperator {
+        let writer_subscription = forward_observable(&writer.observable(), &readiness_observable);
+        let partial_aggregate =
+            partial_aggregate.map(|partial| ChildStep::new(partial, readiness_observable.clone()));
+        Transform::hydrating(TableWriterOperator {
             name: self.name.clone(),
             projection: plan.projection.create(),
             writer,
             target,
             relation: plan.writer_multiplex_schema.clone(),
             construction: None,
+            runtime_error: None,
             partial_aggregate,
             #[cfg(test)]
             local_partial_source: plan.local_partial_source.clone(),
@@ -593,7 +657,12 @@ impl TableWriterOperatorFactory {
             sparse_partial_rows: 0,
             target_multiplex_batch_bytes: MAX_WRITER_MULTIPLEX_ROW_BYTES,
             readiness_observable,
-        }
+            _writer_subscription: writer_subscription,
+            input: None,
+            pending_append: None,
+            pending_rows: None,
+            writer_finish_requested: false,
+        })
     }
 }
 
@@ -612,13 +681,13 @@ impl OperatorFactory for TableWriterOperatorFactory {
     }
 }
 
-fn forward_observable(source: &Arc<Observable>, target: &Arc<Observable>) {
+fn forward_observable(source: &Arc<Observable>, target: &Arc<Observable>) -> ObserverSubscription {
     let target = Arc::downgrade(target);
-    source.add_observer(Arc::new(move || {
+    source.subscribe(Arc::new(move || {
         if let Some(target) = target.upgrade() {
-            target.defer_notify().arm();
+            target.notify_observers();
         }
-    }));
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -642,6 +711,14 @@ struct WriterCompletion {
     _index_accounting: Option<TrackedBytes>,
 }
 
+type TableWriterStep = Transform<TableWriterOperator, HydrateInput>;
+
+struct PendingAppend {
+    batch: crate::exec::pipeline::async_writer::WriterAppendBatch,
+    reservation: crate::exec::pipeline::async_writer::AsyncWriterReservation<WriterCompletion>,
+    rows: u64,
+}
+
 struct TableWriterOperator {
     name: String,
     projection: Box<dyn WriterPageProjection>,
@@ -649,7 +726,8 @@ struct TableWriterOperator {
     target: WriteTargetOrdinal,
     relation: WriterRelationPreparation,
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
-    partial_aggregate: Option<Box<dyn Operator>>,
+    runtime_error: Option<Arc<crate::runtime::runtime_state::RuntimeErrorState>>,
+    partial_aggregate: Option<ChildStep>,
     #[cfg(test)]
     local_partial_source: Option<LocalPreparedWriterPartial>,
     #[cfg(novarocks_dev_controls)]
@@ -675,34 +753,39 @@ struct TableWriterOperator {
     sparse_partial_rows: usize,
     target_multiplex_batch_bytes: usize,
     readiness_observable: Arc<Observable>,
+    _writer_subscription: ObserverSubscription,
+    input: Option<Chunk>,
+    pending_append: Option<PendingAppend>,
+    pending_rows: Option<u64>,
+    writer_finish_requested: bool,
 }
 
 fn encode_writer_completion(
     target: WriteTargetOrdinal,
     fragment_encoder: &dyn ConnectorCommitFragmentEncoder,
     accepted_rows: u64,
-    fragments: Vec<novarocks_spi::connector::write_stack::ConnectorCommitFragment>,
+    fragments: &[novarocks_spi::connector::write_stack::ConnectorCommitFragment],
     tracker: Option<Arc<MemTracker>>,
-) -> Result<WriterCompletion, String> {
+) -> ExecutionResult<WriterCompletion> {
     let mut encoded = VecDeque::with_capacity(fragments.len());
     for fragment in fragments {
         let bytes = fragment_encoder
-            .encode(target, &fragment)
-            .map_err(|error| format!("encode table writer commit fragment: {error}"))?;
+            .encode(target, fragment)
+            .map_err(|error| crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(
+                crate::runtime::fragment::connector_failure::ConnectorOperation::EncodeCommitFragment, error))?;
         if bytes.len() > MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES {
-            return Err(format!(
-                "table writer commit fragment of {} bytes exceeds the frozen single-fragment budget of {} bytes",
-                bytes.len(),
-                MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES
-            ));
+            return Err(
+                crate::exec::pipeline::writer_failure::WriterFailure::CommitFragmentLimit {
+                    requested: bytes.len(),
+                    limit: MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES,
+                }
+                .into(),
+            );
         }
         let accounting = tracker
             .as_ref()
             .map(|tracker| TrackedBytes::try_new(bytes.capacity(), Arc::clone(tracker)))
-            .transpose()
-            .map_err(|error| {
-                format!("ResourceExhausted: table writer fragment result memory: {error}")
-            })?;
+            .transpose()?;
         encoded.push_back(EncodedFragment {
             bytes,
             _accounting: accounting,
@@ -713,10 +796,7 @@ fn encode_writer_completion(
         .saturating_mul(size_of::<EncodedFragment>());
     let index_accounting = tracker
         .map(|tracker| TrackedBytes::try_new(index_bytes, tracker))
-        .transpose()
-        .map_err(|error| {
-            format!("ResourceExhausted: table writer fragment index memory: {error}")
-        })?;
+        .transpose()?;
     Ok(WriterCompletion {
         accepted_rows,
         fragments: encoded,
@@ -724,7 +804,7 @@ fn encode_writer_completion(
     })
 }
 
-impl Operator for TableWriterOperator {
+impl OperatorLifecycle for TableWriterOperator {
     fn creates_typed_storage(&self) -> bool {
         self.relation.is_compiled()
             || self
@@ -801,19 +881,15 @@ impl Operator for TableWriterOperator {
                 if let Some(profiles) = self.profiles.as_ref() {
                     partial.set_profiles(profiles.clone());
                 }
-                if let Some(processor) = partial.as_processor_ref() {
-                    if let Some(observable) = processor.sink_observable() {
-                        forward_observable(&observable, &self.readiness_observable);
-                    }
-                    if let Some(observable) = processor.source_observable() {
-                        forward_observable(&observable, &self.readiness_observable);
-                    }
-                }
                 Ok(partial)
             })();
             match deferred {
                 Ok(partial) => {
-                    self.partial_aggregate = Some(partial);
+                    let mut child = ChildStep::new(partial, self.readiness_observable.clone());
+                    if let Some(control) = &self.runtime_error {
+                        child.bind_failure_port(control.clone())?;
+                    }
+                    self.partial_aggregate = Some(child);
                     self.local_partial_source = None;
                 }
                 Err(error) => {
@@ -832,6 +908,15 @@ impl Operator for TableWriterOperator {
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        let incoming = state.error_state();
+        if self
+            .runtime_error
+            .as_ref()
+            .is_some_and(|old| !Arc::ptr_eq(old, &incoming))
+        {
+            return Err(WriterFailure::AlreadyBound.into());
+        }
+        self.runtime_error = Some(incoming);
         if let Err(error) = self.projection.bind_runtime_state(state) {
             self.state = TableWriterState::Failed;
             return Err(error);
@@ -856,6 +941,7 @@ impl Operator for TableWriterOperator {
         }
         let result = state
             .sink_io_executor()
+            .map_err(crate::runtime::fragment::ExecutionFailure::from)
             .and_then(|executor| self.writer.bind(executor, state.error_state()));
         if result.is_err() {
             self.state = TableWriterState::Failed;
@@ -863,6 +949,47 @@ impl Operator for TableWriterOperator {
         Ok(result?)
     }
 
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        // An early downstream finish may end the driver while this receiver
+        // still owns an open actor. Start that exit before observing its join.
+        if !matches!(self.state, TableWriterState::Finished) {
+            self.stop_writer(false);
+        }
+        if let Some(partial) = self.partial_aggregate.as_mut() {
+            partial.begin_exit()?;
+        }
+        Ok(())
+    }
+    fn observe_exit(&mut self) -> crate::exec::pipeline::operator::ExitObservation {
+        use crate::exec::pipeline::operator::ExitObservation;
+        let observing_exit = match self.state {
+            TableWriterState::Draining => {
+                self.writer_finish_requested
+                    && self.partial_child_finished()
+                    && !self.partial_output_available()
+            }
+            TableWriterState::Aborting | TableWriterState::Failed | TableWriterState::Finished => {
+                true
+            }
+            // The actor is serving this computation, not exiting. The step
+            // protocol advances it; it must not park active input dataflow.
+            TableWriterState::Open | TableWriterState::Producing => false,
+        };
+        if observing_exit {
+            self.writer.observe_actor_exit()
+        } else {
+            ExitObservation::exited()
+        }
+    }
+    fn visit_exits(
+        &mut self,
+        visit: &mut dyn FnMut(crate::exec::pipeline::operator::ExitObservation),
+    ) {
+        visit(self.observe_exit());
+        if let Some(partial) = self.partial_aggregate.as_mut() {
+            partial.visit_exits(visit);
+        }
+    }
     fn close(&mut self) -> ExecutionResult<()> {
         self.finish_blocked_intervals();
         self.sync_metrics();
@@ -873,43 +1000,17 @@ impl Operator for TableWriterOperator {
     }
 
     fn cancel(&mut self) {
-        if matches!(
-            self.state,
-            TableWriterState::Finished | TableWriterState::Aborting
-        ) {
-            return;
-        }
-        if let Some(partial) = self.partial_aggregate.as_mut() {
-            partial.cancel();
-        }
-        self.writer.request_abort();
-        self.aggregate_output = None;
-        self.writer_completion = None;
-        self.state = TableWriterState::Aborting;
-        self.finish_blocked_intervals();
-        self.sync_metrics();
+        self.stop_writer(false);
     }
-
     fn on_driver_failure(&mut self) {
-        if let Some(partial) = self.partial_aggregate.as_mut() {
-            partial.on_driver_failure();
-        }
-        self.cancel();
-    }
-
-    fn is_finished(&self) -> bool {
-        matches!(self.state, TableWriterState::Finished)
-            || (matches!(
-                self.state,
-                TableWriterState::Failed | TableWriterState::Aborting
-            ) && self.writer.is_done()
-                && !self.writer.has_output())
+        self.stop_writer(true);
     }
 
     fn pending_finish(&self) -> Option<FinishWatch> {
         let pending = match self.state {
             TableWriterState::Draining => {
-                self.partial_child_finished()
+                self.writer_finish_requested
+                    && self.partial_child_finished()
                     && !self.partial_output_available()
                     && (!self.writer.is_done() || !self.writer.actor_exited())
             }
@@ -929,286 +1030,389 @@ impl Operator for TableWriterOperator {
             Some(FinishWatch::Notify(Arc::clone(&self.readiness_observable)))
         }
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
 }
 
-impl ProcessorOperator for TableWriterOperator {
-    fn need_input(&self) -> bool {
-        if self.state != TableWriterState::Open {
-            self.writer_queue_blocked_time.observe(false);
-            self.composite_blocked_time.observe(false);
-            return false;
-        }
-        let aggregate_ready = self
-            .partial_aggregate
-            .as_ref()
-            .and_then(|partial| partial.as_processor_ref())
-            .is_none_or(ProcessorOperator::need_input);
-        let writer_ready = self.writer.can_accept();
-        let ready = aggregate_ready
-            && self.aggregate_output.is_none()
-            && !self.partial_child_has_output()
-            && self.writer_completion.is_none()
-            && writer_ready;
-        self.writer_queue_blocked_time.observe(!writer_ready);
-        self.composite_blocked_time.observe(!ready);
-        if !ready {
-            self.blocked_checks.fetch_add(1, Ordering::Relaxed);
-        }
-        ready
+impl InputEncodingPolicy for TableWriterOperator {}
+impl TransformKernel for TableWriterOperator {
+    fn control_observable(&self) -> Option<Arc<Observable>> {
+        Some(self.readiness_observable.clone())
     }
-
-    fn has_output(&self) -> bool {
-        match self.state {
-            TableWriterState::Open => self.partial_output_available(),
-            TableWriterState::Draining => {
-                self.partial_output_available()
-                    || self.writer.error().is_some()
-                    || (self.partial_child_finished()
-                        && (self.writer.has_output() || self.writer.is_done()))
-            }
-            TableWriterState::Producing => self.has_remaining_output(),
-            _ => false,
+    fn poll_control(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+        if let Some(error) = self.writer.error() {
+            return Err(error);
         }
-    }
-
-    fn push_chunk(&mut self, state: &RuntimeState, mut chunk: Chunk) -> ExecutionResult<()> {
-        let result: ExecutionResult<()> = (|| {
-            if !self.need_input() {
-                return Err("composite table writer received input while not ready".into());
-            }
-            if chunk.is_empty() {
-                return Ok(());
-            }
-            let rows = u64::try_from(chunk.len())
-                .map_err(|_| "table writer input row count does not fit u64".to_string())?;
-            let next_rows = self
-                .logical_rows
-                .checked_add(rows)
-                .ok_or_else(|| "table writer logical row count overflowed u64".to_string())?;
-            let projected = self.projection.project(&chunk)?;
-            let batch = projected.record_batch();
-            let retained_bytes = record_batch_bytes(batch);
-            let additional_bytes = record_batch_additional_bytes(batch, chunk.record_batch());
-            let connector_retained_bytes =
-                crate::exec::chunk::record_batch_shared_owner_bytes(batch, chunk.record_batch());
-            let accounting = chunk.take_memory_lease();
-            let reservation = self.writer.try_reserve_input(
-                batch.num_rows(),
-                retained_bytes,
-                accounting,
-                connector_retained_bytes,
-                additional_bytes,
-            )?;
-            // Snapshot only after the original source accounting has moved to
-            // this reservation. Queue custody must not duplicate payload funds.
-            let append = if projected.chunk_schema().is_typed() {
-                let factory = self
-                    .construction
-                    .as_ref()
-                    .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-                let owner = factory.begin_typed_construction(projected.chunk_schema())?;
-                crate::exec::pipeline::async_writer::WriterAppendBatch::try_new(
-                    projected.batch_projection(),
-                    owner.as_ref(),
-                )?
-            } else {
-                #[cfg(test)]
-                {
-                    crate::exec::pipeline::async_writer::WriterAppendBatch::from_fixture_projection(
-                        projected.batch_projection(),
-                    )
-                }
-                #[cfg(not(test))]
+        if let Some(child) = self.partial_aggregate.as_mut() {
+            let control = child.poll_control(ctx)?;
+            if child.is_complete() && self.state == TableWriterState::Open {
                 return Err(
-                    crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
-                        "writer append requires its complete execution bindings".into(),
-                    )
-                    .into(),
+                    crate::exec::pipeline::writer_failure::WriterFailure::PartialDemandClosed
+                        .into(),
                 );
-            };
-            // The writer reservation now owns every retained input charge.
-            // Drop the source view before it releases any unshared connector
-            // bytes, so accounting never leaves live source buffers ownerless.
-            drop(chunk);
-            if let Some(partial) = self.partial_aggregate.as_mut() {
-                #[cfg(novarocks_dev_controls)]
-                self.aggregate_guard
-                    .check(TableWriteAggregateBoundary::PartialUpdate)
-                    .map_err(|error| format!("update writer partial aggregate: {error}"))?;
-                let processor = partial
-                    .as_processor_mut()
-                    .ok_or_else(|| "writer partial aggregate is not a processor".to_string())?;
-                processor.push_chunk(state, projected)?;
             }
-            reservation.send(append)?;
-            self.logical_rows = next_rows;
-            Ok(())
-        })();
-        if result.is_err() {
-            self.fail_attempt();
+            if matches!(control, ControlStep::Runnable) || child.runnable() {
+                return Ok(ControlStep::Runnable);
+            }
         }
-        result
+        Ok(ControlStep::Active)
     }
-
-    fn pull_chunk(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if matches!(
-            self.state,
-            TableWriterState::Open | TableWriterState::Draining
-        ) && self.partial_output_available()
+    fn admission(
+        &self,
+        _: &mut StepContext<'_>,
+        _: &RawInput,
+    ) -> ExecutionResult<Option<AdmissionNext>> {
+        let generation = self.readiness_observable.generation();
+        if let Some(error) = self.writer.error() {
+            return Err(error);
+        }
+        if self.state == TableWriterState::Open
+            && self
+                .partial_aggregate
+                .as_ref()
+                .is_some_and(ChildStep::is_complete)
         {
-            match self.take_partial_output(state) {
-                Ok(Some(output)) => {
-                    self.sync_metrics();
-                    return Ok(Some(output));
-                }
-                Ok(None) => {}
-                Err(error) => {
+            return Err(
+                crate::exec::pipeline::writer_failure::WriterFailure::PartialDemandClosed.into(),
+            );
+        }
+        let ready = self.state == TableWriterState::Open
+            && self.input.is_none()
+            && self.pending_append.is_none()
+            && self.aggregate_output.is_none()
+            && self
+                .partial_aggregate
+                .as_ref()
+                .is_none_or(ChildStep::can_accept)
+            && self.writer.can_accept();
+        self.writer_queue_blocked_time
+            .observe(!self.writer.can_accept());
+        self.composite_blocked_time.observe(!ready);
+        if ready {
+            Ok(None)
+        } else {
+            self.blocked_checks.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(AdmissionNext::Wait(self.wait(generation))))
+        }
+    }
+    fn apply(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        self.input = Some(input.into_uncovered_chunk()?);
+        self.drive(ctx)
+    }
+    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        let generation = self.readiness_observable.generation();
+        let result = self.advance(ctx, generation);
+        match result {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                ctx.report_failure(error.clone());
+                self.fail_attempt();
+                Err(error)
+            }
+        }
+    }
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if self.state == TableWriterState::Open {
+            self.state = TableWriterState::Draining;
+            self.finish_blocked_intervals();
+            #[cfg(novarocks_dev_controls)]
+            if self.partial_aggregate.is_some() {
+                if let Err(error) = self
+                    .aggregate_guard
+                    .check(TableWriteAggregateBoundary::PartialFinalize)
+                {
+                    let error: crate::runtime::fragment::ExecutionFailure = crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(crate::runtime::fragment::connector_failure::ConnectorOperation::CheckPartialAggregateFinalize,error).into();
+                    ctx.report_failure(error.clone());
                     self.fail_attempt();
                     return Err(error);
                 }
             }
-        }
-        if self.state == TableWriterState::Open {
-            return Ok(None);
-        }
-        if self.state == TableWriterState::Draining {
-            if let Some(error) = self.writer.error() {
-                self.fail_attempt();
-                return Err(error.into());
-            }
-            if !self.partial_child_finished() || self.aggregate_output.is_some() {
-                return Ok(None);
-            }
-            let Some(completion) = self.writer.take_output() else {
-                return Ok(None);
-            };
-            if completion.accepted_rows != self.logical_rows {
-                self.state = TableWriterState::Failed;
-                self.sync_metrics();
-                return Err(format!(
-                    "composite table writer row count drift: aggregate accepted {}, writer accepted {}",
-                    self.logical_rows, completion.accepted_rows
-                ).into());
-            }
-            self.writer_completion = Some(completion);
-            self.state = TableWriterState::Producing;
-        }
-        if self.state != TableWriterState::Producing {
-            return Ok(None);
-        }
-
-        let output = if !self.emitted_row_count {
-            self.emitted_row_count = true;
-            let output = self.build_prefix_output(Some(self.logical_rows), &[])?;
-            let bytes = self.output_size(&output)?;
-            if bytes > MAX_WRITER_MULTIPLEX_ROW_BYTES {
-                return Err(format!(
-                    "ResourceExhausted: table writer row-count output requires {bytes} bytes, limit is {}",
-                    MAX_WRITER_MULTIPLEX_ROW_BYTES
-                ).into());
-            }
-            Some(output)
-        } else if self
-            .writer_completion
-            .as_ref()
-            .is_some_and(|completion| !completion.fragments.is_empty())
-        {
-            Some(self.take_fragment_output()?)
-        } else {
-            None
-        };
-
-        if !self.has_remaining_output() {
-            self.aggregate_output = None;
-            self.writer_completion = None;
-            self.state = TableWriterState::Finished;
-        }
-        self.sync_metrics();
-        Ok(output)
-    }
-
-    fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        if self.state != TableWriterState::Open {
-            return Ok(());
-        }
-        self.state = TableWriterState::Draining;
-        self.finish_blocked_intervals();
-        if let Some(partial) = self.partial_aggregate.as_mut() {
-            #[cfg(novarocks_dev_controls)]
-            if let Err(error) = self
-                .aggregate_guard
-                .check(TableWriteAggregateBoundary::PartialFinalize)
-            {
-                self.state = TableWriterState::Failed;
-                self.writer.request_abort();
-                self.state = TableWriterState::Aborting;
-                return Err(format!("finish writer partial aggregate: {error}").into());
-            }
-            let processor = partial
-                .as_processor_mut()
-                .ok_or_else(|| "writer partial aggregate is not a processor".to_string())?;
-            if let Err(error) = processor.set_finishing(state) {
-                self.state = TableWriterState::Failed;
-                self.writer.request_abort();
-                self.state = TableWriterState::Aborting;
-                return Err(error);
+            if let Some(child) = self.partial_aggregate.as_mut() {
+                child.finish_input();
             }
         }
-        if let Err(error) = self.writer.request_finish() {
-            self.state = TableWriterState::Failed;
-            self.writer.request_abort();
-            self.state = TableWriterState::Aborting;
-            return Err(error.into());
-        }
-        Ok(())
-    }
-
-    fn sink_observable(&self) -> Option<Arc<Observable>> {
-        Some(Arc::clone(&self.readiness_observable))
-    }
-
-    fn source_observable(&self) -> Option<Arc<Observable>> {
-        Some(Arc::clone(&self.readiness_observable))
+        self.drive(ctx)
     }
 }
 
 impl TableWriterOperator {
-    #[cfg(test)]
-    fn replace_partial_aggregate_for_test(&mut self, partial: Box<dyn Operator>) {
-        if let Some(processor) = partial.as_processor_ref() {
-            if let Some(observable) = processor.sink_observable() {
-                forward_observable(&observable, &self.readiness_observable);
+    fn wait(&self, generation: u64) -> WaitFact {
+        WaitFact {
+            reason: if self.state == TableWriterState::Open {
+                WaitReason::Output
+            } else {
+                WaitReason::Finish
+            },
+            observable: self.readiness_observable.clone(),
+            observed_generation: generation,
+            deadline: self
+                .partial_aggregate
+                .as_ref()
+                .and_then(|child| child.wait())
+                .and_then(|wait| wait.deadline),
+        }
+    }
+    fn next_work(&self, generation: u64) -> NextStep {
+        if self.input.is_some()
+            || self.aggregate_output.is_some()
+            || self.pending_append.as_ref().is_some_and(|_| {
+                self.partial_aggregate
+                    .as_ref()
+                    .is_none_or(|child| !child.input_pending())
+            })
+            || self
+                .partial_aggregate
+                .as_ref()
+                .is_some_and(ChildStep::runnable)
+        {
+            return NextStep::Runnable;
+        }
+        match self.state {
+            TableWriterState::Open
+                if self.pending_append.is_none()
+                    && self
+                        .partial_aggregate
+                        .as_ref()
+                        .is_none_or(ChildStep::can_accept) =>
+            {
+                NextStep::NeedInput
             }
-            if let Some(observable) = processor.source_observable() {
-                forward_observable(&observable, &self.readiness_observable);
+            TableWriterState::Draining
+                if self.partial_child_finished()
+                    && (!self.writer_finish_requested
+                        || self.writer.has_output()
+                        || self.writer.is_done()) =>
+            {
+                NextStep::Runnable
+            }
+            TableWriterState::Producing => NextStep::Runnable,
+            TableWriterState::Finished | TableWriterState::Failed | TableWriterState::Aborting => {
+                NextStep::Finished
+            }
+            _ => NextStep::Wait(self.wait(generation)),
+        }
+    }
+    fn advance(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        generation: u64,
+    ) -> ExecutionResult<StepResult> {
+        if let Some(error) = self.writer.error() {
+            return Err(error);
+        }
+        if !ctx.work().try_consume(1) {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
+        }
+        if let Some(mut chunk) = self.input.take() {
+            if !chunk.is_empty() {
+                let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+                let next_rows = self.logical_rows.checked_add(rows).ok_or_else(|| crate::runtime::fragment::ExecutionFailure::from(crate::exec::pipeline::writer_failure::WriterFailure::AcceptedRowsOverflow {current:self.logical_rows,incoming:chunk.len()}))?;
+                let projected = self.projection.project(&chunk)?;
+                let batch = projected.record_batch();
+                let reservation = self.writer.try_reserve_input(
+                    batch.num_rows(),
+                    record_batch_bytes(batch),
+                    chunk.take_memory_lease(),
+                    crate::exec::chunk::record_batch_shared_owner_bytes(
+                        batch,
+                        chunk.record_batch(),
+                    ),
+                    record_batch_additional_bytes(batch, chunk.record_batch()),
+                )?;
+                let append = if projected.chunk_schema().is_typed() {
+                    let factory = self.construction.as_ref().ok_or(
+                        crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                    )?;
+                    let owner = factory.begin_typed_construction(projected.chunk_schema())?;
+                    crate::exec::pipeline::async_writer::WriterAppendBatch::try_new(
+                        projected.batch_projection(),
+                        owner.as_ref(),
+                    )?
+                } else {
+                    #[cfg(test)]
+                    {
+                        crate::exec::pipeline::async_writer::WriterAppendBatch::from_fixture_projection(projected.batch_projection())
+                    }
+                    #[cfg(not(test))]
+                    return Err(
+                        crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
+                            "writer append requires its complete execution bindings".into(),
+                        )
+                        .into(),
+                    );
+                };
+                drop(chunk);
+                if let Some(child) = self.partial_aggregate.as_mut() {
+                    #[cfg(novarocks_dev_controls)]
+                    self.aggregate_guard
+                        .check(TableWriteAggregateBoundary::PartialUpdate)
+                        .map_err(|source| ExecutionFailure::from(crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(crate::runtime::fragment::connector_failure::ConnectorOperation::CheckPartialAggregateUpdate,source)))?;
+                    child.offer(projected)?;
+                    self.pending_append = Some(PendingAppend {
+                        batch: append,
+                        reservation,
+                        rows: next_rows,
+                    });
+                } else {
+                    reservation.send(append)?;
+                    self.logical_rows = next_rows;
+                    self.pending_rows = Some(rows);
+                }
             }
         }
-        self.partial_aggregate = Some(partial);
+        if self.aggregate_output.is_none()
+            && let Some(child) = self.partial_aggregate.as_mut()
+            && child.runnable()
+        {
+            if let Some(mut output) = child.advance(ctx)? {
+                if let Some(tracker) = self.aggregate_tracker.as_ref() {
+                    output
+                        .try_transfer_to(tracker)
+                        .map_err(ExecutionFailure::from_domain)?;
+                }
+                self.aggregate_output = Some(output);
+                self.aggregate_output_row = 0;
+                self.next_auxiliary = 0;
+            }
+        }
+        if self.pending_append.is_some()
+            && self
+                .partial_aggregate
+                .as_ref()
+                .is_none_or(|child| !child.input_pending())
+        {
+            let PendingAppend {
+                batch,
+                reservation,
+                rows,
+            } = self.pending_append.take().unwrap();
+            reservation.send(batch)?;
+            self.pending_rows = Some(rows - self.logical_rows);
+            self.logical_rows = rows;
+        }
+        if self.aggregate_output.is_some() {
+            let output = self.take_partial_output()?;
+            self.sync_metrics();
+            return Ok(StepResult::new(
+                output,
+                self.next_work(generation),
+                self.pending_rows.take().unwrap_or(0),
+            ));
+        }
+        if self.state == TableWriterState::Draining && self.partial_child_finished() {
+            if !self.writer_finish_requested {
+                self.writer.request_finish()?;
+                self.writer_finish_requested = true;
+            }
+            if let Some(completion) = self.writer.take_output() {
+                if completion.accepted_rows != self.logical_rows {
+                    return Err(WriterFailure::RowCountDrift {
+                        expected: self.logical_rows,
+                        actual: completion.accepted_rows,
+                    }
+                    .into());
+                }
+                self.writer_completion = Some(completion);
+                self.state = TableWriterState::Producing;
+            } else if self.writer.is_done() {
+                return Err(
+                    crate::exec::pipeline::writer_failure::WriterFailure::MissingTerminalOutcome
+                        .into(),
+                );
+            }
+        }
+        let output = if self.state == TableWriterState::Producing {
+            let output = if !self.emitted_row_count {
+                self.emitted_row_count = true;
+                let output = self.build_prefix_output(Some(self.logical_rows), &[])?;
+                let bytes = self.output_size(&output)?;
+                if bytes > MAX_WRITER_MULTIPLEX_ROW_BYTES {
+                    return Err(WriterFailure::OutputBytes {
+                        bytes,
+                        limit: MAX_WRITER_MULTIPLEX_ROW_BYTES,
+                    }
+                    .into());
+                }
+                Some(output)
+            } else if self
+                .writer_completion
+                .as_ref()
+                .is_some_and(|completion| !completion.fragments.is_empty())
+            {
+                Some(self.take_fragment_output()?)
+            } else {
+                None
+            };
+            if !self.has_remaining_output() {
+                self.writer_completion = None;
+                self.state = TableWriterState::Finished;
+            }
+            output
+        } else {
+            None
+        };
+        self.sync_metrics();
+        Ok(StepResult::new(
+            output,
+            self.next_work(generation),
+            self.pending_rows.take().unwrap_or(0),
+        ))
+    }
+}
+
+impl TableWriterOperator {
+    fn stop_writer(&mut self, failed: bool) {
+        if matches!(
+            self.state,
+            TableWriterState::Finished | TableWriterState::Aborting
+        ) {
+            return;
+        }
+        self.state = TableWriterState::Aborting;
+        self.input = None;
+        self.pending_append = None;
+        let child = self.partial_aggregate.as_mut().map(|partial| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if failed {
+                    partial.on_driver_failure();
+                } else {
+                    partial.cancel();
+                }
+            }))
+        });
+        self.writer.request_abort();
+        self.aggregate_output = None;
+        self.writer_completion = None;
+        self.finish_blocked_intervals();
+        self.sync_metrics();
+        if let Some(Err(payload)) = child {
+            std::panic::resume_unwind(payload);
+        }
     }
 
-    fn partial_child_has_output(&self) -> bool {
-        self.partial_aggregate
-            .as_ref()
-            .and_then(|partial| partial.as_processor_ref())
-            .is_some_and(ProcessorOperator::has_output)
+    #[cfg(test)]
+    fn replace_partial_aggregate_for_test(&mut self, partial: Box<dyn Operator>) {
+        let mut child = ChildStep::new(partial, self.readiness_observable.clone());
+        if let Some(control) = &self.runtime_error {
+            child
+                .bind_failure_port(control.clone())
+                .expect("same writer failure port");
+        }
+        self.partial_aggregate = Some(child);
     }
-
     fn partial_child_finished(&self) -> bool {
         self.partial_aggregate
             .as_ref()
-            .is_none_or(|partial| partial.is_finished())
+            .is_none_or(ChildStep::is_complete)
     }
-
     fn partial_output_available(&self) -> bool {
-        self.aggregate_output.is_some() || self.partial_child_has_output()
+        self.aggregate_output.is_some()
+            || self
+                .partial_aggregate
+                .as_ref()
+                .is_some_and(ChildStep::runnable)
     }
 
     fn has_remaining_output(&self) -> bool {
@@ -1246,9 +1450,8 @@ impl TableWriterOperator {
         &self,
         row_count: Option<u64>,
         fragments: &[&[u8]],
-    ) -> Result<Chunk, String> {
-        let target = target_ordinal_to_wire(self.target)
-            .map_err(|error| format!("table writer target ordinal: {error}"))?;
+    ) -> ExecutionResult<Chunk> {
+        let target = target_ordinal_to_wire(self.target);
         let rows = usize::from(row_count.is_some()) + fragments.len();
         let mut kinds = Vec::with_capacity(rows);
         let mut ordinals = Vec::with_capacity(rows);
@@ -1257,10 +1460,9 @@ impl TableWriterOperator {
         if let Some(row_count) = row_count {
             kinds.push(WriterRowKind::RowCount.to_wire());
             ordinals.push(target);
-            row_counts
-                .push(Some(row_count_to_wire(row_count).map_err(|error| {
-                    format!("table writer row count: {error}")
-                })?));
+            row_counts.push(Some(
+                row_count_to_wire(row_count).map_err(writer_connector)?,
+            ));
             payloads.append_null();
         }
         for fragment in fragments {
@@ -1288,11 +1490,11 @@ impl TableWriterOperator {
                 self.relation.schema()?.chunk_schema().arrow_schema_ref(),
                 columns,
             )
-            .map_err(|error| format!("build table writer prefix output: {error}"))?,
+            .map_err(writer_arrow)?,
         )
     }
 
-    fn take_fragment_output(&mut self) -> Result<Chunk, String> {
+    fn take_fragment_output(&mut self) -> ExecutionResult<Chunk> {
         let available = self
             .writer_completion
             .as_ref()
@@ -1323,10 +1525,11 @@ impl TableWriterOperator {
                 }
                 low = middle + 1;
             } else if middle == 1 {
-                return Err(format!(
-                    "ResourceExhausted: one table writer fragment row requires {bytes} bytes, limit is {}",
-                    MAX_WRITER_MULTIPLEX_ROW_BYTES
-                ));
+                return Err(WriterFailure::OutputBytes {
+                    bytes,
+                    limit: MAX_WRITER_MULTIPLEX_ROW_BYTES,
+                }
+                .into());
             } else {
                 high = middle - 1;
             }
@@ -1339,33 +1542,11 @@ impl TableWriterOperator {
         Ok(output)
     }
 
-    fn take_partial_output(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+    fn take_partial_output(&mut self) -> ExecutionResult<Option<Chunk>> {
         loop {
             if self.aggregate_output.is_none() {
-                let Some(partial) = self.partial_aggregate.as_mut() else {
-                    return Ok(None);
-                };
-                let processor = partial
-                    .as_processor_mut()
-                    .ok_or_else(|| "writer partial aggregate is not a processor".to_string())?;
-                if !processor.has_output() {
-                    return Ok(None);
-                }
-                let Some(mut output) = processor.pull_chunk(state)? else {
-                    return Err(
-                        "writer partial aggregate advertised output but returned none"
-                            .to_string()
-                            .into(),
-                    );
-                };
-                if let Some(tracker) = self.aggregate_tracker.as_ref() {
-                    output.try_transfer_to(tracker)?;
-                }
-                self.aggregate_output = Some(output);
-                self.aggregate_output_row = 0;
-                self.next_auxiliary = 0;
+                return Ok(None);
             }
-
             let Some(first) = self.next_non_null_auxiliary() else {
                 self.advance_partial_row();
                 continue;
@@ -1407,10 +1588,11 @@ impl TableWriterOperator {
                     }
                     low = middle + 1;
                 } else if middle == 1 {
-                    return Err(format!(
-                        "ResourceExhausted: one writer aggregate intermediate value requires {bytes} bytes, limit is {}",
-                        MAX_WRITER_MULTIPLEX_ROW_BYTES
-                    ).into());
+                    return Err(WriterFailure::OutputBytes {
+                        bytes,
+                        limit: MAX_WRITER_MULTIPLEX_ROW_BYTES,
+                    }
+                    .into());
                 } else {
                     high = middle - 1;
                 }
@@ -1457,13 +1639,12 @@ impl TableWriterOperator {
         }
     }
 
-    fn build_partial_output(&self, selected: &[usize]) -> Result<Chunk, String> {
+    fn build_partial_output(&self, selected: &[usize]) -> ExecutionResult<Chunk> {
         let aggregate = self
             .aggregate_output
             .as_ref()
-            .ok_or_else(|| "writer partial aggregate output is missing".to_string())?;
-        let target = target_ordinal_to_wire(self.target)
-            .map_err(|error| format!("table writer target ordinal: {error}"))?;
+            .ok_or_else(|| writer_contract("writer partial aggregate output is missing"))?;
+        let target = target_ordinal_to_wire(self.target);
         let mut columns: Vec<ArrayRef> = vec![
             Arc::new(Int8Array::from(vec![
                 WriterRowKind::AggregatePartial.to_wire(),
@@ -1495,32 +1676,30 @@ impl TableWriterOperator {
                 self.relation.schema()?.chunk_schema().arrow_schema_ref(),
                 columns,
             )
-            .map_err(|error| format!("build writer aggregate partial output: {error}"))?,
+            .map_err(writer_arrow)?,
         )
     }
 
-    fn track_output(&self, batch: RecordBatch) -> Result<Chunk, String> {
+    fn track_output(&self, batch: RecordBatch) -> ExecutionResult<Chunk> {
         let mut chunk = Chunk::try_new_with_chunk_schema(
             batch,
             Arc::clone(self.relation.schema()?.chunk_schema()),
         )?;
         if let Some(tracker) = self.pending_output_tracker.as_ref() {
-            chunk.try_transfer_to(tracker)?;
+            chunk
+                .try_transfer_to(tracker)
+                .map_err(ExecutionFailure::from_domain)?;
         }
         Ok(chunk)
     }
 
-    fn output_size(&self, chunk: &Chunk) -> Result<usize, String> {
+    fn output_size(&self, chunk: &Chunk) -> ExecutionResult<usize> {
         let mut encoded = Vec::new();
         {
-            let mut writer = StreamWriter::try_new(&mut encoded, &chunk.schema())
-                .map_err(|error| format!("table writer output size encoding: {error}"))?;
-            writer
-                .write(&chunk.record_batch())
-                .map_err(|error| format!("table writer output size encoding: {error}"))?;
-            writer
-                .finish()
-                .map_err(|error| format!("table writer output size encoding: {error}"))?;
+            let mut writer =
+                StreamWriter::try_new(&mut encoded, &chunk.schema()).map_err(writer_arrow)?;
+            writer.write(&chunk.record_batch()).map_err(writer_arrow)?;
+            writer.finish().map_err(writer_arrow)?;
         }
         let _accounting = self
             .pending_output_tracker
@@ -1534,16 +1713,7 @@ impl TableWriterOperator {
     }
 
     fn fail_attempt(&mut self) {
-        self.state = TableWriterState::Failed;
-        if let Some(partial) = self.partial_aggregate.as_mut() {
-            partial.on_driver_failure();
-        }
-        self.writer.request_abort();
-        self.aggregate_output = None;
-        self.writer_completion = None;
-        self.state = TableWriterState::Aborting;
-        self.finish_blocked_intervals();
-        self.sync_metrics();
+        self.stop_writer(true);
     }
 
     fn finish_blocked_intervals(&self) {
@@ -1639,7 +1809,7 @@ impl<'chunk> TableWriteRelationColumns<'chunk> {
     /// Read the fixed prefix at its SPI relation positions. The caller has
     /// already proved the chunk is exactly its frozen relation, whose columns
     /// may be carried by any slots (a compiled program allocates its own).
-    pub fn try_from_relation(chunk: &'chunk Chunk) -> Result<Self, String> {
+    pub fn try_from_relation(chunk: &'chunk Chunk) -> ExecutionResult<Self> {
         use novarocks_spi::connector::write_stack::{
             WRITE_RELATION_FRAGMENT_INDEX, WRITE_RELATION_KIND_INDEX,
             WRITE_RELATION_ROW_COUNT_INDEX, WRITE_RELATION_TARGET_INDEX,
@@ -1659,31 +1829,51 @@ impl<'chunk> TableWriteRelationColumns<'chunk> {
         ordinal_index: usize,
         row_count_index: usize,
         fragment_index: usize,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
+        use crate::exec::node::table_write_relation::{WriteRelationViolation, relation_failure};
         let column = |position: usize, name: &str| {
             chunk.columns().get(position).ok_or_else(|| {
-                format!("table write relation column {name} is outside its record batch")
+                relation_failure(
+                    WriteRelationViolation::Column,
+                    format_args!("table write relation column {name} is outside its record batch"),
+                )
             })
         };
         let kinds = column(kind_index, "kind")?
             .as_any()
             .downcast_ref::<Int8Array>()
-            .ok_or_else(|| "table write relation kind column is not Int8".to_string())?;
+            .ok_or_else(|| {
+                relation_failure(
+                    WriteRelationViolation::Column,
+                    "table write relation kind column is not Int8",
+                )
+            })?;
         let ordinals = column(ordinal_index, "write_target_ordinal")?
             .as_any()
             .downcast_ref::<Int32Array>()
             .ok_or_else(|| {
-                "table write relation write_target_ordinal column is not Int32".to_string()
+                relation_failure(
+                    WriteRelationViolation::Column,
+                    "table write relation write_target_ordinal column is not Int32",
+                )
             })?;
         let row_counts = column(row_count_index, "row_count")?
             .as_any()
             .downcast_ref::<Int64Array>()
-            .ok_or_else(|| "table write relation row_count column is not Int64".to_string())?;
+            .ok_or_else(|| {
+                relation_failure(
+                    WriteRelationViolation::Column,
+                    "table write relation row_count column is not Int64",
+                )
+            })?;
         let fragments = column(fragment_index, "commit_fragment")?
             .as_any()
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| {
-                "table write relation commit_fragment column is not Binary".to_string()
+                relation_failure(
+                    WriteRelationViolation::Column,
+                    "table write relation commit_fragment column is not Binary",
+                )
             })?;
         Ok(Self {
             kinds,
@@ -1696,6 +1886,7 @@ impl<'chunk> TableWriteRelationColumns<'chunk> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::exec::pipeline::shape::StepOperator;
     use crate::runtime::fragment::ExecutionFailure;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -1727,7 +1918,7 @@ pub(crate) mod tests {
     use crate::exec::pipeline::global_driver_executor::{DriverTask, FragmentCompletion};
     use crate::runtime::mem_tracker::MemTracker;
 
-    fn poll_until<F: Fn() -> bool>(pred: F, timeout: Duration) -> bool {
+    fn poll_until<F: FnMut() -> bool>(mut pred: F, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if pred() {
@@ -1787,7 +1978,7 @@ pub(crate) mod tests {
             )
             .expect("test execution runtime"),
         );
-        RuntimeState::new(None, None, None, None, None, mem_tracker, Some(runtime))
+        RuntimeState::for_local_execution(None, None, None, None, None, mem_tracker, Some(runtime))
     }
 
     fn install_construction(operator: &mut dyn Operator, state: &RuntimeState) {
@@ -1807,77 +1998,164 @@ pub(crate) mod tests {
         operator.activate(state).expect("activate writer actor");
     }
 
+    fn with_step<T>(state: &RuntimeState, action: impl FnOnce(&mut StepContext<'_>) -> T) -> T {
+        let error = state.error_state();
+        let mut turn =
+            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        action(&mut StepContext::new(&error, &mut turn))
+    }
+    fn complete_native_input(
+        operator: &mut dyn Operator,
+        state: &RuntimeState,
+        chunk: Chunk,
+    ) -> ExecutionResult<()> {
+        use crate::exec::pipeline::step::InputResult;
+        with_step(state, |ctx| {
+            let step = operator;
+            match step.try_push(ctx, RawInput::for_test(chunk)) {
+                InputResult::Accepted(result) => {
+                    assert!(result?.output.is_none());
+                }
+                InputResult::Rejected { failure, .. } => return Err(failure),
+                InputResult::Deferred { .. } => panic!("fixture input must be admissible"),
+            }
+            for _ in 0..64 {
+                let result = step.drive(ctx)?;
+                assert!(
+                    result.output.is_none(),
+                    "fixture has no running partial output"
+                );
+                if matches!(result.next, NextStep::NeedInput) {
+                    return Ok(());
+                }
+                assert!(
+                    matches!(result.next, NextStep::Runnable | NextStep::Yield),
+                    "fixture must not need an external input-completion event"
+                );
+            }
+            panic!("fixture input failed to complete within its finite continuation");
+        })
+    }
+    fn native_failure(
+        operator: &mut dyn Operator,
+        state: &RuntimeState,
+        operation: crate::runtime::fragment::PipelineOperation,
+    ) -> ExecutionFailure {
+        use crate::runtime::fragment::PipelineOperation;
+        if operation == PipelineOperation::Push {
+            return complete_native_input(operator, state, input_chunk(vec![1])).unwrap_err();
+        }
+        with_step(state, |ctx| {
+            let step = operator;
+            if operation == PipelineOperation::Finishing {
+                step.finish(ctx).unwrap();
+            }
+            for _ in 0..64 {
+                match step.drive(ctx) {
+                    Err(error) => return error,
+                    Ok(result) => {
+                        assert!(result.output.is_none());
+                    }
+                }
+            }
+            panic!("injected child error must become observable");
+        })
+    }
     fn wait_for_output(
         operator: &mut Box<dyn Operator>,
         state: &RuntimeState,
     ) -> ExecutionResult<Vec<Chunk>> {
-        let ready = poll_until(
-            || {
-                state.error().is_some()
-                    || operator.as_processor_ref().expect("processor").has_output()
-            },
-            Duration::from_secs(5),
-        );
-        if !ready {
-            return Err("timed out waiting for table writer output".into());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut outputs = Vec::new();
+        let mut next = NextStep::Runnable;
+        loop {
+            if let Some(error) = state.error() {
+                return Err(error);
+            }
+            assert!(Instant::now() < deadline, "writer completion deadline");
+            if let NextStep::Wait(wait) = &next
+                && !wait.is_ready()
+            {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            let result = operator.drive_for_test(state)?;
+            if let Some(output) = result.output {
+                outputs.push(output);
+            }
+            next = result.next;
+            if matches!(next, NextStep::Finished) {
+                return Ok(outputs);
+            }
+            assert!(
+                !matches!(next, NextStep::NeedInput),
+                "EOS continuation must not request another page"
+            );
         }
-        if let Some(error) = state.error() {
-            return Err(error);
+    }
+    fn accept_native_input(
+        operator: &mut dyn Operator,
+        state: &RuntimeState,
+        input: RawInput,
+    ) -> ExecutionResult<()> {
+        use crate::exec::pipeline::step::InputResult;
+        match operator.try_push_for_test(state, input) {
+            InputResult::Accepted(result) => {
+                assert!(result?.output.is_none());
+                Ok(())
+            }
+            InputResult::Rejected { failure, .. } => Err(failure),
+            InputResult::Deferred { .. } => panic!("fixture input must be admissible"),
         }
-        Ok(drain(operator, state))
+    }
+    fn next_running_output(operator: &mut dyn Operator, state: &RuntimeState) -> StepResult {
+        for _ in 0..64 {
+            let result = operator.drive_for_test(state).expect("running output step");
+            if result.output.is_some() {
+                return result;
+            }
+            assert!(
+                matches!(result.next, NextStep::Runnable | NextStep::Yield),
+                "an expected prefix must still be runnable"
+            );
+        }
+        panic!("finite partial fixture must emit its next prefix");
+    }
+    fn exits_ready(operator: &mut dyn Operator) -> bool {
+        let mut ready = true;
+        operator.visit_exits(&mut |exit| {
+            assert!(
+                exit.failure.is_none(),
+                "writer owner has no unconsumed required failure"
+            );
+            assert!(
+                exit.unresolved_exit.is_none(),
+                "writer owner has no unknown exit incident"
+            );
+            match exit.progress {
+                crate::exec::pipeline::operator::ExitProgress::Pending(_)
+                | crate::exec::pipeline::operator::ExitProgress::Unresolved(_) => ready = false,
+                crate::exec::pipeline::operator::ExitProgress::Exited => {}
+            }
+        });
+        ready
     }
 
     struct OneChunkSource {
         chunk: Option<Chunk>,
-        finished: bool,
     }
-
-    impl Operator for OneChunkSource {
+    impl OperatorLifecycle for OneChunkSource {
         fn name(&self) -> &str {
             "one_chunk_source"
         }
-
-        fn is_finished(&self) -> bool {
-            self.finished
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
+    }
+    impl crate::exec::pipeline::shape::SourceKernel for OneChunkSource {
+        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            Ok(StepResult::new(self.chunk.take(), NextStep::Finished, 0))
         }
     }
-
-    impl ProcessorOperator for OneChunkSource {
-        fn need_input(&self) -> bool {
-            false
-        }
-
-        fn has_output(&self) -> bool {
-            self.chunk.is_some()
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-            Err("source does not accept input".to_string().into())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            let chunk = self.chunk.take();
-            self.finished = chunk.is_some();
-            Ok(chunk)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            self.finished = true;
-            Ok(())
-        }
-    }
-
     struct CollectSink {
         chunks: Arc<std::sync::Mutex<Vec<Chunk>>>,
-        finished: bool,
     }
 
     struct ProjectedInputObserver {
@@ -1886,7 +2164,7 @@ pub(crate) mod tests {
         cancelled: bool,
     }
 
-    impl Operator for ProjectedInputObserver {
+    impl OperatorLifecycle for ProjectedInputObserver {
         fn name(&self) -> &str {
             "projected_input_observer"
         }
@@ -1894,90 +2172,49 @@ pub(crate) mod tests {
         fn cancel(&mut self) {
             self.cancelled = true;
         }
-
-        fn is_finished(&self) -> bool {
-            self.cancelled || self.finishing
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
 
-    impl ProcessorOperator for ProjectedInputObserver {
-        fn need_input(&self) -> bool {
-            !self.finishing && !self.cancelled
-        }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+    impl InputEncodingPolicy for ProjectedInputObserver {}
+    impl TransformKernel for ProjectedInputObserver {
+        fn apply(
+            &mut self,
+            _: &mut StepContext<'_>,
+            chunk: PreparedInput,
+        ) -> ExecutionResult<StepResult> {
+            let chunk = chunk.into_uncovered_chunk()?;
             let values = chunk
                 .column_by_slot_id(SlotId::new(1))?
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "embedded aggregate did not receive projected Int64".to_string())?
+                .ok_or_else(|| {
+                    writer_contract("embedded aggregate did not receive projected Int64")
+                })?
                 .values()
                 .to_vec();
             self.values.lock().expect("observed values").extend(values);
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            self.finishing = true;
-            Ok(())
+            Ok(StepResult::new(None, NextStep::NeedInput, 0))
         }
     }
 
-    impl Operator for CollectSink {
+    impl OperatorLifecycle for CollectSink {
         fn name(&self) -> &str {
             "collect_sink"
         }
-
-        fn is_finished(&self) -> bool {
-            self.finished
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
-
-    impl ProcessorOperator for CollectSink {
-        fn need_input(&self) -> bool {
-            !self.finished
-        }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+    impl InputEncodingPolicy for CollectSink {}
+    impl crate::exec::pipeline::shape::SinkKernel for CollectSink {
+        fn consume(
+            &mut self,
+            _: &mut StepContext<'_>,
+            input: PreparedInput,
+        ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
+            let chunk = input.into_uncovered_chunk()?;
+            let rows = chunk.len() as u64;
             self.chunks.lock().expect("collected chunks").push(chunk);
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            self.finished = true;
-            Ok(())
+            Ok(crate::exec::pipeline::shape::SinkStep::new(
+                NextStep::NeedInput,
+                rows,
+            ))
         }
     }
 
@@ -2020,7 +2257,7 @@ pub(crate) mod tests {
         }
     }
 
-    impl Operator for StreamingPartial {
+    impl OperatorLifecycle for StreamingPartial {
         fn name(&self) -> &str {
             "streaming_partial"
         }
@@ -2030,62 +2267,38 @@ pub(crate) mod tests {
             self.outputs.clear();
             self.observable.defer_notify().arm();
         }
-
-        fn is_finished(&self) -> bool {
-            self.cancelled || (self.finishing && self.outputs.is_empty())
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
 
-    impl ProcessorOperator for StreamingPartial {
-        fn need_input(&self) -> bool {
-            !self.finishing && !self.cancelled && self.outputs.is_empty()
-        }
-
-        fn has_output(&self) -> bool {
-            !self.outputs.is_empty()
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-            if !self.need_input() {
-                return Err("streaming partial received input while blocked"
-                    .to_string()
-                    .into());
-            }
+    impl InputEncodingPolicy for StreamingPartial {}
+    impl TransformKernel for StreamingPartial {
+        fn apply(
+            &mut self,
+            ctx: &mut StepContext<'_>,
+            input: PreparedInput,
+        ) -> ExecutionResult<StepResult> {
+            let chunk = input.into_uncovered_chunk()?;
             self.accepted_rows.fetch_add(chunk.len(), Ordering::Relaxed);
             self.outputs.push_back(self.output(10));
             self.outputs.push_back(self.output(20));
-            self.observable.defer_notify().arm();
-            Ok(())
+            self.drive(ctx)
         }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
             let output = self.outputs.pop_front();
-            if self.outputs.is_empty() {
-                self.observable.defer_notify().arm();
-            }
-            Ok(output)
+            let next = if !self.outputs.is_empty() {
+                NextStep::Runnable
+            } else if self.finishing {
+                NextStep::Finished
+            } else {
+                NextStep::NeedInput
+            };
+            Ok(StepResult::new(output, next, 0))
         }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+        fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
             self.finishing = true;
-            self.observable.defer_notify().arm();
-            Ok(())
+            self.drive(ctx)
         }
-
-        fn sink_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.observable))
-        }
-
-        fn source_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.observable))
+        fn control_observable(&self) -> Option<Arc<Observable>> {
+            Some(self.observable.clone())
         }
     }
 
@@ -2094,37 +2307,34 @@ pub(crate) mod tests {
         operation: crate::runtime::fragment::PipelineOperation,
         cancelled: bool,
     }
-    impl Operator for TypedFailurePartial {
+    impl OperatorLifecycle for TypedFailurePartial {
         fn name(&self) -> &str {
             "TypedFailurePartial"
         }
         fn cancel(&mut self) {
             self.cancelled = true;
         }
-        fn is_finished(&self) -> bool {
-            self.cancelled
-        }
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
     }
-    impl ProcessorOperator for TypedFailurePartial {
-        fn need_input(&self) -> bool {
-            !self.cancelled
+    impl InputEncodingPolicy for TypedFailurePartial {}
+    impl TransformKernel for TypedFailurePartial {
+        fn start(&self) -> TransformStart {
+            if self.operation == crate::runtime::fragment::PipelineOperation::Pull {
+                TransformStart::Ready
+            } else {
+                TransformStart::NeedInput
+            }
         }
-        fn has_output(&self) -> bool {
-            !self.cancelled && self.operation == crate::runtime::fragment::PipelineOperation::Pull
-        }
-        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> ExecutionResult<()> {
+        fn apply(
+            &mut self,
+            _: &mut StepContext<'_>,
+            _: PreparedInput,
+        ) -> ExecutionResult<StepResult> {
             Err(self.error.clone())
         }
-        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+        fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
             Err(self.error.clone())
         }
-        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
+        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
             Err(self.error.clone())
         }
     }
@@ -2153,11 +2363,15 @@ pub(crate) mod tests {
                     TableWriterOperatorFactory::for_test_fixture(&node, functions).unwrap();
                 let mut operator = factory.create_operator(1, 0);
                 let original: ExecutionFailure = cause.clone().into();
-                operator.replace_partial_aggregate_for_test(Box::new(TypedFailurePartial {
-                    error: original.clone(),
-                    operation,
-                    cancelled: false,
-                }));
+                operator
+                    .kernel_for_test_mut()
+                    .replace_partial_aggregate_for_test(Box::new(Transform::hydrating(
+                        TypedFailurePartial {
+                            error: original.clone(),
+                            operation,
+                            cancelled: false,
+                        },
+                    )));
                 let state = test_runtime_state();
                 install_construction(&mut operator, &state);
                 operator.prepare().unwrap();
@@ -2167,19 +2381,7 @@ pub(crate) mod tests {
                     || stats.opened.load(Ordering::Relaxed) == 1,
                     Duration::from_secs(5)
                 ));
-                let error = match operation {
-                    PipelineOperation::Push => {
-                        ProcessorOperator::push_chunk(&mut operator, &state, input_chunk(vec![1]))
-                            .unwrap_err()
-                    }
-                    PipelineOperation::Pull => {
-                        ProcessorOperator::pull_chunk(&mut operator, &state).unwrap_err()
-                    }
-                    PipelineOperation::Finishing => {
-                        ProcessorOperator::set_finishing(&mut operator, &state).unwrap_err()
-                    }
-                    PipelineOperation::Admission => unreachable!(),
-                };
+                let error = native_failure(&mut operator, &state, operation);
                 assert_eq!(error, original);
                 assert!(poll_until(
                     || operator.pending_finish().is_none(),
@@ -2212,7 +2414,7 @@ pub(crate) mod tests {
         }
     }
 
-    impl Operator for OneShotPartial {
+    impl OperatorLifecycle for OneShotPartial {
         fn name(&self) -> &str {
             "one_shot_partial"
         }
@@ -2222,50 +2424,27 @@ pub(crate) mod tests {
             self.output = None;
             self.observable.defer_notify().arm();
         }
-
-        fn is_finished(&self) -> bool {
-            self.cancelled || (self.finishing && self.output.is_none())
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
 
-    impl ProcessorOperator for OneShotPartial {
-        fn need_input(&self) -> bool {
-            !self.finishing && !self.cancelled && self.output.is_none()
+    impl InputEncodingPolicy for OneShotPartial {}
+    impl TransformKernel for OneShotPartial {
+        fn apply(
+            &mut self,
+            _: &mut StepContext<'_>,
+            _: PreparedInput,
+        ) -> ExecutionResult<StepResult> {
+            Ok(StepResult::new(
+                self.output_on_push.take(),
+                NextStep::NeedInput,
+                0,
+            ))
         }
-
-        fn has_output(&self) -> bool {
-            self.output.is_some()
-        }
-
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-            self.output = self.output_on_push.take();
-            self.observable.defer_notify().arm();
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(self.output.take())
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+        fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
             self.finishing = true;
-            Ok(())
+            Ok(StepResult::new(None, NextStep::Finished, 0))
         }
-
-        fn sink_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.observable))
-        }
-
-        fn source_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.observable))
+        fn control_observable(&self) -> Option<Arc<Observable>> {
+            Some(self.observable.clone())
         }
     }
 
@@ -2363,7 +2542,9 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct WriteExecutionStats {
         pub opened: AtomicUsize,
+        pub appended_rows: AtomicUsize,
         pub finished: AtomicUsize,
+        pub finish_started: AtomicUsize,
         pub aborted: AtomicUsize,
     }
 
@@ -2372,6 +2553,7 @@ pub(crate) mod tests {
         stats: Arc<WriteExecutionStats>,
         fragments_per_writer: usize,
         fragment_bytes: usize,
+        finish_gate: Option<Arc<tokio::sync::Semaphore>>,
         /// Every driver id this execution has been asked to open a writer for.
         pub driver_ids: std::sync::Mutex<Vec<u32>>,
         pub writer_rows: Arc<std::sync::Mutex<Vec<(u32, usize)>>>,
@@ -2384,6 +2566,7 @@ pub(crate) mod tests {
                 stats,
                 fragments_per_writer: 1,
                 fragment_bytes: 8,
+                finish_gate: None,
                 driver_ids: std::sync::Mutex::new(Vec::new()),
                 writer_rows: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
@@ -2419,6 +2602,7 @@ pub(crate) mod tests {
                 writer_rows: Arc::clone(&self.writer_rows),
                 fragments_per_writer: self.fragments_per_writer,
                 fragment_bytes: self.fragment_bytes,
+                finish_gate: self.finish_gate.clone(),
             }))
         }
     }
@@ -2430,16 +2614,24 @@ pub(crate) mod tests {
         writer_rows: Arc<std::sync::Mutex<Vec<(u32, usize)>>>,
         fragments_per_writer: usize,
         fragment_bytes: usize,
+        finish_gate: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     #[async_trait::async_trait]
     impl ConnectorBatchWriter for TestBatchWriter {
         async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
             self.rows += batch.num_rows();
+            self.stats
+                .appended_rows
+                .fetch_add(batch.num_rows(), Ordering::Release);
             Ok(())
         }
 
         async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+            self.stats.finish_started.fetch_add(1, Ordering::Release);
+            if let Some(gate) = &self.finish_gate {
+                gate.acquire().await.expect("finish gate").forget();
+            }
             self.stats.finished.fetch_add(1, Ordering::Relaxed);
             self.writer_rows
                 .lock()
@@ -2582,18 +2774,6 @@ pub(crate) mod tests {
         (node, function_set)
     }
 
-    fn drain(operator: &mut Box<dyn Operator>, state: &RuntimeState) -> Vec<Chunk> {
-        let processor = operator.as_processor_mut().expect("processor");
-        let mut out = Vec::new();
-        while processor.has_output() {
-            match processor.pull_chunk(state).expect("pull") {
-                Some(chunk) => out.push(chunk),
-                None => break,
-            }
-        }
-        out
-    }
-
     #[test]
     fn table_writer_binding_rejects_a_foreign_catalog_generation() {
         struct ForeignExecution(CatalogHandle);
@@ -2672,7 +2852,10 @@ pub(crate) mod tests {
         operator.cancel();
 
         assert_eq!(stats.opened.load(Ordering::Acquire), 0);
-        assert!(operator.is_finished());
+        assert!(matches!(
+            operator.drive_for_test(&state).unwrap().next,
+            NextStep::Finished
+        ));
         assert!(operator.pending_finish().is_none());
     }
 
@@ -2689,11 +2872,15 @@ pub(crate) mod tests {
         let state = test_runtime_state();
         for (driver, operator) in operators.iter_mut().enumerate() {
             bind(operator, &state);
-            let processor = operator.as_processor_mut().expect("processor");
-            processor
-                .push_chunk(&state, input_chunk(vec![driver as i32; driver + 1]))
-                .expect("append");
-            processor.set_finishing(&state).expect("finish");
+            complete_native_input(
+                operator.as_mut(),
+                &state,
+                input_chunk(vec![driver as i32; driver + 1]),
+            )
+            .expect("append");
+            operator.finish_for_test(&state).expect("signal EOS");
+            wait_for_output(operator, &state)
+                .expect("drive this independent writer's finalization");
         }
         assert!(poll_until(
             || stats.finished.load(Ordering::Relaxed) == dop as usize,
@@ -2737,22 +2924,26 @@ pub(crate) mod tests {
         .expect("projecting writer node");
         let mut operator = writer_factory(&node).create_operator(1, 0);
         let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        operator.replace_partial_aggregate_for_test(Box::new(ProjectedInputObserver {
-            values: Arc::clone(&observed),
-            finishing: false,
-            cancelled: false,
-        }));
+        operator
+            .kernel_for_test_mut()
+            .replace_partial_aggregate_for_test(Box::new(Transform::hydrating(
+                ProjectedInputObserver {
+                    values: Arc::clone(&observed),
+                    finishing: false,
+                    cancelled: false,
+                },
+            )));
         let state = test_runtime_state();
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");
-        ProcessorOperator::push_chunk(&mut operator, &state, input_chunk(vec![7, 11]))
+        complete_native_input(&mut operator, &state, input_chunk(vec![7, 11]))
             .expect("push projected page");
         assert_eq!(
             observed.lock().expect("observed values").as_slice(),
             &[7_i64, 11_i64]
         );
-        ProcessorOperator::set_finishing(&mut operator, &state).expect("finish");
+        operator.finish_for_test(&state).expect("finish");
         let mut boxed: Box<dyn Operator> = Box::new(operator);
         wait_for_output(&mut boxed, &state).expect("writer output");
         assert_eq!(
@@ -2776,17 +2967,22 @@ pub(crate) mod tests {
             .create(1, 0);
         let state = test_runtime_state();
         bind(&mut operator, &state);
-        let error = operator
-            .as_processor_mut()
-            .expect("processor")
-            .push_chunk(&state, input_chunk(vec![1, 2, 3]))
-            .expect_err("partial update fault");
+        let error = native_failure(
+            operator.as_mut(),
+            &state,
+            crate::runtime::fragment::PipelineOperation::Push,
+        );
         assert!(error.detail().contains("PartialUpdate"), "{error}");
         assert!(
             writer_rows.lock().expect("writer rows").is_empty(),
             "the reserved page must not reach the provider writer"
         );
-        assert!(!operator.as_processor_ref().expect("processor").has_output());
+        assert!(
+            operator
+                .drive_for_test(&state)
+                .unwrap_err()
+                .same_occurrence(&error)
+        );
     }
 
     #[cfg(novarocks_dev_controls)]
@@ -2803,18 +2999,20 @@ pub(crate) mod tests {
             .create(1, 0);
         let state = test_runtime_state();
         bind(&mut operator, &state);
-        operator
-            .as_processor_mut()
-            .expect("processor")
-            .push_chunk(&state, input_chunk(vec![1, 2, 3]))
+        complete_native_input(operator.as_mut(), &state, input_chunk(vec![1, 2, 3]))
             .expect("input before finalize fault");
-        let error = operator
-            .as_processor_mut()
-            .expect("processor")
-            .set_finishing(&state)
-            .expect_err("partial finalize fault");
+        let error = native_failure(
+            operator.as_mut(),
+            &state,
+            crate::runtime::fragment::PipelineOperation::Finishing,
+        );
         assert!(error.detail().contains("PartialFinalize"), "{error}");
-        assert!(!operator.as_processor_ref().expect("processor").has_output());
+        assert!(
+            operator
+                .drive_for_test(&state)
+                .unwrap_err()
+                .same_occurrence(&error)
+        );
     }
 
     #[test]
@@ -2828,12 +3026,9 @@ pub(crate) mod tests {
             let mut operator = factory.create(1, 0);
             let state = test_runtime_state();
             bind(&mut operator, &state);
-            let processor = operator.as_processor_mut().expect("processor");
-            processor
-                .push_chunk(&state, input_chunk(vec![1, 2, 3, 4, 5]))
-                .expect("append");
-            assert!(!processor.has_output(), "nothing is emitted before finish");
-            processor.set_finishing(&state).expect("finish");
+            complete_native_input(operator.as_mut(), &state, input_chunk(vec![1, 2, 3, 4, 5]))
+                .expect("append without premature output");
+            operator.finish_for_test(&state).expect("signal EOS");
 
             let chunks = wait_for_output(&mut operator, &state).expect("writer output");
             assert_eq!(
@@ -2864,7 +3059,10 @@ pub(crate) mod tests {
                     row += 1;
                 }
             }
-            assert!(operator.is_finished());
+            assert!(matches!(
+                operator.drive_for_test(&state).unwrap().next,
+                NextStep::Finished
+            ));
         }
     }
 
@@ -2879,14 +3077,11 @@ pub(crate) mod tests {
         let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
         bind(&mut operator, &state);
-        let processor = operator.as_processor_mut().expect("processor");
-        processor
-            .push_chunk(&state, input_chunk(vec![1, 2]))
+        complete_native_input(operator.as_mut(), &state, input_chunk(vec![1, 2]))
             .expect("first page");
-        processor
-            .push_chunk(&state, input_chunk(vec![3, 4, 5]))
+        complete_native_input(operator.as_mut(), &state, input_chunk(vec![3, 4, 5]))
             .expect("second page");
-        processor.set_finishing(&state).expect("finish");
+        operator.finish_for_test(&state).expect("finish");
 
         let chunks = wait_for_output(&mut operator, &state).expect("multiplex output");
         assert_eq!(
@@ -2943,7 +3138,10 @@ pub(crate) mod tests {
         }
         assert_eq!(row_count_rows, 1);
         assert!(observed_channels.into_iter().all(|seen| seen));
-        assert!(operator.is_finished());
+        assert!(matches!(
+            operator.drive_for_test(&state).unwrap().next,
+            NextStep::Finished
+        ));
     }
 
     #[test]
@@ -2962,52 +3160,73 @@ pub(crate) mod tests {
         );
         let aggregate_rows = Arc::new(AtomicUsize::new(0));
         let mut operator = factory.create_operator(1, 0);
-        operator.replace_partial_aggregate_for_test(Box::new(StreamingPartial::new(
-            slot_id,
-            Arc::clone(&aggregate_rows),
-        )));
+        operator
+            .kernel_for_test_mut()
+            .replace_partial_aggregate_for_test(Box::new(Transform::hydrating(
+                StreamingPartial::new(slot_id, Arc::clone(&aggregate_rows)),
+            )));
         let state = test_runtime_state();
         install_construction(&mut operator, &state);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");
 
-        ProcessorOperator::push_chunk(&mut operator, &state, input_chunk(vec![1, 2]))
-            .expect("first input page");
-        assert!(!ProcessorOperator::need_input(&operator));
-        assert!(ProcessorOperator::has_output(&operator));
-        let first = ProcessorOperator::pull_chunk(&mut operator, &state)
-            .expect("first running output")
-            .expect("first running partial");
-        assert!(!ProcessorOperator::need_input(&operator));
-        let second = ProcessorOperator::pull_chunk(&mut operator, &state)
-            .expect("second running output")
-            .expect("second running partial");
-        assert!(ProcessorOperator::need_input(&operator));
-
-        ProcessorOperator::push_chunk(&mut operator, &state, input_chunk(vec![3]))
-            .expect("second input page");
-        ProcessorOperator::set_finishing(&mut operator, &state).expect("finish");
+        accept_native_input(
+            &mut operator,
+            &state,
+            RawInput::for_test(input_chunk(vec![1, 2])),
+        )
+        .expect("first input");
+        let first = next_running_output(&mut operator, &state);
+        assert!(!matches!(first.next, NextStep::NeedInput));
+        let raw = RawInput::for_test(input_chunk(vec![3]));
+        let original = raw.original_for_test().columns()[0].clone();
+        let raw = match operator.try_push_for_test(&state, raw) {
+            crate::exec::pipeline::step::InputResult::Deferred {
+                input,
+                next: AdmissionNext::ResumeExisting,
+            } => input,
+            _ => panic!("running partial output must defer the next original input"),
+        };
+        assert!(Arc::ptr_eq(
+            &original,
+            &raw.original_for_test().columns()[0]
+        ));
+        let second = next_running_output(&mut operator, &state);
+        if !matches!(second.next, NextStep::NeedInput) {
+            let mut completed = false;
+            for _ in 0..64 {
+                let step = operator
+                    .drive_for_test(&state)
+                    .expect("complete first input");
+                assert!(
+                    step.output.is_none(),
+                    "first input emits exactly two partials"
+                );
+                if matches!(step.next, NextStep::NeedInput) {
+                    completed = true;
+                    break;
+                }
+                assert!(matches!(step.next, NextStep::Runnable | NextStep::Yield));
+            }
+            assert!(
+                completed,
+                "finite first input completes before accepting another"
+            );
+        }
+        accept_native_input(&mut operator, &state, raw).expect("the same second raw page resumes");
+        operator
+            .finish_for_test(&state)
+            .expect("signal EOS once with accepted work outstanding");
         assert!(
             operator.pending_finish().is_none(),
-            "pending partial output must remain dataflow-drivable while the writer finishes"
+            "partial continuation remains dataflow work"
         );
-        let mut outputs = vec![first, second];
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !operator.is_finished() {
-            if ProcessorOperator::has_output(&operator) {
-                if let Some(output) =
-                    ProcessorOperator::pull_chunk(&mut operator, &state).expect("drain output")
-                {
-                    outputs.push(output);
-                }
-            } else if Instant::now() >= deadline {
-                panic!("streaming composite writer did not finish");
-            } else {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-        }
-
+        let mut outputs = vec![first.output.unwrap(), second.output.unwrap()];
+        let mut boxed: Box<dyn Operator> = Box::new(operator);
+        outputs.extend(
+            wait_for_output(&mut boxed, &state).expect("drain accepted input and finalization"),
+        );
         assert_eq!(aggregate_rows.load(Ordering::Relaxed), 3);
         assert_eq!(
             writer_rows.lock().expect("writer rows").as_slice(),
@@ -3088,7 +3307,11 @@ pub(crate) mod tests {
 
         let factory = writer_factory(&node);
         let mut operator = factory.create_operator(1, 0);
-        operator.replace_partial_aggregate_for_test(Box::new(OneShotPartial::new(partial)));
+        operator
+            .kernel_for_test_mut()
+            .replace_partial_aggregate_for_test(Box::new(Transform::hydrating(
+                OneShotPartial::new(partial),
+            )));
         let state = test_runtime_state_with_packet_budget(PACKET_BYTES, None);
         install_construction(&mut operator, &state);
         operator.prepare().expect("prepare");
@@ -3098,23 +3321,30 @@ pub(crate) mod tests {
             || stats.opened.load(Ordering::Relaxed) == 1,
             Duration::from_secs(5)
         ));
-        ProcessorOperator::push_chunk(&mut operator, &state, input_chunk(vec![1]))
-            .expect("input reaches both children");
-        let error = ProcessorOperator::pull_chunk(&mut operator, &state)
-            .expect_err("one oversized value must fail before any sparse row is emitted");
-        assert!(error.detail().contains("ResourceExhausted"), "{error}");
-        assert!(
-            error
-                .detail()
-                .contains("one writer aggregate intermediate value")
+        let error = native_failure(
+            &mut operator,
+            &state,
+            crate::runtime::fragment::PipelineOperation::Push,
         );
-        assert!(
-            error
-                .detail()
-                .contains(&format!("limit is {MAX_WRITER_MULTIPLEX_ROW_BYTES}")),
-            "{error}"
+        use novarocks_failure_contract::{FailureClass, FailureProjection, ResourceDimension};
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        assert_eq!(
+            fact.reason(),
+            crate::runtime::fragment::ExecutionReason::WriterOutputBytes.reason()
         );
-        assert!(!ProcessorOperator::has_output(&operator));
+        let resource = fact.resource().expect("original output budget facts");
+        assert_eq!(resource.dimension, ResourceDimension::Bytes);
+        assert_eq!(resource.limit, Some(MAX_WRITER_MULTIPLEX_ROW_BYTES as u64));
+        assert!(resource.requested.unwrap() > MAX_WRITER_MULTIPLEX_ROW_BYTES as u64);
+        assert_eq!(resource.committed, None);
+        assert!(
+            operator
+                .drive_for_test(&state)
+                .unwrap_err()
+                .same_occurrence(&error),
+            "a failed continuation can never emit a success prefix"
+        );
         assert!(poll_until(
             || stats.aborted.load(Ordering::Relaxed) == 1,
             Duration::from_secs(5)
@@ -3180,7 +3410,11 @@ pub(crate) mod tests {
 
         let factory = writer_factory(&node);
         let mut operator = factory.create_operator(1, 0);
-        operator.replace_partial_aggregate_for_test(Box::new(OneShotPartial::new(partial)));
+        operator
+            .kernel_for_test_mut()
+            .replace_partial_aggregate_for_test(Box::new(Transform::hydrating(
+                OneShotPartial::new(partial),
+            )));
         let state = test_runtime_state_with_packet_budget(PACKET_BYTES, None);
         install_construction(&mut operator, &state);
         operator.prepare().expect("prepare");
@@ -3190,19 +3424,34 @@ pub(crate) mod tests {
             || stats.opened.load(Ordering::Relaxed) == 1,
             Duration::from_secs(5)
         ));
-        ProcessorOperator::push_chunk(&mut operator, &state, input_chunk(vec![1]))
-            .expect("input reaches both children");
+        accept_native_input(
+            &mut operator,
+            &state,
+            RawInput::for_test(input_chunk(vec![1])),
+        )
+        .expect("input reaches both children");
 
         let mut output_batches = 0usize;
         let mut seen = vec![false; CHANNELS];
-        while ProcessorOperator::has_output(&operator) {
-            let output = ProcessorOperator::pull_chunk(&mut operator, &state)
-                .expect("sparse output")
-                .expect("sparse batch");
+        let mut next = NextStep::Runnable;
+        while !matches!(next, NextStep::NeedInput) {
+            let step = operator.drive_for_test(&state).expect("sparse output step");
+            next = step.next;
+            let Some(output) = step.output else {
+                assert!(matches!(
+                    next,
+                    NextStep::NeedInput | NextStep::Runnable | NextStep::Yield
+                ));
+                continue;
+            };
             output_batches += 1;
             assert_eq!(output.len(), 1);
             assert!(
-                operator.output_size(&output).expect("encoded output size") <= PACKET_BYTES,
+                operator
+                    .kernel_for_test()
+                    .output_size(&output)
+                    .expect("encoded output size")
+                    <= PACKET_BYTES,
                 "every sparse batch must honor the runtime packet budget"
             );
             let prefix = TableWriteRelationColumns::try_from_relation(&output).expect("prefix");
@@ -3231,14 +3480,17 @@ pub(crate) mod tests {
             assert!(populated > 0 && populated < CHANNELS);
         }
         assert!(output_batches > 1, "the wide row must be split by bytes");
-        assert_eq!(operator.partial_batches, output_batches);
-        assert_eq!(operator.sparse_partial_rows, output_batches);
-        assert_eq!(operator.partial_channels, CHANNELS);
+        assert_eq!(operator.kernel_for_test().partial_batches, output_batches);
+        assert_eq!(
+            operator.kernel_for_test().sparse_partial_rows,
+            output_batches
+        );
+        assert_eq!(operator.kernel_for_test().partial_channels, CHANNELS);
         assert!(seen.into_iter().all(|channel| channel));
-        assert!(ProcessorOperator::need_input(&operator));
+        assert!(matches!(next, NextStep::NeedInput));
         operator.cancel();
         assert!(poll_until(
-            || operator.is_finished(),
+            || exits_ready(&mut operator),
             Duration::from_secs(5)
         ));
     }
@@ -3251,11 +3503,7 @@ pub(crate) mod tests {
         let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
         bind(&mut operator, &state);
-        operator
-            .as_processor_mut()
-            .expect("processor")
-            .set_finishing(&state)
-            .expect("finish");
+        operator.finish_for_test(&state).expect("finish");
         let chunks = wait_for_output(&mut operator, &state).expect("writer output");
         let columns = TableWriteRelationColumns::try_from_relation(&chunks[0]).expect("columns");
         assert_eq!(chunks[0].len(), 1);
@@ -3275,9 +3523,7 @@ pub(crate) mod tests {
         let state = test_runtime_state();
         bind(&mut operator, &state);
         operator
-            .as_processor_mut()
-            .expect("processor")
-            .set_finishing(&state)
+            .finish_for_test(&state)
             .expect("the exact single-fragment budget is legal");
         wait_for_output(&mut operator, &state).expect("exact-budget output");
 
@@ -3292,12 +3538,30 @@ pub(crate) mod tests {
         let state = test_runtime_state();
         bind(&mut operator, &state);
         operator
-            .as_processor_mut()
-            .expect("processor")
-            .set_finishing(&state)
+            .finish_for_test(&state)
             .expect("finish request is asynchronous");
         let error =
             wait_for_output(&mut operator, &state).expect_err("over the single-fragment budget");
+        let fact = novarocks_failure_contract::FailureProjection::failure_fact(&error);
+        assert_eq!(
+            fact.class(),
+            novarocks_failure_contract::FailureClass::Resource
+        );
+        let resource = fact
+            .resource()
+            .expect("the producing writer reports its exact bound");
+        assert_eq!(
+            resource.dimension,
+            novarocks_failure_contract::ResourceDimension::Bytes
+        );
+        assert_eq!(
+            resource.requested,
+            Some((MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1) as u64)
+        );
+        assert_eq!(
+            resource.limit,
+            Some(MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES as u64)
+        );
         assert!(
             error
                 .detail()
@@ -3337,10 +3601,9 @@ pub(crate) mod tests {
 
         // The other driver is untouched and still finishes normally.
         second
-            .as_processor_mut()
-            .expect("processor")
-            .set_finishing(&state)
+            .finish_for_test(&state)
             .expect("second driver finishes independently");
+        wait_for_output(&mut second, &state).expect("drive independent sibling finalization");
         assert!(poll_until(
             || stats.finished.load(Ordering::Relaxed) == 1,
             Duration::from_secs(5)
@@ -3436,30 +3699,58 @@ pub(crate) mod tests {
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");
-        ProcessorOperator::set_finishing(&mut operator, &state).expect("request finish");
+        operator.finish_for_test(&state).expect("request finish");
 
-        assert!(poll_until(
-            || ProcessorOperator::has_output(&operator),
-            Duration::from_secs(5)
-        ));
-        let error = ProcessorOperator::pull_chunk(&mut operator, &state)
-            .expect_err("actor error must be pulled instead of leaving the driver OutputFull");
+        // EOS only marks the input boundary. This worker call starts the
+        // real writer finalizer; the actor reports its error independently.
+        let step = operator.drive_for_test(&state).expect("start finalization");
+        assert!(step.output.is_none());
+        assert!(matches!(step.next, NextStep::Runnable | NextStep::Wait(_)));
+
+        let error = state
+            .error()
+            .or_else(|| {
+                assert!(poll_until(
+                    || state.error().is_some(),
+                    Duration::from_secs(5)
+                ));
+                state.error()
+            })
+            .expect("actor reports its originating failure before data observes stop");
         assert!(
             error.detail().contains("finish connector writer"),
             "{error}"
         );
+        operator.on_driver_failure();
+        assert!(
+            poll_until(
+                || {
+                    let mut pending = false;
+                    operator.visit_exits(&mut |exit| {
+                        if matches!(
+                            exit.report_to(&state.error_state()),
+                            crate::exec::pipeline::operator::ExitProgress::Pending(_)
+                                | crate::exec::pipeline::operator::ExitProgress::Unresolved(_)
+                        ) {
+                            pending = true;
+                        }
+                    });
+                    !pending
+                },
+                Duration::from_secs(5)
+            ),
+            "actual actor join completes"
+        );
         assert_eq!(aborted.load(Ordering::Relaxed), 1);
-        assert!(!ProcessorOperator::has_output(&operator));
-        assert!(poll_until(
-            || operator.is_finished(),
-            Duration::from_secs(5)
-        ));
     }
 
     #[test]
-    fn driver_resumes_after_async_writer_finish_to_deliver_its_output() {
+    fn driver_resumes_after_mandatory_writer_finish_to_deliver_its_output() {
         let stats = Arc::new(WriteExecutionStats::default());
-        let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
+        let finish_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut execution = TestWriteExecution::new(Arc::clone(&stats));
+        execution.finish_gate = Some(finish_gate.clone());
+        let execution = Arc::new(execution);
         let factory = writer_factory(&writer_fixture(execution));
         let runtime_state = Arc::new(test_runtime_state());
         let mut writer = factory.create(1, 0);
@@ -3468,15 +3759,15 @@ pub(crate) mod tests {
         let mut driver = PipelineDriver::new(
             0,
             vec![
-                Box::new(OneChunkSource {
+                Box::new(crate::exec::pipeline::shape::Source::new(OneChunkSource {
                     chunk: Some(input_chunk(vec![1, 2, 3])),
-                    finished: false,
-                }),
+                })),
                 writer,
-                Box::new(CollectSink {
-                    chunks: Arc::clone(&collected),
-                    finished: false,
-                }),
+                Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+                    CollectSink {
+                        chunks: Arc::clone(&collected),
+                    },
+                )),
             ],
             None,
             Vec::new(),
@@ -3484,21 +3775,37 @@ pub(crate) mod tests {
             None,
         );
 
-        let mut saw_pending_finish = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while stats.finish_started.load(Ordering::Acquire) == 0 {
+            let state = driver.process(Duration::from_millis(10));
+            assert!(
+                !matches!(state, DriverState::Finished | DriverState::Failed(_)),
+                "writer finish is still gated: {state:?}"
+            );
+            assert!(Instant::now() < deadline, "writer finish was not entered");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            driver.process(Duration::from_millis(10)),
+            DriverState::Blocked(crate::exec::pipeline::operator::BlockedReason::OutputFull)
+        );
+        assert_eq!(stats.finished.load(Ordering::Acquire), 0);
+        finish_gate.add_permits(1);
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match driver.process(Duration::from_millis(10)) {
-                DriverState::PendingFinish => saw_pending_finish = true,
                 DriverState::Finished => break,
                 DriverState::Failed(error) => panic!("driver failed: {error}"),
-                state if Instant::now() >= deadline => {
-                    panic!("driver did not finish before timeout: {state:?}")
-                }
-                _ => std::thread::sleep(Duration::from_millis(2)),
+                _ => {}
             }
+            assert!(
+                Instant::now() < deadline,
+                "driver did not observe writer completion"
+            );
+            std::thread::yield_now();
         }
-
-        assert!(saw_pending_finish);
+        assert_eq!(stats.finish_started.load(Ordering::Acquire), 1);
+        assert_eq!(stats.appended_rows.load(Ordering::Acquire), 3);
         let chunks = collected.lock().expect("collected chunks");
         assert_eq!(chunks.len(), 2);
         let columns = TableWriteRelationColumns::try_from_relation(&chunks[0]).expect("columns");
@@ -3583,30 +3890,44 @@ pub(crate) mod tests {
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");
 
-        ProcessorOperator::push_chunk(&mut operator, &state, input_chunk(vec![1]))
-            .expect("first page");
+        complete_native_input(&mut operator, &state, input_chunk(vec![1])).expect("first page");
         assert!(poll_until(
             || append_started.load(Ordering::Acquire),
             Duration::from_secs(5)
         ));
         for value in 2..=4 {
-            ProcessorOperator::push_chunk(&mut operator, &state, input_chunk(vec![value]))
+            complete_native_input(&mut operator, &state, input_chunk(vec![value]))
                 .expect("page fits the bounded writer queue");
         }
-        assert!(
-            !ProcessorOperator::need_input(&operator),
-            "the slow writer's full queue must block composite input"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-
-        gate.notify_one();
-        assert!(poll_until(
-            || ProcessorOperator::need_input(&operator),
-            Duration::from_secs(5)
+        use crate::exec::pipeline::{shape::StepOperator, step::InputResult};
+        let raw = RawInput::for_test(input_chunk(vec![5]));
+        let original = raw.original_for_test().columns()[0].clone();
+        let (raw, wait) = with_step(&state, |ctx| match operator.try_push(ctx, raw) {
+            InputResult::Deferred {
+                input,
+                next: AdmissionNext::Wait(wait),
+            } => (input, wait),
+            _ => panic!("full writer must defer the original raw input"),
+        });
+        assert!(Arc::ptr_eq(
+            &original,
+            &raw.original_for_test().columns()[0]
         ));
-        ProcessorOperator::push_chunk(&mut operator, &state, input_chunk(vec![5]))
-            .expect("input resumes only after writer capacity is released");
-        ProcessorOperator::set_finishing(&mut operator, &state).expect("finish");
+        assert!(!wait.is_ready());
+        std::thread::sleep(Duration::from_millis(1));
+        gate.notify_one();
+        assert!(poll_until(|| wait.is_ready(), Duration::from_secs(5)));
+        with_step(&state, |ctx| match operator.try_push(ctx, raw) {
+            InputResult::Accepted(result) => {
+                result.unwrap();
+            }
+            _ => panic!("the same raw input resumes after queue capacity is released"),
+        });
+        with_step(&state, |ctx| {
+            let result = operator.drive(ctx).unwrap();
+            assert!(matches!(result.next, NextStep::NeedInput));
+        });
+        operator.finish_for_test(&state).expect("finish");
         let mut boxed: Box<dyn Operator> = Box::new(operator);
         let outputs = wait_for_output(&mut boxed, &state).expect("writer output");
         let prefix = TableWriteRelationColumns::try_from_relation(&outputs[0]).expect("prefix");
@@ -3687,7 +4008,7 @@ pub(crate) mod tests {
             catalog_handle: catalog_handle(),
             append_started: Arc::clone(&append_started),
             abort_started: Arc::clone(&abort_started),
-            append_gate,
+            append_gate: Arc::clone(&append_gate),
             abort_gate: Arc::clone(&abort_gate),
         });
         let memory = MemTracker::new_root("table-writer-cancel-test");
@@ -3698,15 +4019,15 @@ pub(crate) mod tests {
         let mut driver = PipelineDriver::new(
             0,
             vec![
-                Box::new(OneChunkSource {
+                Box::new(crate::exec::pipeline::shape::Source::new(OneChunkSource {
                     chunk: Some(input_chunk(vec![1, 2, 3])),
-                    finished: false,
-                }),
+                })),
                 writer,
-                Box::new(CollectSink {
-                    chunks: Arc::new(std::sync::Mutex::new(Vec::new())),
-                    finished: false,
-                }),
+                Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+                    CollectSink {
+                        chunks: Arc::new(std::sync::Mutex::new(Vec::new())),
+                    },
+                )),
             ],
             None,
             Vec::new(),
@@ -3733,17 +4054,22 @@ pub(crate) mod tests {
             None,
             None,
         ));
-        let completion = FragmentCompletion::new(1);
-        assert!(completion.fail("injected fragment cancellation".to_string()));
+        let completion = FragmentCompletion::new(1, runtime_state.error_state());
+        let cancellation = ExecutionFailure::from(novarocks_functions::KernelFailure::Cancelled);
+        assert!(completion.fail(cancellation.clone()));
         let task = DriverTask::new(
             driver,
             Arc::clone(&completion),
             fragment,
             Duration::from_millis(10),
         );
-        let task = task
+        let mut task = task
             .finish_due_to_abort()
             .expect("driver must remain pending while writer abort is in flight");
+        assert!(!abort_started.load(Ordering::Acquire));
+        assert!(task.has_pending_finish());
+        assert!(memory.current() > 0, "in-flight append retains its input");
+        append_gate.notify_one();
         assert!(poll_until(
             || abort_started.load(Ordering::Acquire),
             Duration::from_secs(5)
@@ -3754,7 +4080,7 @@ pub(crate) mod tests {
         let waiter = std::thread::spawn(move || tx.send(waiting.wait()).expect("send result"));
         assert!(
             rx.recv_timeout(Duration::from_millis(50)).is_err(),
-            "fragment completion must wait for the writer actor's bounded abort"
+            "fragment completion must wait for the writer's actual abort exit"
         );
         assert_eq!(
             memory.current(),
@@ -3775,9 +4101,216 @@ pub(crate) mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("fragment completion after writer abort")
             .expect_err("the injected cancellation remains first-wins");
-        assert_eq!(error, "injected fragment cancellation".into());
+        assert_eq!(error, cancellation);
         waiter.join().expect("completion waiter");
         assert_eq!(memory.current(), 0);
+    }
+
+    struct ClosedPartial;
+    impl OperatorLifecycle for ClosedPartial {
+        fn name(&self) -> &str {
+            "ClosedPartial"
+        }
+    }
+    impl InputEncodingPolicy for ClosedPartial {}
+    impl TransformKernel for ClosedPartial {
+        fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+            Ok(ControlStep::Withdrawn)
+        }
+        fn apply(
+            &mut self,
+            _: &mut StepContext<'_>,
+            _: PreparedInput,
+        ) -> ExecutionResult<StepResult> {
+            panic!("closed partial never receives data")
+        }
+    }
+    #[test]
+    fn required_partial_withdrawal_is_an_invariant_failure_and_aborts_its_actor() {
+        use crate::exec::pipeline::shape::StepOperator;
+        use crate::exec::pipeline::writer_failure::WriterFailure;
+        use crate::runtime::fragment::ExecutionFailureCause;
+        let stats = Arc::new(WriteExecutionStats::default());
+        let execution = Arc::new(TestWriteExecution::new(stats.clone()));
+        let mut operator = writer_factory(&writer_fixture(execution)).create_operator(1, 0);
+        operator
+            .kernel_for_test_mut()
+            .replace_partial_aggregate_for_test(Box::new(Transform::hydrating(ClosedPartial)));
+        let state = test_runtime_state();
+        install_construction(&mut operator, &state);
+        operator.prepare().unwrap();
+        operator.bind_runtime_state(&state).unwrap();
+        operator.activate(&state).unwrap();
+        assert!(poll_until(
+            || stats.opened.load(Ordering::Acquire) == 1,
+            Duration::from_secs(5)
+        ));
+        let failure = with_step(&state, |ctx| operator.poll_control(ctx)).unwrap_err();
+        assert!(
+            matches!(failure.cause(),ExecutionFailureCause::Writer(cause) if cause.cause()==&WriterFailure::PartialDemandClosed)
+        );
+        assert!(state.error().unwrap().same_occurrence(&failure));
+        operator.on_driver_failure();
+        assert!(poll_until(
+            || {
+                let mut pending = false;
+                operator.visit_exits(&mut |exit| match exit.report_to(&state.error_state()) {
+                    crate::exec::pipeline::operator::ExitProgress::Pending(_)
+                    | crate::exec::pipeline::operator::ExitProgress::Unresolved(_) => {
+                        pending = true
+                    }
+                    crate::exec::pipeline::operator::ExitProgress::Exited => {}
+                });
+                !pending
+            },
+            Duration::from_secs(5)
+        ));
+        assert_eq!(stats.aborted.load(Ordering::Acquire), 1);
+        assert_eq!(stats.finished.load(Ordering::Acquire), 0);
+        assert_eq!(stats.appended_rows.load(Ordering::Acquire), 0);
+        operator.close().unwrap();
+    }
+
+    #[test]
+    fn native_writer_holds_append_until_child_accepts_and_finish_until_child_completes() {
+        use crate::exec::pipeline::shape::fanout::test_support::{Probe, sink};
+        use crate::exec::pipeline::{shape::StepOperator, step::InputResult};
+        let stats = Arc::new(WriteExecutionStats::default());
+        let execution = Arc::new(TestWriteExecution::new(stats.clone()).with_fragments(0, 0));
+        let mut operator = writer_factory(&writer_fixture(execution)).create_operator(1, 0);
+        let child = Probe::new(false);
+        child.finish_ready.store(false, Ordering::Release);
+        operator
+            .kernel_for_test_mut()
+            .replace_partial_aggregate_for_test(sink(child.clone()));
+        let memory = MemTracker::new_root("native writer child handoff");
+        operator.set_mem_tracker(memory.clone());
+        let state = test_runtime_state_with_mem(Some(memory.clone()));
+        install_construction(&mut operator, &state);
+        operator.prepare().unwrap();
+        operator.bind_runtime_state(&state).unwrap();
+        operator.activate(&state).unwrap();
+        assert!(poll_until(
+            || stats.opened.load(Ordering::Acquire) == 1,
+            Duration::from_secs(5)
+        ));
+        with_step(&state, |ctx| {
+            assert!(matches!(
+                operator.try_push(ctx, RawInput::for_test(input_chunk(vec![7, 11]))),
+                InputResult::Accepted(Ok(_))
+            ));
+            let result = operator.drive(ctx).unwrap();
+            assert!(result.output.is_none());
+            let NextStep::Wait(wait) = result.next else {
+                panic!("child admission must park the owning parent");
+            };
+            assert!(!wait.is_ready());
+            for _ in 0..2 {
+                assert!(matches!(
+                    operator.drive(ctx).unwrap().next,
+                    NextStep::Wait(_)
+                ));
+            }
+            assert_eq!(child.tries.load(Ordering::Acquire), 1);
+            assert_eq!(child.drives.load(Ordering::Acquire), 0);
+            assert_eq!(
+                stats.appended_rows.load(Ordering::Acquire),
+                0,
+                "reservation must not publish before the required child accepts"
+            );
+            assert!(operator.kernel_for_test().pending_append.is_some());
+            child.ready.store(true, Ordering::Release);
+            child.event.notify_observers();
+            assert!(wait.is_ready());
+            assert!(matches!(
+                operator.drive(ctx).unwrap().next,
+                NextStep::Runnable
+            ));
+            assert!(operator.kernel_for_test().pending_append.is_none());
+            assert_eq!(
+                child.tries.load(Ordering::Acquire),
+                2,
+                "shared probe checks the exact same child raw identity"
+            );
+            assert!(matches!(
+                operator.drive(ctx).unwrap().next,
+                NextStep::NeedInput
+            ));
+            assert_eq!(*child.rows.lock().unwrap(), [7, 11]);
+            operator.finish(ctx).unwrap();
+            loop {
+                let result = operator.drive(ctx).unwrap();
+                assert!(result.output.is_none());
+                if let NextStep::Wait(wait) = result.next {
+                    assert!(!wait.is_ready());
+                    break;
+                }
+                assert!(matches!(result.next, NextStep::Runnable));
+            }
+        });
+        assert!(poll_until(
+            || stats.appended_rows.load(Ordering::Acquire) == 2,
+            Duration::from_secs(5)
+        ));
+        assert_eq!(
+            stats.finished.load(Ordering::Acquire),
+            0,
+            "provider finish cannot overtake child finalization"
+        );
+        assert!(!operator.kernel_for_test().writer_finish_requested);
+        assert!(
+            operator.pending_finish().is_none(),
+            "mandatory child work must remain dataflow-drivable"
+        );
+        assert_eq!(child.finishes.load(Ordering::Acquire), 1);
+        child.finish_ready.store(true, Ordering::Release);
+        child.event.notify_observers();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut outputs = Vec::new();
+        loop {
+            let result = with_step(&state, |ctx| operator.drive(ctx)).unwrap();
+            if let Some(output) = result.output {
+                outputs.push(output);
+            }
+            match result.next {
+                NextStep::Finished => break,
+                NextStep::Wait(wait) if !wait.is_ready() => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                _ => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native writer completes after the exact child event"
+            );
+        }
+        assert_eq!(outputs.len(), 1);
+        let columns = TableWriteRelationColumns::try_from_relation(&outputs[0]).unwrap();
+        assert_eq!(columns.kinds.value(0), WriterRowKind::RowCount.to_wire());
+        assert_eq!(columns.row_counts.value(0), 2);
+        assert_eq!(stats.finished.load(Ordering::Acquire), 1);
+        assert_eq!(stats.aborted.load(Ordering::Acquire), 0);
+        assert_eq!(child.seals.load(Ordering::Acquire), 1);
+        operator.begin_exit().unwrap();
+        assert!(poll_until(
+            || {
+                let mut pending = false;
+                operator.visit_exits(&mut |exit| match exit.report_to(&state.error_state()) {
+                    crate::exec::pipeline::operator::ExitProgress::Pending(_)
+                    | crate::exec::pipeline::operator::ExitProgress::Unresolved(_) => {
+                        pending = true
+                    }
+                    crate::exec::pipeline::operator::ExitProgress::Exited => {}
+                });
+                !pending
+            },
+            Duration::from_secs(5)
+        ));
+        operator.close().unwrap();
+        drop(outputs);
+        drop(operator);
+        assert_eq!(memory.current(), 0);
+        drop(child.event.subscribe(Arc::new(|| {})));
     }
 
     #[test]
@@ -3795,17 +4328,33 @@ pub(crate) mod tests {
                 let permit = actor_gate.acquire().await.expect("actor exit gate");
                 permit.forget();
             });
-        writer.writer.install_terminal_actor_for_test(actor);
-        writer.state = TableWriterState::Finished;
+        writer
+            .kernel_for_test_mut()
+            .writer
+            .install_terminal_actor_for_test(actor);
+        writer.kernel_for_test_mut().state = TableWriterState::Finished;
 
-        assert!(writer.is_finished(), "semantic output has finished");
+        use crate::exec::pipeline::shape::StepOperator;
+        with_step(&runtime_state, |ctx| {
+            assert!(matches!(
+                writer.drive(ctx).unwrap().next,
+                NextStep::Finished
+            ));
+        });
         assert!(
             writer.pending_finish().is_some(),
             "live actor prevents actual stop"
         );
         gate.add_permits(1);
         assert!(poll_until(
-            || writer.pending_finish().is_none(),
+            || matches!(
+                writer
+                    .kernel_for_test_mut()
+                    .writer
+                    .observe_actor_exit()
+                    .progress,
+                crate::exec::pipeline::operator::ExitProgress::Exited
+            ),
             Duration::from_secs(5)
         ));
     }

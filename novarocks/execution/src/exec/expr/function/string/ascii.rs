@@ -16,6 +16,7 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 #[cfg(test)]
 use arrow::array::{Array, StringArray};
@@ -26,10 +27,11 @@ pub fn eval_ascii<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let _ = expr;
     let array = arena.eval(args[0], chunk)?;
-    Ok((novarocks_functions::builtin::string_measure::evaluate_legacy_ascii(&array))?)
+    novarocks_functions::builtin::string_measure::evaluate_required_ascii(&array)
+        .map_err(ExecutionFailure::from)
 }
 #[cfg(test)]
 mod legacy_string_measure_contract_tests {
@@ -46,7 +48,7 @@ mod legacy_string_measure_contract_tests {
         name: &'static str,
         input: ArrayRef,
         arity: usize,
-    ) -> Result<ArrayRef, String> {
+    ) -> ExecutionResult<ArrayRef> {
         let slot = SlotId::new(1);
         let carrier = input.data_type().clone();
         let batch = RecordBatch::try_new(
@@ -283,7 +285,8 @@ mod legacy_string_measure_contract_tests {
             for arity in [0, 2] {
                 let error = evaluate_with_arity(name, input.clone(), arity).unwrap_err();
                 assert!(
-                    error.contains("expects 1") && error.contains(&format!("got {arity}")),
+                    error.to_string().contains("expects 1")
+                        && error.to_string().contains(&format!("got {arity}")),
                     "{error}"
                 );
             }
@@ -292,7 +295,7 @@ mod legacy_string_measure_contract_tests {
                 Arc::new(BinaryArray::from(vec![Some(b"x".as_slice())])) as ArrayRef,
             ] {
                 let error = evaluate_with_arity(name, input, 1).unwrap_err();
-                assert!(error.contains("expects string"), "{error}");
+                assert!(error.to_string().contains("expects string"), "{error}");
             }
         }
     }

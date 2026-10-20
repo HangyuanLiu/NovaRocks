@@ -751,7 +751,7 @@ fn prepare_core<'loan, 'source, 'control>(
             let counted = if admission.observed() {
                 let result = count_kind(node, input, &mut facts, &mut counts, true);
                 if let Err(Error::Control(cause)) = &result {
-                    return Err(Error::Control(*cause));
+                    return Err(Error::Control(cause.clone()));
                 }
                 let mut prefix = facts;
                 prefix.cumulative_work_upper_bound = admission.numeric(count_work(
@@ -1123,7 +1123,7 @@ fn prepare_core<'loan, 'source, 'control>(
                         })
                         .transpose();
                     if let Err(Error::Control(cause)) = &result {
-                        return Err(Error::Control(*cause));
+                        return Err(Error::Control(cause.clone()));
                     }
                     Some(result)
                 } else {

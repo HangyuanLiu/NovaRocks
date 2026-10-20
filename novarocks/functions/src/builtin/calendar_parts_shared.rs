@@ -25,7 +25,7 @@ use arrow_array::{
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,7 +80,7 @@ pub fn legacy_calendar_parts(
     op: CalendarPartOp,
     array: &ArrayRef,
     selection: Selection<'_>,
-) -> Result<Vec<Option<i64>>, String> {
+) -> Result<Vec<Option<i64>>, KernelFailure> {
     let values = super::calendar_extended_shared::legacy_extract_datetimes(array)?;
     Ok(selection
         .iter()
@@ -93,7 +93,7 @@ pub fn legacy_calendar_names(
     op: CalendarPartOp,
     array: &ArrayRef,
     selection: Selection<'_>,
-) -> Result<Vec<Option<String>>, String> {
+) -> Result<Vec<Option<String>>, KernelFailure> {
     let values = super::calendar_extended_shared::legacy_extract_datetimes(array)?;
     Ok(selection
         .iter()
@@ -107,232 +107,186 @@ pub fn legacy_calendar_names(
         .collect())
 }
 
-fn year_from_datetime(value: NaiveDateTime) -> i32 {
-    CalendarPartOp::Year.extract_i64(value) as i32
-}
-fn year_from_date(value: NaiveDate) -> i32 {
-    year_from_datetime(value.and_hms_opt(0, 0, 0).unwrap())
-}
-
-/// The old explicit Year tag's carrier admission and output contract.
-/// This input projection intentionally retains unchecked Date32 arithmetic,
-/// truncating fractional timestamps and the original invalid-value epoch.
+/// The explicit Year tag retains its original three text grammars and its
+/// NULL result for values outside the calendar domain. Frozen carrier errors
+/// are outer failures; they never manufacture an epoch or a default type.
 pub fn legacy_year_array(
     array: &ArrayRef,
     expected_type: &DataType,
     selection: Selection<'_>,
-) -> Result<ArrayRef, String> {
-    let result: ArrayRef = match array.data_type() {
+) -> Result<ArrayRef, KernelFailure> {
+    if !matches!(
+        expected_type,
+        DataType::Int16 | DataType::Int32 | DataType::Int64
+    ) {
+        return Err(part_contract(format_args!(
+            "year: unsupported frozen output type: {expected_type:?}"
+        )));
+    }
+    let mut values = Vec::with_capacity(selection.len());
+    match array.data_type() {
         DataType::Date32 => {
-            let arr = array
+            let source = array
                 .as_any()
                 .downcast_ref::<Date32Array>()
-                .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
-
-            let values: Vec<Option<i32>> = selection
-                .iter()
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        let days_since_epoch = arr.value(i);
-                        // Date32 represents days since 1970-01-01
-                        // 719163 is the Julian day number for 1970-01-01
-                        let date = NaiveDate::from_num_days_from_ce_opt(719163 + days_since_epoch)
-                            .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
-                        Some(year_from_date(date))
-                    }
-                })
-                .collect();
-
-            // Build result array based on expected type
-            match expected_type {
-                DataType::Int16 => {
-                    let int16_values: Vec<Option<i16>> = values
-                        .iter()
-                        .map(|opt_year| opt_year.and_then(|y| i16::try_from(y).ok()))
-                        .collect();
-                    Arc::new(Int16Array::from(int16_values))
-                }
-                DataType::Int32 => Arc::new(Int32Array::from(values)),
-                _ => {
-                    let int64_values: Vec<Option<i64>> = values
-                        .iter()
-                        .map(|opt_year| opt_year.map(|y| y as i64))
-                        .collect();
-                    Arc::new(Int64Array::from(int64_values))
-                }
+                .ok_or_else(|| part_contract("failed to downcast to Date32Array"))?;
+            for row in selection.iter() {
+                values.push(if source.is_null(row) {
+                    None
+                } else {
+                    crate::datetime_value::date32_to_naive(source.value(row))
+                        .map(|date| date.year())
+                });
             }
         }
-        DataType::Timestamp(unit, _tz) => {
-            let values: Vec<Option<i32>> = match unit {
-                TimeUnit::Second => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampSecondArray>()
-                        .ok_or_else(|| "failed to downcast to TimestampSecondArray".to_string())?;
-                    selection
-                        .iter()
-                        .map(|i| {
-                            if arr.is_null(i) {
-                                None
-                            } else {
-                                let seconds = arr.value(i);
-                                let dt_utc = DateTime::from_timestamp(seconds, 0)
-                                    .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-                                Some(year_from_datetime(dt_utc.naive_utc()))
-                            }
-                        })
-                        .collect()
-                }
-                TimeUnit::Millisecond => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampMillisecondArray>()
-                        .ok_or_else(|| {
-                            "failed to downcast to TimestampMillisecondArray".to_string()
-                        })?;
-                    selection
-                        .iter()
-                        .map(|i| {
-                            if arr.is_null(i) {
-                                None
-                            } else {
-                                let millis = arr.value(i);
-                                let seconds = millis / 1000;
-                                let nanos = ((millis % 1000) * 1_000_000) as u32;
-                                let dt_utc = DateTime::from_timestamp(seconds, nanos)
-                                    .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-                                Some(year_from_datetime(dt_utc.naive_utc()))
-                            }
-                        })
-                        .collect()
-                }
-                TimeUnit::Microsecond => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .ok_or_else(|| {
-                            "failed to downcast to TimestampMicrosecondArray".to_string()
-                        })?;
-                    selection
-                        .iter()
-                        .map(|i| {
-                            if arr.is_null(i) {
-                                None
-                            } else {
-                                let micros = arr.value(i);
-                                let seconds = micros / 1_000_000;
-                                let nanos = ((micros % 1_000_000) * 1000) as u32;
-                                let dt_utc = DateTime::from_timestamp(seconds, nanos)
-                                    .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-                                Some(year_from_datetime(dt_utc.naive_utc()))
-                            }
-                        })
-                        .collect()
-                }
-                TimeUnit::Nanosecond => {
-                    let arr = array
-                        .as_any()
-                        .downcast_ref::<TimestampNanosecondArray>()
-                        .ok_or_else(|| {
-                            "failed to downcast to TimestampNanosecondArray".to_string()
-                        })?;
-                    selection
-                        .iter()
-                        .map(|i| {
-                            if arr.is_null(i) {
-                                None
-                            } else {
-                                let nanos_total = arr.value(i);
-                                let seconds = nanos_total / 1_000_000_000;
-                                let nanos = (nanos_total % 1_000_000_000) as u32;
-                                let dt_utc = DateTime::from_timestamp(seconds, nanos)
-                                    .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-                                Some(year_from_datetime(dt_utc.naive_utc()))
-                            }
-                        })
-                        .collect()
-                }
-            };
-
-            // Build result array based on expected type
-            match expected_type {
-                DataType::Int16 => {
-                    let int16_values: Vec<Option<i16>> = values
-                        .iter()
-                        .map(|opt_year| opt_year.and_then(|y| i16::try_from(y).ok()))
-                        .collect();
-                    Arc::new(Int16Array::from(int16_values))
-                }
-                DataType::Int32 => Arc::new(Int32Array::from(values)),
-                _ => {
-                    let int64_values: Vec<Option<i64>> = values
-                        .iter()
-                        .map(|opt_year| opt_year.map(|y| y as i64))
-                        .collect();
-                    Arc::new(Int64Array::from(int64_values))
-                }
+        DataType::Timestamp(unit, _) => {
+            macro_rules! timestamp_years {
+                ($array:ty) => {{
+                    let source = array.as_any().downcast_ref::<$array>().ok_or_else(|| {
+                        part_contract("year: frozen timestamp carrier cannot be downcast")
+                    })?;
+                    for row in selection.iter() {
+                        values.push(if source.is_null(row) {
+                            None
+                        } else {
+                            crate::datetime_value::timestamp_to_naive(unit, source.value(row))
+                                .map(|date| date.year())
+                        });
+                    }
+                }};
+            }
+            match unit {
+                TimeUnit::Second => timestamp_years!(TimestampSecondArray),
+                TimeUnit::Millisecond => timestamp_years!(TimestampMillisecondArray),
+                TimeUnit::Microsecond => timestamp_years!(TimestampMicrosecondArray),
+                TimeUnit::Nanosecond => timestamp_years!(TimestampNanosecondArray),
             }
         }
         DataType::Utf8 => {
-            // Parse string dates/timestamps
-            let arr = array
+            let source = array
                 .as_any()
                 .downcast_ref::<arrow_array::StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-
-            let values: Vec<Option<i32>> = selection
-                .iter()
-                .map(|i| {
-                    if arr.is_null(i) {
-                        None
-                    } else {
-                        let s = arr.value(i);
-                        // Try to parse as date or timestamp
-                        if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-                            Some(year_from_date(date))
-                        } else if let Ok(dt) =
-                            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-                        {
-                            Some(year_from_date(dt.date()))
-                        } else if let Ok(dt) =
-                            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-                        {
-                            Some(year_from_date(dt.date()))
-                        } else {
-                            None // Return null for unparseable strings
-                        }
-                    }
-                })
-                .collect();
-
-            // Build result array based on expected type
-            match expected_type {
-                DataType::Int16 => {
-                    let int16_values: Vec<Option<i16>> = values
-                        .iter()
-                        .map(|opt_year| opt_year.and_then(|y| i16::try_from(y).ok()))
-                        .collect();
-                    Arc::new(Int16Array::from(int16_values))
-                }
-                DataType::Int32 => Arc::new(Int32Array::from(values)),
-                _ => {
-                    let int64_values: Vec<Option<i64>> = values
-                        .iter()
-                        .map(|opt_year| opt_year.map(|y| y as i64))
-                        .collect();
-                    Arc::new(Int64Array::from(int64_values))
-                }
+                .ok_or_else(|| part_contract("failed to downcast to StringArray"))?;
+            for row in selection.iter() {
+                values.push(if source.is_null(row) {
+                    None
+                } else {
+                    let text = source.value(row);
+                    NaiveDate::parse_from_str(text, "%Y-%m-%d")
+                        .ok()
+                        .map(|date| date.year())
+                        .or_else(|| {
+                            NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+                                .ok()
+                                .map(|date| date.year())
+                        })
+                        .or_else(|| {
+                            NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+                                .ok()
+                                .map(|date| date.year())
+                        })
+                });
             }
         }
-        _ => {
-            return Err(format!(
-                "year: unsupported input type: {:?}",
-                array.data_type()
-            ));
+        other => {
+            return Err(part_contract(format_args!(
+                "year: unsupported input type: {other:?}"
+            )));
         }
-    };
+    }
+    Ok(match expected_type {
+        DataType::Int16 => Arc::new(Int16Array::from(
+            values
+                .into_iter()
+                .map(|year| year.and_then(|year| i16::try_from(year).ok()))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef,
+        DataType::Int32 => Arc::new(Int32Array::from(values)) as ArrayRef,
+        DataType::Int64 => Arc::new(Int64Array::from(
+            values
+                .into_iter()
+                .map(|year| year.map(i64::from))
+                .collect::<Vec<_>>(),
+        )) as ArrayRef,
+        _ => unreachable!("the frozen Year output was validated before reading input"),
+    })
+}
 
-    Ok(result)
+/// The raw host supplies the already frozen result carrier.
+pub fn cast_calendar_array(out: ArrayRef, target: &DataType) -> Result<ArrayRef, KernelFailure> {
+    if out.data_type() == target {
+        return Ok(out);
+    }
+    arrow_cast::cast(&out, target).map_err(super::calendar_parts_failure::output)
+}
+pub fn part_contract(detail: impl std::fmt::Display) -> KernelFailure {
+    super::calendar_parts_failure::contract(detail)
+}
+
+#[cfg(test)]
+mod raw_year_tests {
+    use super::*;
+    #[test]
+    fn raw_year_invalid_dates_and_negative_fractions_do_not_become_epoch_values() {
+        let source: ArrayRef = Arc::new(Date32Array::from(vec![
+            Some(i32::MIN),
+            Some(-1),
+            Some(0),
+            Some(i32::MAX),
+            None,
+        ]));
+        let output = legacy_year_array(&source, &DataType::Int32, Selection::all(5)).unwrap();
+        assert_eq!(
+            output.as_any().downcast_ref::<Int32Array>().unwrap(),
+            &Int32Array::from(vec![None, Some(1969), Some(1970), None, None])
+        );
+        for source in [
+            Arc::new(TimestampSecondArray::from(vec![Some(-1), Some(0), None])) as ArrayRef,
+            Arc::new(TimestampMillisecondArray::from(vec![
+                Some(-1),
+                Some(0),
+                None,
+            ])) as ArrayRef,
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(-1),
+                Some(0),
+                None,
+            ])) as ArrayRef,
+            Arc::new(TimestampNanosecondArray::from(vec![
+                Some(-1),
+                Some(0),
+                None,
+            ])) as ArrayRef,
+        ] {
+            let output = legacy_year_array(&source, &DataType::Int64, Selection::all(3)).unwrap();
+            assert_eq!(
+                output.as_any().downcast_ref::<Int64Array>().unwrap(),
+                &Int64Array::from(vec![Some(1969), Some(1970), None])
+            );
+        }
+        let source: ArrayRef = Arc::new(TimestampSecondArray::from(vec![i64::MIN, i64::MAX]));
+        let output = legacy_year_array(&source, &DataType::Int16, Selection::all(2)).unwrap();
+        assert_eq!(
+            output.as_any().downcast_ref::<Int16Array>().unwrap(),
+            &Int16Array::from(vec![None, None])
+        );
+    }
+    #[test]
+    fn raw_year_keeps_text_grammars_and_rejects_an_unrelated_frozen_output() {
+        let source: ArrayRef = Arc::new(arrow_array::StringArray::from(vec![
+            Some("2020-01-01"),
+            Some("2021-02-03 04:05:06"),
+            Some("2022-03-04 05:06:07.123"),
+            Some("invalid"),
+            None,
+        ]));
+        let output = legacy_year_array(&source, &DataType::Int16, Selection::all(5)).unwrap();
+        assert_eq!(
+            output.as_any().downcast_ref::<Int16Array>().unwrap(),
+            &Int16Array::from(vec![Some(2020), Some(2021), Some(2022), None, None])
+        );
+        let error = legacy_year_array(&source, &DataType::Float64, Selection::all(5)).unwrap_err();
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    }
 }

@@ -27,7 +27,7 @@ impl PureCompileControl for BorrowedControl {
         let mut trace = self.trace.lock().unwrap();
         let index = trace.len();
         trace.push((phase, units));
-        match self.fail_at {
+        match self.fail_at.clone() {
             Some((stop, cause)) if stop == index => Err(cause),
             _ => Ok(()),
         }
@@ -119,7 +119,7 @@ fn actual_wide_call_count_quantum_and_empty_tail_preserve_every_first_control_ca
                 CompileControlError::ResourceExhausted,
             ] {
                 let caller = BorrowedControl {
-                    fail_at: Some((stop, cause)),
+                    fail_at: Some((stop, cause.clone())),
                     ..BorrowedControl::default()
                 };
                 assert_eq!(

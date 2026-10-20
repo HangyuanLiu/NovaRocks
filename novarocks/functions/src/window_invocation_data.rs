@@ -45,6 +45,7 @@ struct OriginalData {
     output_ordinal: Option<usize>,
     frame_origin: Option<crate::WindowFrameOrigin>,
     message: String,
+    source: Option<KernelFailure>,
     // The real reservation remains live after Data. Original message backing
     // is destroyed first. Moving this admission requires no new host request,
     // formatter, cloned text, checkpoint, or fallible error footer.
@@ -149,6 +150,26 @@ impl WindowInvocationData {
     pub fn message(&self) -> &str {
         &self.data().message
     }
+    /// The original typed whole-value cause, when supplied by its producer.
+    /// Invocation coordinates enrich it; they never create a maskable row error.
+    pub fn original_source(&self) -> Option<&KernelFailure> {
+        self.data().source.as_ref()
+    }
+    pub(crate) fn projected_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::FailureProjection;
+        self.original_source().map_or_else(
+            || {
+                novarocks_failure_contract::FailureFact::new(
+                    novarocks_failure_contract::FailureClass::Data,
+                    novarocks_failure_contract::FailureReason::new(
+                        novarocks_failure_contract::domain::KERNEL,
+                        std::num::NonZeroU16::new(52).unwrap(),
+                    ),
+                )
+            },
+            FailureProjection::failure_fact,
+        )
+    }
     pub fn same_backing(&self, other: &Self) -> bool {
         self.0.ptr_eq(&other.0)
     }
@@ -184,7 +205,12 @@ impl fmt::Display for WindowInvocationData {
         f.write_str(self.message())
     }
 }
-impl std::error::Error for WindowInvocationData {}
+impl std::error::Error for WindowInvocationData {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.original_source()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// One per real invocation, allocated before first original frame computation.
 /// The empty slot is never an error or a default source receipt.
@@ -236,6 +262,7 @@ impl WindowDataSlot {
             None,
             None,
             message,
+            None,
             reservation,
         )
     }
@@ -254,6 +281,7 @@ impl WindowDataSlot {
             None,
             Some(origin),
             message,
+            None,
             reservation,
         )
     }
@@ -273,6 +301,30 @@ impl WindowDataSlot {
             output_ordinal,
             None,
             message,
+            None,
+            reservation,
+        )
+    }
+    pub(crate) fn publish_frame_source(
+        &self,
+        phase: WindowInvocationPhase,
+        origin: crate::WindowFrameOrigin,
+        input_row: Option<usize>,
+        source: KernelFailure,
+        reservation: OpaqueReservation,
+    ) -> WindowInvocationData {
+        if self.0.data.get().is_some() {
+            return WindowInvocationData(self.0.clone());
+        }
+        let message = source.to_string();
+        self.publish_with_origin(
+            phase,
+            Some(origin.output_row),
+            input_row,
+            None,
+            Some(origin),
+            message,
+            Some(source),
             reservation,
         )
     }
@@ -284,6 +336,7 @@ impl WindowDataSlot {
         output_ordinal: Option<usize>,
         frame_origin: Option<crate::WindowFrameOrigin>,
         message: String,
+        source: Option<KernelFailure>,
         reservation: OpaqueReservation,
     ) -> WindowInvocationData {
         if self.0.data.get().is_some() {
@@ -321,6 +374,7 @@ impl WindowDataSlot {
             output_ordinal,
             frame_origin,
             message,
+            source,
             reservation,
         });
         WindowInvocationData(self.0.clone())
@@ -363,10 +417,44 @@ pub(crate) fn finish_window_lifecycle<T>(
     post: impl FnOnce() -> Result<(), KernelFailure>,
 ) -> Result<T, WindowEvaluationFailure> {
     match result {
-        Err(data @ WindowEvaluationFailure::InvocationData(_)) => Err(data),
+        Err(original) => Err(original),
         Ok(value) => post().map(|()| value).map_err(Into::into),
-        Err(WindowEvaluationFailure::Kernel(cause)) => {
-            crate::aggregate_kernel::finish_lifecycle(Err(cause), post()).map_err(Into::into)
-        }
+    }
+}
+
+#[cfg(test)]
+mod first_cause_post_tests {
+    use super::*;
+    #[test]
+    fn actual_source_window_failure_stops_before_optional_validation() {
+        let original = crate::aggregate_scalar::build_scalar_array(
+            &arrow_schema::DataType::Boolean,
+            vec![Some(crate::aggregate_scalar::AggScalarValue::Int64(1))],
+            &mut crate::aggregate_scalar::ScalarWork::new(None),
+        )
+        .unwrap_err();
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&original)
+                .reason()
+                .code(),
+            315
+        );
+        let actual = finish_window_lifecycle::<()>(Err(original.clone().into()), || {
+            panic!("no optional validation after the original source")
+        });
+        assert_eq!(actual, Err(WindowEvaluationFailure::Kernel(original)));
+    }
+    #[test]
+    fn normal_row_data_value_still_runs_successful_post_validation() {
+        let post = std::cell::Cell::new(0);
+        let rows = vec![crate::RowDataError::new(0, "normal row data")];
+        let output = finish_window_lifecycle(Ok(rows), || {
+            post.set(post.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(post.get(), 1);
+        assert_eq!(output[0].selected_ordinal(), 0);
+        assert_eq!(output[0].message(), "normal row data");
     }
 }

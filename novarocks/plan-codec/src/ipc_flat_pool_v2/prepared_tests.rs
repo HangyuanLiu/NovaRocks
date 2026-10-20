@@ -31,7 +31,7 @@ fn every_boundary<T>(call: impl Fn(&Control) -> Result<T, TypeCodecError>, succe
     assert_eq!(trace.first(), Some(&(CompilePhase::Encode, 0)));
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(
                 matches!(call(&control), Err(TypeCodecError::Control(actual)) if actual == cause)
             );

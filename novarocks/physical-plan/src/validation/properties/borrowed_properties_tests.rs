@@ -54,7 +54,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after originating refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -239,7 +239,7 @@ fn caller_graph_composition_each_actual_callback_preserves_three_primary_causes(
             for cause in CAUSES {
                 let control = Control {
                     trace: Mutex::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert!(matches!(
                     run(&fixture, derive, &control, &mut |_| Ok(())),

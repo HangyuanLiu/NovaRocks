@@ -29,7 +29,6 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use super::join_hash_map::build_store::BuildStoreChunkProjection;
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray};
@@ -44,15 +43,20 @@ use super::build_requirements::{BuildComponentRequirements, required_build_compo
 use super::join_hash_map::finalize::{finalize_probe_rows, is_all_match_one, mark_build_matches};
 use super::join_hash_map::gather::GatherTimings;
 use super::join_hash_map::match_flags::BuildMatchFlags;
-use super::join_hash_map::method::{ExprEvaluationCallback, JoinHashMap};
+use super::join_hash_map::method::{
+    ExprEvaluationCallback, JoinCursorFailure, JoinHashMap, JoinPairCursor,
+};
 use super::join_hash_map::search::{JoinSelection, SearchStats, append_cross_selection};
-use super::join_probe_utils::cross_join_batches;
 use crate::exec::chunk::{
     ArrayNormalizationStep, Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema,
 };
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::JoinType;
-use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionFactory};
+use crate::exec::pipeline::{
+    operator::{ConstructionFailure, InputConstructionFactory},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::profile::{CounterRef, clamp_u128_to_i64};
 
@@ -192,67 +196,56 @@ fn create_join_input(
     )?)
 }
 
-#[cfg(test)]
-fn reference_join_evaluation_input(
-    batch: RecordBatch,
-    schema: ChunkSchemaRef,
-    sources: &[&Chunk],
-    nullable_slots: &[usize],
-) -> ExecutionResult<Chunk> {
-    if schema.is_typed()
-        || sources
-            .iter()
-            .any(|source| source.chunk_schema().is_typed())
-    {
-        return Err("reference join evaluation requires explicitly untyped source facts".into());
+#[derive(Debug)]
+struct JoinProbeContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for JoinProbeContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
     }
-    let schema = if nullable_slots.is_empty() {
-        schema
-    } else {
-        Arc::new(ChunkSchema::try_new(
-            schema
-                .slots()
-                .iter()
-                .enumerate()
-                .map(|(index, slot)| {
-                    if nullable_slots.contains(&index) {
-                        slot.with_nullable(true)
-                    } else {
-                        slot.clone()
-                    }
-                })
-                .collect(),
-        )?)
-    };
-    Ok(Chunk::try_new_with_chunk_schema(batch, schema)?)
+}
+impl std::error::Error for JoinProbeContract {}
+impl novarocks_failure_contract::FailureProjection for JoinProbeContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::JoinProbeContract.reason(),
+        )
+    }
+}
+fn probe_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(JoinProbeContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
 }
 
 fn concat_compatible_batches(
     schema: &SchemaRef,
     batches: &[RecordBatch],
     context: &str,
-) -> Result<RecordBatch, String> {
+) -> Result<RecordBatch, ExecutionFailure> {
     for batch in batches {
         if schema.fields().len() != batch.num_columns() {
-            return Err(format!(
+            return Err(probe_contract(format_args!(
                 "{context} column count mismatch: schema_fields={} batch_columns={}",
                 schema.fields().len(),
                 batch.num_columns()
-            ));
+            )));
         }
         for (idx, column) in batch.columns().iter().enumerate() {
             let descriptor = schema.field(idx).data_type();
             if descriptor != column.data_type() {
-                return Err(format!(
+                return Err(probe_contract(format_args!(
                     "{context} type mismatch at column {idx}: descriptor={:?} actual={:?}",
                     descriptor,
                     column.data_type()
-                ));
+                )));
             }
         }
     }
     let concat_schema = concat_schema_for_batches(schema, batches);
-    concat_batches(&concat_schema, batches).map_err(|e| e.to_string())
+    concat_batches(&concat_schema, batches).map_err(|cause| {
+        ExecutionFailure::from_domain(super::join_hash_map::gather::GatherKernelFailure(cause))
+    })
 }
 
 fn concat_schema_for_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> SchemaRef {
@@ -281,6 +274,10 @@ fn concat_schema_for_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> Sch
     }
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
+
+#[path = "hash_join_probe_steps.rs"]
+mod steps;
+use steps::InnerProbeCursor;
 
 /// Core hash-join probing engine that performs key lookup and join-type specific row assembly.
 pub(crate) struct HashJoinProbeCore {
@@ -314,7 +311,8 @@ pub(crate) struct HashJoinProbeCore {
     residual_eval_batches: u64,
     residual_matched_rows: u64,
     residual_group_rows_total: u64,
-    pending_output_batches: VecDeque<Chunk>,
+    inner_cursor: Option<InnerProbeCursor>,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
     search_timer: Option<CounterRef>,
     out_build_timer: Option<CounterRef>,
     out_probe_timer: Option<CounterRef>,
@@ -396,7 +394,8 @@ impl HashJoinProbeCore {
             residual_eval_batches: 0,
             residual_matched_rows: 0,
             residual_group_rows_total: 0,
-            pending_output_batches: VecDeque::new(),
+            inner_cursor: None,
+            construction: None,
             search_timer: None,
             out_build_timer: None,
             out_probe_timer: None,
@@ -449,16 +448,16 @@ impl HashJoinProbeCore {
         Self::add_timer_ns(self.out_probe_timer.as_ref(), timings.probe_ns);
     }
 
-    fn build_view(&self) -> Result<&BuildView, String> {
+    fn build_view(&self) -> Result<&BuildView, ExecutionFailure> {
         self.build_view
             .as_ref()
-            .ok_or_else(|| "hash join build artifact not loaded".to_string())
+            .ok_or_else(|| probe_contract("hash join build artifact not loaded"))
     }
 
     fn require_build_chunk(
         &self,
         context: &'static str,
-    ) -> Result<Option<BuildStoreChunkProjection>, String> {
+    ) -> Result<Option<BuildStoreChunkProjection>, ExecutionFailure> {
         if self.build_partition_row_count == 0 {
             return Ok(None);
         }
@@ -533,7 +532,7 @@ impl HashJoinProbeCore {
         artifact: Arc<JoinBuildArtifact>,
         global_build_row_count: usize,
         global_build_has_null_key: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExecutionFailure> {
         if self.build_loaded {
             return Ok(());
         }
@@ -619,14 +618,6 @@ impl HashJoinProbeCore {
         self.residual_group_rows_total
     }
 
-    pub(crate) fn has_pending_output(&self) -> bool {
-        !self.pending_output_batches.is_empty()
-    }
-
-    pub(crate) fn pop_pending_output(&mut self) -> Result<Option<Chunk>, String> {
-        Ok(self.pending_output_batches.pop_front())
-    }
-
     /// Extend a probe-only batch with NULL-filled build-side columns so that
     /// the result matches the full join-scope schema.  This mirrors StarRocks
     /// BE's `_build_default_output` for SEMI/ANTI joins: the pruned side's
@@ -680,8 +671,12 @@ impl HashJoinProbeCore {
                 }
             })
             .collect::<Vec<_>>();
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-            .map_err(|error| error.to_string())?;
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|cause| {
+                ExecutionFailure::from_domain(super::join_hash_map::gather::GatherKernelFailure(
+                    cause,
+                ))
+            })?;
         let chunk = create_input(
             batch,
             Arc::clone(&self.join_scope_chunk_schema),
@@ -725,8 +720,12 @@ impl HashJoinProbeCore {
                 }
             })
             .collect::<Vec<_>>();
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-            .map_err(|error| error.to_string())?;
+        let batch =
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|cause| {
+                ExecutionFailure::from_domain(super::join_hash_map::gather::GatherKernelFailure(
+                    cause,
+                ))
+            })?;
         let chunk = create_input(
             batch,
             Arc::clone(&self.join_scope_chunk_schema),
@@ -761,111 +760,152 @@ impl HashJoinProbeCore {
         ))
     }
 
-    #[cfg(test)]
-    pub(crate) fn join_probe_chunks(
+    pub(crate) fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.construction = Some(factory);
+    }
+    pub(crate) fn release_owned(&mut self) {
+        self.build_loaded = false;
+        self.inner_cursor = None;
+        self.build_view = None;
+        self.build_chunk = None;
+        self.build_null_key_rows = None;
+        self.build_table = None;
+        self.build_matched = None;
+    }
+    pub(crate) fn accept_probe(
         &mut self,
-        probe_chunks: Vec<Chunk>,
-    ) -> Result<Option<Chunk>, String> {
-        if probe_chunks
-            .iter()
-            .any(|input| input.chunk_schema().is_typed())
-        {
-            return Err("reference join evaluation requires untyped inputs".into());
+        ctx: &mut StepContext<'_>,
+        chunk: Chunk,
+    ) -> ExecutionResult<StepResult> {
+        ctx.checkpoint()?;
+        if chunk.is_empty() {
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
         }
-        let arena = Arc::clone(&self.arena);
-        self.join_probe_chunks_with(
-            probe_chunks,
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        if self.join_type == JoinType::Inner {
+            self.start_inner(ctx, chunk)?;
+            let next = if self.inner_cursor.is_some() {
+                NextStep::Runnable
+            } else {
+                NextStep::NeedInput
+            };
+            return Ok(StepResult::new(None, next, rows));
+        }
+        // Non-inner reductions retain one complete relation per accepted input.
+        // Evaluation capabilities are borrowed only for this step.
+        let factory = self
+            .construction
+            .clone()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let arena = self.arena.clone();
+        let output = self.join_probe_chunks_with(
+            vec![chunk],
             &mut |id, input| {
-                if input.chunk_schema().is_typed() {
-                    return Err(
-                        "reference join evaluation requires an untyped derived input".into(),
-                    );
-                }
-                arena.eval(id, input).map_err(Into::into)
+                let owner = factory.begin_input_construction(input)?;
+                crate::exec::expr::ExprEvaluationContext::new(&arena, owner.as_ref(), ctx)
+                    .eval(id, input)
             },
-            &mut reference_join_evaluation_input,
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn finish(
-        &mut self,
-        probe_chunks: Vec<Chunk>,
-        flags: Option<Vec<bool>>,
-    ) -> Result<Option<Chunk>, String> {
-        let out = self.join_probe_chunks(probe_chunks)?;
-        self.finish_from_probe_output(out, flags, true)
-    }
-
-    pub(crate) fn join_probe_chunks_evaluated(
-        &mut self,
-        probe_chunks: Vec<Chunk>,
-        factory: &dyn InputConstructionFactory,
-        evaluate: &mut ExprEvaluationCallback<'_>,
-    ) -> ExecutionResult<Option<Chunk>> {
-        self.join_probe_chunks_with(
-            probe_chunks,
-            evaluate,
             &mut |batch, schema, sources, nullable_slots| {
-                create_join_input(batch, schema, sources, nullable_slots, factory)
+                create_join_input(batch, schema, sources, nullable_slots, factory.as_ref())
             },
-        )
+        )?;
+        ctx.checkpoint()?;
+        Ok(StepResult::new(output, NextStep::NeedInput, rows))
     }
-
     fn join_probe_chunks_with(
         &mut self,
         probe_chunks: Vec<Chunk>,
         evaluate: &mut ExprEvaluationCallback<'_>,
         create_input: &mut JoinInputCreator<'_>,
-    ) -> Result<Option<Chunk>, ExecutionFailure> {
-        if probe_chunks.is_empty() {
-            return Ok(None);
-        }
-        let probe_chunks = self.apply_runtime_filters(probe_chunks)?;
-        if probe_chunks.is_empty() {
-            return Ok(None);
-        }
-
+    ) -> ExecutionResult<Option<Chunk>> {
         match self.join_type {
-            JoinType::Inner => Ok((self.join_inner(probe_chunks, evaluate, create_input))?),
             JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter => {
-                Ok((self.join_outer(probe_chunks, evaluate, create_input))?)
+                self.join_outer(probe_chunks, evaluate, create_input)
             }
             JoinType::LeftSemi | JoinType::RightSemi | JoinType::LeftAnti | JoinType::RightAnti => {
-                Ok((self.join_semi_anti(probe_chunks, evaluate, create_input))?)
+                self.join_semi_anti(probe_chunks, evaluate, create_input)
             }
             JoinType::NullAwareLeftAnti => {
-                Ok((self.join_null_aware_left_anti(probe_chunks, evaluate, create_input))?)
+                self.join_null_aware_left_anti(probe_chunks, evaluate, create_input)
+            }
+            JoinType::Inner => Err(probe_contract(
+                "inner join requires its input-owned step cursor",
+            )),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn join_probe_chunks(
+        &mut self,
+        chunks: Vec<Chunk>,
+    ) -> Result<Option<Chunk>, ExecutionFailure> {
+        // A relation oracle normalizes the real step outputs only in tests.
+        // No production caller can turn output-ready steps into this vector.
+        let control = crate::runtime::runtime_state::RuntimeErrorState::default();
+        let mut work =
+            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, u32::MAX);
+        let mut ctx = StepContext::new(&control, &mut work);
+        let mut output = Vec::new();
+        for chunk in chunks {
+            let mut step = self.accept_probe(&mut ctx, chunk)?;
+            loop {
+                if let Some(chunk) = step.output {
+                    output.push(chunk);
+                }
+                if matches!(step.next, NextStep::NeedInput) {
+                    break;
+                }
+                step = self.drive_probe(&mut ctx)?;
+            }
+        }
+        match output.len() {
+            0 => Ok(None),
+            1 => Ok(output.pop()),
+            _ => {
+                let schema = output[0].chunk_schema_ref();
+                let batches = output
+                    .iter()
+                    .map(|chunk| chunk.record_batch().clone())
+                    .collect::<Vec<_>>();
+                let batch = concat_compatible_batches(
+                    &schema.arrow_schema_ref(),
+                    &batches,
+                    "test join relation",
+                )?;
+                let factory = self
+                    .construction
+                    .as_deref()
+                    .ok_or(ConstructionFailure::MissingOwner)?;
+                let sources = output.iter().collect::<Vec<_>>();
+                create_join_input(batch, schema, &sources, &[], factory).map(Some)
             }
         }
     }
-
-    pub(crate) fn finish_evaluated(
+    #[cfg(test)]
+    pub(crate) fn finish(
         &mut self,
-        probe_chunks: Vec<Chunk>,
-        merged_build_flags: Option<Vec<bool>>,
-        factory: &dyn InputConstructionFactory,
-        evaluate: &mut ExprEvaluationCallback<'_>,
+        chunks: Vec<Chunk>,
+        flags: Option<Vec<bool>>,
     ) -> Result<Option<Chunk>, ExecutionFailure> {
-        let out = self.join_probe_chunks_evaluated(probe_chunks, factory, evaluate)?;
-        self.finish_from_probe_output_evaluated(out, merged_build_flags, true, factory)
+        let output = self.join_probe_chunks(chunks)?;
+        self.finish_from_probe_output(output, flags, true)
     }
 
-    #[cfg(test)]
     pub(crate) fn finish_from_probe_output(
         &mut self,
         out: Option<Chunk>,
         merged_build_flags: Option<Vec<bool>>,
         count_build_rows: bool,
-    ) -> Result<Option<Chunk>, String> {
-        self.finish_from_probe_output_with(
+    ) -> ExecutionResult<Option<Chunk>> {
+        let factory = self
+            .construction
+            .clone()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        self.finish_from_probe_output_evaluated(
             out,
             merged_build_flags,
             count_build_rows,
-            &mut reference_join_evaluation_input,
+            factory.as_ref(),
         )
-        .map_err(|error| error.to_string())
     }
 
     pub(crate) fn finish_from_probe_output_evaluated(
@@ -953,7 +993,7 @@ impl HashJoinProbeCore {
                 .batches
                 .into_iter()
                 .next()
-                .ok_or_else(|| "join residual candidate batch missing".to_string())?;
+                .ok_or_else(|| probe_contract("join residual candidate batch missing"))?;
             let candidate_chunk = create_input(
                 candidate,
                 Arc::clone(&self.join_scope_chunk_schema),
@@ -964,14 +1004,15 @@ impl HashJoinProbeCore {
             let mask = mask_arr
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "join residual predicate must return boolean array".to_string())?;
+                .ok_or_else(|| {
+                    probe_contract("join residual predicate must return boolean array")
+                })?;
             if mask.len() != end - offset {
-                return Err((format!(
+                return Err(probe_contract(format_args!(
                     "join residual mask length mismatch: mask={} selection={}",
                     mask.len(),
                     end - offset
-                ))
-                .into());
+                )));
             }
             let matched_before = kept.len();
             for mask_idx in 0..mask.len() {
@@ -999,16 +1040,16 @@ impl HashJoinProbeCore {
         matched: &mut [bool],
         selection: &JoinSelection,
         context: &str,
-    ) -> Result<u64, String> {
+    ) -> Result<u64, ExecutionFailure> {
         let mut newly_marked = 0u64;
         for &probe_row in &selection.probe {
             let slot = probe_row as usize;
             let Some(matched_slot) = matched.get_mut(slot) else {
-                return Err(format!(
+                return Err(probe_contract(format_args!(
                     "{context} probe row out of bounds: row={} rows={}",
                     slot,
                     matched.len()
-                ));
+                )));
             };
             if !*matched_slot {
                 *matched_slot = true;
@@ -1080,12 +1121,11 @@ impl HashJoinProbeCore {
                 let probe_row = probe_rows[probe_pos];
                 let probe_slot = probe_row as usize;
                 let Some(matched_slot) = matched.get(probe_slot) else {
-                    return Err((format!(
+                    return Err(probe_contract(format_args!(
                         "{context} probe row out of bounds: row={} rows={}",
                         probe_slot,
                         matched.len()
-                    ))
-                    .into());
+                    )));
                 };
                 if *matched_slot {
                     probe_pos += 1;
@@ -1108,7 +1148,7 @@ impl HashJoinProbeCore {
                 let appended = selection.len() - before_len;
                 build_pos = build_pos
                     .checked_add(appended)
-                    .ok_or_else(|| "join residual cross selection overflow".to_string())?;
+                    .ok_or_else(|| probe_contract("join residual cross selection overflow"))?;
                 if build_pos >= build_rows.len() {
                     probe_pos += 1;
                     build_pos = 0;
@@ -1139,16 +1179,16 @@ impl HashJoinProbeCore {
     fn build_unmatched_build_output_from_flags(
         &mut self,
         flags: &[bool],
-    ) -> Result<Option<RecordBatch>, String> {
+    ) -> Result<Option<RecordBatch>, ExecutionFailure> {
         let Some(build_chunk) = self.require_build_chunk("unmatched build output")? else {
             return Ok(None);
         };
         if flags.len() != build_chunk.len() {
-            return Err(format!(
+            return Err(probe_contract(format_args!(
                 "join build match flags length mismatch: flags={} build_rows={}",
                 flags.len(),
                 build_chunk.len()
-            ));
+            )));
         }
         let indices = flags
             .iter()
@@ -1188,14 +1228,14 @@ impl HashJoinProbeCore {
         &mut self,
         flags: &[bool],
         want_matched: bool,
-    ) -> Result<Option<RecordBatch>, String> {
+    ) -> Result<Option<RecordBatch>, ExecutionFailure> {
         self.build_right_semi_anti_output_from_flat_flags(flags, want_matched)
     }
 
     pub(crate) fn build_right_semi_anti_output(
         &mut self,
         want_matched: bool,
-    ) -> Result<Option<RecordBatch>, String> {
+    ) -> Result<Option<RecordBatch>, ExecutionFailure> {
         if self
             .build_chunk
             .as_ref()
@@ -1216,16 +1256,16 @@ impl HashJoinProbeCore {
         &mut self,
         flags: &[bool],
         want_matched: bool,
-    ) -> Result<Option<RecordBatch>, String> {
+    ) -> Result<Option<RecordBatch>, ExecutionFailure> {
         let Some(build_chunk) = self.build_chunk.as_ref() else {
             return Ok(None);
         };
         if flags.len() != build_chunk.len() {
-            return Err(format!(
+            return Err(probe_contract(format_args!(
                 "join build match flags length mismatch: flags={} build_rows={}",
                 flags.len(),
                 build_chunk.len()
-            ));
+            )));
         }
         let mask = flags
             .iter()
@@ -1234,7 +1274,11 @@ impl HashJoinProbeCore {
         let mask = BooleanArray::from(mask);
         let output_start = std::time::Instant::now();
         let filtered =
-            filter_record_batch(&build_chunk.record_batch(), &mask).map_err(|e| e.to_string())?;
+            filter_record_batch(&build_chunk.record_batch(), &mask).map_err(|cause| {
+                ExecutionFailure::from_domain(super::join_hash_map::gather::GatherKernelFailure(
+                    cause,
+                ))
+            })?;
         self.record_out_build_ns(output_start);
         if filtered.num_rows() == 0 {
             return Ok(None);
@@ -1283,159 +1327,14 @@ impl HashJoinProbeCore {
         )?))
     }
 
-    fn join_inner(
-        &mut self,
-        probe_chunks: Vec<Chunk>,
-        evaluate: &mut ExprEvaluationCallback<'_>,
-        create_input: &mut JoinInputCreator<'_>,
-    ) -> Result<Option<Chunk>, ExecutionFailure> {
-        let build_chunk_opt = self.build_chunk.clone();
-        if self.probe_keys.is_empty()
-            && build_chunk_opt
-                .as_ref()
-                .map(|chunk| chunk.is_empty())
-                .unwrap_or(true)
-        {
-            return Ok(None);
-        }
-        let output_schema = Arc::clone(
-            self.output_schema
-                .get_or_insert_with(|| Arc::clone(&self.join_scope_schema)),
-        );
-
-        let mut output_batches = Vec::new();
-        let mut residual_applied_during_selection = false;
-        if self.probe_keys.is_empty() {
-            let Some(right) = build_chunk_opt.as_ref() else {
-                return Ok(None);
-            };
-            for left in &probe_chunks {
-                let batches = cross_join_batches(&left, right, &output_schema)?;
-                output_batches.extend(batches);
-            }
-        } else {
-            let Some(table) = self.build_table.clone() else {
-                return Ok(None);
-            };
-            let Some(build_chunk) = self.build_chunk.clone() else {
-                return Ok(None);
-            };
-            if table.is_empty() || build_chunk.is_empty() {
-                return Ok(None);
-            }
-            residual_applied_during_selection = self.residual_predicate.is_some();
-            for probe in &probe_chunks {
-                let search_start = std::time::Instant::now();
-                let (mut selection, stats) =
-                    table.search_pairs_evaluated(&self.probe_keys, &probe, evaluate)?;
-                self.record_search_ns(search_start);
-                self.lookup_hit_rows = self.lookup_hit_rows.saturating_add(stats.lookup_hit_rows);
-                self.lookup_miss_rows =
-                    self.lookup_miss_rows.saturating_add(stats.lookup_miss_rows);
-                if selection.is_empty() {
-                    continue;
-                }
-                if let Some(pred) = self.residual_predicate {
-                    self.residual_rows_checked = self
-                        .residual_rows_checked
-                        .saturating_add(stats.lookup_hit_rows);
-                    self.residual_group_rows_total = self
-                        .residual_group_rows_total
-                        .saturating_add(selection.len() as u64);
-                    self.compact_selection_by_residual(
-                        &probe,
-                        &build_chunk,
-                        &mut selection,
-                        pred,
-                        evaluate,
-                        create_input,
-                    )?;
-                }
-                if selection.is_empty() {
-                    continue;
-                }
-                let all_match_one = is_all_match_one(&selection, probe.len());
-                let gathered =
-                    crate::exec::operators::hashjoin::join_hash_map::gather::gather_probe_build_batches(
-                        &probe,
-                        build_chunk.as_ref(),
-                        &selection.probe,
-                        &selection.build,
-                        &output_schema,
-                        self.probe_is_left,
-                        all_match_one,
-                    )?;
-                self.record_out_timings(gathered.timings);
-                output_batches.extend(gathered.batches);
-            }
-        }
-
-        if !residual_applied_during_selection && let Some(pred) = self.residual_predicate {
-            let mut filtered = Vec::with_capacity(output_batches.len());
-            for batch in output_batches.into_iter() {
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let mut sources = probe_chunks.iter().collect::<Vec<_>>();
-                if let Some(build) = build_chunk_opt.as_ref() {
-                    sources.push(build.as_ref());
-                }
-                let chunk = create_input(
-                    batch,
-                    Arc::clone(&self.join_scope_chunk_schema),
-                    &sources,
-                    &[],
-                )?;
-                let mask_arr = evaluate(pred, &chunk)?;
-                let mask = mask_arr
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| {
-                        "join residual predicate must return boolean array".to_string()
-                    })?;
-                let filtered_batch = filter_record_batch(&chunk.record_batch(), mask)
-                    .map_err(|e| format!("join residual filter failed: {e}"))?;
-                if filtered_batch.num_rows() > 0 {
-                    filtered.push(filtered_batch);
-                }
-            }
-            output_batches = filtered;
-        }
-
-        if output_batches.is_empty() {
-            return Ok(None);
-        }
-        let output_rows: usize = output_batches.iter().map(|b| b.num_rows()).sum();
-        self.output_rows = self.output_rows.saturating_add(output_rows as u64);
-        let mut sources = probe_chunks.iter().collect::<Vec<_>>();
-        if let Some(build) = &build_chunk_opt {
-            sources.push(build.as_ref());
-        }
-        let first = create_input(
-            output_batches.remove(0),
-            Arc::clone(&self.join_scope_chunk_schema),
-            &sources,
-            &[],
-        )?;
-        for batch in output_batches {
-            self.pending_output_batches.push_back(create_input(
-                batch,
-                Arc::clone(&self.join_scope_chunk_schema),
-                &sources,
-                &[],
-            )?);
-        }
-        Ok(Some(first))
-    }
-
     fn join_outer(
         &mut self,
         probe_chunks: Vec<Chunk>,
         evaluate: &mut ExprEvaluationCallback<'_>,
         create_input: &mut JoinInputCreator<'_>,
-    ) -> Result<Option<Chunk>, ExecutionFailure> {
+    ) -> ExecutionResult<Option<Chunk>> {
         if self.probe_keys.is_empty() {
-            return Err(("outer join requires non-empty eq join keys".to_string()).into());
+            return Err(probe_contract("outer join requires non-empty eq join keys"));
         }
         let output_schema = self.outer_output_schema();
         let output_unmatched_probe =
@@ -1586,7 +1485,9 @@ impl HashJoinProbeCore {
         create_input: &mut JoinInputCreator<'_>,
     ) -> Result<Option<Chunk>, ExecutionFailure> {
         if self.probe_keys.is_empty() {
-            return Err(("semi/anti join requires non-empty eq join keys".to_string()).into());
+            return Err(probe_contract(
+                "semi/anti join requires non-empty eq join keys",
+            ));
         }
 
         if self.probe_is_left && matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti)
@@ -1738,8 +1639,12 @@ impl HashJoinProbeCore {
                     .collect::<Vec<bool>>();
                 let output_start = std::time::Instant::now();
                 let mask = BooleanArray::from(keep);
-                let filtered_batch = filter_record_batch(&probe.record_batch(), &mask)
-                    .map_err(|e| format!("semi/anti filter failed: {e}"))?;
+                let filtered_batch =
+                    filter_record_batch(&probe.record_batch(), &mask).map_err(|cause| {
+                        ExecutionFailure::from_domain(
+                            super::join_hash_map::gather::GatherKernelFailure(cause),
+                        )
+                    })?;
                 self.record_out_probe_ns(output_start);
                 if filtered_batch.num_rows() > 0 {
                     output_batches.push(filtered_batch);
@@ -1792,12 +1697,11 @@ impl HashJoinProbeCore {
                 table.search_membership_evaluated(&self.probe_keys, &probe, evaluate)?;
             self.record_search_ns(search_start);
             if membership.len() != probe.len() {
-                return Err((format!(
+                return Err(probe_contract(format_args!(
                     "semi/anti membership length mismatch: membership={} rows={}",
                     membership.len(),
                     probe.len()
-                ))
-                .into());
+                )));
             }
             self.lookup_hit_rows = self.lookup_hit_rows.saturating_add(stats.lookup_hit_rows);
             self.lookup_miss_rows = self.lookup_miss_rows.saturating_add(stats.lookup_miss_rows);
@@ -1809,8 +1713,12 @@ impl HashJoinProbeCore {
                 .collect::<Vec<bool>>();
             let output_start = std::time::Instant::now();
             let mask = BooleanArray::from(keep);
-            let filtered_batch = filter_record_batch(&probe.record_batch(), &mask)
-                .map_err(|e| format!("semi/anti membership filter failed: {e}"))?;
+            let filtered_batch =
+                filter_record_batch(&probe.record_batch(), &mask).map_err(|cause| {
+                    ExecutionFailure::from_domain(
+                        super::join_hash_map::gather::GatherKernelFailure(cause),
+                    )
+                })?;
             self.record_out_probe_ns(output_start);
             if filtered_batch.num_rows() > 0 {
                 output_batches.push(filtered_batch);
@@ -1848,7 +1756,9 @@ impl HashJoinProbeCore {
         create_input: &mut JoinInputCreator<'_>,
     ) -> Result<Option<Chunk>, ExecutionFailure> {
         if self.probe_keys.is_empty() {
-            return Err(("semi/anti join requires non-empty eq join keys".to_string()).into());
+            return Err(probe_contract(
+                "semi/anti join requires non-empty eq join keys",
+            ));
         }
         if self.global_build_row_count == 0 {
             let output_schema = probe_chunks[0].schema();
@@ -1887,11 +1797,9 @@ impl HashJoinProbeCore {
             return Ok(None);
         }
         if has_residual && self.build_null_key_rows.is_none() {
-            return Err(
-                ("null-aware left anti join with residual requires build null-key rows"
-                    .to_string())
-                .into(),
-            );
+            return Err(probe_contract(
+                "null-aware left anti join with residual requires build null-key rows",
+            ));
         }
 
         let build_null_key_rows = self.build_null_key_rows.clone();
@@ -2000,12 +1908,10 @@ impl HashJoinProbeCore {
                     else {
                         return Ok(None);
                     };
+                    super::join_hash_table::checked_row_count(0, build_chunk.len())?;
                     let all_build_rows = (0..build_chunk.len())
-                        .map(|row| {
-                            u32::try_from(row)
-                                .map_err(|_| "join residual build row id overflow".to_string())
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
+                        .map(|row| row as u32)
+                        .collect::<Vec<_>>();
                     let probe_rows = probe_null_rows
                         .iter()
                         .enumerate()
@@ -2043,8 +1949,12 @@ impl HashJoinProbeCore {
 
             let output_start = std::time::Instant::now();
             let mask = BooleanArray::from(keep);
-            let filtered_batch = filter_record_batch(&probe.record_batch(), &mask)
-                .map_err(|e| format!("null-aware anti filter failed: {e}"))?;
+            let filtered_batch =
+                filter_record_batch(&probe.record_batch(), &mask).map_err(|cause| {
+                    ExecutionFailure::from_domain(
+                        super::join_hash_map::gather::GatherKernelFailure(cause),
+                    )
+                })?;
             self.record_out_probe_ns(output_start);
             if filtered_batch.num_rows() > 0 {
                 output_batches.push(filtered_batch);
@@ -2145,7 +2055,7 @@ impl HashJoinProbeCore {
         Ok(())
     }
 
-    fn apply_runtime_filters(&self, chunks: Vec<Chunk>) -> Result<Vec<Chunk>, String> {
+    fn apply_runtime_filters(&self, chunks: Vec<Chunk>) -> Result<Vec<Chunk>, ExecutionFailure> {
         Ok(chunks)
     }
 
@@ -2235,7 +2145,10 @@ mod tests {
         let v_arr = Arc::new(Int32Array::from(v.to_vec())) as ArrayRef;
         let batch =
             RecordBatch::try_new(Arc::clone(&schema), vec![k_arr, v_arr]).expect("record batch");
-        Chunk::new_with_chunk_schema(batch, chunk_schema_of(&schema, slot_ids))
+        super::super::probe_step_test_support::int32_source(Chunk::new_with_chunk_schema(
+            batch,
+            chunk_schema_of(&schema, slot_ids),
+        ))
     }
 
     fn int32_values(chunk: &Chunk, column: usize) -> Vec<Option<i32>> {
@@ -2346,7 +2259,7 @@ mod tests {
         let join_scope_schema = join_schema(&left_schema, &right_schema);
         let mut arena = ExprArena::default();
         let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
-        HashJoinProbeCore::new_native(
+        fixture_core(HashJoinProbeCore::new_native(
             Arc::new(arena),
             JoinType::LeftSemi,
             vec![probe_key],
@@ -2364,7 +2277,7 @@ mod tests {
                     RIGHT_W_SLOT_ID,
                 ],
             ),
-        )
+        ))
     }
 
     #[allow(
@@ -2385,6 +2298,29 @@ mod tests {
         assert!(!core.build_partition_has_null_key);
     }
 
+    fn fixture_core(mut core: HashJoinProbeCore) -> HashJoinProbeCore {
+        for schema in [
+            &mut core.left_chunk_schema,
+            &mut core.right_chunk_schema,
+            &mut core.join_scope_chunk_schema,
+        ] {
+            let ids = schema
+                .slots()
+                .iter()
+                .map(|slot| slot.slot_id())
+                .collect::<Vec<_>>();
+            *schema = super::super::probe_step_test_support::int32_schema(
+                &schema.arrow_schema_ref(),
+                &ids,
+            );
+        }
+        let (_, factory) = super::super::probe_step_test_support::factory(Arc::new(
+            crate::runtime::runtime_state::RuntimeErrorState::default(),
+        ));
+        core.set_construction_factory(factory);
+        core
+    }
+
     #[test]
     fn set_build_artifact_rejects_component_contract_mismatch() {
         let left_schema = schema_kv("lk", "lv");
@@ -2403,7 +2339,7 @@ mod tests {
         );
         let artifact = Arc::new(direct_set_build_artifact_from_build_chunk(build_chunk));
 
-        let mut core = HashJoinProbeCore::new_native(
+        let mut core = fixture_core(HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::Inner,
             vec![probe_key],
@@ -2421,12 +2357,15 @@ mod tests {
                     RIGHT_W_SLOT_ID,
                 ],
             ),
-        );
+        ));
 
         let err = core
             .set_build_artifact(artifact, 1, false)
             .expect_err("probe core must validate build artifact contract");
-        assert!(err.contains("component contract mismatch"), "err={err}");
+        assert!(
+            err.detail().contains("component contract mismatch"),
+            "err={err}"
+        );
     }
 
     #[test]
@@ -2467,7 +2406,7 @@ mod tests {
             None,
         ));
 
-        let mut core = HashJoinProbeCore::new_native(
+        let mut core = fixture_core(HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::LeftSemi,
             vec![probe_key],
@@ -2485,11 +2424,11 @@ mod tests {
                     RIGHT_W_SLOT_ID,
                 ],
             ),
-        );
+        ));
         let err = core
             .set_build_artifact(artifact, build_chunk.len(), false)
             .expect_err("residual semi must require row payload");
-        assert!(err.contains("row payload required"));
+        assert!(err.detail().contains("row payload required"));
     }
 
     #[test]
@@ -2514,7 +2453,7 @@ mod tests {
             None,
         ));
 
-        let mut core = HashJoinProbeCore::new_native(
+        let mut core = fixture_core(HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::Inner,
             Vec::new(),
@@ -2532,7 +2471,7 @@ mod tests {
                     RIGHT_W_SLOT_ID,
                 ],
             ),
-        );
+        ));
         core.set_build_artifact(artifact, build_chunk.len(), false)
             .expect("cross join build artifact should not require lookup table");
 
@@ -2589,7 +2528,7 @@ mod tests {
         );
         let artifact = Arc::new(direct_build_artifact_from_build_chunk(build_chunk));
 
-        let mut core = HashJoinProbeCore::new_native(
+        let mut core = fixture_core(HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::Inner,
             vec![probe_key],
@@ -2607,7 +2546,7 @@ mod tests {
                     RIGHT_W_SLOT_ID,
                 ],
             ),
-        );
+        ));
         core.set_build_artifact(artifact, 3, false)
             .expect("set build");
 
@@ -2651,7 +2590,7 @@ mod tests {
             None,
         ));
 
-        let mut core = HashJoinProbeCore::new_native(
+        let mut core = fixture_core(HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::LeftOuter,
             vec![probe_key],
@@ -2669,7 +2608,7 @@ mod tests {
                     RIGHT_W_SLOT_ID,
                 ],
             ),
-        );
+        ));
         core.set_build_artifact(artifact, 1, false)
             .expect("set build");
 
@@ -2718,7 +2657,7 @@ mod tests {
             None,
         ));
 
-        let mut core = HashJoinProbeCore::new_native(
+        let mut core = fixture_core(HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::FullOuter,
             vec![probe_key],
@@ -2736,7 +2675,7 @@ mod tests {
                     RIGHT_W_SLOT_ID,
                 ],
             ),
-        );
+        ));
         core.set_build_artifact(artifact, 3, false)
             .expect("set build");
 
@@ -2797,7 +2736,7 @@ mod tests {
         );
         let artifact = Arc::new(direct_set_build_artifact_from_build_chunk(build_chunk));
 
-        let mut core = HashJoinProbeCore::new_native(
+        let mut core = fixture_core(HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::LeftSemi,
             vec![probe_key],
@@ -2815,7 +2754,7 @@ mod tests {
                     RIGHT_W_SLOT_ID,
                 ],
             ),
-        );
+        ));
         core.set_build_artifact(artifact, 3, false)
             .expect("set build");
 
@@ -2855,7 +2794,7 @@ mod tests {
         );
         let artifact = Arc::new(direct_set_build_artifact_from_build_chunk(build_chunk));
 
-        let mut core = HashJoinProbeCore::new_native(
+        let mut core = fixture_core(HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::LeftAnti,
             vec![probe_key],
@@ -2873,7 +2812,7 @@ mod tests {
                     RIGHT_W_SLOT_ID,
                 ],
             ),
-        );
+        ));
         core.set_build_artifact(artifact, 3, false)
             .expect("set build");
 
@@ -2916,7 +2855,7 @@ mod tests {
         );
         let artifact = Arc::new(direct_build_artifact_from_build_chunk(build_chunk));
 
-        let mut core = HashJoinProbeCore::new_native(
+        let mut core = fixture_core(HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::LeftSemi,
             vec![probe_key],
@@ -2934,7 +2873,7 @@ mod tests {
                     RIGHT_W_SLOT_ID,
                 ],
             ),
-        );
+        ));
         core.set_build_artifact(artifact, 3, false)
             .expect("set build");
 
@@ -2976,7 +2915,7 @@ mod tests {
         );
         let artifact = Arc::new(direct_build_artifact_from_build_chunk(build_chunk));
 
-        let mut core = HashJoinProbeCore::new_native(
+        let mut core = fixture_core(HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::LeftAnti,
             vec![probe_key],
@@ -2994,7 +2933,7 @@ mod tests {
                     RIGHT_W_SLOT_ID,
                 ],
             ),
-        );
+        ));
         core.set_build_artifact(artifact, 3, false)
             .expect("set build");
 
@@ -3043,11 +2982,12 @@ mod tests {
             .expect_err("join concat must reject actual-widen decimal");
 
         assert!(
-            err.contains("join merge type mismatch at column 0"),
+            err.detail()
+                .contains("join merge type mismatch at column 0"),
             "err={err}"
         );
-        assert!(err.contains("Decimal128(10, 2)"), "err={err}");
-        assert!(err.contains("Decimal128(38, 2)"), "err={err}");
+        assert!(err.detail().contains("Decimal128(10, 2)"), "err={err}");
+        assert!(err.detail().contains("Decimal128(38, 2)"), "err={err}");
     }
 
     #[test]
@@ -3120,7 +3060,7 @@ mod tests {
             None,
         ));
 
-        let mut core = HashJoinProbeCore::new_native(
+        let mut core = fixture_core(HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::RightSemi,
             vec![probe_key],
@@ -3138,7 +3078,7 @@ mod tests {
                     RIGHT_W_SLOT_ID,
                 ],
             ),
-        );
+        ));
         core.set_build_artifact(artifact, 1, false)
             .expect("set build");
 
@@ -3187,7 +3127,7 @@ mod tests {
             Some(Arc::new(Vec::new())),
         ));
 
-        let mut core = HashJoinProbeCore::new_native(
+        let mut core = fixture_core(HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::NullAwareLeftAnti,
             vec![probe_key],
@@ -3205,7 +3145,7 @@ mod tests {
                     RIGHT_W_SLOT_ID,
                 ],
             ),
-        );
+        ));
         core.set_build_artifact(artifact, 3, false)
             .expect("set build");
 
@@ -3246,7 +3186,7 @@ mod tests {
             false,
             Some(Arc::new(Vec::new())),
         ));
-        let mut core = HashJoinProbeCore::new_native(
+        let mut core = fixture_core(HashJoinProbeCore::new_native(
             Arc::clone(&arena),
             JoinType::NullAwareLeftAnti,
             vec![probe_key],
@@ -3264,7 +3204,7 @@ mod tests {
                     RIGHT_W_SLOT_ID,
                 ],
             ),
-        );
+        ));
         core.set_build_artifact(artifact, 1, false)
             .expect("set build");
 
@@ -3363,21 +3303,35 @@ mod tests {
             &[1, 2, 40],
         );
 
-        (core, arena, probe_key, residual, probe_chunk)
+        (fixture_core(core), arena, probe_key, residual, probe_chunk)
     }
 
     #[test]
     fn null_aware_evaluated_probe_preserves_repeated_key_order_and_derived_scope() {
         let (mut core, arena, key, residual, probe) = evaluated_null_aware_fixture();
         let mut calls = Vec::new();
+        let factory = core.construction.clone().expect("fixture creator");
+        let control = crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        );
         let out = core
             .join_probe_chunks_with(
                 vec![probe],
                 &mut |id, input| {
                     calls.push((id, input.len(), input.record_batch().num_columns()));
-                    arena.eval(id, input).map_err(Into::into)
+                    {
+                        let owner = factory.begin_input_construction(input)?;
+                        crate::exec::expr::ExprEvaluationContext::new(
+                            &arena,
+                            owner.as_ref(),
+                            &control,
+                        )
+                        .eval(id, input)
+                    }
                 },
-                &mut reference_join_evaluation_input,
+                &mut |batch, schema, sources, nullable_slots| {
+                    create_join_input(batch, schema, sources, nullable_slots, factory.as_ref())
+                },
             )
             .unwrap()
             .unwrap();
@@ -3411,10 +3365,20 @@ mod tests {
         .into_iter()
         .map(Into::into)
         .collect();
-        failures.push(ExecutionFailure::from("cancelled").at_operator(41, PipelineOperation::Pull));
+        failures.push(
+            ExecutionFailure::from(KernelFailure::Operational(KernelDiagnostic::new(
+                "cancelled",
+            )))
+            .at_operator(41, PipelineOperation::Pull),
+        );
         for original in failures {
             for stop in 0..4 {
                 let (mut core, arena, _, _, probe) = evaluated_null_aware_fixture();
+                let factory = core.construction.clone().expect("fixture creator");
+                let control =
+                    crate::exec::operators::compiled_expression::RuntimeKernelControl::new(
+                        Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+                    );
                 let mut calls = 0;
                 let failure = core
                     .join_probe_chunks_with(
@@ -3426,9 +3390,25 @@ mod tests {
                             if at == stop {
                                 return Err(original.clone());
                             }
-                            arena.eval(id, input).map_err(Into::into)
+                            {
+                                let owner = factory.begin_input_construction(input)?;
+                                crate::exec::expr::ExprEvaluationContext::new(
+                                    &arena,
+                                    owner.as_ref(),
+                                    &control,
+                                )
+                                .eval(id, input)
+                            }
                         },
-                        &mut reference_join_evaluation_input,
+                        &mut |batch, schema, sources, nullable_slots| {
+                            create_join_input(
+                                batch,
+                                schema,
+                                sources,
+                                nullable_slots,
+                                factory.as_ref(),
+                            )
+                        },
                     )
                     .unwrap_err();
                 assert_eq!(failure, original, "evaluation ordinal {stop}");

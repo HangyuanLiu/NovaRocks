@@ -14,7 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 use super::*;
+use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use allocator_api2::alloc::{AllocError, Allocator, Global};
 use arrow_array::{NullArray, UInt64Array};
 use std::{
@@ -36,7 +38,11 @@ unsafe impl Allocator for Storage {
     }
 }
 impl ScalarStateAllocator for Storage {
-    fn scalar_allocation_error(&self, _: &str) -> ScalarStateError {
+    fn scalar_allocation_error<E: crate::allocation_failure::AllocationRefusalSource>(
+        &self,
+        _: &str,
+        _source: E,
+    ) -> crate::KernelFailure {
         KernelFailure::ResourceExhausted.into()
     }
 }
@@ -83,16 +89,23 @@ impl MannResources for Observe {
         }
     }
 }
-fn legacy<T>(result: Result<T, ScalarStateError>) -> String {
+fn domain_message<T>(result: Result<T, MannFailure>) -> String {
     match result {
-        Err(ScalarStateError::Legacy(message)) => message,
-        _ => panic!("expected full original data error"),
+        Err(MannFailure::Value(source)) => source.to_string(),
+        Err(MannFailure::Kernel(source)) => {
+            assert_eq!(
+                novarocks_failure_contract::FailureProjection::failure_fact(&source).class(),
+                novarocks_failure_contract::FailureClass::Invariant
+            );
+            source.to_string()
+        }
+        _ => panic!("expected actual domain refusal"),
     }
 }
 fn input<'a>(
     args: &'a [ArrayRef],
     events: &mut Observe,
-) -> Result<MannWhitneyInput<'a>, ScalarStateError> {
+) -> Result<MannWhitneyInput<'a>, MannFailure> {
     MannWhitneyInput::try_new_channels_with_resources(
         std::array::from_fn(|i| args.get(i)),
         args.len(),
@@ -124,7 +137,7 @@ fn state(alternative: TestingAlternative, count: usize) -> MannWhitneyState<Stor
 fn mann_whitney_resources_setup_events_precede_original_errors_even_without_rows() {
     let mut events = Observe::default();
     assert_eq!(
-        legacy(input(&[], &mut events)),
+        domain_message(input(&[], &mut events)),
         "mann_whitney_u_test expects 2 to 4 arguments"
     );
     assert_eq!(
@@ -142,8 +155,8 @@ fn mann_whitney_resources_setup_events_precede_original_errors_even_without_rows
     ];
     let mut events = Observe::default();
     assert_eq!(
-        legacy(input(&args, &mut events)),
-        "mann_whitney_u_test expects boolean or integer treatment"
+        domain_message(input(&args, &mut events)),
+        "mann_whitney_u_test expects boolean or integer treatment; got Utf8"
     );
     assert_eq!(events.events, vec![Event::Int(DataType::Utf8, true)]);
     for cause in causes() {
@@ -152,7 +165,7 @@ fn mann_whitney_resources_setup_events_precede_original_errors_even_without_rows
             ..Observe::default()
         };
         assert!(
-            matches!(input(&args, &mut events), Err(ScalarStateError::Kernel(actual)) if actual == cause)
+            matches!(input(&args, &mut events), Err(MannFailure::Kernel(actual)) if actual == cause)
         );
         assert_eq!(events.events.len(), 1);
     }
@@ -239,14 +252,7 @@ fn mann_whitney_resources_static_integer_events_keep_treatment_context_and_typed
                 )
                 .map(|_| ())
             };
-            assert_eq!(
-                legacy(result),
-                if replacement {
-                    "mann_whitney_u_test expects boolean or integer treatment"
-                } else {
-                    message
-                }
-            );
+            assert_eq!(domain_message(result), message);
             assert_eq!(
                 events.events,
                 vec![Event::Static(
@@ -269,14 +275,14 @@ fn mann_whitney_resources_static_integer_events_keep_treatment_context_and_typed
                     &mut ScalarWork::new(None),
                     &mut events,
                 );
-                assert!(matches!(result, Err(ScalarStateError::Kernel(actual)) if actual == cause));
+                assert!(matches!(result, Err(MannFailure::Kernel(actual)) if actual == cause));
             }
         }
     }
     let boolean: ArrayRef = Arc::new(Wrapped(Arc::new(BooleanArray::from(vec![true]))));
     let mut events = Observe::default();
     assert_eq!(
-        legacy(TreatmentArrayView::new_with_resources(
+        domain_message(TreatmentArrayView::new_with_resources(
             &boolean,
             &mut ScalarWork::new(None),
             &mut events
@@ -291,13 +297,14 @@ fn mann_whitney_resources_static_integer_events_keep_treatment_context_and_typed
 
 #[test]
 fn mann_whitney_resources_row_frontiers_preserve_first_parameters_and_null_skips() {
-    for (alternative, continuity, treatment, expected, event_count) in [
+    for (alternative, continuity, treatment, expected, event_count, contract_failure) in [
         (
             "invalid",
             -1,
             None,
             Some("Logical Error: invalid alternative `invalid`."),
             1,
+            false,
         ),
         (
             "LESS",
@@ -305,14 +312,16 @@ fn mann_whitney_resources_row_frontiers_preserve_first_parameters_and_null_skips
             None,
             Some("Logical Error: continuity_correction must be non-negative."),
             2,
+            false,
         ),
-        ("LESS", 0, None, None, 1),
+        ("LESS", 0, None, None, 1, false),
         (
             "LESS",
             0,
             Some(true),
             Some("unsupported scalar type: UInt64"),
             2,
+            true,
         ),
     ] {
         let args: [ArrayRef; 4] = [
@@ -331,7 +340,17 @@ fn mann_whitney_resources_row_frontiers_preserve_first_parameters_and_null_skips
             &mut events,
         );
         match expected {
-            Some(message) => assert_eq!(legacy(result), message),
+            Some(message) if contract_failure => {
+                let Err(MannFailure::Kernel(cause)) = result else {
+                    panic!("reader contract cause")
+                };
+                assert_eq!(
+                    novarocks_failure_contract::FailureProjection::failure_fact(&cause).class(),
+                    novarocks_failure_contract::FailureClass::Invariant
+                );
+                assert_eq!(cause.to_string(), message);
+            }
+            Some(message) => assert_eq!(domain_message(result), message),
             None => result.unwrap(),
         }
         assert_eq!(events.events.len(), event_count);
@@ -387,7 +406,7 @@ fn mann_whitney_resources_each_row_frontier_refusal_keeps_all_seven_causes() {
             let input = input(&args, &mut events).unwrap();
             let mut state = MannWhitneyState::new(Storage::default());
             assert!(
-                matches!(input.update_row_with_resources(&mut state, [0;4], &mut ScalarWork::new(None), &mut events), Err(ScalarStateError::Kernel(actual)) if actual == cause)
+                matches!(input.update_row_with_resources(&mut state, [0;4], &mut ScalarWork::new(None), &mut events), Err(MannFailure::Kernel(actual)) if actual == cause)
             );
             assert_eq!(events.events.len(), at + 1);
             assert!(!state.has_samples());
@@ -403,7 +422,7 @@ fn mann_whitney_resources_merge_frontier_follows_compatibility_and_precedes_sort
     let before = left.extents();
     let mut events = Observe::default();
     assert_eq!(
-        legacy(left.merge_with_resources(right, &mut ScalarWork::new(None), &mut events)),
+        domain_message(left.merge_with_resources(right, &mut ScalarWork::new(None), &mut events)),
         "mann_whitney_u_test state parameters mismatch"
     );
     assert_eq!(
@@ -424,7 +443,7 @@ fn mann_whitney_resources_merge_frontier_follows_compatibility_and_precedes_sort
             ..Observe::default()
         };
         assert!(
-            matches!(left.merge_with_resources(right, &mut ScalarWork::new(None), &mut events), Err(ScalarStateError::Kernel(actual)) if actual == cause)
+            matches!(left.merge_with_resources(right, &mut ScalarWork::new(None), &mut events), Err(MannFailure::Kernel(actual)) if actual == cause)
         );
         assert_eq!(events.events, vec![Event::Scratch(before, other)]);
         assert_eq!(left.extents(), before);
@@ -440,7 +459,7 @@ fn mann_whitney_resources_merge_frontier_follows_compatibility_and_precedes_sort
 }
 
 #[test]
-fn mann_whitney_resources_decode_reserves_original_samples_before_payload_shortage() {
+fn mann_whitney_resources_decode_validates_payload_before_sample_allocation() {
     let mut data = vec![1];
     data.extend_from_slice(&1i64.to_le_bytes());
     data.extend_from_slice(&1u32.to_le_bytes());
@@ -448,7 +467,7 @@ fn mann_whitney_resources_decode_reserves_original_samples_before_payload_shorta
     let allocator = Storage::default();
     let mut events = Observe::default();
     assert_eq!(
-        legacy(MannWhitneyState::deserialize_in_with_resources(
+        domain_message(MannWhitneyState::deserialize_in_with_resources(
             &data,
             allocator.clone(),
             &mut ScalarWork::new(None),
@@ -456,7 +475,7 @@ fn mann_whitney_resources_decode_reserves_original_samples_before_payload_shorta
         )),
         "mann_whitney_u_test deserialize: buffer too short"
     );
-    assert_eq!(*allocator.0.lock().unwrap(), vec![8]);
+    assert!(allocator.0.lock().unwrap().is_empty());
     assert_eq!(
         events.events,
         vec![Event::Static(
@@ -471,14 +490,14 @@ fn mann_whitney_resources_decode_reserves_original_samples_before_payload_shorta
             ..Observe::default()
         };
         assert!(
-            matches!(MannWhitneyState::deserialize_in_with_resources(&data, allocator.clone(), &mut ScalarWork::new(None), &mut events), Err(ScalarStateError::Kernel(actual)) if actual == cause)
+            matches!(MannWhitneyState::deserialize_in_with_resources(&data, allocator.clone(), &mut ScalarWork::new(None), &mut events), Err(MannFailure::Kernel(actual)) if actual == cause)
         );
-        assert_eq!(*allocator.0.lock().unwrap(), vec![8]);
+        assert!(allocator.0.lock().unwrap().is_empty());
     }
     let allocator = Storage::default();
     let mut events = Observe::default();
     assert_eq!(
-        legacy(MannWhitneyState::deserialize_in_with_resources(
+        domain_message(MannWhitneyState::deserialize_in_with_resources(
             &[],
             allocator.clone(),
             &mut ScalarWork::new(None),
@@ -487,4 +506,88 @@ fn mann_whitney_resources_decode_reserves_original_samples_before_payload_shorta
         "mann_whitney_u_test deserialize: buffer too short"
     );
     assert!(allocator.0.lock().unwrap().is_empty());
+}
+
+#[test]
+fn mann_whitney_codec_exact_storage_matches_actual_producer() {
+    use super::super::aggregate_mann_whitney_resources::codec_facts;
+    use crate::arrow_result_custody::RequestUpper;
+    for count in [0, 1, 2, 3, 7, 29, 63, 127, 220, 513, 1024] {
+        let mut state = state(TestingAlternative::TwoSided, count);
+        let actual = state.serialize().unwrap();
+        let (facts, output) = codec_facts(count).unwrap();
+        assert_eq!(output, actual.len());
+        assert_eq!(facts.retained, actual.capacity());
+        assert_eq!(facts.peak, actual.capacity());
+        assert_eq!(
+            facts.requests,
+            RequestUpper {
+                bytes: actual.capacity(),
+                requests: 1
+            }
+        );
+    }
+    assert_eq!(
+        codec_facts(usize::MAX),
+        Err(crate::scalar_resources::ScalarResourceError::Arithmetic)
+    );
+}
+
+#[test]
+fn mann_whitney_untrusted_wire_counts_never_allocate_before_validation() {
+    for lengths in [[1u32, 0], [0, u32::MAX], [u32::MAX, u32::MAX]] {
+        let mut data = vec![1];
+        data.extend_from_slice(&1i64.to_le_bytes());
+        for count in lengths {
+            data.extend_from_slice(&count.to_le_bytes());
+        }
+        let allocator = Storage::default();
+        let failure = MannWhitneyState::deserialize_in(&data, allocator.clone()).unwrap_err();
+        assert!(matches!(
+            failure,
+            MannFailure::Value(MannValueFailure::TruncatedState)
+        ));
+        let fact = novarocks_failure_contract::FailureProjection::failure_fact(
+            &failure.into_kernel_failure(),
+        );
+        assert_eq!(fact.class(), novarocks_failure_contract::FailureClass::Data);
+        assert_eq!(
+            fact,
+            novarocks_failure_contract::FailureProjection::failure_fact(
+                &crate::DataFailureReason::InvalidEncoding
+            )
+        );
+        assert!(allocator.0.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn mann_whitney_wire_count_boundary_keeps_exact_fact_and_original_source() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let ([left, right], bytes) = wire_geometry([u32::MAX as usize, 0]).unwrap();
+    assert_eq!([left, right], [u32::MAX, 0]);
+    assert_eq!(bytes as u128, 17 + 8 * u32::MAX as u128);
+    let required = u32::MAX as usize + 1;
+    let cause = wire_geometry([0, required]).unwrap_err();
+    assert_eq!(cause.failure_fact().class(), FailureClass::Representation);
+    let extent = cause.failure_fact().representation().unwrap();
+    assert_eq!(extent.required, Some(required as u64));
+    assert_eq!(extent.extent_limit, Some(u32::MAX as u64));
+    assert_eq!(extent.representable_prefix, None);
+    let mut source: &(dyn std::error::Error + 'static) = &cause;
+    while !source.is::<std::num::TryFromIntError>() {
+        source = source
+            .source()
+            .expect("original integer conversion failure retained");
+    }
+    let cause = storage_count::<(f64, usize)>(usize::MAX as u128).unwrap_err();
+    assert_eq!(cause.failure_fact().class(), FailureClass::Representation);
+    assert_eq!(
+        cause.failure_fact().representation().unwrap().required,
+        None
+    );
+    let mut source: &(dyn std::error::Error + 'static) = &cause;
+    while !source.is::<std::alloc::LayoutError>() {
+        source = source.source().expect("actual layout failure retained");
+    }
 }

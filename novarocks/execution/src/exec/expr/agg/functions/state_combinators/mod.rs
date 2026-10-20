@@ -53,7 +53,7 @@ mod tests {
     };
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 
-    type UnionFn = fn(&[u8], &[u8]) -> Result<Vec<u8>, String>;
+    type UnionFn = fn(&[u8], &[u8]) -> crate::runtime::fragment::ExecutionResult<Vec<u8>>;
 
     struct MergeCase {
         name: &'static str,
@@ -276,3 +276,5 @@ mod tests {
         }
     }
 }
+
+mod failure;

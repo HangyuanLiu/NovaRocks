@@ -152,7 +152,11 @@ fn timestamp_cast_compiler_controller_all_sixteen_pairs_keep_exact_units_and_leg
                                     (source, target),
                                     (TimeUnit::Microsecond, TimeUnit::Nanosecond)
                                 );
-                                assert!(error.contains("microsecond->nanosecond overflow"));
+                                assert!(
+                                    error
+                                        .to_string()
+                                        .contains("microsecond->nanosecond overflow")
+                                );
                                 assert_eq!(actual[ordinal], None);
                                 expected_errors.push(ordinal);
                             }

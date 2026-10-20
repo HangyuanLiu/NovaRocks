@@ -79,10 +79,13 @@ impl NlJoinSharedState {
         self.node_id
     }
 
-    pub(crate) fn set_build(&self, artifact: Arc<NlJoinBuildArtifact>) -> Result<(), String> {
+    pub(crate) fn set_build(
+        &self,
+        artifact: Arc<NlJoinBuildArtifact>,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let mut guard = self.build.lock().expect("nljoin build lock");
         if guard.is_some() {
-            return Err("nljoin build already set".to_string());
+            return Err(super::failure::contract("nljoin build already set"));
         }
         let total_rows = artifact
             .build_batches

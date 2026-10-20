@@ -75,7 +75,7 @@ impl fmt::Display for FieldPath {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProtocolErrorKind {
     MissingField,
     InvalidEnum,
@@ -128,8 +128,8 @@ impl ProtocolError {
         &self.path
     }
 
-    pub fn kind(&self) -> ProtocolErrorKind {
-        self.kind
+    pub fn kind(&self) -> &ProtocolErrorKind {
+        &self.kind
     }
 
     pub fn detail(&self) -> &str {
@@ -200,7 +200,7 @@ mod tests {
             "root is required",
         );
         assert_eq!(error.path(), &path);
-        assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(error.kind(), &ProtocolErrorKind::MissingField);
         assert_eq!(error.detail(), "root is required");
         assert_eq!(
             error.to_string(),
@@ -221,7 +221,7 @@ mod tests {
                 FieldPath::root("provider_payload")
                     .field("columns")
                     .index(17),
-                ProtocolErrorKind::CompileControl(cause),
+                ProtocolErrorKind::CompileControl(cause.clone()),
                 "decoder stopped before publishing a column",
             );
             // Exercise the actual nested connector adapter, including the
@@ -229,7 +229,10 @@ mod tests {
             let nested =
                 crate::connector_read::nest(FieldPath::root("fragment").field("scan"), error);
             assert_eq!(nested.path().to_string(), "fragment.scan.columns[17]");
-            assert_eq!(nested.kind(), ProtocolErrorKind::CompileControl(cause));
+            assert_eq!(
+                nested.kind(),
+                &ProtocolErrorKind::CompileControl(cause.clone())
+            );
             assert_eq!(
                 nested.detail(),
                 "decoder stopped before publishing a column"
@@ -270,9 +273,54 @@ mod tests {
             let nested =
                 crate::connector_read::nest(FieldPath::root("fragment").field("scan"), error);
             assert_eq!(nested.path().to_string(), "fragment.scan.header");
-            assert_eq!(nested.kind(), ProtocolErrorKind::Capacity);
+            assert_eq!(nested.kind(), &ProtocolErrorKind::Capacity);
             assert_eq!(nested.detail(), diagnostic);
             assert!(nested.source().is_none());
         }
+    }
+}
+
+impl novarocks_execution_contract::failure::FailureProjection for ProtocolError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let (class, code) = match self.kind() {
+            ProtocolErrorKind::CompileControl(cause) => return cause.failure_fact(),
+            ProtocolErrorKind::MissingField => (FailureClass::Data, 1),
+            ProtocolErrorKind::InvalidEnum => (FailureClass::Data, 2),
+            ProtocolErrorKind::InvalidValue => (FailureClass::Data, 3),
+            ProtocolErrorKind::OutOfRange => (FailureClass::Data, 4),
+            ProtocolErrorKind::DuplicateField => (FailureClass::Data, 5),
+            ProtocolErrorKind::InconsistentFields => (FailureClass::Data, 6),
+            ProtocolErrorKind::Unsupported => (FailureClass::Data, 7),
+            ProtocolErrorKind::Conflict => (FailureClass::Data, 8),
+            ProtocolErrorKind::Capacity => (FailureClass::Resource, 9),
+            ProtocolErrorKind::VersionMismatch => (FailureClass::Data, 10),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::PROTOCOL, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+#[cfg(test)]
+mod failure_projection_tests {
+    use super::*;
+    use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+    #[test]
+    fn protocol_fact_preserves_control_and_ignores_misleading_detail() {
+        let cause = novarocks_type_contract::CompileControlError::DeadlineExceeded;
+        let error = ProtocolError::new(
+            FieldPath::root("fixture"),
+            ProtocolErrorKind::CompileControl(cause.clone()),
+            "memory exhausted",
+        );
+        assert_eq!(error.failure_fact(), cause.failure_fact());
+        let error = ProtocolError::new(
+            FieldPath::root("fixture"),
+            ProtocolErrorKind::InvalidValue,
+            "ResourceExhausted",
+        );
+        assert_eq!(error.failure_fact().class(), FailureClass::Data);
+        assert_eq!(error.failure_fact().reason().code(), 3);
     }
 }

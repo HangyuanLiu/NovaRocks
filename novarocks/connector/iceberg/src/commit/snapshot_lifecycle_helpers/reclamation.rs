@@ -1187,6 +1187,7 @@ fn iceberg_error(error: crate::iceberg::Error) -> ConnectorError {
     use novarocks_spi::connector::ConnectorMutationFailureKind as Failure;
     let failure = crate::commit::attempt::before_dispatch_failure(&error);
     let kind = match failure.kind() {
+        Failure::Interrupted => ConnectorErrorKind::Interrupted,
         Failure::Cancelled => ConnectorErrorKind::Cancelled,
         Failure::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
         Failure::PermissionDenied | Failure::Unauthenticated => {
@@ -1202,7 +1203,7 @@ fn iceberg_error(error: crate::iceberg::Error) -> ConnectorError {
         Failure::Internal => ConnectorErrorKind::Internal,
         Failure::Unavailable => ConnectorErrorKind::Unavailable,
     };
-    ConnectorError::new(kind, error.to_string())
+    ConnectorError::from_domain(kind, failure).map_message(|_| error.to_string())
 }
 fn predecessor_read_error(error: crate::iceberg::Error) -> ConnectorError {
     let error = iceberg_error(error);

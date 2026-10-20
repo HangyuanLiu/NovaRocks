@@ -16,31 +16,17 @@
 // under the License.
 
 //! Borrow the original Worker stop/wait loan through Execution's neutral port.
-use novarocks_execution::runtime::preparation_memory::{
-    PreparationMemoryStop, SynchronousPreparationControl,
-};
-use novarocks_worker::{PreparationControlLoan, PreparationStop};
+use novarocks_execution::runtime::preparation_memory::SynchronousPreparationControl;
+use novarocks_worker::PreparationControlLoan;
 
 pub(crate) struct WorkerPreparationMemoryControl<'a> {
     pub(crate) preparation: &'a PreparationControlLoan<'a>,
 }
 impl SynchronousPreparationControl for WorkerPreparationMemoryControl<'_> {
-    fn checkpoint(&self) -> Result<(), PreparationMemoryStop> {
-        self.preparation.checkpoint().map_err(neutral_stop)
+    fn checkpoint(&self) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+        self.preparation.checkpoint()
     }
-    fn wait(&self) -> Result<(), PreparationMemoryStop> {
-        self.preparation.wait().map_err(neutral_stop)
-    }
-}
-fn neutral_stop(stop: PreparationStop) -> PreparationMemoryStop {
-    match stop {
-        PreparationStop::Cancel(cause) => PreparationMemoryStop::Cancel(cause),
-        PreparationStop::Abort(cause) => PreparationMemoryStop::Abort(cause),
-    }
-}
-pub(crate) fn worker_stop(stop: PreparationMemoryStop) -> PreparationStop {
-    match stop {
-        PreparationMemoryStop::Cancel(cause) => PreparationStop::Cancel(cause),
-        PreparationMemoryStop::Abort(cause) => PreparationStop::Abort(cause),
+    fn wait(&self) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+        self.preparation.wait()
     }
 }

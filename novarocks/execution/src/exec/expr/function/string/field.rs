@@ -16,7 +16,8 @@
 // under the License.
 //! Original arena demand order around ONE shared FIELD state computation.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 use novarocks_functions::field_shared::{FieldState, validate_arity};
 pub fn eval_field<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -24,8 +25,8 @@ pub fn eval_field<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    validate_arity(args.len())?;
+) -> ExecutionResult<ArrayRef> {
+    validate_arity(args.len()).map_err(ExecutionFailure::from_domain)?;
     let first = arena.eval(args[0], chunk)?;
     let mut state = FieldState::new(&first, args.len())?;
     for (index, arg) in args[1..].iter().enumerate() {

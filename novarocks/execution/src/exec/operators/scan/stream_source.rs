@@ -29,9 +29,13 @@
 
 // Design: ADR-0159 (docs/adr/ADR-0159-driver-polled-connector-scan-streams.md)
 
-use crate::runtime::fragment::ExecutionResult;
+use crate::exec::pipeline::operator::OperatorLifecycle;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 
-use std::sync::{Arc, Mutex};
+use std::future::Future;
+use std::mem::ManuallyDrop;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
@@ -46,15 +50,17 @@ use super::output_filter::{
 use crate::exec::chunk::Chunk;
 #[cfg(test)]
 use crate::exec::expr::ExprArena;
-use crate::exec::node::scan::{ScanOp, ScanOutputStream, ScanStreamSource};
+use crate::exec::node::scan::{
+    ScanExitBodyProof, ScanExitObservation, ScanOp, ScanOutputStream, ScanStreamSource,
+};
 use crate::exec::operators::runtime_filter::{
     CompiledRuntimeFilterConsumers, RuntimeFilterConsumerState, RuntimeFilterGate,
 };
-use crate::exec::pipeline::operator::{
-    DriverBlockDeadline, FinishWatch, Operator, ProcessorOperator, forward_observable,
-};
+use crate::exec::pipeline::operator::{FinishWatch, Operator, forward_observable};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
+use crate::exec::pipeline::shape::{Source, SourceKernel};
+use crate::exec::pipeline::step::{NextStep, StepResult, WaitFact, WaitReason};
 use crate::runtime::fragment::io::{FragmentEventSink, NoopFragmentEventSink};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
@@ -63,7 +69,8 @@ use crate::runtime::scan_stream_metrics::{ScanStreamPending, observe_scan_stream
 
 /// CPU budget of one driver turn inside a scan stream, in provider work
 /// units (roughly one decoded batch each).
-pub(crate) const SCAN_STREAM_TURN_BUDGET: u64 = 64;
+pub(crate) const SCAN_STREAM_TURN_BUDGET: u64 =
+    crate::exec::pipeline::step_context::DEFAULT_TURN_WORK_UNITS as u64;
 
 /// The operator and profile name of a scan source, always carrying the plan
 /// node id.
@@ -205,16 +212,26 @@ impl OperatorFactory for StreamScanSourceFactory {
         if let Some(blocking) = self.filter.blocking() {
             forward_observable(&blocking.gate_observable(), &readiness.observable());
         }
-        Box::new(StreamScanSourceOperator {
+        Box::new(Source::new(StreamScanSourceOperator {
             name: self.name.clone(),
             limit: self.limit,
             op: Arc::clone(&self.op),
             source: Arc::clone(&self.source),
             stage: StreamStage::Unclaimed,
-            closing: Mutex::new(None),
+            closing: None,
+            close_phase: ExitFuturePhase::NotStarted,
+            close_result: None,
+            actual_exit: None,
+            actual_exit_phase: ExitFuturePhase::NotStarted,
+            actual_exit_result: None,
+            body_proof: None,
+            stream_exit: None,
+            close_failure_reported: false,
+            termination_started: false,
+            termination: None,
+            exit_panics: ScanExitPanicCustody::default(),
             readiness,
             budget: ConnectorPollBudget::new(),
-            wake_generation: None,
             filter: self.filter.for_driver(),
             rows_emitted: 0,
             profiles: None,
@@ -227,7 +244,7 @@ impl OperatorFactory for StreamScanSourceFactory {
             output_tracker: None,
             downstream_paused: false,
             construction: None,
-        })
+        }))
     }
 
     fn is_source(&self) -> bool {
@@ -244,6 +261,181 @@ enum StreamStage {
     Ended,
 }
 
+/// A call is marked before entering foreign code. If it unwinds, the phase
+/// stays at that call and the same hook/future is never entered again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExitFuturePhase {
+    NotStarted,
+    Constructing,
+    Pending,
+    Polling,
+    Dropping,
+    Complete,
+}
+
+/// The shared Driver catches only this marker as an already-reported exit
+/// health fault. It carries no original Any, Task source or foreign capture.
+#[derive(Clone, Copy, Debug)]
+struct ScanExitUnwind;
+pub(crate) fn is_scan_exit_unwind(payload: &(dyn std::any::Any + Send)) -> bool {
+    payload.is::<ScanExitUnwind>()
+}
+fn resume_exit_unwind() -> ! {
+    std::panic::resume_unwind(Box::new(ScanExitUnwind))
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(usize)]
+enum ScanExitFault {
+    ObservationConstruction,
+    CloseConstruction,
+    ClosePoll,
+    CloseDrop,
+    ObservationPoll,
+    ObservationDrop,
+    Termination,
+    BackpressureRelease,
+}
+impl std::fmt::Display for ScanExitFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ObservationConstruction => "scan exit observation construction panicked",
+            Self::CloseConstruction => "scan close construction panicked",
+            Self::ClosePoll => "scan close future poll panicked",
+            Self::CloseDrop => "scan close future destruction panicked",
+            Self::ObservationPoll => "scan exit observation poll panicked",
+            Self::ObservationDrop => "scan exit observation destruction panicked",
+            Self::Termination => "scan termination hook panicked",
+            Self::BackpressureRelease => "scan exit backpressure release panicked",
+        })
+    }
+}
+impl std::error::Error for ScanExitFault {}
+impl novarocks_failure_contract::FailureProjection for ScanExitFault {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        let code = match self {
+            Self::ObservationConstruction => 579,
+            Self::CloseConstruction => 580,
+            Self::ClosePoll => 581,
+            Self::CloseDrop => 582,
+            Self::ObservationPoll => 583,
+            Self::ObservationDrop => 584,
+            Self::Termination => 585,
+            Self::BackpressureRelease => 586,
+        };
+        FailureFact::new(
+            FailureClass::Unexpected,
+            FailureReason::new(domain::EXECUTION, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+type ScanPanicPayload = Box<dyn std::any::Any + Send + 'static>;
+// A closed phase list: one constructor/poll/drop per future, one termination,
+// one exit backpressure release. No append, arbitrary threshold or global park.
+const SCAN_EXIT_PHASES: usize = 8;
+#[derive(Default)]
+struct ScanExitPanicCustody {
+    attempted: [bool; SCAN_EXIT_PHASES],
+    secondary: [Option<ManuallyDrop<ScanPanicPayload>>; SCAN_EXIT_PHASES],
+}
+impl ScanExitPanicCustody {
+    fn record(
+        &mut self,
+        kind: ScanExitFault,
+        payload: ScanPanicPayload,
+        failures: &RuntimeErrorState,
+    ) {
+        let index = kind as usize;
+        assert!(
+            !self.attempted[index],
+            "an unwound scan exit phase is never retried"
+        );
+        self.attempted[index] = true;
+        let cause = ExecutionFailure::from_domain(kind);
+        // RuntimeErrorState projects to the exact accepted Task's original
+        // health owner (or its explicit local owner), never a Task conclusion.
+        failures.report_cleanup(&cause);
+        failures.report_unresolved_exit(&cause);
+        // The original Any is an independent once cleanup. A secondary opaque
+        // destructor panic remains in this same scan/Driver continuation.
+        if let Err(secondary) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+            self.secondary[index] = Some(ManuallyDrop::new(secondary));
+        }
+    }
+    fn has_unknown_payload(&self) -> bool {
+        self.secondary.iter().any(Option::is_some)
+    }
+}
+fn catch_exit_action<T>(
+    custody: &mut ScanExitPanicCustody,
+    failures: &RuntimeErrorState,
+    kind: ScanExitFault,
+    action: impl FnOnce() -> T,
+) -> Result<T, ScanExitUnwind> {
+    catch_unwind(AssertUnwindSafe(action)).map_err(|payload| {
+        custody.record(kind, payload, failures);
+        ScanExitUnwind
+    })
+}
+
+fn poll_exit_observation<T: Clone>(
+    future: &mut Option<BoxFuture<'static, T>>,
+    phase: &mut ExitFuturePhase,
+    ready_result: &mut Option<T>,
+    cx: &mut Context<'_>,
+) -> Option<T> {
+    if *phase != ExitFuturePhase::Pending {
+        return None;
+    }
+    *phase = ExitFuturePhase::Polling;
+    match future
+        .as_mut()
+        .expect("pending exit has its original future")
+        .as_mut()
+        .poll(cx)
+    {
+        Poll::Pending => {
+            *phase = ExitFuturePhase::Pending;
+            None
+        }
+        Poll::Ready(result) => {
+            // Keep the known result in the original owner before the foreign
+            // Future destructor. Unwind cannot implicitly destroy its source.
+            *ready_result = Some(result);
+            *phase = ExitFuturePhase::Dropping;
+            drop(future.take());
+            *phase = ExitFuturePhase::Complete;
+            ready_result.clone()
+        }
+    }
+}
+fn poll_exit_component<T: Clone>(
+    future: &mut Option<BoxFuture<'static, T>>,
+    phase: &mut ExitFuturePhase,
+    ready_result: &mut Option<T>,
+    custody: &mut ScanExitPanicCustody,
+    failures: &RuntimeErrorState,
+    observation: bool,
+    cx: &mut Context<'_>,
+) -> bool {
+    match catch_unwind(AssertUnwindSafe(|| {
+        poll_exit_observation(future, phase, ready_result, cx)
+    })) {
+        Ok(_) => false,
+        Err(payload) => {
+            let kind = match (observation, *phase) {
+                (false, ExitFuturePhase::Dropping) => ScanExitFault::CloseDrop,
+                (true, ExitFuturePhase::Dropping) => ScanExitFault::ObservationDrop,
+                (false, _) => ScanExitFault::ClosePoll,
+                (true, _) => ScanExitFault::ObservationPoll,
+            };
+            custody.record(kind, payload, failures);
+            true
+        }
+    }
+}
+
 struct StreamScanSourceOperator {
     name: String,
     /// Scan-level LIMIT: delivery ends once this many rows were emitted.
@@ -252,12 +444,22 @@ struct StreamScanSourceOperator {
     source: Arc<dyn ScanStreamSource>,
     stage: StreamStage,
     /// The exit observation of an ended stream, until it resolves.
-    closing: Mutex<Option<BoxFuture<'static, Result<(), String>>>>,
+    closing: Option<BoxFuture<'static, crate::runtime::fragment::ExecutionResult<()>>>,
+    close_phase: ExitFuturePhase,
+    close_result: Option<ExecutionResult<()>>,
+    /// Acquired before close consumes the stream; retained across a close panic.
+    actual_exit: Option<BoxFuture<'static, crate::exec::node::scan::ScanExitProof>>,
+    actual_exit_phase: ExitFuturePhase,
+    actual_exit_result: Option<crate::exec::node::scan::ScanExitProof>,
+    body_proof: Option<ScanExitBodyProof>,
+    /// The immutable outcome remains observable after consuming the close future.
+    stream_exit: Option<crate::exec::node::scan::ScanExitProof>,
+    close_failure_reported: bool,
+    termination_started: bool,
+    termination: Option<ExecutionResult<()>>,
+    exit_panics: ScanExitPanicCustody,
     readiness: Arc<SourceReadiness>,
     budget: ConnectorPollBudget,
-    /// The readiness generation sampled before the last poll, when that poll
-    /// returned `Pending`. A different generation means the stream woke up.
-    wake_generation: Option<u64>,
     filter: ScanDriverFilter,
     rows_emitted: usize,
     profiles: Option<OperatorProfiles>,
@@ -273,12 +475,70 @@ struct StreamScanSourceOperator {
 impl StreamScanSourceOperator {
     /// Ends delivery: the stream is closed, which stops its operations
     /// before returning, and only its exit observation is kept.
-    fn end_delivery(&mut self) {
-        if let StreamStage::Open(stream) = std::mem::replace(&mut self.stage, StreamStage::Ended) {
-            *self.closing.lock().expect("scan stream close lock") = Some(stream.close());
+    fn end_delivery(&mut self) -> bool {
+        if !matches!(self.stage, StreamStage::Open(_)) && !self.downstream_paused {
+            self.stage = StreamStage::Ended;
+            return false;
         }
-        self.wake_generation = None;
-        self.set_downstream_paused(false);
+        let failures = self
+            .runtime_error
+            .as_ref()
+            .expect("a bound scan owns its runtime failure state")
+            .clone();
+        let mut unwound = false;
+        if let StreamStage::Open(stream) = std::mem::replace(&mut self.stage, StreamStage::Ended) {
+            // Even an observation constructor fault cannot skip the independent
+            // once stop/close of the still-owned original stream.
+            self.close_phase = ExitFuturePhase::Constructing;
+            match catch_exit_action(
+                &mut self.exit_panics,
+                &failures,
+                ScanExitFault::CloseConstruction,
+                || stream.close(failures.clone()),
+            ) {
+                Ok(closing) => {
+                    self.closing = Some(closing);
+                    self.close_phase = ExitFuturePhase::Pending;
+                }
+                Err(_) => unwound = true,
+            }
+        }
+        if self.downstream_paused {
+            self.downstream_paused = false;
+            unwound |= catch_exit_action(
+                &mut self.exit_panics,
+                &failures,
+                ScanExitFault::BackpressureRelease,
+                || self.op.on_output_backpressure(false),
+            )
+            .is_err();
+        }
+        if unwound {
+            let (termination, _) = self.request_termination_inner();
+            if let Err(cause) = termination {
+                failures.report_cleanup(&cause);
+            }
+        }
+        // Data authors must still return their original output/EOS/read error.
+        // Only terminal lifecycle callers propagate the already-reported marker.
+        unwound
+    }
+
+    fn poll_actual_exit(&mut self) -> bool {
+        let Some(failures) = self.runtime_error.as_ref().cloned() else {
+            return false;
+        };
+        let waker = self.readiness.waker();
+        let mut cx = Context::from_waker(&waker);
+        poll_exit_component(
+            &mut self.actual_exit,
+            &mut self.actual_exit_phase,
+            &mut self.actual_exit_result,
+            &mut self.exit_panics,
+            &failures,
+            true,
+            &mut cx,
+        )
     }
 
     fn set_downstream_paused(&mut self, paused: bool) {
@@ -288,14 +548,34 @@ impl StreamScanSourceOperator {
         }
     }
 
-    fn gate_holds_input(&self) -> bool {
-        self.filter
-            .blocking()
-            .is_some_and(RuntimeFilterConsumerState::gate_holds_input)
+    fn request_termination_inner(&mut self) -> (ExecutionResult<()>, bool) {
+        let mut unwound = false;
+        if !self.termination_started {
+            self.termination_started = true;
+            let failures = self
+                .runtime_error
+                .as_ref()
+                .expect("a bound scan owns its runtime failure state")
+                .clone();
+            match catch_exit_action(
+                &mut self.exit_panics,
+                &failures,
+                ScanExitFault::Termination,
+                || self.op.terminate(),
+            ) {
+                Ok(result) => self.termination = Some(result),
+                Err(_) => unwound = true,
+            }
+        }
+        (self.termination.clone().unwrap_or(Ok(())), unwound)
     }
 }
 
-impl Operator for StreamScanSourceOperator {
+impl OperatorLifecycle for StreamScanSourceOperator {
+    fn bind_poll_budget(&mut self, budget: ConnectorPollBudget) {
+        self.budget = budget;
+    }
+
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -323,98 +603,182 @@ impl Operator for StreamScanSourceOperator {
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        // Bind the original failure owner before any later fallible binding;
+        // partial preparation cleanup must not mint a separate health latch.
+        self.runtime_error = Some(state.error_state());
         self.filter.bind_runtime_state(state)?;
         if let Some(consumers) = self.filter.blocking() {
             consumers.set_wait_timeout(scan_runtime_filter_wait_timeout(state));
             consumers.bind(state)?;
         }
-        self.runtime_error = Some(state.error_state());
         self.output_tracker = state
             .mem_tracker()
             .map(|root| MemTracker::new_child(self.output_tracker_label.clone(), &root));
         Ok(())
     }
 
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        let abandoned_delivery = !matches!(self.stage, StreamStage::Ended);
+        let mut unwound = self.end_delivery();
+        let result = if abandoned_delivery {
+            let (result, termination_unwound) = self.request_termination_inner();
+            unwound |= termination_unwound;
+            result
+        } else {
+            Ok(())
+        };
+        if unwound {
+            resume_exit_unwind();
+        }
+        result
+    }
     fn close(&mut self) -> ExecutionResult<()> {
-        self.end_delivery();
         Ok(())
     }
 
     /// Ends delivery and starts the scan's terminal cleanup, which stops
     /// what its stream does not own itself, such as queued work.
     fn cancel(&mut self) {
-        self.end_delivery();
-        let _ = self.op.terminate();
-    }
-
-    fn is_finished(&self) -> bool {
-        matches!(self.stage, StreamStage::Ended)
+        let mut unwound = self.end_delivery();
+        let (termination, termination_unwound) = self.request_termination_inner();
+        unwound |= termination_unwound;
+        if let Err(error) = termination {
+            if let Some(signal) = &self.runtime_error {
+                signal.report_cleanup(&error);
+            }
+        }
+        if unwound {
+            resume_exit_unwind();
+        }
     }
 
     /// An ended stream is observed until its operations exited, so its
     /// driver completes only after the real exit and reports its error.
     fn pending_finish(&self) -> Option<FinishWatch> {
-        let mut closing = self.closing.lock().expect("scan stream close lock");
-        let future = closing.as_mut()?;
+        (self.stream_exit.is_none()
+            && (self.close_phase != ExitFuturePhase::NotStarted
+                || (self.termination_started && self.termination.is_none())))
+        .then(|| FinishWatch::Notify(self.readiness.observable()))
+    }
+    fn observe_exit(&mut self) -> crate::exec::pipeline::operator::ExitObservation {
+        use crate::exec::node::scan::ScanExitProof;
+        use crate::exec::pipeline::operator::{ExitObservation, FinishWatch};
+        let readiness = self.readiness.clone();
+        let watch = || FinishWatch::Notify(readiness.observable());
+        if self.stream_exit == Some(ScanExitProof::Exited) {
+            return ExitObservation::exited();
+        }
+        let observation_unwound = self.poll_actual_exit();
+        if self.close_phase == ExitFuturePhase::NotStarted
+            && !self.exit_panics.has_unknown_payload()
+            && (!self.termination_started || self.termination.is_some())
+        {
+            if observation_unwound {
+                resume_exit_unwind();
+            }
+            // No exit obligation has started. Never cache this as physical exit.
+            return if self.actual_exit_result == Some(ScanExitProof::Unresolved) {
+                ExitObservation::unresolved(watch())
+            } else {
+                ExitObservation::exited()
+            };
+        }
         let waker = self.readiness.waker();
         let mut context = Context::from_waker(&waker);
-        match future.as_mut().poll(&mut context) {
-            Poll::Pending => Some(FinishWatch::Notify(self.readiness.observable())),
-            Poll::Ready(result) => {
-                *closing = None;
-                if let Err(error) = result
-                    && let Some(runtime_error) = self.runtime_error.as_ref()
-                {
-                    runtime_error.set_error(error);
-                }
-                None
-            }
+        let failures = self
+            .runtime_error
+            .as_ref()
+            .expect("bound scan exit owner")
+            .clone();
+        let close_unwound = poll_exit_component(
+            &mut self.closing,
+            &mut self.close_phase,
+            &mut self.close_result,
+            &mut self.exit_panics,
+            &failures,
+            false,
+            &mut context,
+        );
+        if !self.close_failure_reported
+            && let Some(Err(cause)) = &self.close_result
+        {
+            self.close_failure_reported = true;
+            failures.report_cleanup(cause);
         }
-    }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+        if close_unwound || observation_unwound {
+            resume_exit_unwind();
+        }
+        let termination_known = !self.termination_started || self.termination.is_some();
+        let never_claimed = self.close_phase == ExitFuturePhase::NotStarted;
+        let body_exited = self.close_phase == ExitFuturePhase::Complete
+            || (self.body_proof == Some(ScanExitBodyProof::Included)
+                && self.close_phase == ExitFuturePhase::Constructing);
+        let opaque_exited = !self.exit_panics.has_unknown_payload();
+        let actual_exited = self.actual_exit_phase == ExitFuturePhase::Complete
+            && self.actual_exit_result == Some(ScanExitProof::Exited);
+        if opaque_exited && termination_known && (never_claimed || (body_exited && actual_exited)) {
+            self.stream_exit = Some(ScanExitProof::Exited);
+            return ExitObservation::exited();
+        }
+        let unknown = !termination_known
+            || self.actual_exit_result == Some(ScanExitProof::Unresolved)
+            || !opaque_exited
+            || matches!(
+                self.close_phase,
+                ExitFuturePhase::Constructing
+                    | ExitFuturePhase::Polling
+                    | ExitFuturePhase::Dropping
+            )
+            || matches!(
+                self.actual_exit_phase,
+                ExitFuturePhase::Constructing
+                    | ExitFuturePhase::Polling
+                    | ExitFuturePhase::Dropping
+            );
+        if unknown {
+            ExitObservation::unresolved(watch())
+        } else {
+            ExitObservation::pending(watch())
+        }
     }
 }
 
-impl ProcessorOperator for StreamScanSourceOperator {
-    fn need_input(&self) -> bool {
-        false
+impl SourceKernel for StreamScanSourceOperator {
+    fn control_observable(&self) -> Option<Arc<crate::runtime::observable::Observable>> {
+        Some(self.readiness.observable())
     }
-
-    /// Whether polling now can make progress: always after the stream
-    /// delivered, and after a `Pending` only once it woke the driver.
-    fn has_output(&self) -> bool {
-        match &self.stage {
-            StreamStage::Ended => false,
-            StreamStage::Unclaimed | StreamStage::Open(_) => {
-                !self.gate_holds_input()
-                    && self
-                        .wake_generation
-                        .is_none_or(|generation| self.readiness.generation() != generation)
-            }
+    fn poll_control(
+        &mut self,
+        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<crate::exec::pipeline::shape::ControlStep> {
+        if self.poll_actual_exit() {
+            resume_exit_unwind();
         }
+        ctx.checkpoint()?;
+        Ok(crate::exec::pipeline::shape::ControlStep::Active)
     }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-        Err("scan source operator does not accept input"
-            .to_string()
-            .into())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+    fn poll_output(
+        &mut self,
+        ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<StepResult> {
         if matches!(self.stage, StreamStage::Ended) {
-            return Ok(None);
+            return Ok(StepResult::new(None, NextStep::Finished, 0));
         }
         // The gate's wait starts where the scan would read its first page.
+        let gate_generation = self.readiness.generation();
         if let Some(consumers) = self.filter.blocking()
             && !matches!(consumers.poll_gate(), RuntimeFilterGate::Open)
         {
-            return Ok(None);
+            return Ok(StepResult::new(
+                None,
+                NextStep::Wait(WaitFact {
+                    reason: WaitReason::Dependency,
+                    observable: self.readiness.observable(),
+                    observed_generation: gate_generation,
+                    deadline: consumers.gate_deadline(),
+                }),
+                0,
+            ));
         }
         if matches!(self.stage, StreamStage::Unclaimed) {
             let profile = self
@@ -430,12 +794,43 @@ impl ProcessorOperator for StreamScanSourceOperator {
                 profile,
                 Arc::clone(construction),
             )?);
+            self.actual_exit_phase = ExitFuturePhase::Constructing;
+            let failures = self
+                .runtime_error
+                .as_ref()
+                .expect("bound scan source")
+                .clone();
+            let StreamStage::Open(stream) = &mut self.stage else {
+                unreachable!()
+            };
+            let acquired = catch_exit_action(
+                &mut self.exit_panics,
+                &failures,
+                ScanExitFault::ObservationConstruction,
+                || stream.as_mut().take_exit_observation(failures.clone()),
+            );
+            match acquired {
+                Ok(Ok(observation)) => {
+                    self.body_proof = Some(observation.body_proof);
+                    self.actual_exit = Some(observation.actual_exit);
+                    self.actual_exit_phase = ExitFuturePhase::Pending;
+                }
+                Ok(Err(cause)) => {
+                    failures.report_unresolved_exit(&cause);
+                    return Err(cause);
+                }
+                Err(_) => resume_exit_unwind(),
+            }
         }
+        if self.poll_actual_exit() {
+            resume_exit_unwind();
+        }
+        ctx.checkpoint()?;
         let waker = self.readiness.waker();
         let mut context = Context::from_waker(&waker);
         loop {
             let StreamStage::Open(stream) = &mut self.stage else {
-                return Ok(None);
+                return Ok(StepResult::new(None, NextStep::Finished, 0));
             };
             // Sampled before the poll: a wake during or after it moves the
             // generation past this value, so it cannot be lost.
@@ -443,24 +838,36 @@ impl ProcessorOperator for StreamScanSourceOperator {
             let exhaustions = self.budget.exhaustions();
             match stream.as_mut().poll_next(&mut context) {
                 Poll::Pending => {
-                    self.wake_generation = Some(generation);
-                    observe_scan_stream_pending(if self.budget.exhaustions() > exhaustions {
+                    let yielded = self.budget.exhaustions() > exhaustions;
+                    observe_scan_stream_pending(if yielded {
                         ScanStreamPending::BudgetYield
                     } else {
                         ScanStreamPending::Wait
                     });
-                    return Ok(None);
+                    let next = if yielded {
+                        NextStep::Yield
+                    } else {
+                        NextStep::Wait(WaitFact {
+                            reason: WaitReason::Input,
+                            observable: self.readiness.observable(),
+                            observed_generation: generation,
+                            deadline: None,
+                        })
+                    };
+                    return Ok(StepResult::new(None, next, 0));
                 }
                 Poll::Ready(None) => {
-                    self.end_delivery();
-                    return Ok(None);
+                    let _already_reported_exit_unwind = self.end_delivery();
+                    return Ok(StepResult::new(None, NextStep::Finished, 0));
                 }
                 Poll::Ready(Some(Err(error))) => {
-                    self.end_delivery();
-                    return Err(error.into());
+                    // Provider close may run synchronous stop hooks. Publish
+                    // the actual read cause before starting that cleanup.
+                    ctx.report_failure(error.clone());
+                    let _already_reported_exit_unwind = self.end_delivery();
+                    return Err(error);
                 }
                 Poll::Ready(Some(Ok(mut chunk))) => {
-                    self.wake_generation = None;
                     if self.filter.requires_input_accounting() {
                         let tracker = self.output_tracker.as_ref().ok_or(
                             crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
@@ -468,7 +875,7 @@ impl ProcessorOperator for StreamScanSourceOperator {
                         // Use the original whole-source author before any
                         // ordered transformation borrows or retains this input.
                         // An existing provider charge remains its sole owner.
-                        chunk.try_transfer_to_typed(tracker).map_err(
+                        chunk.try_transfer_to(tracker).map_err(
                             crate::exec::pipeline::operator::ConstructionFailure::Memory,
                         )?;
                     }
@@ -482,18 +889,18 @@ impl ProcessorOperator for StreamScanSourceOperator {
                         self.filter
                             .restrict_limit(chunk, self.limit, self.rows_emitted)?
                     else {
-                        self.end_delivery();
-                        return Ok(None);
+                        let _already_reported_exit_unwind = self.end_delivery();
+                        return Ok(StepResult::new(None, NextStep::Finished, 0));
                     };
                     let rows = chunk.len();
                     match scan_limit_decision(self.limit, self.rows_emitted, rows) {
                         ScanLimitDecision::Stop => {
-                            self.end_delivery();
-                            return Ok(None);
+                            let _already_reported_exit_unwind = self.end_delivery();
+                            return Ok(StepResult::new(None, NextStep::Finished, 0));
                         }
                         ScanLimitDecision::EmitThenStop => {
                             self.rows_emitted = self.rows_emitted.saturating_add(rows);
-                            self.end_delivery();
+                            let _already_reported_exit_unwind = self.end_delivery();
                         }
                         ScanLimitDecision::Emit => {
                             self.rows_emitted = self.rows_emitted.saturating_add(rows);
@@ -505,30 +912,16 @@ impl ProcessorOperator for StreamScanSourceOperator {
                     if let Some(tracker) = self.output_tracker.as_ref() {
                         chunk.transfer_to(tracker);
                     }
-                    return Ok(Some(chunk));
+                    let next = if matches!(self.stage, StreamStage::Ended) {
+                        NextStep::Finished
+                    } else {
+                        NextStep::Runnable
+                    };
+                    return Ok(StepResult::new(Some(chunk), next, 0));
                 }
             }
         }
     }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        Ok(())
-    }
-
-    fn source_observable(&self) -> Option<Arc<Observable>> {
-        Some(self.readiness.observable())
-    }
-
-    fn source_block_deadline(&self) -> Option<DriverBlockDeadline> {
-        self.filter
-            .blocking()
-            .and_then(RuntimeFilterConsumerState::gate_deadline)
-    }
-
-    fn begin_turn(&mut self) {
-        self.budget.refill(SCAN_STREAM_TURN_BUDGET);
-    }
-
     fn on_downstream_backpressure(&mut self, paused: bool) {
         if !matches!(self.stage, StreamStage::Ended) {
             self.set_downstream_paused(paused);
@@ -590,6 +983,11 @@ mod tests {
     #[derive(Default)]
     struct StreamControl {
         chunks: Mutex<VecDeque<Chunk>>,
+        error: Mutex<Option<crate::runtime::fragment::ExecutionFailure>>,
+        close_check: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        observation_check: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        termination_check: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        backpressure_release_check: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         ended: AtomicBool,
         waker: Mutex<Option<Waker>>,
         /// On the next empty poll, make `staged` available and wake the
@@ -598,6 +996,8 @@ mod tests {
         staged: Mutex<Option<Chunk>>,
         polls: AtomicUsize,
         close_requested: AtomicBool,
+        /// Exercises a stream whose work body is not covered by its ledger.
+        requires_close_body: AtomicBool,
         operations: ConnectorSourceOperations,
         terminations: AtomicUsize,
     }
@@ -627,6 +1027,9 @@ mod tests {
         fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             let this = self.get_mut();
             this.control.polls.fetch_add(1, Ordering::AcqRel);
+            if let Some(error) = this.control.error.lock().unwrap().take() {
+                return Poll::Ready(Some(Err(error)));
+            }
             if this.control.chunks.lock().expect("chunks").is_empty() {
                 if this.control.ended.load(Ordering::Acquire) {
                     return Poll::Ready(None);
@@ -656,12 +1059,81 @@ mod tests {
         }
     }
 
+    async fn observe_fixture_source(
+        operations: novarocks_spi::connector::read_stack::ConnectorSourceOperations,
+        failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+    ) -> crate::exec::node::scan::ScanExitProof {
+        use novarocks_spi::connector::read_stack::{
+            ConnectorSourceExitProof, ConnectorSourceFailureEvent,
+        };
+        let mut events = operations
+            .claim_failure_receiver()
+            .expect("one fixture source receiver");
+        let mut exit = Box::pin(operations.exited());
+        let mut events_ended = false;
+        futures::future::poll_fn(move |cx| {
+            if !events_ended { loop { match events.poll_event(cx) {
+                Poll::Ready(Some(ConnectorSourceFailureEvent::Required(cause))) => failures.report_failure(
+                    crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(
+                        crate::runtime::fragment::connector_failure::ConnectorOperation::SourceExit,cause).into()),
+                Poll::Ready(Some(ConnectorSourceFailureEvent::CleanupUnresolved(cause))) => {
+                    let cause = crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(
+                        crate::runtime::fragment::connector_failure::ConnectorOperation::SourceExit,cause).into();
+                    failures.report_cleanup(&cause); failures.report_unresolved_exit(&cause);
+                }
+                Poll::Ready(None) => {events_ended=true;break;}, Poll::Pending=>break,
+            }}}
+            match exit.as_mut().poll(cx) {
+                Poll::Ready(proof) if events_ended => Poll::Ready(match proof {
+                    ConnectorSourceExitProof::Exited=>crate::exec::node::scan::ScanExitProof::Exited,
+                    ConnectorSourceExitProof::Unresolved=>crate::exec::node::scan::ScanExitProof::Unresolved,
+                }),
+                _=>Poll::Pending,
+            }
+        }).await
+    }
     impl ScanChunkStream for ScriptedStream {
-        fn close(self: Pin<Box<Self>>) -> BoxFuture<'static, Result<(), String>> {
+        fn take_exit_observation(
+            self: Pin<&mut Self>,
+            failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+        ) -> ExecutionResult<ScanExitObservation> {
+            let check = self.control.observation_check.lock().unwrap().take();
+            if let Some(check) = check {
+                check();
+            }
+            Ok(ScanExitObservation {
+                body_proof: if self.control.requires_close_body.load(Ordering::Acquire) {
+                    ScanExitBodyProof::CloseBodyRequired
+                } else {
+                    ScanExitBodyProof::Included
+                },
+                actual_exit: Box::pin(observe_fixture_source(
+                    self.control.operations.clone(),
+                    failures,
+                )),
+            })
+        }
+        fn close(
+            self: Pin<Box<Self>>,
+            _failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+        ) -> BoxFuture<'static, crate::runtime::fragment::ExecutionResult<()>> {
+            let check = self.control.close_check.lock().unwrap().take();
+            if let Some(check) = check {
+                check();
+            }
             self.control.close_requested.store(true, Ordering::Release);
             self.control.operations.seal();
             let exit = self.control.operations.exited();
-            Box::pin(async move { exit.await.map_err(|error| error.to_string()) })
+            Box::pin(async move {
+                match exit.await {
+                    novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited => {
+                        Ok(())
+                    }
+                    novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Unresolved => {
+                        futures::future::pending().await
+                    }
+                }
+            })
         }
     }
 
@@ -686,7 +1158,10 @@ mod tests {
             _construction: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
         ) -> ExecutionResult<ScanOutputStream> {
             if self.claims.fetch_add(1, Ordering::AcqRel) > 0 {
-                return Err("scan stream already claimed".to_string().into());
+                return Err(novarocks_functions::KernelFailure::Internal(
+                    novarocks_functions::KernelDiagnostic::new(&("scan stream already claimed")),
+                )
+                .into());
             }
             Ok(Box::pin(ScriptedStream {
                 control: Arc::clone(&self.control),
@@ -704,13 +1179,30 @@ mod tests {
     impl ScanOp for StreamScanOp {
         fn on_output_backpressure(&self, paused: bool) {
             self.backpressure.lock().expect("backpressure").push(paused);
+            if !paused {
+                let check = self
+                    .source
+                    .control
+                    .backpressure_release_check
+                    .lock()
+                    .unwrap()
+                    .take();
+                if let Some(check) = check {
+                    check();
+                }
+            }
         }
 
-        fn terminate(&self) -> Result<(), String> {
+        fn terminate(&self) -> crate::runtime::fragment::ExecutionResult<()> {
             self.source
                 .control
                 .terminations
                 .fetch_add(1, Ordering::AcqRel);
+            self.source.control.operations.seal();
+            let check = self.source.control.termination_check.lock().unwrap().take();
+            if let Some(check) = check {
+                check();
+            }
             Ok(())
         }
 
@@ -721,53 +1213,38 @@ mod tests {
 
     struct CollectSink {
         values: Arc<Mutex<Vec<i32>>>,
-        finished: bool,
-        observable: Arc<Observable>,
+        on_finish: Option<Box<dyn FnOnce() + Send>>,
     }
-
-    impl Operator for CollectSink {
+    impl OperatorLifecycle for CollectSink {
         fn name(&self) -> &str {
             "COLLECT_SINK"
         }
-
-        fn is_finished(&self) -> bool {
-            self.finished
-        }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
-
-    impl ProcessorOperator for CollectSink {
-        fn need_input(&self) -> bool {
-            !self.finished
-        }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+    impl crate::exec::pipeline::operator::InputEncodingPolicy for CollectSink {}
+    impl crate::exec::pipeline::shape::SinkKernel for CollectSink {
+        fn consume(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            input: crate::exec::pipeline::input::PreparedInput,
+        ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
+            let chunk = input.into_uncovered_chunk()?;
             self.values.lock().expect("values").push(value_of(&chunk));
-            Ok(())
+            Ok(crate::exec::pipeline::shape::SinkStep::new(
+                NextStep::NeedInput,
+                chunk.len() as u64,
+            ))
         }
-
-        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
-            self.finished = true;
-            Ok(())
-        }
-
-        fn sink_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.observable))
+        fn finish(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+        ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
+            if let Some(finish) = self.on_finish.take() {
+                finish();
+            }
+            Ok(crate::exec::pipeline::shape::SinkStep::new(
+                NextStep::Finished,
+                0,
+            ))
         }
     }
 
@@ -804,6 +1281,18 @@ mod tests {
         Arc<ScriptedSource>,
         Arc<Mutex<Vec<bool>>>,
     ) {
+        observed_stream_scan_source_in_with_limit(control, state, None)
+    }
+
+    fn observed_stream_scan_source_in_with_limit(
+        control: &Arc<StreamControl>,
+        state: &RuntimeState,
+        limit: Option<usize>,
+    ) -> (
+        Box<dyn Operator>,
+        Arc<ScriptedSource>,
+        Arc<Mutex<Vec<bool>>>,
+    ) {
         let source = Arc::new(ScriptedSource {
             control: Arc::clone(control),
             claims: AtomicUsize::new(0),
@@ -813,7 +1302,8 @@ mod tests {
             source: Arc::clone(&source),
             backpressure: Arc::clone(&backpressure),
         });
-        let factory = StreamScanSourceFactory::new_compiled(7, op, None);
+        let mut factory = StreamScanSourceFactory::new_compiled(7, op, None);
+        factory.limit = limit;
         let mut operator = factory.create(1, 0);
         operator.set_construction_factory(actual_test_factory());
         operator
@@ -823,6 +1313,7 @@ mod tests {
     }
 
     struct Pipeline {
+        state: Arc<RuntimeState>,
         driver: PipelineDriver,
         control: Arc<StreamControl>,
         source: Arc<ScriptedSource>,
@@ -830,25 +1321,28 @@ mod tests {
     }
 
     fn pipeline() -> Pipeline {
+        let state = Arc::new(RuntimeState::default());
         let control = Arc::new(StreamControl::default());
-        let (scan, source) = stream_scan_source(&control);
+        let (scan, source, _) = observed_stream_scan_source_in(&control, &state);
         let values = Arc::new(Mutex::new(Vec::new()));
         let driver = PipelineDriver::new(
             1,
             vec![
                 scan,
-                Box::new(CollectSink {
-                    values: Arc::clone(&values),
-                    finished: false,
-                    observable: Arc::new(Observable::new()),
-                }),
+                Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+                    CollectSink {
+                        values: Arc::clone(&values),
+                        on_finish: None,
+                    },
+                )),
             ],
             None,
             Vec::new(),
-            Arc::new(RuntimeState::default()),
+            state.clone(),
             None,
         );
         Pipeline {
+            state,
             driver,
             control,
             source,
@@ -870,7 +1364,833 @@ mod tests {
     }
 
     #[test]
-    fn a_wake_inside_the_poll_keeps_the_driver_runnable() {
+    fn an_exited_operation_scope_cannot_replace_an_unknown_reader_body() {
+        use crate::exec::pipeline::operator::ExitProgress;
+        let control = Arc::new(StreamControl::default());
+        control.requires_close_body.store(true, Ordering::Release);
+        let (mut scan, _) = stream_scan_source(&control);
+        let primed = scan.drive_for_test(&RuntimeState::default());
+        let entered = Arc::new(AtomicUsize::new(0));
+        *control.close_check.lock().unwrap() = Some(Box::new({
+            let entered = entered.clone();
+            move || {
+                entered.fetch_add(1, Ordering::AcqRel);
+                panic!("unknown reader close body");
+            }
+        }));
+        let begin = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan.begin_exit()));
+        let first_pending = matches!(scan.observe_exit().progress, ExitProgress::Unresolved(_));
+        let second_begin = scan.begin_exit();
+        let second_pending = matches!(scan.observe_exit().progress, ExitProgress::Unresolved(_));
+        let actual_scope_exited = control.operations.is_exited();
+        let calls = entered.load(Ordering::Acquire);
+        drop(scan);
+        assert!(primed.is_ok());
+        assert!(begin.is_err());
+        assert!(second_begin.is_ok());
+        assert!(actual_scope_exited, "the real ledger is sealed and empty");
+        assert_eq!(calls, 1, "cleanup must not retry the consumed close hook");
+        assert!(
+            first_pending && second_pending,
+            "neither an error nor an exited ledger proves an unknown reader body exited"
+        );
+    }
+
+    #[test]
+    fn a_panicked_exit_observation_is_not_repolled_or_released_as_completed() {
+        // The same future retains its real captured data after poll unwinds;
+        // a subsequent cleanup observation must not reenter foreign code.
+        let captured = Arc::new(vec![7_u8; 1024]);
+        let weak = Arc::downgrade(&captured);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let poll_calls = calls.clone();
+        let mut future: Option<BoxFuture<'static, ExecutionResult<()>>> =
+            Some(Box::pin(futures::future::poll_fn(move |_| {
+                let _live_data = captured.len();
+                poll_calls.fetch_add(1, Ordering::AcqRel);
+                panic!("actual exit observer poll panic");
+                #[allow(unreachable_code)]
+                Poll::Ready(Ok(()))
+            })));
+        let mut phase = ExitFuturePhase::Pending;
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+        let mut ready_result = None;
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            poll_exit_observation(&mut future, &mut phase, &mut ready_result, &mut context)
+        }));
+        let retained_after_panic = weak.upgrade().is_some();
+        let second =
+            poll_exit_observation(&mut future, &mut phase, &mut ready_result, &mut context);
+        let unresolved = phase == ExitFuturePhase::Polling;
+        let calls = calls.load(Ordering::Acquire);
+        drop(future);
+        let released_on_actual_drop = weak.upgrade().is_none();
+        assert!(first.is_err());
+        assert!(retained_after_panic);
+        assert!(second.is_none());
+        assert!(unresolved);
+        assert_eq!(calls, 1);
+        assert!(released_on_actual_drop);
+    }
+
+    struct SecondaryScanPayload {
+        drops: Arc<AtomicUsize>,
+        _actual_capture: Arc<Vec<u8>>,
+    }
+    impl Drop for SecondaryScanPayload {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct OriginalScanPayload {
+        drops: Arc<AtomicUsize>,
+        secondary: Option<SecondaryScanPayload>,
+    }
+    impl Drop for OriginalScanPayload {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            if let Some(secondary) = self.secondary.take() {
+                std::panic::panic_any(secondary);
+            }
+        }
+    }
+    fn explicit_scan_fact(code: u16) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        FailureFact::new(
+            FailureClass::Unexpected,
+            FailureReason::new(domain::EXECUTION, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+    #[test]
+    fn close_unwind_reports_original_health_without_selecting_a_task_failure() {
+        use crate::exec::pipeline::operator::ExitProgress;
+        let state = RuntimeState::default();
+        let failures = state.error_state();
+        let control = Arc::new(StreamControl::default());
+        let (mut scan, _, _) = observed_stream_scan_source_in(&control, &state);
+        let primed = scan.drive_for_test(&state);
+        let primary = Arc::new(AtomicUsize::new(0));
+        let payload = OriginalScanPayload {
+            drops: primary.clone(),
+            secondary: None,
+        };
+        *control.close_check.lock().unwrap() =
+            Some(Box::new(move || std::panic::panic_any(payload)));
+        let begin = catch_unwind(AssertUnwindSafe(|| scan.begin_exit()));
+        let exit = scan.observe_exit().progress;
+        let marker = begin
+            .as_ref()
+            .err()
+            .is_some_and(|payload| is_scan_exit_unwind(payload.as_ref()));
+        assert!(primed.is_ok());
+        assert!(marker, "only the safe marker may reach the shared Driver");
+        assert_eq!(primary.load(Ordering::SeqCst), 1);
+        assert!(
+            failures.error().is_none(),
+            "health is not Task failure acceptance"
+        );
+        assert_eq!(
+            failures.local_exit_fault().unwrap().fact(),
+            explicit_scan_fact(580)
+        );
+        assert!(control.operations.is_exited());
+        assert!(
+            matches!(exit, ExitProgress::Exited),
+            "Included fixture's actual ledger and normal payload disposal are real exit proof"
+        );
+        assert_eq!(
+            control.terminations.load(Ordering::Acquire),
+            1,
+            "close panic cannot skip the independent stop hook"
+        );
+    }
+    #[test]
+    fn opaque_secondary_payload_keeps_original_scan_pending_even_with_included_scope() {
+        use crate::exec::pipeline::operator::ExitProgress;
+        let state = RuntimeState::default();
+        let failures = state.error_state();
+        let control = Arc::new(StreamControl::default());
+        let (mut scan, _, _) = observed_stream_scan_source_in(&control, &state);
+        let primed = scan.drive_for_test(&state);
+        let primary = Arc::new(AtomicUsize::new(0));
+        let secondary = Arc::new(AtomicUsize::new(0));
+        let capture = Arc::new(vec![9_u8; 512]);
+        let weak = Arc::downgrade(&capture);
+        let payload = OriginalScanPayload {
+            drops: primary.clone(),
+            secondary: Some(SecondaryScanPayload {
+                drops: secondary.clone(),
+                _actual_capture: capture,
+            }),
+        };
+        *control.close_check.lock().unwrap() =
+            Some(Box::new(move || std::panic::panic_any(payload)));
+        let begin = catch_unwind(AssertUnwindSafe(|| scan.begin_exit()));
+        let first = scan.observe_exit().progress;
+        let second_begin = scan.begin_exit();
+        let second = scan.observe_exit().progress;
+        assert!(primed.is_ok());
+        assert!(
+            begin
+                .as_ref()
+                .err()
+                .is_some_and(|payload| is_scan_exit_unwind(payload.as_ref()))
+        );
+        assert!(second_begin.is_ok());
+        assert!(control.operations.is_exited());
+        assert!(
+            matches!(first, ExitProgress::Unresolved(_))
+                && matches!(second, ExitProgress::Unresolved(_))
+        );
+        assert_eq!(primary.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary.load(Ordering::SeqCst), 0);
+        assert!(
+            weak.upgrade().is_some(),
+            "the actual opaque capture is retained by original scan custody"
+        );
+        assert_eq!(
+            failures.local_exit_fault().unwrap().fact(),
+            explicit_scan_fact(580)
+        );
+        assert!(failures.error().is_none());
+        // The production Driver keeps this Pending operator. This unit fixture
+        // has no live reader or Task grant; its bounded opaque cell is not a
+        // claim that dropping an unresolved production Driver is permitted.
+    }
+    #[test]
+    fn observation_constructor_unwind_still_closes_and_terminates_real_stream_once() {
+        use crate::exec::pipeline::operator::ExitProgress;
+        let state = RuntimeState::default();
+        let control = Arc::new(StreamControl::default());
+        let (mut scan, _, _) = observed_stream_scan_source_in(&control, &state);
+        let calls = Arc::new(AtomicUsize::new(0));
+        *control.observation_check.lock().unwrap() = Some(Box::new({
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::panic::panic_any(17_u32);
+            }
+        }));
+        let primed = catch_unwind(AssertUnwindSafe(|| scan.drive_for_test(&state)));
+        let begin = catch_unwind(AssertUnwindSafe(|| scan.begin_exit()));
+        let first = scan.observe_exit().progress;
+        let second_begin = scan.begin_exit();
+        let second = scan.observe_exit().progress;
+        assert!(
+            primed
+                .as_ref()
+                .err()
+                .is_some_and(|payload| is_scan_exit_unwind(payload.as_ref()))
+        );
+        assert!(
+            begin.is_ok(),
+            "separate cleanup follows the captured constructor fault"
+        );
+        assert!(second_begin.is_ok());
+        assert!(control.close_requested.load(Ordering::Acquire));
+        assert_eq!(control.terminations.load(Ordering::Acquire), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(first, ExitProgress::Unresolved(_))
+                && matches!(second, ExitProgress::Unresolved(_))
+        );
+        assert_eq!(
+            state.error_state().local_exit_fault().unwrap().fact(),
+            explicit_scan_fact(579)
+        );
+        assert!(state.error().is_none());
+    }
+    #[test]
+    fn a_termination_unwind_does_not_retry_or_replace_the_original_execution_cause() {
+        use crate::exec::pipeline::operator::ExitProgress;
+        let state = RuntimeState::default();
+        let control = Arc::new(StreamControl::default());
+        let (mut scan, _, _) = observed_stream_scan_source_in(&control, &state);
+        let primed = scan.drive_for_test(&state);
+        let original: ExecutionFailure =
+            novarocks_functions::KernelFailure::ResourceExhausted.into();
+        state.error_state().set_error(original.clone());
+        *control.termination_check.lock().unwrap() =
+            Some(Box::new(|| std::panic::panic_any(23_u32)));
+        let begin = catch_unwind(AssertUnwindSafe(|| scan.begin_exit()));
+        let first = scan.observe_exit().progress;
+        let second_begin = scan.begin_exit();
+        let second = scan.observe_exit().progress;
+        assert!(primed.is_ok());
+        assert!(
+            begin
+                .as_ref()
+                .err()
+                .is_some_and(|payload| is_scan_exit_unwind(payload.as_ref()))
+        );
+        assert!(second_begin.is_ok());
+        assert_eq!(control.terminations.load(Ordering::Acquire), 1);
+        assert!(
+            matches!(first, ExitProgress::Unresolved(_))
+                && matches!(second, ExitProgress::Unresolved(_))
+        );
+        assert_eq!(
+            state.error_state().local_exit_fault().unwrap().fact(),
+            explicit_scan_fact(585)
+        );
+        assert!(state.error().unwrap().same_occurrence(&original));
+    }
+    #[test]
+    fn a_normally_pending_exit_never_marks_runtime_health_unresolved() {
+        let failures = RuntimeErrorState::default();
+        let mut custody = ScanExitPanicCustody::default();
+        let mut future: Option<BoxFuture<'static, ExecutionResult<()>>> =
+            Some(Box::pin(futures::future::pending()));
+        let mut phase = ExitFuturePhase::Pending;
+        let mut result = None;
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..2 {
+            assert!(!poll_exit_component(
+                &mut future,
+                &mut phase,
+                &mut result,
+                &mut custody,
+                &failures,
+                false,
+                &mut cx
+            ));
+        }
+        assert!(phase == ExitFuturePhase::Pending);
+        assert!(failures.local_exit_fault().is_none());
+        assert!(failures.error().is_none());
+        assert!(!custody.has_unknown_payload());
+    }
+    #[test]
+    fn observed_poll_panic_has_exact_health_and_keeps_original_future_without_reentry() {
+        let failures = RuntimeErrorState::default();
+        let mut custody = ScanExitPanicCustody::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let capture = Arc::new(vec![5_u8; 512]);
+        let weak = Arc::downgrade(&capture);
+        let mut future: Option<BoxFuture<'static, ExecutionResult<()>>> =
+            Some(Box::pin(futures::future::poll_fn({
+                let calls = calls.clone();
+                move |_| {
+                    let _actual_capture = capture.len();
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::panic::panic_any(31_u32);
+                    #[allow(unreachable_code)]
+                    Poll::Ready(Ok(()))
+                }
+            })));
+        let mut phase = ExitFuturePhase::Pending;
+        let mut result = None;
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let first = poll_exit_component(
+            &mut future,
+            &mut phase,
+            &mut result,
+            &mut custody,
+            &failures,
+            true,
+            &mut cx,
+        );
+        let second = poll_exit_component(
+            &mut future,
+            &mut phase,
+            &mut result,
+            &mut custody,
+            &failures,
+            true,
+            &mut cx,
+        );
+        assert!(first && !second);
+        assert!(phase == ExitFuturePhase::Polling);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(weak.upgrade().is_some());
+        assert!(future.is_some());
+        assert_eq!(
+            failures.local_exit_fault().unwrap().fact(),
+            explicit_scan_fact(583)
+        );
+        assert!(failures.error().is_none());
+    }
+    struct ReadyDropPanic {
+        result: ExecutionFailure,
+        drops: Arc<AtomicUsize>,
+    }
+    impl std::future::Future for ReadyDropPanic {
+        type Output = ExecutionResult<()>;
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Ready(Err(self.result.clone()))
+        }
+    }
+    impl Drop for ReadyDropPanic {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(41_u32);
+        }
+    }
+    #[test]
+    fn a_ready_error_is_kept_in_original_owner_before_future_drop_can_unwind() {
+        let failures = RuntimeErrorState::default();
+        let mut custody = ScanExitPanicCustody::default();
+        let original: ExecutionFailure =
+            novarocks_functions::KernelFailure::ResourceExhausted.into();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut future: Option<BoxFuture<'static, ExecutionResult<()>>> =
+            Some(Box::pin(ReadyDropPanic {
+                result: original.clone(),
+                drops: drops.clone(),
+            }));
+        let mut phase = ExitFuturePhase::Pending;
+        let mut result = None;
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let first = poll_exit_component(
+            &mut future,
+            &mut phase,
+            &mut result,
+            &mut custody,
+            &failures,
+            false,
+            &mut cx,
+        );
+        let second = poll_exit_component(
+            &mut future,
+            &mut phase,
+            &mut result,
+            &mut custody,
+            &failures,
+            false,
+            &mut cx,
+        );
+        assert!(first && !second);
+        assert!(phase == ExitFuturePhase::Dropping);
+        assert!(future.is_none());
+        assert!(
+            result
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .same_occurrence(&original)
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            failures.local_exit_fault().unwrap().fact(),
+            explicit_scan_fact(582)
+        );
+        assert!(failures.error().is_none());
+    }
+
+    #[test]
+    fn emit_then_stop_preserves_the_real_last_chunk_when_close_construction_unwinds() {
+        use crate::exec::pipeline::operator::ExitProgress;
+        let state = RuntimeState::default();
+        let control = Arc::new(StreamControl::default());
+        control.requires_close_body.store(true, Ordering::Release);
+        control.push(one_row(73));
+        let (mut scan, _, _) = observed_stream_scan_source_in_with_limit(&control, &state, Some(1));
+        let budget = ConnectorPollBudget::new();
+        budget.refill(SCAN_STREAM_TURN_BUDGET);
+        scan.bind_poll_budget(budget);
+        *control.close_check.lock().unwrap() = Some(Box::new(|| std::panic::panic_any(71_u32)));
+        // This is the real Source adapter and EmitThenStop lane. No catch can
+        // hide loss of the local Chunk before it enters its actual StepResult.
+        let first = scan.drive_for_test(&state);
+        let step = first.expect("cleanup unwind must not escape the data author");
+        let next_is_finished = matches!(step.next, NextStep::Finished);
+        let chunk = step
+            .output
+            .expect("the required limit prefix must be delivered");
+        let delivered = value_of(&chunk);
+        let exit = scan.observe_exit().progress;
+        assert!(next_is_finished);
+        assert_eq!(delivered, 73);
+        assert_eq!(chunk.len(), 1);
+        assert_eq!(control.polls.load(Ordering::Acquire), 1);
+        assert_eq!(control.terminations.load(Ordering::Acquire), 1);
+        assert!(
+            state.error().is_none(),
+            "exit health cannot replace the successful data result"
+        );
+        assert_eq!(
+            state.error_state().local_exit_fault().unwrap().fact(),
+            explicit_scan_fact(580)
+        );
+        assert!(
+            matches!(exit, ExitProgress::Unresolved(_)),
+            "the production-style unknown body still has no exit proof"
+        );
+    }
+    #[test]
+    fn originating_read_error_is_returned_unchanged_when_close_construction_unwinds() {
+        use crate::exec::pipeline::operator::ExitProgress;
+        use crate::runtime::fragment::connector_failure::{
+            ConnectorCallFailure, ConnectorOperation,
+        };
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        let state = RuntimeState::default();
+        let control = Arc::new(StreamControl::default());
+        control.requires_close_body.store(true, Ordering::Release);
+        let original: ExecutionFailure = ConnectorCallFailure::new(
+            ConnectorOperation::ReadPage,
+            ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "original read data is corrupt",
+            ),
+        )
+        .into();
+        *control.error.lock().unwrap() = Some(original.clone());
+        let (mut scan, _, _) = observed_stream_scan_source_in(&control, &state);
+        *control.close_check.lock().unwrap() = Some(Box::new(|| std::panic::panic_any(79_u32)));
+        let returned = scan.drive_for_test(&state);
+        let exit = scan.observe_exit().progress;
+        assert!(
+            returned
+                .as_ref()
+                .err()
+                .is_some_and(|cause| cause.same_occurrence(&original))
+        );
+        assert!(state.error().unwrap().same_occurrence(&original));
+        assert_eq!(
+            state.error_state().local_exit_fault().unwrap().fact(),
+            explicit_scan_fact(580)
+        );
+        assert_eq!(control.polls.load(Ordering::Acquire), 1);
+        assert_eq!(control.terminations.load(Ordering::Acquire), 1);
+        assert!(matches!(exit, ExitProgress::Unresolved(_)));
+    }
+
+    #[test]
+    fn an_unclaimed_scan_cannot_discard_an_unknown_exit_control_payload() {
+        use crate::exec::pipeline::operator::ExitProgress;
+        let state = RuntimeState::default();
+        let control = Arc::new(StreamControl::default());
+        let (mut scan, source, _) = observed_stream_scan_source_in(&control, &state);
+        scan.on_downstream_backpressure(true);
+        let primary = Arc::new(AtomicUsize::new(0));
+        let secondary = Arc::new(AtomicUsize::new(0));
+        let capture = Arc::new(vec![3_u8; 512]);
+        let weak = Arc::downgrade(&capture);
+        let payload = OriginalScanPayload {
+            drops: primary.clone(),
+            secondary: Some(SecondaryScanPayload {
+                drops: secondary.clone(),
+                _actual_capture: capture,
+            }),
+        };
+        *control.backpressure_release_check.lock().unwrap() =
+            Some(Box::new(move || std::panic::panic_any(payload)));
+        let begin = catch_unwind(AssertUnwindSafe(|| scan.begin_exit()));
+        let first = scan.observe_exit().progress;
+        let second = scan.observe_exit().progress;
+        assert_eq!(
+            source.claims.load(Ordering::Acquire),
+            0,
+            "no reader or operation exit was invented"
+        );
+        assert!(
+            begin
+                .as_ref()
+                .err()
+                .is_some_and(|payload| is_scan_exit_unwind(payload.as_ref()))
+        );
+        assert_eq!(control.terminations.load(Ordering::Acquire), 1);
+        assert_eq!(primary.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary.load(Ordering::SeqCst), 0);
+        assert!(weak.upgrade().is_some());
+        assert!(
+            matches!(first, ExitProgress::Unresolved(_))
+                && matches!(second, ExitProgress::Unresolved(_))
+        );
+        assert_eq!(
+            state.error_state().local_exit_fault().unwrap().fact(),
+            explicit_scan_fact(586)
+        );
+        assert!(state.error().is_none());
+    }
+
+    #[test]
+    fn close_construction_panic_keeps_a_live_source_exit_pending() {
+        use crate::exec::pipeline::operator::ExitProgress;
+
+        let control = Arc::new(StreamControl::default());
+        let ticket = control
+            .operations
+            .admit(Arc::new(|| {}))
+            .expect("one real operation");
+        let (release, released) = mpsc::channel::<()>();
+        let operation = std::thread::spawn(move || {
+            // Dropping the sender also releases the real operation on unwind.
+            let _ = released.recv();
+            ticket.end(novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited);
+        });
+        let (mut scan, _source) = stream_scan_source(&control);
+        let primed = scan.drive_for_test(&RuntimeState::default());
+        let entered = Arc::new(AtomicBool::new(false));
+        *control.close_check.lock().unwrap() = Some(Box::new({
+            let entered = entered.clone();
+            move || {
+                entered.store(true, Ordering::Release);
+                panic!("injected close constructor panic before the exit future exists");
+            }
+        }));
+        let begin = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan.begin_exit()));
+        let was_pending = matches!(scan.observe_exit().progress, ExitProgress::Unresolved(_));
+        let live_before = control.operations.live_operations();
+        let exited_before = control.operations.is_exited();
+        let entered_before = entered.load(Ordering::Acquire);
+
+        // Release the actual operation and join it before every test oracle.
+        // Sealing does not end its ticket; only the operation above does that.
+        control.operations.seal();
+        drop(release);
+        let joined = operation.join();
+        drop(scan);
+
+        assert!(joined.is_ok(), "the real operation must return");
+        assert!(
+            primed.is_ok(),
+            "the production source was claimed before cleanup"
+        );
+        assert!(
+            entered_before,
+            "the existing close_check reached construction"
+        );
+        assert!(begin.is_err(), "the fixture must inject an actual panic");
+        assert_eq!(live_before, 1);
+        assert!(!exited_before);
+        assert!(control.operations.is_exited());
+        assert!(
+            was_pending,
+            "a caught close-constructor panic cannot turn an outstanding operation into Ready(Ok)"
+        );
+    }
+
+    #[test]
+    fn close_construction_panic_cannot_publish_driver_stopped_before_the_source_operation_exits() {
+        use crate::exec::pipeline::fragment_context::FragmentContext;
+        use crate::exec::pipeline::global_driver_executor::{
+            DriverTask, FragmentCompletion, GlobalDriverExecutor,
+        };
+        use crate::runtime::fragment::ExecutionFailure;
+
+        let mut pipeline = pipeline();
+        let control = pipeline.control.clone();
+        let state = pipeline.state.clone();
+        let ticket = control
+            .operations
+            .admit(Arc::new(|| {}))
+            .expect("one real source operation");
+        let (release, released) = mpsc::channel::<()>();
+        let operation = std::thread::spawn(move || {
+            let _ = released.recv();
+            ticket.end(novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited);
+        });
+        let primed = pipeline.driver.process(TURN);
+        let entered = Arc::new(AtomicBool::new(false));
+        *control.close_check.lock().unwrap() = Some(Box::new({
+            let entered = entered.clone();
+            move || {
+                entered.store(true, Ordering::Release);
+                panic!("injected driver close constructor panic");
+            }
+        }));
+        let original: ExecutionFailure =
+            novarocks_functions::KernelFailure::ResourceExhausted.into();
+        state.error_state().set_error(original.clone());
+        let completion = FragmentCompletion::new(1, state.error_state());
+        let context = Arc::new(FragmentContext::new(
+            None,
+            state.clone(),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let task = DriverTask::new(pipeline.driver, completion.clone(), context, TURN);
+
+        // A second real DriverTask on the same one-worker queue is a barrier:
+        // its stopped notification follows the scan driver's stop/park turn.
+        // It does not manufacture completion for the scan or its operation.
+        let barrier_state = Arc::new(RuntimeState::default());
+        let barrier_completion = FragmentCompletion::new(1, barrier_state.error_state());
+        let barrier_context = Arc::new(FragmentContext::new(
+            None,
+            barrier_state.clone(),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let barrier_driver =
+            PipelineDriver::new(2, Vec::new(), None, Vec::new(), barrier_state, None);
+        let barrier_task = DriverTask::new(
+            barrier_driver,
+            barrier_completion.clone(),
+            barrier_context,
+            TURN,
+        );
+        let (barrier_sent, barrier_received) = mpsc::channel();
+        let mut barrier_finisher: Option<
+            crate::exec::pipeline::global_driver_executor::once_role::Callback<
+                crate::exec::pipeline::global_driver_executor::FragmentStoppedFact,
+            >,
+        > = Some(Box::new(move |fact| {
+            let _ = barrier_sent.send(fact.clone());
+            true
+        }));
+        barrier_completion
+            .bind_resources_finisher(&mut barrier_finisher)
+            .expect("one original barrier resource finisher");
+        let executor = GlobalDriverExecutor::new(1);
+        let admitted = executor.submit(vec![task, barrier_task]);
+        let barrier = barrier_received.recv_timeout(Duration::from_secs(2));
+        let stopped_before = completion.stopped_fact();
+        let live_before = control.operations.live_operations();
+        let exited_before = control.operations.is_exited();
+        let entered_before = entered.load(Ordering::Acquire);
+
+        // No assertion is inside the engine catch or before real cleanup.
+        // Unpark and join the source operation, then join the actual executor.
+        control.operations.seal();
+        drop(release);
+        let joined = operation.join();
+        control.wake();
+        let shutdown = executor.shutdown();
+        let stopped_after = completion.stopped_fact();
+        let observed = state.error();
+
+        assert!(joined.is_ok());
+        assert!(
+            shutdown.is_ok(),
+            "executor must join after the real source exit: {shutdown:?}"
+        );
+        assert!(admitted);
+        assert!(
+            matches!(primed, DriverState::Blocked(BlockedReason::InputEmpty)),
+            "prime the real stream before stop: {primed:?}"
+        );
+        assert!(
+            barrier.is_ok(),
+            "the independent queue barrier must really run: {barrier:?}"
+        );
+        assert!(entered_before);
+        assert_eq!(live_before, 1);
+        assert!(!exited_before);
+        assert!(control.operations.is_exited());
+        assert!(
+            stopped_before.is_none(),
+            "a caught constructor panic cannot certify the live source operation exited: {stopped_before:?}"
+        );
+        assert!(
+            stopped_after.is_some(),
+            "actual source exit must eventually allow real driver completion"
+        );
+        assert!(
+            observed.unwrap().same_occurrence(&original),
+            "cleanup panic cannot replace the original work failure"
+        );
+    }
+
+    #[test]
+    fn an_original_background_work_failure_wakes_the_live_scan_before_any_close() {
+        use crate::runtime::fragment::connector_failure::ConnectorOperation;
+        use novarocks_spi::connector::{
+            ConnectorError, ConnectorErrorKind, read_stack::ConnectorOperationExit,
+        };
+        let mut pipeline = pipeline();
+        let failed = pipeline.control.operations.admit(Arc::new(|| {})).unwrap();
+        let live = pipeline.control.operations.admit(Arc::new(|| {})).unwrap();
+        assert!(matches!(
+            pipeline.driver.process(TURN),
+            DriverState::Blocked(BlockedReason::InputEmpty)
+        ));
+        assert!(!pipeline.control.close_requested.load(Ordering::Acquire));
+        assert_eq!(pipeline.control.terminations.load(Ordering::Acquire), 0);
+        let (observable, generation, _) = pipeline
+            .driver
+            .blocked_observable_snapshot()
+            .expect("actual scan waiter");
+        failed.end(ConnectorOperationExit::WorkFailed(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "actual accepted background operation failed",
+        )));
+        assert!(
+            observable.generation() > generation,
+            "the original registered source receiver wakes its blocked driver before close"
+        );
+        assert_eq!(pipeline.driver.process(TURN), DriverState::PendingFinish);
+        let original = pipeline
+            .state
+            .error()
+            .expect("the original runtime already accepted the work author");
+        let crate::runtime::fragment::ExecutionFailureCause::Connector(cause) = original.cause()
+        else {
+            panic!("the real SourceExit author remains typed");
+        };
+        assert_eq!(cause.operation(), ConnectorOperation::SourceExit);
+        assert_eq!(cause.cause().kind(), ConnectorErrorKind::CorruptData);
+        assert_eq!(
+            cause.cause().message(),
+            "actual accepted background operation failed"
+        );
+        assert_eq!(pipeline.control.operations.live_operations(), 1);
+        assert!(!pipeline.control.operations.is_exited());
+        assert!(pipeline.control.close_requested.load(Ordering::Acquire));
+        drop(live);
+        match pipeline.driver.process(TURN) {
+            DriverState::Failed(observed) => assert!(observed.same_occurrence(&original)),
+            other => panic!("only actual sibling exit completes this failed driver: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn originating_read_failure_is_visible_before_close_and_keeps_its_step_location() {
+        use crate::runtime::fragment::connector_failure::{
+            ConnectorCallFailure, ConnectorOperation,
+        };
+        use crate::runtime::fragment::{ExecutionFailure, PipelineOperation};
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        let mut pipeline = pipeline();
+        let original: ExecutionFailure = ConnectorCallFailure::new(
+            ConnectorOperation::ReadPage,
+            ConnectorError::new(ConnectorErrorKind::CorruptData, "original corrupt page"),
+        )
+        .at_sequence(42)
+        .into();
+        let expected = original.clone().at_operator(0, PipelineOperation::Pull);
+        let error_state = pipeline.state.error_state();
+        let checked = Arc::new(AtomicBool::new(false));
+        *pipeline.control.close_check.lock().unwrap() = Some(Box::new({
+            let expected = expected.clone();
+            let checked = checked.clone();
+            let error_state = error_state.clone();
+            move || {
+                assert_eq!(error_state.error(), Some(expected));
+                checked.store(true, Ordering::Release);
+            }
+        }));
+        let exit = pipeline.control.operations.admit(Arc::new(|| {})).unwrap();
+        *pipeline.control.error.lock().unwrap() = Some(original);
+        assert_eq!(pipeline.driver.process(TURN), DriverState::PendingFinish);
+        assert!(checked.load(Ordering::Acquire));
+        assert_eq!(error_state.error(), Some(expected.clone()));
+        assert_eq!(pipeline.source.claims.load(Ordering::Acquire), 1);
+        exit.end(
+            novarocks_spi::connector::read_stack::ConnectorOperationExit::WorkFailed(
+                ConnectorError::new(ConnectorErrorKind::Unavailable, "later source exit failure"),
+            ),
+        );
+        assert_eq!(
+            pipeline.driver.process(TURN),
+            DriverState::Failed(expected.clone())
+        );
+        assert_eq!(error_state.error(), Some(expected));
+    }
+
+    #[test]
+    fn a_wake_inside_the_poll_is_rechecked_before_the_driver_parks() {
         let mut pipeline = pipeline();
         *pipeline.control.staged.lock().expect("staged") = Some(one_row(1));
         pipeline
@@ -879,8 +2199,8 @@ mod tests {
             .store(true, Ordering::Release);
 
         // The poll returns Pending after waking itself: the driver must not
-        // park on a wake it already received.
-        assert!(matches!(pipeline.driver.process(TURN), DriverState::Ready));
+        // park on a wake it already received. The worker rechecks and delivers
+        // that row in the current turn, then parks on the next empty poll.
         assert!(matches!(
             pipeline.driver.process(TURN),
             DriverState::Blocked(BlockedReason::InputEmpty)
@@ -961,6 +2281,65 @@ mod tests {
     }
 
     #[test]
+    fn actual_stream_close_outcome_stays_immutable_after_operation_exit() {
+        use crate::exec::pipeline::operator::ExitProgress;
+        use crate::runtime::fragment::connector_failure::ConnectorOperation;
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        for fail in [false, true] {
+            let control = Arc::new(StreamControl::default());
+            let ticket = control.operations.admit(Arc::new(|| {})).unwrap();
+            let state = RuntimeState::default();
+            let (mut scan, _, _) = observed_stream_scan_source_in(&control, &state);
+            scan.drive_for_test(&state).unwrap();
+            scan.begin_exit().unwrap();
+            assert!(control.close_requested.load(Ordering::Acquire));
+            assert!(!control.operations.is_exited());
+            assert!(matches!(
+                scan.observe_exit().progress,
+                ExitProgress::Pending(_)
+            ));
+            ticket.end(if fail {
+                novarocks_spi::connector::read_stack::ConnectorOperationExit::WorkFailed(
+                    ConnectorError::new(
+                        ConnectorErrorKind::Unavailable,
+                        "original stream exit refusal",
+                    ),
+                )
+            } else {
+                novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited
+            });
+            assert!(control.operations.is_exited());
+            let observation = scan.observe_exit();
+            assert!(matches!(observation.progress, ExitProgress::Exited));
+            assert!(
+                observation.failure.is_none(),
+                "the bound runtime consumed the author event"
+            );
+            let original = state.error();
+            assert_eq!(original.is_some(), fail);
+            if let Some(error) = &original {
+                let crate::runtime::fragment::ExecutionFailureCause::Connector(source) =
+                    error.cause()
+                else {
+                    panic!("the actual SourceExit domain remains intact");
+                };
+                assert_eq!(source.operation(), ConnectorOperation::SourceExit);
+                assert_eq!(source.cause().kind(), ConnectorErrorKind::Unavailable);
+            }
+            for _ in 0..3 {
+                let observed = scan.observe_exit();
+                assert!(matches!(observed.progress, ExitProgress::Exited));
+                assert!(observed.failure.is_none());
+                match (&original, state.error()) {
+                    (None, None) => {}
+                    (Some(original), Some(observed)) => assert!(observed.same_occurrence(original)),
+                    _ => panic!("the original runtime outcome cannot change after consumption"),
+                }
+            }
+        }
+    }
+
+    #[test]
     fn end_of_stream_waits_for_the_sources_exit_before_the_driver_ends() {
         let mut pipeline = pipeline();
         let ticket = pipeline
@@ -983,7 +2362,7 @@ mod tests {
             DriverState::PendingFinish
         ));
 
-        ticket.end(Ok(()));
+        ticket.end(novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited);
         assert!(matches!(
             pipeline.driver.process(TURN),
             DriverState::Finished
@@ -991,21 +2370,50 @@ mod tests {
     }
 
     #[test]
-    fn a_close_that_is_never_observed_still_stops_the_stream() {
+    fn pending_source_close_does_not_prevent_downstream_eos() {
+        let state = Arc::new(RuntimeState::default());
+        let control = Arc::new(StreamControl::default());
+        let operation = control.operations.admit(Arc::new(|| {})).unwrap();
+        let (scan, source, _) = observed_stream_scan_source_in(&control, &state);
+        let values = Arc::new(Mutex::new(Vec::new()));
+        let finishes = Arc::new(AtomicUsize::new(0));
+        let finish_count = finishes.clone();
+        let sink = crate::exec::pipeline::shape::Transform::hydrating(CollectSink {
+            values: values.clone(),
+            // This admitted source operation owes the consumer its input EOS.
+            // Its explicit end occurs in that same mandatory finalization.
+            on_finish: Some(Box::new(move || {
+                finish_count.fetch_add(1, Ordering::AcqRel);
+                operation.end(novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited);
+            })),
+        });
+        let mut driver =
+            PipelineDriver::new(1, vec![scan, Box::new(sink)], None, vec![], state, None);
+        control.push(one_row(3));
+        control.ended.store(true, Ordering::Release);
+        assert_eq!(run_until_parked(&mut driver), DriverState::Finished);
+        assert_eq!(*values.lock().unwrap(), vec![3]);
+        assert_eq!(finishes.load(Ordering::Acquire), 1);
+        assert!(control.close_requested.load(Ordering::Acquire));
+        assert!(control.operations.is_exited());
+        assert_eq!(source.claims.load(Ordering::Acquire), 1);
+        drop(driver);
+        assert_eq!(finishes.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn beginning_exit_without_observing_it_still_stops_the_stream() {
         let control = Arc::new(StreamControl::default());
         let (mut scan, _source) = stream_scan_source(&control);
         let _ticket = control
             .operations
             .admit(Arc::new(|| {}))
             .expect("one running operation");
-        let processor = scan.as_processor_mut().expect("stream scan processor");
-        assert!(
-            processor
-                .pull_chunk(&RuntimeState::default())
-                .expect("poll")
-                .is_none()
-        );
+        let step = scan.drive_for_test(&RuntimeState::default()).expect("poll");
+        assert!(step.output.is_none());
+        assert!(matches!(step.next, NextStep::Wait(_)));
 
+        scan.begin_exit().expect("begin exit");
         scan.close().expect("close");
         drop(scan);
         assert!(control.close_requested.load(Ordering::Acquire));
@@ -1043,11 +2451,12 @@ mod tests {
             1,
             vec![
                 scan,
-                Box::new(CollectSink {
-                    values: Arc::clone(&values),
-                    finished: false,
-                    observable: Arc::new(Observable::new()),
-                }),
+                Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+                    CollectSink {
+                        values: Arc::clone(&values),
+                        on_finish: None,
+                    },
+                )),
             ],
             None,
             Vec::new(),
@@ -1074,13 +2483,15 @@ mod tests {
         let (mut scan, _source) = stream_scan_source(&control);
         scan.cancel();
         assert_eq!(control.terminations.load(Ordering::Acquire), 1);
-        assert!(scan.is_finished());
+        let ended = scan.drive_for_test(&RuntimeState::default()).unwrap();
+        assert!(ended.output.is_none());
+        assert!(matches!(ended.next, NextStep::Finished));
     }
 
     #[test]
     fn a_stream_scan_charges_the_chunks_it_hands_out_to_its_fragment() {
         let fragment = crate::runtime::mem_tracker::MemTracker::new_root("fragment_under_test");
-        let state = RuntimeState::new(
+        let state = RuntimeState::for_local_execution(
             None,
             None,
             None,
@@ -1092,10 +2503,12 @@ mod tests {
         let control = Arc::new(StreamControl::default());
         let (mut scan, _source, _) = observed_stream_scan_source_in(&control, &state);
         control.push(one_row(3));
-        let processor = scan.as_processor_mut().expect("stream scan processor");
-        processor.begin_turn();
-        let chunk = processor
-            .pull_chunk(&state)
+        let budget = ConnectorPollBudget::new();
+        budget.refill(SCAN_STREAM_TURN_BUDGET);
+        scan.bind_poll_budget(budget);
+        let chunk = scan
+            .drive_for_test(&state)
+            .map(|step| step.output)
             .expect("poll")
             .expect("the scripted chunk");
         assert_eq!(value_of(&chunk), 3);
@@ -1114,44 +2527,40 @@ mod tests {
         observable: Arc<Observable>,
     }
 
-    impl Operator for GatedSink {
+    impl OperatorLifecycle for GatedSink {
         fn name(&self) -> &str {
             "GATED_SINK"
         }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
+    impl crate::exec::pipeline::operator::InputEncodingPolicy for GatedSink {}
 
-    impl ProcessorOperator for GatedSink {
-        fn need_input(&self) -> bool {
-            self.open.load(Ordering::Acquire)
+    impl crate::exec::pipeline::shape::SinkKernel for GatedSink {
+        fn admission(
+            &self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            _: &crate::exec::pipeline::input::RawInput,
+        ) -> ExecutionResult<Option<crate::exec::pipeline::step::AdmissionNext>> {
+            let generation = self.observable.generation();
+            Ok((!self.open.load(Ordering::Acquire)).then(|| {
+                crate::exec::pipeline::step::AdmissionNext::Wait(WaitFact {
+                    reason: WaitReason::Output,
+                    observable: self.observable.clone(),
+                    observed_generation: generation,
+                    deadline: None,
+                })
+            }))
         }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+        fn consume(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            input: crate::exec::pipeline::input::PreparedInput,
+        ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
+            let chunk = input.into_uncovered_chunk()?;
             self.values.lock().expect("values").push(value_of(&chunk));
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn sink_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.observable))
+            Ok(crate::exec::pipeline::shape::SinkStep::new(
+                NextStep::NeedInput,
+                chunk.len() as u64,
+            ))
         }
     }
 
@@ -1166,11 +2575,13 @@ mod tests {
             1,
             vec![
                 scan,
-                Box::new(GatedSink {
-                    open: Arc::clone(&open),
-                    values: Arc::clone(&values),
-                    observable: Arc::clone(&sink_observable),
-                }),
+                Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+                    GatedSink {
+                        open: Arc::clone(&open),
+                        values: Arc::clone(&values),
+                        observable: Arc::clone(&sink_observable),
+                    },
+                )),
             ],
             None,
             Vec::new(),
@@ -1209,52 +2620,32 @@ mod tests {
     struct BlockingSink {
         entered: mpsc::Sender<i32>,
         release: Arc<Mutex<mpsc::Receiver<()>>>,
-        observable: Arc<Observable>,
     }
 
-    impl Operator for BlockingSink {
+    impl OperatorLifecycle for BlockingSink {
         fn name(&self) -> &str {
             "BLOCKING_SINK"
         }
-
-        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-            Some(self)
-        }
-
-        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-            Some(self)
-        }
     }
+    impl crate::exec::pipeline::operator::InputEncodingPolicy for BlockingSink {}
 
-    impl ProcessorOperator for BlockingSink {
-        fn need_input(&self) -> bool {
-            true
-        }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+    impl crate::exec::pipeline::shape::SinkKernel for BlockingSink {
+        fn consume(
+            &mut self,
+            _: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            input: crate::exec::pipeline::input::PreparedInput,
+        ) -> ExecutionResult<crate::exec::pipeline::shape::SinkStep> {
+            let chunk = input.into_uncovered_chunk()?;
             self.entered.send(value_of(&chunk)).expect("entered");
             self.release
                 .lock()
                 .expect("release")
                 .recv()
                 .expect("released");
-            Ok(())
-        }
-
-        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
-            Ok(())
-        }
-
-        fn sink_observable(&self) -> Option<Arc<Observable>> {
-            Some(Arc::clone(&self.observable))
+            Ok(crate::exec::pipeline::shape::SinkStep::new(
+                NextStep::NeedInput,
+                chunk.len() as u64,
+            ))
         }
     }
 
@@ -1264,12 +2655,15 @@ mod tests {
         let (scan, _source) = stream_scan_source(&control);
         let exchanger = LocalExchanger::new_handoff(1, 1, 8, Arc::new(ExprArena::default()));
         let state = Arc::new(RuntimeState::default());
+        let mut exchange_sink =
+            LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger)).create(1, 0);
+        exchange_sink.set_construction_factory(actual_test_factory());
+        exchange_sink
+            .bind_runtime_state(&state)
+            .expect("bind exchange queue ownership");
         let mut scan_driver = PipelineDriver::new(
             1,
-            vec![
-                scan,
-                LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger)).create(1, 0),
-            ],
+            vec![scan, exchange_sink],
             None,
             Vec::new(),
             Arc::clone(&state),
@@ -1281,11 +2675,12 @@ mod tests {
             2,
             vec![
                 LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger)).create(1, 0),
-                Box::new(BlockingSink {
-                    entered: entered_tx,
-                    release: Arc::new(Mutex::new(release_rx)),
-                    observable: Arc::new(Observable::new()),
-                }),
+                Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+                    BlockingSink {
+                        entered: entered_tx,
+                        release: Arc::new(Mutex::new(release_rx)),
+                    },
+                )),
             ],
             None,
             Vec::new(),

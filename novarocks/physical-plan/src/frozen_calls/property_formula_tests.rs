@@ -44,7 +44,7 @@ impl PureCompileControl for FormulaControl {
             assert!(at <= stop, "callback after first property refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -116,7 +116,7 @@ fn prefixes(
         for cause in CAUSES {
             let control = FormulaControl {
                 trace: Mutex::new(vec![]),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(call(&control), Err(FragmentPropertyError::Control(actual)) if actual == cause)

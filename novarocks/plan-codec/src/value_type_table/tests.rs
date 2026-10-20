@@ -58,7 +58,7 @@ impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         let mut trace = self.trace.lock().unwrap();
         trace.push((phase, units));
-        if let Some((stop, cause)) = self.stop
+        if let Some((stop, cause)) = self.stop.clone()
             && trace.len() == stop
         {
             return Err(cause);
@@ -539,14 +539,14 @@ fn every_original_control_prefix_preserves_encode_and_decode_primary_causes() {
         CompileControlError::ResourceExhausted,
     ] {
         for stop in 1..=encode_calls {
-            let control = Control::refusing(stop, cause);
+            let control = Control::refusing(stop, cause.clone());
             assert!(
                 matches!(encode(&roots, &control, &mut allow), Err(Failure::Codec(LogicalTypeCodecError::Control(actual))) if actual == cause)
             );
             assert_eq!(control.calls(), stop);
         }
         for stop in 1..=decode_calls {
-            let control = Control::refusing(stop, cause);
+            let control = Control::refusing(stop, cause.clone());
             assert!(
                 matches!(decode(&definitions, ValueTypeStorageLifetime::pure(), &control, &mut allow), Err(Failure::Codec(LogicalTypeCodecError::Control(actual))) if actual == cause)
             );

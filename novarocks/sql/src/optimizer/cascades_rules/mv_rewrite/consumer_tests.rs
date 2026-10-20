@@ -55,7 +55,7 @@ impl PureCompileControl for Control {
             assert!(index <= at, "refused control was called again");
         }
         events.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((at, cause)) if at == index => Err(cause),
             _ => Ok(()),
         }
@@ -339,7 +339,7 @@ fn check_callbacks<T>(run: impl Fn(&Control) -> Result<T, SqlCompileError>) {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let refusal = Control::at(index, cause);
+            let refusal = Control::at(index, cause.clone());
             match run(&refusal) {
                 Err(error) => assert_cause(error, cause),
                 Ok(_) => panic!("control refusal must be fatal"),

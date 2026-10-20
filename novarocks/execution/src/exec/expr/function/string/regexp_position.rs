@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 use novarocks_functions::builtin::regexp_position::{
-    evaluate_legacy, validate_legacy_position, validate_legacy_strings,
+    evaluate_required, validate_argument_strings, validate_position_argument,
 };
 
 pub fn eval_regexp_position<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -26,21 +27,21 @@ pub fn eval_regexp_position<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let _ = expr;
     let str_arr = arena.eval(args[0], chunk)?;
     let pat_arr = arena.eval(args[1], chunk)?;
-    validate_legacy_strings(&str_arr, &pat_arr)?;
+    validate_argument_strings(&str_arr, &pat_arr)?;
     let mut arrays = vec![str_arr, pat_arr];
     if args.len() >= 3 {
         let start = arena.eval(args[2], chunk)?;
-        validate_legacy_position(&start)?;
+        validate_position_argument(&start)?;
         arrays.push(start);
     }
     if args.len() >= 4 {
         let occurrence = arena.eval(args[3], chunk)?;
-        validate_legacy_position(&occurrence)?;
+        validate_position_argument(&occurrence)?;
         arrays.push(occurrence);
     }
-    Ok((evaluate_legacy(&arrays, chunk.len()))?)
+    evaluate_required(&arrays, chunk.len()).map_err(ExecutionFailure::from)
 }

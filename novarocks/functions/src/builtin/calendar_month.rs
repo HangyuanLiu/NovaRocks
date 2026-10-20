@@ -16,10 +16,8 @@
 // under the License.
 
 //! The original month/year shift expression, including narrowing, clipping and panic order.
-use super::{
-    calendar_extended::{DateInput, timestamp_value_for_type},
-    calendar_extended_shared::CalendarInput,
-};
+use super::calendar_timestamp::timestamp_value;
+use super::{calendar_extended::DateInput, calendar_extended_shared::CalendarInput};
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, SelectedValues,
     kernel_control::{internal, invalid},
@@ -66,9 +64,9 @@ fn shift_calendar_months(
     let months = months as i32 * factor;
     date.map(|date| add_months_to_datetime(date, months))
 }
-pub(super) fn evaluate_month_shift<'a>(
+pub(super) fn evaluate_month_shift<'a, E>(
     factor: i32,
-    input: CalendarInput<'_, 'a>,
+    input: CalendarInput<'_, 'a, E>,
     control: &dyn KernelEvaluationControl,
 ) -> Result<SelectedValues<'a>, KernelFailure> {
     control.checkpoint(0)?;
@@ -92,8 +90,7 @@ pub(super) fn evaluate_month_shift<'a>(
             || interval_type.logical_type() != ValueLogicalType::Physical
             || interval_type.data_type() != &DataType::Int64
             || interval_arg.array().data_type() != &DataType::Int64
-            || (!input.legacy
-                && target.data_type() != &DataType::Timestamp(TimeUnit::Microsecond, None))
+            || target.data_type() != &DataType::Timestamp(TimeUnit::Microsecond, None)
         {
             return Err(invalid(
                 "month shift differs from its exact declared profile",
@@ -151,11 +148,8 @@ pub(super) fn evaluate_month_shift<'a>(
             .map_err(|_| KernelFailure::ResourceExhausted)?;
         work.flush()?;
         for value in values {
-            // A legacy Date32 requested result intentionally projects NULL into its
-            // historical TimestampUS carrier; the owner admits only exact TimestampUS.
-            projected.push(
-                value.and_then(|date| timestamp_value_for_type(date, target.data_type()).ok()),
-            );
+            projected
+                .push(value.and_then(|date| timestamp_value(date, TimeUnit::Microsecond).ok()));
             work.step()?;
         }
         work.flush()?;

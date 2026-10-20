@@ -27,9 +27,7 @@ use novarocks_query_application::api::{
 use novarocks_query_application::protocol_delivery::StreamingStatementResult;
 use novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome;
 use novarocks_result_contract::{RootOutputKind, ValidatedClientBody};
-use opensrv_mysql::{
-    CapabilityFlags, ErrorKind, OwnedStreamingMysqlWriter, QueryResultWriter, StatusFlags,
-};
+use opensrv_mysql::{CapabilityFlags, OwnedStreamingMysqlWriter, QueryResultWriter, StatusFlags};
 use tokio::io::AsyncWrite;
 
 use crate::governed_result_writer::{
@@ -531,11 +529,7 @@ async fn close_relay<'writer, W: AsyncWrite + Unpin>(
     // This item was prefetched but not delivered: dropping it grants no ACK.
     drop(resident_items);
     let payload = error_payload(&error, lease.writer().protocol_limits().diagnostic_bytes);
-    let kind = if is_terminal_cancellation(&error) {
-        ErrorKind::ER_QUERY_INTERRUPTED
-    } else {
-        ErrorKind::ER_UNKNOWN_ERROR
-    };
+    let kind = crate::error_mapping::execution_error_kind(&error);
     let writer = match lease.into_closing_lease(tail, kind, &payload[9..]) {
         Ok(writer) => writer,
         Err((lease, rejection)) => {
@@ -738,18 +732,18 @@ pub(crate) fn success_payload(capabilities: CapabilityFlags, more: bool) -> Vec<
     }
 }
 pub(crate) fn error_payload(error: &QueryExecutionError, limit: usize) -> Vec<u8> {
-    let kind = if is_terminal_cancellation(error) {
-        ErrorKind::ER_QUERY_INTERRUPTED
-    } else {
-        ErrorKind::ER_UNKNOWN_ERROR
-    };
-    let message = error.message();
+    let kind = crate::error_mapping::execution_error_kind(&error);
+    let message = crate::error_mapping::execution_error_message(error);
     let mut payload = Vec::with_capacity(message.len().min(limit) + 9);
     payload.push(0xff);
     payload.extend_from_slice(&(kind as u16).to_le_bytes());
     payload.push(b'#');
     payload.extend_from_slice(kind.sqlstate());
-    payload.extend_from_slice(&message.as_bytes()[..message.len().min(limit)]);
+    let mut end = message.len().min(limit);
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    payload.extend_from_slice(&message.as_bytes()[..end]);
     payload
 }
 pub(crate) fn invalid(message: impl Into<String>) -> QueryExecutionError {

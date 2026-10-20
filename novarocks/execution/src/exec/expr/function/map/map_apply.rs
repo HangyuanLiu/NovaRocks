@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::{Chunk, ChunkSchema};
-use crate::exec::expr::{ExprArena, ExprId, ExprNode};
+use crate::exec::expr::expression_contract;
+use crate::exec::expr::function::array::common as array_common;
+use crate::exec::expr::{ExprId, ExprNode};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, MapArray, UInt32Array, make_array, new_empty_array};
 use arrow::compute::{cast, concat, take};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -31,9 +34,12 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     if args.len() < 2 {
-        return Err((format!("map_apply expects at least 2 arguments, got {}", args.len())).into());
+        return Err(expression_contract(format_args!(
+            "map_apply expects at least 2 arguments, got {}",
+            args.len()
+        )));
     }
 
     let (lambda_id, map_args) = match arena.node(args[0]) {
@@ -43,39 +49,42 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 (args[args.len() - 1], &args[..args.len() - 1])
             }
             _ => {
-                return Err(
-                    ("map_apply expects a lambda function as the first or last argument"
-                        .to_string())
-                    .into(),
-                );
+                return Err(expression_contract(
+                    "map_apply expects a lambda function as the first or last argument",
+                ));
             }
         },
     };
 
     if map_args.is_empty() {
-        return Err(("map_apply expects at least one map argument".to_string()).into());
+        return Err(expression_contract(
+            "map_apply expects at least one map argument",
+        ));
     }
 
     let output_type = arena
         .data_type(expr)
         .cloned()
-        .ok_or_else(|| "map_apply missing output type".to_string())?;
+        .ok_or_else(|| expression_contract("map_apply missing output type"))?;
     let (map_field, output_fields, ordered) = match output_type {
         DataType::Map(field, ordered) => {
             let DataType::Struct(fields) = field.data_type().clone() else {
-                return Err(
-                    ("map_apply output map entries type must be Struct".to_string()).into(),
-                );
+                return Err(expression_contract(
+                    "map_apply output map entries type must be Struct",
+                ));
             };
             if fields.len() != 2 {
-                return Err(
-                    ("map_apply output map entries type must have 2 fields".to_string()).into(),
-                );
+                return Err(expression_contract(
+                    "map_apply output map entries type must have 2 fields",
+                ));
             }
             (field, fields, ordered)
         }
         other => {
-            return Err((format!("map_apply output type must be Map, got {:?}", other)).into());
+            return Err(expression_contract(format_args!(
+                "map_apply output type must be Map, got {:?}",
+                other
+            )));
         }
     };
 
@@ -86,37 +95,41 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             common_sub_exprs,
             ..
         }) => (*body, arg_slots.clone(), common_sub_exprs.clone()),
-        _ => return Err(("map_apply expects lambda function expression".to_string()).into()),
+        _ => {
+            return Err(expression_contract(
+                "map_apply expects lambda function expression",
+            ));
+        }
     };
 
     let expected_lambda_args = map_args
         .len()
         .checked_mul(2)
-        .ok_or_else(|| "map_apply lambda argument count overflow".to_string())?;
+        .ok_or_else(|| expression_contract("map_apply lambda argument count overflow"))?;
     if lambda_args.len() != expected_lambda_args {
-        return Err((format!(
+        return Err(expression_contract(format_args!(
             "map_apply expects {} lambda arguments, got {}",
             expected_lambda_args,
             lambda_args.len()
-        ))
-        .into());
+        )));
     }
 
     let num_rows = chunk.len();
     let mut input_maps = Vec::with_capacity(map_args.len());
     for arg in map_args {
         let array = arena.eval(*arg, chunk)?;
-        let map = array
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .ok_or_else(|| format!("map_apply expects MapArray, got {:?}", array.data_type()))?;
+        let map = array.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+            expression_contract(format_args!(
+                "map_apply expects MapArray, got {:?}",
+                array.data_type()
+            ))
+        })?;
         if map.len() != 1 && map.len() != num_rows {
-            return Err((format!(
+            return Err(expression_contract(format_args!(
                 "map_apply input length mismatch: expected 1 or {}, got {}",
                 num_rows,
                 map.len()
-            ))
-            .into());
+            )));
         }
         input_maps.push(array);
     }
@@ -131,7 +144,7 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let map = map_arr
                 .as_any()
                 .downcast_ref::<MapArray>()
-                .ok_or_else(|| "map_apply internal map downcast failed".to_string())?;
+                .ok_or_else(|| expression_contract("map_apply internal map downcast failed"))?;
             let map_row = super::common::row_index(row, map.len());
             if map.is_null(map_row) {
                 row_is_null = true;
@@ -141,9 +154,12 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let len = (offsets[map_row + 1] - offsets[map_row]) as usize;
             if let Some(prev) = len_opt {
                 if prev != len {
-                    return Err(("Input map element's size are not equal in map_apply()."
-                        .to_string())
-                    .into());
+                    return Err(array_common::length_mismatch_failure(
+                        "map_apply",
+                        row,
+                        prev,
+                        len,
+                    ));
                 }
             } else {
                 len_opt = Some(len);
@@ -160,17 +176,11 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         row_lengths[row] = len;
         total_elements = total_elements
             .checked_add(len)
-            .ok_or_else(|| "map_apply total element count overflow".to_string())?;
+            .ok_or_else(|| expression_contract("map_apply total element count overflow"))?;
     }
 
     if total_elements == 0 {
-        return Ok((build_empty_output_map(
-            output_fields,
-            map_field,
-            ordered,
-            &row_valid,
-            num_rows,
-        ))?);
+        return build_empty_output_map(output_fields, map_field, ordered, &row_valid, num_rows);
     }
 
     let mut flat_columns = Vec::<ArrayRef>::with_capacity(input_maps.len() * 2);
@@ -178,11 +188,13 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         let map = map_arr
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| "map_apply internal map downcast failed".to_string())?;
+            .ok_or_else(|| expression_contract("map_apply internal map downcast failed"))?;
         let flat_keys = flatten_map_component(map, &row_valid, true)?;
         let flat_values = flatten_map_component(map, &row_valid, false)?;
         if flat_keys.len() != total_elements || flat_values.len() != total_elements {
-            return Err(("map_apply flattened input length mismatch".to_string()).into());
+            return Err(expression_contract(
+                "map_apply flattened input length mismatch",
+            ));
         }
         flat_columns.push(flat_keys);
         flat_columns.push(flat_values);
@@ -200,7 +212,10 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     for (idx, slot_id) in lambda_args.iter().enumerate() {
         if !seen.insert(*slot_id) {
-            return Err((format!("duplicate lambda argument slot id: {}", slot_id)).into());
+            return Err(expression_contract(format_args!(
+                "duplicate lambda argument slot id: {}",
+                slot_id
+            )));
         }
         let col = flat_columns[idx].clone();
         fields.push(Field::new(
@@ -214,7 +229,10 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     for (slot_id, col) in captured_columns {
         if !seen.insert(slot_id) {
-            return Err((format!("lambda captured slot id conflicts: {}", slot_id)).into());
+            return Err(expression_contract(format_args!(
+                "lambda captured slot id conflicts: {}",
+                slot_id
+            )));
         }
         fields.push(Field::new(
             format!("lambda_capture_{slot_id}"),
@@ -229,16 +247,18 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     for (idx, (slot_id, expr_id)) in common_sub_exprs.iter().enumerate() {
         if !seen.insert(*slot_id) {
-            return Err((format!("lambda common sub expr slot id conflicts: {}", slot_id)).into());
+            return Err(expression_contract(format_args!(
+                "lambda common sub expr slot id conflicts: {}",
+                slot_id
+            )));
         }
         let col = arena.eval(*expr_id, &lambda_chunk)?;
         if col.len() != total_elements {
-            return Err((format!(
+            return Err(expression_contract(format_args!(
                 "lambda common sub expr length mismatch: expected {}, got {}",
                 total_elements,
                 col.len()
-            ))
-            .into());
+            )));
         }
         fields.push(Field::new(
             format!("lambda_common_{idx}"),
@@ -252,37 +272,26 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     let lambda_result = arena.eval(lambda_body, &lambda_chunk)?;
     if lambda_result.len() != total_elements {
-        return Err((format!(
+        return Err(expression_contract(format_args!(
             "lambda body length mismatch: expected {}, got {}",
             total_elements,
             lambda_result.len()
-        ))
-        .into());
+        )));
     }
     let lambda_map = lambda_result
         .as_any()
         .downcast_ref::<MapArray>()
-        .ok_or_else(|| "map_apply lambda must return MAP type".to_string())?;
+        .ok_or_else(|| expression_contract("map_apply lambda must return MAP type"))?;
 
     let mut lambda_keys = lambda_map.keys().clone();
     let mut lambda_values = lambda_map.values().clone();
     if lambda_keys.data_type() != output_fields[0].data_type() {
-        lambda_keys = cast(&lambda_keys, output_fields[0].data_type()).map_err(|e| {
-            format!(
-                "map_apply failed to cast lambda key to {:?}: {}",
-                output_fields[0].data_type(),
-                e
-            )
-        })?;
+        lambda_keys = cast(&lambda_keys, output_fields[0].data_type())
+            .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
     if lambda_values.data_type() != output_fields[1].data_type() {
-        lambda_values = cast(&lambda_values, output_fields[1].data_type()).map_err(|e| {
-            format!(
-                "map_apply failed to cast lambda value to {:?}: {}",
-                output_fields[1].data_type(),
-                e
-            )
-        })?;
+        lambda_values = cast(&lambda_values, output_fields[1].data_type())
+            .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
 
     let keys_data = lambda_keys.to_data();
@@ -293,7 +302,7 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let lambda_offsets = lambda_map.value_offsets();
     let mut out_offsets = Vec::with_capacity(num_rows + 1);
     out_offsets.push(0_i32);
-    let mut current: i64 = 0;
+    let mut current = 0i32;
     let mut null_builder = NullBufferBuilder::new(num_rows);
     let mut lambda_row_cursor = 0usize;
 
@@ -318,10 +327,9 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 continue;
             }
             if end - start != 1 {
-                return Err(
-                    ("map_apply lambda result must contain exactly one key-value pair".to_string())
-                        .into(),
-                );
+                return Err(array_common::lambda_value_failure(
+                    "map_apply lambda result must contain exactly one key-value pair",
+                ));
             }
             let key_row = start;
             let mut duplicated = false;
@@ -339,13 +347,12 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             if duplicated {
                 continue;
             }
+            let next =
+                novarocks_functions::aggregate_scalar::checked_map_output_offset(current, 1)?;
             out_keys.extend(0, key_row, key_row + 1);
             out_values.extend(0, key_row, key_row + 1);
             picked_key_rows.push(key_row);
-            current += 1;
-            if current > i32::MAX as i64 {
-                return Err(("map_apply offset overflow".to_string()).into());
-            }
+            current = next;
         }
 
         lambda_row_cursor += len;
@@ -354,12 +361,21 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     }
 
     if lambda_row_cursor != total_elements {
-        return Err(("map_apply internal lambda cursor mismatch".to_string()).into());
+        return Err(expression_contract(
+            "map_apply internal lambda cursor mismatch",
+        ));
     }
 
     let out_keys = make_array(out_keys.freeze());
     let out_values = make_array(out_values.freeze());
-    let entries = arrow::array::StructArray::new(output_fields, vec![out_keys, out_values], None);
+    let entries =
+        arrow::array::StructArray::try_new(output_fields, vec![out_keys, out_values], None)
+            .map_err(|source| {
+                crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+                    "map_apply entries",
+                    source,
+                )
+            })?;
     let out = MapArray::try_new(
         map_field,
         OffsetBuffer::new(out_offsets.into()),
@@ -367,7 +383,12 @@ pub fn eval_map_apply<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         null_builder.finish(),
         ordered,
     )
-    .map_err(|e| format!("map_apply: {}", e))?;
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "map_apply constructor",
+            source,
+        )
+    })?;
     Ok(Arc::new(out))
 }
 
@@ -377,10 +398,17 @@ fn build_empty_output_map(
     ordered: bool,
     row_valid: &[bool],
     num_rows: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let out_keys = new_empty_array(output_fields[0].data_type());
     let out_values = new_empty_array(output_fields[1].data_type());
-    let entries = arrow::array::StructArray::new(output_fields, vec![out_keys, out_values], None);
+    let entries =
+        arrow::array::StructArray::try_new(output_fields, vec![out_keys, out_values], None)
+            .map_err(|source| {
+                crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+                    "map_apply entries",
+                    source,
+                )
+            })?;
     let mut offsets = vec![0_i32; num_rows + 1];
     let mut null_builder = NullBufferBuilder::new(num_rows);
     for row in 0..num_rows {
@@ -398,7 +426,12 @@ fn build_empty_output_map(
         null_builder.finish(),
         ordered,
     )
-    .map_err(|e| format!("map_apply: {}", e))?;
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "map_apply constructor",
+            source,
+        )
+    })?;
     Ok(Arc::new(out))
 }
 
@@ -406,7 +439,7 @@ fn flatten_map_component(
     map: &MapArray,
     row_valid: &[bool],
     keys: bool,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     let values = if keys { map.keys() } else { map.values() };
     let offsets = map.value_offsets();
     let mut slices = Vec::<ArrayRef>::new();
@@ -418,7 +451,7 @@ fn flatten_map_component(
         let start = offsets[map_row] as i64;
         let end = offsets[map_row + 1] as i64;
         if end < start {
-            return Err("map_apply map offsets are invalid".to_string());
+            return Err(expression_contract("map_apply map offsets are invalid"));
         }
         let len = (end - start) as usize;
         if len == 0 {
@@ -430,7 +463,12 @@ fn flatten_map_component(
         return Ok(new_empty_array(values.data_type()));
     }
     let refs: Vec<&dyn Array> = slices.iter().map(|arr| arr.as_ref()).collect();
-    concat(&refs).map_err(|e| e.to_string())
+    concat(&refs).map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "map_apply Arrow operation",
+            source,
+        )
+    })
 }
 
 fn collect_captured_slots<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -538,7 +576,7 @@ fn replicate_captured_columns(
     captured_slots: &[SlotId],
     row_lengths: &[usize],
     total_elements: usize,
-) -> Result<Vec<(SlotId, ArrayRef)>, String> {
+) -> ExecutionResult<Vec<(SlotId, ArrayRef)>> {
     if captured_slots.is_empty() {
         return Ok(Vec::new());
     }
@@ -546,7 +584,7 @@ fn replicate_captured_columns(
     let mut indices: Vec<u32> = Vec::with_capacity(total_elements);
     for (row, len) in row_lengths.iter().enumerate() {
         for _ in 0..*len {
-            indices.push(u32::try_from(row).map_err(|_| "map_apply index overflow".to_string())?);
+            indices.push(array_common::index_u32(row)?);
         }
     }
     let idx_array = UInt32Array::from(indices);
@@ -557,14 +595,14 @@ fn replicate_captured_columns(
         let flat = if total_elements == 0 {
             new_empty_array(col.data_type())
         } else {
-            take(col.as_ref(), &idx_array, None).map_err(|e| e.to_string())?
+            array_common::take_values(col.as_ref(), &idx_array, "higher-order take")?
         };
         if flat.len() != total_elements {
-            return Err(format!(
+            return Err(expression_contract(format_args!(
                 "captured column length mismatch: expected {}, got {}",
                 total_elements,
                 flat.len()
-            ));
+            )));
         }
         out.push((*slot_id, flat));
     }
@@ -575,12 +613,16 @@ fn build_chunk_from_columns(
     fields: &[Field],
     columns: &[ArrayRef],
     slot_ids: &[SlotId],
-) -> Result<Chunk, String> {
+) -> ExecutionResult<Chunk> {
     let schema = Arc::new(Schema::new(fields.to_vec()));
-    let batch =
-        RecordBatch::try_new(schema.clone(), columns.to_vec()).map_err(|e| e.to_string())?;
-    Chunk::try_new_with_chunk_schema(
+    let batch = RecordBatch::try_new(schema.clone(), columns.to_vec()).map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "map_apply Arrow operation",
+            source,
+        )
+    })?;
+    Ok(Chunk::try_new_with_chunk_schema(
         batch,
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)?,
-    )
+    )?)
 }

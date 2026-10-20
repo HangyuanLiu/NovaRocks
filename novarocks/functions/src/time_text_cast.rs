@@ -63,12 +63,12 @@ pub fn parse_datetime_string_to_seconds(raw: &str) -> Option<i64> {
     Some((t.hour() as i64) * 3600 + (t.minute() as i64) * 60 + t.second() as i64)
 }
 
-pub fn seconds_to_time64_micro_array(seconds: Vec<Option<i64>>) -> Result<ArrayRef, String> {
+pub fn seconds_to_time64_micro_array(seconds: Vec<Option<i64>>) -> ArrayRef {
     let micros: Vec<Option<i64>> = seconds
         .into_iter()
         .map(|v| v.and_then(|s| s.checked_mul(1_000_000)))
         .collect();
-    Ok(Arc::new(Time64MicrosecondArray::from(micros)) as ArrayRef)
+    Arc::new(Time64MicrosecondArray::from(micros)) as ArrayRef
 }
 
 fn observe<E>(
@@ -107,11 +107,12 @@ pub fn evaluate_arrays_observed<E>(
     target: &DataType,
     mode: TimeTextParseMode,
     mut observer: Option<&mut dyn FnMut(TimeTextObservation) -> Result<(), E>>,
-) -> Result<Result<ArrayRef, String>, E> {
+) -> Result<Result<ArrayRef, crate::temporal_carrier::TemporalCastFailure>, E> {
     if !matches!(target, DataType::Time64(TimeUnit::Microsecond)) {
-        return Ok(Err(format!(
-            "CAST failed: TIME target must be Time64(Microsecond), got {:?}",
-            target
+        return Ok(Err(crate::temporal_carrier::TemporalCastFailure::Contract(
+            novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+                "CAST failed: TIME target must be Time64(Microsecond), got {target:?}"
+            )),
         )));
     }
     observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
@@ -121,7 +122,11 @@ pub fn evaluate_arrays_observed<E>(
     observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
     if array.data_type() == &DataType::Utf8 {
         let Some(source) = array.as_any().downcast_ref::<StringArray>() else {
-            return Ok(Err("failed to downcast to StringArray".to_string()));
+            return Ok(Err(crate::temporal_carrier::TemporalCastFailure::Contract(
+                novarocks_failure_contract::BoundedDetail::truncating_display(
+                    "failed to downcast to StringArray",
+                ),
+            )));
         };
         for row in 0..source.len() {
             observe(&mut observer, TimeTextObservation::Step)?;
@@ -146,7 +151,7 @@ pub fn evaluate_arrays_observed<E>(
         observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
         let output = seconds_to_time64_micro_array(seconds);
         observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
-        Ok(output)
+        Ok(Ok(output))
     } else {
         // Exact native text profiles use the original Arrow safe parser.
         // The caller has proved the concrete carrier and selected row domain.
@@ -175,13 +180,8 @@ pub fn evaluate_arrays_observed<E>(
             }
         }
         observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
-        let output = arrow_cast::cast(array.as_ref(), target).map_err(|error| {
-            format!(
-                "CAST failed: from {:?} to {:?}: {error}",
-                array.data_type(),
-                target
-            )
-        });
+        let output = arrow_cast::cast(array.as_ref(), target)
+            .map_err(crate::temporal_carrier::TemporalCastFailure::Arrow);
         if output.is_ok() {
             observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
         }
@@ -194,7 +194,7 @@ pub fn evaluate_arrays(
     array: &ArrayRef,
     target: &DataType,
     mode: TimeTextParseMode,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::temporal_carrier::TemporalCastFailure> {
     match evaluate_arrays_observed::<std::convert::Infallible>(array, target, mode, None) {
         Ok(result) => result,
         Err(never) => match never {},

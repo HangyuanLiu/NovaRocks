@@ -42,7 +42,7 @@ fn composition_prefixes(invoke: impl Fn(&Control) -> Result<(), Error>, succeeds
     for at in 0..expected.len() {
         for cause in CAUSES {
             let control = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(matches!(invoke(&control), Err(Error::Control(actual)) if actual == cause));

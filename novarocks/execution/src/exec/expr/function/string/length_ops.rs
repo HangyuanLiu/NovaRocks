@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 fn eval_char_length_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
@@ -23,29 +24,28 @@ fn eval_char_length_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     utf8: bool,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let array = arena.eval(args[0], chunk)?;
-    Ok(
-        (novarocks_functions::builtin::string_measure::evaluate_legacy_length(
-            &array,
-            utf8,
-            arena.data_type(expr),
-        ))?,
+    novarocks_functions::builtin::string_measure::evaluate_required_length(
+        &array,
+        utf8,
+        arena.data_type(expr),
     )
+    .map_err(ExecutionFailure::from)
 }
 pub fn eval_length<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_char_length_impl(arena, expr, args, chunk, false))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_char_length_impl(arena, expr, args, chunk, false)
 }
 pub fn eval_char_length<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_char_length_impl(arena, expr, args, chunk, true))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_char_length_impl(arena, expr, args, chunk, true)
 }

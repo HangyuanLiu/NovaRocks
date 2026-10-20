@@ -1008,7 +1008,7 @@ impl<'a, 'f> RecursiveConstantStream<'a, 'f> {
             None,
             &self.version,
         )
-        .map_err(|error| RecursiveReaderError::Arrow(error.to_string()));
+        .map_err(RecursiveReaderError::Arrow);
         work.flush()?;
         let decoded = decoded?;
         if admission.is_some() {

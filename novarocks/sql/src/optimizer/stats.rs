@@ -7006,7 +7006,7 @@ mod control_tests {
         fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             self.units.lock().unwrap().push(units);
             if units == self.trigger {
-                self.fail.map_or(Ok(()), Err)
+                self.fail.clone().map_or(Ok(()), Err)
             } else {
                 Ok(())
             }
@@ -7056,15 +7056,15 @@ mod control_tests {
             let mut memo = Memo::new();
             let root = memo.new_group(values(0, 0));
             memo.groups[root].logical_props = Some(LogicalProperties::new(vec![], 999.0));
-            let control = owner(0, Some(error));
+            let control = owner(0, Some(error.clone()));
             assert_class(
                 derive_group_statistics(&mut memo, &input(), &control).unwrap_err(),
-                error,
+                error.clone(),
             );
             memo.groups[root].logical_exprs.clear();
             assert_class(
                 pick_group_representative(&memo, root, &input(), &control).unwrap_err(),
-                error,
+                error.clone(),
             );
             assert_class(
                 copy_in_join_tree(&mut memo, &JoinTree::Leaf(root), &input(), &control)
@@ -7090,7 +7090,7 @@ mod control_tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = owner(2, Some(error));
+            let control = owner(2, Some(error.clone()));
             assert_class(
                 pick_group_representative(&memo, root, &input(), &control).unwrap_err(),
                 error,
@@ -7137,7 +7137,7 @@ mod control_tests {
             memo.groups[root].logical_props = Some(LogicalProperties::new(vec![], 999.0));
             // Candidate, member, and actual per-expression derive each charge
             // one unit; this trigger observes the final completed candidate.
-            let control = owner(3, Some(error));
+            let control = owner(3, Some(error.clone()));
             assert_class(
                 derive_group_statistics_for(&mut memo, root, &input(), &control).unwrap_err(),
                 error,
@@ -7312,10 +7312,10 @@ mod control_tests {
                 CompileControlError::ResourceExhausted,
             ] {
                 for trigger in [0, 256, 197] {
-                    let control = owner(trigger, Some(error));
+                    let control = owner(trigger, Some(error.clone()));
                     assert_class(
                         derive_statistics(&expr, &memo, &input(), &control).unwrap_err(),
-                        error,
+                        error.clone(),
                     );
                     let units = control.units.lock().unwrap();
                     assert!(units.iter().all(|units| *units <= 256));
@@ -7336,7 +7336,7 @@ mod control_tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = owner(256, Some(error));
+            let control = owner(256, Some(error.clone()));
             assert_class(
                 pick_group_representative(&memo, root, &input(), &control).unwrap_err(),
                 error,
@@ -7562,7 +7562,7 @@ mod control_tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = owner(256, Some(error));
+            let control = owner(256, Some(error.clone()));
             assert_class(
                 derive_statistics(&expr, &memo, &input(), &control).unwrap_err(),
                 error,

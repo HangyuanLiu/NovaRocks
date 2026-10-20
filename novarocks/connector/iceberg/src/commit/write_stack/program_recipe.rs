@@ -314,7 +314,7 @@ fn copy_text(value: &str, work: &mut CompileCheckpoints<'_>) -> Result<String, F
 
 fn lift(error: ConnectorCodecError) -> Failure {
     match error.compile_control_error() {
-        Some(cause) => Failure::Control(cause),
+        Some(cause) => Failure::Control(cause.clone()),
         None => Failure::Provider(error),
     }
 }

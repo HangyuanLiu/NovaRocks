@@ -16,10 +16,9 @@
 // under the License.
 
 //! Owned scalar staging under the same actual opaque host authority.
-use crate::aggregate_scalar::{self as scalar, AggScalarValue as V, ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::{self as scalar, AggScalarValue as V, ScalarWork};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::opaque_memory::OpaqueRetainedCharge;
-use crate::scalar_output_operation::ScalarOutputFailure;
 use crate::scalar_output_resources::ScalarOutputResources;
 use crate::{AggregateStateAllocator, KernelFailure};
 use arrow_array::ArrayRef;
@@ -65,39 +64,18 @@ impl WindowOutputScalars {
         row: usize,
         resources: ScalarOutputResources,
         work: &mut EvaluationCheckpoints<'_>,
-    ) -> Result<(), ScalarOutputFailure> {
-        let bytes = resources
-            .operation_upper_bound()
-            .map_err(|cause| match cause {
-                ScalarStateError::Kernel(cause) => ScalarOutputFailure::Kernel(cause),
-                _ => unreachable!("resource facts contain no value-data error"),
-            })?;
+    ) -> Result<(), KernelFailure> {
+        let bytes = resources.operation_upper_bound()?;
         work.flush()?;
         let mut reservation = self.charge.reserve_operation(bytes)?;
         work.flush()?;
-        let value = match scalar::scalar_from_array(values, row, &mut ScalarWork::new(Some(work))) {
-            Ok(value) => value,
-            Err(ScalarStateError::Kernel(cause)) => return Err(cause.into()),
-            Err(ScalarStateError::OutputAllocation(_)) => {
-                return Err(KernelFailure::ResourceExhausted.into());
-            }
-            Err(ScalarStateError::Legacy(message)) => {
-                return Err(ScalarOutputFailure::OriginalData {
-                    message,
-                    reservation,
-                });
-            }
-        };
+        let value = scalar::scalar_from_array(values, row, &mut ScalarWork::new(Some(work)))?;
         // All original scalar copies have completed under the real operation
         // lease. Cached retained growth is from their actual owned capacities.
         let heap = ScalarOutputResources::owned_heap_bytes(
             std::slice::from_ref(&value),
             &mut ScalarWork::new(Some(work)),
-        )
-        .map_err(|cause| match cause {
-            ScalarStateError::Kernel(cause) => ScalarOutputFailure::Kernel(cause),
-            _ => unreachable!("graph capacity facts contain no value-data error"),
-        })?;
+        )?;
         let heap_bytes = self
             .heap_bytes
             .checked_add(heap)

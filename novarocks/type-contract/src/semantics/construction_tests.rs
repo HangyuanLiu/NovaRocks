@@ -35,7 +35,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         let ordinal = trace.len();
         trace.push((phase, units));
-        if let Some((at, cause)) = self.refusal
+        if let Some((at, cause)) = self.refusal.clone()
             && at == ordinal
         {
             return Err(cause);
@@ -194,7 +194,7 @@ fn every_actual_success_ordinary_empty_and_character_quantum_prefix_preserves_co
         for at in 0..trace.len() {
             for cause in CAUSES {
                 let c = Control {
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 assert_eq!(
@@ -268,7 +268,7 @@ fn actual_lazy_pull_is_bracketed_and_invalid_prefix_never_publishes() {
     for at in 0..trace.len() {
         for cause in CAUSES {
             let c = Control {
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 ..Control::default()
             };
             let pulls = Cell::new(0);

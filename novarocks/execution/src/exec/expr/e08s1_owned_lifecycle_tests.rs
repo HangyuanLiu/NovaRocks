@@ -165,7 +165,7 @@ impl PureCompileControl for Refuse {
             0,
             "no checkpoint after first refusal"
         );
-        Err(self.cause)
+        Err(self.cause.clone())
     }
 }
 #[test]
@@ -182,7 +182,7 @@ fn e08s1_actual_selected_lifecycle_retains_three_compile_causes_and_original_has
         CompileControlError::ResourceExhausted,
     ] {
         let control = Refuse {
-            cause,
+            cause: cause.clone(),
             calls: AtomicUsize::new(0),
         };
         original

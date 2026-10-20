@@ -28,8 +28,8 @@ use crate::exec::chunk::Chunk;
 use crate::exec::operators::runtime_filter::{
     CompiledRuntimeFilterConsumers, CompiledRuntimeFilterKeys, RuntimeFilterConsumerState,
 };
-use crate::runtime::fragment::ExecutionResult;
 use crate::runtime::fragment::io::FragmentEventSink;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit};
 
 // These counters describe the core-owned residual scan conjunct. They are
@@ -184,7 +184,9 @@ impl ScanDriverFilter {
                     .apply_chunk_observed(chunk, keys, Some(event_sink))?
             }
             (Some(_), None) => {
-                return Err("compiled scan runtime filters have no driver key instances".into());
+                return Err(scan_contract(
+                    "compiled scan runtime filters have no driver key instances",
+                ));
             }
             (None, _) => Some(chunk),
         }) else {
@@ -255,4 +257,36 @@ mod tests {
             ScanLimitDecision::Stop
         );
     }
+}
+
+#[derive(Debug)]
+enum ScanOutputFailure {
+    Contract(&'static str),
+}
+impl std::fmt::Display for ScanOutputFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Contract(detail) => f.write_str(detail),
+        }
+    }
+}
+impl std::error::Error for ScanOutputFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Contract(_) => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ScanOutputFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let (class, reason) = match self {
+            Self::Contract(_) => (FailureClass::Invariant, ExecutionReason::ScanOutputContract),
+        };
+        FailureFact::new(class, reason.reason())
+    }
+}
+fn scan_contract(detail: &'static str) -> ExecutionFailure {
+    ExecutionFailure::from_domain(ScanOutputFailure::Contract(detail))
 }

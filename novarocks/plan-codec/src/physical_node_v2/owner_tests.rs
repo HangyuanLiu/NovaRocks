@@ -34,7 +34,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         trace.push(units);
         if trace.len() > 1
-            && let Some(cause) = *self.late.lock().unwrap()
+            && let Some(cause) = self.late.lock().unwrap().clone()
         {
             assert_eq!(trace.len(), 2, "callback after originating refusal");
             return Err(cause);
@@ -92,7 +92,7 @@ fn containing_parent_refuses_known_axes_before_pending_observation() {
         for late in CAUSES {
             for axis in 0..7 {
                 let control = Control::default();
-                *control.late.lock().unwrap() = Some(late);
+                *control.late.lock().unwrap() = Some(late.clone());
                 let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
                 for _ in 0..pending {
                     work.step().unwrap();
@@ -172,7 +172,7 @@ fn accepted_parent_preserves_plain_completed_trace_and_first_refusal() {
         for _ in 0..255 {
             work.step().unwrap();
         }
-        let result = model.facts_in(64, 1, limits(), &mut |_| Err(cause), &mut work);
+        let result = model.facts_in(64, 1, limits(), &mut |_| Err(cause.clone()), &mut work);
         assert!(matches!(finish(work, result), Err(Error::Control(actual)) if actual == cause));
         assert_eq!(*control.trace.lock().unwrap(), [0]);
     }

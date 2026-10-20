@@ -215,10 +215,12 @@ fn ordered_topn_owned_real_limits_refuse_prefix_vector_and_late_holder_without_s
         tracker.install_limit_once(limit as i64).unwrap();
         let host = OrderedTopNAllocationHost::new(tracker.clone());
         let control = Control::pass();
-        assert!(matches!(
-            host.copy_utf8(Some(&text), &control),
-            Err(KernelFailure::ResourceExhausted)
-        ));
+        let refusal = host.copy_utf8(Some(&text), &control).err().unwrap();
+        if limit == prefix {
+            crate::runtime_filter::assert_real_vector_refusal(&refusal, Some(text.len() as u64));
+        } else {
+            crate::runtime_filter::assert_real_tracker_capacity(&refusal, limit as i64);
+        }
         assert_eq!(tracker.current(), 0);
         if limit == 1 {
             assert_eq!(control.calls.load(Ordering::SeqCst), 0);
@@ -239,24 +241,48 @@ fn ordered_topn_owned_encoder_and_null_refuse_prefix_before_the_first_callback()
     let host = OrderedTopNAllocationHost::new(tracker.clone());
     let contract = RuntimeOrderContract::new([RuntimeOrderKey::new(DataType::Utf8)], [5; 32]);
     let control = Control::pass();
-    assert!(matches!(
-        host.encode_ordered_bound(
+    let refusal = host
+        .encode_ordered_bound(
             OrderedTupleRef::Single(Some(OrderedScalarRef::Utf8("value"))),
             &contract,
             1024,
-            &control
-        ),
-        Err(ControlledContributionCodecError::Kernel(
-            KernelFailure::ResourceExhausted
-        ))
-    ));
+            &control,
+        )
+        .err()
+        .unwrap();
+    let ControlledContributionCodecError::Kernel(refusal) = refusal else {
+        panic!("the actual prefix host must refuse before the codec");
+    };
+    crate::runtime_filter::assert_real_tracker_capacity(&refusal, 1);
     assert_eq!(control.calls.load(Ordering::SeqCst), 0);
     assert_eq!(tracker.current(), 0);
-    assert!(matches!(
-        host.copy_utf8(None, &control),
-        Err(KernelFailure::ResourceExhausted)
-    ));
+    let refusal = host.copy_utf8(None, &control).err().unwrap();
+    crate::runtime_filter::assert_real_tracker_capacity(&refusal, 1);
     assert_eq!(control.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(tracker.current(), 0);
+
+    // A distinct real admission reaches the vector after its prefix. The
+    // standard container preserves its Layout, but erases the quota cause.
+    let tracker = MemTracker::new_root("ordered-encoder-real-vector-refusal");
+    tracker
+        .install_limit_once(source_custody_prefix_facts().requests().bytes() as i64)
+        .unwrap();
+    let host = OrderedTopNAllocationHost::new(tracker.clone());
+    let control = Control::pass();
+    let refusal = host
+        .encode_ordered_bound(
+            OrderedTupleRef::Single(Some(OrderedScalarRef::Utf8("value"))),
+            &contract,
+            1024,
+            &control,
+        )
+        .err()
+        .unwrap();
+    let ControlledContributionCodecError::Kernel(refusal) = refusal else {
+        panic!("the actual encoded vector must refuse before publication");
+    };
+    crate::runtime_filter::assert_real_vector_refusal(&refusal, None);
+    assert!(control.calls.load(Ordering::SeqCst) > 0);
     assert_eq!(tracker.current(), 0);
 }
 
@@ -470,10 +496,15 @@ fn ordered_topn_owned_frozen_key_slots_refuse_real_prefix_vector_and_holder_limi
         tracker.install_limit_once(limit as i64).unwrap();
         let host = OrderedTopNAllocationHost::new(tracker.clone());
         let control = Control::pass();
-        assert!(matches!(
-            host.order_contract(&contract, &control),
-            Err(e) if e.cause() == &crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted)
-        ));
+        let refusal = host.order_contract(&contract, &control).unwrap_err();
+        if limit == prefix {
+            crate::runtime_filter::assert_real_vector_refusal(
+                &refusal,
+                Some(std::mem::size_of::<RuntimeOrderKey>() as u64),
+            );
+        } else {
+            crate::runtime_filter::assert_real_tracker_capacity(&refusal, limit as i64);
+        }
         assert_eq!(tracker.current(), 0);
         if limit == 1 {
             assert_eq!(control.calls.load(Ordering::SeqCst), 0);
@@ -631,9 +662,7 @@ fn ordered_topn_owned_frozen_contract_rejects_changed_digests_with_original_type
                 );
                 assert_eq!(
                     actual.cause(),
-                    &ExecutionFailureCause::RuntimeFilter(RuntimeFilterFailure::Contract(
-                        expected.clone()
-                    ))
+                    &ExecutionFailureCause::RuntimeFilter(expected.clone())
                 );
                 assert_eq!(actual.to_string(), expected.to_string());
                 assert_eq!(actual.context(), None);

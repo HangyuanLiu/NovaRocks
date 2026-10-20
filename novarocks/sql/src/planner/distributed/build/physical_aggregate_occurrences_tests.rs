@@ -71,7 +71,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after first refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -547,7 +547,7 @@ fn prefixes(
         for cause in CAUSES {
             let c = Control {
                 trace: Mutex::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(invoke(&c),Err(PhysicalAggregateOccurrenceError::Control(actual)) if actual==cause),
@@ -574,7 +574,7 @@ fn request_prefixes<'a>(
         for cause in CAUSES {
             let c = Control {
                 trace: Mutex::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(invoke(&c),Err(PhysicalAggregateRequestError::Control(actual)) if actual==cause)
@@ -1412,7 +1412,53 @@ fn fragment_prefixes(
     assert_eq!(outcome.is_ok(), success, "{outcome:?}");
     let trace = c.trace();
     assert_eq!(trace.first(), Some(&(PHASE, 0)));
-    assert!(trace.len() > 1);
+    if success {
+        assert!(trace.len() > 1);
+        assert!(trace.iter().any(|(_, units)| *units > 0));
+    } else {
+        let original = outcome.unwrap_err();
+        if matches!(
+            &original,
+            PhysicalFragmentEffectsError::MissingScope(_)
+                | PhysicalFragmentEffectsError::InvalidSource(
+                    "relational scope does not loan this actual source call"
+                        | "relational source scopes contain an extra call site"
+                )
+        ) {
+            // These small scope checks reject before the first bounded flush.
+            // A completed semantic refusal does not start an outer footer.
+            assert_eq!(trace, [(PHASE, 0)]);
+        }
+        for cause in CAUSES {
+            let c = Control {
+                trace: Mutex::default(),
+                refusal: Some((trace.len(), cause)),
+            };
+            let actual = invoke(&c).unwrap_err();
+            match (&actual, &original) {
+                (
+                    PhysicalFragmentEffectsError::MissingScope(actual),
+                    PhysicalFragmentEffectsError::MissingScope(original),
+                ) => assert_eq!(actual, original),
+                (
+                    PhysicalFragmentEffectsError::InvalidSource(actual),
+                    PhysicalFragmentEffectsError::InvalidSource(original),
+                ) => assert_eq!(actual, original),
+                (
+                    PhysicalFragmentEffectsError::AggregateRequest(
+                        PhysicalAggregateRequestError::MissingLogicalSource(actual),
+                    ),
+                    PhysicalFragmentEffectsError::AggregateRequest(
+                        PhysicalAggregateRequestError::MissingLogicalSource(original),
+                    ),
+                ) => assert_eq!(actual, original),
+                _ => panic!(
+                    "different original aggregate composition refusal: {actual:?}; expected {original:?}"
+                ),
+            }
+            assert_eq!(c.trace(), trace);
+        }
+    }
     let positions: Vec<_> = if wide {
         assert!(trace.iter().any(|(_, n)| *n == 256));
         (0..trace.len())
@@ -1425,7 +1471,7 @@ fn fragment_prefixes(
         for cause in CAUSES {
             let c = Control {
                 trace: Mutex::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(invoke(&c),Err(PhysicalFragmentEffectsError::Control(actual)) if actual==cause),
@@ -1516,6 +1562,12 @@ fn aggregate_fragment_composer_missing_extra_and_same_shape_foreign_source_scope
     let foreign = f.node().clone();
     let mut scopes = fragment_scopes(&f, &o);
     scopes.get_mut(&f.site(0)).unwrap().source = &foreign;
+    assert!(matches!(
+        fragment_run(&f, &o, &p, &scopes, &Control::default()),
+        Err(PhysicalFragmentEffectsError::InvalidSource(
+            "relational scope does not loan this actual source call"
+        ))
+    ));
     fragment_prefixes(|c| fragment_run(&f, &o, &p, &scopes, c), false, false);
     let mut scopes = fragment_scopes(&f, &o);
     scopes.insert(
@@ -1527,6 +1579,12 @@ fn aggregate_fragment_composer_missing_extra_and_same_shape_foreign_source_scope
             proof_scope: CallProofScope::Domain(context(&o, f.site(0)).domain),
         },
     );
+    assert!(matches!(
+        fragment_run(&f, &o, &p, &scopes, &Control::default()),
+        Err(PhysicalFragmentEffectsError::InvalidSource(
+            "relational source scopes contain an extra call site"
+        ))
+    ));
     fragment_prefixes(|c| fragment_run(&f, &o, &p, &scopes, c), false, false);
 }
 

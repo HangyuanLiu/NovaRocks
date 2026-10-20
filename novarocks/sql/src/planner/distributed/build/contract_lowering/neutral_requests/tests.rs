@@ -52,7 +52,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -595,7 +595,7 @@ fn neutral_sql_transfer_success_and_ordinary_refusal_preserve_every_original_con
             ] {
                 let control = Control {
                     trace: Mutex::new(Vec::new()),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert!(
                     matches!(finish(source, &control), Err(ContractLoweringError::Control(actual)) if actual == cause)
@@ -695,7 +695,7 @@ fn neutral_sql_finish_draft_missing_canonical_completes_pending_ordinary_tail_an
         ] {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(finish_without_actual_canonical_source(&source, &functions, &control),

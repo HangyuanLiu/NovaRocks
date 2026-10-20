@@ -49,7 +49,7 @@ impl PureCompileControl for CompileControl {
         }
         let index = trace.len();
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((at, cause)) if at == index => Err(cause),
             _ => Ok(()),
         }
@@ -600,7 +600,7 @@ fn actual_largeint_prepare_callbacks_keep_three_primary_compile_causes_and_exact
             CompileControlError::ResourceExhausted,
         ] {
             let control = CompileControl {
-                refusal: Some((index, cause)),
+                refusal: Some((index, cause.clone())),
                 ..Default::default()
             };
             let error = PreparedArithmeticRecipe::try_new(

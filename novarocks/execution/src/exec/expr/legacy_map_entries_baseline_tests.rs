@@ -89,7 +89,10 @@ fn setup(a: ArrayRef) -> (ExprArena, Vec<ExprId>, Chunk) {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[slot]).unwrap();
     (arena, vec![id], Chunk::new_with_chunk_schema(batch, cs))
 }
-fn raw(a: ArrayRef, target: Option<DataType>) -> Result<ArrayRef, String> {
+fn raw(
+    a: ArrayRef,
+    target: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (mut arena, args, chunk) = setup(a);
     let expr = target
         .map(|t| arena.push_typed(ExprNode::SlotId(SlotId::new(999)), t))
@@ -175,44 +178,49 @@ fn original_map_entries_nested_children_are_not_decoded_or_sorted() {
 #[test]
 fn original_map_entries_bad_source_and_output_cast_keep_full_original_errors() {
     assert_eq!(
-        raw(Arc::new(Int32Array::from(vec![1])), None).unwrap_err(),
+        (raw(Arc::new(Int32Array::from(vec![1])), None).unwrap_err()).to_string(),
         "map_entries expects MapArray, got Int32"
     );
     let a = fixture(false);
     let expected =
         arrow::compute::cast(&raw(a.clone(), None).unwrap(), &DataType::Int32).unwrap_err();
     assert_eq!(
-        raw(a, Some(DataType::Int32)).unwrap_err(),
+        (raw(a, Some(DataType::Int32)).unwrap_err()).to_string(),
         format!("map_entries: failed to cast output: {expected}")
     );
 }
 #[test]
-fn original_map_entries_raw_empty_arity_panics_before_any_output_lookup() {
-    let (arena, _, chunk) = setup(fixture(false));
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            super::function::map::eval_map_entries(&arena, ExprId(usize::MAX), &[], &chunk)
-        }))
-        .is_err()
-    );
+fn map_entries_prepared_arity_is_rejected_before_any_child_or_output_lookup() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let (arena, args, chunk) = setup(fixture(false));
+    for bad in [vec![], vec![args[0], ExprId(usize::MAX)]] {
+        let error =
+            super::function::map::eval_map_entries(&arena, ExprId(usize::MAX), &bad, &chunk)
+                .unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            error.failure_fact().reason(),
+            crate::runtime::fragment::ExecutionReason::ExpressionContract.reason()
+        );
+    }
 }
 
 #[test]
-fn original_map_entries_first_child_error_and_extra_argument_not_demanded() {
+fn map_entries_exact_child_keeps_values_and_original_failure() {
     let a = fixture(false);
-    let (arena, mut args, chunk) = setup(a.clone());
-    args.push(ExprId(usize::MAX));
+    let (arena, args, chunk) = setup(a.clone());
     let out =
         super::function::map::eval_map_entries(&arena, ExprId(usize::MAX), &args, &chunk).unwrap();
     assert_eq!(out.to_data(), raw(a, None).unwrap().to_data());
     assert_eq!(
-        super::function::map::eval_map_entries(
+        (super::function::map::eval_map_entries(
             &arena,
             ExprId(usize::MAX),
             &[ExprId(usize::MAX)],
             &chunk
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "invalid ExprId"
     );
 }

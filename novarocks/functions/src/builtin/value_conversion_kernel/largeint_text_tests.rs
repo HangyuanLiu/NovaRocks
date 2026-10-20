@@ -82,7 +82,7 @@ fn nominal_largeint_text_exact_binding_field_target_and_unrelated_domains() {
             CompileControlError::ResourceExhausted,
         ] {
             let c = CompileControl {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..Default::default()
             };
             assert_eq!(

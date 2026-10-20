@@ -92,7 +92,7 @@ fn group_rejects_wrong_category_and_mixed_provider_identity() {
     .unwrap_err();
     assert_eq!(
         category_error.kind(),
-        ConnectorCodecErrorKind::InconsistentFields
+        &ConnectorCodecErrorKind::InconsistentFields
     );
 
     let identity_error = ProviderReadCodecDefinitions::try_new(
@@ -104,7 +104,7 @@ fn group_rejects_wrong_category_and_mixed_provider_identity() {
     .unwrap_err();
     assert_eq!(
         identity_error.kind(),
-        ConnectorCodecErrorKind::InconsistentFields
+        &ConnectorCodecErrorKind::InconsistentFields
     );
 }
 
@@ -131,7 +131,7 @@ fn registry_is_order_stable_and_rejects_duplicate_provider_identity() {
     );
 
     let error = SealedProviderRegistry::seal([paimon.clone(), paimon]).unwrap_err();
-    assert_eq!(error.kind(), ConnectorCodecErrorKind::DuplicateField);
+    assert_eq!(error.kind(), &ConnectorCodecErrorKind::DuplicateField);
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn definitions_reject_cross_provider_capability_groups() {
         write("paimon"),
     )
     .unwrap_err();
-    assert_eq!(error.kind(), ConnectorCodecErrorKind::InconsistentFields);
+    assert_eq!(error.kind(), &ConnectorCodecErrorKind::InconsistentFields);
 }
 
 #[test]
@@ -178,7 +178,7 @@ fn codec_declarations_are_bounded_and_digest_the_exact_registered_descriptor() {
             )
             .unwrap_err()
             .kind(),
-            ConnectorCodecErrorKind::InvalidValue
+            &ConnectorCodecErrorKind::InvalidValue
         );
     }
     assert_eq!(
@@ -191,7 +191,7 @@ fn codec_declarations_are_bounded_and_digest_the_exact_registered_descriptor() {
         )
         .unwrap_err()
         .kind(),
-        ConnectorCodecErrorKind::InvalidValue
+        &ConnectorCodecErrorKind::InvalidValue
     );
     assert_eq!(
         ConnectorCodecDeclaration::try_new(
@@ -203,7 +203,7 @@ fn codec_declarations_are_bounded_and_digest_the_exact_registered_descriptor() {
         )
         .unwrap_err()
         .kind(),
-        ConnectorCodecErrorKind::InvalidValue
+        &ConnectorCodecErrorKind::InvalidValue
     );
 }
 

@@ -42,7 +42,7 @@ impl PureCompileControl for Control {
         let mut events = self.events.lock().unwrap();
         events.push((phase, work));
         if self.stop == Some(events.len()) {
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -336,7 +336,7 @@ fn exact_conversion_old_validation_still_refuses_signature_drift_before_pair_wal
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let refusing = Control::new(Some(stop), cause);
+                let refusing = Control::new(Some(stop), cause.clone());
                 let error = ValueConversionResolver
                     .validate_selected(&drifted, request(&arguments, &target), &refusing)
                     .unwrap_err();
@@ -428,7 +428,7 @@ fn assert_prefixes(
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let refusing = Control::new(Some(stop), cause);
+            let refusing = Control::new(Some(stop), cause.clone());
             let error = operation(&refusing).unwrap_err();
             assert_eq!(error.control_error(), Some(cause));
             assert_eq!(refusing.trace(), trace[..stop]);
@@ -481,7 +481,7 @@ fn exact_conversion_wide_json_has_real_256_work_and_sampled_primary_refusals() {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let refusing = Control::new(Some(stop), cause);
+            let refusing = Control::new(Some(stop), cause.clone());
             let error = selected(&catalog, JSON_TEXT, &arguments, &target, &refusing).unwrap_err();
             assert_eq!(error.control_error(), Some(cause));
             assert_eq!(refusing.trace(), trace[..stop]);

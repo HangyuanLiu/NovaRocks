@@ -16,19 +16,19 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 #[cfg(test)]
 use arrow::array::{ListArray, new_null_array};
 #[cfg(test)]
 use arrow::datatypes::{DataType, Field};
 use novarocks_functions::builtin::array_literal_core::{ArrayLiteralInputs, ConstructionFailure};
-use std::convert::Infallible;
 #[cfg(test)]
 use std::sync::Arc;
-fn legacy_error(failure: ConstructionFailure<Infallible>) -> String {
+fn construction_error(failure: ConstructionFailure<ExecutionFailure>) -> ExecutionFailure {
     match failure {
-        ConstructionFailure::Data(error) => error.legacy_message(),
-        ConstructionFailure::Control(never) => match never {},
+        ConstructionFailure::Domain(error) => ExecutionFailure::from_domain(error),
+        ConstructionFailure::Caller(error) => error,
     }
 }
 pub fn eval_array_expr<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -36,27 +36,27 @@ pub fn eval_array_expr<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     id: ExprId,
     elements: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    let mut observe = |_| Ok::<(), Infallible>(());
+) -> ExecutionResult<ArrayRef> {
+    let mut observe = |_| Ok::<(), ExecutionFailure>(());
     let mut inputs = ArrayLiteralInputs::from_output(
         arena.data_type(id),
         chunk.len(),
         elements.len(),
         &mut observe,
     )
-    .map_err(legacy_error)?;
+    .map_err(construction_error)?;
     for expr_id in elements {
         let array = arena.eval(*expr_id, chunk)?;
         inputs
             .push_evaluated(array, &mut observe)
-            .map_err(legacy_error)?;
+            .map_err(construction_error)?;
     }
-    Ok((inputs
+    inputs
         .finish(
             crate::exec::expr::cast::cast_with_special_rules,
             &mut observe,
         )
-        .map_err(legacy_error))?)
+        .map_err(construction_error)
 }
 
 #[cfg(test)]

@@ -2628,7 +2628,7 @@ mod tests {
         impl PureCompileControl for Stop {
             fn checkpoint(&self, phase: CompilePhase, _: u32) -> Result<(), CompileControlError> {
                 assert_eq!(phase, CompilePhase::FunctionSpecialization);
-                Err(self.0)
+                Err(self.0.clone())
             }
         }
         let input = test_values_plan(vec![
@@ -2673,7 +2673,7 @@ mod tests {
                 91,
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 crate::constant::test_constant_policy(),
-                &Stop(error),
+                &Stop(error.clone()),
             );
             assert!(
                 matches!(result, Err(actual) if actual == crate::compiler::SqlCompileError::from(error))

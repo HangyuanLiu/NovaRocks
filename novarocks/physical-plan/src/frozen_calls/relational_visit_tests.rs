@@ -102,7 +102,7 @@ fn assert_relational_prefixes(fragment: &Fragment, failure: Option<usize>) {
             CompileControlError::ResourceExhausted,
         ] {
             let refused = TraceControl {
-                refusal: Some((position, cause)),
+                refusal: Some((position, cause.clone())),
                 ..Default::default()
             };
             assert_eq!(
@@ -351,7 +351,7 @@ fn relational_visitor_wide_real_call_array_observes_quantum_without_binding_dedu
             CompileControlError::ResourceExhausted,
         ] {
             let refused = TraceControl {
-                refusal: Some((position, cause)),
+                refusal: Some((position, cause.clone())),
                 ..Default::default()
             };
             assert_eq!(

@@ -37,7 +37,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -312,7 +312,7 @@ fn every_prefix(mut invoke: impl FnMut(&Control) -> Result<(), Error>, ordinary:
     for at in 0..positive.len() {
         for cause in CAUSES {
             let control = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(matches!(invoke(&control), Err(Error::Control(actual)) if actual == cause));
@@ -372,7 +372,7 @@ fn provider_binding_namespace_source_lookup_and_retained_floor_keep_original_con
         for at in before..positive.len() {
             for cause in CAUSES {
                 let control = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 let token = encode_provider_bindings(&inputs, SOURCE, limits(), &control).unwrap();
@@ -401,7 +401,7 @@ fn provider_binding_namespace_real_wide_both_directions_observe_quantum_and_pres
         .unwrap();
     for cause in CAUSES {
         let control = Control {
-            stop: Some((at, cause)),
+            stop: Some((at, cause.clone())),
             ..Control::default()
         };
         assert!(
@@ -420,7 +420,7 @@ fn provider_binding_namespace_real_wide_both_directions_observe_quantum_and_pres
         .unwrap();
     for cause in CAUSES {
         let control = Control {
-            stop: Some((at, cause)),
+            stop: Some((at, cause.clone())),
             ..Control::default()
         };
         assert!(

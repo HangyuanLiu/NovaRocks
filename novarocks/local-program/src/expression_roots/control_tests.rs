@@ -42,7 +42,7 @@ struct Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         self.observations.lock().unwrap().push((phase, units));
-        if let Some((at, failure)) = self.failure
+        if let Some((at, failure)) = self.failure.clone()
             && at == units
         {
             return Err(failure);
@@ -1108,7 +1108,7 @@ fn compile_control_failures_at_entry_preserve_typed_category() {
         CompileControlError::ResourceExhausted,
     ] {
         let control = Control {
-            failure: Some((0, failure)),
+            failure: Some((0, failure.clone())),
             ..Control::default()
         };
         let program = project_program(bool_arena(), vec![0], DataType::Boolean);
@@ -1137,7 +1137,7 @@ fn root_collection_and_flow_binding_observe_control_at_256_work() {
         CompileControlError::ResourceExhausted,
     ] {
         let control = Control {
-            failure: Some((256, failure)),
+            failure: Some((256, failure.clone())),
             ..Control::default()
         };
         let program = project_program(bool_arena(), vec![0; 300], DataType::Boolean);
@@ -1151,7 +1151,7 @@ fn root_collection_and_flow_binding_observe_control_at_256_work() {
         assert_eq!(
             ProgramRootControlBindings::try_new(program, main_flow(roots), bindings, &control)
                 .unwrap_err(),
-            ProgramRootBindingError::Roots(ProgramExpressionRootError::Control(failure))
+            ProgramRootBindingError::Roots(ProgramExpressionRootError::Control(failure.clone()))
         );
         assert_eq!(
             control.observations.lock().unwrap().last().copied(),
@@ -1159,7 +1159,7 @@ fn root_collection_and_flow_binding_observe_control_at_256_work() {
         );
 
         let control = Control {
-            failure: Some((256, failure)),
+            failure: Some((256, failure.clone())),
             ..Control::default()
         };
         let (arena, ty) = array_arena(300);

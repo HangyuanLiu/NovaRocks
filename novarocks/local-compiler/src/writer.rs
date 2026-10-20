@@ -526,7 +526,7 @@ fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCre
         ExpressionsCompileError::Control(cause) => FragmentCompileError::Control(cause),
         error => FragmentCompileError::Owner {
             phase: "writer projection expressions",
-            error: Box::new(error),
+            error: novarocks_failure_contract::SharedFailureCause::new(error),
         },
     })?;
     let arena = Arc::new(arena);

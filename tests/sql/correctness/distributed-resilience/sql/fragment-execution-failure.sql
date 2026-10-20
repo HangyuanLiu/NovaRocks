@@ -71,7 +71,10 @@ INSERT INTO ${case_db}.fragment_execution_failure VALUES (3, 5);
 -- @query_lifecycle_fault=task-execution-failure,1
 -- Task status and root termination can expose the same originating failure.
 -- Require the injected cause shared by both observation paths.
--- @expect_error=runner-owned task execution failure injected
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.unexpected
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1105 (HY000): [query.execution.unexpected]
 -- @be_log_count_at_least=NOVAROCKS_TASK_EXECUTION_FAILURE_INJECTED,1
 -- Participant counts cannot be pinned to the cluster size: a context exists
 -- only where a task is placed, and which backends get the table's splits is

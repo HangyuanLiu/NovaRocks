@@ -59,9 +59,12 @@ impl AnyValueKernel {
         observed(control, |work| {
             let expected = states.len();
             let mut values = Vec::new();
-            values
-                .try_reserve_exact(expected)
-                .map_err(|_| KernelFailure::ResourceExhausted)?;
+            values.try_reserve_exact(expected).map_err(|source| {
+                KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+                    "any_value emission values",
+                    source,
+                ))
+            })?;
             let mut work = ScalarWork::new(Some(work));
             for state in states {
                 if values.len() == expected {
@@ -70,19 +73,13 @@ impl AnyValueKernel {
                 if state.failed {
                     return Err(KernelFailure::InstanceFailed);
                 }
-                work.step()
-                    .map_err(scalar::ScalarStateError::into_kernel_failure)?;
-                values.push(
-                    state
-                        .output(&mut work)
-                        .map_err(scalar::ScalarStateError::into_kernel_failure)?,
-                );
+                work.step()?;
+                values.push(state.output(&mut work)?);
             }
             if values.len() != expected {
                 return Err(internal("any_value state iterator shortened its extent"));
             }
             scalar::build_scalar_array(self.output_type(), values, &mut work)
-                .map_err(scalar::ScalarStateError::into_kernel_failure)
         })
     }
 }
@@ -178,9 +175,7 @@ impl PreparedAggregateKernel for AnyValueKernel {
             if address >= argument.array().len() {
                 return Err(internal("any_value selected address is out of bounds"));
             }
-            state
-                .update_from_array(argument.array(), address, &mut ScalarWork::new(Some(work)))
-                .map_err(scalar::ScalarStateError::into_kernel_failure)
+            state.update_from_array(argument.array(), address, &mut ScalarWork::new(Some(work)))
         });
         if result.is_err() {
             state.latch_failure();
@@ -229,9 +224,7 @@ impl PreparedAggregateKernel for AnyValueKernel {
             if address >= argument.array().len() {
                 return Err(internal("any_value merge address is out of bounds"));
             }
-            state
-                .update_from_array(argument.array(), address, &mut ScalarWork::new(Some(work)))
-                .map_err(scalar::ScalarStateError::into_kernel_failure)
+            state.update_from_array(argument.array(), address, &mut ScalarWork::new(Some(work)))
         });
         if result.is_err() {
             state.latch_failure();

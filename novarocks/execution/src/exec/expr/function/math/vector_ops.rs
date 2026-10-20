@@ -17,6 +17,7 @@
 use super::common::cast_output;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{Array, ArrayRef, Float64Array, ListArray};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
@@ -31,23 +32,26 @@ fn ensure_row_count(
     out_len: usize,
     fn_name: &str,
     arg_name: &str,
-) -> Result<(), String> {
+) -> Result<(), ExecutionFailure> {
     if out_len == 0 || len == out_len || len == 1 {
         return Ok(());
     }
-    Err(format!(
+    Err(crate::exec::expr::expression_contract(format_args!(
         "{} requires array arguments with row count 1 or {}, but {} array size is {}",
         fn_name, out_len, arg_name, len
-    ))
+    )))
 }
 
-fn require_list_arg<'a>(arg: &'a ArrayRef, fn_name: &str) -> Result<&'a ListArray, String> {
+fn require_list_arg<'a>(
+    arg: &'a ArrayRef,
+    fn_name: &str,
+) -> Result<&'a ListArray, ExecutionFailure> {
     arg.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-        format!(
+        crate::exec::expr::expression_contract(format_args!(
             "{} expects ListArray arguments, got {:?}",
             fn_name,
             arg.data_type()
-        )
+        ))
     })
 }
 
@@ -55,23 +59,31 @@ fn cast_list_values_to_f64(
     list: &ListArray,
     fn_name: &str,
     arg_name: &str,
-) -> Result<Arc<Float64Array>, String> {
+) -> Result<Arc<Float64Array>, ExecutionFailure> {
     let values = list.values();
-    let casted = cast(&values, &DataType::Float64).map_err(|e| {
-        format!(
-            "{} expects numeric array elements for {} argument: {}",
-            fn_name, arg_name, e
+    let casted = cast(&values, &DataType::Float64).map_err(|source| {
+        super::common::input_cast_failure(
+            format_args!(
+                "{} expects numeric array elements for {} argument",
+                fn_name, arg_name
+            ),
+            source,
         )
     })?;
     let out = casted
         .as_any()
         .downcast_ref::<Float64Array>()
-        .ok_or_else(|| format!("{} failed to cast {} values to float64", fn_name, arg_name))?;
+        .ok_or_else(|| {
+            crate::exec::expr::expression_contract(format_args!(
+                "{} failed to cast {} values to float64",
+                fn_name, arg_name
+            ))
+        })?;
     if out.null_count() > 0 {
-        return Err(format!(
+        return Err(super::common::invalid_value(format_args!(
             "{} does not support null values. {} array has null value.",
             fn_name, arg_name
-        ));
+        )));
     }
     Ok(Arc::new(out.clone()))
 }
@@ -83,25 +95,23 @@ fn eval_cosine_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     chunk: &Chunk,
     normalized: bool,
     fn_name: &'static str,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let left = arena.eval(args[0], chunk)?;
     let right = arena.eval(args[1], chunk)?;
     let left_list = require_list_arg(&left, fn_name)?;
     let right_list = require_list_arg(&right, fn_name)?;
 
     if left_list.null_count() > 0 {
-        return Err((format!(
+        return Err(super::common::invalid_value(format_args!(
             "{} does not support null values. base array has null value.",
             fn_name
-        ))
-        .into());
+        )));
     }
     if right_list.null_count() > 0 {
-        return Err((format!(
+        return Err(super::common::invalid_value(format_args!(
             "{} does not support null values. target array has null value.",
             fn_name
-        ))
-        .into());
+        )));
     }
 
     let out_len = chunk.len();
@@ -126,13 +136,16 @@ fn eval_cosine_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         let left_dim = left_end - left_start;
         let right_dim = right_end - right_start;
         if left_dim != right_dim {
-            return Err((format!(
+            return Err(super::common::invalid_value(format_args!(
                 "{} requires equal length arrays in each row. base array dimension size is {}, target array dimension size is {}.",
                 fn_name, left_dim, right_dim
-            )).into());
+            )));
         }
         if left_dim == 0 {
-            return Err((format!("{} requires non-empty arrays in each row", fn_name)).into());
+            return Err(super::common::invalid_value(format_args!(
+                "{} requires non-empty arrays in each row",
+                fn_name
+            )));
         }
 
         let mut dot = 0.0_f64;
@@ -158,10 +171,10 @@ fn eval_cosine_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         out.push(Some(value));
     }
 
-    Ok((cast_output(
+    cast_output(
         Arc::new(Float64Array::from(out)) as ArrayRef,
         arena.data_type(expr),
-    ))?)
+    )
 }
 
 pub fn eval_cosine_similarity<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -169,8 +182,8 @@ pub fn eval_cosine_similarity<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_cosine_impl(arena, expr, args, chunk, false, "cosine_similarity"))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_cosine_impl(arena, expr, args, chunk, false, "cosine_similarity")
 }
 
 pub fn eval_cosine_similarity_norm<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -178,8 +191,8 @@ pub fn eval_cosine_similarity_norm<__Eval: crate::exec::expr::ExprEvaluation + ?
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_cosine_impl(arena, expr, args, chunk, true, "cosine_similarity_norm"))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_cosine_impl(arena, expr, args, chunk, true, "cosine_similarity_norm")
 }
 
 pub fn eval_l2_distance<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -187,23 +200,21 @@ pub fn eval_l2_distance<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let left = arena.eval(args[0], chunk)?;
     let right = arena.eval(args[1], chunk)?;
     let left_list = require_list_arg(&left, "l2_distance")?;
     let right_list = require_list_arg(&right, "l2_distance")?;
 
     if left_list.null_count() > 0 {
-        return Err(
-            ("l2_distance does not support null values. base array has null value.".to_string())
-                .into(),
-        );
+        return Err(super::common::invalid_value(
+            "l2_distance does not support null values. base array has null value.",
+        ));
     }
     if right_list.null_count() > 0 {
-        return Err(
-            ("l2_distance does not support null values. target array has null value.".to_string())
-                .into(),
-        );
+        return Err(super::common::invalid_value(
+            "l2_distance does not support null values. target array has null value.",
+        ));
     }
 
     let out_len = chunk.len();
@@ -228,13 +239,15 @@ pub fn eval_l2_distance<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         let left_dim = left_end - left_start;
         let right_dim = right_end - right_start;
         if left_dim != right_dim {
-            return Err((format!(
+            return Err(super::common::invalid_value(format_args!(
                 "l2_distance requires equal length arrays in each row. base array dimension size is {}, target array dimension size is {}.",
                 left_dim, right_dim
-            )).into());
+            )));
         }
         if left_dim == 0 {
-            return Err(("l2_distance requires non-empty arrays in each row".to_string()).into());
+            return Err(super::common::invalid_value(
+                "l2_distance requires non-empty arrays in each row",
+            ));
         }
 
         let mut distance = 0.0_f64;
@@ -245,10 +258,10 @@ pub fn eval_l2_distance<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         out.push(Some(distance));
     }
 
-    Ok((cast_output(
+    cast_output(
         Arc::new(Float64Array::from(out)) as ArrayRef,
         arena.data_type(expr),
-    ))?)
+    )
 }
 
 #[cfg(test)]
@@ -295,7 +308,7 @@ mod legacy_vector_contract_tests {
             None,
         )
     }
-    fn evaluate(name: &str, left: ArrayRef, right: ArrayRef) -> Result<ArrayRef, String> {
+    fn evaluate(name: &str, left: ArrayRef, right: ArrayRef) -> Result<ArrayRef, ExecutionFailure> {
         let types = [left.data_type().clone(), right.data_type().clone()];
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -422,16 +435,21 @@ mod legacy_vector_contract_tests {
         for name in ["cosine_similarity", "cosine_similarity_norm", "l2_distance"] {
             for left in &required_nulls {
                 let error = evaluate(name, left.clone(), vector(&[Some(1.0)])).unwrap_err();
-                assert!(error.contains("does not support null values"), "{error}");
+                assert!(
+                    error.detail().contains("does not support null values"),
+                    "{error}"
+                );
             }
             assert!(
                 evaluate(name, vector(&[]), vector(&[]))
                     .unwrap_err()
+                    .detail()
                     .contains("requires non-empty arrays")
             );
             assert!(
                 evaluate(name, vector(&[Some(1.0)]), vector(&[Some(1.0), Some(2.0)]))
                     .unwrap_err()
+                    .detail()
                     .contains("requires equal length arrays")
             );
         }
@@ -446,7 +464,10 @@ mod legacy_vector_contract_tests {
         for name in ["cosine_similarity", "cosine_similarity_norm", "l2_distance"] {
             let error =
                 evaluate(name, unused_nulls.clone(), vector(&[Some(0.0), Some(0.0)])).unwrap_err();
-            assert!(error.contains("base array has null value"), "{error}");
+            assert!(
+                error.detail().contains("base array has null value"),
+                "{error}"
+            );
         }
     }
     #[test]
@@ -582,6 +603,7 @@ mod legacy_vector_contract_tests {
         assert!(
             evaluate("l2_distance", whole, zeroes)
                 .unwrap_err()
+                .detail()
                 .contains("base array has null value")
         );
         // Rebuilding each batch with an actually sliced Union selects a

@@ -20,11 +20,31 @@ use super::{MemTracker, TrackedStateAllocator};
 use novarocks_functions::opaque_memory::OpaqueRetainedCharge;
 use novarocks_functions::{AggregateStateAllocator, KernelFailure};
 use std::{alloc::Layout, sync::Arc};
+pub(super) fn assert_tracker_refusal(failure: &KernelFailure, limit: i64, requested: Option<u64>) {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+    let KernelFailure::Capacity(source) = failure else {
+        panic!("the real tracker must preserve its capacity receipt: {failure:?}");
+    };
+    let fact = failure.failure_fact();
+    assert_eq!(fact, source.failure_fact());
+    assert_eq!(fact.class(), FailureClass::Resource);
+    assert_eq!(fact.reason().domain(), domain::MEMORY.get());
+    assert_eq!(fact.reason().code(), 8);
+    assert!(fact.representation().is_none());
+    let resource = fact.resource().unwrap();
+    assert_eq!(resource.limit, Some(limit as u64));
+    assert!(resource.requested.unwrap() > 0);
+    if let Some(requested) = requested {
+        assert_eq!(resource.requested, Some(requested));
+    }
+    assert!(resource.committed.unwrap() > limit as u64);
+    assert_eq!(resource.request_scope, None);
+    assert_eq!(resource.constraint_scope, None);
+}
 fn host() -> (Arc<MemTracker>, Arc<dyn AggregateStateAllocator>) {
     let tracker = MemTracker::new_root("opaque-real-tracker-test");
-    let host: Arc<dyn AggregateStateAllocator> = Arc::new(TrackedStateAllocator {
-        tracker: Arc::clone(&tracker),
-    });
+    let host: Arc<dyn AggregateStateAllocator> =
+        Arc::new(TrackedStateAllocator::new(Arc::clone(&tracker)));
     (tracker, host)
 }
 #[test]
@@ -55,7 +75,7 @@ fn opaque_host_actual_refusal_restores_charge_without_dummy_allocation() {
         .reserve_operation(33)
         .err()
         .expect("actual host limit refusal");
-    assert_eq!(error, KernelFailure::ResourceExhausted);
+    assert_tracker_refusal(&error, 32, Some(33));
     assert_eq!(tracker.current(), 0);
     drop(charge);
     assert_eq!(tracker.current(), 0);
@@ -67,19 +87,13 @@ fn typed_and_opaque_host_refusals_roll_back_all_ancestors_but_keep_peak() {
     root.install_limit_once(31).unwrap();
     let middle = MemTracker::new_child("middle", &root);
     let leaf = MemTracker::new_child("leaf", &middle);
-    let host: Arc<dyn AggregateStateAllocator> = Arc::new(TrackedStateAllocator {
-        tracker: Arc::clone(&leaf),
-    });
+    let host: Arc<dyn AggregateStateAllocator> =
+        Arc::new(TrackedStateAllocator::new(Arc::clone(&leaf)));
     let layout = Layout::from_size_align(32, 8).unwrap();
-    assert_eq!(
-        host.allocate(layout).unwrap_err(),
-        KernelFailure::ResourceExhausted
-    );
+    assert_tracker_refusal(&host.allocate(layout).unwrap_err(), 31, Some(32));
     let charge = OpaqueRetainedCharge::try_new(host).unwrap();
-    assert!(matches!(
-        charge.reserve_operation(32),
-        Err(KernelFailure::ResourceExhausted)
-    ));
+    let refusal = charge.reserve_operation(32).err().unwrap();
+    assert_tracker_refusal(&refusal, 31, Some(32));
     for tracker in [&leaf, &middle, &root] {
         assert_eq!(tracker.current(), 0);
         assert_eq!(tracker.allocated(), 64);
@@ -98,7 +112,17 @@ fn opaque_host_actual_underestimate_does_not_publish_retained_growth() {
     let error = charge
         .reconcile_under_reservation(17, &mut lease)
         .unwrap_err();
-    assert!(matches!(error, KernelFailure::Internal(_)));
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(error.failure_fact().reason().code(), 167);
+    let KernelFailure::Source(cause) = error else {
+        panic!("expected exact preflight violation")
+    };
+    let source = std::error::Error::source(&cause)
+        .unwrap()
+        .downcast_ref::<novarocks_functions::opaque_memory::OpaqueRetainedUnderestimate>()
+        .unwrap();
+    assert_eq!((source.reserved, source.growth), (16, 17));
     assert_eq!(charge.bytes(), 0);
     assert_eq!(lease.remaining_bytes(), 16);
     drop(lease);
@@ -150,7 +174,9 @@ fn opaque_host_actual_pinned_library_new_update_conversion_and_payload_overlap()
         drop(lease);
         assert_eq!(tracker.current(), charge.bytes() as i64);
         for hash in 0u64..2048 {
-            let preflight = handle.update_hash_allocation_preflight();
+            let preflight = handle
+                .update_hash_allocation_preflight()
+                .expect("valid HLL update preflight");
             let mut lease = charge
                 .reserve_operation(preflight.bounds().additional_headroom_bytes())
                 .unwrap();

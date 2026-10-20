@@ -41,7 +41,7 @@ impl PureCompileControl for Control {
         let mut calls = self.calls.lock().unwrap();
         let at = calls.len();
         calls.push((phase, units));
-        if let Some((fail_at, cause)) = self.fail_at
+        if let Some((fail_at, cause)) = self.fail_at.clone()
             && fail_at == at
         {
             return Err(cause);
@@ -147,11 +147,12 @@ fn check_prefixes(trace: &Trace, make: impl Fn() -> Fixture) {
             CompileControlError::ResourceExhausted,
         ] {
             let control = Control {
-                fail_at: Some((at, cause)),
+                fail_at: Some((at, cause.clone())),
                 ..Control::default()
             };
             let error = make().run(&control).unwrap_err();
             let expected = match cause {
+                CompileControlError::Source(source) => SqlCompileError::CompilationSource(source),
                 CompileControlError::Cancelled => SqlCompileError::Cancelled,
                 CompileControlError::DeadlineExceeded => SqlCompileError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted => SqlCompileError::ResourceExhausted,

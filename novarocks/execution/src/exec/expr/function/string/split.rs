@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 
 pub fn eval_split<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -23,8 +24,9 @@ pub fn eval_split<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     str_expr: ExprId,
     delim_expr: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let str_array = arena.eval(str_expr, chunk)?;
     let delim_array = arena.eval(delim_expr, chunk)?;
-    Ok((novarocks_functions::builtin::string_split::evaluate_legacy(&str_array, &delim_array))?)
+    novarocks_functions::builtin::string_split::evaluate_required(&str_array, &delim_array)
+        .map_err(ExecutionFailure::from)
 }

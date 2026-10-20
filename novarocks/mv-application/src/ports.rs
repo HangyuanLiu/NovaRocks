@@ -60,10 +60,8 @@ impl MvProviderFailure {
         self.compile_control = error;
         self
     }
-    pub const fn compile_control_error(
-        &self,
-    ) -> Option<novarocks_type_contract::CompileControlError> {
-        self.compile_control
+    pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control.clone()
     }
 
     pub const fn kind(&self) -> MvProviderFailureKind {
@@ -256,10 +254,10 @@ mod tests {
                 let ordinary =
                     MvProviderFailure::new(kind, control.to_string()).into_product_error();
                 let typed = MvProviderFailure::new(kind, control.to_string())
-                    .with_compile_control(Some(control))
+                    .with_compile_control(Some(control.clone()))
                     .into_product_error();
                 assert_eq!(typed.kind(), ordinary.kind());
-                assert_eq!(typed.compile_control_error(), Some(control));
+                assert_eq!(typed.compile_control_error(), Some(control.clone()));
                 assert_eq!(ordinary.compile_control_error(), None);
             }
         }

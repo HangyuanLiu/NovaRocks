@@ -23,6 +23,7 @@ use crate::exec::expr::{ExprNode, LiteralValue};
 use arrow::array::{Array, BinaryArray, Float64Array, Int64Array, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use novarocks_failure_contract::FailureProjection;
 use novarocks_types::SlotId;
 
 fn setup(arrays: Vec<ArrayRef>) -> (ExprArena, Vec<ExprId>, Chunk) {
@@ -46,7 +47,7 @@ fn setup(arrays: Vec<ArrayRef>) -> (ExprArena, Vec<ExprId>, Chunk) {
         .collect();
     (arena, args, chunk)
 }
-fn evaluate(arrays: Vec<ArrayRef>) -> Result<ArrayRef, String> {
+fn evaluate(arrays: Vec<ArrayRef>) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (mut arena, args, chunk) = setup(arrays);
     let expr = arena.push_typed(
         ExprNode::FunctionCall {
@@ -100,7 +101,7 @@ fn legacy_ds_hll_baseline_scalar_null_skips_bad_tuning_but_value_type_still_matt
     assert!(out.is_null(0));
     let values = Arc::new(UInt32Array::from(vec![None])) as ArrayRef;
     assert_eq!(
-        evaluate(vec![values]).unwrap_err(),
+        (evaluate(vec![values]).unwrap_err()).to_string(),
         "ds_hll_count_distinct_state: unsupported sketch hash input type UInt32"
     );
 }
@@ -116,7 +117,8 @@ fn legacy_ds_hll_baseline_scalar_checked_integer_float_and_type_full_errors() {
         (266, "ds_hll_count_distinct_state log_k out of range: 266"),
     ] {
         assert_eq!(
-            evaluate(vec![value.clone(), Arc::new(Int64Array::from(vec![log]))]).unwrap_err(),
+            (evaluate(vec![value.clone(), Arc::new(Int64Array::from(vec![log]))]).unwrap_err())
+                .to_string(),
             message
         );
     }
@@ -130,13 +132,14 @@ fn legacy_ds_hll_baseline_scalar_checked_integer_float_and_type_full_errors() {
     assert_eq!(bytes[3], 10);
     assert_eq!((bytes[7] >> 2) & 3, 1);
     assert_eq!(
-        evaluate(vec![
+        (evaluate(vec![
             value,
             Arc::new(Int64Array::from(vec![10])),
             Arc::new(Int64Array::from(vec![7]))
         ])
-        .unwrap_err(),
-        "ds_hll_count_distinct_state target type expects string input, got Int64(7)"
+        .unwrap_err())
+        .to_string(),
+        "ds_hll_count_distinct_state target type expects string input, got Int64"
     );
 }
 #[test]
@@ -146,7 +149,7 @@ fn legacy_ds_hll_baseline_scalar_child_evaluation_precedes_row_hash_and_tuning()
     args.push(ExprId(usize::MAX));
     let expr = arena.push_typed(ExprNode::Literal(LiteralValue::Null), DataType::Binary);
     assert_eq!(
-        eval_ds_hll_count_distinct_state(&arena, expr, &args, &chunk).unwrap_err(),
+        (eval_ds_hll_count_distinct_state(&arena, expr, &args, &chunk).unwrap_err()).to_string(),
         "invalid ExprId"
     );
     let (mut arena, mut args, chunk) = setup(vec![Arc::new(Int64Array::from(vec![1])) as ArrayRef]);
@@ -159,9 +162,21 @@ fn legacy_ds_hll_baseline_scalar_child_evaluation_precedes_row_hash_and_tuning()
         ExprId(usize::MAX),
     ]);
     let expr = arena.push_typed(ExprNode::Literal(LiteralValue::Null), DataType::Binary);
-    assert!(
-        eval_ds_hll_count_distinct_state(&arena, expr, &args, &chunk).is_ok(),
-        "raw fourth child is ignored, not a bound overload"
+    let failure = eval_ds_hll_count_distinct_state(&arena, expr, &args, &chunk).unwrap_err();
+    assert_eq!(
+        failure.failure_fact().class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert_eq!(
+        failure.failure_fact().reason(),
+        novarocks_failure_contract::FailureReason::new(
+            novarocks_failure_contract::domain::KERNEL,
+            std::num::NonZeroU16::new(308).unwrap()
+        )
+    );
+    assert_eq!(
+        failure.detail(),
+        "ds_hll_count_distinct_state requires one to three arguments, got 4"
     );
 }
 

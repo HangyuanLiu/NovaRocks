@@ -335,7 +335,7 @@ pub(crate) fn freeze_binding_with_creation<H>(
     )
     .map_err(|error| FragmentCompileError::Owner {
         phase: "frozen aggregate selection",
-        error: Box::new(error),
+        error: novarocks_failure_contract::SharedFailureCause::new(error),
     })?;
     crate::creation::request(
         novarocks_local_program::FrozenAggregateSelection::storage_allocation_layout()?,
@@ -396,7 +396,7 @@ pub(crate) fn lower_call<H>(
         AggregateOverloadIdentity::try_new(function.overload.as_str()).map_err(|error| {
             FragmentCompileError::Owner {
                 phase: "aggregate overload identity",
-                error: Box::new(error),
+                error: novarocks_failure_contract::SharedFailureCause::new(error),
             }
         })?;
     work.flush()?;

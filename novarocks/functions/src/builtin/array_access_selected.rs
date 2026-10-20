@@ -19,7 +19,7 @@
 use super::{
     array_access_core::{AccessFailure, AccessRows, ArrayAccessInputs, lookup_observed},
     array_literal_core::CollectionObservation,
-    collection_selected::{compact, copy_error, nullable_take_type, reserve},
+    collection_selected::{compact, copy_error, nullable_take_type},
 };
 use crate::{
     FunctionArgumentType, KernelEvaluationControl, KernelFailure, ScalarCallContract,
@@ -107,7 +107,7 @@ pub(super) fn evaluate<'a>(
             ArrayAccessInputs::new(list.array().clone(), normalized_index, None, &mut observer)
                 .map_err(|error| match error {
                     AccessFailure::Control(cause) => cause,
-                    AccessFailure::Data(message) => internal(&message),
+                    AccessFailure::Operation(cause) => cause,
                 })?;
         let values = lookup_observed(
             &inputs,
@@ -127,25 +127,24 @@ pub(super) fn evaluate<'a>(
             },
             Some(target.data_type()),
             |values, indices| {
-                let mut exact = reserve::<Option<u64>>(indices.len(), &work)?;
-                for index in indices {
-                    work.borrow_mut().step()?;
-                    exact.push(index.map(u64::from))
-                }
-                selected_copy::preflight_take(values, &exact, |boundary| {
-                    if boundary {
-                        work.borrow_mut().flush()
-                    } else {
-                        work.borrow_mut().step()
-                    }
-                })
+                selected_copy::preflight_original_take(
+                    values,
+                    selected_copy::CopyIndexView::UInt32(indices),
+                    |boundary| {
+                        if boundary {
+                            work.borrow_mut().flush()
+                        } else {
+                            work.borrow_mut().step()
+                        }
+                    },
+                )
                 .map_err(copy_error)
             },
             &mut observer,
         )
         .map_err(|error| match error {
             AccessFailure::Control(cause) => cause,
-            AccessFailure::Data(message) => internal(&message),
+            AccessFailure::Operation(cause) => cause,
         })?;
         SelectedValues::try_new(selection, target.data_type(), values, Box::default())
             .map_err(|_| internal("array element compact output violates its frozen contract"))

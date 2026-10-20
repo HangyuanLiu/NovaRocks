@@ -46,7 +46,9 @@ impl From<CompileControlError> for Error {
 impl Error {
     fn control(&self) -> Option<CompileControlError> {
         match self {
-            Self::Control(error) | Self::Constant(ConstantError::Control(error)) => Some(*error),
+            Self::Control(error) | Self::Constant(ConstantError::Control(error)) => {
+                Some(error.clone())
+            }
             _ => None,
         }
     }
@@ -84,7 +86,7 @@ impl PureCompileControl for Control {
             );
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, error)) if stop == position => Err(error),
             _ => Ok(()),
         }
@@ -371,7 +373,7 @@ fn literal_factory_refuses_wrong_carriers_nonnullable_null_and_invalid_field_dom
             policy(),
             &Control::good()
         ),
-        Err(Error::Constant(ConstantError::Arrow(_)))
+        Err(Error::Constant(ConstantError::Source(_)))
     ));
 }
 
@@ -471,7 +473,7 @@ fn literal_factory_all_small_actual_callback_prefixes_keep_three_original_contro
                 CompileControlError::ResourceExhausted,
             ] {
                 let refused = Control {
-                    refusal: Some((position, cause)),
+                    refusal: Some((position, cause.clone())),
                     ..Control::good()
                 };
                 let error = admit(&literal, &ty, policy(), &refused).err().unwrap();
@@ -569,7 +571,7 @@ fn literal_factory_wide_typed_null_source_observes_actual_quantum_and_original_p
             CompileControlError::ResourceExhausted,
         ] {
             let refused = Control {
-                refusal: Some((position, cause)),
+                refusal: Some((position, cause.clone())),
                 ..Control::good()
             };
             assert_eq!(

@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, StringArray};
 
 pub fn eval_from_base64<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -23,13 +24,23 @@ pub fn eval_from_base64<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "from_base64 requires exactly 1 prepared argument(s)",
+        ));
+    }
     let input = arena.eval(args[0], chunk)?;
     let input = input
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "from_base64 expects VARCHAR argument".to_string())?;
+        .ok_or_else(|| expression_contract("from_base64 expects VARCHAR argument"))?;
 
+    if input.len() < chunk.len() {
+        return Err(expression_contract(
+            "from_base64 prepared input is shorter than its batch",
+        ));
+    }
     let mut out = Vec::with_capacity(chunk.len());
     for row in 0..chunk.len() {
         if input.is_null(row) {
@@ -46,5 +57,6 @@ pub fn eval_from_base64<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         out.push(super::common::decode_base64(value.as_bytes()));
     }
 
-    Ok((super::common::build_bytes_output_latin1(out, arena.data_type(expr)))?)
+    super::common::build_bytes_output_latin1(out, arena.data_type(expr))
+        .map_err(ExecutionFailure::from)
 }

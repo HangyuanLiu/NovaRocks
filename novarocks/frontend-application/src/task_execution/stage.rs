@@ -385,9 +385,7 @@ mod destination_close_tests {
     /// model: the oracle checks output safety and frozen membership directly.
     #[test]
     fn destination_reducer_bounded_interleavings() {
-        use novarocks_execution::task_execution::{
-            SafeDetail, TaskFailure, TaskFailureCategory, TerminationDetail,
-        };
+        use novarocks_execution::task_execution::{SafeDetail, TaskFailure, TerminationDetail};
         use novarocks_query_application::coordination::{RootReadFacts, TerminationLatch};
 
         #[derive(Clone, Copy, Debug)]
@@ -413,7 +411,13 @@ mod destination_close_tests {
         let destinations = [identity(2), identity(3)];
         let failures = ["destination A failed", "destination B failed"].map(|detail| {
             TerminationDetail::Failed(TaskFailure::new(
-                TaskFailureCategory::Execution,
+                novarocks_execution_contract::failure::FailureFact::new(
+                    novarocks_execution_contract::failure::FailureClass::Data,
+                    novarocks_execution_contract::failure::FailureReason::new(
+                        std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                        std::num::NonZeroU16::new(1).unwrap(),
+                    ),
+                ),
                 SafeDetail::truncating(detail),
             ))
         });
@@ -470,9 +474,8 @@ mod destination_close_tests {
                             if !close_seen.is_empty() {
                                 failure_after_close_hits += 1;
                             }
-                            failure.latch(
-                                failures[usize::from(matches!(event, Event::FailureB))].clone(),
-                            );
+                            let index = usize::from(matches!(event, Event::FailureB));
+                            failure.latch(destinations[index], failures[index].clone());
                             (Vec::new(), Vec::new())
                         }
                     };

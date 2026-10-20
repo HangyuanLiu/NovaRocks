@@ -42,6 +42,57 @@ use novarocks_sql::planning::mv::{
 use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
 use novarocks_types::{SlotId, mv_aggregate_layout::MvAggregateStateRole};
 
+/// The staged read path retains actual construction/materialization sources.
+/// Its existing pure semantic helpers still author textual contract reasons;
+/// those do not become a generic execution failure or a recovery category.
+#[derive(Debug)]
+pub(crate) enum AggregateFirstRefreshError {
+    Semantic(String),
+    Construction(novarocks_execution::exec::chunk::ChunkConstructionFailure),
+    Materialization(novarocks_execution::runtime::fragment::ExecutionFailure),
+    Arrow {
+        operation: &'static str,
+        source: arrow::error::ArrowError,
+    },
+}
+impl std::fmt::Display for AggregateFirstRefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Semantic(message) => f.write_str(message),
+            Self::Construction(source) => source.fmt(f),
+            Self::Materialization(source) => source.fmt(f),
+            Self::Arrow { operation, source } => write!(f, "{operation}: {source}"),
+        }
+    }
+}
+impl std::error::Error for AggregateFirstRefreshError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Semantic(_) => None,
+            Self::Construction(source) => Some(source),
+            Self::Materialization(source) => Some(source),
+            Self::Arrow { source, .. } => Some(source),
+        }
+    }
+}
+impl From<String> for AggregateFirstRefreshError {
+    fn from(message: String) -> Self {
+        Self::Semantic(message)
+    }
+}
+impl From<novarocks_execution::exec::chunk::ChunkConstructionFailure>
+    for AggregateFirstRefreshError
+{
+    fn from(source: novarocks_execution::exec::chunk::ChunkConstructionFailure) -> Self {
+        Self::Construction(source)
+    }
+}
+impl From<novarocks_execution::runtime::fragment::ExecutionFailure> for AggregateFirstRefreshError {
+    fn from(source: novarocks_execution::runtime::fragment::ExecutionFailure) -> Self {
+        Self::Materialization(source)
+    }
+}
+
 #[allow(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
@@ -62,7 +113,7 @@ pub(crate) fn prepare_aggregate_first_refresh_chunks<F>(
     current_catalog: Option<&str>,
     current_database: &str,
     read: &mut F,
-) -> Result<Vec<Chunk>, String>
+) -> Result<Vec<Chunk>, AggregateFirstRefreshError>
 where
     F: FnMut(&str, &AggregateSqlCalls, ast::Query) -> Result<AggregateStateRead, String>,
 {
@@ -224,7 +275,7 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_chunks<F>(
     current_catalog: Option<&str>,
     current_database: &str,
     read: &mut F,
-) -> Result<Vec<Chunk>, String>
+) -> Result<Vec<Chunk>, AggregateFirstRefreshError>
 where
     F: FnMut(&str, &AggregateSqlCalls, ast::Query) -> Result<AggregateStateRead, String>,
 {
@@ -242,7 +293,8 @@ where
         if branch_index == 0 && &branch_calls != first_branch_calls {
             return Err(
                 "branch UNION ALL aggregate first branch calls drifted from the validated contract"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             );
         }
         let (branch_read, next_occurrence) = read_aggregate_state(
@@ -343,7 +395,10 @@ fn flatten_branch_union_all_set_expr(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn append_branch_id_to_chunks(chunks: Vec<Chunk>, branch_id: i32) -> Result<Vec<Chunk>, String> {
+fn append_branch_id_to_chunks(
+    chunks: Vec<Chunk>,
+    branch_id: i32,
+) -> Result<Vec<Chunk>, AggregateFirstRefreshError> {
     chunks
         .into_iter()
         .map(|chunk| append_branch_id_to_chunk(chunk, branch_id))
@@ -354,7 +409,10 @@ fn append_branch_id_to_chunks(chunks: Vec<Chunk>, branch_id: i32) -> Result<Vec<
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn append_branch_id_to_chunk(chunk: Chunk, branch_id: i32) -> Result<Chunk, String> {
+fn append_branch_id_to_chunk(
+    chunk: Chunk,
+    branch_id: i32,
+) -> Result<Chunk, AggregateFirstRefreshError> {
     let mut fields = chunk
         .record_batch()
         .schema()
@@ -375,10 +433,11 @@ fn append_branch_id_to_chunk(chunk: Chunk, branch_id: i32) -> Result<Chunk, Stri
             .num_rows(
             )
     ])));
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|error| {
-        format!(
-            "append branch id to branch UNION ALL aggregate first refresh chunk failed: {error}"
-        )
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|source| {
+        AggregateFirstRefreshError::Arrow {
+            operation: "append branch id to branch UNION ALL aggregate first refresh chunk failed",
+            source,
+        }
     })?;
     chunk_from_record_batch(batch)
 }
@@ -405,7 +464,7 @@ fn normalize_and_materialize_aggregate_read(
     source_calls: &AggregateSqlCalls,
     target_layout: &SqlMvAggregatePhysicalLayout,
     target_calls: &AggregateSqlCalls,
-) -> Result<Vec<Chunk>, String> {
+) -> Result<Vec<Chunk>, AggregateFirstRefreshError> {
     validate_aggregate_layout_compatibility(
         0,
         source_calls,
@@ -421,7 +480,8 @@ fn normalize_and_materialize_aggregate_read(
             "aggregate MV state result source/target slot count mismatch: source={} target={}",
             source_names.len(),
             target_names.len()
-        ));
+        )
+        .into());
     }
 
     let metadata_names = read
@@ -467,8 +527,8 @@ fn normalize_and_materialize_aggregate_read(
                 &permutation,
             )
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    materialize_aggregate_result_chunks(chunks, target_layout.runtime_layout())
+        .collect::<Result<Vec<_>, AggregateFirstRefreshError>>()?;
+    materialize_aggregate_result_chunks(chunks, target_layout.runtime_layout()).map_err(Into::into)
 }
 
 #[allow(
@@ -784,14 +844,14 @@ fn reorder_and_rename_chunk_columns(
     chunk: Chunk,
     names: &[String],
     permutation: &[usize],
-) -> Result<Chunk, String> {
+) -> Result<Chunk, AggregateFirstRefreshError> {
     if chunk.record_batch().num_columns() != names.len() || permutation.len() != names.len() {
         return Err(format!(
             "aggregate MV state result chunk column count mismatch: columns={} names={} permutation={}",
             chunk.record_batch().num_columns(),
             names.len(),
             permutation.len()
-        ));
+        ).into());
     }
     if permutation
         .iter()
@@ -800,7 +860,7 @@ fn reorder_and_rename_chunk_columns(
         return Err(format!(
             "aggregate MV state result column permutation out of range: columns={} permutation={permutation:?}",
             chunk.record_batch().num_columns()
-        ));
+        ).into());
     }
     let source_schema = chunk.record_batch().schema();
     let fields = permutation
@@ -819,12 +879,16 @@ fn reorder_and_rename_chunk_columns(
         .iter()
         .map(|source_index| chunk.record_batch().column(*source_index).clone())
         .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-        .map_err(|error| format!("reorder aggregate MV state result columns failed: {error}"))?;
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|source| {
+        AggregateFirstRefreshError::Arrow {
+            operation: "reorder aggregate MV state result columns failed",
+            source,
+        }
+    })?;
     chunk_from_record_batch(batch)
 }
 
-fn chunk_from_record_batch(batch: RecordBatch) -> Result<Chunk, String> {
+fn chunk_from_record_batch(batch: RecordBatch) -> Result<Chunk, AggregateFirstRefreshError> {
     let slot_ids = (1..=batch.num_columns())
         .map(|index| {
             u32::try_from(index)
@@ -833,7 +897,7 @@ fn chunk_from_record_batch(batch: RecordBatch) -> Result<Chunk, String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     let schema = ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slot_ids)?;
-    Chunk::try_new_with_chunk_schema(batch, schema)
+    Chunk::try_new_with_chunk_schema(batch, schema).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -1018,7 +1082,7 @@ mod tests {
         assert_eq!(chunks[0].record_batch().schema().field(1).name(), "region");
     }
 
-    fn prepare_with_result(result: QueryResult) -> Result<Vec<Chunk>, String> {
+    fn prepare_with_result(result: QueryResult) -> Result<Vec<Chunk>, AggregateFirstRefreshError> {
         let select_sql = "select region, count(*) as c from ice.sales.fact group by region";
         let calls = parse_calls(select_sql);
         let pin =
@@ -1046,7 +1110,10 @@ mod tests {
 
         let error = prepare_with_result(result).expect_err("metadata arity must be exact");
 
-        assert!(error.contains("metadata column count mismatch"), "{error}");
+        assert!(
+            error.to_string().contains("metadata column count mismatch"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1060,8 +1127,12 @@ mod tests {
             let error = prepare_with_result(result).expect_err("metadata names must be exact");
 
             assert!(
-                error.contains("requires exactly one column named `__agg_state_c`")
-                    || error.contains("requires exactly one column named `region`"),
+                error
+                    .to_string()
+                    .contains("requires exactly one column named `__agg_state_c`")
+                    || error
+                        .to_string()
+                        .contains("requires exactly one column named `region`"),
                 "{error}"
             );
         }
@@ -1084,7 +1155,9 @@ mod tests {
         let error = prepare_with_result(result).expect_err("chunk names must be exact");
 
         assert!(
-            error.contains("state result chunk requires exactly one"),
+            error
+                .to_string()
+                .contains("state result chunk requires exactly one"),
             "{error}"
         );
     }
@@ -1106,7 +1179,9 @@ mod tests {
         )
         .expect_err("callback failure must propagate");
 
-        assert_eq!(error, "query read failed");
+        assert!(
+            matches!(error, AggregateFirstRefreshError::Semantic(message) if message == "query read failed")
+        );
     }
 
     #[test]
@@ -1179,7 +1254,10 @@ mod tests {
             &mut read,
         )
         .expect_err("UNION DISTINCT must fail");
-        assert!(error.contains("supports UNION ALL only"), "{error}");
+        assert!(
+            error.to_string().contains("supports UNION ALL only"),
+            "{error}"
+        );
 
         let error = prepare_branch_union_aggregate_first_refresh_chunks(
             branch_select_sql(),
@@ -1191,7 +1269,10 @@ mod tests {
             &mut read,
         )
         .expect_err("branch count mismatch must fail");
-        assert!(error.contains("expected 3 branches, found 2"), "{error}");
+        assert!(
+            error.to_string().contains("expected 3 branches, found 2"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1212,7 +1293,10 @@ mod tests {
         )
         .expect_err("first branch contract drift must fail");
 
-        assert!(error.contains("first branch calls drifted"), "{error}");
+        assert!(
+            error.to_string().contains("first branch calls drifted"),
+            "{error}"
+        );
     }
 
     fn assert_branch_layout_mismatch(
@@ -1311,9 +1395,8 @@ mod tests {
         .expect_err("layout nullability drift must fail");
 
         assert_eq!(reads, 2);
-        assert_eq!(
-            error,
-            "aggregate MV branch 1 visible column 0 nullability mismatch with branch 0"
+        assert!(
+            matches!(error, AggregateFirstRefreshError::Semantic(message) if message == "aggregate MV branch 1 visible column 0 nullability mismatch with branch 0")
         );
     }
 
@@ -1346,6 +1429,8 @@ mod tests {
         .expect_err("callback failure must abort the complete preparation");
 
         assert_eq!(reads, 2);
-        assert_eq!(error, "second branch read failed");
+        assert!(
+            matches!(error, AggregateFirstRefreshError::Semantic(message) if message == "second branch read failed")
+        );
     }
 }

@@ -257,7 +257,7 @@ impl PureCompileControl for PhaseCompile {
             assert!(ordinal <= stop);
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == ordinal => Err(cause),
             _ => Ok(()),
         }
@@ -279,7 +279,7 @@ fn ds_hll_local_stage_after_three_compile_causes_never_publish_partial_recipe() 
         ] {
             let control = PhaseCompile {
                 trace: Mutex::default(),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             let mut source = handle();
             let original = source.contract().clone();

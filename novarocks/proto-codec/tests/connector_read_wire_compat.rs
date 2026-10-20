@@ -152,7 +152,7 @@ fn public_carriers_enforce_category_and_scheduling_budgets_without_provider_sema
         ValidatedColumnHandle::parse(wrong_column, FieldPath::root("column"))
             .expect_err("column carrier must require ReadColumn")
             .kind(),
-        ProtocolErrorKind::InconsistentFields
+        &ProtocolErrorKind::InconsistentFields
     );
 
     let split =
@@ -182,7 +182,7 @@ fn public_carriers_enforce_category_and_scheduling_budgets_without_provider_sema
         )
         .expect_err("address count must be bounded")
         .kind(),
-        ProtocolErrorKind::OutOfRange
+        &ProtocolErrorKind::OutOfRange
     );
     assert_eq!(
         ValidatedConnectorSplit::parse(
@@ -191,6 +191,6 @@ fn public_carriers_enforce_category_and_scheduling_budgets_without_provider_sema
         )
         .expect_err("affinity key must be bounded")
         .kind(),
-        ProtocolErrorKind::OutOfRange
+        &ProtocolErrorKind::OutOfRange
     );
 }

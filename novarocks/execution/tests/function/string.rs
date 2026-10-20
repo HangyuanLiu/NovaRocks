@@ -175,7 +175,7 @@ fn assert_string_function_logic(name: &str) {
             let s = common::literal_string(&mut arena, "AB");
             let err = eval_string_function(name, &arena, expr_str, &[s], &chunk)
                 .expect_err("group_concat should not be evaluated in scalar path");
-            assert!(err.contains("aggregate"));
+            assert!(err.to_string().contains("aggregate"));
         }
         "hex" => {
             let s = common::literal_string(&mut arena, "AB");
@@ -1003,7 +1003,7 @@ fn eval_rows(
     arena: &ExprArena,
     args: &[novarocks_execution::exec::expr::ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> novarocks_execution::runtime::fragment::ExecutionResult<ArrayRef> {
     eval_string_function(name, arena, args[0], args, chunk)
 }
 
@@ -1125,7 +1125,7 @@ fn test_regexp_count_invalid_constant_pattern_errors() {
     let pattern = common::literal_string(&mut arena, "[0-9");
 
     assert_eq!(
-        eval_rows("regexp_count", &arena, &[input, pattern], &chunk).unwrap_err(),
+        (eval_rows("regexp_count", &arena, &[input, pattern], &chunk).unwrap_err()).to_string(),
         invalid_regex_expression("[0-9")
     );
 }
@@ -1237,7 +1237,8 @@ fn test_regexp_extract_invalid_pattern_errors_only_when_a_row_needs_it() {
         int64_column(vec![Some(1), Some(1)]),
     ]);
     assert_eq!(
-        eval_rows("regexp_extract", &arena, &[input, pattern, group], &needed).unwrap_err(),
+        (eval_rows("regexp_extract", &arena, &[input, pattern, group], &needed).unwrap_err())
+            .to_string(),
         regex_error("(bad")
     );
 
@@ -1268,7 +1269,8 @@ fn test_regexp_extract_invalid_per_row_pattern_errors_at_first_row_that_needs_it
     let group = common::slot_ref(&mut arena, 3, DataType::Int64);
 
     assert_eq!(
-        eval_rows("regexp_extract", &arena, &[input, pattern, group], &chunk).unwrap_err(),
+        (eval_rows("regexp_extract", &arena, &[input, pattern, group], &chunk).unwrap_err())
+            .to_string(),
         regex_error("[bad")
     );
 }
@@ -1368,13 +1370,14 @@ fn test_regexp_extract_all_invalid_pattern_errors_only_when_a_row_needs_it() {
         int64_column(vec![Some(-1), Some(0)]),
     ]);
     assert_eq!(
-        eval_rows(
+        (eval_rows(
             "regexp_extract_all",
             &arena,
             &[input, pattern, group],
             &needed
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         regex_error("(bad")
     );
 
@@ -1488,7 +1491,7 @@ fn test_regexp_position_invalid_pattern_errors_only_when_a_row_needs_it() {
         int64_column(vec![Some(1), Some(1)]),
     ]);
     assert_eq!(
-        eval_rows("regexp_position", &arena, &args, &needed).unwrap_err(),
+        (eval_rows("regexp_position", &arena, &args, &needed).unwrap_err()).to_string(),
         invalid_regex_expression("[0-9")
     );
 
@@ -1589,7 +1592,7 @@ fn test_regexp_replace_invalid_pattern_errors_only_when_a_row_needs_it() {
         utf8_column(vec![Some("-")]),
     ]);
     assert_eq!(
-        eval_rows("regexp_replace", &arena, &args, &needed).unwrap_err(),
+        (eval_rows("regexp_replace", &arena, &args, &needed).unwrap_err()).to_string(),
         regex_error("(bad")
     );
 
@@ -2091,7 +2094,10 @@ fn test_raise_error_non_null_returns_err() {
     let msg = common::literal_string(&mut arena, "custom error message");
     let err = eval_string_function("raise_error", &arena, expr_str, &[msg], &chunk)
         .expect_err("raise_error with non-null should return Err");
-    assert!(err.contains("custom error message"), "err={err:?}");
+    assert!(
+        err.to_string().contains("custom error message"),
+        "err={err:?}"
+    );
 }
 
 #[test]
@@ -2615,7 +2621,10 @@ fn field_keeps_string_identity_and_rejects_unfrozen_arguments() {
         &common::chunk_len_1(),
     )
     .unwrap_err();
-    assert!(error.contains("frozen argument mismatch"), "{error}");
+    assert!(
+        error.to_string().contains("frozen argument mismatch"),
+        "{error}"
+    );
     assert!(eval_string_function("field", &arena, expr, &[first], &common::chunk_len_1()).is_err());
 }
 

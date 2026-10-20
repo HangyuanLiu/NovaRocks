@@ -176,7 +176,32 @@ fn count_null_inspection_preserves_control_failure_and_rejects_bad_address() {
             &mut |_| Ok::<(), &'static str>(())
         ),
         Err(CountVisitError::Invalid(
-            "kernel value has invalid nested row addressing"
+            super::NullAddressViolation::NestedAddress
         ))
     );
+}
+
+#[test]
+fn invalid_row_address_keeps_the_native_source_without_input_ownership() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let array = arrow_array::Int64Array::from(vec![1]);
+    let error =
+        super::logical_is_null_observed(
+            &array,
+            1,
+            1,
+            &mut || Ok::<_, std::convert::Infallible>(()),
+        )
+        .unwrap_err();
+    let super::NullVisitError::Invalid(source) = error else {
+        panic!("unexpected control refusal")
+    };
+    assert_eq!(source, super::NullAddressViolation::NestedAddress);
+    let fact = source.failure_fact();
+    assert_eq!(fact.class(), FailureClass::Invariant);
+    assert_eq!(fact.reason().code(), 160);
+    let outer = crate::KernelFailure::from_domain(source);
+    assert_eq!(outer.failure_fact(), fact);
+    assert!(matches!(outer, crate::KernelFailure::Source(ref cause)
+        if std::error::Error::source(cause).unwrap().is::<super::NullAddressViolation>()));
 }

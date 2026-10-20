@@ -88,12 +88,192 @@ pub struct CompiledRuntimeFilterEndpoints {
     by_binding: BTreeMap<u32, CompiledRuntimeFilterEndpoint>,
 }
 
+/// Why the package's own numbered binding cannot resolve to its endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompiledRuntimeFilterBindingError {
+    UnnumberedScanBinding {
+        binding: u32,
+    },
+    ProducerAtScan {
+        binding: u32,
+    },
+    WrongScanNode {
+        binding: u32,
+        actual: u32,
+        expected: u32,
+    },
+    DuplicateDynamicFilter {
+        filter: u32,
+    },
+    MissingDynamicConsumer {
+        filter: u32,
+    },
+    MultipleDynamicConsumers {
+        filter: u32,
+        count: usize,
+    },
+    MissingFrozenDynamicFilter {
+        filter: u32,
+    },
+    NegativeRequirement {
+        binding: i32,
+    },
+    DuplicateRequirement {
+        binding: u32,
+    },
+    UnknownRequirement {
+        binding: u32,
+    },
+    MissingRequirement {
+        binding: u32,
+    },
+    ForeignFragment {
+        binding: u32,
+        actual: u32,
+        expected: u32,
+    },
+    UnknownFilter {
+        binding: u32,
+        filter: u32,
+    },
+    MissingProducer {
+        binding: u32,
+        filter: u32,
+        index: usize,
+    },
+    MissingConsumer {
+        binding: u32,
+        filter: u32,
+        index: usize,
+    },
+    DuplicateBinding {
+        binding: u32,
+    },
+}
+impl std::fmt::Display for CompiledRuntimeFilterBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnnumberedScanBinding { binding } => write!(
+                f,
+                "runtime-filter binding_id={binding} is not numbered by the scan's package"
+            ),
+            Self::ProducerAtScan { binding } => write!(
+                f,
+                "runtime-filter binding_id={binding} is a producer, not a consumer of the scan"
+            ),
+            Self::WrongScanNode {
+                binding,
+                actual,
+                expected,
+            } => write!(
+                f,
+                "runtime-filter binding_id={binding} consumes at node {actual}, not at this scan {expected}"
+            ),
+            Self::DuplicateDynamicFilter { filter } => write!(
+                f,
+                "frozen dynamic filter of runtime filter {filter} is stated twice"
+            ),
+            Self::MissingDynamicConsumer { filter } => write!(
+                f,
+                "frozen dynamic filter of runtime filter {filter} has no scan-source consumer binding at this scan"
+            ),
+            Self::MultipleDynamicConsumers { filter, count } => write!(
+                f,
+                "frozen dynamic filter of runtime filter {filter} corresponds to {count} scan-source consumer bindings, not exactly one"
+            ),
+            Self::MissingFrozenDynamicFilter { filter } => write!(
+                f,
+                "scan-source consumer of runtime filter {filter} has no frozen dynamic filter"
+            ),
+            Self::NegativeRequirement { binding } => write!(
+                f,
+                "compiled program requires negative runtime-filter binding_id={binding}"
+            ),
+            Self::DuplicateRequirement { binding } => write!(
+                f,
+                "compiled program requires runtime-filter binding_id={binding} twice"
+            ),
+            Self::UnknownRequirement { binding } => write!(
+                f,
+                "compiled program requires runtime-filter binding_id={binding}, which its package does not number"
+            ),
+            Self::MissingRequirement { binding } => write!(
+                f,
+                "package runtime-filter binding_id={binding} has no requirement in its compiled program"
+            ),
+            Self::ForeignFragment {
+                binding,
+                actual,
+                expected,
+            } => write!(
+                f,
+                "runtime-filter binding_id={binding} names an endpoint in fragment {actual}, not in its package's fragment {expected}"
+            ),
+            Self::UnknownFilter { binding, filter } => write!(
+                f,
+                "runtime-filter binding_id={binding} names filter {filter}, which the package's cuts do not carry"
+            ),
+            Self::MissingProducer {
+                binding,
+                filter,
+                index,
+            } => write!(
+                f,
+                "runtime-filter binding_id={binding} names absent producer {index} of filter {filter}"
+            ),
+            Self::MissingConsumer {
+                binding,
+                filter,
+                index,
+            } => write!(
+                f,
+                "runtime-filter binding_id={binding} names absent consumer {index} of filter {filter}"
+            ),
+            Self::DuplicateBinding { binding } => {
+                write!(f, "runtime-filter binding_id={binding} is numbered twice")
+            }
+        }
+    }
+}
+impl std::error::Error for CompiledRuntimeFilterBindingError {}
+impl novarocks_execution_contract::failure::FailureProjection
+    for CompiledRuntimeFilterBindingError
+{
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let code = match self {
+            Self::UnnumberedScanBinding { .. } => 9310,
+            Self::ProducerAtScan { .. } => 9311,
+            Self::WrongScanNode { .. } => 9312,
+            Self::DuplicateDynamicFilter { .. } => 9313,
+            Self::MissingDynamicConsumer { .. } => 9314,
+            Self::MultipleDynamicConsumers { .. } => 9315,
+            Self::MissingFrozenDynamicFilter { .. } => 9316,
+            Self::NegativeRequirement { .. } => 9305,
+            Self::DuplicateRequirement { .. } => 9306,
+            Self::UnknownRequirement { .. } => 9307,
+            Self::MissingRequirement { .. } => 9308,
+            Self::ForeignFragment { .. } => 9300,
+            Self::UnknownFilter { .. } => 9301,
+            Self::MissingProducer { .. } => 9302,
+            Self::MissingConsumer { .. } => 9303,
+            Self::DuplicateBinding { .. } => 9304,
+        };
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+
 impl CompiledRuntimeFilterEndpoints {
     /// Projects the binding table of `package`'s cuts. Every binding must
     /// resolve to an endpoint of one of the package's own filter contracts,
     /// in the package's own fragment; anything else is refused rather than
     /// skipped.
-    pub fn from_package(package: &FragmentPackage) -> Result<Self, String> {
+    pub fn from_package(
+        package: &FragmentPackage,
+    ) -> Result<Self, CompiledRuntimeFilterBindingError> {
         let fragment = package.fragment().id();
         let cuts = package.cuts();
         let filters = cuts
@@ -101,38 +281,34 @@ impl CompiledRuntimeFilterEndpoints {
             .iter()
             .map(|filter| (filter.id, filter))
             .collect::<BTreeMap<_, _>>();
-        let local = |binding_id: u32, endpoint: &RuntimeFilterEndpoint| {
+        let local = |binding: u32, endpoint: &RuntimeFilterEndpoint| {
             if endpoint.fragment == fragment {
                 Ok(endpoint.node.get())
             } else {
-                Err(format!(
-                    "runtime-filter binding_id={binding_id} names an endpoint in fragment {}, \
-                     not in its package's fragment {}",
-                    endpoint.fragment.get(),
-                    fragment.get()
-                ))
+                Err(CompiledRuntimeFilterBindingError::ForeignFragment {
+                    binding,
+                    actual: endpoint.fragment.get(),
+                    expected: fragment.get(),
+                })
             }
         };
         let mut endpoints = Vec::with_capacity(cuts.runtime_filter_bindings.len());
         for cut in cuts.runtime_filter_bindings.iter() {
-            let filter = filters.get(&cut.filter).ok_or_else(|| {
-                format!(
-                    "runtime-filter binding_id={} names filter {}, which the package's cuts do \
-                     not carry",
-                    cut.binding_id,
-                    cut.filter.get()
-                )
-            })?;
+            let filter = filters.get(&cut.filter).ok_or(
+                CompiledRuntimeFilterBindingError::UnknownFilter {
+                    binding: cut.binding_id,
+                    filter: cut.filter.get(),
+                },
+            )?;
             let endpoint = match cut.role {
                 RuntimeFilterBindingRole::Producer(index) => {
-                    let producer = filter.producers.get(index).ok_or_else(|| {
-                        format!(
-                            "runtime-filter binding_id={} names absent producer {index} of \
-                             filter {}",
-                            cut.binding_id,
-                            filter.id.get()
-                        )
-                    })?;
+                    let producer = filter.producers.get(index).ok_or(
+                        CompiledRuntimeFilterBindingError::MissingProducer {
+                            binding: cut.binding_id,
+                            filter: filter.id.get(),
+                            index,
+                        },
+                    )?;
                     CompiledRuntimeFilterEndpoint::new(
                         filter.id.get(),
                         local(cut.binding_id, &producer.endpoint)?,
@@ -140,14 +316,13 @@ impl CompiledRuntimeFilterEndpoints {
                     )
                 }
                 RuntimeFilterBindingRole::Consumer(index) => {
-                    let consumer = filter.consumers.get(index).ok_or_else(|| {
-                        format!(
-                            "runtime-filter binding_id={} names absent consumer {index} of \
-                             filter {}",
-                            cut.binding_id,
-                            filter.id.get()
-                        )
-                    })?;
+                    let consumer = filter.consumers.get(index).ok_or(
+                        CompiledRuntimeFilterBindingError::MissingConsumer {
+                            binding: cut.binding_id,
+                            filter: filter.id.get(),
+                            index,
+                        },
+                    )?;
                     CompiledRuntimeFilterEndpoint::new(
                         filter.id.get(),
                         local(cut.binding_id, &consumer.endpoint)?,
@@ -163,17 +338,14 @@ impl CompiledRuntimeFilterEndpoints {
         Self::try_from_endpoints(endpoints)
     }
 
-    /// One table from `(binding_id, endpoint)` pairs; a binding named twice
-    /// is refused.
+    /// One endpoint per binding identity; duplicates are a local contract failure.
     pub fn try_from_endpoints(
         endpoints: impl IntoIterator<Item = (u32, CompiledRuntimeFilterEndpoint)>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, CompiledRuntimeFilterBindingError> {
         let mut by_binding = BTreeMap::new();
-        for (binding_id, endpoint) in endpoints {
-            if by_binding.insert(binding_id, endpoint).is_some() {
-                return Err(format!(
-                    "runtime-filter binding_id={binding_id} is numbered twice"
-                ));
+        for (binding, endpoint) in endpoints {
+            if by_binding.insert(binding, endpoint).is_some() {
+                return Err(CompiledRuntimeFilterBindingError::DuplicateBinding { binding });
             }
         }
         Ok(Self { by_binding })
@@ -204,33 +376,27 @@ impl CompiledRuntimeFilterEndpoints {
 pub fn program_runtime_filter_bindings(
     requirements: &BindingRequirements,
     endpoints: &CompiledRuntimeFilterEndpoints,
-) -> Result<BTreeSet<u32>, String> {
+) -> Result<BTreeSet<u32>, CompiledRuntimeFilterBindingError> {
     let mut bindings = BTreeSet::new();
     for requirement in requirements.entries() {
         let BindingRequirement::RuntimeFilter { binding_id } = requirement else {
             continue;
         };
-        let binding_id = u32::try_from(*binding_id).map_err(|_| {
-            format!("compiled program requires negative runtime-filter binding_id={binding_id}")
+        let binding = u32::try_from(*binding_id).map_err(|_| {
+            CompiledRuntimeFilterBindingError::NegativeRequirement {
+                binding: *binding_id,
+            }
         })?;
-        if !bindings.insert(binding_id) {
-            return Err(format!(
-                "compiled program requires runtime-filter binding_id={binding_id} twice"
-            ));
+        if !bindings.insert(binding) {
+            return Err(CompiledRuntimeFilterBindingError::DuplicateRequirement { binding });
         }
     }
     let numbered = endpoints.binding_ids();
-    if let Some(binding_id) = bindings.difference(&numbered).next() {
-        return Err(format!(
-            "compiled program requires runtime-filter binding_id={binding_id}, which its \
-             package does not number"
-        ));
+    if let Some(binding) = bindings.difference(&numbered).next() {
+        return Err(CompiledRuntimeFilterBindingError::UnknownRequirement { binding: *binding });
     }
-    if let Some(binding_id) = numbered.difference(&bindings).next() {
-        return Err(format!(
-            "package runtime-filter binding_id={binding_id} has no requirement in its \
-             compiled program"
-        ));
+    if let Some(binding) = numbered.difference(&bindings).next() {
+        return Err(CompiledRuntimeFilterBindingError::MissingRequirement { binding: *binding });
     }
     Ok(bindings)
 }
@@ -249,63 +415,42 @@ pub fn validate_scan_dynamic_filters(
     dynamic_filters: &[StaticScanDynamicFilter],
     consumers: &[FilterConsumerAtExpr],
     endpoints: &CompiledRuntimeFilterEndpoints,
-) -> Result<(), String> {
-    let mut by_filter = BTreeMap::<u32, Vec<u32>>::new();
+) -> Result<(), CompiledRuntimeFilterBindingError> {
+    use CompiledRuntimeFilterBindingError as Refusal;
+    let mut by_filter = BTreeMap::<u32, usize>::new();
     for site in consumers {
-        let binding_id = site.consumer.binding_id();
-        let endpoint = endpoints.get(binding_id).ok_or_else(|| {
-            format!("runtime-filter binding_id={binding_id} is not numbered by the scan's package")
-        })?;
+        let binding = site.consumer.binding_id();
+        let endpoint = endpoints
+            .get(binding)
+            .ok_or(Refusal::UnnumberedScanBinding { binding })?;
         let CompiledRuntimeFilterRole::Consumer { scan_source } = endpoint.role() else {
-            return Err(format!(
-                "runtime-filter binding_id={binding_id} is a producer, not a consumer of the scan"
-            ));
+            return Err(Refusal::ProducerAtScan { binding });
         };
         if endpoint.node() != scan_node {
-            return Err(format!(
-                "runtime-filter binding_id={binding_id} consumes at node {}, not at this scan",
-                endpoint.node()
-            ));
+            return Err(Refusal::WrongScanNode {
+                binding,
+                actual: endpoint.node(),
+                expected: scan_node,
+            });
         }
         if scan_source {
-            by_filter
-                .entry(endpoint.filter_id())
-                .or_default()
-                .push(binding_id);
+            *by_filter.entry(endpoint.filter_id()).or_default() += 1;
         }
     }
     let mut frozen = BTreeSet::new();
     for dynamic in dynamic_filters {
-        let filter_id = dynamic.filter_id();
-        if !frozen.insert(filter_id) {
-            return Err(format!(
-                "frozen dynamic filter of runtime filter {filter_id} is stated twice"
-            ));
+        let filter = dynamic.filter_id();
+        if !frozen.insert(filter) {
+            return Err(Refusal::DuplicateDynamicFilter { filter });
         }
-        match by_filter.get(&filter_id).map(Vec::as_slice) {
-            Some([_]) => {}
-            None | Some([]) => {
-                return Err(format!(
-                    "frozen dynamic filter of runtime filter {filter_id} has no scan-source \
-                     consumer binding at this scan"
-                ));
-            }
-            Some(bindings) => {
-                return Err(format!(
-                    "frozen dynamic filter of runtime filter {filter_id} corresponds to \
-                     scan-source consumer bindings {bindings:?}, not exactly one"
-                ));
-            }
+        match by_filter.get(&filter).copied() {
+            Some(1) => {}
+            None | Some(0) => return Err(Refusal::MissingDynamicConsumer { filter }),
+            Some(count) => return Err(Refusal::MultipleDynamicConsumers { filter, count }),
         }
     }
-    if let Some((filter_id, bindings)) = by_filter
-        .iter()
-        .find(|(filter_id, _)| !frozen.contains(filter_id))
-    {
-        return Err(format!(
-            "scan-source consumer bindings {bindings:?} of runtime filter {filter_id} have no \
-             frozen dynamic filter"
-        ));
+    if let Some(filter) = by_filter.keys().find(|filter| !frozen.contains(filter)) {
+        return Err(Refusal::MissingFrozenDynamicFilter { filter: *filter });
     }
     Ok(())
 }
@@ -381,13 +526,16 @@ mod tests {
         let table = endpoints(&[(3, 7, SCAN, SCAN_SOURCE)]);
         let missing = validate_scan_dynamic_filters(SCAN, &[dynamic(7)], &[], &table)
             .expect_err("no site consumes filter 7");
-        assert!(
-            missing.contains("has no scan-source consumer binding"),
-            "{missing}"
+        assert_eq!(
+            missing,
+            CompiledRuntimeFilterBindingError::MissingDynamicConsumer { filter: 7 }
         );
         let other = validate_scan_dynamic_filters(SCAN, &[dynamic(8)], &[consumer(3)], &table)
             .expect_err("filter 8 is nobody's");
-        assert!(other.contains("runtime filter 8"), "{other}");
+        assert_eq!(
+            other,
+            CompiledRuntimeFilterBindingError::MissingDynamicConsumer { filter: 8 }
+        );
     }
 
     #[test]
@@ -395,7 +543,10 @@ mod tests {
         let table = endpoints(&[(3, 7, SCAN, SCAN_SOURCE)]);
         let error = validate_scan_dynamic_filters(SCAN, &[], &[consumer(3)], &table)
             .expect_err("binding 3 applies at the source");
-        assert!(error.contains("have no frozen dynamic filter"), "{error}");
+        assert_eq!(
+            error,
+            CompiledRuntimeFilterBindingError::MissingFrozenDynamicFilter { filter: 7 }
+        );
     }
 
     #[test]
@@ -404,7 +555,13 @@ mod tests {
         let error =
             validate_scan_dynamic_filters(SCAN, &[dynamic(7)], &[consumer(3), consumer(5)], &table)
                 .expect_err("one dynamic filter, two bindings");
-        assert!(error.contains("[3, 5], not exactly one"), "{error}");
+        assert_eq!(
+            error,
+            CompiledRuntimeFilterBindingError::MultipleDynamicConsumers {
+                filter: 7,
+                count: 2
+            }
+        );
         let twice = validate_scan_dynamic_filters(
             SCAN,
             &[dynamic(7), dynamic(7)],
@@ -412,7 +569,10 @@ mod tests {
             &endpoints(&[(3, 7, SCAN, SCAN_SOURCE)]),
         )
         .expect_err("a dynamic filter stated twice");
-        assert!(twice.contains("stated twice"), "{twice}");
+        assert_eq!(
+            twice,
+            CompiledRuntimeFilterBindingError::DuplicateDynamicFilter { filter: 7 }
+        );
     }
 
     #[test]
@@ -423,13 +583,26 @@ mod tests {
         ]);
         let elsewhere = validate_scan_dynamic_filters(SCAN, &[], &[consumer(3)], &table)
             .expect_err("binding 3 consumes at another node");
-        assert!(elsewhere.contains("not at this scan"), "{elsewhere}");
+        assert_eq!(
+            elsewhere,
+            CompiledRuntimeFilterBindingError::WrongScanNode {
+                binding: 3,
+                actual: SCAN + 1,
+                expected: SCAN
+            }
+        );
         let producer = validate_scan_dynamic_filters(SCAN, &[], &[consumer(4)], &table)
             .expect_err("binding 4 is a producer");
-        assert!(producer.contains("is a producer"), "{producer}");
+        assert_eq!(
+            producer,
+            CompiledRuntimeFilterBindingError::ProducerAtScan { binding: 4 }
+        );
         let unnumbered = validate_scan_dynamic_filters(SCAN, &[], &[consumer(6)], &table)
             .expect_err("binding 6 is unnumbered");
-        assert!(unnumbered.contains("not numbered"), "{unnumbered}");
+        assert_eq!(
+            unnumbered,
+            CompiledRuntimeFilterBindingError::UnnumberedScanBinding { binding: 6 }
+        );
     }
 
     fn requirements(binding_ids: &[i32]) -> BindingRequirements {
@@ -465,22 +638,25 @@ mod tests {
 
         let invented = program_runtime_filter_bindings(&requirements(&[3, 4, 5]), &table)
             .expect_err("binding 5 is not the package's");
-        assert!(
-            invented.contains("binding_id=5, which its package does not number"),
-            "{invented}"
+        assert_eq!(
+            invented,
+            super::CompiledRuntimeFilterBindingError::UnknownRequirement { binding: 5 }
         );
         let dropped = program_runtime_filter_bindings(&requirements(&[3]), &table)
             .expect_err("binding 4 has no site");
-        assert!(
-            dropped.contains("binding_id=4 has no requirement"),
-            "{dropped}"
+        assert_eq!(
+            dropped,
+            super::CompiledRuntimeFilterBindingError::MissingRequirement { binding: 4 }
         );
         let negative = program_runtime_filter_bindings(
             &requirements(&[-1]),
             &CompiledRuntimeFilterEndpoints::default(),
         )
         .expect_err("a negative binding identity");
-        assert!(negative.contains("negative"), "{negative}");
+        assert_eq!(
+            negative,
+            super::CompiledRuntimeFilterBindingError::NegativeRequirement { binding: -1 }
+        );
     }
 
     #[test]
@@ -489,6 +665,12 @@ mod tests {
         let error =
             CompiledRuntimeFilterEndpoints::try_from_endpoints([(3, endpoint), (3, endpoint)])
                 .expect_err("binding 3 twice");
-        assert!(error.contains("numbered twice"), "{error}");
+        assert_eq!(
+            error,
+            super::CompiledRuntimeFilterBindingError::DuplicateBinding { binding: 3 }
+        );
+        use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(error.failure_fact().reason().code(), 9304);
     }
 }

@@ -18,6 +18,7 @@
 use super::common::cast_output;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::ArrayRef;
 #[cfg(test)]
 use arrow::array::Float64Array;
@@ -32,10 +33,10 @@ pub fn eval_e<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let out = evaluate_legacy_numeric_elementary(NumericElementaryOp::E, &[], chunk.len())
-        .map_err(|error| error.to_string())?;
-    Ok((cast_output(out, arena.data_type(expr)))?)
+        .map_err(ExecutionFailure::from)?;
+    cast_output(out, arena.data_type(expr))
 }
 
 pub fn eval_pi<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -43,10 +44,10 @@ pub fn eval_pi<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let out = evaluate_legacy_numeric_elementary(NumericElementaryOp::Pi, &[], chunk.len())
-        .map_err(|error| error.to_string())?;
-    Ok((cast_output(out, arena.data_type(expr)))?)
+        .map_err(ExecutionFailure::from)?;
+    cast_output(out, arena.data_type(expr))
 }
 
 #[cfg(test)]

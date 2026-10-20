@@ -126,7 +126,7 @@ pub(super) fn legacy(
     right: ArrayRef,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let lt = FunctionValueType::new(left.data_type().clone(), true);
     let rt = FunctionValueType::new(right.data_type().clone(), true);
     legacy_typed(op, left, right, lt, rt, policy, allow)
@@ -139,7 +139,7 @@ fn legacy_typed(
     rt: FunctionValueType,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let output = arithmetic_result_value_type_with_op(&lt, &rt, op).unwrap();
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
@@ -175,7 +175,7 @@ fn shared(
     right: ArrayRef,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, novarocks_functions::legacy_arithmetic::ArithmeticFailure> {
     use novarocks_functions::legacy_arithmetic::*;
     match op {
         ArithmeticOperator::Add => eval_add_arrays(left, right, DataType::Float64, allow, policy),
@@ -227,7 +227,13 @@ fn original_float_arithmetic_same_arrow_author_complete_carrier_axes() {
                     );
                     match (legacy, author) {
                         (Ok(a), Ok(b)) => assert_bits(&a, &b),
-                        (Err(a), Err(b)) => assert_eq!(a, b),
+                        (Err(a), Err(b)) => {
+                            assert_eq!(
+                                novarocks_failure_contract::FailureProjection::failure_fact(&a),
+                                novarocks_failure_contract::FailureProjection::failure_fact(&b)
+                            );
+                            assert_eq!(a.to_string(), b.to_string());
+                        }
                         pair => panic!("original shared author differs: {pair:?}"),
                     }
                 }
@@ -444,7 +450,10 @@ fn original_float_arithmetic_child_error_order_and_nominal_arrow_refusal() {
             ),
         };
         let id = arena.push_typed(node, DataType::Float64);
-        assert_eq!(arena.eval(id, &chunk).unwrap_err(), "invalid ExprId");
+        assert_eq!(
+            (arena.eval(id, &chunk).unwrap_err()).to_string(),
+            "invalid ExprId"
+        );
     }
     let large = novarocks_functions::largeint::array_from_i128(&vec![Some(1); 12]).unwrap();
     for op in OPERATORS {
@@ -467,7 +476,7 @@ fn original_float_arithmetic_child_error_order_and_nominal_arrow_refusal() {
         let expected = arrow::compute::cast(&large, &DataType::Float64)
             .unwrap_err()
             .to_string();
-        assert_eq!(error, expected);
+        assert_eq!((error).to_string(), expected);
     }
 }
 
@@ -578,7 +587,7 @@ fn original_float_arithmetic_nominal_largeint_setup_error_precedes_empty_and_nul
                 ),
             ] {
                 assert_eq!(
-                    legacy_typed(
+                    (legacy_typed(
                         op,
                         left,
                         right,
@@ -587,7 +596,8 @@ fn original_float_arithmetic_nominal_largeint_setup_error_precedes_empty_and_nul
                         DecimalOverflowPolicy::OutputNull,
                         false
                     )
-                    .unwrap_err(),
+                    .unwrap_err())
+                    .to_string(),
                     original_error
                 );
             }

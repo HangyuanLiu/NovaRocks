@@ -289,3 +289,21 @@ mod tests {
         }
     }
 }
+
+impl novarocks_failure_contract::FailureProjection for RootLifetimeError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        let (class, code) = match self {
+            Self::Closed => (FailureClass::Control, 220),
+            Self::ConflictingEnd => (FailureClass::Invariant, 221),
+            Self::ProducerStillRunning => (FailureClass::Invariant, 222),
+            Self::EndNotPublished => (FailureClass::Invariant, 223),
+            Self::ContextNotHolding => (FailureClass::Invariant, 224),
+            Self::ReadNotConverged => (FailureClass::Invariant, 225),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::RESULT, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}

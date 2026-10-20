@@ -603,13 +603,13 @@ impl BackendParticipantOutbound {
                 novarocks_worker::runtime_filter::domain::BackendProducerOpenMetadata::try_new(
                     local_partition_count,
                 )
-                .map_err(|error| outbound_violation(error.to_string()))?,
+                .map_err(outbound_domain_violation)?,
             ),
             None,
             contribution.contract_digest(),
             contribution.canonical_bytes().clone(),
         )
-        .map_err(outbound_violation)?;
+        .map_err(outbound_domain_violation)?;
         self.forward_producer(
             channel_id,
             binding_id,
@@ -643,13 +643,13 @@ impl BackendParticipantOutbound {
                 novarocks_worker::runtime_filter::domain::BackendProducerOpenMetadata::try_new(
                     local_partition_count,
                 )
-                .map_err(|error| outbound_violation(error.to_string()))?,
+                .map_err(outbound_domain_violation)?,
             ),
             None,
             [0; 32],
             Arc::<[u8]>::from([]),
         )
-        .map_err(outbound_violation)?;
+        .map_err(outbound_domain_violation)?;
         self.forward_producer(
             channel_id,
             binding_id,
@@ -677,7 +677,7 @@ impl BackendParticipantOutbound {
             [0; 32],
             Arc::<[u8]>::from(producer_codec::encode_producer_failure(reason)),
         )
-        .map_err(outbound_violation)?;
+        .map_err(outbound_domain_violation)?;
         self.forward_producer(
             channel_id,
             binding_id,
@@ -750,7 +750,7 @@ impl BackendParticipantOutbound {
             delivery.schema_digest(),
             delivery.payload().clone(),
         )
-        .map_err(outbound_violation)
+        .map_err(outbound_domain_violation)
     }
 
     fn next_delivery_sequence(
@@ -988,6 +988,20 @@ fn violation(
     detail: impl Into<Arc<str>>,
 ) -> RuntimeFilterContractViolation {
     RuntimeFilterContractViolation::new(kind, detail)
+}
+
+fn outbound_domain_violation<E>(source: E) -> RuntimeFilterContractViolation
+where
+    E: std::error::Error
+        + novarocks_execution_contract::failure::FailureProjection
+        + Send
+        + Sync
+        + 'static,
+{
+    RuntimeFilterContractViolation::from_domain(
+        RuntimeFilterContractViolationKind::ContractMismatch,
+        source,
+    )
 }
 
 fn outbound_violation(detail: impl Into<Arc<str>>) -> RuntimeFilterContractViolation {

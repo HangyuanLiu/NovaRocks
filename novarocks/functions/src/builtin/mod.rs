@@ -47,6 +47,7 @@ mod aggregate_approx_percentile_owner;
 mod aggregate_array;
 pub mod aggregate_array_core;
 mod aggregate_array_owner;
+mod aggregate_array_source_failure;
 pub mod aggregate_basic;
 mod aggregate_basic_owner;
 mod aggregate_by;
@@ -75,6 +76,7 @@ mod aggregate_hll_kernel;
 mod aggregate_hll_owner;
 pub mod aggregate_mann_whitney_core;
 mod aggregate_mann_whitney_emission;
+mod aggregate_mann_whitney_failure;
 mod aggregate_mann_whitney_operation;
 mod aggregate_mann_whitney_owner;
 mod aggregate_mann_whitney_resources;
@@ -115,12 +117,15 @@ pub mod calendar_extended_shared;
 mod calendar_extended_timestampdiff;
 mod calendar_month;
 mod calendar_parts;
+mod calendar_parts_failure;
 mod calendar_parts_owner;
 pub mod calendar_parts_shared;
 mod calendar_period_diff;
 mod calendar_period_diff_owner;
+pub mod calendar_timestamp;
 pub mod calendar_to_date;
 mod calendar_to_date_owner;
+pub mod collection_arrow;
 mod collection_cardinality;
 mod collection_cardinality_owner;
 mod control_owner;
@@ -231,8 +236,10 @@ mod string_trim;
 pub mod string_trim_core;
 mod string_trim_owner;
 mod string_url_decode;
+pub use string_url_decode::evaluate_required as evaluate_required_url_decode;
 mod string_url_decode_owner;
 mod string_url_encode;
+pub use string_url_encode::evaluate_required as evaluate_required_url_encode;
 mod string_url_encode_owner;
 mod table_unnest;
 mod table_unnest_owner;
@@ -255,6 +262,8 @@ mod window_value_owner;
 #[cfg(test)]
 mod window_value_tests;
 
+mod string_failure;
+pub use string_failure::required_regex_compile_failure;
 mod string_regexp_extract;
 mod string_regexp_replace;
 
@@ -349,6 +358,7 @@ mod aggregate_hll_payload_kernel;
 mod aggregate_hll_payload_owner;
 
 pub mod aggregate_map_core;
+mod aggregate_map_source_failure;
 
 mod aggregate_map;
 mod aggregate_map_owner;
@@ -391,3 +401,5 @@ pub(crate) use string_field_owner::StringFieldOwner;
 
 #[cfg(test)]
 mod array_struct_subfield_owner_tests;
+
+pub mod array_cum_sum_core;

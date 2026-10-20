@@ -26,7 +26,10 @@ use arrow::record_batch::RecordBatch;
 use arrow_buffer::NullBuffer;
 use novarocks_types::SlotId;
 use std::sync::Arc;
-fn raw(columns: Vec<ArrayRef>, output: Option<DataType>) -> Result<ArrayRef, String> {
+fn raw(
+    columns: Vec<ArrayRef>,
+    output: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let slots = (0..columns.len())
         .map(|i| SlotId::new(i as u32 + 1))
         .collect::<Vec<_>>();
@@ -143,12 +146,12 @@ fn original_repeat_source_cast_null_expansion_and_explicit_field_metadata() {
     assert_eq!(l.values().null_count(), 3);
 }
 #[test]
-fn original_repeat_missing_or_nonlist_output_uses_original_source_field() {
+fn array_repeat_default_field_is_exact_and_nonlist_target_is_rejected() {
     let source: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
     let count: ArrayRef = Arc::new(Int64Array::from(vec![1, 2]));
     let a = raw(vec![source.clone(), count.clone()], None).unwrap();
-    let b = raw(vec![source, count], Some(DataType::Utf8)).unwrap();
-    assert_eq!(a.to_data(), b.to_data());
+    let refusal = raw(vec![source, count], Some(DataType::Utf8)).unwrap_err();
+    super::legacy_array_append_baseline_tests::assert_frozen_target(&refusal);
     assert_eq!(
         a.data_type(),
         &DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
@@ -203,36 +206,26 @@ fn original_repeat_nested_nulls_and_slice_values_are_retained() {
     );
 }
 #[test]
-fn original_repeat_full_arrow_count_and_source_cast_errors_are_retained() {
-    let s: ArrayRef = Arc::new(Int32Array::from(vec![1]));
+fn array_repeat_retains_original_count_and_source_arrow_cast_errors() {
+    use super::legacy_array_append_baseline_tests::assert_original_arrow;
+    let source: ArrayRef = Arc::new(Int32Array::from(vec![1]));
     let bad: ArrayRef = Arc::new(StructArray::new(
         vec![Arc::new(Field::new("x", DataType::Int32, false))].into(),
-        vec![s.clone()],
+        vec![source.clone()],
         None,
     ));
-    let expected = format!(
-        "array_repeat failed to cast repeat count {:?} -> BIGINT: {}",
-        bad.data_type(),
-        arrow::compute::cast(&bad, &DataType::Int64).unwrap_err()
-    );
-    assert_eq!(raw(vec![s, bad.clone()], None).unwrap_err(), expected);
+    let expected = arrow::compute::cast(&bad, &DataType::Int64).unwrap_err();
+    let refusal = raw(vec![source, bad.clone()], None).unwrap_err();
+    assert_original_arrow(&refusal, &expected);
     let count: ArrayRef = Arc::new(Int64Array::from(vec![1]));
-    let expected = format!(
-        "array_repeat failed to cast source type {:?} -> {:?}: {}",
-        bad.data_type(),
-        DataType::Int64,
-        arrow::compute::cast(&bad, &DataType::Int64).unwrap_err()
-    );
-    assert_eq!(
-        raw(
-            vec![bad, count],
-            Some(DataType::List(Arc::new(Field::new(
-                "item",
-                DataType::Int64,
-                true
-            ))))
-        )
-        .unwrap_err(),
-        expected
-    );
+    let refusal = raw(
+        vec![bad, count],
+        Some(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        )))),
+    )
+    .unwrap_err();
+    assert_original_arrow(&refusal, &expected);
 }

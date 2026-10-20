@@ -19,26 +19,39 @@
 //! The preceding Values source owns parameter evaluation through the original
 //! compiled Frame. This processor receives arrays only and calls the one
 //! original Functions computation. Whole-call original Data remains the
-//! existing pipeline String channel; controls keep their typed first cause.
+//! function-domain cause; controls keep their typed first cause.
 //! Expansion/Arrow retained memory and opaque allocation are still OPEN.
 
 use super::compiled_expression::RuntimeKernelControl;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
-use crate::exec::pipeline::operator::{FinishingWait, Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::OperatorLifecycle;
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{Transform, TransformKernel},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use novarocks_functions::{
-    KernelDiagnostic, KernelEvaluationControl, KernelFailure, MAX_UNOBSERVED_KERNEL_WORK,
+    KernelEvaluationControl, KernelFailure, MAX_UNOBSERVED_KERNEL_WORK,
     generate_series_core::{self, SeriesFailure, SeriesObservation},
 };
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind};
 use std::sync::Arc;
 
-fn invalid(message: &str) -> ExecutionFailure {
-    KernelFailure::InvalidProgram(KernelDiagnostic::new(message)).into()
+#[path = "compiled_series_failure.rs"]
+mod failure;
+use crate::exec::fragment::error::{
+    FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
+};
+use failure::CompiledSeriesFailure;
+fn binding(kind: FragmentBindingErrorKind, detail: &'static str) -> FragmentBindingError {
+    FragmentBindingError::new(FragmentBindingTarget::Program, kind, detail)
 }
 
 pub(crate) struct CompiledGenerateSeriesProcessorFactory {
@@ -53,33 +66,44 @@ impl CompiledGenerateSeriesProcessorFactory {
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Self, String> {
-        let graph_node = program
-            .graph()
-            .nodes()
-            .get(node.index())
-            .ok_or("compiled series node is absent")?;
+    ) -> Result<Self, FragmentBindingError> {
+        let graph_node = program.graph().nodes().get(node.index()).ok_or_else(|| {
+            binding(
+                FragmentBindingErrorKind::MissingAssignment,
+                "compiled series node is absent",
+            )
+        })?;
         let ProgramNodeKind::GenerateSeries {
             input,
             parameter_slots,
         } = graph_node.kind()
         else {
-            return Err("compiled node is not an integer-series source".to_owned());
+            return Err(binding(
+                FragmentBindingErrorKind::WrongAssignmentKind,
+                "compiled node is not an integer-series source",
+            ));
         };
-        let bounds = program
-            .graph()
-            .nodes()
-            .get(input.index())
-            .ok_or("compiled series bounds are absent")?;
+        let bounds = program.graph().nodes().get(input.index()).ok_or_else(|| {
+            binding(
+                FragmentBindingErrorKind::MissingAssignment,
+                "compiled series bounds are absent",
+            )
+        })?;
         let ProgramNodeKind::Values { values } = bounds.kind() else {
-            return Err("compiled series bounds are not Values".to_owned());
+            return Err(binding(
+                FragmentBindingErrorKind::WrongAssignmentKind,
+                "compiled series bounds are not Values",
+            ));
         };
         let layout = bounds.output_layout();
         if values.num_rows() != 1
             || !matches!(parameter_slots.len(), 2 | 3)
             || graph_node.output_layout().slots().len() != 1
         {
-            return Err("compiled series has an invalid bounds or output shape".to_owned());
+            return Err(binding(
+                FragmentBindingErrorKind::LayoutMismatch,
+                "compiled series has an invalid bounds or output shape",
+            ));
         }
         let parameters = parameter_slots
             .iter()
@@ -89,7 +113,10 @@ impl CompiledGenerateSeriesProcessorFactory {
                     .iter()
                     .position(|candidate| candidate == slot)
                     .ok_or_else(|| {
-                        "compiled series parameter is outside its bounds port".to_owned()
+                        binding(
+                            FragmentBindingErrorKind::LayoutMismatch,
+                            "compiled series parameter is outside its bounds port",
+                        )
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -117,7 +144,7 @@ impl CompiledGenerateSeriesProcessorFactory {
             pending: None,
             offset: 0,
             accepted: false,
-            finishing: false,
+            batch_rows: None,
             failed: false,
         }
     }
@@ -127,7 +154,9 @@ impl OperatorFactory for CompiledGenerateSeriesProcessorFactory {
         &self.name
     }
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(self.instance(Arc::new(RuntimeKernelControl::new(Arc::clone(&self.error)))))
+        Box::new(Transform::hydrating(self.instance(Arc::new(
+            RuntimeKernelControl::new(Arc::clone(&self.error)),
+        ))))
     }
 }
 
@@ -172,7 +201,7 @@ struct CompiledGenerateSeriesProcessor {
     pending: Option<Chunk>,
     offset: usize,
     accepted: bool,
-    finishing: bool,
+    batch_rows: Option<std::num::NonZeroUsize>,
     failed: bool,
 }
 impl CompiledGenerateSeriesProcessor {
@@ -185,9 +214,7 @@ impl CompiledGenerateSeriesProcessor {
         let output_schema = self.prepared_output()?;
         let mut work = Work::begin(self.control.as_ref())?;
         if chunk.len() != 1 || chunk.schema().as_ref() != self.input.as_ref() {
-            return Err(invalid(
-                "compiled series input differs from its frozen bounds port",
-            ));
+            return Err(CompiledSeriesFailure::InputPort.into());
         }
         let batch = chunk.record_batch();
         let start = batch.column(self.parameters[0]);
@@ -200,7 +227,7 @@ impl CompiledGenerateSeriesProcessor {
         let expanded = match expanded {
             Ok(value) => value,
             Err(SeriesFailure::Control(cause)) => return Err(cause.into()),
-            Err(SeriesFailure::Data(message)) => return Err(message.into()),
+            Err(SeriesFailure::Cause(cause)) => return Err(ExecutionFailure::from_domain(cause)),
         };
         if expanded.total_rows == 0 {
             work.flush()?;
@@ -219,7 +246,7 @@ impl CompiledGenerateSeriesProcessor {
         let column = match column {
             Ok(column) => column,
             Err(SeriesFailure::Control(cause)) => return Err(cause.into()),
-            Err(SeriesFailure::Data(message)) => return Err(message.into()),
+            Err(SeriesFailure::Cause(cause)) => return Err(ExecutionFailure::from_domain(cause)),
         };
         work.flush()?;
         let output = if output_schema.is_typed() {
@@ -243,7 +270,7 @@ impl CompiledGenerateSeriesProcessor {
             )?
         } else {
             let batch = RecordBatch::try_new(output_schema.arrow_schema_ref(), vec![column])
-                .map_err(|error| ExecutionFailure::from(error.to_string()))?;
+                .map_err(CompiledSeriesFailure::Arrow)?;
             Chunk::try_new_with_chunk_schema(batch, Arc::clone(output_schema))?
         };
         work.flush()?;
@@ -251,13 +278,13 @@ impl CompiledGenerateSeriesProcessor {
     }
     fn alive(&self) -> ExecutionResult<()> {
         if self.failed {
-            Err(KernelFailure::InstanceFailed.into())
+            Err(CompiledSeriesFailure::AlreadyFailed.into())
         } else {
             Ok(())
         }
     }
 }
-impl Operator for CompiledGenerateSeriesProcessor {
+impl OperatorLifecycle for CompiledGenerateSeriesProcessor {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -294,39 +321,52 @@ impl Operator for CompiledGenerateSeriesProcessor {
     fn name(&self) -> &str {
         &self.name
     }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.batch_rows = Some(
+            std::num::NonZeroUsize::new(state.chunk_size())
+                .ok_or_else(|| CompiledSeriesFailure::InvalidBatchRows)?,
+        );
+        Ok(())
     }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.pending = None;
+        Ok(())
     }
-    fn is_finished(&self) -> bool {
-        self.failed || (self.finishing && self.pending.is_none())
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
     }
     fn cancel(&mut self) {
         self.failed = true;
         self.pending = None;
     }
 }
-impl ProcessorOperator for CompiledGenerateSeriesProcessor {
-    fn need_input(&self) -> bool {
-        !self.failed && !self.accepted && !self.finishing
-    }
-    fn has_output(&self) -> bool {
-        !self.failed && self.pending.is_some()
-    }
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+impl InputEncodingPolicy for CompiledGenerateSeriesProcessor {}
+impl TransformKernel for CompiledGenerateSeriesProcessor {
+    fn apply(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
         self.alive()?;
         self.prepared_output()?;
-        if self.accepted || self.finishing {
+        if self.accepted {
             self.failed = true;
-            return Err(invalid("compiled series accepts its bounds port once"));
+            return Err(CompiledSeriesFailure::DuplicateBounds.into());
         }
+        self.batch_rows
+            .ok_or_else(|| CompiledSeriesFailure::MissingBatchRows)?;
         self.accepted = true;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         match self.invoke(&chunk) {
             Ok(output) => {
+                let next = if output.is_some() {
+                    NextStep::Runnable
+                } else {
+                    NextStep::Finished
+                };
                 self.pending = output;
-                Ok(())
+                Ok(StepResult::new(None, next, rows))
             }
             Err(error) => {
                 self.failed = true;
@@ -335,7 +375,7 @@ impl ProcessorOperator for CompiledGenerateSeriesProcessor {
             }
         }
     }
-    fn pull_chunk(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+    fn drive(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         self.alive()?;
         if let Err(cause) = self.control.checkpoint(0) {
             self.failed = true;
@@ -343,10 +383,14 @@ impl ProcessorOperator for CompiledGenerateSeriesProcessor {
             return Err(cause.into());
         }
         let Some(chunk) = &self.pending else {
-            return Ok(None);
+            return Ok(StepResult::new(None, NextStep::Finished, 0));
         };
         let total = chunk.len();
-        let rows = state.chunk_size().max(1).min(total - self.offset);
+        let rows = self
+            .batch_rows
+            .ok_or_else(|| CompiledSeriesFailure::MissingBatchRows)?
+            .get()
+            .min(total - self.offset);
         let sliced = (|| -> ExecutionResult<Chunk> {
             let output = if chunk.chunk_schema().is_typed() {
                 use crate::exec::pipeline::operator::ConstructionFailure;
@@ -380,22 +424,17 @@ impl ProcessorOperator for CompiledGenerateSeriesProcessor {
             return Err(cause.into());
         }
         self.offset += rows;
-        if self.offset == total {
+        let next = if self.offset == total {
             self.pending = None;
-        }
-        Ok(Some(output))
-    }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        self.alive()?;
-        self.finishing = true;
-        Ok(())
-    }
-    fn finishing_wait(&self) -> FinishingWait {
-        if self.pending.is_some() {
-            FinishingWait::OwedOutput
+            NextStep::Finished
         } else {
-            FinishingWait::Complete
-        }
+            NextStep::Runnable
+        };
+        Ok(StepResult::new(Some(output), next, 0))
+    }
+    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        self.alive()?;
+        Ok(StepResult::new(None, NextStep::Finished, 0))
     }
 }
 

@@ -19,6 +19,7 @@ use super::{ExprArena, ExprId, ExprNode};
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, StringArray};
 use arrow::datatypes::{DataType, Schema};
+use novarocks_failure_contract::FailureProjection;
 use novarocks_functions::FunctionValueType;
 use novarocks_type_contract::RegexpCountPatternSource as Source;
 use std::sync::Arc;
@@ -80,6 +81,30 @@ fn value(arena: &ExprArena, root: ExprId) -> Option<i64> {
     let output = output.as_any().downcast_ref::<Int64Array>().unwrap();
     (!output.is_null(0)).then(|| output.value(0))
 }
+fn assert_literal_pattern_failure(
+    failure: crate::runtime::fragment::ExecutionFailure,
+    original_prefix: &str,
+) {
+    assert_eq!(
+        failure.failure_fact(),
+        novarocks_functions::DataFailureReason::InvalidValue.failure_fact(),
+    );
+    assert!(
+        failure.to_string().starts_with(original_prefix),
+        "{failure}"
+    );
+    let mut source: &(dyn std::error::Error + 'static) = &failure;
+    loop {
+        if let Some(actual) = source.downcast_ref::<regex::Error>() {
+            assert!(matches!(actual, regex::Error::Syntax(_)));
+            break;
+        }
+        source = source
+            .source()
+            .expect("original invalid regex syntax source");
+    }
+}
+
 #[test]
 fn regexp_count_explicit_receipt_preserves_raw_pool_and_exact_selected_ordinal() {
     for complete in [false, true] {
@@ -92,11 +117,9 @@ fn regexp_count_explicit_receipt_preserves_raw_pool_and_exact_selected_ordinal()
         arena
             .set_regexp_count_pattern_source(root, Source::NativeV1Utf8LiteralWhenPresent)
             .unwrap();
-        assert!(
-            arena
-                .eval(root, &input())
-                .unwrap_err()
-                .starts_with("Invalid regex expression: [0-9.")
+        assert_literal_pattern_failure(
+            arena.eval(root, &input()).unwrap_err(),
+            "Invalid regex expression: [0-9.",
         );
         assert!(
             arena
@@ -140,11 +163,9 @@ fn regexp_count_receipt_survives_full_and_legacy_freeze_thaw_without_inventing_a
             let restored = ExprArena::from_immutable(&frozen).unwrap();
             assert_eq!(restored.regexp_count_pattern_source(root), source);
             if source == Some(Source::NativeV1Utf8LiteralWhenPresent) {
-                assert!(
-                    restored
-                        .eval(root, &input())
-                        .unwrap_err()
-                        .starts_with("Invalid regex expression:")
+                assert_literal_pattern_failure(
+                    restored.eval(root, &input()).unwrap_err(),
+                    "Invalid regex expression:",
                 );
             } else {
                 assert_eq!(value(&restored, root), None);

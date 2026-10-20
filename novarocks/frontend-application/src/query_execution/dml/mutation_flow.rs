@@ -595,7 +595,7 @@ pub(crate) trait MutationExecution: Send + Sync {
         dead_code,
         reason = "Retained for staged query-execution DML recovery and connector wiring."
     )]
-    fn stage(&self) -> Result<QueryExecutionResult, String>;
+    fn stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError>;
     fn needs_abort_on_stage_error(&self) -> bool {
         false
     }
@@ -700,8 +700,7 @@ impl MutationPublicationAuthority {
 pub(crate) enum MutationStagedWrite {
     NoOp,
     AbortRequired {
-        reason: String,
-        engine_error_code: Option<novarocks_types::EngineErrorCode>,
+        reason: crate::dml::error::DmlExecutionError,
         execution: Arc<dyn MutationExecution>,
     },
     CommitRequired {
@@ -714,10 +713,8 @@ fn mutation_stage_abort_required(
     error: crate::dml::error::DmlExecutionError,
     execution: Arc<dyn MutationExecution>,
 ) -> MutationStagedWrite {
-    let (reason, engine_error_code) = error.into_abort_parts();
     MutationStagedWrite::AbortRequired {
-        reason,
-        engine_error_code,
+        reason: error,
         execution,
     }
 }
@@ -1433,7 +1430,10 @@ pub(crate) fn stage_prepared_update_mutation(
                     return Err(error);
                 }
                 Err(error) => {
-                    return Ok(mutation_stage_abort_required(error, execution_handle));
+                    return Ok(MutationStagedWrite::AbortRequired {
+                        reason: error,
+                        execution: execution_handle,
+                    });
                 }
             };
             // A statement whose every branch closed without staging an artifact
@@ -1442,8 +1442,7 @@ pub(crate) fn stage_prepared_update_mutation(
             if !staged.staged_any_artifact {
                 if let Err(reason) = execution_handle.release_empty_write_session() {
                     return Ok(MutationStagedWrite::AbortRequired {
-                        engine_error_code: None,
-                        reason,
+                        reason: crate::dml::error::DmlExecutionError::Engine(reason),
                         execution: execution_handle,
                     });
                 }
@@ -1519,8 +1518,9 @@ pub(crate) fn stage_prepared_update_mutation(
             };
             let Some(completion) = result.write_session else {
                 return Ok(MutationStagedWrite::AbortRequired {
-                    engine_error_code: None,
-                    reason: "MOR UPDATE staged without a write-session completion".to_string(),
+                    reason: crate::dml::error::DmlExecutionError::Engine(
+                        "MOR UPDATE staged without a write-session completion".to_string(),
+                    ),
                     execution: execution_handle,
                 });
             };
@@ -1532,8 +1532,7 @@ pub(crate) fn stage_prepared_update_mutation(
             if completion.is_empty() {
                 if let Err(reason) = execution_handle.release_empty_write_session(&completion) {
                     return Ok(MutationStagedWrite::AbortRequired {
-                        engine_error_code: None,
-                        reason,
+                        reason: crate::dml::error::DmlExecutionError::Engine(reason),
                         execution: execution_handle,
                     });
                 }
@@ -1894,8 +1893,8 @@ impl MorUpdateChangeStreamExecutor {
 }
 
 impl MutationExecution for MorUpdateChangeStreamExecutor {
-    fn stage(&self) -> Result<QueryExecutionResult, String> {
-        self.run_stage().map_err(|error| error.to_string())
+    fn stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
+        self.run_stage()
     }
 
     fn needs_abort_on_stage_error(&self) -> bool {
@@ -1951,8 +1950,8 @@ impl MorMergeChangeStreamExecutor {
 }
 
 impl MutationExecution for MorMergeChangeStreamExecutor {
-    fn stage(&self) -> Result<QueryExecutionResult, String> {
-        self.run_stage().map_err(|error| error.to_string())
+    fn stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
+        self.run_stage()
     }
 
     fn needs_abort_on_stage_error(&self) -> bool {
@@ -2932,8 +2931,10 @@ impl DistributedCowUpdateExecutor {
 }
 
 impl MutationExecution for DistributedCowUpdateExecutor {
-    fn stage(&self) -> Result<QueryExecutionResult, String> {
-        Err("COW staging produces a multi-branch write result".to_string())
+    fn stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
+        Err(crate::dml::error::DmlExecutionError::Engine(
+            "COW staging produces a multi-branch write result".to_string(),
+        ))
     }
 
     fn needs_abort_on_stage_error(&self) -> bool {
@@ -3576,12 +3577,12 @@ fn execute_exact_cow_match_query(
         None,
     )
     .and_then(|request| request.with_cow_match_consumer(consumer))
-    .map_err(|error| error.to_string())?;
+    .map_err(crate::dml::error::DmlExecutionError::from_distributed)?;
     Ok(state
         .query_execution()
         .execute(request)
         .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_cow_match)
-        .map_err(crate::dml::error::DmlExecutionError::from)?)
+        .map_err(crate::dml::error::DmlExecutionError::from_distributed)?)
 }
 
 #[cfg(test)]
@@ -4042,8 +4043,9 @@ pub(crate) fn stage_prepared_merge_mutation(
         };
         let Some(completion) = result.write_session else {
             return Ok(MutationStagedWrite::AbortRequired {
-                engine_error_code: None,
-                reason: "MOR MERGE staged without a write-session completion".to_string(),
+                reason: crate::dml::error::DmlExecutionError::Engine(
+                    "MOR MERGE staged without a write-session completion".to_string(),
+                ),
                 execution: execution_handle,
             });
         };
@@ -4053,8 +4055,7 @@ pub(crate) fn stage_prepared_merge_mutation(
         if completion.is_empty() {
             if let Err(reason) = execution_handle.release_empty_write_session(&completion) {
                 return Ok(MutationStagedWrite::AbortRequired {
-                    engine_error_code: None,
-                    reason,
+                    reason: crate::dml::error::DmlExecutionError::Engine(reason),
                     execution: execution_handle,
                 });
             }
@@ -4132,14 +4133,16 @@ pub(crate) fn stage_prepared_merge_mutation(
             return Err(error);
         }
         Err(error) => {
-            return Ok(mutation_stage_abort_required(error, execution_handle));
+            return Ok(MutationStagedWrite::AbortRequired {
+                reason: error,
+                execution: execution_handle,
+            });
         }
     };
     if !staged.staged_any_artifact {
         if let Err(reason) = execution_handle.release_empty_write_session() {
             return Ok(MutationStagedWrite::AbortRequired {
-                engine_error_code: None,
-                reason,
+                reason: crate::dml::error::DmlExecutionError::Engine(reason),
                 execution: execution_handle,
             });
         }
@@ -5822,8 +5825,10 @@ mod tests {
     }
 
     impl MutationExecution for AbortOutcomeExecution {
-        fn stage(&self) -> Result<QueryExecutionResult, String> {
-            Err("synthetic post-begin staging failure".to_string())
+        fn stage(&self) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
+            Err(crate::dml::error::DmlExecutionError::Engine(
+                "synthetic post-begin staging failure".to_string(),
+            ))
         }
 
         fn abort_terminal(
@@ -5885,22 +5890,20 @@ mod tests {
 
         for expected in outcomes {
             let staged = MutationStagedWrite::AbortRequired {
-                engine_error_code: None,
-                reason: "synthetic post-begin staging failure".to_string(),
+                reason: crate::dml::error::DmlExecutionError::Engine(
+                    "synthetic post-begin staging failure".to_string(),
+                ),
                 execution: Arc::new(AbortOutcomeExecution {
                     outcome: expected.clone(),
                     context: connector_context_for_test(),
                 }),
             };
-            let MutationStagedWrite::AbortRequired {
-                reason,
-                execution,
-                engine_error_code: None,
-            } = staged
-            else {
+            let MutationStagedWrite::AbortRequired { reason, execution } = staged else {
                 panic!("expected AbortRequired");
             };
-            assert_eq!(reason, "synthetic post-begin staging failure");
+            assert!(
+                matches!(reason, crate::dml::error::DmlExecutionError::Engine(message) if message == "synthetic post-begin staging failure")
+            );
             assert_eq!(
                 execution.abort_terminal().expect("typed abort outcome"),
                 expected
@@ -7644,24 +7647,29 @@ mod tests {
         let fixture = row_mutation_session_fixture(true, known_uncommitted_outcome());
         let execution = mor_update_executor(Arc::clone(&fixture.session));
         let staged = mutation_stage_abort_required(
-            crate::dml::error::DmlExecutionError::UnsupportedCompiledShape(
-                "FULL OUTER hash join".into(),
+            crate::dml::error::DmlExecutionError::from_encode(
+                novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                    "FULL OUTER hash join".into(),
+                ),
             ),
             execution,
         );
-        let MutationStagedWrite::AbortRequired {
-            reason,
-            engine_error_code,
-            execution,
-        } = staged
-        else {
+        let MutationStagedWrite::AbortRequired { reason, execution } = staged else {
             panic!("post-begin failure must retain abort ownership");
         };
-        assert_eq!(
-            engine_error_code,
-            Some(novarocks_types::EngineErrorCode::UnsupportedCompiledShape)
+        use novarocks_failure_contract::FailureProjection;
+        let original = novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+            "FULL OUTER hash join".into(),
         );
-        assert_eq!(reason, "FULL OUTER hash join");
+        let reason = reason.into_dml_error(None);
+        assert_eq!(
+            reason.execution_failure().unwrap().fact(),
+            original.failure_fact()
+        );
+        assert_eq!(
+            reason.execution_failure().unwrap().fact().class(),
+            novarocks_failure_contract::FailureClass::Unsupported
+        );
         assert_eq!(fixture.calls.lock().unwrap().abort, 0);
         assert!(matches!(
             execution.abort_terminal().unwrap(),
@@ -7679,7 +7687,10 @@ mod tests {
         let reason = execution
             .run_stage()
             .expect_err("a stage with no dispatched plan fails");
-        assert!(reason.to_string().contains("already consumed"), "{reason}");
+        let crate::dml::error::DmlExecutionError::Engine(reason) = reason else {
+            panic!("an undispatched stage must fail in its owning coordinator: {reason}");
+        };
+        assert!(reason.contains("already consumed"), "{reason}");
         assert!(execution.needs_abort_on_stage_error());
         assert_eq!(fixture.session.finish_invocations(), 0);
 

@@ -30,7 +30,7 @@ fn every_boundary<T>(call: impl Fn(&Control) -> Result<T, FlatReaderError>, succ
     assert_eq!(trace.first(), Some(&(CompilePhase::Decode, 0)));
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let refusing = Control::refusing(at, cause);
+            let refusing = Control::refusing(at, cause.clone());
             assert!(
                 matches!(call(&refusing), Err(FlatReaderError::Projection(FlatPoolResourceError::Control(actual))) if actual == cause)
             );

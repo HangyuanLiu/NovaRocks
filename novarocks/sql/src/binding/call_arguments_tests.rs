@@ -48,7 +48,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after the original refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -122,6 +122,9 @@ fn prefixes(
     let baseline = control.trace();
     assert_eq!(baseline[0], 0);
     assert!(!baseline.is_empty());
+    if expected_success {
+        assert!(baseline.iter().any(|units| *units > 0));
+    }
     for stop in 0..baseline.len() {
         for cause in [
             CompileControlError::Cancelled,
@@ -129,7 +132,7 @@ fn prefixes(
             CompileControlError::ResourceExhausted,
         ] {
             let control = Control {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..Control::default()
             };
             assert!(
@@ -421,10 +424,33 @@ fn logical_capture_small_success_and_ordinary_tails_keep_every_original_control_
     assert!(matches!(
         capture_logical_call_arguments(&invalid_binding, 1, &invalid, policy(), &control),
         Err(LogicalCallArgumentCaptureError::Binding(
-            FunctionBindingError::InvalidBinding(_)
+            FunctionBindingError::Constant(novarocks_constant_contract::ConstantError::Invalid(
+                "SQL integer syntax exceeds its declared carrier"
+            ))
         ))
     ));
-    assert!(control.trace().last().is_some_and(|units| *units > 0));
+    let trace = control.trace();
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let late = Control {
+            refusal: Some((trace.len(), cause)),
+            ..Control::default()
+        };
+        assert!(matches!(
+            capture_logical_call_arguments(&invalid_binding, 1, &invalid, policy(), &late),
+            Err(LogicalCallArgumentCaptureError::Binding(
+                FunctionBindingError::Constant(
+                    novarocks_constant_contract::ConstantError::Invalid(
+                        "SQL integer syntax exceeds its declared carrier"
+                    )
+                )
+            ))
+        ));
+        assert_eq!(late.trace(), trace);
+    }
     prefixes(&invalid_binding, 1, &invalid, false);
     let zero = ConstantPolicy {
         max_rows: 0,
@@ -432,8 +458,10 @@ fn logical_capture_small_success_and_ordinary_tails_keep_every_original_control_
     };
     assert!(matches!(
         capture_logical_call_arguments(&selected, 1, &args, zero, &Control::default()),
-        Err(LogicalCallArgumentCaptureError::Control(
-            CompileControlError::ResourceExhausted
+        Err(LogicalCallArgumentCaptureError::Binding(
+            FunctionBindingError::Constant(novarocks_constant_contract::ConstantError::Limit(
+                "constant factory row limit exceeded"
+            ))
         ))
     ));
 }
@@ -491,7 +519,7 @@ fn logical_capture_count_admission_precedes_iterator_and_wide_lambda_observes_re
             CompileControlError::ResourceExhausted,
         ] {
             let control = Control {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..Control::default()
             };
             assert!(
@@ -542,22 +570,44 @@ fn authored_move_uses_the_original_bounded_collection_and_control_tails() {
             })
             .collect::<Vec<_>>()
     };
-    for (logical, count, success) in [(1, 1, true), (0, 1, false), (1, 0, false), (1, 2, false)] {
+    for (logical, count, ordinary_error) in [
+        (1, 1, None),
+        (
+            0,
+            1,
+            Some("logical call count differs from its original selected binding"),
+        ),
+        (
+            1,
+            0,
+            Some("logical call iterator has fewer channels than its selected binding"),
+        ),
+        (
+            1,
+            2,
+            Some("logical call iterator has more channels than its selected binding"),
+        ),
+    ] {
         let control = Control::default();
-        assert_eq!(
-            move_authored_call_arguments_observed(
-                &selected,
-                logical,
-                make(count),
-                policy(),
-                &control
-            )
-            .is_ok(),
-            success
+        let result = move_authored_call_arguments_observed(
+            &selected,
+            logical,
+            make(count),
+            policy(),
+            &control,
         );
+        match (&result, ordinary_error) {
+            (Ok(_), None) => {}
+            (Err(LogicalCallArgumentCaptureError::InvalidSource(actual)), Some(expected)) => {
+                assert_eq!(*actual, expected);
+            }
+            _ => panic!("unexpected original authored-move result: {result:?}"),
+        }
         let baseline = control.trace();
         assert_eq!(baseline[0], 0);
-        assert!(baseline.last().is_some_and(|units| *units > 0));
+        if ordinary_error.is_none() {
+            assert!(baseline.last().is_some_and(|units| *units > 0));
+        }
         for stop in 0..baseline.len() {
             for cause in [
                 CompileControlError::Cancelled,
@@ -565,13 +615,39 @@ fn authored_move_uses_the_original_bounded_collection_and_control_tails() {
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert!(
                     matches!(move_authored_call_arguments_observed(&selected,logical,make(count),policy(),&control),Err(LogicalCallArgumentCaptureError::Control(actual)) if actual==cause)
                 );
                 assert_eq!(control.trace(), baseline[..=stop]);
+            }
+        }
+        if let Some(expected) = ordinary_error {
+            // An authored ordinary error is already final. A refusal armed
+            // only for a later footer must not start a new callback or replace
+            // that original error; every real earlier prefix remains above.
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let late = Control {
+                    refusal: Some((baseline.len(), cause)),
+                    ..Control::default()
+                };
+                assert!(matches!(
+                    move_authored_call_arguments_observed(
+                        &selected,
+                        logical,
+                        make(count),
+                        policy(),
+                        &late,
+                    ),
+                    Err(LogicalCallArgumentCaptureError::InvalidSource(actual)) if actual == expected
+                ));
+                assert_eq!(late.trace(), baseline);
             }
         }
     }

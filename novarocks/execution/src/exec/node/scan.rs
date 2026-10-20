@@ -25,6 +25,33 @@ use crate::exec::expr::ExprId;
 use crate::runtime::profile::RuntimeProfile;
 use novarocks_spi::connector::read_stack::ConnectorPollBudget;
 
+/// Which work the independently held exit observation actually covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanExitBodyProof {
+    /// The observer covers every work owner; the stream and its close future
+    /// retain only control metadata. The implementation must justify this.
+    Included,
+    /// The stream or close future holds additional reader/data owners. Their
+    /// normal close completion and successful destruction are also required.
+    CloseBodyRequired,
+}
+
+/// Pure proof held independently from the stream and its close body.
+///
+/// This future observes the original work scope. It must register the supplied
+/// waker against that scope with no lost wake, and must not cancel its work on
+/// drop. Authored Required events are reported separately, even before close.
+/// An unresolved proof never permits dropping a receiver with live event sources.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanExitProof {
+    Exited,
+    Unresolved,
+}
+pub struct ScanExitObservation {
+    pub actual_exit: BoxFuture<'static, ScanExitProof>,
+    pub body_proof: ScanExitBodyProof,
+}
+
 /// A scan's single output stream, owned by the one driver that polls it.
 ///
 /// `Poll::Pending` registers the context's waker and is never end of
@@ -33,10 +60,25 @@ use novarocks_spi::connector::read_stack::ConnectorPollBudget;
 pub trait ScanChunkStream:
     Stream<Item = crate::runtime::fragment::ExecutionResult<Chunk>> + Send
 {
+    /// Acquire the original observation immediately after claim, before the first
+    /// data poll. Register the original receiver before work can be observed.
+    /// There is deliberately no default: every author states the real scope
+    /// and whether close still owns an additional body that must exit.
+    fn take_exit_observation(
+        self: Pin<&mut Self>,
+        failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+    ) -> crate::runtime::fragment::ExecutionResult<ScanExitObservation>;
+
     /// Ends delivery and asks every operation of the scan to stop, before
-    /// returning. The future resolves once they all exited, with the first
-    /// real error; it only observes, so dropping it changes nothing.
-    fn close(self: Pin<Box<Self>>) -> BoxFuture<'static, Result<(), String>>;
+    /// returning. Its result belongs to reader/close cleanup; originating work
+    /// failures belong to the independent observation and its original reporter.
+    /// Completion proves only this body exited, never the independent scope.
+    /// Report cleanup before waiting on another owner. Unknown body exit must
+    /// stay pending and retain its original responsibility.
+    fn close(
+        self: Pin<Box<Self>>,
+        failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+    ) -> BoxFuture<'static, crate::runtime::fragment::ExecutionResult<()>>;
 }
 
 /// A scan output stream owned by its driver.
@@ -64,7 +106,7 @@ pub trait ScanOp: Send + Sync {
 
     /// Starts terminal cleanup of the scan's reads without waiting for them:
     /// the scan's stream observes their exit when it is closed.
-    fn terminate(&self) -> Result<(), String> {
+    fn terminate(&self) -> crate::runtime::fragment::ExecutionResult<()> {
         Ok(())
     }
 
@@ -110,7 +152,10 @@ pub enum BoundScanRanges {
 /// uniform and free of proto/thrift types. Later KRN-1 phases store an
 /// Task-owned `Arc<dyn ScanSource>` values bind their exact assignment at execution time.
 pub trait ScanSource: Send + Sync {
-    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String>;
+    fn bind(
+        &self,
+        ranges: BoundScanRanges,
+    ) -> crate::runtime::fragment::ExecutionResult<Arc<dyn ScanOp>>;
 
     fn profile_name(&self) -> Option<String> {
         None
@@ -148,6 +193,9 @@ impl ScanStreamSource for UnusedScanStream {
         _profile: Option<RuntimeProfile>,
         _construction: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) -> crate::runtime::fragment::ExecutionResult<ScanOutputStream> {
-        Err("this test scan is never run".to_string().into())
+        Err(novarocks_functions::KernelFailure::Internal(
+            novarocks_functions::KernelDiagnostic::new(&("this test scan is never run")),
+        )
+        .into())
     }
 }

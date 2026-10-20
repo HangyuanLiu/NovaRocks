@@ -70,7 +70,20 @@ impl fmt::Display for SchemaCodecError {
         }
     }
 }
-impl std::error::Error for SchemaCodecError {}
+impl std::error::Error for SchemaCodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Type(source) => Some(source),
+            Self::Binding(source) => Some(source),
+            Self::Node(source) => Some(source),
+            Self::ConstructionResource(source) => Some(source),
+            Self::SourceCustody(source) => Some(source),
+            Self::SourceMetadata(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<CompileControlError> for SchemaCodecError {
     fn from(e: CompileControlError) -> Self {
         Self::Control(e)

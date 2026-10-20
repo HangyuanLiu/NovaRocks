@@ -602,7 +602,7 @@ impl PureCompileControl for FailureControl {
         assert!(units <= novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK);
         self.work.lock().unwrap().push(units);
         if !self.positive_only || units > 0 {
-            Err(self.failure)
+            Err(self.failure.clone())
         } else {
             Ok(())
         }
@@ -625,23 +625,23 @@ fn package_and_extraction_keep_typed_control_failures_before_and_during_validati
     ] {
         for positive_only in [false, true] {
             let control = FailureControl {
-                failure,
+                failure: failure.clone(),
                 positive_only,
                 work: std::sync::Mutex::default(),
             };
             assert_eq!(
                 FragmentPackage::try_new(input.clone(), package_admission(), &control).unwrap_err(),
-                FragmentPackageError::Control(failure)
+                FragmentPackageError::Control(failure.clone())
             );
             if positive_only {
                 assert!(control.work.lock().unwrap().iter().any(|units| *units > 0));
             }
             let control = FailureControl {
-                failure,
+                failure: failure.clone(),
                 positive_only,
                 work: std::sync::Mutex::default(),
             };
-            let expected = FragmentPackageExtractionError::Control(failure);
+            let expected = FragmentPackageExtractionError::Control(failure.clone());
             assert_eq!(
                 extract_fragment_packages(
                     &fixture_plan_parameters(&plan, SemanticParameters::default().clone()),
@@ -1656,7 +1656,7 @@ fn package_and_observed_plan_require_original_static_requests_and_keep_first_con
                 assert!(calls.len() < at, "callback after the originating refusal");
             }
             calls.push((phase, units));
-            match self.refusal {
+            match self.refusal.clone() {
                 Some((at, cause)) if calls.len() == at => Err(cause),
                 _ => Ok(()),
             }
@@ -1691,7 +1691,7 @@ fn package_and_observed_plan_require_original_static_requests_and_keep_first_con
             ] {
                 let control = Trace {
                     calls: Default::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert_eq!(run(&control), Some(cause));
                 assert_eq!(*control.calls.lock().unwrap(), calls[..at]);
@@ -2673,7 +2673,7 @@ fn parameter_free_actual_definitions_keep_original_control_at_every_package_boun
             assert!(units <= novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK);
             let mut calls = self.calls.lock().unwrap();
             calls.push(units);
-            match self.refusal {
+            match self.refusal.clone() {
                 Some((index, error)) if calls.len() == index + 1 => Err(error),
                 _ => Ok(()),
             }
@@ -2708,7 +2708,7 @@ fn parameter_free_actual_definitions_keep_original_control_at_every_package_boun
         ] {
             let control = Trace {
                 calls: Default::default(),
-                refusal: Some((index, error)),
+                refusal: Some((index, error.clone())),
             };
             assert_eq!(
                 FragmentPackage::try_new(input.clone(), package_admission(), &control).unwrap_err(),

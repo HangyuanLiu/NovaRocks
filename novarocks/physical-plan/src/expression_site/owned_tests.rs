@@ -38,7 +38,7 @@ impl PureCompileControl for Control {
         let mut t = self.trace.lock().unwrap();
         let at = t.len();
         t.push(n);
-        if let Some((i, c)) = self.fail
+        if let Some((i, c)) = self.fail.clone()
             && i == at
         {
             Err(c)
@@ -212,7 +212,7 @@ fn root_validation_actual_success_and_foreign_fragment_error_keep_all_original_p
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let (out, actual) = run(source, &r, Some((at, cause)));
+                let (out, actual) = run(source, &r, Some((at, cause.clone())));
                 assert!(matches!(out,Err(RootUseBindingError::Control(c))if c==cause));
                 assert_eq!(actual, trace[..=at]);
             }

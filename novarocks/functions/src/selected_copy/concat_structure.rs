@@ -29,7 +29,7 @@ use std::alloc::Layout;
 pub enum ConcatStructureFailure<H> {
     Construction(CopyConstructionError<H>),
     /// Original constructor-model source error, never a caller/host cause.
-    Source(String),
+    Source(crate::array_projection::ArrayProjectionFailure),
     ValueType(novarocks_type_contract::ValueTypeError),
 }
 impl<H> From<novarocks_type_contract::ValueTypeError> for ConcatStructureFailure<H> {
@@ -37,8 +37,8 @@ impl<H> From<novarocks_type_contract::ValueTypeError> for ConcatStructureFailure
         Self::ValueType(error)
     }
 }
-impl<H> From<String> for ConcatStructureFailure<H> {
-    fn from(source: String) -> Self {
+impl<H> From<crate::array_projection::ArrayProjectionFailure> for ConcatStructureFailure<H> {
+    fn from(source: crate::array_projection::ArrayProjectionFailure) -> Self {
         Self::Source(source)
     }
 }
@@ -138,11 +138,20 @@ pub fn preflight_concat_structure_construction<H>(
     // This real model/preflight reference table is separate from the caller's
     // Vec<&ArrayRef> and Arrow concat_batches' own per-column reference table.
     temporary
-        .request_layout(Layout::array::<&dyn Array>(sources.len()).map_err(|_| CopyError::Extent)?)
+        .request_layout(
+            Layout::array::<&dyn Array>(sources.len())
+                .map_err(|source| CopyError::layout::<&dyn Array>(sources.len(), source))?,
+        )
         .map_err(CopyConstructionError::Creator)?;
     let mut refs = Vec::new();
-    refs.try_reserve_exact(sources.len())
-        .map_err(|_| CopyError::Extent)?;
+    refs.try_reserve_exact(sources.len()).map_err(|source| {
+        CopyError::Control(crate::KernelFailure::from_domain(
+            crate::allocation_failure::AllocationRefusal::new(
+                "copy concat reference table",
+                source,
+            ),
+        ))
+    })?;
     for source in sources {
         work(false)?;
         refs.push(source.as_ref());

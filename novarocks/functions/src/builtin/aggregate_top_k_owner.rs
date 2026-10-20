@@ -217,6 +217,7 @@ impl PureFunctionMetadataOwner for TopKOwner {
             })?;
             validate_selected_profile(selected, &state.intermediate_type, &mut work).map_err(
                 |cause| match cause {
+                    KernelFailure::CompileControl(cause) => FunctionBindingError::Control(cause),
                     KernelFailure::Cancelled => FunctionBindingError::Control(
                         novarocks_type_contract::CompileControlError::Cancelled,
                     ),
@@ -414,12 +415,7 @@ impl TopKOwner {
             work.flush().map_err(compile_failure)?;
             Ok(prepared)
         })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
+        if result.as_ref().is_err_and(KernelFailure::is_interruption) {
             return result;
         }
         work.finish().map_err(compile_failure)?;

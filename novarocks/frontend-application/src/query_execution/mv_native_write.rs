@@ -240,17 +240,9 @@ pub(crate) fn encode_compile_error(
 ) -> novarocks_sql::compiler::SqlCompileError {
     match error {
         novarocks_plan_codec::PhysicalEncodeError::Control(error) => error.into(),
-        novarocks_plan_codec::PhysicalEncodeError::Invalid(error) => {
-            novarocks_sql::compiler::SqlCompileError::Compilation(error)
-        }
-        novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(message) => {
-            novarocks_sql::compiler::SqlCompileError::Compilation(
-                novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(
-                    message,
-                )
-                .to_bracketed_user_message(),
-            )
-        }
+        other => novarocks_sql::compiler::SqlCompileError::CompilationSource(
+            novarocks_failure_contract::SharedFailureCause::new(other),
+        ),
     }
 }
 
@@ -309,14 +301,20 @@ pub trait MvRefreshProviderActivation: Send + Sync {
 mod capability_identity_tests {
     #[test]
     fn mv_encode_capability_refusal_keeps_the_client_identity() {
-        let error = super::encode_compile_error(
-            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
-                "change-stream router".into(),
-            ),
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let original = novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+            "change-stream router".into(),
         );
+        let expected = original.failure_fact();
+        let novarocks_sql::compiler::SqlCompileError::CompilationSource(source) =
+            super::encode_compile_error(original)
+        else {
+            panic!("retain the actual encode author")
+        };
+        assert_eq!(source.failure_fact(), expected);
+        assert_eq!(expected.class(), FailureClass::Unsupported);
         assert!(
-            matches!(error, novarocks_sql::compiler::SqlCompileError::Compilation(message)
-            if message == "[UnsupportedCompiledShape] change-stream router")
+            matches!(source.downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>(), Some(novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(detail)) if detail == "change-stream router")
         );
     }
 }

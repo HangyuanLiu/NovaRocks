@@ -136,7 +136,7 @@ fn aes_original_null_empty_and_aad_errors_have_original_priority() {
             &[0; 5],
             ToBase64ByteSource::Ordinary
         ),
-        Row::Data(DataError::AadRequiresGcm)
+        Row::Failure(RowFailure::AadRequiresGcm)
     ));
     args[0] = text(None);
     assert!(matches!(
@@ -283,4 +283,70 @@ fn aes_bytes_output_null_empty_loop_observes_real_256_quantum_and_each_cause() {
             }
         }
     }
+}
+
+#[test]
+fn required_aes_preserves_domain_aad_refusal_and_separates_invalid_addresses() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    let args = [
+        text(Some("a")),
+        text(Some("k")),
+        text(None),
+        text(Some("AES_128_ECB")),
+        text(Some("")),
+    ];
+    let failure = evaluate_required_row(
+        Operation::Encrypt,
+        &args,
+        &[0; 5],
+        ToBase64ByteSource::Ordinary,
+        7,
+    )
+    .unwrap_err();
+    assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+    assert_eq!(failure.failure_fact().reason().code(), 373);
+    assert_eq!(
+        failure.to_string(),
+        "aes_encrypt: requires GCM mode to use AAD parameter"
+    );
+    let source = failure
+        .source()
+        .unwrap()
+        .source()
+        .unwrap()
+        .downcast_ref::<RequiredAesFailure>()
+        .unwrap();
+    assert_eq!(source.ordinal, 7);
+    for rows in [&[0][..], &[0, 0, 0, 0, 1][..]] {
+        let failure = evaluate_required_row(
+            Operation::Encrypt,
+            &args,
+            rows,
+            ToBase64ByteSource::Ordinary,
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(failure.failure_fact().reason().code(), 372);
+    }
+    let zeros = [0; 16];
+    let input = OwnedBytesArray::LargeUtf8(arrow_array::LargeStringArray::from(vec!["ÿ\u{80}"]));
+    let args = [
+        input,
+        binary(&zeros),
+        binary(&zeros),
+        text(Some("AES_128_CTR")),
+    ];
+    assert_eq!(
+        evaluate_required_row(
+            Operation::Decrypt,
+            &args,
+            &[0; 4],
+            ToBase64ByteSource::NativeV1EncryptionLatin1,
+            0
+        )
+        .unwrap(),
+        Some(vec![0x99, 0x69])
+    );
 }

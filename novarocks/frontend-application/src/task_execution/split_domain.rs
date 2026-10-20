@@ -93,6 +93,7 @@ pub(crate) fn delivery_action(error: &SplitAssignmentDriverError) -> FrontendAct
         SplitAssignmentDriverError::Rejected { .. }
         | SplitAssignmentDriverError::Assignment(_)
         | SplitAssignmentDriverError::NoAdmittedTask { .. }
-        | SplitAssignmentDriverError::SplitSource { .. } => FrontendAction::FailAttempt,
+        | SplitAssignmentDriverError::SplitSource { .. }
+        | SplitAssignmentDriverError::SourceClose { .. } => FrontendAction::FailAttempt,
     }
 }

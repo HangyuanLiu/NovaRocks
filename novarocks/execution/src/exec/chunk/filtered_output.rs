@@ -37,6 +37,60 @@ use novarocks_functions::{
 };
 use std::sync::Arc;
 
+#[derive(Debug)]
+struct FilteredOutputKernelFailure(arrow::error::ArrowError);
+impl std::fmt::Display for FilteredOutputKernelFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ordered filtered output kernel: {}", self.0)
+    }
+}
+impl std::error::Error for FilteredOutputKernelFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for FilteredOutputKernelFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use arrow::error::ArrowError;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let (class, reason) = match self.0 {
+            ArrowError::MemoryError(_) | ArrowError::ArithmeticOverflow(_) => (
+                FailureClass::Resource,
+                ExecutionReason::OrderedFilterAllocation,
+            ),
+            ArrowError::OffsetOverflowError(_) => (
+                FailureClass::Representation,
+                ExecutionReason::OrderedFilterOffset,
+            ),
+            ArrowError::IoError(..) => (
+                FailureClass::Unexpected,
+                ExecutionReason::OrderedFilterUnexpected,
+            ),
+            _ => (FailureClass::Invariant, ExecutionReason::OrderedFilterArrow),
+        };
+        let fact = FailureFact::new(class, reason.reason());
+        if matches!(self.0, ArrowError::OffsetOverflowError(_)) {
+            use novarocks_failure_contract::{
+                RepresentationBoundary, RepresentationFacts, RepresentationLayout, domain,
+            };
+            use std::num::NonZeroU16;
+            fact.with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::SingleOutput,
+                layout: RepresentationLayout {
+                    domain: domain::EXECUTION,
+                    code: NonZeroU16::new(26).unwrap(),
+                },
+                required: None,
+                extent_limit: None,
+                representable_prefix: None,
+            })
+        } else {
+            fact
+        }
+    }
+}
+
 fn invalid(detail: &'static str) -> KernelFailure {
     KernelFailure::InvalidProgram(KernelDiagnostic::new(detail))
 }
@@ -136,7 +190,11 @@ fn adopt_ordered_output<R: OrderedRawBatch + Send + Sync + 'static, C: Send + Sy
         .with_row_count(Some(backing.borrowed().raw.record_batch().num_rows()));
     let batch =
         RecordBatch::try_new_with_options(schema.arrow_schema_ref(), wrapped.columns, &options)
-            .map_err(|error| ExecutionFailure::from(format!("compiled Filter: {error}")))?;
+            .map_err(|error| {
+                ExecutionFailure::from_domain(super::construction_failure::ChunkRecordBatchFailure(
+                    error,
+                ))
+            })?;
     let mut output =
         Chunk::try_new_with_output_column_metadata(batch, schema, wrapped.metadata, construction)?;
     output.attach_additional_buffers(ledger)?;
@@ -365,7 +423,7 @@ impl Chunk {
                 input.record_batch(),
                 &transaction.mask.as_ref().expect("normalized mask").mask,
             )
-            .map_err(|error| ExecutionFailure::from(format!("compiled Filter: {error}")))?,
+            .map_err(|error| ExecutionFailure::from_domain(FilteredOutputKernelFailure(error)))?,
         );
         work.flush()?;
         let delta = record_batch_additional_bytes_observed(
@@ -391,8 +449,11 @@ impl Chunk {
         )?);
         let options = RecordBatchOptions::new().with_row_count(Some(rows));
         transaction.raw = Some(
-            RecordBatch::try_new_with_options(schema, columns, &options)
-                .map_err(|error| ExecutionFailure::from(format!("compiled Filter: {error}")))?,
+            RecordBatch::try_new_with_options(schema, columns, &options).map_err(|error| {
+                ExecutionFailure::from_domain(super::construction_failure::ChunkRecordBatchFailure(
+                    error,
+                ))
+            })?,
         );
         let output = adopt_ordered_output(
             FilteredBatchBacking {

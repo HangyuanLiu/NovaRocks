@@ -66,7 +66,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         state.trace.push(units);
-        match state.stop {
+        match state.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -168,7 +168,7 @@ fn prefixes(source: &AggregateBinding, emit: bool, successful: bool) {
     let trace = baseline.trace();
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let control = Control::rejecting(at, cause);
+            let control = Control::rejecting(at, cause.clone());
             assert!(
                 matches!(operation(&control), Err(BindingCodecError::Control(actual)) if actual == cause)
             );
@@ -428,7 +428,7 @@ fn wide_aggregate_copy_has_real_prepare_quantum_and_sampled_emit_prefixes() {
         baseline.len() - 1,
     ] {
         for cause in CAUSES {
-            let control = Control::rejecting(at, cause);
+            let control = Control::rejecting(at, cause.clone());
             assert!(
                 matches!(prepare(&control), Err(BindingCodecError::Control(actual)) if actual == cause)
             );
@@ -454,7 +454,7 @@ fn wide_aggregate_copy_has_real_prepare_quantum_and_sampled_emit_prefixes() {
     let baseline = control.trace();
     for at in [0, baseline.len() / 2, baseline.len() - 1] {
         for cause in CAUSES {
-            let control = Control::rejecting(at, cause);
+            let control = Control::rejecting(at, cause.clone());
             assert!(
                 matches!(emit(&control), Err(BindingCodecError::Control(actual)) if actual == cause)
             );

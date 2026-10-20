@@ -91,7 +91,18 @@ impl fmt::Display for SemanticsCodecError {
         }
     }
 }
-impl std::error::Error for SemanticsCodecError {}
+impl std::error::Error for SemanticsCodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Parameter(source) => Some(source),
+            Self::Calls(source) => Some(source),
+            Self::Pruning(source) => Some(source),
+            Self::ControlComponent(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<CompileControlError> for SemanticsCodecError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)

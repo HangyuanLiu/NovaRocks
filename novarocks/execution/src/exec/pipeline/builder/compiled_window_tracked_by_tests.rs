@@ -19,6 +19,7 @@
 //! The old FixedZero driver helper and its oracle remain untouched.
 use super::super::window_fixture::window_catalog_from_actual;
 use super::*;
+use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
 use crate::runtime::fragment::ExecutionFailureCause;
 use crate::runtime::mem_tracker::MemTracker;
 use novarocks_functions::FunctionKind;
@@ -106,19 +107,23 @@ fn by_window_compiled_actual_owner_frame_null_winner_and_last_array_drop() {
             tracker.install_limit_once(64 * 1024 * 1024).unwrap();
             let mut operator = operator(&program, Some(Arc::clone(&tracker)));
             operator.prepare().unwrap();
-            let processor = operator.as_processor_mut().unwrap();
             let state = RuntimeState::default();
+            let mut processor = TestDriver::new(operator.as_mut(), &state);
             for offset in (0..3).step_by(step) {
                 processor
-                    .push_chunk(
-                        &state,
-                        chunk(&program, batch.slice(offset, step.min(3 - offset))),
-                    )
+                    .input_without_output(chunk(
+                        &program,
+                        batch.slice(offset, step.min(3 - offset)),
+                    ))
                     .unwrap();
             }
-            processor.set_finishing(&state).unwrap();
+            processor.signal_eos().unwrap();
             let mut outputs = Vec::new();
-            while let Some(output) = processor.pull_chunk(&state).unwrap() {
+            while let Some(output) = processor
+                .advance_to_boundary()
+                .map(|step| step.output)
+                .unwrap()
+            {
                 outputs.push(output);
             }
             assert_eq!(
@@ -155,6 +160,7 @@ fn by_window_compiled_actual_owner_frame_null_winner_and_last_array_drop() {
             drop(outputs);
             let data = output.record_batch().column(3).to_data();
             let payload = data.buffers()[0].clone();
+            drop(processor);
             drop(operator);
             drop(output);
             drop(data);
@@ -176,13 +182,17 @@ fn window_output_schema_outlives_program_and_releases_at_last_schema_reference()
     tracker.install_limit_once(64 * 1024 * 1024).unwrap();
     let mut operator = operator(&program, Some(tracker.clone()));
     operator.prepare().unwrap();
-    let processor = operator.as_processor_mut().unwrap();
     let state = RuntimeState::default();
+    let mut processor = TestDriver::new(operator.as_mut(), &state);
     processor
-        .push_chunk(&state, chunk(&program, batch))
+        .input_without_output(chunk(&program, batch))
         .unwrap();
-    processor.set_finishing(&state).unwrap();
-    let output = processor.pull_chunk(&state).unwrap().unwrap();
+    processor.signal_eos().unwrap();
+    let output = processor
+        .advance_to_boundary()
+        .map(|step| step.output)
+        .unwrap()
+        .unwrap();
     let schema = output.chunk_schema_ref();
     assert!(schema.is_typed());
     assert!(schema.arrow_schema_ref().metadata().capacity() == 0);
@@ -193,6 +203,7 @@ fn window_output_schema_outlives_program_and_releases_at_last_schema_reference()
             .all(|slot| slot.field_ref().metadata().capacity() == 0)
     );
     drop(output);
+    drop(processor);
     drop(operator);
     drop(program);
     assert!(
@@ -225,18 +236,24 @@ fn by_window_prepare_refusal_precedes_input_and_preserves_original_cause() {
             other => panic!("exact original construction refusal: {other:?}"),
         }
         assert_eq!(operator.prepare().unwrap_err(), first);
-        let processor = operator.as_processor_mut().unwrap();
-        assert!(!processor.need_input());
-        assert!(!processor.has_output());
         let state = RuntimeState::default();
+        let mut processor = TestDriver::new(operator.as_mut(), &state);
+        assert!(processor.drive().unwrap_err().same_occurrence(&first));
         assert_eq!(
             processor
-                .push_chunk(&state, chunk(&program, batch.clone()))
+                .input_without_output(chunk(&program, batch.clone()))
                 .unwrap_err(),
             first
         );
-        assert_eq!(processor.pull_chunk(&state).unwrap_err(), first);
-        assert_eq!(processor.set_finishing(&state).unwrap_err(), first);
+        assert_eq!(
+            processor
+                .advance_to_boundary()
+                .map(|step| step.output)
+                .unwrap_err(),
+            first
+        );
+        assert_eq!(processor.signal_eos().unwrap_err(), first);
+        drop(processor);
         drop(operator);
         assert_eq!(tracker.current(), 0);
     }
@@ -278,3 +295,99 @@ fn by_window_compiled_original_output_validator_keeps_full_text_and_check_order(
 
 #[path = "compiled_window_source_custody_tests.rs"]
 mod source_custody_tests;
+
+#[test]
+fn by_window_step_keeps_arrival_boundaries_and_yields_before_output_construction() {
+    use crate::exec::pipeline::{
+        input::RawInput,
+        step::{InputResult, NextStep},
+        step_context::{StepContext, TurnWork},
+    };
+    use std::num::NonZeroU64;
+    let (program, batch) = source(
+        &[
+            vec![Some(1), Some(1), Some(4)],
+            vec![Some(1), Some(2), Some(9)],
+            vec![Some(1), Some(3), Some(7)],
+        ],
+        false,
+    );
+    let tracker = MemTracker::new_root("window output continuation");
+    tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+    let mut operator = operator(&program, Some(tracker.clone()));
+    operator.prepare().unwrap();
+    let state = RuntimeState::default();
+    let error = state.error_state();
+    let mut turn = TurnWork::new(NonZeroU64::new(1).unwrap(), 0);
+    let mut context = StepContext::new(&error, &mut turn);
+    let step = operator.as_mut();
+    for (offset, rows) in [(0, 1), (1, 2)] {
+        assert!(matches!(
+            step.try_push(
+                &mut context,
+                RawInput::for_test(chunk(&program, batch.slice(offset, rows)))
+            ),
+            InputResult::Accepted(Ok(_))
+        ));
+        let applied = step.drive(&mut context).unwrap();
+        assert!(applied.output.is_none());
+        assert!(matches!(applied.next, NextStep::NeedInput));
+    }
+    step.finish(&mut context).unwrap();
+    let finalized = step.drive(&mut context).unwrap();
+    assert!(finalized.output.is_none());
+    assert!(matches!(finalized.next, NextStep::Runnable));
+    let allocated = tracker.allocated();
+    assert!(matches!(
+        step.drive(&mut context).unwrap().next,
+        NextStep::Yield
+    ));
+    assert_eq!(tracker.allocated(), allocated);
+    drop(context);
+    turn.begin_turn(1).unwrap();
+    let mut context = StepContext::new(&error, &mut turn);
+    let first = step.drive(&mut context).unwrap();
+    assert!(matches!(first.next, NextStep::Runnable));
+    let first = first.output.unwrap();
+    assert_eq!(first.len(), 1);
+    let allocated = tracker.allocated();
+    assert!(matches!(
+        step.drive(&mut context).unwrap().next,
+        NextStep::Yield
+    ));
+    assert_eq!(tracker.allocated(), allocated);
+    drop(context);
+    turn.begin_turn(1).unwrap();
+    let mut context = StepContext::new(&error, &mut turn);
+    let last = step.drive(&mut context).unwrap();
+    assert!(matches!(last.next, NextStep::Finished));
+    let last = last.output.unwrap();
+    assert_eq!(last.len(), 2);
+    let values = [
+        first.record_batch().column(3),
+        last.record_batch().column(3),
+    ]
+    .into_iter()
+    .flat_map(|array| array.as_any().downcast_ref::<Int64Array>().unwrap().iter())
+    .collect::<Vec<_>>();
+    assert_eq!(values, vec![Some(7), Some(7), Some(7)]);
+    assert!(step.drive(&mut context).unwrap().output.is_none());
+    let raw = chunk(&program, batch.slice(0, 1));
+    let original = raw.columns()[0].clone();
+    let InputResult::Rejected { input, .. } = step.try_push(&mut context, RawInput::for_test(raw))
+    else {
+        panic!("finished window rejects a new delivery");
+    };
+    assert!(Arc::ptr_eq(
+        input.original_for_test().columns().first().unwrap(),
+        &original
+    ));
+    drop(operator);
+    drop(first);
+    assert!(
+        tracker.current() > 0,
+        "remaining output owns its finite result custody"
+    );
+    drop(last);
+    assert_eq!(tracker.current(), 0);
+}

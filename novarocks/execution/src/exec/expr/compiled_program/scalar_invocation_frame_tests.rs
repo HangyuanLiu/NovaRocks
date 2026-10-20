@@ -598,8 +598,7 @@ fn input(program: &LocalProgram, flags: Vec<Option<bool>>, root_null: bool) -> R
 }
 fn tracked_instance(program: &Arc<LocalProgram>) -> (CompiledExpressionInstance, Arc<MemTracker>) {
     let tracker = MemTracker::new_root("actual-array-invocation-probe");
-    let host =
-        crate::exec::operators::compiled_aggregate::expression_allocation_host(tracker.clone());
+    let host = crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
     (
         CompiledExpressionInstance::try_new_with_allocator(
             program.clone(),
@@ -808,7 +807,7 @@ fn scalar_invocation_boolean_truth_only_and_filter_keep_atomic_original_data() {
     let program = invocation_program(2, Guard::Filter);
     let batch = input(&program, vec![Some(true); 3], false);
     let tracker = MemTracker::new_root("actual-filter-invocation-probe");
-    let host = crate::exec::operators::compiled_aggregate::expression_allocation_host(tracker);
+    let host = crate::runtime::tracked_state_allocator::expression_allocation_host(tracker);
     let mut filter = super::super::CompiledFilterConjunctionInstance::try_new_with_allocator(
         program,
         ProgramNodeId::new(2),
@@ -1219,7 +1218,7 @@ fn original_domain_mixed_and_selected_root_copies_keep_finite_source_until_last_
         let mut chunk =
             crate::exec::chunk::Chunk::try_new_with_chunk_schema(batch, schema).unwrap();
         let source = MemTracker::new_root("actual-mixed-source-custody");
-        chunk.try_transfer_to_typed(&source).unwrap();
+        chunk.try_transfer_to(&source).unwrap();
         let bytes = source.current();
         let (mut frame, _) = tracked_instance(&program);
         let selected_rows = [0];

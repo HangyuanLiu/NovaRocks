@@ -19,6 +19,7 @@
 //! through compiled SortOrder roots only. The oracle is an independent stable
 //! Rust sort over the literal rows.
 
+use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -264,8 +265,8 @@ fn compiled_topn_pruning_keeps_exactly_the_rows_a_full_sort_would() {
         Arc::new(RuntimeErrorState::default()),
     ));
     operator.prepare().unwrap();
-    let processor = operator.as_processor_mut().unwrap();
     let state = RuntimeState::default();
+    let mut processor = TestDriver::new(operator.as_mut(), &state);
     let layout = program.graph().nodes()[0].output_layout();
     let schema = ChunkSchema::from_compiled_layout(layout).unwrap();
     // Twelve rows in four chunks; ties on `a` resolve by arrival (`b`).
@@ -297,14 +298,18 @@ fn compiled_topn_pruning_keeps_exactly_the_rows_a_full_sort_would() {
         )
         .unwrap();
         let chunk = Chunk::try_new_with_chunk_schema(batch, Arc::clone(&schema)).unwrap();
-        processor.push_chunk(&state, chunk).unwrap();
+        processor.input_without_output(chunk).unwrap();
     }
-    processor.set_finishing(&state).unwrap();
+    processor.signal_eos().unwrap();
     let mut chunks = Vec::new();
-    while let Some(chunk) = processor.pull_chunk(&state).unwrap() {
+    while let Some(chunk) = processor
+        .advance_to_boundary()
+        .map(|step| step.output)
+        .unwrap()
+    {
         chunks.push(chunk);
     }
-    assert!(processor.is_finished());
+    assert!(matches!(processor.next(), NextStep::Finished));
     assert_eq!(
         int64_rows(&chunks),
         oracle(&input, &keys, Some(limit), offset)
@@ -330,7 +335,7 @@ fn compiled_sort_factory_refuses_a_node_that_is_not_a_sort() {
         Ok(_) => panic!("a Values node is not a Sort"),
         Err(error) => error,
     };
-    assert!(error.contains("is not a Sort"), "{error}");
+    assert!(error.to_string().contains("is not a Sort"), "{error}");
 }
 
 #[test]
@@ -362,25 +367,30 @@ fn compiled_sort_retains_original_column_metadata_until_input_or_processor_exit(
         operator.set_construction_factory(construction);
         operator.prepare().unwrap();
         operator.bind_runtime_state(&state).unwrap();
-        let processor = operator.as_processor_mut().unwrap();
-        processor.push_chunk(&state, chunk).unwrap();
+        let mut processor = TestDriver::new(operator.as_mut(), &state);
+        processor.input_without_output(chunk).unwrap();
         assert_eq!(
             tracker.current(),
             charged,
             "the input container is still live"
         );
         if finish {
-            processor.set_finishing(&state).unwrap();
-            assert_eq!(tracker.current(), 0, "original runs have actually exited");
+            processor.signal_eos().unwrap();
             let mut output = Vec::new();
-            while let Some(chunk) = processor.pull_chunk(&state).unwrap() {
+            while let Some(chunk) = processor
+                .advance_to_boundary()
+                .map(|step| step.output)
+                .unwrap()
+            {
                 output.push(chunk);
             }
             assert_eq!(
                 int64_rows(&output),
                 oracle(&ROWS, &[A_ASC_NULLS_LAST], None, 0)
             );
+            assert_eq!(tracker.current(), 0, "original runs have actually exited");
         }
+        drop(processor);
         drop(operator);
         assert_eq!(tracker.current(), 0);
     }

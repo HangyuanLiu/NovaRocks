@@ -95,19 +95,23 @@ fn lossless_actual_column_emit_every_host_allocation_cause_has_no_footer() {
         trace: Mutex::new(vec![]),
     };
     let failure = column.emit_evaluation(&[0], 1, &trace).unwrap_err();
-    let EvaluationFailure::InvocationData(data) = failure else {
-        panic!("original value-sensitive final Data")
+    let EvaluationFailure::Kernel(cause) = failure else {
+        panic!("frozen output contract failure");
     };
     assert_eq!(
-        data.message(),
-        "build aggregate final output: unsupported percentile_cont output type Int64"
+        novarocks_failure_contract::FailureProjection::failure_fact(&cause).class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert_eq!(
+        cause.to_string(),
+        "unsupported percentile_cont output type Int64"
     );
     let allocations = reference.ledger.lock().unwrap().attempts - before;
     assert!(
-        allocations > 1,
-        "actual metadata plus diagnostic and domain backing"
+        allocations > 0,
+        "actual host metadata is exercised before the contract refusal"
     );
-    drop(data);
+    drop(cause);
     drop(column);
     assert_eq!(reference.ledger.lock().unwrap().bytes, 0);
     for cause in causes() {
@@ -130,13 +134,14 @@ fn lossless_actual_column_emit_every_host_allocation_cause_has_no_footer() {
     }
 }
 #[test]
-fn lossless_actual_column_emit_all_control_causes_and_atomic_data_prefix() {
+fn lossless_actual_column_emit_all_control_causes_and_atomic_contract_prefix() {
     let handle = prepared_handle();
     let reference = Arc::new(Host::default());
     let column = real_column(&handle, reference.clone());
     let trace = Control::default();
     let failure = column.emit_evaluation(&[0], 1, &trace).unwrap_err();
-    assert!(matches!(failure, EvaluationFailure::InvocationData(_)));
+    assert!(matches!(&failure, EvaluationFailure::Kernel(cause)
+        if novarocks_failure_contract::FailureProjection::failure_fact(cause).class() == novarocks_failure_contract::FailureClass::Invariant));
     let callbacks = trace.trace.lock().unwrap().len();
     drop(failure);
     drop(column);
@@ -164,7 +169,8 @@ fn lossless_actual_column_emit_all_control_causes_and_atomic_data_prefix() {
         refusal: Some((callbacks, KernelFailure::Cancelled)),
     };
     let failure = column.emit_evaluation(&[0], 1, &control).unwrap_err();
-    assert!(matches!(failure, EvaluationFailure::InvocationData(_)));
+    assert!(matches!(&failure, EvaluationFailure::Kernel(cause)
+        if novarocks_failure_contract::FailureProjection::failure_fact(cause).class() == novarocks_failure_contract::FailureClass::Invariant));
     assert_eq!(control.trace.lock().unwrap().len(), callbacks);
     drop(failure);
     drop(column);

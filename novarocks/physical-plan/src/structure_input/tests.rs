@@ -40,7 +40,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -263,7 +263,7 @@ fn prefixes(source: &FragmentStructureInput, success: bool, wide: bool) {
             let owned = source.clone();
             let c = Control {
                 trace: Mutex::new(vec![]),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(construct(owned,PlanLimits::FROZEN,&c),Err(FragmentStructureError::Control(actual))if actual==cause)

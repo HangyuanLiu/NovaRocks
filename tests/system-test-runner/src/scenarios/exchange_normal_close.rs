@@ -16,19 +16,26 @@
 //! One real producer keeps sending to B after A's exact normal departure.
 
 use std::path::Path;
+use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use arrow_array::{Array, Int64Array};
 use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::test_sessions::{
+    ClusterTestSessionPlan, RoleLaunchReference, RoleSlot,
+};
+use novarocks_failpoint::{session::DomainGrant, target_binding::RoleProcessReceipt};
 use novarocks_proto_models::{common, novarocks as proto};
+use novarocks_types::{BackendProcessId, FrontendProcessId};
 use prost::Message;
+use serde_json::json;
 
 use super::native_compatibility::{raw_operation_envelope, raw_unary};
 use super::native_creation::{
     RawBackendSession, RawCreate, RawSink, compiled_fragment, observe_task_terminal_and_stopped,
-    outcome, session_control,
+    outcome, receipt_verdict, session_control,
 };
 use super::query_lifecycle::{await_resource_convergence, resource_snapshot};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
@@ -38,13 +45,73 @@ const POLL: Duration = Duration::from_millis(50);
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
-        Box::new(SameProducerNormalClose { multicast: false }),
-        Box::new(SameProducerNormalClose { multicast: true }),
+        Box::new(SameProducerNormalClose {
+            multicast: false,
+            observation: Mutex::new(None),
+        }),
+        Box::new(SameProducerNormalClose {
+            multicast: true,
+            observation: Mutex::new(None),
+        }),
     ]
 }
 
 struct SameProducerNormalClose {
     multicast: bool,
+    observation: Mutex<Option<ExchangeObservation>>,
+}
+
+struct ExchangeObservation {
+    identity: (common::UniqueId, FrontendProcessId),
+    producer: RoleLaunchReference,
+    deadline: Instant,
+    selected: bool,
+}
+
+impl SameProducerNormalClose {
+    fn take_identity(&self, deadline: Instant) -> Result<(common::UniqueId, FrontendProcessId)> {
+        let mut owner = self
+            .observation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("exchange observation owner poisoned"))?;
+        let frozen = owner
+            .as_mut()
+            .context("exchange observation was not frozen")?;
+        ensure!(
+            !frozen.selected,
+            "exchange observation identity already selected"
+        );
+        ensure!(
+            frozen.deadline == deadline && Instant::now() < deadline,
+            "exchange observation original deadline changed or expired"
+        );
+        frozen.selected = true;
+        Ok(frozen.identity)
+    }
+
+    fn verify_producer(&self, actual: BackendProcessId) -> Result<()> {
+        let owner = self
+            .observation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("exchange observation owner poisoned"))?;
+        let frozen = owner
+            .as_ref()
+            .context("exchange observation was not frozen")?;
+        ensure!(
+            Instant::now() < frozen.deadline,
+            "exchange observation deadline expired"
+        );
+        let receipt = RoleProcessReceipt::read_private(&frozen.producer.process_receipt)?;
+        ensure!(
+            receipt.session_id == frozen.producer.session_id,
+            "exchange producer receipt belongs to another role session"
+        );
+        ensure!(
+            receipt.backend_process()? == actual,
+            "exchange producer differs from the original declared backend process"
+        );
+        Ok(())
+    }
 }
 
 impl Scenario for SameProducerNormalClose {
@@ -65,20 +132,71 @@ impl Scenario for SameProducerNormalClose {
         }
     }
 
-    fn launch_config(&self, _: &Path) -> Result<ScenarioLaunchConfig> {
-        let mut launch = ScenarioLaunchConfig::default();
-        for index in 0..3 {
-            launch
-                .child_environment
-                .be_by_index
-                .entry(index)
-                .or_default()
-                .insert(
-                    "NOVAROCKS_SQL_TEST_EMIT_EXCHANGE_SNAPSHOT_MARKER".into(),
-                    "true".into(),
-                );
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        ensure!(
+            cluster_size == 3,
+            "exchange evidence requires native 1FE+3BE"
+        );
+        let mut owner = self
+            .observation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("exchange observation owner poisoned"))?;
+        ensure!(owner.is_none(), "exchange observation already frozen");
+        let identity = RawBackendSession::declare_identity();
+        let mut plan = ClusterTestSessionPlan::new(deadline)?;
+        let root = plan.reserve_transport("exchange-normal-close-observation")?;
+        let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
+        plan.authorize_ordinary_launch(&frontend, binary.to_path_buf())?;
+        for index in 0..2 {
+            let backend = plan.reserve_launch(RoleSlot::Backend(index))?;
+            plan.authorize_ordinary_launch(&backend, binary.to_path_buf())?;
         }
-        Ok(launch)
+        // P is the only sender of the validated normal-close evidence.
+        let producer = plan.reserve_launch(RoleSlot::Backend(2))?;
+        let parameters = json!({
+            "action": "exchange-snapshot",
+            "root": root,
+            "backend_index": 2,
+            "target_session_id": producer.session_id,
+            "max_events": 16384,
+            "query_execution": {
+                "query_id_hi": identity.0.hi,
+                "query_id_lo": identity.0.lo,
+                "attempt_id": 1,
+            },
+        });
+        ensure!(
+            serde_json::to_vec(&parameters)?.len() <= 4096,
+            "exchange observation parameters exceed bounded input"
+        );
+        plan.authorize_launch(
+            &producer,
+            vec![DomainGrant {
+                domain: "native-observation".into(),
+                grant_id: "exchange-normal-close-p".into(),
+                parameters,
+            }],
+            vec![
+                ("novarocks-server".into(), "test-controls".into()),
+                ("novarocks-native-adapter".into(), "test-controls".into()),
+            ],
+        )?;
+        plan.set_launch_binary(&producer, binary.to_path_buf())?;
+        plan.validate_selected_intents(cluster_size)?;
+        *owner = Some(ExchangeObservation {
+            identity,
+            producer,
+            deadline,
+            selected: false,
+        });
+        Ok(Some(plan))
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -87,9 +205,12 @@ impl Scenario for SameProducerNormalClose {
             "exchange evidence requires native 1FE+3BE"
         );
         let baseline = resource_snapshot(context)?;
+        let identity = self.take_identity(context.deadline())?;
         let mut sessions = Vec::new();
         let result = (|| -> Result<()> {
-            sessions.push(RawBackendSession::establish(context, 0)?);
+            sessions.push(RawBackendSession::establish_declared(
+                context, 0, identity.0, identity.1,
+            )?);
             sessions.push(RawBackendSession::establish_same_attempt(
                 context,
                 1,
@@ -103,6 +224,7 @@ impl Scenario for SameProducerNormalClose {
             let a = &sessions[0];
             let b = &sessions[1];
             let p = &sessions[2];
+            self.verify_producer(p.backend)?;
             let producer_base = RawCreate::values(&p, 3);
             let producer_identity = proto::TaskIdentity {
                 query_execution_id: producer_base.context.query_execution_id,
@@ -167,7 +289,7 @@ impl Scenario for SameProducerNormalClose {
             )?;
             ensure!(
                 matches!(
-                    outcome(&cancel),
+                    outcome(&cancel)?,
                     proto::TaskOperationOutcome::Accepted | proto::TaskOperationOutcome::Idempotent
                 ),
                 "exact normal Cancel failed: {cancel:?}"
@@ -202,7 +324,7 @@ impl Scenario for SameProducerNormalClose {
             )?;
             ensure!(
                 matches!(
-                    outcome(&open),
+                    outcome(&open)?,
                     proto::TaskOperationOutcome::Accepted | proto::TaskOperationOutcome::Idempotent
                 ),
                 "producer open failed: {open:?}"
@@ -275,7 +397,7 @@ impl FrozenTask {
     ) -> Result<()> {
         let accepted = session.apply(self.operation.clone(), "create exact exchange fixture")?;
         ensure!(
-            outcome(&accepted) == proto::TaskOperationOutcome::Accepted,
+            outcome(&accepted)? == proto::TaskOperationOutcome::Accepted,
             "fixture Create was not Accepted: {accepted:?}"
         );
         loop {
@@ -283,7 +405,9 @@ impl FrozenTask {
                 self.operation.clone(),
                 "observe frozen fixture installation",
             )?;
-            let Some(proto::task_operation_receipt::Ack::CreateTask(ack)) = receipt.ack else {
+            let Some(proto::task_operation_verdict::Ack::CreateTask(ack)) =
+                receipt_verdict(&receipt)?.ack.clone()
+            else {
                 bail!("Create replay omitted ack: {receipt:?}");
             };
             let status = ack
@@ -602,5 +726,177 @@ fn await_normal_close_marker(
                 .remaining("observe P Native validated A normal-close proof")?
                 .min(POLL),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normal_close_observation_uses_original_query_and_exact_producer_role() {
+        let scenario = SameProducerNormalClose {
+            multicast: false,
+            observation: Mutex::new(None),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let binary = std::env::current_exe().unwrap();
+        let plan = scenario
+            .test_session_plan(
+                &ScenarioLaunchConfig::default(),
+                Path::new("/tmp"),
+                3,
+                &binary,
+                deadline,
+            )
+            .unwrap()
+            .unwrap();
+        let (expected, producer) = {
+            let owner = scenario.observation.lock().unwrap();
+            let frozen = owner.as_ref().unwrap();
+            (frozen.identity, frozen.producer.clone())
+        };
+        assert!(
+            scenario
+                .take_identity(deadline + Duration::from_millis(1))
+                .is_err()
+        );
+        assert_eq!(scenario.take_identity(plan.deadline()).unwrap(), expected);
+        assert!(scenario.take_identity(plan.deadline()).is_err());
+        let process = BackendProcessId::new_v7();
+        RoleProcessReceipt {
+            schema_version: 1,
+            session_id: producer.session_id.clone(),
+            launch_id: "exchange-test-launch".into(),
+            role: novarocks_failpoint::session::SessionRole::Be,
+            process_id: process.to_string(),
+        }
+        .write_private(&producer.process_receipt)
+        .unwrap();
+        assert!(scenario.verify_producer(process).is_ok());
+        assert!(
+            scenario
+                .verify_producer(BackendProcessId::new_v7())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn normal_close_producer_keeps_original_bigint_source_and_exact_constant_references() {
+        use arrow_schema::{DataType, Field};
+        use novarocks_physical_plan::{ConstantPoolId, ExprKind, FragmentId, NodeKind};
+        use novarocks_plan_codec::{
+            physical_package_v2::{PackageDecodeLimits, decode_fragment_package},
+            resource_preflight_v2::FragmentDecodeResourceModel,
+        };
+        use novarocks_type_contract::{
+            CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
+        };
+        struct FixtureCompileControl(Instant);
+        impl PureCompileControl for FixtureCompileControl {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                if Instant::now() >= self.0 {
+                    Err(CompileControlError::DeadlineExceeded)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let control = FixtureCompileControl(Instant::now() + Duration::from_secs(10));
+        let model = FragmentDecodeResourceModel::try_new(&control).unwrap();
+        for multicast in [false, true] {
+            // Decode the same checked compiled-only source the scenario sends.
+            // No legacy tree or second, handwritten constant namespace is used.
+            let frozen = compiled_fragment(2, 1, None, RawSink::Stream { multicast }, &ROWS);
+            let wire = novarocks_proto_models::physical_package_v2::FragmentPackage::decode(
+                frozen.package.as_ref(),
+            )
+            .unwrap();
+            let package = decode_fragment_package(
+                frozen.package.as_ref(),
+                &model,
+                &PackageDecodeLimits::FROZEN,
+                &control,
+            )
+            .unwrap();
+            let ty = FunctionValueType::new(DataType::Int64, false);
+            let fragment = package.fragment();
+            assert_eq!(fragment.id(), FragmentId::new(2));
+            assert_eq!(fragment.dop_domain().min, 1);
+            assert_eq!(fragment.dop_domain().max, 1);
+            let root = fragment.root();
+            let node = &fragment.nodes()[&root];
+            let [output] = node.output.columns.as_ref() else {
+                panic!("the original producer has one BIGINT output");
+            };
+            assert_eq!(fragment.values()[output].ty, ty);
+            assert!(package.calls().entries().is_empty());
+            assert_eq!(package.cuts().outbound.len(), if multicast { 2 } else { 1 });
+            let fields = wire.source_fields.as_ref().unwrap();
+            assert!(fields.shape.is_some());
+            assert_eq!(fields.field_facts.len(), 1);
+            assert!(
+                wire.fragment
+                    .as_ref()
+                    .unwrap()
+                    .call_requests
+                    .as_ref()
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+            assert!(wire.calls.as_ref().unwrap().entries.is_empty());
+            let [record] = wire.constants.as_slice() else {
+                panic!("the original five rows must share one actual constant pool");
+            };
+            assert_eq!(record.id, 0);
+            assert_eq!(fields.field_facts[0].field_id, record.source_field_id);
+            assert!(record.value_type_id.is_some());
+            assert!(record.source_field_id.is_some());
+            let mut reader = arrow_ipc::reader::StreamReader::try_new(
+                std::io::Cursor::new(&record.arrow_ipc[..]),
+                None,
+            )
+            .unwrap();
+            let batch = reader.next().unwrap().unwrap();
+            assert_eq!(batch.num_columns(), 1);
+            assert_eq!(
+                batch.schema().field(0),
+                &Field::new("v", DataType::Int64, false)
+            );
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            assert_eq!(values.null_count(), 0);
+            assert_eq!(values.values().as_ref(), &ROWS);
+            assert!(reader.next().is_none());
+            let pools = package.constants().entries();
+            assert_eq!(pools.len(), 1);
+            let pool = &pools[&ConstantPoolId::new(record.id)];
+            assert_eq!(pool.value_type(), &ty);
+            assert_eq!(
+                pool.field_ref().as_ref(),
+                &Field::new("v", DataType::Int64, false)
+            );
+            let NodeKind::Values { rows } = &node.kind else {
+                panic!("the exact producer must remain an actual VALUES source");
+            };
+            assert_eq!(rows.len(), ROWS.len());
+            for (ordinal, row) in rows.iter().enumerate() {
+                let [id] = row.as_ref() else {
+                    panic!("each original row has one BIGINT expression");
+                };
+                let value = fragment.expressions().get(*id).unwrap();
+                assert_eq!(value.owner, root);
+                assert_eq!(value.ty, ty);
+                let ExprKind::Constant(reference) = &value.kind else {
+                    panic!("the typed v2 decoder must keep the actual admitted constant reference");
+                };
+                assert_eq!(reference.pool, ConstantPoolId::new(record.id));
+                assert_eq!(reference.ordinal, u32::try_from(ordinal).unwrap());
+            }
+        }
     }
 }

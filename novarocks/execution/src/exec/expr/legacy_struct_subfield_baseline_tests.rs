@@ -74,7 +74,7 @@ fn raw(
     a: ArrayRef,
     b: ArrayRef,
     target: Option<DataType>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (mut arena, args, chunk) = setup(a, b);
     let expr = target
         .map(|t| arena.push_typed(ExprNode::SlotId(SlotId::new(999)), t))
@@ -120,7 +120,7 @@ fn original_subfield_array_offsets_struct_nulls_top_nulls_and_slices_preserved()
         ));
         if a.is_empty() {
             assert_eq!(
-                raw(true, a, names(Some("Chosen"), 0), Some(target)).unwrap_err(),
+                (raw(true, a, names(Some("Chosen"), 0), Some(target)).unwrap_err()).to_string(),
                 "__array_struct_subfield field-name argument is empty"
             );
             continue;
@@ -184,11 +184,14 @@ fn original_subfield_field_name_full_errors_exact_case_constant_and_type_order()
                 format!("{prefix} field-name argument must be VARCHAR"),
             ),
         ] {
-            assert_eq!(raw(array, a.clone(), b, None).unwrap_err(), error);
+            assert_eq!(
+                (raw(array, a.clone(), b, None).unwrap_err()).to_string(),
+                error
+            );
         }
         let input: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
         assert_eq!(
-            raw(array, input.clone(), names(None, 2), None).unwrap_err(),
+            (raw(array, input.clone(), names(None, 2), None).unwrap_err()).to_string(),
             format!(
                 "{prefix} expects {}Array, got Int32",
                 if array { "List" } else { "Struct" }
@@ -242,16 +245,22 @@ fn original_subfield_array_untyped_target_retains_original_struct_cast_failure()
     let cause = arrow::compute::cast(&child, &target)
         .unwrap_err()
         .to_string();
-    assert_eq!(
-        raw(true, a, names(Some("Chosen"), 1), None).unwrap_err(),
-        format!(
-            "__array_struct_subfield: failed to cast output Int32 -> {:?}: {}",
-            target, cause
-        )
-    );
+    let failure = raw(true, a, names(Some("Chosen"), 1), None).unwrap_err();
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    let mut source: &(dyn std::error::Error + 'static) = &failure;
+    loop {
+        if let Some(original) = source.downcast_ref::<arrow::error::ArrowError>() {
+            assert_eq!(original.to_string(), cause);
+            break;
+        }
+        source = source
+            .source()
+            .expect("subfield retains its original output CAST refusal");
+    }
 }
 #[test]
-fn original_subfield_child_evaluation_order_ignored_tail_and_original_arity_panic() {
+fn subfield_exact_children_keep_order_and_wrong_prepared_arity_is_typed() {
     let (arena, args, chunk) = setup(
         structure(Arc::new(Int32Array::from(vec![1])), None),
         names(Some("Chosen"), 1),
@@ -270,17 +279,25 @@ fn original_subfield_child_evaluation_order_ignored_tail_and_original_arity_pani
             }
         };
         assert_eq!(
-            call(&[ExprId(usize::MAX), args[1]]).unwrap_err(),
+            (call(&[ExprId(usize::MAX), args[1]]).unwrap_err()).to_string(),
             "invalid ExprId"
         );
         assert_eq!(
-            call(&[args[0], ExprId(usize::MAX)]).unwrap_err(),
+            (call(&[args[0], ExprId(usize::MAX)]).unwrap_err()).to_string(),
             "invalid ExprId"
         );
-        assert!(catch_unwind(AssertUnwindSafe(|| call(&[]))).is_err());
-        assert!(catch_unwind(AssertUnwindSafe(|| call(&[args[0]]))).is_err());
-        if !array {
-            assert!(call(&[args[0], args[1], ExprId(usize::MAX)]).is_ok());
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        for bad in [
+            vec![],
+            vec![args[0]],
+            vec![args[0], args[1], ExprId(usize::MAX)],
+        ] {
+            let error = call(&bad).unwrap_err();
+            assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+            assert_eq!(
+                error.failure_fact().reason(),
+                crate::runtime::fragment::ExecutionReason::ExpressionContract.reason()
+            );
         }
     }
 }
@@ -299,7 +316,7 @@ fn original_subfield_array_full_name_scope_and_selected_single_row_counterexampl
         Some("Chosen"),
     ]));
     assert_eq!(
-        raw(true, a.clone(), b.clone(), Some(target.clone())).unwrap_err(),
+        (raw(true, a.clone(), b.clone(), Some(target.clone())).unwrap_err()).to_string(),
         "__array_struct_subfield field-name argument must be constant"
     );
     for row in [0, 2] {
@@ -307,7 +324,7 @@ fn original_subfield_array_full_name_scope_and_selected_single_row_counterexampl
         assert_eq!(output.len(), 1);
     }
     assert_eq!(
-        raw(true, a.slice(1, 1), b.slice(1, 1), Some(target)).unwrap_err(),
+        (raw(true, a.slice(1, 1), b.slice(1, 1), Some(target)).unwrap_err()).to_string(),
         "__array_struct_subfield field 'other' does not exist"
     );
 }
@@ -323,19 +340,20 @@ fn original_subfield_array_wrongcase_on_null_and_empty_actual_invocations() {
         Some(vec![false, false]),
     );
     assert_eq!(
-        raw(
+        (raw(
             true,
             a.clone(),
             names(Some("chosen"), 2),
             Some(target.clone())
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "__array_struct_subfield field 'chosen' does not exist"
     );
     // An actual empty invocation evaluates an empty field-name column; this is
     // distinct from a caller that never invokes the function for an empty use.
     assert_eq!(
-        raw(true, a.slice(0, 0), names(Some("Chosen"), 0), Some(target)).unwrap_err(),
+        (raw(true, a.slice(0, 0), names(Some("Chosen"), 0), Some(target)).unwrap_err()).to_string(),
         "__array_struct_subfield field-name argument is empty"
     );
 }
@@ -381,7 +399,7 @@ fn original_subfield_array_constant_expr_empty_chunk_and_null_input_do_not_skip_
         )
         .unwrap_err();
         assert_eq!(
-            error,
+            (error).to_string(),
             if rows == 0 {
                 "__array_struct_subfield field-name argument is empty"
             } else {
@@ -413,7 +431,7 @@ fn original_subfield_array_arena_arity_validation_precedes_all_children() {
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
         );
         assert_eq!(
-            arena.eval(expr, &chunk).unwrap_err(),
+            (arena.eval(expr, &chunk).unwrap_err()).to_string(),
             format!("{} expects 2 to 2 arguments, got {n}", metadata.name)
         );
     }

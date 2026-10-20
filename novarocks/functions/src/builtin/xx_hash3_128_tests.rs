@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use super::*;
+use crate::kernel_control::internal;
 use crate::{EvaluatedArgument, FunctionValueType, ScalarEvaluationInstance};
 use arrow_array::{LargeBinaryArray, LargeStringArray};
 use std::sync::{Arc, Mutex};
@@ -145,13 +146,19 @@ fn xx_hash3_128_selected_large_constant_compact_and_sparse_addresses_keep_origin
     assert_eq!(array.value(0), expected.to_be_bytes());
 }
 #[test]
-fn xx_hash3_128_legacy_output_cast_callback_preserves_full_error_before_bounds() {
+fn xx_hash3_128_raw_output_cast_keeps_bounded_detail_and_complete_arrow_source() {
     let input = prepare_legacy_input(Arc::new(StringArray::from(vec!["hello"])), 0).unwrap();
     let name = "long_target_".to_string() + &"x".repeat(1025);
     let target =
         DataType::Struct(vec![arrow_schema::Field::new(&name, DataType::Int64, true)].into());
     let error = evaluate_legacy(&[input], 1, Some(&target)).unwrap_err();
-    assert!(error.starts_with("xx_hash3_128: failed to cast output:"));
-    assert!(error.contains(&name));
-    assert!(error.len() > 512);
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert!(error.to_string().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
+    let mut cause: &dyn std::error::Error = &error;
+    while !cause.is::<arrow_schema::ArrowError>() {
+        cause = cause.source().unwrap();
+    }
+    assert!(cause.to_string().contains(&name));
+    assert!(cause.to_string().len() > 512);
 }

@@ -255,7 +255,7 @@ mod checked_constant_tests {
                 assert!(trace.len() < at, "no callback after original refusal");
             }
             trace.push((phase, units));
-            match self.stop {
+            match self.stop.clone() {
                 Some((at, error)) if trace.len() == at => Err(error),
                 _ => Ok(()),
             }
@@ -338,7 +338,7 @@ mod checked_constant_tests {
             CompileControlError::ResourceExhausted,
         ] {
             for at in 1..=trace.len() {
-                let original_control = control(Some((at, error)));
+                let original_control = control(Some((at, error.clone())));
                 let failure = convert_value_domain_with_catalog(
                     crate::functions::builtin_sql_function_catalog(),
                     source.clone(),
@@ -348,7 +348,7 @@ mod checked_constant_tests {
                     &original_control,
                 )
                 .unwrap_err();
-                assert_eq!(failure.control_error(), Some(error));
+                assert_eq!(failure.control_error(), Some(error.clone()));
                 assert_eq!(*original_control.trace.lock().unwrap(), trace[..at]);
             }
         }

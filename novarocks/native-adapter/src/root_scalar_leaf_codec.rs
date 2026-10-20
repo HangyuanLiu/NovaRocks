@@ -77,7 +77,14 @@ impl std::fmt::Display for NativeScalarLeafError {
         })
     }
 }
-impl std::error::Error for NativeScalarLeafError {}
+impl std::error::Error for NativeScalarLeafError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Leaf(cause) => Some(cause),
+            _ => None,
+        }
+    }
+}
 impl From<ScalarLeafError> for NativeScalarLeafError {
     fn from(value: ScalarLeafError) -> Self {
         Self::Leaf(value)
@@ -829,8 +836,12 @@ mod tests {
             value.typed_binding().clone(),
             None,
             fixture_storage.clone(),
-        )?;
-        let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], fixture_storage)?);
+        )
+        .map_err(|cause| cause.to_string())?;
+        let schema = Arc::new(
+            ChunkSchema::try_new_typed(vec![slot], fixture_storage)
+                .map_err(|cause| cause.to_string())?,
+        );
         let tracker = novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
             "scalar leaf source fixture",
         );
@@ -1567,5 +1578,27 @@ mod tests {
             assert!(weak_array.upgrade().is_none());
             assert!(weak_field.upgrade().is_none());
         }
+    }
+}
+
+impl novarocks_execution_contract::failure::FailureProjection for NativeScalarLeafError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let (class, code) = match self {
+            Self::Shape => (FailureClass::Invariant, 400),
+            Self::EmptyInput => (FailureClass::Invariant, 401),
+            Self::Slot => (FailureClass::Invariant, 402),
+            Self::Type => (FailureClass::Invariant, 403),
+            Self::LogicalMetadata => (FailureClass::Invariant, 404),
+            Self::UnsupportedContainer => (FailureClass::Invariant, 405),
+            Self::ScratchLimit => (FailureClass::Resource, 406),
+            Self::Leaf(cause) => return cause.failure_fact(),
+            Self::ChangedInput => (FailureClass::Invariant, 408),
+            Self::Failed => (FailureClass::Invariant, 409),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
+        )
     }
 }

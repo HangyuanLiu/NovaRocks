@@ -27,7 +27,7 @@ use novarocks_types::SlotId;
 use std::sync::Arc;
 
 #[test]
-fn legacy_regexp_count_long_invalid_literal_preserves_entire_original_error_string() {
+fn regexp_count_invalid_literal_retains_original_sdk_and_bounds_the_diagnostic() {
     // An unclosed character class is invalid without relying on nesting limits.
     let pattern = format!("[{}", "a".repeat(1024));
     let original_error = regex::Regex::new(&pattern).unwrap_err();
@@ -55,7 +55,45 @@ fn legacy_regexp_count_long_invalid_literal_preserves_entire_original_error_stri
         let actual =
             eval_string_function("regexp_count", &arena, source, &[source, literal], &chunk)
                 .unwrap_err();
-        assert!(actual.len() > 512);
-        assert_eq!(actual.as_bytes(), expected.as_bytes());
+        assert_regex_failure(&actual, &original_error.to_string(), &expected);
     }
+}
+
+// These cheap dispatcher probes share the actual regex SDK source oracle.
+// The journal's stable Data reason is independent of its bounded local text.
+pub(super) fn assert_regex_failure(
+    error: &crate::runtime::fragment::ExecutionFailure,
+    sdk: &str,
+    detail: &str,
+) {
+    use novarocks_failure_contract::{BoundedDetail, FailureProjection};
+    assert_eq!(
+        error.failure_fact(),
+        novarocks_functions::DataFailureReason::InvalidValue.failure_fact()
+    );
+    assert_eq!(error.detail(), BoundedDetail::truncating(detail).as_str());
+    assert!(error.detail().len() <= 512);
+    let mut source: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(original) = source.downcast_ref::<regex::Error>() {
+            assert!(matches!(original, regex::Error::Syntax(_)));
+            assert_eq!(original.to_string(), sdk);
+            break;
+        }
+        source = source
+            .source()
+            .expect("original regex compiler error must survive required-row propagation");
+    }
+}
+pub(super) fn assert_regex_contract(
+    error: crate::runtime::fragment::ExecutionFailure,
+    detail: &str,
+) {
+    let crate::runtime::fragment::ExecutionFailureCause::Kernel(
+        novarocks_functions::KernelFailure::Internal(original),
+    ) = error.cause()
+    else {
+        panic!("prepared regex carrier failure must remain outer: {error:?}");
+    };
+    assert_eq!(original.message(), detail);
 }

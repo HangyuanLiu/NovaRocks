@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::ExprId;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::function::pattern_memo::PatternMemo;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
 use regex::Regex;
 use std::sync::Arc;
@@ -26,7 +28,12 @@ pub fn eval_regexp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(expression_contract(
+            "regexp requires exactly two prepared arguments",
+        ));
+    }
     let _ = expr;
     let left = arena.eval(args[0], chunk)?;
     let right = arena.eval(args[1], chunk)?;
@@ -34,13 +41,18 @@ pub fn eval_regexp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let left = left
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "regexp expects VARCHAR as first argument".to_string())?;
+        .ok_or_else(|| expression_contract("regexp expects VARCHAR as first argument"))?;
     let right = right
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "regexp expects VARCHAR as second argument".to_string())?;
+        .ok_or_else(|| expression_contract("regexp expects VARCHAR as second argument"))?;
 
     let mut patterns = PatternMemo::new();
+    if left.len() != chunk.len() || right.len() != chunk.len() {
+        return Err(expression_contract(
+            "regexp prepared argument lengths differ from their batch",
+        ));
+    }
     let mut out = Vec::with_capacity(chunk.len());
     for row in 0..chunk.len() {
         if left.is_null(row) || right.is_null(row) {
@@ -49,8 +61,17 @@ pub fn eval_regexp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         }
 
         let regex = patterns
-            .get_or_compile(right.value(row), Regex::new)
-            .map_err(|e| format!("regexp: invalid pattern: {}", e))?;
+            .get_or_compile(right.value(row), |pattern| {
+                Regex::new(pattern).map_err(Arc::new)
+            })
+            .map_err(|source| {
+                ExecutionFailure::from(
+                    novarocks_functions::builtin::required_regex_compile_failure(
+                        row,
+                        Arc::clone(source),
+                    ),
+                )
+            })?;
         out.push(Some(regex.is_match(left.value(row))));
     }
 

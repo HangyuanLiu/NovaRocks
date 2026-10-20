@@ -29,6 +29,7 @@ use super::aggregate_fixture::{
 use super::family_fixture::{FixtureControl, cell, int64};
 use super::*;
 use crate::exec::operators::compiled_aggregate::CompiledAggregateProcessorFactory;
+use crate::exec::pipeline::test_driver::TestDriver;
 use crate::runtime::fragment::ExecutionFailureCause;
 use arrow::array::{
     BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, Int8Array, Int16Array,
@@ -699,16 +700,20 @@ fn partial_chunks(f: &Fixture, offset: usize, len: usize) -> Vec<Chunk> {
     operator.set_mem_tracker(MemTracker::new_root("grouped-fixture-partial"));
     prepare_typed_fixture_operator(operator.as_mut());
     let state = RuntimeState::default();
-    let processor = operator.as_processor_mut().unwrap();
+    let mut processor = TestDriver::new(operator.as_mut(), &state);
     processor
-        .push_chunk(
-            &state,
-            Chunk::new_like(f.input.record_batch().slice(offset, len), &f.input),
-        )
+        .input_without_output(Chunk::new_like(
+            f.input.record_batch().slice(offset, len),
+            &f.input,
+        ))
         .unwrap();
-    processor.set_finishing(&state).unwrap();
+    processor.signal_eos().unwrap();
     let mut output = Vec::new();
-    while let Some(chunk) = processor.pull_chunk(&state).unwrap() {
+    while let Some(chunk) = processor
+        .advance_to_boundary()
+        .map(|step| step.output)
+        .unwrap()
+    {
         output.push(chunk);
     }
     output
@@ -775,13 +780,13 @@ fn try_final_chunks_tracked(
     operator.set_mem_tracker(tracker);
     prepare_typed_fixture_operator(operator.as_mut());
     let state = RuntimeState::default();
-    let processor = operator.as_processor_mut().unwrap();
+    let mut processor = TestDriver::new(operator.as_mut(), &state);
     for chunk in chunks {
-        processor.push_chunk(&state, chunk)?;
+        processor.input_without_output(chunk)?;
     }
-    processor.set_finishing(&state)?;
+    processor.signal_eos()?;
     let mut output = Vec::new();
-    while let Some(chunk) = processor.pull_chunk(&state)? {
+    while let Some(chunk) = processor.advance_to_boundary().map(|step| step.output)? {
         output.push(chunk);
     }
     Ok(output)
@@ -840,29 +845,36 @@ fn compiled_grouped_topn_keeps_all_contributions_within_its_distinct_key_bound()
         processor.set_mem_tracker(tracker.clone());
         prepare_typed_fixture_operator(&mut processor);
         let state = RuntimeState::default();
+        let mut processor = TestDriver::new(&mut processor, &state);
         for (offset, len) in [(0, 3), (3, 2), (5, 4), (9, 2), (11, 4)] {
             for chunk in partial_chunks(&f, offset, len) {
-                processor.push_chunk(&state, chunk).unwrap();
+                processor.input_without_output(chunk).unwrap();
                 assert!(
                     processor
+                        .operator()
+                        .kernel_for_test()
                         .candidates
                         .as_ref()
                         .map_or(0, |set| set.entries.len())
                         <= limit
                 );
                 assert!(
-                    !processor.has_output(),
+                    matches!(processor.next(), NextStep::NeedInput),
                     "no unfinished state prefix escapes"
                 );
             }
         }
-        processor.set_finishing(&state).unwrap();
+        processor.signal_eos().unwrap();
         let mut output = Vec::new();
-        while let Some(chunk) = processor.pull_chunk(&state).unwrap() {
+        while let Some(chunk) = processor
+            .advance_to_boundary()
+            .map(|step| step.output)
+            .unwrap()
+        {
             output.push(chunk);
         }
         assert_eq!(collect_final(&f, output), oracle(limit, asc, nulls_first));
-        assert!(processor.is_finished());
+        assert!(matches!(processor.next(), NextStep::Finished));
         assert_eq!(tracker.current(), 0);
     }
 }
@@ -882,21 +894,32 @@ fn compiled_grouped_topn_cancel_destroys_live_owners_and_keeps_the_first_cause()
     processor.set_mem_tracker(tracker.clone());
     prepare_typed_fixture_operator(&mut processor);
     let state = RuntimeState::default();
+    let mut processor = TestDriver::new(&mut processor, &state);
     for chunk in partial_chunks(&f, 0, 3) {
-        processor.push_chunk(&state, chunk).unwrap();
+        processor.input_without_output(chunk).unwrap();
     }
     assert!(tracker.current() > 0);
-    error.set_error("stop the actual grouped consumer after accumulation");
-    let first = processor.push_chunk(&state, f.input.clone()).unwrap_err();
+    error.set_error(novarocks_functions::KernelFailure::Internal(
+        novarocks_functions::KernelDiagnostic::new(
+            &("stop the actual grouped consumer after accumulation"),
+        ),
+    ));
+    let first = processor.input_without_output(f.input.clone()).unwrap_err();
     assert_eq!(
         first.cause(),
         &ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
     );
     assert_eq!(tracker.current(), 0);
-    assert_eq!(processor.pull_chunk(&state).unwrap_err(), first);
-    assert_eq!(processor.set_finishing(&state).unwrap_err(), first);
-    processor.cancel();
-    assert_eq!(processor.close().unwrap_err(), first);
+    assert_eq!(
+        processor
+            .advance_to_boundary()
+            .map(|step| step.output)
+            .unwrap_err(),
+        first
+    );
+    assert_eq!(processor.signal_eos().unwrap_err(), first);
+    processor.operator_mut().cancel();
+    processor.operator_mut().close().unwrap();
 }
 
 /// Independent declared scalar values. No Arrow row encoding or candidate
@@ -1164,12 +1187,15 @@ fn compiled_grouped_topn_complete_key_domains_preserve_order_types_and_contribut
             processor.set_mem_tracker(tracker.clone());
             prepare_typed_fixture_operator(&mut processor);
             let state = RuntimeState::default();
+            let mut processor = TestDriver::new(&mut processor, &state);
             let batch_size = rows.len() / 3;
             for offset in (0..rows.len()).step_by(batch_size) {
                 for chunk in partial_chunks(&f, offset, batch_size) {
-                    processor.push_chunk(&state, chunk).unwrap();
+                    processor.input_without_output(chunk).unwrap();
                     assert!(
                         processor
+                            .operator()
+                            .kernel_for_test()
                             .candidates
                             .as_ref()
                             .map_or(0, |set| set.entries.len())
@@ -1177,9 +1203,13 @@ fn compiled_grouped_topn_complete_key_domains_preserve_order_types_and_contribut
                     );
                 }
             }
-            processor.set_finishing(&state).unwrap();
+            processor.signal_eos().unwrap();
             let mut intermediate = Vec::new();
-            while let Some(chunk) = processor.pull_chunk(&state).unwrap() {
+            while let Some(chunk) = processor
+                .advance_to_boundary()
+                .map(|step| step.output)
+                .unwrap()
+            {
                 intermediate.push(chunk);
             }
             let expected = complete_key_oracle(&rows, &ranking, limit);

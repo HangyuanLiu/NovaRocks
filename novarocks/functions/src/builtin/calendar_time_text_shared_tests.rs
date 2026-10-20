@@ -97,7 +97,7 @@ fn shared_time_core_refusal_at_every_actual_callback_preserves_seven_causes_and_
     }
 }
 #[test]
-fn shared_time_core_keeps_long_raw_carrier_error() {
+fn shared_time_core_keeps_bounded_carrier_fact_without_retaining_the_type() {
     let dtype = arrow_schema::DataType::Timestamp(
         arrow_schema::TimeUnit::Microsecond,
         Some(Arc::<str>::from("z".repeat(800))),
@@ -107,11 +107,17 @@ fn shared_time_core_keeps_long_raw_carrier_error() {
     let dtype = arrow_schema::DataType::List(field);
     let array = arrow_array::new_null_array(&dtype, 1);
     let mut work = EvaluationCheckpoints::new(&LegacyControl);
-    let error = datetime_seconds(&array, &mut work)
-        .unwrap_err()
-        .into_legacy();
-    assert_eq!(error, format!("unsupported datetime input type: {dtype:?}"));
-    assert!(error.len() > 512);
+    let error = datetime_seconds(&array, &mut work).unwrap_err();
+    use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureProjection};
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(
+        error.to_string(),
+        BoundedDetail::truncating_display(format_args!(
+            "unsupported datetime input type: {dtype:?}"
+        ))
+        .as_str()
+    );
+    assert!(error.to_string().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
 }
 #[test]
 fn shared_time_core_empty_broadcast_and_original_formatter_bug() {
@@ -140,7 +146,107 @@ fn shared_time_core_empty_broadcast_and_original_formatter_bug() {
     assert_eq!(
         format_output(&[], &format, 1, &mut work)
             .unwrap_err()
-            .into_legacy(),
+            .to_string(),
         "time_format argument length mismatch"
     );
+}
+
+#[test]
+fn time_text_actual_duration_limits_and_virtual_backing_refuse_without_wrap_or_giant_allocation() {
+    assert_eq!(
+        parse_hms_duration_to_seconds("2562047788015215:30:07"),
+        Some(i64::MAX)
+    );
+    assert_eq!(
+        parse_hms_duration_to_seconds("2562047788015215:30:08"),
+        None
+    );
+    assert_eq!(
+        parse_hms_duration_to_seconds("9223372036854775807:00:00"),
+        None
+    );
+    let mut work = EvaluationCheckpoints::new(&LegacyControl);
+    let error = format_output(
+        &[Some(1)],
+        &StringArray::from(vec!["%H"]),
+        usize::MAX,
+        &mut work,
+    )
+    .unwrap_err();
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(error.failure_fact().class(), FailureClass::Representation);
+    let facts = error.failure_fact().representation().unwrap();
+    assert_eq!(
+        facts.boundary,
+        novarocks_failure_contract::RepresentationBoundary::SingleOutput
+    );
+    assert_eq!(facts.extent_limit, Some(isize::MAX as u64));
+    assert_eq!(
+        facts.required, None,
+        "actual usize::MAX row backing exceeds u64 bytes; no invented narrowed count"
+    );
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .is::<std::alloc::LayoutError>()
+    );
+    let error = TimeTextError::Extent {
+        required: i32::MAX as u128 + 1,
+        largest: 8,
+        prefix: 19,
+    };
+    let facts = error.failure_fact().representation().unwrap();
+    assert_eq!(
+        facts.boundary,
+        novarocks_failure_contract::RepresentationBoundary::SingleOutput
+    );
+    assert_eq!(facts.extent_limit, Some(i32::MAX as u64));
+    assert_eq!(facts.representable_prefix, Some(19));
+    let error = TimeTextError::Arrow(arrow_schema::ArrowError::MemoryError(
+        "invalid value".into(),
+    ));
+    assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .is::<arrow_schema::ArrowError>()
+    );
+}
+
+#[test]
+fn time_text_temporal_value_cast_is_data_but_unsupported_frozen_cast_is_not() {
+    let mut work = EvaluationCheckpoints::new(&LegacyControl);
+    let array: ArrayRef = Arc::new(arrow_array::Date32Array::from(vec![0, i32::MAX]));
+    let DurationCastError::Data(source) = duration_cast_source(&array, &mut work).unwrap_err()
+    else {
+        panic!("actual temporal value formatting failure must remain Data");
+    };
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(source.failure_fact().class(), FailureClass::Data);
+    assert!(
+        std::error::Error::source(&source)
+            .unwrap()
+            .is::<arrow_schema::ArrowError>()
+    );
+    let row = source.row_error(7);
+    assert_eq!(row.selected_ordinal(), 7);
+    assert_eq!(row.failure_fact(), source.failure_fact());
+    let array: ArrayRef = Arc::new(arrow_array::StructArray::new_empty_fields(1, None));
+    let DurationCastError::Outer(source) = duration_cast_source(&array, &mut work).unwrap_err()
+    else {
+        panic!("unsupported frozen type cannot be a value-data failure");
+    };
+    assert_eq!(source.failure_fact().class(), FailureClass::Invariant);
+    let source = TimeTextError::Extent {
+        required: i32::MAX as u128 + 17,
+        largest: i32::MAX as u128 + 1,
+        prefix: 2,
+    };
+    let facts = source.failure_fact().representation().unwrap();
+    assert_eq!(
+        facts.boundary,
+        novarocks_failure_contract::RepresentationBoundary::MinimumUnit
+    );
+    assert_eq!(facts.required, Some(i32::MAX as u64 + 1));
+    assert_eq!(facts.representable_prefix, Some(2));
 }

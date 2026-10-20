@@ -24,6 +24,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+mod failure;
 mod nljoin_build_sink;
 mod nljoin_probe_processor;
 mod nljoin_shared;

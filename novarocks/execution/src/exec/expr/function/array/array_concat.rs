@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, ListArray, make_array};
 use arrow::datatypes::{DataType, Field, Fields};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
@@ -69,28 +71,40 @@ pub fn eval_array_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     if args.is_empty() {
-        return Err(("array_concat expects at least one argument".to_string()).into());
+        return Err(expression_contract(
+            "array_concat expects at least one argument",
+        ));
     }
 
     let mut list_arrays = Vec::with_capacity(args.len());
     for arg in args {
         let arr = arena.eval(*arg, chunk)?;
-        arr.as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| format!("array_concat expects ListArray, got {:?}", arr.data_type()))?;
+        arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+            expression_contract(format_args!(
+                "array_concat expects ListArray, got {:?}",
+                arr.data_type()
+            ))
+        })?;
+        super::common::validate_rows(arr.len(), chunk.len(), "array_concat source")?;
         list_arrays.push(arr);
     }
 
     let mut output_field = match arena.data_type(expr) {
         Some(DataType::List(field)) => field.clone(),
-        _ => match list_arrays[0].data_type() {
+        Some(other) => {
+            return Err(expression_contract(format_args!(
+                "array_concat output must be List, got {other:?}"
+            )));
+        }
+        None => match list_arrays[0].data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(
-                    (format!("array_concat output type must be List, got {:?}", other)).into(),
-                );
+                return Err(expression_contract(format_args!(
+                    "array_concat output type must be List, got {:?}",
+                    other
+                )));
             }
         },
     };
@@ -125,12 +139,12 @@ pub fn eval_array_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     let mut offsets = Vec::with_capacity(chunk.len() + 1);
     offsets.push(0_i32);
-    let mut current: i64 = 0;
+    let mut current = 0i32;
     let mut null_builder = NullBufferBuilder::new(chunk.len());
 
     for row in 0..chunk.len() {
         let mut row_null = false;
-        let mut row_len: i64 = 0;
+        let mut row_len = 0u128;
 
         for arr in &list_arrays {
             let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
@@ -140,7 +154,7 @@ pub fn eval_array_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 break;
             }
             let offs = list.value_offsets();
-            row_len += (offs[row_idx + 1] - offs[row_idx]) as i64;
+            row_len += (offs[row_idx + 1] - offs[row_idx]) as u128;
         }
 
         if row_null {
@@ -149,6 +163,9 @@ pub fn eval_array_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             continue;
         }
 
+        let next = novarocks_functions::aggregate_scalar::checked_list_output_offset_u128(
+            current, row_len,
+        )?;
         for (src_idx, arr) in list_arrays.iter().enumerate() {
             let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
             let row_idx = super::common::row_index(row, list.len());
@@ -160,20 +177,23 @@ pub fn eval_array_concat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             }
         }
 
-        current += row_len;
-        if current > i32::MAX as i64 {
-            return Err(("array_concat offset overflow".to_string()).into());
-        }
+        current = next;
         offsets.push(current as i32);
         null_builder.append_non_null();
     }
 
     let out_values = make_array(mutable.freeze());
-    let list = ListArray::new(
+    let list = ListArray::try_new(
         output_field,
         OffsetBuffer::new(offsets.into()),
         out_values,
         null_builder.finish(),
-    );
+    )
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "array_concat constructor",
+            source,
+        )
+    })?;
     Ok(Arc::new(list) as ArrayRef)
 }

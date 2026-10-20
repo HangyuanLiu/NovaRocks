@@ -28,13 +28,11 @@ fn build_builtin_kernel_set(
     functions: &[AggFunction],
     input_types: &[Option<DataType>],
     argument_types: &[Vec<DataType>],
-) -> Result<agg::AggKernelSet, String> {
+) -> Result<agg::AggKernelSet, Box<dyn std::error::Error>> {
     let mut builder = agg::ExecutionFunctionSetBuilder::new();
-    novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
-        .map_err(|error| error.to_string())?;
-    agg::contribute_builtin_aggregate_implementations(&mut builder)
-        .map_err(|error| error.to_string())?;
-    let function_set = builder.seal().map_err(|error| error.to_string())?;
+    novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())?;
+    agg::contribute_builtin_aggregate_implementations(&mut builder)?;
+    let function_set = builder.seal()?;
     let selected = functions
         .iter()
         .zip(argument_types)
@@ -42,10 +40,14 @@ fn build_builtin_kernel_set(
             function_set
                 .catalog()
                 .resolve_aggregate_trusted(&function.name, argument_types)
-                .map_err(|error| error.to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    agg::build_kernel_set(&function_set, functions, input_types, &selected)
+    Ok(agg::build_kernel_set(
+        &function_set,
+        functions,
+        input_types,
+        &selected,
+    )?)
 }
 
 fn run_two_phase_i64(name: &str, part1: Vec<Option<i64>>, part2: Vec<Option<i64>>) -> Option<f64> {

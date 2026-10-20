@@ -35,12 +35,18 @@
 //! order the kernel produced them, so the operator preserves its input's
 //! order and every pass-through ordering. Rows stay on their driver.
 //!
-//! Open host obligation: the produced relation of one input batch is retained
-//! until its output chunks are pulled. The step grant bounds each page, not
-//! the expansion of a whole batch; memory admission for that expansion is not
-//! yet loaned to this host.
+//! The invocation currently retains its relation and parent-order selection.
+//! Output arrays are gathered one page per driver step. The function's grant
+//! bounds each kernel page, not the expansion of a whole input batch; memory
+//! admission and incremental invocation remain obligations of the MEM work.
 
-use std::collections::VecDeque;
+use crate::exec::fragment::error::{
+    FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
+};
+use crate::exec::pipeline::operator::OperatorLifecycle;
+#[path = "compiled_table_failure.rs"]
+mod failure;
+use failure::{CompiledTableFailure, CompiledTableFailureKind};
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, UInt64Array, new_empty_array};
@@ -60,9 +66,15 @@ use novarocks_types::SlotId;
 use super::compiled_expression::RuntimeKernelControl;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{
-    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator,
+    ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{Transform, TransformKernel},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
@@ -94,12 +106,15 @@ impl CompiledTableFunctionProcessorFactory {
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let at = node.index();
         let nodes = program.graph().nodes();
-        let graph_node = nodes
-            .get(at)
-            .ok_or_else(|| format!("compiled TableFunction node {at} is absent"))?;
+        let graph_node = nodes.get(at).ok_or_else(|| {
+            program_binding_failure(
+                PlanBindingKind::MissingAssignment,
+                format!("compiled TableFunction node {at} is absent"),
+            )
+        })?;
         let ProgramNodeKind::TableFunction {
             input,
             param_slots,
@@ -111,9 +126,17 @@ impl CompiledTableFunctionProcessorFactory {
             ..
         } = graph_node.kind()
         else {
-            return Err(format!("compiled local node {at} is not a TableFunction"));
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!("compiled local node {at} is not a TableFunction"),
+            ));
         };
-        let invalid = |what: String| format!("compiled TableFunction at local node {at} {what}");
+        let invalid = |what: String| {
+            program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!("compiled TableFunction at local node {at} {what}"),
+            )
+        };
         if !*fn_result_required {
             return Err(invalid(
                 "with optional function results is not executable yet".to_string(),
@@ -217,7 +240,7 @@ impl CompiledTableFunctionProcessorFactory {
                         .borrowed()
                         .same_physical_binding_ignoring_root_nullability_observed(
                             target.borrowed(),
-                            || Ok::<(), String>(()),
+                            || Ok::<(), crate::runtime::fragment::ExecutionFailure>(()),
                         )?
                 {
                     return Err(invalid(format!(
@@ -251,7 +274,7 @@ impl OperatorFactory for CompiledTableFunctionProcessorFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(CompiledTableFunctionProcessor {
+        Box::new(Transform::hydrating(CompiledTableFunctionProcessor {
             name: self.name.clone(),
             node: self.node,
             kernel: Arc::clone(&self.kernel),
@@ -264,11 +287,10 @@ impl OperatorFactory for CompiledTableFunctionProcessorFactory {
             output: None,
             construction: None,
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
-            pending: VecDeque::new(),
-            finishing: false,
-            finished: false,
+            cursor: None,
+            batch_rows: None,
             failed: false,
-        })
+        }))
     }
 }
 
@@ -285,10 +307,8 @@ struct CompiledTableFunctionProcessor {
     output: Option<ChunkSchemaRef>,
     construction: Option<Arc<dyn InputConstructionFactory>>,
     control: RuntimeKernelControl,
-    /// Output chunks of the current input batch, in output order.
-    pending: VecDeque<Chunk>,
-    finishing: bool,
-    finished: bool,
+    cursor: Option<OutputCursor>,
+    batch_rows: Option<std::num::NonZeroUsize>,
     failed: bool,
 }
 
@@ -302,10 +322,20 @@ struct Produced {
     counts: Vec<usize>,
 }
 
+/// One invocation's relation and its parent-order selection. Output arrays are
+/// gathered only when the driver makes a free output edge available.
+struct OutputCursor {
+    input: Chunk,
+    columns: Vec<ArrayRef>,
+    parent_rows: Vec<u64>,
+    result_rows: Vec<Option<u64>>,
+    offset: usize,
+}
+
 impl CompiledTableFunctionProcessor {
     fn alive(&self) -> ExecutionResult<()> {
         if self.failed {
-            Err(novarocks_functions::KernelFailure::InstanceFailed.into())
+            Err(self.failure(CompiledTableFailureKind::AlreadyFailed))
         } else {
             Ok(())
         }
@@ -315,11 +345,12 @@ impl CompiledTableFunctionProcessor {
             .as_ref()
             .ok_or_else(|| ConstructionFailure::MissingOwner.into())
     }
-    fn failure(&self, what: impl std::fmt::Display) -> ExecutionFailure {
-        ExecutionFailure::from(format!(
-            "compiled TableFunction at local node {} {what}",
-            self.node
-        ))
+    fn failure(&self, reason: CompiledTableFailureKind) -> ExecutionFailure {
+        CompiledTableFailure {
+            node: self.node,
+            reason,
+        }
+        .into()
     }
 
     /// Run one exact invocation over every row of `batch` to its end.
@@ -340,7 +371,7 @@ impl CompiledTableFunctionProcessor {
         // and error. Each channel needs at most one fact to make progress.
         let capacity = TableStepCapacity {
             page: TablePageCapacity {
-                rows: page_rows.max(1),
+                rows: page_rows,
                 completions: parents,
             },
             parent_errors: parents,
@@ -353,28 +384,43 @@ impl CompiledTableFunctionProcessor {
             let page = match cursor.next(capacity, &self.control)? {
                 TableCursorStep::Page(page) => page,
                 TableCursorStep::CapacityRequired(required) => {
-                    return Err(self.failure(format!(
-                        "table cursor requires {required:?} beyond its full step grant"
-                    )));
+                    return Err(self.failure(CompiledTableFailureKind::Capacity {
+                        required,
+                        granted: capacity,
+                    }));
                 }
             };
             // A parent's row error is a required error of this operator.
             if let Some(error) = page.parent_errors.first() {
-                let row = selection
-                    .row(error.selected_ordinal())
-                    .ok_or_else(|| self.failure("reported an error outside its invocation"))?;
-                return Err(self.failure(format!("failed at batch row {row}: {}", error.message())));
+                let row = selection.row(error.selected_ordinal()).ok_or_else(|| {
+                    self.failure(CompiledTableFailureKind::ParentErrorOrdinal {
+                        ordinal: error.selected_ordinal(),
+                    })
+                })?;
+                return Err(self.failure(CompiledTableFailureKind::ParentData {
+                    row,
+                    cause: error.clone(),
+                }));
             }
             for &parent in page.parent_ordinals.iter() {
                 if completed[parent] {
-                    return Err(self.failure("produced a row after its parent completed"));
+                    return Err(
+                        self.failure(CompiledTableFailureKind::RowAfterCompletion { parent })
+                    );
                 }
-                counts[parent] += 1;
+                counts[parent] = counts[parent].checked_add(1).ok_or_else(|| {
+                    self.failure(CompiledTableFailureKind::OutputExtent {
+                        prefix: counts[parent],
+                        additional: 1,
+                    })
+                })?;
                 produced.push(parent);
             }
             for &parent in page.completed_parents.iter() {
                 if std::mem::replace(&mut completed[parent], true) {
-                    return Err(self.failure("completed one parent twice"));
+                    return Err(
+                        self.failure(CompiledTableFailureKind::DuplicateCompletion { parent })
+                    );
                 }
             }
             if !page.parent_ordinals.is_empty() {
@@ -384,8 +430,8 @@ impl CompiledTableFunctionProcessor {
                 break;
             }
         }
-        if completed.iter().any(|done| !done) {
-            return Err(self.failure("ended before every parent completed"));
+        if let Some(first) = completed.iter().position(|done| !done) {
+            return Err(self.failure(CompiledTableFailureKind::IncompleteParents { first }));
         }
         cursor.finish(&self.control)?;
         drop(cursor);
@@ -398,7 +444,12 @@ impl CompiledTableFunctionProcessor {
                     .iter()
                     .map(|page| page[index].as_ref())
                     .collect::<Vec<&dyn Array>>();
-                concat(&parts).map_err(|error| self.failure(format!("result {index}: {error}")))?
+                concat(&parts).map_err(|error| {
+                    self.failure(CompiledTableFailureKind::Arrow {
+                        result: Some(index),
+                        cause: error,
+                    })
+                })?
             };
             columns.push(column);
         }
@@ -409,15 +460,9 @@ impl CompiledTableFunctionProcessor {
         })
     }
 
-    /// Assemble `produced` with its parents into output chunks of at most
-    /// `chunk_rows` rows, in parent order.
-    fn assemble(
-        &self,
-        batch: &RecordBatch,
-        produced: Produced,
-        chunk_rows: usize,
-    ) -> ExecutionResult<VecDeque<Chunk>> {
-        let parents = batch.num_rows();
+    /// Freeze parent order once; no output chunks are materialized here.
+    fn ordered_output(&self, input: Chunk, produced: Produced) -> ExecutionResult<OutputCursor> {
+        let parents = input.len();
         // Rows of each parent: its produced rows, or one NULL-extended row for
         // a LEFT OUTER parent that completed without one.
         let mut starts = Vec::with_capacity(parents + 1);
@@ -429,9 +474,12 @@ impl CompiledTableFunctionProcessor {
             } else {
                 count
             };
-            total = total
-                .checked_add(rows)
-                .ok_or_else(|| self.failure("output row count exceeds the host range"))?;
+            total = total.checked_add(rows).ok_or_else(|| {
+                self.failure(CompiledTableFailureKind::OutputExtent {
+                    prefix: total,
+                    additional: rows,
+                })
+            })?;
         }
         starts.push(total);
         let mut parent_rows = vec![0u64; total];
@@ -450,53 +498,70 @@ impl CompiledTableFunctionProcessor {
                 next[parent] += 1;
             }
         }
+        Ok(OutputCursor {
+            input,
+            columns: produced.columns,
+            parent_rows,
+            result_rows,
+            offset: 0,
+        })
+    }
+
+    fn output_page(&self, cursor: &OutputCursor, rows: usize) -> ExecutionResult<Chunk> {
+        let end = cursor.offset + rows;
+        let outer = UInt64Array::from(cursor.parent_rows[cursor.offset..end].to_vec());
+        let results = UInt64Array::from(cursor.result_rows[cursor.offset..end].to_vec());
         let output = self.prepared_output()?;
-        let mut chunks = VecDeque::new();
-        let mut start = 0usize;
-        while start < total {
-            let end = total.min(start + chunk_rows.max(1));
-            let outer = UInt64Array::from(parent_rows[start..end].to_vec());
-            let results = UInt64Array::from(result_rows[start..end].to_vec());
-            let factory = self
-                .construction
-                .as_ref()
-                .ok_or(ConstructionFailure::MissingOwner)?;
-            let owner = factory.begin_typed_construction(output)?;
-            owner.observe(
-                0,
-                &[],
-                crate::exec::chunk::ArrayNormalizationStep::CreateChunkColumns {
-                    channels: self.producers.len(),
-                },
-            )?;
-            let mut columns = Vec::with_capacity(self.producers.len());
-            for producer in self.producers.iter() {
-                let column = match producer {
-                    Producer::Outer(input) => take(batch.column(*input).as_ref(), &outer, None),
-                    Producer::Result(index) => {
-                        take(produced.columns[*index].as_ref(), &results, None)
-                    }
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let owner = factory.begin_typed_construction(output)?;
+        owner.observe(
+            0,
+            &[],
+            crate::exec::chunk::ArrayNormalizationStep::CreateChunkColumns {
+                channels: self.producers.len(),
+            },
+        )?;
+        let mut columns = Vec::with_capacity(self.producers.len());
+        for producer in self.producers.iter() {
+            let column = match producer {
+                Producer::Outer(input) => {
+                    take(cursor.input.columns()[*input].as_ref(), &outer, None)
                 }
-                .map_err(|error| self.failure(format!("output gather: {error}")))?;
-                columns.push(column);
+                Producer::Result(index) => take(cursor.columns[*index].as_ref(), &results, None),
             }
-            chunks.push_back(Chunk::try_new_typed_with_columns_owned_observed::<
-                ConstructionFailure,
-                _,
-            >(
-                Arc::clone(output),
-                columns,
-                end - start,
-                owner.storage_lifetime(),
-                |step| owner.observe(0, &[], step),
-            )?);
-            start = end;
+            .map_err(|error| {
+                self.failure(CompiledTableFailureKind::Arrow {
+                    result: None,
+                    cause: error,
+                })
+            })?;
+            columns.push(column);
         }
-        Ok(chunks)
+        // Arrow gather may reuse nested input backing. The output must retain
+        // its original finite storage responsibility after this cursor exits.
+        let storage = cursor
+            .input
+            .source_storage_lifetime_observed::<ConstructionFailure>(
+                owner.storage_lifetime(),
+                |layout| owner.request(layout),
+            )?;
+        Ok(Chunk::try_new_typed_with_columns_owned_observed::<
+            ConstructionFailure,
+            _,
+        >(
+            Arc::clone(output),
+            columns,
+            rows,
+            storage,
+            |step| owner.observe(0, &[], step),
+        )?)
     }
 }
 
-impl Operator for CompiledTableFunctionProcessor {
+impl OperatorLifecycle for CompiledTableFunctionProcessor {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -529,39 +594,42 @@ impl Operator for CompiledTableFunctionProcessor {
     fn name(&self) -> &str {
         &self.name
     }
-    fn is_finished(&self) -> bool {
-        self.failed || self.finished
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.control.bind_runtime_memory(state);
+        self.batch_rows = Some(
+            std::num::NonZeroUsize::new(state.chunk_size())
+                .ok_or_else(|| self.failure(CompiledTableFailureKind::InvalidBatchRows))?,
+        );
+        Ok(())
+    }
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.cursor = None;
+        Ok(())
+    }
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
     }
     fn cancel(&mut self) {
         self.failed = true;
-        self.pending.clear();
-    }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+        self.cursor = None;
     }
 }
 
-impl ProcessorOperator for CompiledTableFunctionProcessor {
-    fn need_input(&self) -> bool {
-        !self.failed && !self.finishing && !self.finished && self.pending.is_empty()
-    }
-    fn has_output(&self) -> bool {
-        !self.failed && !self.pending.is_empty()
-    }
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+impl InputEncodingPolicy for CompiledTableFunctionProcessor {}
+impl TransformKernel for CompiledTableFunctionProcessor {
+    fn apply(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
         self.alive()?;
+        let chunk = input.into_uncovered_chunk()?;
         self.prepared_output()?;
-        if !self.pending.is_empty() {
-            return Err(self.failure("received input while output is pending"));
-        }
         if chunk.is_empty() {
-            return Ok(());
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
         }
         if chunk.record_batch().schema().as_ref() != self.input_schema.as_ref() {
-            return Err(self.failure("input differs from its frozen input port"));
+            return Err(self.failure(CompiledTableFailureKind::InputPort));
         }
         if self.input_layout.is_typed() {
             let schema = chunk.chunk_schema();
@@ -571,39 +639,70 @@ impl ProcessorOperator for CompiledTableFunctionProcessor {
                     self.input_layout.value_binding_at(ordinal) != Some(slot.typed_binding())
                 })
             {
-                return Err(self.failure("input differs from its complete frozen value bindings"));
+                return Err(self.failure(CompiledTableFailureKind::InputValueBindings));
             }
         }
-        let chunk_rows = state.chunk_size();
+        let chunk_rows = self
+            .batch_rows
+            .ok_or_else(|| self.failure(CompiledTableFailureKind::MissingBatchRows))?
+            .get();
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         let result = self
             .invoke(chunk.record_batch(), chunk_rows)
-            .and_then(|produced| self.assemble(chunk.record_batch(), produced, chunk_rows));
+            .and_then(|produced| self.ordered_output(chunk, produced));
         match result {
-            Ok(pending) => {
-                self.pending = pending;
-                Ok(())
+            Ok(cursor) => {
+                let next = if cursor.parent_rows.is_empty() {
+                    NextStep::NeedInput
+                } else {
+                    self.cursor = Some(cursor);
+                    NextStep::Runnable
+                };
+                Ok(StepResult::new(None, next, rows))
             }
             Err(cause) => {
                 self.failed = true;
-                self.pending.clear();
+                self.cursor = None;
                 Err(cause)
             }
         }
     }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         self.alive()?;
-        let output = self.pending.pop_front();
-        if self.finishing && self.pending.is_empty() {
-            self.finished = true;
+        let Some(cursor) = self.cursor.as_ref() else {
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
+        };
+        if !ctx.work().try_consume(1) {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
-        Ok(output)
+        let rows = self
+            .batch_rows
+            .expect("an installed cursor has a prepared batch size")
+            .get()
+            .min(cursor.parent_rows.len() - cursor.offset);
+        let output = match self.output_page(cursor, rows) {
+            Ok(output) => output,
+            Err(cause) => {
+                self.failed = true;
+                self.cursor = None;
+                return Err(cause);
+            }
+        };
+        let cursor = self
+            .cursor
+            .as_mut()
+            .expect("output cursor remains installed");
+        cursor.offset += rows;
+        let next = if cursor.offset == cursor.parent_rows.len() {
+            self.cursor = None;
+            NextStep::NeedInput
+        } else {
+            NextStep::Runnable
+        };
+        Ok(StepResult::new(Some(output), next, 0))
     }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         self.alive()?;
-        self.finishing = true;
-        if self.pending.is_empty() {
-            self.finished = true;
-        }
-        Ok(())
+        Ok(StepResult::new(None, NextStep::Finished, 0))
     }
 }

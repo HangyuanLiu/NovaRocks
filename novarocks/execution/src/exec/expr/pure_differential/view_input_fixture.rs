@@ -364,13 +364,12 @@ pub(super) fn assert_scalar_matches_v1_with_plain_views(raw: ScalarDiffSpec) -> 
         let before = source.to_data();
         // Independent current-engine rejection remains a real ingress fact,
         // including a constant-only call whose host Chunk would use an anchor.
-        let error = crate::exec::chunk::validate_chunk_carrier_encoding_observed::<String>(
-            source.data_type(),
-            &mut |_| Ok(()),
-        )
+        let error = crate::exec::chunk::validate_chunk_carrier_encoding_observed::<
+            crate::exec::chunk::ChunkConstructionFailure,
+        >(source.data_type(), &mut |_| Ok(()))
         .unwrap_err();
         assert_eq!(
-            error,
+            error.to_string(),
             "view carriers are not supported by the current execution engine"
         );
         let values = prepare_array(&source, &declared);

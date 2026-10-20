@@ -450,7 +450,7 @@ fn zip_exact_carrier_shape_and_encoded_constructor_boundaries_refuse_explicitly(
     ] {
         let array = new_empty_array(&ty);
         assert!(
-            matches!(preflight_zip(&empty, array.as_ref(), array.as_ref(), |_| Ok(())), Err(CopyError::Unsupported(actual)) if novarocks_type_contract::arrow_data_types_exact(&actual, &ty))
+            matches!(preflight_zip(&empty, array.as_ref(), array.as_ref(), |_| Ok(())), Err(CopyError::Unsupported(actual)) if actual.as_str() == CopyError::unsupported(&ty).to_string())
         );
     }
 }
@@ -461,52 +461,54 @@ fn zip_static_layout_offset_and_growth_exact_boundaries_need_no_giant_allocation
     assert_eq!(rounded_capacity(maximum_aligned).unwrap(), maximum_aligned);
     assert!(matches!(
         rounded_capacity(maximum_aligned + 1),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
     assert!(matches!(
         rounded_capacity(usize::MAX),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
     flat_extent(&DataType::Int64, maximum_aligned / 8).unwrap();
     assert!(matches!(
         flat_extent(&DataType::Int64, maximum_aligned / 8 + 1),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
     flat_extent(&DataType::FixedSizeBinary(16), maximum_aligned / 16).unwrap();
     assert!(matches!(
         flat_extent(&DataType::FixedSizeBinary(16), maximum_aligned / 16 + 1),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
-    assert!(matches!(
-        flat_extent(&DataType::FixedSizeBinary(-1), 0),
-        Err(CopyError::Extent)
-    ));
+    let invalid_width = flat_extent(&DataType::FixedSizeBinary(-1), 0).unwrap_err();
+    assert!(matches!(invalid_width, CopyError::Invalid(_)));
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(&invalid_width).class(),
+        novarocks_failure_contract::FailureClass::Invariant,
+    );
     assert!(matches!(
         flat_extent(&DataType::LargeUtf8, usize::MAX),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
     let mut extent = ByteBufferExtent::new(0).unwrap();
     if usize::BITS > 32 {
         extent.extend(i32::MAX as usize, false).unwrap();
         assert_eq!(extent.len, i32::MAX as usize);
-        assert!(matches!(extent.extend(1, false), Err(CopyError::Extent)));
+        assert!(matches!(extent.extend(1, false), Err(CopyError::Extent(_))));
     } else {
         // The offset is legal, but its 64-byte-rounded allocation exceeds the
         // 32-bit Rust Layout limit before that offset can be materialized.
         assert!(matches!(
             extent.extend(i32::MAX as usize, false),
-            Err(CopyError::Extent)
+            Err(CopyError::Extent(_))
         ));
     }
     let mut extent = ByteBufferExtent::new(0).unwrap();
     extent.extend(maximum_aligned, true).unwrap();
-    assert!(matches!(extent.extend(1, true), Err(CopyError::Extent)));
+    assert!(matches!(extent.extend(1, true), Err(CopyError::Extent(_))));
     // Required final bytes fit, but the real old-capacity doubling does not.
     let half = (isize::MAX as usize).div_ceil(2);
     let mut extent = ByteBufferExtent::new(half).unwrap();
     assert!(matches!(
         extent.extend(half + 1, true),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
 }
 

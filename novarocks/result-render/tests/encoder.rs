@@ -410,10 +410,7 @@ fn unsupported_and_cancel() {
             true,
         )],
     );
-    assert_eq!(
-        e.step(&mut [0; 100]).unwrap_err().kind,
-        E::UnsupportedPresentation
-    );
+    assert_eq!(e.step(&mut [0; 100]).unwrap_err().kind, E::InvalidValue);
     for json in [
         "",
         "[1,]",
@@ -428,11 +425,11 @@ fn unsupported_and_cancel() {
             input(vec![Arc::new(StringArray::from(vec![json]))]),
             vec![field(N::Json, P::JsonText, true)],
         );
-        assert_eq!(
-            e.step(&mut [0; 100]).unwrap_err().kind,
-            E::UnsupportedPresentation,
-            "{json}"
-        );
+        let cause = e.step(&mut [0; 100]).unwrap_err();
+        assert_eq!(cause.kind, E::InvalidJson, "{json}");
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(cause.failure_fact().class(), FailureClass::Data);
+        assert_eq!(cause.failure_fact().reason().code(), 110);
     }
     let value = "x".repeat(1000000);
     let mut e = string_encoder(vec![&value]);
@@ -501,10 +498,11 @@ fn variant_malformed_and_old_unsupported() {
         vec![2, 1, 0, 2, 1, 0],
     ] {
         let mut e = variant(serialized(&[1, 0, 0], &value), 0);
-        assert_eq!(
-            e.step(&mut [0; 1000]).unwrap_err().kind,
-            E::UnsupportedPresentation
-        );
+        let cause = e.step(&mut [0; 1000]).unwrap_err();
+        assert_eq!(cause.kind, E::InvalidVariant);
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        assert_eq!(cause.failure_fact().class(), FailureClass::Data);
+        assert_eq!(cause.failure_fact().reason().code(), 111);
     }
     let data = serialized(&[1, 0, 0], &[0]);
     assert_eq!(

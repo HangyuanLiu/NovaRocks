@@ -1261,7 +1261,7 @@ impl<O: PureFunctionMetadataOwner + PureAggregateImplementation> InstalledPureOw
         )?;
         let effects = value.effects();
         let handle = PreparedAggregateHandle::from_typed(value.into_prepared(), control)
-            .map_err(FunctionSpecializationFailure::Kernel)?;
+            .map_err(FunctionSpecializationFailure::from)?;
         Ok(PreparedPureCallDraft {
             effects,
             prepared: PreparedPureKernel::Aggregate(handle),
@@ -1285,7 +1285,7 @@ fn prepare_aggregate_handle<O: PureAggregateImplementation>(
     }?;
     let effects = value.effects();
     let handle = PreparedAggregateHandle::from_typed(value.into_prepared(), control)
-        .map_err(FunctionSpecializationFailure::Kernel)?;
+        .map_err(FunctionSpecializationFailure::from)?;
     Ok(PreparedPureCallDraft {
         effects,
         prepared: PreparedPureKernel::Aggregate(handle),
@@ -1535,7 +1535,7 @@ impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
         )?;
         let call = Arc::new(
             FunctionCallContract::from_refined(input, &receipt, selected, control)
-                .map_err(FunctionSpecializationFailure::Kernel)?,
+                .map_err(FunctionSpecializationFailure::from)?,
         );
         control
             .checkpoint(CompilePhase::FunctionSpecialization, 0)
@@ -1569,7 +1569,7 @@ impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
         )?;
         let call = Arc::new(
             FunctionCallContract::from_refined(input, &receipt, selected, control)
-                .map_err(FunctionSpecializationFailure::Kernel)?,
+                .map_err(FunctionSpecializationFailure::from)?,
         );
         control
             .checkpoint(CompilePhase::FunctionSpecialization, 0)
@@ -1970,11 +1970,7 @@ impl EngineFunctionCatalog {
             }
             lookup_installed_overload(binding, overload, &mut work)
         })();
-        if matches!(&result, Err(FunctionSpecializationFailure::Control(_))) {
-            return result;
-        }
-        work.finish()?;
-        result
+        work.finish_result(result, FunctionSpecializationFailure::from)
     }
 
     /// Prepare one exact selected implementation from this catalogue's
@@ -2168,37 +2164,28 @@ fn prepare_selected_with_creation<H>(
             },
         })
     })();
-    // Preparation may forward an original compile refusal through the kernel
-    // boundary. Both typed representations remain primary without a callback.
-    if matches!(
-        &result,
-        Err(CheckedCallPreparationFailure::Binding(
-            crate::FunctionBindingCreationFailure::Creator(_)
-        )) | Err(CheckedCallPreparationFailure::Binding(
-            crate::FunctionBindingCreationFailure::Resource(_)
-        )) | Err(CheckedCallPreparationFailure::Binding(
-            crate::FunctionBindingCreationFailure::Binding(FunctionBindingError::Control(_))
-        )) | Err(CheckedCallPreparationFailure::Preparation(
-            crate::CheckedOwnerFailure::Original(
-                FunctionSpecializationFailure::Control(_)
-                    | FunctionSpecializationFailure::Kernel(
-                        KernelFailure::Cancelled
-                            | KernelFailure::DeadlineExceeded
-                            | KernelFailure::ResourceExhausted
-                    )
-            )
-        ))
-    ) {
-        return result;
-    }
-    work.finish()?;
-    result
+    work.finish_result(result, CheckedCallPreparationFailure::from)
 }
 
 #[derive(Debug)]
 pub enum CheckedCallPreparationFailure<H> {
     Binding(crate::FunctionBindingCreationFailure<H>),
     Preparation(crate::CheckedOwnerFailure<FunctionSpecializationFailure>),
+}
+impl<H> CheckedCallPreparationFailure<H> {
+    pub(crate) fn is_interruption(&self) -> bool {
+        match self {
+            Self::Binding(
+                crate::FunctionBindingCreationFailure::Creator(_)
+                | crate::FunctionBindingCreationFailure::Resource(_)
+                | crate::FunctionBindingCreationFailure::Binding(FunctionBindingError::Control(_)),
+            ) => true,
+            Self::Preparation(crate::CheckedOwnerFailure::Original(cause)) => {
+                cause.is_interruption()
+            }
+            _ => false,
+        }
+    }
 }
 impl<H> From<crate::FunctionBindingCreationFailure<H>> for CheckedCallPreparationFailure<H> {
     fn from(error: crate::FunctionBindingCreationFailure<H>) -> Self {

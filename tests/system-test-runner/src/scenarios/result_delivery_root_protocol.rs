@@ -30,11 +30,13 @@ use bytes::Bytes;
 use h2::client;
 use http::{HeaderMap, Request, header};
 use novarocks_cluster_harness::NativeTrustFixtureMode;
-use novarocks_execution_contract::root_result::{RootReadOutcome, RootResultReply};
+use novarocks_execution_contract::root_result::{
+    RootReadOutcome, RootReadResponse, RootResultReply,
+};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{common, novarocks as proto};
 use novarocks_task_codec::identity::decode_task_identity;
-use novarocks_task_codec::root_result::{decode_read, decode_reply};
+use novarocks_task_codec::root_result::{decode_read, decode_response};
 use novarocks_types::{BackendProcessId, NativeEndpoint};
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -363,13 +365,26 @@ pub(super) fn probe_candidate(
         Instant::now() < deadline,
         "root protocol probe completed after its deadline"
     );
-    if status == ProbeStatus::UnknownRoot {
-        let identity = expected.root_task();
+    ensure!(
+        status == ProbeStatus::Success,
+        "root response transport did not succeed"
+    );
+    let message = single_message(&frame)?;
+    let wire =
+        proto::FetchRootResultResponse::decode(message).context("decode root response protobuf")?;
+    let response = decode_response(
+        wire,
+        &expected,
+        maximum_delivered_consumed,
+        FieldPath::root("root_probe_reply"),
+    )?;
+    let Some(reply) = discovery_reply(response)? else {
         let observation = serde_json::json!({
             "backend_index": backend, "actual_grpc_port": port,
-            "response_frame_bytes": 0, "body_bytes": 0,
-            "grpc_status": 5, "grpc_message": "unknown context root",
-            "outcome": "unknown_root", "identity": identity_observation(identity),
+            "response_frame_bytes": frame.len(), "body_bytes": 0,
+            "grpc_status": 0, "outcome": "unknown_root",
+            "failure_domain": "WORKER", "failure_reason": 165,
+            "identity": identity_observation(expected.root_task()),
             "request_identity": identity_observation(expected.root_task())
         });
         ensure!(
@@ -377,16 +392,7 @@ pub(super) fn probe_candidate(
             "root candidate observation exceeded its deadline"
         );
         return Ok((None, observation));
-    }
-    let message = single_message(&frame)?;
-    let wire =
-        proto::FetchRootResultResponse::decode(message).context("decode root reply protobuf")?;
-    let reply = decode_reply(
-        wire,
-        &expected,
-        maximum_delivered_consumed,
-        FieldPath::root("root_probe_reply"),
-    )?;
+    };
     let (outcome, sequence, body_bytes, body_sha256) = match &reply.outcome {
         RootReadOutcome::Data(data) => (
             "data",
@@ -449,7 +455,6 @@ impl Drop for ConnectionDriver {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProbeStatus {
     Success,
-    UnknownRoot,
 }
 
 fn grpc_content_type(headers: &HeaderMap) -> Result<()> {
@@ -475,38 +480,11 @@ fn candidate_status(headers: &HeaderMap) -> Result<Option<ProbeStatus>> {
         statuses.next().is_none(),
         "root reply has duplicate gRPC status"
     );
-    if status.as_bytes() == b"0" {
-        return Ok(Some(ProbeStatus::Success));
-    }
     ensure!(
-        status.as_bytes() == b"5",
-        "root candidate gRPC status is neither success nor unknown-root"
+        status.as_bytes() == b"0",
+        "root response gRPC status is not success"
     );
-    let mut messages = headers.get_all("grpc-message").iter();
-    let message = messages
-        .next()
-        .context("unknown-root status has no message")?;
-    ensure!(
-        messages.next().is_none(),
-        "unknown-root status has duplicate messages"
-    );
-    ensure!(
-        message.as_bytes().len() <= 3 * "unknown context root".len(),
-        "unknown-root message exceeds its bound"
-    );
-    // Tonic decodes percent-encoded grpc-message. Supply only these two
-    // bounded fields; unrelated status-details headers must not enter its
-    // decoder or observations.
-    let mut bounded = HeaderMap::new();
-    bounded.insert("grpc-status", status.clone());
-    bounded.insert("grpc-message", message.clone());
-    let decoded =
-        tonic::Status::from_header_map(&bounded).context("missing unknown-root status")?;
-    ensure!(
-        decoded.code() == tonic::Code::NotFound && decoded.message() == "unknown context root",
-        "gRPC not-found is not the exact unknown-root refusal"
-    );
-    Ok(Some(ProbeStatus::UnknownRoot))
+    Ok(Some(ProbeStatus::Success))
 }
 
 fn response_status(
@@ -516,28 +494,43 @@ fn response_status(
     saw_data: bool,
 ) -> Result<ProbeStatus> {
     ensure!(
-        header.is_none() || trailer.is_none(),
-        "root reply repeats status across headers and trailers"
+        header.is_none(),
+        "root response must carry its status in final trailers"
     );
-    if let Some(header) = header {
-        ensure!(
-            header == ProbeStatus::UnknownRoot && !saw_data && body.is_empty(),
-            "initial root status is not an exact trailers-only unknown-root error"
-        );
-        return Ok(header);
-    }
-    let trailer = trailer.context("root response has no final gRPC status")?;
-    match trailer {
-        ProbeStatus::Success => ensure!(
-            saw_data && !body.is_empty(),
-            "successful root reply has no DATA message"
+    ensure!(
+        trailer == Some(ProbeStatus::Success),
+        "root response has no final success status"
+    );
+    ensure!(
+        saw_data && !body.is_empty(),
+        "successful root reply has no DATA message"
+    );
+    Ok(ProbeStatus::Success)
+}
+
+// This wire probe uses the stable producer reason as an independent oracle.
+// It does not classify query failures or supply replacement authority.
+fn discovery_reply(response: RootReadResponse) -> Result<Option<RootResultReply>> {
+    use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureReason, domain};
+    match response {
+        RootReadResponse::Reply(reply) => Ok(Some(reply)),
+        RootReadResponse::Refused(refusal) => {
+            let unknown = FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(domain::WORKER, std::num::NonZeroU16::new(165).unwrap()),
+            );
+            ensure!(
+                refusal.fact() == unknown,
+                "root candidate was refused with a different producer fact: {:?}",
+                refusal.fact()
+            );
+            Ok(None)
+        }
+        RootReadResponse::Deferred(deferred) => anyhow::bail!(
+            "root candidate did not provide a receipt: {:?}",
+            deferred.reason()
         ),
-        ProbeStatus::UnknownRoot => ensure!(
-            !saw_data && body.is_empty(),
-            "unknown-root reply contains DATA"
-        ),
     }
-    Ok(trailer)
 }
 
 fn single_message(frame: &[u8]) -> Result<&[u8]> {
@@ -687,60 +680,76 @@ mod tests {
     }
 
     #[test]
-    fn discovery_accepts_only_exact_unknown_root_with_empty_body() {
+    fn discovery_accepts_only_the_exact_typed_unknown_root_fact() {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, domain,
+        };
+        use novarocks_execution_contract::{
+            SafeDetail,
+            root_result::{RootReadDeferral, RootReadDeferred, RootReadRefusal},
+        };
+        let root = parse_unique_created_task(&["".into()], &[marker()], 0).unwrap();
+        let request = proto::FetchRootResultRequest {
+            root_task: Some(root),
+            profile_id: 1,
+            output_kind: Some(novarocks_proto_models::result::RootOutputKind {
+                kind: Some(
+                    novarocks_proto_models::result::root_output_kind::Kind::ClientRows(true),
+                ),
+            }),
+            wanted_sequence: Some(1),
+            consumed_sequence: 0,
+            max_wait_millis: 100,
+        };
+        let read = decode_read(&request, FieldPath::root("test_read")).unwrap();
+        for (namespace, code, class, accepted) in [
+            (domain::WORKER, 165, FailureClass::Data, true),
+            (domain::WORKER, 164, FailureClass::Data, false),
+            (domain::WORKER, 165, FailureClass::Dependency, false),
+            (domain::QUERY, 165, FailureClass::Data, false),
+        ] {
+            let fact = FailureFact::new(
+                class,
+                FailureReason::new(namespace, std::num::NonZeroU16::new(code).unwrap()),
+            );
+            let result = discovery_reply(RootReadResponse::Refused(RootReadRefusal::for_request(
+                &read,
+                fact,
+                SafeDetail::truncating("arbitrary safe text is not a discriminator"),
+            )));
+            if accepted {
+                assert!(result.unwrap().is_none());
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        assert!(
+            discovery_reply(RootReadResponse::Deferred(RootReadDeferred::for_request(
+                &read,
+                RootReadDeferral::Preparing
+            )))
+            .is_err()
+        );
         let mut headers = HeaderMap::new();
         headers.insert("grpc-status", "5".parse().unwrap());
-        assert!(candidate_status(&headers).is_err());
-        for message in ["unknown context root", "unknown%20context%20root"] {
-            headers.insert("grpc-message", message.parse().unwrap());
-            let status = candidate_status(&headers).unwrap();
-            assert_eq!(
-                response_status(status, None, &[], false).unwrap(),
-                ProbeStatus::UnknownRoot
-            );
-            assert!(response_status(status, None, &[0, 0, 0, 0, 0], true).is_err());
-            assert!(response_status(status, Some(ProbeStatus::Success), &[], false).is_err());
-        }
-        for code in ["8", "9", "14", "05"] {
-            headers.insert("grpc-status", code.parse().unwrap());
-            assert!(candidate_status(&headers).is_err());
-        }
-        headers.insert("grpc-status", "5".parse().unwrap());
-        for message in [
-            "unknown task",
-            "unknown context root extra",
-            "unknown%FFcontext%20root",
-        ] {
-            headers.insert("grpc-message", message.parse().unwrap());
-            assert!(candidate_status(&headers).is_err());
-        }
         headers.insert("grpc-message", "unknown context root".parse().unwrap());
-        headers.append("grpc-message", "unknown context root".parse().unwrap());
         assert!(candidate_status(&headers).is_err());
-        assert!(response_status(None, None, &[], false).is_err());
     }
 
     #[test]
     fn response_structure_requires_final_success_and_no_duplicate_status() {
         let success = Some(ProbeStatus::Success);
-        let unknown = Some(ProbeStatus::UnknownRoot);
         let message = &[0, 0, 0, 0, 0];
         assert_eq!(
             response_status(None, success, message, true).unwrap(),
             ProbeStatus::Success
         );
-        assert_eq!(
-            response_status(None, unknown, &[], false).unwrap(),
-            ProbeStatus::UnknownRoot
-        );
         assert!(response_status(success, None, message, true).is_err());
         assert!(response_status(success, None, &[], false).is_err());
         assert!(response_status(success, success, message, true).is_err());
-        assert!(response_status(unknown, unknown, &[], false).is_err());
         assert!(response_status(None, success, &[], false).is_err());
         assert!(response_status(None, None, message, true).is_err());
-        assert!(response_status(unknown, None, &[], true).is_err());
-        assert!(response_status(None, unknown, &[], true).is_err());
+        assert!(response_status(None, success, &[], true).is_err());
     }
 
     #[test]

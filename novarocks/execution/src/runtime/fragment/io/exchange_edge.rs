@@ -225,6 +225,21 @@ impl fmt::Display for ExchangeEdgeGateError {
 }
 
 impl std::error::Error for ExchangeEdgeGateError {}
+impl novarocks_failure_contract::FailureProjection for ExchangeEdgeGateError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason as R;
+        use novarocks_failure_contract::*;
+        FailureFact::new(
+            FailureClass::Invariant,
+            match self {
+                Self::DuplicateEdge(_) => R::ExchangeDuplicateFrozenEdge,
+                Self::EdgeWithoutDestinations(_) => R::ExchangeEdgeWithoutDestinations,
+                Self::DestinationClaimedTwice(_) => R::ExchangeDestinationClaimedTwice,
+            }
+            .reason(),
+        )
+    }
+}
 
 /// How an accepted open request was applied.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

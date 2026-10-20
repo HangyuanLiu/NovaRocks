@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::ArrayRef;
 use std::collections::HashMap;
 
@@ -45,89 +45,76 @@ pub fn eval_object_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     let canonical = OBJECT_FUNCTIONS
         .iter()
         .find_map(|(alias, target)| (*alias == name).then_some(*target))
         .unwrap_or(name);
 
     match canonical {
-        "array_to_bitmap" => {
-            Ok((super::array_to_bitmap::eval_array_to_bitmap(arena, expr, args, chunk))?)
-        }
-        "bitmap_empty" => {
-            Ok((super::bitmap_functions::eval_bitmap_empty(arena, expr, args, chunk))?)
-        }
+        "array_to_bitmap" => super::array_to_bitmap::eval_array_to_bitmap(arena, expr, args, chunk),
+        "bitmap_empty" => super::bitmap_functions::eval_bitmap_empty(arena, expr, args, chunk),
         "bitmap_from_string" => {
-            Ok((super::bitmap_functions::eval_bitmap_from_string(arena, expr, args, chunk))?)
+            super::bitmap_functions::eval_bitmap_from_string(arena, expr, args, chunk)
         }
-        "bitmap_count" => {
-            Ok((super::bitmap_functions::eval_bitmap_count(arena, expr, args, chunk))?)
-        }
-        "bitmap_min" => Ok((super::bitmap_functions::eval_bitmap_min(arena, expr, args, chunk))?),
-        "bitmap_max" => Ok((super::bitmap_functions::eval_bitmap_max(arena, expr, args, chunk))?),
-        "bitmap_and" => Ok((super::bitmap_functions::eval_bitmap_and(arena, expr, args, chunk))?),
-        "bitmap_andnot" => {
-            Ok((super::bitmap_functions::eval_bitmap_andnot(arena, expr, args, chunk))?)
-        }
+        "bitmap_count" => super::bitmap_functions::eval_bitmap_count(arena, expr, args, chunk),
+        "bitmap_min" => super::bitmap_functions::eval_bitmap_min(arena, expr, args, chunk),
+        "bitmap_max" => super::bitmap_functions::eval_bitmap_max(arena, expr, args, chunk),
+        "bitmap_and" => super::bitmap_functions::eval_bitmap_and(arena, expr, args, chunk),
+        "bitmap_andnot" => super::bitmap_functions::eval_bitmap_andnot(arena, expr, args, chunk),
         "bitmap_contains" => {
-            Ok((super::bitmap_functions::eval_bitmap_contains(arena, expr, args, chunk))?)
+            super::bitmap_functions::eval_bitmap_contains(arena, expr, args, chunk)
         }
-        "bitmap_has_any" => {
-            Ok((super::bitmap_functions::eval_bitmap_has_any(arena, expr, args, chunk))?)
-        }
+        "bitmap_has_any" => super::bitmap_functions::eval_bitmap_has_any(arena, expr, args, chunk),
         "bitmap_intersect" => {
-            Ok((super::bitmap_functions::eval_bitmap_intersect(arena, expr, args, chunk))?)
+            super::bitmap_functions::eval_bitmap_intersect(arena, expr, args, chunk)
         }
-        "bitmap_or" => Ok((super::bitmap_functions::eval_bitmap_or(arena, expr, args, chunk))?),
-        "bitmap_xor" => Ok((super::bitmap_functions::eval_bitmap_xor(arena, expr, args, chunk))?),
-        "sub_bitmap" => Ok((super::bitmap_functions::eval_sub_bitmap(arena, expr, args, chunk))?),
+        "bitmap_or" => super::bitmap_functions::eval_bitmap_or(arena, expr, args, chunk),
+        "bitmap_xor" => super::bitmap_functions::eval_bitmap_xor(arena, expr, args, chunk),
+        "sub_bitmap" => super::bitmap_functions::eval_sub_bitmap(arena, expr, args, chunk),
         "bitmap_subset_limit" => {
-            Ok((super::bitmap_functions::eval_bitmap_subset_limit(arena, expr, args, chunk))?)
+            super::bitmap_functions::eval_bitmap_subset_limit(arena, expr, args, chunk)
         }
         "bitmap_subset_in_range" => {
-            Ok((super::bitmap_functions::eval_bitmap_subset_in_range(arena, expr, args, chunk))?)
+            super::bitmap_functions::eval_bitmap_subset_in_range(arena, expr, args, chunk)
         }
         "bitmap_to_binary" => {
-            Ok((super::bitmap_functions::eval_bitmap_to_binary(arena, expr, args, chunk))?)
+            super::bitmap_functions::eval_bitmap_to_binary(arena, expr, args, chunk)
         }
         "bitmap_from_binary" => {
-            Ok((super::bitmap_functions::eval_bitmap_from_binary(arena, expr, args, chunk))?)
+            super::bitmap_functions::eval_bitmap_from_binary(arena, expr, args, chunk)
         }
         "bitmap_to_base64" => {
-            Ok((super::bitmap_functions::eval_bitmap_to_base64(arena, expr, args, chunk))?)
+            super::bitmap_functions::eval_bitmap_to_base64(arena, expr, args, chunk)
         }
-        "bitmap_to_array" => {
-            Ok((super::bitmap_to_array::eval_bitmap_to_array(arena, expr, args, chunk))?)
-        }
+        "bitmap_to_array" => super::bitmap_to_array::eval_bitmap_to_array(arena, expr, args, chunk),
         "bitmap_to_string" => {
-            Ok((super::bitmap_to_string::eval_bitmap_to_string(arena, expr, args, chunk))?)
+            super::bitmap_to_string::eval_bitmap_to_string(arena, expr, args, chunk)
         }
-        "hll_empty" => Ok((super::hll_codec::eval_hll_empty(arena, expr, args, chunk))?),
-        "hll_serialize" => Ok((super::hll_codec::eval_hll_serialize(arena, expr, args, chunk))?),
-        "hll_deserialize" => {
-            Ok((super::hll_codec::eval_hll_deserialize(arena, expr, args, chunk))?)
+        "hll_empty" => super::hll_codec::eval_hll_empty(arena, expr, args, chunk),
+        "hll_serialize" => super::hll_codec::eval_hll_serialize(arena, expr, args, chunk),
+        "hll_deserialize" => super::hll_codec::eval_hll_deserialize(arena, expr, args, chunk),
+        "hll_cardinality" => super::hll_codec::eval_hll_cardinality(arena, expr, args, chunk),
+        "to_bitmap" => super::to_bitmap::eval_to_bitmap(arena, expr, args, chunk),
+        "hll_hash" => super::hll_hash::eval_hll_hash(arena, expr, args, chunk),
+        "ds_hll_count_distinct_state" => {
+            super::ds_hll_functions::eval_ds_hll_count_distinct_state(arena, expr, args, chunk)
         }
-        "hll_cardinality" => {
-            Ok((super::hll_codec::eval_hll_cardinality(arena, expr, args, chunk))?)
-        }
-        "to_bitmap" => Ok((super::to_bitmap::eval_to_bitmap(arena, expr, args, chunk))?),
-        "hll_hash" => Ok((super::hll_hash::eval_hll_hash(arena, expr, args, chunk))?),
-        "ds_hll_count_distinct_state" => Ok(
-            (super::ds_hll_functions::eval_ds_hll_count_distinct_state(arena, expr, args, chunk))?,
-        ),
         "percentile_hash" => {
-            Ok((super::percentile_functions::eval_percentile_hash(arena, expr, args, chunk))?)
+            super::percentile_functions::eval_percentile_hash(arena, expr, args, chunk)
         }
         "percentile_empty" => {
-            Ok((super::percentile_functions::eval_percentile_empty(arena, expr, args, chunk))?)
+            super::percentile_functions::eval_percentile_empty(arena, expr, args, chunk)
         }
-        "percentile_approx_raw" => Ok((super::percentile_functions::eval_percentile_approx_raw(
-            arena, expr, args, chunk,
-        ))?),
-        "json_object" => Ok((super::json_object::eval_json_object(arena, expr, args, chunk))?),
-        "sleep" => Ok((super::utility_functions::eval_sleep(arena, expr, args, chunk))?),
-        other => Err((format!("unsupported object function: {}", other)).into()),
+        "percentile_approx_raw" => {
+            super::percentile_functions::eval_percentile_approx_raw(arena, expr, args, chunk)
+        }
+        "json_object" => super::json_object::eval_json_object(arena, expr, args, chunk),
+        "sleep" => super::utility_functions::eval_sleep(arena, expr, args, chunk),
+        other => Err(crate::exec::expr::expression_contract(format_args!(
+            "unsupported object function: {}",
+            other
+        ))),
     }
 }
 

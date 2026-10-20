@@ -47,7 +47,7 @@ impl PureCompileControl for Control {
             assert!(index <= stop, "callback after first refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == index => Err(cause),
             _ => Ok(()),
         }
@@ -183,7 +183,7 @@ fn prefixes(
         ] {
             let control = Control {
                 trace: Default::default(),
-                refusal: Some((index, cause)),
+                refusal: Some((index, cause.clone())),
             };
             assert!(
                 matches!(invoke(&control), Err(PhysicalAggregateOccurrenceError::Control(actual)) if actual == cause)

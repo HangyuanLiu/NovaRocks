@@ -18,8 +18,10 @@
 //! ONE original array_append value/type/NULL and MutableArrayData author.
 use super::{
     array_literal_core::CollectionObservation,
-    map_lookup_core::{cast_output, row_index},
+    collection_arrow::{ArrowSite, arrow_failure, cast_output, contract},
+    map_lookup_core::row_index,
 };
+use crate::KernelFailure;
 use arrow_array::{Array, ArrayRef, ListArray, make_array};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_data::transform::MutableArrayData;
@@ -27,7 +29,7 @@ use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 #[derive(Debug)]
 pub enum AppendFailure<E> {
-    Data(String),
+    Operation(KernelFailure),
     Control(E),
 }
 fn observe<E>(
@@ -56,20 +58,20 @@ impl ArrayAppendInputs {
         observer: &mut dyn FnMut(CollectionObservation) -> Result<(), E>,
     ) -> Result<Self, AppendFailure<E>> {
         let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-            AppendFailure::Data(format!(
+            AppendFailure::Operation(contract(format_args!(
                 "array_append expects ListArray, got {:?}",
                 array.data_type()
-            ))
+            )))
         })?;
         let output_field = match output {
             AppendOutputFacts::FrozenList(field) => field.clone(),
             AppendOutputFacts::OriginalInputList => match list.data_type() {
                 DataType::List(field) => field.clone(),
                 other => {
-                    return Err(AppendFailure::Data(format!(
+                    return Err(AppendFailure::Operation(contract(format_args!(
                         "array_append output type must be List, got {:?}",
                         other
-                    )));
+                    ))));
                 }
             },
         };
@@ -77,27 +79,23 @@ impl ArrayAppendInputs {
         let mut values = list.values().clone();
         if values.data_type() != &target_item_type {
             observe(observer, CollectionObservation::OpaqueBoundary)?;
-            values = cast_output(values.clone(), Some(&target_item_type)).map_err(|cause| {
-                AppendFailure::Data(format!(
-                    "array_append failed to cast element type {:?} -> {:?}: {}",
-                    values.data_type(),
-                    target_item_type,
-                    cause
-                ))
-            })?;
+            values = cast_output(
+                values.clone(),
+                Some(&target_item_type),
+                "array_append element",
+            )
+            .map_err(AppendFailure::Operation)?;
             observe(observer, CollectionObservation::OpaqueBoundary)?;
         }
         let mut targets = target;
         if targets.data_type() != &target_item_type {
             observe(observer, CollectionObservation::OpaqueBoundary)?;
-            targets = cast_output(targets.clone(), Some(&target_item_type)).map_err(|cause| {
-                AppendFailure::Data(format!(
-                    "array_append failed to cast target type {:?} -> {:?}: {}",
-                    targets.data_type(),
-                    target_item_type,
-                    cause
-                ))
-            })?;
+            targets = cast_output(
+                targets.clone(),
+                Some(&target_item_type),
+                "array_append target",
+            )
+            .map_err(AppendFailure::Operation)?;
             observe(observer, CollectionObservation::OpaqueBoundary)?;
         }
         Ok(Self {
@@ -117,17 +115,22 @@ impl ArrayAppendInputs {
     pub fn constructor_sources(&self) -> [&dyn Array; 2] {
         [self.values.as_ref(), self.targets.as_ref()]
     }
-    fn row_action(&self, rows: AppendRows) -> AppendRowAction {
+    fn row_action(&self, rows: AppendRows) -> Result<AppendRowAction, KernelFailure> {
         let list = self.list();
+        if rows.list >= list.len() || rows.target >= self.targets.len() {
+            return Err(contract(
+                "array_append row mapping is outside its physical carriers",
+            ));
+        }
         if list.is_null(rows.list) {
-            return AppendRowAction::NullParent;
+            return Ok(AppendRowAction::NullParent);
         }
         let offsets = list.value_offsets();
-        AppendRowAction::Copy {
+        Ok(AppendRowAction::Copy {
             start: offsets[rows.list] as usize,
             end: offsets[rows.list + 1] as usize,
             target: rows.target,
-        }
+        })
     }
     /// Produce the actual extension plan through the same original row author.
     /// This method allocates nothing and leaves plan scratch ownership to its caller.
@@ -141,7 +144,7 @@ impl ArrayAppendInputs {
         for (ordinal, row) in selection.iter().enumerate() {
             observe(observer, CollectionObservation::Step)?;
             let rows = rows(ordinal, row).map_err(AppendFailure::Control)?;
-            match self.row_action(rows) {
+            match self.row_action(rows).map_err(AppendFailure::Operation)? {
                 AppendRowAction::NullParent => {}
                 AppendRowAction::Copy { start, end, target } => {
                     if end > start {
@@ -153,7 +156,7 @@ impl ArrayAppendInputs {
         }
         Ok(())
     }
-    pub fn legacy_rows(&self, row: usize) -> AppendRows {
+    pub fn direct_rows(&self, row: usize) -> AppendRows {
         AppendRows {
             list: row_index(row, self.list().len()),
             target: row_index(row, self.targets.len()),
@@ -210,14 +213,20 @@ pub fn append_observed_guarded<E>(
     for (ordinal, row) in selection.iter().enumerate() {
         observe(observer, CollectionObservation::Step)?;
         let rows = rows(ordinal, row).map_err(AppendFailure::Control)?;
-        let (start, end, target_row) = match inputs.row_action(rows) {
-            AppendRowAction::NullParent => {
-                null_builder.append_null();
-                out_offsets.push(current as i32);
-                continue;
-            }
-            AppendRowAction::Copy { start, end, target } => (start, end, target),
-        };
+        let (start, end, target_row) =
+            match inputs.row_action(rows).map_err(AppendFailure::Operation)? {
+                AppendRowAction::NullParent => {
+                    null_builder.append_null();
+                    out_offsets.push(current as i32);
+                    continue;
+                }
+                AppendRowAction::Copy { start, end, target } => (start, end, target),
+            };
+        let row_elements = end - start + 1;
+        // All previously emitted rows proved `current` within i32 offsets.
+        let next =
+            crate::aggregate_scalar::checked_list_output_offset(current as i32, row_elements)
+                .map_err(AppendFailure::Operation)?;
         if end > start {
             before_extend(values.as_ref(), start, end - start, current)
                 .map_err(AppendFailure::Control)?;
@@ -230,23 +239,21 @@ pub fn append_observed_guarded<E>(
         observe(observer, CollectionObservation::OpaqueBoundary)?;
         mutable.extend(1, target_row, target_row + 1);
         observe(observer, CollectionObservation::OpaqueBoundary)?;
-        current += 1;
-        if current > i32::MAX as i64 {
-            return Err(AppendFailure::Data(
-                "array_append offset overflow".to_string(),
-            ));
-        }
+        current = i64::from(next);
         out_offsets.push(current as i32);
         null_builder.append_non_null();
     }
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     let out_values = make_array(mutable.freeze());
-    let out = ListArray::new(
+    let out = ListArray::try_new(
         output_field,
         OffsetBuffer::new(out_offsets.into()),
         out_values,
         null_builder.finish(),
-    );
+    )
+    .map_err(|source| {
+        AppendFailure::Operation(arrow_failure("array_append", ArrowSite::Construct, source))
+    })?;
     observe(observer, CollectionObservation::OpaqueBoundary)?;
     Ok(Arc::new(out) as ArrayRef)
 }

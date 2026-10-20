@@ -35,7 +35,7 @@ impl PureCompileControl for Control {
         let mut observations = self.observations.lock().unwrap();
         let ordinal = observations.len();
         observations.push(units);
-        if let Some((at, cause)) = self.reject
+        if let Some((at, cause)) = self.reject.clone()
             && at == ordinal
         {
             return Err(cause);
@@ -318,7 +318,7 @@ fn ordered_projection_preserves_every_original_control_failure_prefix() {
     ] {
         for at in 0..trace.len() {
             let control = Control {
-                reject: Some((at, cause)),
+                reject: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(

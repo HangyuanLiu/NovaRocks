@@ -62,7 +62,7 @@ impl PureCompileControl for Control {
             assert!(trace.len() < at, "no callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((at, cause)) if trace.len() == at => Err(cause),
             _ => Ok(()),
         }
@@ -479,11 +479,11 @@ fn materialized_variant_requests_keep_original_control_at_all_read_and_rewrite_b
             let before = f.arena.borrow().node_count();
             let control = Control {
                 trace: Mutex::new(vec![]),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             let error = apply(&f, &control).unwrap_err();
             assert!(matches!(
-                (cause, error),
+                (cause.clone(), error),
                 (CompileControlError::Cancelled, SqlCompileError::Cancelled)
                     | (
                         CompileControlError::DeadlineExceeded,

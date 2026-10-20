@@ -44,7 +44,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut calls = self.calls.lock().unwrap();
         calls.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((at, cause)) if calls.len() == at => Err(cause),
             _ => Ok(()),
         }
@@ -249,7 +249,7 @@ fn unnest_created_validation_preserves_every_first_h_and_control_prefix() {
         for at in 1..=calls.len() {
             let (facts, mut scope) = Scope::new(None);
             let control = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Default::default()
             };
             assert!(

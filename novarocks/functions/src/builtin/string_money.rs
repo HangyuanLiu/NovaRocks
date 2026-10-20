@@ -17,6 +17,7 @@
 
 //! Original MONEY_FORMAT rounding, grouping and floating negative-zero behavior.
 use super::string_extended::Row;
+use super::string_failure::MoneyDataFailure;
 use crate::{KernelFailure, kernel_control::internal, kernel_input::EvaluationCheckpoints};
 use arrow_array::{
     Array, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
@@ -117,33 +118,29 @@ pub(super) fn visit(
     }
     Ok(Row::Value)
 }
-fn round_half_away_from_zero(value: f64) -> Result<i128, &'static str> {
+fn round_half_away_from_zero(value: f64) -> Result<i128, MoneyDataFailure> {
     if !value.is_finite() {
-        return Err("money_format input must be finite");
+        return Err(MoneyDataFailure::NonFinite);
     }
     let rounded = if value >= 0.0 {
         (value + 0.5).floor()
     } else {
         (value - 0.5).ceil()
     };
-    if rounded < i128::MIN as f64 || rounded > i128::MAX as f64 {
-        return Err("money_format overflow");
+    if rounded < i128::MIN as f64 || rounded >= i128::MAX as f64 {
+        return Err(MoneyDataFailure::Overflow);
     }
     Ok(rounded as i128)
 }
 
-fn pow10_i128(exp: u32) -> Result<i128, &'static str> {
-    10_i128
-        .checked_pow(exp)
-        .ok_or_else(|| "money_format overflow")
+fn pow10_i128(exp: u32) -> Result<i128, MoneyDataFailure> {
+    10_i128.checked_pow(exp).ok_or(MoneyDataFailure::Overflow)
 }
 
-fn decimal_to_cents(value: i128, scale: i32) -> Result<i128, &'static str> {
+fn decimal_to_cents(value: i128, scale: i32) -> Result<i128, MoneyDataFailure> {
     if scale <= 2 {
         let factor = pow10_i128((2 - scale) as u32)?;
-        return value
-            .checked_mul(factor)
-            .ok_or_else(|| "money_format overflow");
+        return value.checked_mul(factor).ok_or(MoneyDataFailure::Overflow);
     }
 
     let divisor = pow10_i128((scale - 2) as u32)?;
@@ -152,7 +149,7 @@ fn decimal_to_cents(value: i128, scale: i32) -> Result<i128, &'static str> {
     if remainder.saturating_mul(2) >= divisor as u128 {
         cents = cents
             .checked_add(if value >= 0 { 1 } else { -1 })
-            .ok_or_else(|| "money_format overflow")?;
+            .ok_or(MoneyDataFailure::Overflow)?;
     }
     Ok(cents)
 }
@@ -197,14 +194,33 @@ mod tests {
     fn selected_money_original_rounding_and_negative_zero() {
         assert_eq!(decimal_to_cents(5, 3), Ok(1));
         assert_eq!(decimal_to_cents(-5, 3), Ok(-1));
-        assert_eq!(decimal_to_cents(i128::MAX, 0), Err("money_format overflow"));
+        assert_eq!(
+            decimal_to_cents(i128::MAX, 0),
+            Err(MoneyDataFailure::Overflow)
+        );
         assert_eq!(format_currency(-123456789, false, false), "-1,234,567.89");
         assert_eq!(format_currency(0, true, true), "-.00");
         assert_eq!(format_currency(0, false, false), "0.00");
         assert_eq!(
             round_half_away_from_zero(f64::INFINITY),
-            Err("money_format input must be finite")
+            Err(MoneyDataFailure::NonFinite)
         );
         assert_eq!(round_half_away_from_zero(-0.5), Ok(-1));
+    }
+}
+
+#[cfg(test)]
+mod source_boundaries {
+    use super::*;
+    #[test]
+    fn floating_upper_limit_is_exclusive_without_saturating_to_i128_max() {
+        assert_eq!(
+            round_half_away_from_zero(i128::MAX as f64),
+            Err(MoneyDataFailure::Overflow)
+        );
+        assert_eq!(
+            round_half_away_from_zero(i128::MIN as f64).unwrap(),
+            i128::MIN
+        );
     }
 }

@@ -35,7 +35,7 @@ impl PureCompileControl for Control {
         let mut events = self.events.lock().unwrap();
         let ordinal = events.len();
         events.push((phase, units));
-        match self.failure {
+        match self.failure.clone() {
             Some((at, cause)) if at == ordinal => Err(cause),
             _ => Ok(()),
         }
@@ -162,7 +162,7 @@ fn assert_prefixes(
     for &at in positions {
         for cause in causes() {
             let control = Control {
-                failure: Some((at, cause)),
+                failure: Some((at, cause.clone())),
                 ..Default::default()
             };
             assert_eq!(

@@ -221,7 +221,10 @@ impl RuntimeMembershipFilter {
         }
     }
 
-    pub fn filter_chunk(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+    pub fn filter_chunk(
+        &self,
+        chunk: Chunk,
+    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
         if chunk.is_empty() {
             return Ok(Some(chunk));
         }
@@ -236,12 +239,14 @@ impl RuntimeMembershipFilter {
         &self,
         array: &ArrayRef,
         chunk: Chunk,
-    ) -> Result<Option<Chunk>, String> {
+    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
         if chunk.is_empty() {
             return Ok(Some(chunk));
         }
         if array.len() != chunk.len() {
-            return Err("runtime membership filter array length mismatch".to_string());
+            return Err(crate::exec::runtime_filter::failure::contract(
+                "runtime membership filter array length mismatch",
+            ));
         }
         let mut current_chunk = chunk;
         let mut current_array = array.clone();
@@ -256,8 +261,12 @@ impl RuntimeMembershipFilter {
         if !keep.iter().all(|v| *v) {
             let mask = BooleanArray::from(keep);
             let filtered_batch = filter_record_batch(&current_chunk.record_batch(), &mask)
-                .map_err(|e| e.to_string())?;
-            let filtered_array = filter(&current_array, &mask).map_err(|e| e.to_string())?;
+                .map_err(|source| {
+                    crate::exec::runtime_filter::failure::arrow("membership selection", source)
+                })?;
+            let filtered_array = filter(&current_array, &mask).map_err(|source| {
+                crate::exec::runtime_filter::failure::arrow("membership selection", source)
+            })?;
             current_chunk = Chunk::new_like(filtered_batch, &current_chunk);
             current_array = filtered_array;
         }
@@ -276,9 +285,11 @@ impl RuntimeMembershipFilter {
         &self,
         array: &ArrayRef,
         keep: &mut [bool],
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         if keep.len() != array.len() {
-            return Err("runtime membership filter value selection size mismatch".to_string());
+            return Err(crate::exec::runtime_filter::failure::contract(
+                "runtime membership filter value selection size mismatch",
+            ));
         }
         let check_null = matches!(self, RuntimeMembershipFilter::Empty(_));
         self.min_max()
@@ -299,8 +310,8 @@ impl RuntimeMembershipFilter {
         arena: &ExprArena,
         expr_id: ExprId,
         chunk: Chunk,
-    ) -> Result<Option<Chunk>, String> {
-        let array = arena.eval(expr_id, &chunk).map_err(|e| e.to_string())?;
+    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
+        let array = arena.eval(expr_id, &chunk)?;
         self.filter_chunk_with_array(&array, chunk)
     }
 
@@ -313,7 +324,10 @@ impl RuntimeMembershipFilter {
     }
 
     #[allow(dead_code)]
-    pub fn merge_from(&mut self, other: &RuntimeMembershipFilter) -> Result<(), String> {
+    pub fn merge_from(
+        &mut self,
+        other: &RuntimeMembershipFilter,
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         match (self, other) {
             (RuntimeMembershipFilter::Bloom(lhs), RuntimeMembershipFilter::Bloom(rhs)) => {
                 lhs.merge_from(rhs)
@@ -324,16 +338,24 @@ impl RuntimeMembershipFilter {
             (RuntimeMembershipFilter::Empty(lhs), RuntimeMembershipFilter::Empty(rhs)) => {
                 lhs.min_max_mut().merge_from(rhs.min_max())
             }
-            _ => Err("runtime membership filter type mismatch".to_string()),
+            _ => Err(crate::exec::runtime_filter::failure::contract(
+                "runtime membership filter type mismatch",
+            )),
         }
     }
 
     #[allow(dead_code)]
-    pub fn merge_min_max_from(&mut self, other: &RuntimeMembershipFilter) -> Result<(), String> {
+    pub fn merge_min_max_from(
+        &mut self,
+        other: &RuntimeMembershipFilter,
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         self.min_max_mut().merge_from(other.min_max())
     }
 
-    pub fn merge_membership_from(&mut self, other: &RuntimeMembershipFilter) -> Result<(), String> {
+    pub fn merge_membership_from(
+        &mut self,
+        other: &RuntimeMembershipFilter,
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         match (self, other) {
             (RuntimeMembershipFilter::Bloom(lhs), RuntimeMembershipFilter::Bloom(rhs)) => {
                 lhs.merge_from(rhs)
@@ -342,7 +364,9 @@ impl RuntimeMembershipFilter {
                 lhs.merge_from(rhs)
             }
             (RuntimeMembershipFilter::Empty(_), RuntimeMembershipFilter::Empty(_)) => Ok(()),
-            _ => Err("runtime membership filter type mismatch".to_string()),
+            _ => Err(crate::exec::runtime_filter::failure::contract(
+                "runtime membership filter type mismatch",
+            )),
         }
     }
 

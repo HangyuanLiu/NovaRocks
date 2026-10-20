@@ -33,42 +33,50 @@ use novarocks_execution_contract::task_execution::status::{
 };
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
 
-/// One operation's settled Worker verdict and optional acknowledgement.
+/// One operation's Worker result. Domain failure carries no acknowledgement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationReceipt<T> {
     operation_id: TaskOperationId,
-    outcome: OperationOutcome,
-    detail: Option<SafeDetail>,
-    acknowledgement: Option<T>,
+    result: novarocks_execution_contract::operation::OperationResult<T>,
 }
-
 impl<T> OperationReceipt<T> {
+    pub const fn from_result(
+        operation_id: TaskOperationId,
+        result: novarocks_execution_contract::operation::OperationResult<T>,
+    ) -> Self {
+        Self {
+            operation_id,
+            result,
+        }
+    }
     pub const fn acknowledged(
         operation_id: TaskOperationId,
         outcome: OperationOutcome,
         acknowledgement: T,
     ) -> Self {
-        Self {
+        Self::from_result(
             operation_id,
-            outcome,
-            detail: None,
-            acknowledgement: Some(acknowledgement),
-        }
+            novarocks_execution_contract::operation::OperationResult::Verdict {
+                outcome,
+                detail: None,
+                acknowledgement: Some(acknowledgement),
+            },
+        )
     }
-
     pub fn rejected(
         operation_id: TaskOperationId,
         outcome: OperationOutcome,
         detail: impl AsRef<str>,
     ) -> Self {
-        Self {
+        Self::from_result(
             operation_id,
-            outcome,
-            detail: Some(SafeDetail::truncating(detail.as_ref())),
-            acknowledgement: None,
-        }
+            novarocks_execution_contract::operation::OperationResult::Verdict {
+                outcome,
+                detail: Some(SafeDetail::truncating(detail.as_ref())),
+                acknowledgement: None,
+            },
+        )
     }
-
     pub fn settled(
         operation_id: TaskOperationId,
         outcome: OperationOutcome,
@@ -76,25 +84,45 @@ impl<T> OperationReceipt<T> {
     ) -> Self {
         Self::rejected(operation_id, outcome, detail)
     }
-
+    pub const fn domain_failure(
+        operation_id: TaskOperationId,
+        outcome: novarocks_execution_contract::operation::DomainFailureOutcome,
+        failure: novarocks_execution_contract::operation::OperationDomainFailure,
+    ) -> Self {
+        Self::from_result(
+            operation_id,
+            novarocks_execution_contract::operation::OperationResult::DomainFailure {
+                outcome,
+                failure,
+            },
+        )
+    }
     pub const fn operation_id(&self) -> TaskOperationId {
         self.operation_id
     }
-
+    pub const fn result(&self) -> &novarocks_execution_contract::operation::OperationResult<T> {
+        &self.result
+    }
     pub const fn outcome(&self) -> OperationOutcome {
-        self.outcome
+        self.result.outcome()
     }
-
     pub const fn detail(&self) -> Option<&SafeDetail> {
-        self.detail.as_ref()
+        self.result.detail()
     }
-
     pub const fn acknowledgement(&self) -> Option<&T> {
-        self.acknowledgement.as_ref()
+        self.result.acknowledgement()
     }
-
     pub fn into_acknowledgement(self) -> Option<T> {
-        self.acknowledgement
+        match self.result {
+            novarocks_execution_contract::operation::OperationResult::Verdict {
+                acknowledgement,
+                ..
+            } => acknowledgement,
+            novarocks_execution_contract::operation::OperationResult::DomainFailure { .. } => None,
+        }
+    }
+    pub fn map_ack<U>(self, map: impl FnOnce(T) -> U) -> OperationReceipt<U> {
+        OperationReceipt::from_result(self.operation_id, self.result.map_ack(map))
     }
 }
 

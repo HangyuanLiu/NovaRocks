@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 use novarocks_functions::{
     Selection,
@@ -28,16 +29,23 @@ pub fn eval_cardinality<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "collection count requires exactly one argument",
+        ));
+    }
     let arr = arena.eval(args[0], chunk)?;
     let out = count_observed(
         arr.as_ref(),
         Selection::all(arr.len()),
-        |_, row| Ok::<_, String>(row),
+        |_, row| Ok::<_, novarocks_functions::KernelFailure>(row),
         &mut |_| Ok(()),
     )
     .map_err(|failure| match failure {
-        OffsetCountFailure::Data(message) | OffsetCountFailure::Control(message) => message,
+        OffsetCountFailure::Operation(source) | OffsetCountFailure::Control(source) => {
+            ExecutionFailure::from(source)
+        }
     })?;
-    Ok((super::common::cast_output(out, arena.data_type(expr), "cardinality"))?)
+    super::common::cast_output(out, arena.data_type(expr), "cardinality")
 }

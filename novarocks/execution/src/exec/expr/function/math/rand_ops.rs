@@ -16,7 +16,8 @@
 // under the License.
 use super::common::{NumericArrayView, cast_output, value_at_i64};
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{ArrayRef, Float64Array};
 use rand::prelude::*;
 use std::sync::Arc;
@@ -26,7 +27,7 @@ fn eval_rand_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let len = chunk.len();
     let mut values = Vec::with_capacity(len);
     if args.is_empty() {
@@ -44,7 +45,7 @@ fn eval_rand_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         }
     }
     let out = Arc::new(Float64Array::from(values)) as ArrayRef;
-    Ok((cast_output(out, arena.data_type(expr)))?)
+    cast_output(out, arena.data_type(expr))
 }
 
 pub fn eval_rand<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -52,6 +53,6 @@ pub fn eval_rand<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_rand_impl(arena, expr, args, chunk))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_rand_impl(arena, expr, args, chunk)
 }

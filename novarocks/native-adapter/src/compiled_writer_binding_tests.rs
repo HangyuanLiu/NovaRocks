@@ -168,10 +168,17 @@ fn a_recipe_for_an_uninstalled_catalog_is_refused() {
         Err(error) => error,
     };
     assert_eq!(error.node(), Some(1));
-    assert!(
-        error.detail().contains("no installed write execution"),
-        "{error}"
+    use novarocks_worker::CatalogExecutionAccessError;
+    let actual = crate::backend_test_support::find_source::<CatalogExecutionAccessError>(&error)
+        .expect("original query-leased catalog lookup");
+    assert_eq!(
+        actual,
+        &CatalogExecutionAccessError::LeaseUnavailable {
+            catalog: binding("other_catalog").catalog_handle().clone()
+        }
     );
+    use novarocks_execution_contract::failure::FailureProjection;
+    assert_eq!(error.failure_fact(), actual.failure_fact());
 }
 
 /// A handle payload the installed decoder refuses is refused, not repaired.
@@ -186,7 +193,18 @@ fn a_handle_the_installed_decoder_refuses_is_refused() {
         Ok(_) => panic!("an undecodable handle must be refused"),
         Err(error) => error,
     };
-    assert!(error.detail().contains("not decodable"), "{error}");
+    use novarocks_spi::connector::{
+        ConnectorCodecError, ConnectorCodecErrorKind, ConnectorFieldPath,
+    };
+    let actual = crate::backend_test_support::find_source::<ConnectorCodecError>(&error)
+        .expect("the installed decoder's actual source");
+    assert_eq!(actual.kind(), &ConnectorCodecErrorKind::InvalidValue);
+    assert_eq!(
+        actual.path(),
+        &ConnectorFieldPath::root("writer_handle").field("provider_payload")
+    );
+    use novarocks_execution_contract::failure::FailureProjection;
+    assert_eq!(error.failure_fact(), actual.failure_fact());
 }
 
 /// A finish binds the Task's canonical carrier validator, which refuses a

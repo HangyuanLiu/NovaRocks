@@ -15,29 +15,38 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef};
 use novarocks_functions::{
     Selection,
-    builtin::map_size_core::{MapSizeFailure, count_observed, map_input},
+    builtin::collection_offset_count::OffsetCountFailure,
+    builtin::map_size_core::{count_observed, map_input},
 };
 pub fn eval_map_size<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "collection count requires exactly one argument",
+        ));
+    }
     let _ = chunk;
     let map_arr = arena.eval(args[0], chunk)?;
     let map = map_input(map_arr.as_ref())?;
     let out = count_observed(
         map,
         Selection::all(map.len()),
-        |_, row| Ok::<_, String>(row),
+        |_, row| Ok::<_, novarocks_functions::KernelFailure>(row),
         &mut |_| Ok(()),
     )
     .map_err(|failure| match failure {
-        MapSizeFailure::Data(message) | MapSizeFailure::Control(message) => message,
+        OffsetCountFailure::Operation(source) | OffsetCountFailure::Control(source) => {
+            ExecutionFailure::from(source)
+        }
     })?;
-    Ok((super::common::cast_output(out, arena.data_type(expr), "map_size"))?)
+    super::common::cast_output(out, arena.data_type(expr), "map_size")
 }

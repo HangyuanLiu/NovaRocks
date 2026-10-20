@@ -52,7 +52,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         trace.push(units);
-        match self.refuse {
+        match self.refuse.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -168,7 +168,7 @@ fn prefixes(input: &Input, policy: ConstantPolicy, ordinary: bool) {
     assert!(trace.len() >= 2);
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let c = Control::new(Some((at, cause)));
+            let c = Control::new(Some((at, cause.clone())));
             let result = input.parent(&c, policy, &mut Vec::new());
             assert!(matches!(result, Err(ConstantError::Control(actual)) if actual==cause));
             assert_eq!(c.trace(), trace[..=at]);
@@ -463,7 +463,7 @@ fn wide_actual_struct_preserves_all_children_and_samples_true_work_quantum() {
         .expect("actual borrowed type/array loops must expose their quantum");
     for at in [0, quantum, trace.len() / 2, trace.len() - 1] {
         for cause in CAUSES {
-            let c = Control::new(Some((at, cause)));
+            let c = Control::new(Some((at, cause.clone())));
             assert!(
                 matches!(input.parent(&c,policy(),&mut Vec::new()),Err(ConstantError::Control(actual)) if actual==cause)
             );

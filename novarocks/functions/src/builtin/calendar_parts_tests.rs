@@ -71,7 +71,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -687,7 +687,7 @@ fn calendar_parts_strict_null_inactive_hidden_payload_empty_and_child_failures_a
             &[EvaluatedArgument::SelectedColumn(&failed)],
             &Control::default()
         ),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let after = Control::default();
     assert_eq!(
@@ -708,7 +708,7 @@ fn calendar_parts_strict_null_inactive_hidden_payload_empty_and_child_failures_a
             &[EvaluatedArgument::Column(&hidden)],
             &Control::default()
         ),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
 }
 
@@ -782,10 +782,11 @@ fn calendar_parts_every_actual_compile_callback_preserves_three_causes_success_a
                 CompileControlError::Cancelled,
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
+                CompileControlError::from_domain(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let error = prepared_for_test_with_control(
                     "year",

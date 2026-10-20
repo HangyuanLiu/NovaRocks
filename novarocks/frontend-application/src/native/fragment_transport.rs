@@ -21,6 +21,7 @@
 //! task and process frozen by this attempt. Root bodies stay encoded until
 //! their admitted domain owner consumes them.
 
+use futures::future::BoxFuture;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
@@ -33,12 +34,15 @@ use novarocks_execution::task_execution::operation::FetchTaskDynamicFilters;
 use novarocks_execution::task_execution::{
     FinalTaskInfo, OperationOutcome, TaskIdentity, TaskOperationId,
 };
-use novarocks_execution_contract::BackendProcessDescriptor;
+use novarocks_execution_contract::{
+    BackendProcessDescriptor, SafeDetail, failure::FailureProjection,
+};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::native_rpc::NativeRpcMethod;
 use novarocks_query_application::{
     api::{QueryExecutionError, QueryExecutionErrorKind},
-    coordination::{AttemptFailureClass, RootResultFetchFailure},
+    coordination::RootResultFetchFailure,
+    execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
 };
 use novarocks_task_codec::operation::{
     decode_operation_outcome, encode_fetch_dynamic_filters, encode_get_final_task_info,
@@ -168,8 +172,13 @@ impl fmt::Display for DynamicFilterReadError {
     reason = "The production cutover routes the coordinator's result loop onto this face."
 )]
 pub trait TaskResultTransport: Send + Sync + 'static {
-    /// Reads one terminal task's bounded final info.
-    fn final_task_info(&self, identity: TaskIdentity) -> Result<FinalTaskInfoRead, String>;
+    /// Reads one terminal task's bounded final info without blocking a turn.
+    /// The caller keeps this future in its original local owner while pending;
+    /// a read result is not a Task lifecycle or resource-exit receipt.
+    fn final_task_info(
+        &self,
+        identity: TaskIdentity,
+    ) -> BoxFuture<'_, Result<FinalTaskInfoRead, String>>;
 
     /// Reads whatever one task advertised above the reader's own cursor.
     fn dynamic_filters(
@@ -278,167 +287,114 @@ fn transport_error_chain(error: &tonic::Status) -> String {
     chain
 }
 
-fn classify_fetch_task_result_rpc_status(error: tonic::Status) -> NativeRootResultFetchError {
-    let unknown_is_transport = error.code() == tonic::Code::Unknown
-        && (std::error::Error::source(&error).is_some()
-            || error.message().starts_with("Service was not ready: "));
-    // A backend that stops gracefully sends GOAWAY, and the streams it cuts
-    // arrive here as `Cancelled` carrying the transport error that caused it.
-    // That is the same fact as the torn socket this used to see as `Unknown`:
-    // the endpoint could not complete the request. Reading it any other way
-    // would make an orderly stop less recoverable than an abrupt one. The
-    // source is required for the same reason it is required above -- a
-    // source-less remote `Cancelled` is the peer's own answered refusal.
-    let cancelled_is_transport =
-        error.code() == tonic::Code::Cancelled && std::error::Error::source(&error).is_some();
-    let detail = format!(
-        "fetch_task_result rpc failed: {error}{}",
-        transport_error_chain(&error)
-    );
-    match error.code() {
-        // These statuses state that the exact backend endpoint or its HTTP/2
-        // transport could not complete the request in this attempt's bounded
-        // transport window.
-        tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
-            NativeRootResultFetchError::infrastructure(detail)
-        }
-        tonic::Code::Unknown if unknown_is_transport => {
-            NativeRootResultFetchError::infrastructure(detail)
-        }
-        tonic::Code::Cancelled if cancelled_is_transport => {
-            NativeRootResultFetchError::infrastructure(detail)
-        }
-        // A peer that explicitly refuses work for capacity reasons has made a
-        // resource-governance decision rather than disappearing.
-        tonic::Code::ResourceExhausted => NativeRootResultFetchError::resource_governance(detail),
-        // The FetchResult response carries every application-owned refusal in
-        // band. Tonic's generated client maps service-readiness failures to a
-        // source-less Unknown with a fixed generated prefix; HTTP/2 failures
-        // retain an error source. A source-less remote Unknown is ambiguous and
-        // therefore remains a contract failure. Every other gRPC status is an
-        // answered protocol, identity, authorization, or server-contract
-        // refusal. Attempt execution failure is learned from the accepted Task
-        // status projection, never inferred from this transport status.
-        _ => NativeRootResultFetchError::contract(detail),
-    }
+fn root_failure(
+    reason: QueryFailureReason,
+    site: ExecutionFailureSite,
+    detail: &'static str,
+) -> RootResultFetchFailure {
+    RootResultFetchFailure::from_input(ExecutionFailureInput::new(
+        reason.failure_fact(),
+        SafeDetail::truncating(detail),
+        site,
+    ))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NativeRootResultFetchErrorClass {
-    Infrastructure,
-    ResourceGovernance,
-    ContractViolation,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct NativeRootResultFetchError {
-    class: NativeRootResultFetchErrorClass,
-    detail: String,
-}
-
-impl NativeRootResultFetchError {
-    fn infrastructure(detail: impl Into<String>) -> Self {
-        Self {
-            class: NativeRootResultFetchErrorClass::Infrastructure,
-            detail: detail.into(),
-        }
-    }
-
-    fn resource_governance(detail: impl Into<String>) -> Self {
-        Self {
-            class: NativeRootResultFetchErrorClass::ResourceGovernance,
-            detail: detail.into(),
-        }
-    }
-
-    fn contract(detail: impl Into<String>) -> Self {
-        Self {
-            class: NativeRootResultFetchErrorClass::ContractViolation,
-            detail: detail.into(),
-        }
-    }
-
-    fn into_pump_failure_for_backend(
-        self,
-        backend: novarocks_types::identity::BackendProcessId,
-    ) -> RootResultFetchFailure {
-        let requirement = if self.class == NativeRootResultFetchErrorClass::Infrastructure {
-            novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
-                backend,
-            )
-        } else {
-            novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
+fn classify_fetch_task_result_rpc_status(
+    error: tonic::Status,
+    root: TaskIdentity,
+) -> RootResultFetchFailure {
+    // Private transport diagnostics are not a credential-redaction contract.
+    tracing::warn!(task = %root, error = %error, chain = %transport_error_chain(&error), "Native root result RPC failed");
+    let mut source = std::error::Error::source(&error);
+    for _ in 0..16 {
+        let Some(current) = source else {
+            break;
         };
-        self.into_pump_failure()
-            .with_topology_requirement(requirement)
+        if current.is::<super::root_result_codec::RootWireProtocolError>() {
+            return root_failure(
+                QueryFailureReason::ResultProtocol,
+                ExecutionFailureSite::RootRead { root },
+                "root response violates its wire contract",
+            );
+        }
+        source = current.source();
     }
-
-    fn into_pump_failure(self) -> RootResultFetchFailure {
-        let (class, kind) = match self.class {
-            NativeRootResultFetchErrorClass::Infrastructure => (
-                AttemptFailureClass::RecoverableInfrastructure,
-                QueryExecutionErrorKind::Failed,
-            ),
-            NativeRootResultFetchErrorClass::ResourceGovernance => (
-                AttemptFailureClass::ResourceGovernance,
-                QueryExecutionErrorKind::Rejected,
-            ),
-            NativeRootResultFetchErrorClass::ContractViolation => (
-                AttemptFailureClass::ContractViolation,
-                QueryExecutionErrorKind::InvalidRequest,
-            ),
-        };
-        RootResultFetchFailure::new(class, QueryExecutionError::new(kind, self.detail))
+    if super::transport::is_observed_connection_loss(&error) {
+        return root_failure(
+            QueryFailureReason::BackendLost,
+            ExecutionFailureSite::Backend {
+                process: root.backend_process_id(),
+            },
+            "the original backend connection was lost",
+        );
     }
+    let reason = match error.code() {
+        tonic::Code::DeadlineExceeded => QueryFailureReason::TransportDeadline,
+        tonic::Code::ResourceExhausted => QueryFailureReason::TransportCapacity,
+        // Application-owned admission/refusal travels in the closed response
+        // sum. These codes therefore report a broken request, framing, codec
+        // or service contract, whether authored locally or by this endpoint.
+        // Tonic can reject framing before the custom decoder supplies a source.
+        tonic::Code::InvalidArgument
+        | tonic::Code::FailedPrecondition
+        | tonic::Code::Internal
+        | tonic::Code::OutOfRange
+        | tonic::Code::DataLoss
+        | tonic::Code::Unimplemented
+        | tonic::Code::NotFound => QueryFailureReason::ResultProtocol,
+        _ => QueryFailureReason::TransportRefused,
+    };
+    root_failure(
+        reason,
+        ExecutionFailureSite::RootRead { root },
+        "the root result transport did not complete the read",
+    )
 }
-
-impl fmt::Display for NativeRootResultFetchError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.detail)
-    }
-}
-
-impl std::error::Error for NativeRootResultFetchError {}
 
 impl TaskResultTransport for NativeTaskResultTransport {
-    fn final_task_info(&self, identity: TaskIdentity) -> Result<FinalTaskInfoRead, String> {
-        let (client, address) = self.client_of(identity)?;
-        let request = encode_get_final_task_info(identity);
-        // Final info is a projection of a retained record, answered
-        // immediately, so this bound only covers a backend that stopped
-        // answering. It has to be bounded for the same reason as the poll
-        // above, and more sharply: this read runs inside the attempt's drain,
-        // whose whole point is not to hold a client-visible completion.
-        let deadline = self.grace.deadline_for(std::time::Duration::ZERO);
-        let response = self.data_runtime.block_on(async {
-            let expires_at = tokio::time::Instant::now() + deadline;
-            let mut grpc = tokio::time::timeout_at(
-                expires_at,
-                client.grpc_with_channel_error(NativeRpcMethod::GetFinalTaskInfo),
-            )
-            .await
-            .map_err(|_| {
-                format!(
-                    "{address}: final info read for task {identity} could not acquire a \
-                         channel within {deadline:?}"
+    fn final_task_info(
+        &self,
+        identity: TaskIdentity,
+    ) -> BoxFuture<'_, Result<FinalTaskInfoRead, String>> {
+        Box::pin(async move {
+            let (client, address) = self.client_of(identity)?;
+            let request = encode_get_final_task_info(identity);
+            // Final info is a projection of a retained record, answered
+            // immediately, so this bound only covers a backend that stopped
+            // answering. It has to be bounded for the same reason as the poll
+            // above, and more sharply: this read runs inside the attempt's drain,
+            // whose whole point is not to hold a client-visible completion.
+            let deadline = self.grace.deadline_for(std::time::Duration::ZERO);
+            let response = async {
+                let expires_at = tokio::time::Instant::now() + deadline;
+                let mut grpc = tokio::time::timeout_at(
+                    expires_at,
+                    client.grpc_with_channel_error(NativeRpcMethod::GetFinalTaskInfo),
                 )
-            })?
-            .map_err(|error| error.to_string())?;
-            tokio::time::timeout_at(expires_at, grpc.get_final_task_info(request))
                 .await
                 .map_err(|_| {
                     format!(
-                        "{address}: final info read for task {identity} did not answer within \
-                         {deadline:?}"
+                        "{address}: final info read for task {identity} could not acquire a \
+                         channel within {deadline:?}"
                     )
                 })?
-                .map(tonic::Response::into_inner)
-                .map_err(|error| format!("get_final_task_info rpc failed: {error}"))
-        })??;
-        let result = response
-            .result
-            .ok_or_else(|| format!("{address}: final info response carries no result"))?;
-        match result {
+                .map_err(|error| error.to_string())?;
+                tokio::time::timeout_at(expires_at, grpc.get_final_task_info(request))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "{address}: final info read for task {identity} did not answer within \
+                         {deadline:?}"
+                        )
+                    })?
+                    .map(tonic::Response::into_inner)
+                    .map_err(|error| format!("get_final_task_info rpc failed: {error}"))
+            }
+            .await?;
+            let result = response
+                .result
+                .ok_or_else(|| format!("{address}: final info response carries no result"))?;
+            match result {
             novarocks_proto_models::novarocks::get_final_task_info_response::Result::Info(info) => {
                 decode_final_task_info(identity, &info, FieldPath::root("final_task_info"))
                     .map(FinalTaskInfoRead::Available)
@@ -450,6 +406,7 @@ impl TaskResultTransport for NativeTaskResultTransport {
                 .map(FinalTaskInfoRead::Unavailable)
                 .map_err(|error| format!("{address}: {error}")),
         }
+        })
     }
 
     fn dynamic_filters(
@@ -584,77 +541,128 @@ impl novarocks_query_application::api::BoundedRootReadPort for NativeBoundedRoot
             .map(|(client, address)| (client.clone(), address));
         let grace = self.transport.grace;
         Box::pin(async move {
+            let site = ExecutionFailureSite::RootRead { root };
             if sealed {
-                return Err(NativeRootResultFetchError::contract(format!(
-                    "root reads for task {root} are sealed"
-                ))
-                .into_pump_failure());
+                return Err(root_failure(
+                    QueryFailureReason::ResultProtocol,
+                    site,
+                    "root reads are sealed",
+                ));
             }
-            let (client, address) = route
-                .map_err(|error| NativeRootResultFetchError::contract(error).into_pump_failure())?;
+            let (client, address) = route.map_err(|error| {
+                tracing::warn!(task = %root, error = %error, "Root read has no frozen route");
+                root_failure(
+                    QueryFailureReason::ResultProtocol,
+                    site,
+                    "root read has no frozen route",
+                )
+            })?;
             let wire = novarocks_task_codec::root_result::encode_read(&request);
-            let wait = request.max_wait();
-            let deadline = grace.deadline_for(wait);
+            let deadline = grace.deadline_for(request.max_wait());
             let expires_at = tokio::time::Instant::now() + deadline;
-            let mut grpc = tokio::time::timeout_at(
-                expires_at,
-                client.grpc_with_channel_error(NativeRpcMethod::FetchRootResult),
-            )
+            let (mut grpc, acquired) = tokio::time::timeout_at(
+                expires_at, client.root_result_grpc_with_channel_identity(),
+            ).await.map_err(|_| root_failure(QueryFailureReason::TransportDeadline, site,
+                "root read channel acquisition exceeded its transport window"))?
+                .map_err(|error| {
+                    tracing::warn!(task = %root, address = %address, error = %error, "Root read channel acquisition failed");
+                    if error.observed_connection_loss() {
+                        root_failure(QueryFailureReason::BackendLost, ExecutionFailureSite::Backend { process: backend },
+                            "the original backend connection was lost")
+                    } else if matches!(error, super::transport::ChannelAcquisitionError::Fatal(_)) {
+                        root_failure(QueryFailureReason::ResultProtocol, site, "root read channel binding violates its contract")
+                    } else {
+                        root_failure(QueryFailureReason::TransportRefused, site, "root read channel acquisition was refused")
+                    }
+                })?;
+            let mut channel_attempt = super::transport::NativeChannelAttempt::new(
+                &client,
+                NativeRpcMethod::FetchRootResult,
+                acquired,
+            );
+            let response = tokio::time::timeout_at(expires_at, async {
+                grpc.ready().await.map_err(|error| {
+                    tracing::warn!(task = %root, error = %error, "Root read channel was not ready");
+                    if super::transport::is_observed_connection_loss(error.as_ref()) {
+                        root_failure(
+                            QueryFailureReason::BackendLost,
+                            ExecutionFailureSite::Backend { process: backend },
+                            "the original backend connection was lost",
+                        )
+                    } else {
+                        root_failure(
+                            QueryFailureReason::TransportRefused,
+                            site,
+                            "root read channel was not ready",
+                        )
+                    }
+                })?;
+                let mut wire = tonic::Request::new(wire);
+                wire.extensions_mut().insert(tonic::GrpcMethod::new(
+                    "novarocks.NovaRocksGrpc",
+                    "FetchRootResult",
+                ));
+                let path = tonic::codegen::http::uri::PathAndQuery::from_static(
+                    NativeRpcMethod::FetchRootResult.contract().path,
+                );
+                grpc.unary(wire, path, super::root_result_codec::RootResultCodec)
+                    .await
+                    .map(tonic::Response::into_inner)
+                    .map_err(|status| classify_fetch_task_result_rpc_status(status, root))
+            })
             .await
             .map_err(|_| {
-                NativeRootResultFetchError::infrastructure(format!(
-                    "{address}: root read for task {root} could not acquire a channel within \
-                     {deadline:?}"
-                ))
-                .into_pump_failure_for_backend(backend)
-            })?
-            .map_err(|error| {
-                NativeRootResultFetchError::infrastructure(error.to_string())
-                    .into_pump_failure_for_backend(backend)
+                root_failure(
+                    QueryFailureReason::TransportDeadline,
+                    site,
+                    "root read exceeded its transport window",
+                )
             })?;
-            let response = tokio::time::timeout_at(expires_at, grpc.fetch_root_result(wire))
-                .await
-                .map_err(|_| {
-                    NativeRootResultFetchError::infrastructure(format!(
-                        "{address}: root read for task {root} did not answer within \
-                         {deadline:?}; it was asked to wait at most {wait:?}"
-                    ))
-                    .into_pump_failure_for_backend(backend)
-                })?
-                .map(tonic::Response::into_inner)
-                .map_err(|status| {
-                    classify_fetch_task_result_rpc_status(status)
-                        .into_pump_failure_for_backend(backend)
-                })?;
-            let reply = novarocks_task_codec::root_result::decode_reply(
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    // Retire only the channel generation actually used. This is
+                    // cache hygiene, not permission for a replacement attempt.
+                    return Err(error);
+                }
+            };
+            // The original RPC has actually returned. Application refusals
+            // keep this healthy connection; future cancellation/timeouts above
+            // retire only the exact acquired cache generation via its guard.
+            channel_attempt.rpc_completed();
+            let response = novarocks_task_codec::root_result::decode_response(
                 response,
                 &request,
                 request.consumed(),
                 FieldPath::root("fetch_root_result"),
             )
             .map_err(|error| {
-                NativeRootResultFetchError::contract(format!("{address}: {error}"))
-                    .into_pump_failure()
+                tracing::warn!(task = %root, error = %error, "Invalid root response");
+                root_failure(
+                    QueryFailureReason::ResultProtocol,
+                    site,
+                    "root response violates its contract",
+                )
             })?;
-            // The decoded body and its message envelope live together until
-            // the delivery exits; both are covered by the window grant.
-            let live = match &reply.outcome {
-                novarocks_execution_contract::root_result::RootReadOutcome::Data(data) => {
-                    data.body().len() as u64
+            // This checks the visible carrier against its full retained window;
+            // logical body length supplies no physical refund or allocation
+            // capacity receipt. The complete original grant stays owned below.
+            let visible = match &response {
+                novarocks_execution_contract::root_result::RootReadResponse::Reply(reply) => {
+                    match &reply.outcome {
+                        novarocks_execution_contract::root_result::RootReadOutcome::Data(data) => {
+                            data.body().len() as u64
+                        }
+                        _ => 0,
+                    }
                 }
                 _ => 0,
             } + novarocks_result_contract::RootProfileV1::ENVELOPE_BYTES as u64;
-            novarocks_query_application::api::RetainedRootReply::try_new(
-                reply,
-                physical_guard,
-                live,
-            )
-            .map_err(|error| {
-                NativeRootResultFetchError::contract(format!(
-                    "{address}: root reply exceeds its window: {error}"
-                ))
-                .into_pump_failure()
-            })
+            novarocks_query_application::api::RetainedRootReply::try_new(response, physical_guard, visible)
+                .map_err(|error| {
+                    tracing::warn!(task = %root, error = %error, "Root response conflicts with its retained window");
+                    root_failure(QueryFailureReason::ResultProtocol, site, "root response conflicts with its retained window")
+                })
         })
     }
 
@@ -690,143 +698,116 @@ fn classify_dynamic_filter_status(address: &str, status: &tonic::Status) -> Dyna
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use novarocks_query_application::coordination::AttemptFailureClass;
 
-    use super::{NativeRootResultFetchError, classify_fetch_task_result_rpc_status};
-
-    #[test]
-    fn query_adapter_classifies_native_transport_failures_without_guessing() {
-        let contract =
-            NativeRootResultFetchError::contract("malformed response").into_pump_failure();
-        assert_eq!(contract.class(), AttemptFailureClass::ContractViolation);
-        let unavailable =
-            NativeRootResultFetchError::infrastructure("backend unavailable").into_pump_failure();
-        assert_eq!(
-            unavailable.class(),
-            AttemptFailureClass::RecoverableInfrastructure
-        );
-        let capacity = NativeRootResultFetchError::resource_governance("fetch intake closed")
-            .into_pump_failure();
-        assert_eq!(capacity.class(), AttemptFailureClass::ResourceGovernance);
+    fn root() -> TaskIdentity {
+        TaskIdentity::new(
+            novarocks_types::QueryExecutionId::new(
+                novarocks_types::QueryId::new(61, 20),
+                novarocks_types::AttemptId::new(1).unwrap(),
+            )
+            .unwrap(),
+            novarocks_types::StageId::new(1).unwrap(),
+            novarocks_types::TaskId::new(1).unwrap(),
+            BackendProcessId::new_v7(),
+        )
     }
-
     #[test]
-    fn fetch_transport_loss_excludes_only_its_exact_root_process() {
-        use novarocks_query_application::api::NativeAttemptTopologyRequirement;
-        let backend = novarocks_types::identity::BackendProcessId::new_v7();
-        let lost = NativeRootResultFetchError::infrastructure("endpoint lost")
-            .into_pump_failure_for_backend(backend);
-        assert_eq!(
-            lost.topology_requirement(),
-            NativeAttemptTopologyRequirement::ExcludeProcess(backend)
-        );
-        let refusal = NativeRootResultFetchError::contract("answered refusal")
-            .into_pump_failure_for_backend(backend);
-        assert_eq!(
-            refusal.topology_requirement(),
-            NativeAttemptTopologyRequirement::LiveSnapshot
-        );
-    }
-
-    #[test]
-    fn grpc_status_classification_retries_only_endpoint_unavailability() {
-        for code in [tonic::Code::Unavailable, tonic::Code::DeadlineExceeded] {
-            let failure = classify_fetch_task_result_rpc_status(tonic::Status::new(code, "lost"))
-                .into_pump_failure();
-            assert_eq!(
-                failure.class(),
-                AttemptFailureClass::RecoverableInfrastructure
-            );
-        }
-
-        let generated_readiness = classify_fetch_task_result_rpc_status(tonic::Status::unknown(
-            "Service was not ready: transport error",
-        ))
-        .into_pump_failure();
-        assert_eq!(
-            generated_readiness.class(),
-            AttemptFailureClass::RecoverableInfrastructure
-        );
-        let sourced_transport =
-            classify_fetch_task_result_rpc_status(tonic::Status::from_error(Box::new(
-                std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset"),
-            )))
-            .into_pump_failure();
-        assert_eq!(
-            sourced_transport.class(),
-            AttemptFailureClass::RecoverableInfrastructure
-        );
-        // A backend that stops gracefully sends GOAWAY, so its cut streams
-        // arrive as `Cancelled` carrying the transport error. That has to stay
-        // as recoverable as the torn socket it replaced, or an orderly stop
-        // would be less recoverable than an abrupt one.
-        let mut graceful_stop =
-            tonic::Status::new(tonic::Code::Cancelled, "operation was canceled");
-        graceful_stop.set_source(std::sync::Arc::new(std::io::Error::other(
-            "connection closed",
-        )));
-        assert_eq!(
-            classify_fetch_task_result_rpc_status(graceful_stop)
-                .into_pump_failure()
-                .class(),
-            AttemptFailureClass::RecoverableInfrastructure
-        );
-
-        let remote_unknown = classify_fetch_task_result_rpc_status(tonic::Status::unknown(
-            "remote application returned an unknown status",
-        ))
-        .into_pump_failure();
-        assert_eq!(
-            remote_unknown.class(),
-            AttemptFailureClass::ContractViolation
-        );
-
-        let capacity = classify_fetch_task_result_rpc_status(tonic::Status::new(
-            tonic::Code::ResourceExhausted,
-            "full",
-        ))
-        .into_pump_failure();
-        assert_eq!(capacity.class(), AttemptFailureClass::ResourceGovernance);
-
+    fn remote_status_and_local_deadline_do_not_prove_backend_loss() {
+        let root = root();
         for code in [
-            tonic::Code::InvalidArgument,
-            tonic::Code::FailedPrecondition,
-            tonic::Code::Unauthenticated,
-            tonic::Code::PermissionDenied,
-            tonic::Code::Internal,
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Unknown,
             tonic::Code::Cancelled,
         ] {
-            let failure =
-                classify_fetch_task_result_rpc_status(tonic::Status::new(code, "refused"))
-                    .into_pump_failure();
-            assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
+            let failure = classify_fetch_task_result_rpc_status(
+                tonic::Status::new(code, "Service was not ready: transport error"),
+                root,
+            );
+            assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
+            assert_eq!(
+                failure.topology_requirement(),
+                novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
+            );
+            assert_eq!(
+                failure.input().site(),
+                ExecutionFailureSite::RootRead { root }
+            );
         }
+        let capacity = classify_fetch_task_result_rpc_status(
+            tonic::Status::resource_exhausted("private remote diagnostic"),
+            root,
+        );
+        assert_eq!(capacity.class(), AttemptFailureClass::ResourceGovernance);
+        assert_eq!(capacity.input().fact().resource(), None);
+        assert!(!capacity.error().message().contains("private"));
     }
-
     #[test]
-    fn a_transport_failure_reports_what_actually_broke_the_connection() {
-        // `tonic::Status` prints only its own code and message, so every
-        // broken connection reached logs and clients as the fixed text
-        // "transport error" while the io error underneath went nowhere. The
-        // classification already reads that source to decide the failure
-        // class; reporting it costs nothing and is the difference between a
-        // diagnosable incident and a guess.
+    fn original_typed_connection_loss_excludes_only_its_exact_backend() {
+        let root = root();
         let status = tonic::Status::from_error(Box::new(std::io::Error::new(
             std::io::ErrorKind::ConnectionReset,
-            "connection reset by peer",
+            "private socket detail",
         )));
-        let detail = classify_fetch_task_result_rpc_status(status).detail;
-        assert!(
-            detail.contains("connection reset by peer"),
-            "the cause must survive into the reported detail: {detail}"
+        let failure = classify_fetch_task_result_rpc_status(status, root);
+        assert_eq!(
+            failure.class(),
+            AttemptFailureClass::RecoverableInfrastructure
         );
-        assert!(detail.contains("caused by"), "{detail}");
+        assert_eq!(
+            failure.topology_requirement(),
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::ExcludeProcess(
+                root.backend_process_id()
+            )
+        );
+        assert!(!failure.error().message().contains("private"));
     }
-
+    #[test]
+    fn unrelated_source_and_timeout_do_not_manufacture_connection_loss() {
+        let root = root();
+        for error in [
+            std::io::Error::other("connection closed"),
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"),
+        ] {
+            let mut status = tonic::Status::cancelled("operation canceled");
+            status.set_source(Arc::new(error));
+            assert_eq!(
+                classify_fetch_task_result_rpc_status(status, root).class(),
+                AttemptFailureClass::ExecutionFailure
+            );
+        }
+    }
+    #[test]
+    fn outer_framing_and_answered_protocol_codes_are_not_remote_application_refusals() {
+        let root = root();
+        for code in [
+            tonic::Code::OutOfRange,
+            tonic::Code::DataLoss,
+            tonic::Code::Internal,
+            tonic::Code::InvalidArgument,
+            tonic::Code::FailedPrecondition,
+            tonic::Code::Unimplemented,
+            tonic::Code::NotFound,
+        ] {
+            let failure = classify_fetch_task_result_rpc_status(
+                tonic::Status::new(code, "arbitrary text"),
+                root,
+            );
+            assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
+            assert_eq!(
+                failure.input().site(),
+                ExecutionFailureSite::RootRead { root }
+            );
+            assert_eq!(
+                failure.topology_requirement(),
+                novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
+            );
+        }
+    }
     #[test]
     fn a_status_with_no_cause_reports_no_chain() {
-        let status = tonic::Status::new(tonic::Code::ResourceExhausted, "full");
-        let detail = classify_fetch_task_result_rpc_status(status).detail;
-        assert!(!detail.contains("caused by"), "{detail}");
+        assert!(transport_error_chain(&tonic::Status::resource_exhausted("full")).is_empty());
     }
 }

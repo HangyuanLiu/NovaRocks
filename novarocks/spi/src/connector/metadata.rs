@@ -1770,7 +1770,7 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let mut request = |_| panic!("validation creates no new holder");
-            let mut work = |_| Err(cause);
+            let mut work = |_| Err(cause.clone());
             let mut creation = crate::connector::read_stack::ConnectorReadSchemaCreation::new(
                 ValueTypeStorageLifetime::pure(),
                 &mut request,

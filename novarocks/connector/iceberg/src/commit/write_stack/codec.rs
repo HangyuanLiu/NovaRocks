@@ -1688,7 +1688,9 @@ pub(crate) fn spi_codec_error(error: ConnectorWriteCodecError) -> ConnectorCodec
         }
         ProtocolErrorKind::VersionMismatch => ConnectorCodecErrorKind::VersionMismatch,
         ProtocolErrorKind::InvalidValue => ConnectorCodecErrorKind::InvalidValue,
-        ProtocolErrorKind::CompileControl(cause) => ConnectorCodecErrorKind::CompileControl(cause),
+        ProtocolErrorKind::CompileControl(cause) => {
+            ConnectorCodecErrorKind::CompileControl(cause.clone())
+        }
     };
     ConnectorCodecError::new(path, kind, protocol.detail())
 }
@@ -1706,7 +1708,7 @@ mod tests {
         ] {
             let protocol = novarocks_proto_codec::ProtocolError::new(
                 novarocks_proto_codec::FieldPath::root("provider_payload").index(7),
-                novarocks_proto_codec::ProtocolErrorKind::CompileControl(cause),
+                novarocks_proto_codec::ProtocolErrorKind::CompileControl(cause.clone()),
                 cause.to_string(),
             );
             let error = super::spi_codec_error(
@@ -1714,7 +1716,7 @@ mod tests {
                     "iceberg", protocol,
                 ),
             );
-            assert_eq!(error.compile_control_error(), Some(cause));
+            assert_eq!(error.compile_control_error(), Some(&cause));
             assert_eq!(error.path().to_string(), "provider_payload[7]");
             assert_eq!(
                 std::error::Error::source(&error)
@@ -2222,7 +2224,7 @@ mod tests {
         let error = codec
             .decode_writer_handle_value(&private, &mut context)
             .expect_err("Puffin cannot carry a Parquet row group size");
-        assert_eq!(error.kind(), ConnectorCodecErrorKind::InvalidValue);
+        assert_eq!(error.kind(), &ConnectorCodecErrorKind::InvalidValue);
         assert_eq!(error.path().to_string(), "writer_handle.iceberg.output");
         assert!(error.detail().contains("Iceberg Parquet row group size"));
 
@@ -2238,7 +2240,7 @@ mod tests {
         let error = codec
             .decode_writer_handle_value(&private, &mut context)
             .expect_err("merge target must retain the session's base snapshot");
-        assert_eq!(error.kind(), ConnectorCodecErrorKind::InvalidValue);
+        assert_eq!(error.kind(), &ConnectorCodecErrorKind::InvalidValue);
         assert_eq!(error.path().to_string(), "writer_handle.iceberg");
         assert!(error.detail().contains("frozen base snapshot"));
     }
@@ -2277,7 +2279,7 @@ mod tests {
             if units == self.at_units {
                 self.refused
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                return Err(self.failure);
+                return Err(self.failure.clone());
             }
             Ok(())
         }
@@ -2295,14 +2297,14 @@ mod tests {
     fn value_projection_control_entry_keeps_all_three_typed_causes() {
         let header = private_header("catalog.iceberg", 1, ConnectorCodecCategory::WriteHandle);
         for cause in projection_control_causes() {
-            let control = ProjectionControl::new(cause, 0);
+            let control = ProjectionControl::new(cause.clone(), 0);
             let mut ledger = ConnectorDecodeLedger::new(private_limits());
             let error =
                 match ConnectorDecodeContext::try_new_for_compile(&header, &mut ledger, &control) {
                     Ok(_) => panic!("entry refusal must not establish a decode scope"),
                     Err(error) => error,
                 };
-            assert_eq!(error.compile_control_error(), Some(cause));
+            assert_eq!(error.compile_control_error(), Some(&cause));
             assert_eq!(*control.calls.lock().unwrap(), [0]);
         }
     }
@@ -2327,7 +2329,7 @@ mod tests {
                     dto::iceberg_merged_delete_reference::Entry::DeleteFilePath(path)
                 };
                 let references = [dto::IcebergMergedDeleteReference { entry: Some(entry) }];
-                let control = ProjectionControl::new(cause, 256);
+                let control = ProjectionControl::new(cause.clone(), 256);
                 let mut ledger = ConnectorDecodeLedger::new(private_limits());
                 let mut context =
                     ConnectorDecodeContext::try_new_for_compile(&header, &mut ledger, &control)
@@ -2339,7 +2341,7 @@ mod tests {
                         &mut context,
                     )
                     .unwrap_err();
-                assert_eq!(error.compile_control_error(), Some(cause));
+                assert_eq!(error.compile_control_error(), Some(&cause));
                 assert_eq!(control.calls.lock().unwrap().last(), Some(&256));
                 let count = control.calls.lock().unwrap().len();
                 assert_eq!(
@@ -2347,7 +2349,7 @@ mod tests {
                         .flush_compile_control()
                         .unwrap_err()
                         .compile_control_error(),
-                    Some(cause)
+                    Some(&cause)
                 );
                 assert_eq!(control.calls.lock().unwrap().len(), count);
             }
@@ -2371,7 +2373,7 @@ mod tests {
         }
         for cause in projection_control_causes() {
             for writer_side in [true, false] {
-                let control = ProjectionControl::new(cause, 256);
+                let control = ProjectionControl::new(cause.clone(), 256);
                 let mut ledger = ConnectorDecodeLedger::new(private_limits());
                 let mut context =
                     ConnectorDecodeContext::try_new_for_compile(&header, &mut ledger, &control)
@@ -2385,7 +2387,7 @@ mod tests {
                         .decode_commit_fragment_value(&fragment, &mut context)
                         .expect_err("fragment copy refusal")
                 };
-                assert_eq!(error.compile_control_error(), Some(cause));
+                assert_eq!(error.compile_control_error(), Some(&cause));
                 let calls = control.calls.lock().unwrap();
                 assert_eq!(calls.last(), Some(&256));
                 assert!(calls.iter().all(|units| *units <= 256));
@@ -2408,7 +2410,7 @@ mod tests {
                     compression: dto::IcebergCompression::Snappy as i32,
                     parquet_row_group_size_bytes: Some(4096),
                 };
-                let control = ProjectionControl::new(cause, 1);
+                let control = ProjectionControl::new(cause.clone(), 1);
                 let mut ledger = ConnectorDecodeLedger::new(private_limits());
                 let mut context =
                     ConnectorDecodeContext::try_new_for_compile(&header, &mut ledger, &control)
@@ -2424,7 +2426,7 @@ mod tests {
                     .expect_err(
                         "the completed constructor tail must refuse publication or ordinary error",
                     );
-                assert_eq!(error.compile_control_error(), Some(cause));
+                assert_eq!(error.compile_control_error(), Some(&cause));
                 assert_eq!(control.calls.lock().unwrap().last(), Some(&1));
             }
         }
@@ -2560,7 +2562,7 @@ mod tests {
                         .unwrap_err(),
                     _ => unreachable!(),
                 };
-                assert_eq!(error.kind(), ConnectorCodecErrorKind::VersionMismatch);
+                assert_eq!(error.kind(), &ConnectorCodecErrorKind::VersionMismatch);
                 assert_eq!(error.path().to_string(), "header.codec_revision");
                 assert_eq!(ledger.raw_bytes(), 0);
             }
@@ -2582,7 +2584,7 @@ mod tests {
             decode_private_handle(&facets, &unknown_root, private_limits())
                 .expect_err("unknown root field")
                 .kind(),
-            ConnectorCodecErrorKind::UnknownField
+            &ConnectorCodecErrorKind::UnknownField
         );
 
         let codec = IcebergWriteValueCodec::new("catalog.iceberg");
@@ -2598,7 +2600,7 @@ mod tests {
             )
             .expect_err("duplicate nested singular")
             .kind(),
-            ConnectorCodecErrorKind::DuplicateField
+            &ConnectorCodecErrorKind::DuplicateField
         );
 
         let mut unknown_nested = table.encode_to_vec();
@@ -2612,7 +2614,7 @@ mod tests {
             )
             .expect_err("unknown nested field")
             .kind(),
-            ConnectorCodecErrorKind::UnknownField
+            &ConnectorCodecErrorKind::UnknownField
         );
 
         let mut wrong_wire = table.encode_to_vec();
@@ -2626,7 +2628,7 @@ mod tests {
             )
             .expect_err("wrong nested wire type")
             .kind(),
-            ConnectorCodecErrorKind::InvalidValue
+            &ConnectorCodecErrorKind::InvalidValue
         );
     }
 
@@ -2654,7 +2656,7 @@ mod tests {
                 decode_private_handle(&facets, &bytes, limits)
                     .expect_err("one independent budget must reject")
                     .kind(),
-                ConnectorCodecErrorKind::Capacity
+                &ConnectorCodecErrorKind::Capacity
             );
         }
     }
@@ -2706,7 +2708,7 @@ mod tests {
         );
         let error = decode_private_handle(&facets, &zero_bytes, private_limits())
             .expect_err("the existing domain invariant rejects a claimed zero");
-        assert_eq!(error.kind(), ConnectorCodecErrorKind::InvalidValue);
+        assert_eq!(error.kind(), &ConnectorCodecErrorKind::InvalidValue);
         assert!(error.detail().contains("must be positive"));
     }
 
@@ -2818,7 +2820,7 @@ mod tests {
             decode_private_handle(&facets, &private.encode_to_vec(), private_limits())
                 .unwrap_err()
                 .kind(),
-            ConnectorCodecErrorKind::InconsistentFields
+            &ConnectorCodecErrorKind::InconsistentFields
         );
     }
 
@@ -2869,7 +2871,7 @@ mod tests {
                 decode_private_fragment(&facets, &private.encode_to_vec())
                     .unwrap_err()
                     .kind(),
-                ConnectorCodecErrorKind::InconsistentFields
+                &ConnectorCodecErrorKind::InconsistentFields
             );
         }
     }
@@ -2927,7 +2929,7 @@ mod tests {
             .expect_err("another generation must reject the envelope");
         assert_eq!(
             error.protocol().kind(),
-            ProtocolErrorKind::InconsistentFields
+            &ProtocolErrorKind::InconsistentFields
         );
         assert_public_provider_error_path(&error, "header.catalog");
         assert!(error.protocol().detail().contains("catalog"));
@@ -2959,7 +2961,7 @@ mod tests {
             .handle_decoder
             .decode_writer_handle(&parse_handle(raw))
             .expect_err("a Puffin writer with a Parquet row group size");
-        assert_eq!(error.protocol().kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(error.protocol().kind(), &ProtocolErrorKind::InvalidValue);
         assert_public_provider_error_path(&error, "writer_handle.iceberg.output");
         assert!(
             error
@@ -3019,7 +3021,7 @@ mod tests {
             .expect_err("a deletion vector that disagrees with itself");
         assert_eq!(
             error.protocol().kind(),
-            ProtocolErrorKind::InconsistentFields
+            &ProtocolErrorKind::InconsistentFields
         );
         assert_public_provider_error_path(&error, "commit_fragment.iceberg.deletion_vector");
         assert!(
@@ -3072,7 +3074,7 @@ mod tests {
             .handle_encoder
             .encode_writer_handle(&neutral)
             .expect_err("an oversized writer handle");
-        assert_eq!(error.protocol().kind(), ProtocolErrorKind::Capacity);
+        assert_eq!(error.protocol().kind(), &ProtocolErrorKind::Capacity);
         assert_public_provider_error_path(&error, "writer_handle.iceberg");
 
         // One path past the 1 MiB commit-fragment bound.
@@ -3092,7 +3094,7 @@ mod tests {
             .fragment_encoder
             .encode_commit_fragment(&neutral)
             .expect_err("an oversized commit fragment");
-        assert_eq!(error.protocol().kind(), ProtocolErrorKind::Capacity);
+        assert_eq!(error.protocol().kind(), &ProtocolErrorKind::Capacity);
         assert_public_provider_error_path(&error, "commit_fragment.iceberg");
     }
     fn unpartitioned() -> IcebergArtifactPartition {

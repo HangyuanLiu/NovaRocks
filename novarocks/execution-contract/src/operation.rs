@@ -778,6 +778,21 @@ impl fmt::Display for RequestError {
 
 impl std::error::Error for RequestError {}
 
+impl crate::failure::FailureProjection for RequestError {
+    fn failure_fact(&self) -> crate::failure::FailureFact {
+        use crate::failure::{FailureClass, FailureFact, FailureReason, domain};
+        let code = match self {
+            Self::ContextMismatch(_) => 1032,
+            Self::EmptyUpdate => 1033,
+            Self::EmptyEdgeSet => 1034,
+        };
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::PROTOCOL, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+
 /// Create one task.
 ///
 /// The descriptor is a required field of this type and of no other. There is
@@ -2053,5 +2068,119 @@ mod request_tests {
             first.envelope().operation_id(),
             second.envelope().operation_id()
         );
+    }
+}
+
+/// A producer's bounded neutral failure. It proves no Task acceptance or exit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationDomainFailure {
+    fact: crate::failure::FailureFact,
+    detail: crate::status::SafeDetail,
+}
+impl OperationDomainFailure {
+    pub const fn new(fact: crate::failure::FailureFact, detail: crate::status::SafeDetail) -> Self {
+        Self { fact, detail }
+    }
+    pub const fn fact(&self) -> crate::failure::FailureFact {
+        self.fact
+    }
+    pub const fn detail(&self) -> &crate::status::SafeDetail {
+        &self.detail
+    }
+}
+impl crate::failure::FailureProjection for OperationDomainFailure {
+    fn failure_fact(&self) -> crate::failure::FailureFact {
+        self.fact
+    }
+}
+/// The operation verdict remains separate from the originating failure's facts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DomainFailureOutcome {
+    InvalidStateOrRequest,
+    ResourceExhausted,
+    DomainConflict,
+}
+impl DomainFailureOutcome {
+    pub const fn outcome(self) -> OperationOutcome {
+        match self {
+            Self::InvalidStateOrRequest => OperationOutcome::InvalidStateOrRequest,
+            Self::ResourceExhausted => OperationOutcome::ResourceExhausted,
+            Self::DomainConflict => OperationOutcome::DomainConflict,
+        }
+    }
+}
+/// One mandatory result branch. Normal protocol/deferred verdicts invent no failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OperationResult<T> {
+    Verdict {
+        outcome: OperationOutcome,
+        detail: Option<crate::status::SafeDetail>,
+        acknowledgement: Option<T>,
+    },
+    DomainFailure {
+        outcome: DomainFailureOutcome,
+        failure: OperationDomainFailure,
+    },
+}
+impl<T> OperationResult<T> {
+    pub const fn outcome(&self) -> OperationOutcome {
+        match self {
+            Self::Verdict { outcome, .. } => *outcome,
+            Self::DomainFailure { outcome, .. } => outcome.outcome(),
+        }
+    }
+    pub const fn detail(&self) -> Option<&crate::status::SafeDetail> {
+        match self {
+            Self::Verdict { detail, .. } => detail.as_ref(),
+            Self::DomainFailure { failure, .. } => Some(failure.detail()),
+        }
+    }
+    pub const fn acknowledgement(&self) -> Option<&T> {
+        match self {
+            Self::Verdict {
+                acknowledgement, ..
+            } => acknowledgement.as_ref(),
+            Self::DomainFailure { .. } => None,
+        }
+    }
+    pub fn map_ack<U>(self, map: impl FnOnce(T) -> U) -> OperationResult<U> {
+        match self {
+            Self::Verdict {
+                outcome,
+                detail,
+                acknowledgement,
+            } => OperationResult::Verdict {
+                outcome,
+                detail,
+                acknowledgement: acknowledgement.map(map),
+            },
+            Self::DomainFailure { outcome, failure } => {
+                OperationResult::DomainFailure { outcome, failure }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_failure_projection_tests {
+    use super::*;
+    use crate::failure::{FailureClass, FailureProjection, domain};
+    use crate::identity::IdentityField;
+    #[test]
+    fn request_shapes_keep_distinct_owner_reasons_without_task_acceptance() {
+        for (error, code) in [
+            (
+                RequestError::ContextMismatch(IdentityMismatch::new(IdentityField::BackendProcess)),
+                1032,
+            ),
+            (RequestError::EmptyUpdate, 1033),
+            (RequestError::EmptyEdgeSet, 1034),
+        ] {
+            let fact = error.failure_fact();
+            assert_eq!(fact.class(), FailureClass::Invariant);
+            assert_eq!(fact.reason().domain(), domain::PROTOCOL.get());
+            assert_eq!(fact.reason().code(), code);
+            assert_eq!(fact.resource(), None);
+        }
     }
 }

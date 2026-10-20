@@ -73,15 +73,13 @@ struct RowStorageBlock {
 }
 
 impl RowStorageBlock {
-    fn try_new(size: usize, allocator: AggregateAllocator) -> Result<Self, String> {
-        let layout = Layout::array::<u8>(size.max(1))
-            .map_err(|error| format!("invalid row-storage block layout: {error}"))?;
-        let ptr = allocator
-            .allocate_zeroed(layout)
-            .map_err(|_| allocator.allocation_error("allocate row-storage block"))?
-            .cast::<u8>();
+    fn try_new(
+        size: usize,
+        allocator: AggregateAllocator,
+    ) -> Result<Self, novarocks_functions::KernelFailure> {
+        let (pointer, layout) = allocator.allocate_zeroed_block(size.max(1), 1)?;
         Ok(Self {
-            ptr,
+            ptr: pointer.cast::<u8>(),
             layout,
             allocator,
         })
@@ -123,7 +121,7 @@ pub struct RowStorage {
     blocks: AggregateVec<RowStorageBlock>,
     cursor: usize,
     block_size: usize,
-    memory_limit_exceeded: bool,
+    failure: Option<novarocks_functions::KernelFailure>,
 }
 
 impl RowStorage {
@@ -140,13 +138,16 @@ impl RowStorage {
             blocks: AggregateVec::new_in(AggregateAllocator::new(tracker)),
             cursor: 0,
             block_size: block_size.max(1),
-            memory_limit_exceeded: false,
+            failure: None,
         }
     }
 
-    pub fn alloc_copy(&mut self, bytes: &[u8]) -> Result<RowKey, String> {
-        if self.memory_limit_exceeded {
-            return Err("row storage memory limit was previously exceeded".to_string());
+    pub fn alloc_copy(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<RowKey, novarocks_functions::KernelFailure> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
         }
         let needed = bytes.len().max(1);
         let current_block_len = self.blocks.last().map_or(0, RowStorageBlock::len);
@@ -158,14 +159,15 @@ impl RowStorage {
         {
             let block_size = self.block_size.max(needed);
             let allocator = self.blocks.allocator().clone();
-            if self.blocks.try_reserve(1).is_err() {
-                self.memory_limit_exceeded = true;
-                return Err(allocator.allocation_error("reserve row-storage blocks"));
+            if let Err(source) = self.blocks.try_reserve(1) {
+                let error = allocator.allocation_error("reserve row-storage blocks", source);
+                self.failure = Some(error.clone());
+                return Err(error);
             }
             let block = match RowStorageBlock::try_new(block_size, allocator) {
                 Ok(block) => block,
                 Err(error) => {
-                    self.memory_limit_exceeded = true;
+                    self.failure = Some(error.clone());
                     return Err(error);
                 }
             };
@@ -175,9 +177,11 @@ impl RowStorage {
         }
         let block = self.blocks.last_mut().expect("row storage block");
         let start = self.cursor;
-        let end = start
-            .checked_add(bytes.len())
-            .ok_or_else(|| "row-storage cursor overflow".to_string())?;
+        let end = start.checked_add(bytes.len()).ok_or_else(|| {
+            novarocks_functions::KernelFailure::from_domain(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            )
+        })?;
         block.copy_from(start, bytes);
         self.cursor = end;
         let ptr = block.as_mut_ptr().wrapping_add(start) as usize;
@@ -217,13 +221,14 @@ mod tests {
             let error = storage
                 .alloc_copy(b"key")
                 .expect_err("first block must cross the limit");
-            assert!(error.contains("ResourceExhausted"), "{error}");
+            use novarocks_failure_contract::{FailureClass, FailureProjection};
+            assert_eq!(error.failure_fact().class(), FailureClass::Resource);
             assert_eq!(storage.retained_bytes(), 0);
             assert_eq!(query.current(), 0);
             let retry_error = storage
                 .alloc_copy(b"second")
                 .expect_err("limit failure must be latched");
-            assert!(retry_error.contains("previously exceeded"), "{retry_error}");
+            assert_eq!(retry_error, error);
             assert_eq!(query.current(), 0);
         }
 

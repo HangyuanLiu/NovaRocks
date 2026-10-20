@@ -32,7 +32,7 @@ impl PureCompileControl for Caller {
             assert!(at <= stop, "observation after first refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -62,7 +62,7 @@ fn prefixes(invoke: impl Fn(&Caller) -> Result<(), ConstantError>, ordinary: boo
         for cause in CAUSES {
             let failed = Caller {
                 trace: Mutex::new(vec![]),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(invoke(&failed), Err(ConstantError::Control(actual)) if actual == cause)

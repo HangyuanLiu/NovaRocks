@@ -30,8 +30,7 @@
 use crate::runtime::fragment::ExecutionFailure;
 
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::exec::pipeline::schedule::event_scheduler::EventScheduler;
 use crate::runtime::endpoint::RuntimeEndpoint;
@@ -62,8 +61,6 @@ pub struct FragmentContext {
     runtime_profile_report_interval_ns: Option<i64>,
     legacy_progress_reporting: bool,
     event_sink: Arc<dyn FragmentEventSink>,
-    final_error: Mutex<Option<ExecutionFailure>>,
-    cancelled: AtomicBool,
     event_scheduler: Arc<EventScheduler>,
 }
 
@@ -97,8 +94,6 @@ impl FragmentContext {
             runtime_profile_report_interval_ns,
             legacy_progress_reporting: true,
             event_sink: Arc::new(NoopFragmentEventSink),
-            final_error: Mutex::new(None),
-            cancelled: AtomicBool::new(false),
             event_scheduler: Arc::new(EventScheduler::new()),
         }
     }
@@ -121,8 +116,6 @@ impl FragmentContext {
             runtime_profile_report_interval_ns: None,
             legacy_progress_reporting: false,
             event_sink,
-            final_error: Mutex::new(None),
-            cancelled: AtomicBool::new(false),
             event_scheduler: Arc::new(EventScheduler::new()),
         }
     }
@@ -180,24 +173,11 @@ impl FragmentContext {
         Arc::clone(&self.event_scheduler)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn is_canceled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
-
     pub(crate) fn set_final_status(&self, err: impl Into<ExecutionFailure>) -> bool {
-        let err = err.into();
-        {
-            let mut guard = self.final_error.lock().expect("final error lock");
-            if guard.is_some() {
-                return false;
-            }
-            *guard = Some(err.clone());
-        }
-        self.cancelled.store(true, Ordering::Release);
-        self.runtime_state.error_state().set_error(err);
-
+        let accepted = self.runtime_state.error_state().accept_error(err.into());
+        // Driver control subscriptions already cover the owner's generation.
+        // Explicit fanout also advances any currently parked scheduler slots.
         self.event_scheduler.enqueue_all_blocked();
-        true
+        accepted
     }
 }

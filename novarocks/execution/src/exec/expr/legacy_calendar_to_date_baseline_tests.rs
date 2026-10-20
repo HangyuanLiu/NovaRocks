@@ -42,7 +42,11 @@ fn chunk(columns: Vec<ArrayRef>) -> Chunk {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     Chunk::new_with_chunk_schema(batch, schema)
 }
-fn eval(name: &'static str, columns: Vec<ArrayRef>, result: DataType) -> Result<ArrayRef, String> {
+fn eval(
+    name: &'static str,
+    columns: Vec<ArrayRef>,
+    result: DataType,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut arena = ExprArena::default();
     let args = columns
         .iter()
@@ -98,7 +102,7 @@ fn legacy_to_date_baseline_all_aliases_text_grammar_nulls_and_invalids() {
     }
 }
 #[test]
-fn legacy_to_date_baseline_date32_ranges_and_result_carrier_ignore_requested_type() {
+fn legacy_to_date_baseline_date32_ranges_and_result_carrier_rejects_incompatible_frozen_type() {
     for name in ["date", "to_date"] {
         assert_dates(
             eval(
@@ -111,10 +115,18 @@ fn legacy_to_date_baseline_date32_ranges_and_result_carrier_ignore_requested_typ
                     Some(i32::MAX),
                     None,
                 ]))],
-                DataType::Utf8,
+                DataType::Date32,
             )
             .unwrap(),
             vec![None, Some(-1), Some(0), Some(19782), None, None],
+        );
+        assert_frozen_calendar_contract(
+            eval(
+                name,
+                vec![Arc::new(Date32Array::from(vec![Some(0)]))],
+                DataType::Utf8,
+            )
+            .unwrap_err(),
         );
     }
 }
@@ -210,7 +222,7 @@ fn legacy_to_date_baseline_declared_int64_drift_and_complete_unsupported_type_er
         ] {
             let expected = format!("unsupported date input type: {:?}", input.data_type());
             assert_eq!(
-                eval(name, vec![input], DataType::Date32).unwrap_err(),
+                (eval(name, vec![input], DataType::Date32).unwrap_err()).to_string(),
                 expected
             );
         }
@@ -226,9 +238,28 @@ fn legacy_to_date_baseline_declared_int64_drift_and_complete_unsupported_type_er
         )) as ArrayRef;
         let expected = format!("unsupported date input type: {:?}", input.data_type());
         assert!(expected.len() > 1024);
+        let failure = eval(name, vec![input], DataType::Date32).unwrap_err();
+        use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureProjection};
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(failure.failure_fact().reason().code(), 273);
         assert_eq!(
-            eval(name, vec![input], DataType::Date32).unwrap_err(),
-            expected
+            failure.detail(),
+            BoundedDetail::truncating(&expected).as_str()
         );
+        assert!(failure.detail().len() <= 512);
+        assert!(failure.detail().is_char_boundary(failure.detail().len()));
     }
+}
+
+fn assert_frozen_calendar_contract(failure: crate::runtime::fragment::ExecutionFailure) {
+    use novarocks_failure_contract::{
+        FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+    };
+    assert_eq!(
+        failure.failure_fact(),
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(274).unwrap())
+        )
+    );
 }

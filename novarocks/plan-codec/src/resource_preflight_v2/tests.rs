@@ -30,7 +30,7 @@ impl PureCompileControl for Control {
         let mut events = self.events.lock().unwrap();
         let ordinal = events.iter().filter(|(seen, _)| *seen == phase).count();
         events.push((phase, units));
-        match self.fail {
+        match self.fail.clone() {
             Some((target, at, error)) if target == phase && at == ordinal => Err(error),
             _ => Ok(()),
         }
@@ -234,7 +234,7 @@ fn malformed_prefix_preserves_completed_resource_charges_and_ordinary_error_tail
     assert!(trace.iter().any(|(_, units)| *units == 256));
     for error in errors() {
         let stop = Control {
-            fail: Some((CompilePhase::Decode, trace.len() - 1, error)),
+            fail: Some((CompilePhase::Decode, trace.len() - 1, error.clone())),
             ..Control::default()
         };
         assert!(
@@ -260,7 +260,7 @@ fn original_control_refuses_model_and_raw_scan_entry_quantum_tail_before_publica
     for error in errors() {
         for at in 0..build_trace.len() {
             let stop = Control {
-                fail: Some((CompilePhase::Validate, at, error)),
+                fail: Some((CompilePhase::Validate, at, error.clone())),
                 ..Control::default()
             };
             assert!(
@@ -269,7 +269,7 @@ fn original_control_refuses_model_and_raw_scan_entry_quantum_tail_before_publica
         }
         for at in 0..decode_trace.len() {
             let stop = Control {
-                fail: Some((CompilePhase::Decode, at, error)),
+                fail: Some((CompilePhase::Decode, at, error.clone())),
                 ..Control::default()
             };
             assert!(

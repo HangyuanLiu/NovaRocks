@@ -22,11 +22,11 @@ use arrow::array::{ArrayRef, BinaryBuilder, Int64Builder};
 use arrow::datatypes::DataType;
 
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::ExprId;
 use crate::exec::expr::agg::{
     HLL_REGISTERS_COUNT, estimate_cardinality_from_registers, hash_bytes_for_hll,
     update_register_from_hash,
 };
-use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::mv::state_codec::{KeyValue, decode_multiset_self_describing, read_key};
 
 use super::common::{binary_value_or_empty, row_count, row_index};
@@ -36,11 +36,16 @@ thread_local! {
         const { RefCell::new([0u8; HLL_REGISTERS_COUNT]) };
 }
 
-pub fn approx_count_distinct_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
+pub fn approx_count_distinct_state_union(
+    a: &[u8],
+    b: &[u8],
+) -> Result<Vec<u8>, crate::runtime::fragment::ExecutionFailure> {
     super::min_max::min_state_union(a, b)
 }
 
-pub fn approx_count_distinct_state_visible(s: &[u8]) -> Result<i64, String> {
+pub fn approx_count_distinct_state_visible(
+    s: &[u8],
+) -> Result<i64, crate::runtime::fragment::ExecutionFailure> {
     let (key_type, entries) = decode_multiset_self_describing(s)?;
     if entries.is_empty() {
         return Ok(0);
@@ -57,11 +62,16 @@ pub fn approx_count_distinct_state_visible(s: &[u8]) -> Result<i64, String> {
     })
 }
 
-fn hash_multiset_key_for_hll(key_type: &DataType, key_bytes: &[u8]) -> Result<u64, String> {
+fn hash_multiset_key_for_hll(
+    key_type: &DataType,
+    key_bytes: &[u8],
+) -> Result<u64, crate::runtime::fragment::ExecutionFailure> {
     let mut cursor = key_bytes;
     let key = read_key(&mut cursor, key_type)?;
     if !cursor.is_empty() {
-        return Err("approx_count_distinct_state_visible key has trailing bytes".to_string());
+        return Err(super::failure::invalid_state(
+            "approx_count_distinct_state_visible key has trailing bytes",
+        ));
     }
     match key {
         KeyValue::Utf8(value) => Ok(hash_bytes_for_hll(value.as_bytes())),
@@ -76,17 +86,16 @@ pub fn eval_approx_count_distinct_state_union<
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if args.len() != 2 {
-        return Err((format!(
+        return Err(super::failure::contract(format_args!(
             "approx_count_distinct_state_union expects 2 arguments, got {}",
             args.len()
-        ))
-        .into());
+        )));
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    Ok((eval_approx_count_distinct_state_union_arrays(&lhs, &rhs))?)
+    eval_approx_count_distinct_state_union_arrays(&lhs, &rhs)
 }
 
 pub fn eval_approx_count_distinct_state_visible<
@@ -96,24 +105,24 @@ pub fn eval_approx_count_distinct_state_visible<
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if args.len() != 1 {
-        return Err((format!(
+        return Err(super::failure::contract(format_args!(
             "approx_count_distinct_state_visible expects 1 argument, got {}",
             args.len()
-        ))
-        .into());
+        )));
     }
     let input = arena.eval(args[0], chunk)?;
-    Ok((eval_approx_count_distinct_state_visible_array(&input))?)
+    eval_approx_count_distinct_state_visible_array(&input)
 }
 
 fn eval_approx_count_distinct_state_union_arrays(
     lhs: &ArrayRef,
     rhs: &ArrayRef,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = row_count("approx_count_distinct_state_union", lhs.len(), rhs.len())?;
     let mut builder = BinaryBuilder::new();
+    let mut extent = super::failure::StateOutputTally::default();
     for row in 0..rows {
         let left = binary_value_or_empty(
             lhs,
@@ -127,12 +136,16 @@ fn eval_approx_count_distinct_state_union_arrays(
             "approx_count_distinct_state_union",
             1,
         )?;
-        builder.append_value(approx_count_distinct_state_union(left, right)?);
+        let state = approx_count_distinct_state_union(left, right)?;
+        extent.append(state.len())?;
+        builder.append_value(state);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-fn eval_approx_count_distinct_state_visible_array(input: &ArrayRef) -> Result<ArrayRef, String> {
+fn eval_approx_count_distinct_state_visible_array(
+    input: &ArrayRef,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut builder = Int64Builder::new();
     for row in 0..input.len() {
         let state = binary_value_or_empty(input, row, "approx_count_distinct_state_visible", 0)?;

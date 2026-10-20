@@ -49,7 +49,7 @@ impl PureCompileControl for Control {
         let mut checks = self.checks.lock().unwrap();
         let index = checks.len();
         checks.push(units);
-        if let Some((at, error)) = self.failure
+        if let Some((at, error)) = self.failure.clone()
             && at == index
         {
             Err(error)
@@ -480,7 +480,7 @@ fn actual_source_work_entry_256_and_gate_finish_keep_original_control_before_own
             for at in [0, full, finish] {
                 let control = Arc::new(Control {
                     checks: Mutex::default(),
-                    failure: Some((at, error)),
+                    failure: Some((at, error.clone())),
                 });
                 let owner = Owner::new(mode, control.clone());
                 assert!(

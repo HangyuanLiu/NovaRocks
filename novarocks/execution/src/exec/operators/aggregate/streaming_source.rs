@@ -29,16 +29,14 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
-use std::sync::Arc;
-
-use crate::exec::chunk::Chunk;
 use crate::exec::operators::aggregate::streaming_state::AggregateStreamingState;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::runtime_state::RuntimeState;
+use crate::exec::pipeline::shape::{Source, SourceKernel, SourceRead};
+use crate::exec::pipeline::step::{NextStep, StepResult, WaitFact, WaitReason};
 
 /// Factory that constructs streaming aggregate source operators for Phase 2 pre-aggregation.
 pub struct AggregateStreamingSourceFactory {
@@ -63,10 +61,10 @@ impl OperatorFactory for AggregateStreamingSourceFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(AggregateStreamingSourceOperator {
+        Box::new(Source::new(AggregateStreamingSourceOperator {
             name: self.name.clone(),
             state: self.state.clone(),
-        })
+        }))
     }
 
     fn is_source(&self) -> bool {
@@ -79,48 +77,63 @@ struct AggregateStreamingSourceOperator {
     state: AggregateStreamingState,
 }
 
-impl Operator for AggregateStreamingSourceOperator {
+impl OperatorLifecycle for AggregateStreamingSourceOperator {
     fn name(&self) -> &str {
         &self.name
     }
+}
 
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.state.is_done()
+impl SourceKernel for AggregateStreamingSourceOperator {
+    fn poll_output(
+        &mut self,
+        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<StepResult> {
+        let observable = self.state.observable();
+        let observed_generation = observable.generation();
+        let (output, next) = match self.state.next_chunk() {
+            SourceRead::Chunk(chunk) => (Some(chunk), NextStep::Runnable),
+            SourceRead::Finished => (None, NextStep::Finished),
+            SourceRead::Pending => (
+                None,
+                NextStep::Wait(WaitFact {
+                    reason: WaitReason::Input,
+                    observable,
+                    observed_generation,
+                    deadline: None,
+                }),
+            ),
+        };
+        Ok(StepResult::new(output, next, 0))
     }
 }
 
-impl ProcessorOperator for AggregateStreamingSourceOperator {
-    fn need_input(&self) -> bool {
-        false
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::pipeline::step_context::{StepContext, TurnWork};
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    use std::num::NonZeroU64;
 
-    fn has_output(&self) -> bool {
-        self.state.has_chunks()
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-        Err("aggregate streaming source does not accept input"
-            .to_string()
-            .into())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(self.state.poll_chunk())
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        Ok(())
-    }
-
-    fn source_observable(&self) -> Option<Arc<Observable>> {
-        Some(self.state.observable())
+    #[test]
+    fn empty_streaming_source_waits_for_every_producer_before_eos() {
+        let shared = AggregateStreamingState::new(2);
+        let mut source = AggregateStreamingSourceFactory::new(7, shared.clone()).create(1, 0);
+        let control = RuntimeErrorState::default();
+        let mut work = TurnWork::new(NonZeroU64::new(1).unwrap(), 8);
+        let mut context = StepContext::new(&control, &mut work);
+        let source = source.as_mut();
+        assert!(matches!(
+            source.drive(&mut context).unwrap().next,
+            NextStep::Wait(_)
+        ));
+        shared.mark_sink_finished();
+        assert!(matches!(
+            source.drive(&mut context).unwrap().next,
+            NextStep::Wait(_)
+        ));
+        shared.mark_sink_finished();
+        let eos = source.drive(&mut context).unwrap();
+        assert!(eos.output.is_none());
+        assert!(matches!(eos.next, NextStep::Finished));
     }
 }

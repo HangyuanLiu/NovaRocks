@@ -530,12 +530,13 @@ impl Frame {
                     array,
                     work,
                 )?;
-            if let Some(message) = data_error {
+            if let Some(source) = data_error {
                 #[cfg(test)]
                 super::guarded_tests::record_temporal_invocation_data(
                     source_shape,
                     self.next - 1,
-                    &message,
+                    source.detail(),
+                    novarocks_failure_contract::FailureProjection::failure_fact(&source),
                     &self.rows,
                     &ordinals,
                     &self.errors,
@@ -544,7 +545,7 @@ impl Frame {
                     work.step()?;
                     self.errors
                         .entry(parent)
-                        .or_insert_with(|| RowDataError::new(parent, &message));
+                        .or_insert_with(|| source.row_error(parent));
                 }
             }
         }
@@ -2047,12 +2048,7 @@ fn assemble(
         },
         work.control,
     )
-    .map_err(|error| match error {
-        novarocks_functions::control_values::AssemblyFailure::Kernel(error) => error,
-        novarocks_functions::control_values::AssemblyFailure::Arrow(_) => {
-            internal("checked guarded result could not be assembled")
-        }
-    })?;
+    .map_err(novarocks_functions::control_values::AssemblyFailure::into_kernel)?;
     work.flush()?;
     let mut errors = Vec::with_capacity(row_errors.len());
     for error in std::mem::take(row_errors).into_values() {
@@ -2686,18 +2682,7 @@ fn temporal_math<T>(
     work.flush()?;
     let mut scope = novarocks_functions::EvaluationCheckpoints::new(work.control);
     let value = body(&mut scope);
-    // A primary callback refusal never reaches a second checkpoint.
-    if let Err(TimeTextError::Kernel(cause)) = value {
-        return Err(cause);
-    }
-    scope.finish()?;
-    let value = value.map_err(|error| match error {
-        TimeTextError::Kernel(cause) => cause,
-        TimeTextError::Legacy(message) => internal(&message),
-        TimeTextError::InvocationData(_) => {
-            invalid("invocation data escaped its demanded temporal source phase")
-        }
-    })?;
+    let value = scope.finish_result(value.map_err(TimeTextError::into_kernel))?;
     work.flush()?;
     Ok(value)
 }
@@ -2766,7 +2751,10 @@ impl TemporalValues {
         ordinals: &[usize],
         array: ArrayRef,
         work: &mut Work<'_, '_>,
-    ) -> Result<Option<String>, KernelFailure> {
+    ) -> Result<
+        Option<novarocks_functions::builtin::calendar_time_text_shared::TimeTextDataFailure>,
+        KernelFailure,
+    > {
         use novarocks_functions::builtin::calendar_time_text_shared as math;
         use novarocks_type_contract::{TemporalSourceRole as R, TemporalSourceShape as S};
         if array.len() != domain.len() || domain.len() != ordinals.len() {
@@ -2833,17 +2821,14 @@ impl TemporalValues {
                 work.flush()?;
                 let mut scope = novarocks_functions::EvaluationCheckpoints::new(work.control);
                 let result = math::duration_cast_source(&array, &mut scope);
-                if let Err(math::TimeTextError::Kernel(cause)) = result {
-                    return Err(cause);
-                }
-                scope.finish()?;
-                match result {
-                    Ok(Some(values)) => self.set_seconds(ordinals, &values, true, work)?,
-                    Ok(None) => {}
-                    Err(math::TimeTextError::InvocationData(message)) => return Ok(Some(message)),
-                    Err(math::TimeTextError::Legacy(message)) => return Err(invalid(&message)),
-                    Err(math::TimeTextError::Kernel(cause)) => return Err(cause),
-                }
+                let values = match result {
+                    Ok(values) => scope.finish_result(Ok(values))?,
+                    Err(math::DurationCastError::Outer(source)) => {
+                        return scope.finish_result(Err(source.into_kernel()));
+                    }
+                    Err(math::DurationCastError::Data(source)) => return Ok(Some(source)),
+                };
+                self.set_seconds(ordinals, &values, true, work)?;
                 work.flush()?;
             }
             R::Format => {
@@ -2991,7 +2976,7 @@ fn in_observed<T>(
         // Exact signed recipes and actual carrier validation establish matching
         // concrete types/lengths before Arrow equality. An error here violates
         // that checked invariant; it is not a maskable SQL row-data result.
-        Err(novarocks_functions::native_inlist::InError::Data(message)) => Err(internal(&message)),
+        Err(novarocks_functions::native_inlist::InError::Operation(cause)) => Err(cause),
     }
 }
 fn duplicate_child(child: &Child, work: &mut Work<'_, '_>) -> Result<Child, KernelFailure> {

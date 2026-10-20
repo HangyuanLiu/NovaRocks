@@ -56,7 +56,7 @@ impl Original {
     fn pointer(&mut self) -> AggStatePtr {
         self.raw.as_mut_ptr() as AggStatePtr
     }
-    fn update(&mut self, columns: Vec<ArrayRef>) -> Result<(), String> {
+    fn update(&mut self, columns: Vec<ArrayRef>) -> crate::runtime::fragment::ExecutionResult<()> {
         let fields = columns
             .iter()
             .enumerate()
@@ -65,15 +65,15 @@ impl Original {
         let packed = Arc::new(StructArray::new(Fields::from(fields), columns, None)) as ArrayRef;
         self.update_packed(packed)
     }
-    fn update_packed(&mut self, packed: ArrayRef) -> Result<(), String> {
+    fn update_packed(&mut self, packed: ArrayRef) -> crate::runtime::fragment::ExecutionResult<()> {
         let pointers = vec![self.pointer(); packed.len()];
         PercentileAgg.update_batch(&self.spec, 0, &pointers, &AggInputView::Any(&packed))
     }
-    fn merge(&mut self, payload: ArrayRef) -> Result<(), String> {
+    fn merge(&mut self, payload: ArrayRef) -> crate::runtime::fragment::ExecutionResult<()> {
         let pointers = vec![self.pointer(); payload.len()];
         PercentileAgg.merge_batch(&self.spec, 0, &pointers, &AggInputView::Any(&payload))
     }
-    fn output(&mut self, partial: bool) -> Result<ArrayRef, String> {
+    fn output(&mut self, partial: bool) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         let pointer = self.pointer();
         PercentileAgg.build_array(&self.spec, 0, &[pointer], partial)
     }
@@ -159,7 +159,7 @@ fn original_approx_percentile_rate_and_compression_errors_precede_null_value() {
         args.push(one(Some(1.25)));
         args.push(one(Some(f64::NAN)));
         assert_eq!(
-            state.update(args).unwrap_err(),
+            (state.update(args).unwrap_err()).to_string(),
             format!("{name}: percentile parameter must be between 0 and 1, got 1.25")
         );
         let mut args = vec![one(None)];
@@ -169,7 +169,7 @@ fn original_approx_percentile_rate_and_compression_errors_precede_null_value() {
         args.push(one(Some(0.5)));
         args.push(one(Some(f64::NAN)));
         assert_eq!(
-            state.update(args).unwrap_err(),
+            (state.update(args).unwrap_err()).to_string(),
             "percentile compression must be finite"
         );
         let mut args = vec![one(None)];
@@ -179,7 +179,7 @@ fn original_approx_percentile_rate_and_compression_errors_precede_null_value() {
         args.push(one(Some(0.5)));
         args.push(one(Some(0.0)));
         assert_eq!(
-            state.update(args).unwrap_err(),
+            (state.update(args).unwrap_err()).to_string(),
             "compression parameter must be positive in percentile_approx_weighted, but got: 0"
         );
     }
@@ -200,9 +200,10 @@ fn original_approx_percentile_weight_null_truncation_and_value_null_mask() {
         .unwrap();
     assert_eq!(state.count(), 0.0);
     assert_eq!(
-        state
+        (state
             .update(vec![one(Some(f64::NAN)), one(Some(-8.0)), one(Some(0.5))])
-            .unwrap_err(),
+            .unwrap_err())
+        .to_string(),
         "percentile_approx_weighted: percentile weight must be non-negative, got -8"
     );
     let mut state = Original::new("percentile_approx_weighted", DataType::Float64);
@@ -261,7 +262,7 @@ fn original_approx_percentile_quantile_array_null_empty_count_and_order() {
         }
         args.push(quantiles(vec![]));
         assert_eq!(
-            state.update(args).unwrap_err(),
+            (state.update(args).unwrap_err()).to_string(),
             "percentile array cannot be empty"
         );
         let mut args = vec![one(None)];
@@ -270,7 +271,7 @@ fn original_approx_percentile_quantile_array_null_empty_count_and_order() {
         }
         args.push(quantiles(vec![Some(0.5), None]));
         assert_eq!(
-            state.update(args).unwrap_err(),
+            (state.update(args).unwrap_err()).to_string(),
             format!("{name}: percentile array element[1] cannot be null")
         );
         let mut args = vec![one(None)];
@@ -279,7 +280,7 @@ fn original_approx_percentile_quantile_array_null_empty_count_and_order() {
         }
         args.push(quantiles(vec![Some(0.5); 4097]));
         assert_eq!(
-            state.update(args).unwrap_err(),
+            (state.update(args).unwrap_err()).to_string(),
             format!("{name}: percentile quantile count 4097 exceeds 4096")
         );
         let mut state = Original::new(name, list_type());
@@ -344,7 +345,7 @@ fn original_approx_percentile_rate_mismatch_keeps_prior_row_mutation() {
         }
         args.push(floats(vec![Some(0.5), Some(0.75)]));
         assert_eq!(
-            state.update(args).unwrap_err(),
+            (state.update(args).unwrap_err()).to_string(),
             "percentile quantile mismatch while merging states: existing=0.5 incoming=0.75"
         );
         assert_eq!(state.count(), 1.0);
@@ -384,15 +385,15 @@ fn original_approx_percentile_bounded_merge_accepts_wrong_magic_but_rejects_v3()
             vec![0xa2, 4, 0, 0x10, 0x27, 0, 0, 0, 0, 0, 0]
         );
         assert_eq!(
-            state.merge(bin(&[0xa2, 3])).unwrap_err(),
+            (state.merge(bin(&[0xa2, 3])).unwrap_err()).to_string(),
             "bounded percentile aggregate requires state version 4"
         );
         assert_eq!(
-            state.merge(bin(&[])).unwrap_err(),
+            (state.merge(bin(&[])).unwrap_err()).to_string(),
             "bounded percentile aggregate requires state version 4"
         );
         assert_eq!(
-            state.merge(bin(&[0xa2, 4])).unwrap_err(),
+            (state.merge(bin(&[0xa2, 4])).unwrap_err()).to_string(),
             "percentile state payload too short"
         );
     }
@@ -401,21 +402,23 @@ fn original_approx_percentile_bounded_merge_accepts_wrong_magic_but_rejects_v3()
 fn original_approx_percentile_v4_count_metadata_and_trailing_payload_errors_exact() {
     let mut state = Original::new("percentile_approx", DataType::Float64);
     assert_eq!(
-        state
+        (state
             .merge(bin(&[0xa2, 4, 0, 0x10, 0x27, 0, 0, 1, 0, 0, 0]))
-            .unwrap_err(),
+            .unwrap_err())
+        .to_string(),
         "percentile state quantile payload truncated"
     );
     assert_eq!(
-        state
+        (state
             .merge(bin(&[0xa2, 4, 1, 0x10, 0x27, 0, 0, 0, 0, 0, 0]))
-            .unwrap_err(),
+            .unwrap_err())
+        .to_string(),
         "invalid percentile state quantile metadata: kind=1 count=0"
     );
     let mut bytes = vec![0xa2, 4, 0, 0x10, 0x27, 0, 0, 0, 0, 0, 0];
     bytes.extend_from_slice(&[0]);
     assert_eq!(
-        state.merge(bin(&bytes)).unwrap_err(),
+        (state.merge(bin(&bytes)).unwrap_err()).to_string(),
         "tdigest compression truncated"
     );
 }
@@ -423,18 +426,20 @@ fn original_approx_percentile_v4_count_metadata_and_trailing_payload_errors_exac
 fn original_approx_percentile_raw_type_error_null_carrier_and_serialized_value_route() {
     let mut state = Original::new("percentile_approx", DataType::Float64);
     assert_eq!(
-        state
+        (state
             .update(vec![
                 Arc::new(BooleanArray::from(vec![true])),
                 one(Some(0.5))
             ])
-            .unwrap_err(),
+            .unwrap_err())
+        .to_string(),
         "percentile_approx: unsupported numeric input type Boolean"
     );
     assert_eq!(
-        state
+        (state
             .update(vec![one(None), Arc::new(NullArray::new(1))])
-            .unwrap_err(),
+            .unwrap_err())
+        .to_string(),
         "percentile_approx: unsupported numeric input type Null"
     );
     let mut source = Original::new("percentile_approx", DataType::Float64);
@@ -445,9 +450,10 @@ fn original_approx_percentile_raw_type_error_null_carrier_and_serialized_value_r
     assert_eq!(target.scalar(), Some(8.0));
     let mut weighted = Original::new("percentile_approx_weighted", DataType::Float64);
     assert_eq!(
-        weighted
+        (weighted
             .update(vec![bin(&bytes), one(Some(1.0)), one(Some(0.5))])
-            .unwrap_err(),
+            .unwrap_err())
+        .to_string(),
         "percentile_approx_weighted: unsupported numeric input type Binary"
     );
 }

@@ -296,6 +296,14 @@ pub enum ConnectorPreparationProgress {
     Ready,
 }
 
+/// A preparation scope's physical outcome. The originating watcher retains
+/// any opaque payload; this receipt contains only its nominal domain cause.
+#[derive(Clone, Debug)]
+pub enum ConnectorPreparationExit {
+    Exited,
+    Unresolved(ConnectorError),
+}
+
 /// Control shared with a timer or task owner that does not poll the stream it
 /// belongs to. Requests do not imply that started I/O has exited.
 pub trait ConnectorPreparationControl: Send + Sync {
@@ -320,7 +328,7 @@ pub trait ConnectorPreparationControl: Send + Sync {
     /// Wait for actual operation exit and release after the most recent stop
     /// or reclaim. Implementations may use any runtime internally; no runtime
     /// type crosses this interface.
-    fn wait_drained(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    fn wait_drained(&self) -> Pin<Box<dyn Future<Output = ConnectorPreparationExit> + Send + '_>>;
 }
 
 /// Opaque, provider-owned input for a future split. The engine can drive and

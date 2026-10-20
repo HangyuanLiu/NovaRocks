@@ -655,7 +655,7 @@ fn values_original_control_every_materialization_callback_success_and_ordinary_t
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let refused = Control::refusing(position, cause);
+                let refused = Control::refusing(position, cause.clone());
                 is_control(direct(&package, lowered, &refused).unwrap_err(), cause);
                 assert_eq!(refused.trace(), trace[..position]);
             }
@@ -700,7 +700,7 @@ fn values_wide_real_rows_observe_quantum_and_preserve_all_rows() {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let refused = Control::refusing(position, cause);
+            let refused = Control::refusing(position, cause.clone());
             is_control(direct(&package, &lowered, &refused).unwrap_err(), cause);
             assert_eq!(refused.trace(), trace[..position]);
         }
@@ -733,7 +733,7 @@ fn values_cross_pool_nested_copy_refuses_explicitly_without_resource_or_control_
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = Control::refusing(position, cause);
+            let control = Control::refusing(position, cause.clone());
             is_control(direct(&package, &lowered, &control).unwrap_err(), cause);
             assert_eq!(control.trace(), trace[..position]);
         }

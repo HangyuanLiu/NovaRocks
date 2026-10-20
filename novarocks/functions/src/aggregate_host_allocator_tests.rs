@@ -277,3 +277,29 @@ mod covered_journal {
         assert_eq!(host.0.ledger.lock().unwrap().attempts, 0);
     }
 }
+
+#[test]
+fn container_overflow_never_consumes_an_earlier_host_refusal() {
+    use crate::aggregate_scalar::ScalarStateAllocator;
+    use novarocks_failure_contract::FailureProjection;
+    for cause in causes() {
+        let host = Arc::new(Host::default());
+        let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+        let mut values = allocator_api2::vec::Vec::<u64, _>::new_in(allocator.clone());
+        arm_refusal(&host, cause.clone());
+        let refused = values.try_reserve_exact(1).unwrap_err();
+        let attempts = host.ledger.lock().unwrap().attempts;
+        let overflow = values.try_reserve_exact(usize::MAX).unwrap_err();
+        assert_eq!(host.ledger.lock().unwrap().attempts, attempts);
+        let overflow = allocator.scalar_allocation_error("oversized state", overflow);
+        assert_eq!(overflow.failure_fact().reason().code(), 168);
+        assert_eq!(allocator.recorded_failure(), Some(cause.clone()));
+        assert_eq!(
+            allocator.scalar_allocation_error("actual host refusal", refused),
+            cause
+        );
+        drop(values);
+        drop(allocator);
+        assert_eq!(host.ledger.lock().unwrap().bytes, 0);
+    }
+}

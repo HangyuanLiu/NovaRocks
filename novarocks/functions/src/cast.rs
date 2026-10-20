@@ -62,7 +62,9 @@ pub enum CastPrepareError {
 impl CastPrepareError {
     pub fn control_error(&self) -> Option<CompileControlError> {
         match self {
-            Self::Control(error) => Some(*error),
+            Self::Control(error) | Self::Kernel(KernelFailure::CompileControl(error)) => {
+                Some(error.clone())
+            }
             Self::Kernel(KernelFailure::Cancelled) => Some(CompileControlError::Cancelled),
             Self::Kernel(KernelFailure::DeadlineExceeded) => {
                 Some(CompileControlError::DeadlineExceeded)
@@ -961,7 +963,12 @@ impl PreparedCastRecipe {
             // retains the separate carrier NULL projection without a row error.
             CastBody::DecimalFloat { .. } => false,
             CastBody::TemporalCarrier { .. } => {
-                matches!(self.result.data_type(), DataType::Date32 | DataType::Utf8)
+                matches!(
+                    self.result.data_type(),
+                    DataType::Date32
+                        | DataType::Utf8
+                        | DataType::Timestamp(TimeUnit::Microsecond | TimeUnit::Nanosecond, None)
+                )
             }
             CastBody::FloatDate { .. } => true,
             CastBody::Calendar { unit, .. } => unit == Some(TimeUnit::Nanosecond),
@@ -1100,10 +1107,20 @@ impl PreparedCastRecipe {
                     Err(crate::decimal128_rescale::DecimalRescaleError::Host(cause)) => {
                         return Err(cause);
                     }
-                    Err(crate::decimal128_rescale::DecimalRescaleError::Data(message)) => {
-                        return Ok(CastRowResult::RowError(RowDataError::new(
-                            ordinal, &message,
-                        )));
+                    Err(crate::decimal128_rescale::DecimalRescaleError::Domain(cause)) => {
+                        use crate::decimal128_rescale::ClassifiedDecimalCastFailure;
+                        match cause.classify() {
+                            ClassifiedDecimalCastFailure::Value(cause) => {
+                                return Ok(CastRowResult::RowError(RowDataError::with_reason(
+                                    ordinal,
+                                    cause.reason(),
+                                    &cause.to_string(),
+                                )));
+                            }
+                            ClassifiedDecimalCastFailure::Outer(cause) => {
+                                return Err(KernelFailure::from_domain(cause));
+                            }
+                        }
                     }
                 };
                 work.flush()?;
@@ -1157,10 +1174,20 @@ impl PreparedCastRecipe {
                     Err(crate::decimal128_rescale::DecimalRescaleError::Host(cause)) => {
                         return Err(cause);
                     }
-                    Err(crate::decimal128_rescale::DecimalRescaleError::Data(message)) => {
-                        return Ok(CastRowResult::RowError(RowDataError::new(
-                            ordinal, &message,
-                        )));
+                    Err(crate::decimal128_rescale::DecimalRescaleError::Domain(cause)) => {
+                        use crate::decimal128_rescale::ClassifiedDecimalCastFailure;
+                        match cause.classify() {
+                            ClassifiedDecimalCastFailure::Value(cause) => {
+                                return Ok(CastRowResult::RowError(RowDataError::with_reason(
+                                    ordinal,
+                                    cause.reason(),
+                                    &cause.to_string(),
+                                )));
+                            }
+                            ClassifiedDecimalCastFailure::Outer(cause) => {
+                                return Err(KernelFailure::from_domain(cause));
+                            }
+                        }
                     }
                 };
                 work.flush()?;
@@ -1222,11 +1249,7 @@ impl PreparedCastRecipe {
                 )?;
                 let output = match output {
                     Ok(output) => output,
-                    Err(message) => {
-                        return Ok(CastRowResult::RowError(RowDataError::new(
-                            ordinal, &message,
-                        )));
-                    }
+                    Err(cause) => return temporal_row_failure(cause, ordinal),
                 };
                 work.flush()?;
                 let output = output
@@ -1278,10 +1301,8 @@ impl PreparedCastRecipe {
                 )?;
                 let output = match output {
                     Ok(output) => output,
-                    Err(message) => {
-                        return Ok(CastRowResult::RowError(RowDataError::new(
-                            ordinal, &message,
-                        )));
+                    Err(cause) => {
+                        return temporal_row_failure(cause, ordinal);
                     }
                 };
                 work.flush()?;
@@ -1322,7 +1343,7 @@ impl PreparedCastRecipe {
                 }
                 work.flush()?;
                 let text = crate::binary_text::value_text(argument.array(), row)
-                    .map_err(|error| internal(&error))?;
+                    .map_err(KernelFailure::from_domain)?;
                 work.flush()?;
                 return Ok(text.map(CastRowResult::Text).unwrap_or(CastRowResult::Null));
             }
@@ -1348,7 +1369,7 @@ impl PreparedCastRecipe {
                     .ok_or_else(|| internal("checked LARGEINT text has a foreign carrier"))?;
                 work.flush()?;
                 let text = crate::largeint_text::value_text(source, row)
-                    .map_err(|error| internal(&error))?;
+                    .map_err(KernelFailure::from_domain)?;
                 work.flush()?;
                 return Ok(CastRowResult::Text(text));
             }
@@ -1514,8 +1535,9 @@ impl PreparedCastRecipe {
                 work.flush()?;
                 return Ok(match converted {
                     Ok(value) => value,
-                    Err(message) => CastRowResult::RowError(RowDataError::new(
+                    Err(message) => CastRowResult::RowError(RowDataError::with_reason(
                         ordinal,
+                        crate::DataFailureReason::NumericOutOfRange,
                         &format!(
                             "CAST failed: from {:?} to {:?}: {message}",
                             self.source.data_type(),
@@ -1530,21 +1552,34 @@ impl PreparedCastRecipe {
                 if is_null && !self.source.nullable() {
                     return Err(invalid("non-null cast argument contains a selected NULL"));
                 }
-                // The original Arrow body controls NULL visitation. Do not mask
-                // Date32's hidden-payload multiplication before invoking it.
+                // The temporal owner checks active Date32 values and preserves
+                // the NULL mask without interpreting hidden physical payload.
                 work.flush()?;
                 let selected = argument.array().slice(row, 1);
                 let converted =
-                    crate::temporal_carrier::cast(selected.as_ref(), self.result.data_type());
-                work.flush()?;
-                let converted = match converted {
-                    Ok(array) => array,
-                    Err(message) => {
-                        return Ok(CastRowResult::RowError(RowDataError::new(
-                            ordinal, &message,
-                        )));
-                    }
-                };
+                    match crate::temporal_carrier::cast(selected.as_ref(), self.result.data_type())
+                    {
+                        Ok(array) => {
+                            work.flush()?;
+                            array
+                        }
+                        Err(cause) => {
+                            use crate::temporal_carrier::ClassifiedTemporalCastFailure;
+                            match cause.classify() {
+                                ClassifiedTemporalCastFailure::Value(cause) => {
+                                    work.flush()?;
+                                    return Ok(CastRowResult::RowError(RowDataError::with_reason(
+                                        ordinal,
+                                        cause.reason(),
+                                        &cause.to_string(),
+                                    )));
+                                }
+                                ClassifiedTemporalCastFailure::Outer(cause) => {
+                                    return Err(KernelFailure::from_domain(cause));
+                                }
+                            }
+                        }
+                    };
                 if converted.is_null(0) {
                     return if self.result.nullable() {
                         Ok(CastRowResult::Null)
@@ -1590,7 +1625,7 @@ impl PreparedCastRecipe {
                 }
                 work.flush()?;
                 let text = crate::carrier_text::render(argument.array().as_ref(), row)
-                    .map_err(|_| internal("checked text cast has a foreign carrier"))?;
+                    .map_err(KernelFailure::from_domain)?;
                 work.flush()?;
                 return Ok(CastRowResult::Text(text));
             }
@@ -2080,3 +2115,16 @@ mod float_decimal128_tests;
 #[cfg(test)]
 #[path = "cast_nested_identity_tests.rs"]
 mod nested_identity_tests;
+
+fn temporal_row_failure(
+    cause: crate::temporal_carrier::TemporalCastFailure,
+    ordinal: usize,
+) -> Result<CastRowResult, KernelFailure> {
+    use crate::temporal_carrier::ClassifiedTemporalCastFailure;
+    match cause.classify() {
+        ClassifiedTemporalCastFailure::Value(cause) => Ok(CastRowResult::RowError(
+            RowDataError::with_reason(ordinal, cause.reason(), &cause.to_string()),
+        )),
+        ClassifiedTemporalCastFailure::Outer(cause) => Err(KernelFailure::from_domain(cause)),
+    }
+}

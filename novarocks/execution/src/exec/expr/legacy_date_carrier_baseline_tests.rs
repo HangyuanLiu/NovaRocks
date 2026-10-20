@@ -21,10 +21,8 @@ use arrow::array::{
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
 use arrow::datatypes::{DataType, TimeUnit};
-use std::{
-    panic::{AssertUnwindSafe, catch_unwind},
-    sync::Arc,
-};
+use novarocks_failure_contract::{FailureClass, FailureProjection};
+use std::sync::Arc;
 
 #[test]
 fn legacy_date_carrier_epoch_leap_text_and_timestamp_units() {
@@ -94,33 +92,38 @@ fn legacy_timestamp_date_carrier_negative_fraction_and_extreme_error() {
     }
     let input: ArrayRef = Arc::new(TimestampSecondArray::from(vec![Some(0), Some(i64::MAX)]));
     assert_eq!(
-        cast_with_special_rules(&input, &DataType::Date32).unwrap_err(),
+        cast_with_special_rules(&input, &DataType::Date32)
+            .unwrap_err()
+            .detail(),
         "Cast error: Cannot convert arrow_array::types::TimestampSecondType 9223372036854775807 to datetime"
     );
     let input: ArrayRef = Arc::new(Date32Array::from(vec![i32::MAX]));
     assert_eq!(
-        cast_with_special_rules(&input, &DataType::Utf8).unwrap_err(),
+        cast_with_special_rules(&input, &DataType::Utf8)
+            .unwrap_err()
+            .detail(),
         "Cast error: Failed to convert 2147483647 to temporal for Date32"
     );
 }
 
 #[test]
-fn legacy_date_carrier_extreme_timestamp_multiplication_keeps_debug_panic() {
-    let input: ArrayRef = Arc::new(Date32Array::from(vec![i32::MAX]));
-    for unit in [TimeUnit::Microsecond, TimeUnit::Nanosecond] {
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            cast_with_special_rules(&input, &DataType::Timestamp(unit, None))
-        }));
-        if cfg!(debug_assertions) {
-            assert!(result.is_err());
-        } else {
-            assert!(result.unwrap().is_ok());
+fn legacy_date_carrier_extreme_timestamp_is_typed_numeric_refusal() {
+    for days in [i32::MIN, i32::MAX] {
+        let input: ArrayRef = Arc::new(Date32Array::from(vec![days]));
+        for unit in [TimeUnit::Microsecond, TimeUnit::Nanosecond] {
+            let error =
+                cast_with_special_rules(&input, &DataType::Timestamp(unit, None)).unwrap_err();
+            assert_eq!(
+                error.failure_fact(),
+                novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+            );
+            assert_eq!(error.failure_fact().class(), FailureClass::Data);
         }
     }
 }
 
 #[test]
-fn legacy_date_carrier_hidden_null_payload_keeps_original_multiply_order() {
+fn legacy_date_carrier_hidden_null_payload_is_not_multiplied() {
     let input: ArrayRef = Arc::new(Date32Array::new(
         vec![i32::MAX, 0].into(),
         Some(arrow_buffer::NullBuffer::from(vec![false, true])),
@@ -131,13 +134,27 @@ fn legacy_date_carrier_hidden_null_payload_keeps_original_multiply_order() {
         StringArray::from(vec![None, Some("1970-01-01")]).to_data()
     );
     for unit in [TimeUnit::Microsecond, TimeUnit::Nanosecond] {
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            cast_with_special_rules(&input, &DataType::Timestamp(unit, None))
-        }));
-        if cfg!(debug_assertions) {
-            assert!(result.is_err());
-        } else {
-            assert!(result.unwrap().is_ok());
+        let result = cast_with_special_rules(&input, &DataType::Timestamp(unit, None)).unwrap();
+        assert!(result.is_null(0));
+        assert!(!result.is_null(1));
+        match unit {
+            TimeUnit::Microsecond => assert_eq!(
+                result
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap()
+                    .value(1),
+                0
+            ),
+            TimeUnit::Nanosecond => assert_eq!(
+                result
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .unwrap()
+                    .value(1),
+                0
+            ),
+            _ => unreachable!(),
         }
     }
 }

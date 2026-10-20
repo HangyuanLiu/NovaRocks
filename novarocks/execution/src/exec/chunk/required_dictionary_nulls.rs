@@ -154,13 +154,34 @@ mod tests {
         )
     }
 
+    fn assert_required_null(error: &ConstructionFailure) {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use novarocks_functions::array_projection::{
+            ArrayProjectionFailure, ArrayProjectionViolation,
+        };
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        let mut original: &dyn std::error::Error = error;
+        loop {
+            if let Some(cause) = original.downcast_ref::<ArrayProjectionFailure>() {
+                assert!(matches!(
+                    cause,
+                    ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::UnmaskedRequiredNull
+                    )
+                ));
+                break;
+            }
+            original = original
+                .source()
+                .expect("the original required-child cause");
+        }
+    }
+
     #[test]
     fn safe_array_data_required_dictionary_child_is_rejected_at_actual_typed_ingress() {
         let (array, value) = required_struct(vec![1, 0], None);
         let error = ingress(array, value).unwrap_err();
-        assert!(
-            matches!(error, ConstructionFailure::InvalidSource(ref detail) if detail.contains("unmasked logical null"))
-        );
+        assert_required_null(&error);
     }
 
     #[test]
@@ -207,9 +228,7 @@ mod tests {
         .unwrap();
         assert!(ingress(array.slice(0, 2), value.clone()).is_ok());
         let error = ingress(array.slice(1, 2), value).unwrap_err();
-        assert!(
-            matches!(error, ConstructionFailure::InvalidSource(ref detail) if detail.contains("unmasked logical null"))
-        );
+        assert_required_null(&error);
     }
 
     #[test]
@@ -280,9 +299,7 @@ mod tests {
                 }
             }
             let error = ingress(original.slice(1, 2), value.clone()).unwrap_err();
-            assert!(
-                matches!(error, ConstructionFailure::InvalidSource(ref detail) if detail.contains("unmasked logical null"))
-            );
+            assert_required_null(&error);
         }
     }
 
@@ -357,26 +374,35 @@ mod tests {
     #[test]
     fn every_borrowed_active_check_preserves_the_first_caller_refusal() {
         let (array, value) = required_struct(vec![1, 0], Some(vec![false, true]));
+        let original = crate::runtime::fragment::ExecutionFailure::from(
+            novarocks_functions::KernelFailure::Cancelled,
+        );
         let mut calls = 0;
-        validate_required_dictionary_children::<String, _>(&array, &value, &mut |_| {
-            calls += 1;
-            Ok(())
-        })
+        validate_required_dictionary_children::<crate::runtime::fragment::ExecutionFailure, _>(
+            &array,
+            &value,
+            &mut |_| {
+                calls += 1;
+                Ok(())
+            },
+        )
         .unwrap();
         assert!(calls > 2);
         for stop in 1..=calls {
             let mut observed = 0;
-            let error =
-                validate_required_dictionary_children::<String, _>(&array, &value, &mut |_| {
-                    observed += 1;
-                    if observed == stop {
-                        Err("original borrowed active NULL refusal".to_owned())
-                    } else {
-                        Ok(())
-                    }
-                })
-                .unwrap_err();
-            assert_eq!(error, "original borrowed active NULL refusal");
+            let error = validate_required_dictionary_children::<
+                crate::runtime::fragment::ExecutionFailure,
+                _,
+            >(&array, &value, &mut |_| {
+                observed += 1;
+                if observed == stop {
+                    Err(original.clone())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert_eq!(error, original);
             assert_eq!(observed, stop);
         }
     }

@@ -29,7 +29,7 @@ use novarocks_type_contract::{
 };
 use std::{collections::BTreeSet, fmt};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CompiledOriginsError {
     Control(CompileControlError),
     Provenance(ProvenanceError),
@@ -197,7 +197,7 @@ mod tests {
             let mut trace = self.trace.lock().unwrap();
             let index = trace.len();
             trace.push(units);
-            if let Some((at, cause)) = self.stop
+            if let Some((at, cause)) = self.stop.clone()
                 && index == at
             {
                 return Err(cause);
@@ -447,7 +447,7 @@ mod tests {
             ] {
                 let control = Control {
                     trace: Mutex::default(),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 assert_eq!(
                     compile_origins(&source, vec![claim.clone()], &allowed, &control).unwrap_err(),
@@ -469,7 +469,7 @@ mod tests {
         ] {
             let control = Control {
                 trace: Mutex::default(),
-                stop: Some((trace.len() - 1, cause)),
+                stop: Some((trace.len() - 1, cause.clone())),
             };
             assert_eq!(
                 compile_origins(&source, vec![operator(&[0], &[0])], &allowed, &control)

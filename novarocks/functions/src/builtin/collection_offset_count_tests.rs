@@ -77,7 +77,7 @@ fn offset_core_raw_classification_follows_original_capacity_boundary() {
     )
     .unwrap_err();
     assert!(
-        matches!(error,OffsetCountFailure::Data(message) if message=="cardinality expects ARRAY or MAP, got Int32")
+        matches!(error,OffsetCountFailure::Operation(source) if source.to_string().contains("cardinality expects ARRAY or MAP, got Int32") && novarocks_failure_contract::FailureProjection::failure_fact(&source).class() == novarocks_failure_contract::FailureClass::Invariant)
     );
     assert_eq!(trace, vec![true, true]);
 }
@@ -131,5 +131,24 @@ fn offset_core_each_observed_boundary_preserves_seven_typed_causes_without_later
             assert!(matches!(error,OffsetCountFailure::Control(actual) if actual==cause));
             assert_eq!(trace, good[..=at]);
         }
+    }
+}
+
+#[test]
+fn count_output_geometry_retains_actual_layout_source_without_inventing_quota() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let error = output_capacity(usize::MAX).unwrap_err();
+    let fact = error.failure_fact();
+    assert_eq!(fact.class(), FailureClass::Representation);
+    let representation = fact.representation().unwrap();
+    assert_eq!(representation.required, None);
+    assert_eq!(representation.extent_limit, Some(isize::MAX as u64));
+    assert_eq!(representation.representable_prefix, None);
+    assert!(fact.resource().is_none());
+    let mut source: &(dyn std::error::Error + 'static) = &error;
+    while !source.is::<std::alloc::LayoutError>() {
+        source = source
+            .source()
+            .expect("actual standard layout error retained");
     }
 }

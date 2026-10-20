@@ -34,7 +34,7 @@ fn text(values: &[&str]) -> ArrayRef {
         None,
     ))
 }
-fn output(source: &ArrayRef, keys: &[ArrayRef]) -> Result<ArrayRef, String> {
+fn output(source: &ArrayRef, keys: &[ArrayRef]) -> Result<ArrayRef, KernelFailure> {
     evaluate(
         source,
         keys.len(),
@@ -138,7 +138,9 @@ fn sortby_source_null_skips_key_lengths_but_nonnull_mismatch_keeps_full_error() 
     let result = output(&source, &[one(&[1, 2])]).unwrap();
     assert!(result.is_null(0));
     assert_eq!(
-        output(&one(&[10, 20]), &[one(&[1])]).unwrap_err(),
+        output(&one(&[10, 20]), &[one(&[1])])
+            .unwrap_err()
+            .to_string(),
         "Expr evaluate meet error: Input arrays' size are not equal in array_sortby."
     );
 }
@@ -170,14 +172,14 @@ fn sortby_source_shape_refusal_precedes_original_lazy_key_evaluation() {
         1,
         |_| {
             keys += 1;
-            Err("later key failure".into())
+            Err(crate::kernel_control::invalid("later key failure"))
         },
         None,
         1,
     );
     assert_eq!(keys, 0);
     assert_eq!(
-        result.unwrap_err(),
+        result.unwrap_err().to_string(),
         "array_sortby expects ListArray src, got Utf8"
     );
 }
@@ -186,11 +188,11 @@ fn sortby_source_shape_refusal_precedes_original_lazy_key_evaluation() {
 fn sortby_lazy_key_failure_preserves_typed_source_and_stops_later_keys() {
     #[derive(Debug, PartialEq)]
     enum Failure {
-        Math(String),
+        Math(KernelFailure),
         Runtime { category: u8, context: &'static str },
     }
-    impl From<String> for Failure {
-        fn from(value: String) -> Self {
+    impl From<KernelFailure> for Failure {
+        fn from(value: KernelFailure) -> Self {
             Self::Math(value)
         }
     }
@@ -221,5 +223,70 @@ fn sortby_lazy_key_failure_preserves_typed_source_and_stops_later_keys() {
         .unwrap_err();
         assert_eq!(error, original);
         assert_eq!(calls, vec![0, 1]);
+    }
+}
+
+#[test]
+fn original_shape_and_ordered_contract_failures_are_not_invocation_data() {
+    let source: ArrayRef = Arc::new(StringArray::from(vec!["ResourceExhausted"]));
+    let failure = evaluate(
+        &source,
+        1,
+        |_| panic!("invalid source must precede keys"),
+        None,
+        1,
+    )
+    .unwrap_err();
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    let values: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+    let failure = compare_values_ordered(&values, 0, 1).unwrap_err();
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    let unsupported = one(&[1]);
+    let failure = compare_values_ordered(&unsupported, 0, 0).unwrap_err();
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(failure.failure_fact().reason().code(), 402);
+}
+
+#[test]
+fn conditional_cast_keeps_original_arrow_cause_and_releases_inputs() {
+    use std::error::Error;
+    let source = one(&[20, 10]);
+    let weak = Arc::downgrade(&source);
+    let target = DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::Struct(vec![Arc::new(Field::new("value", DataType::Int64, true))].into()),
+        true,
+    )));
+    let failure = evaluate(&source, 1, |_| Ok(one(&[2, 1])), Some(&target), 1).unwrap_err();
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    let mut cause: &(dyn Error + 'static) = &failure;
+    loop {
+        if cause.is::<arrow_schema::ArrowError>() {
+            break;
+        }
+        cause = cause.source().expect("original Arrow cast source");
+    }
+    drop(source);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn length_mismatch_retains_actual_geometry_and_shared_data_reason() {
+    use std::error::Error;
+    let failure = output(&one(&[10, 20]), &[one(&[1])]).unwrap_err();
+    assert_eq!(
+        failure.failure_fact(),
+        crate::DataFailureReason::InvalidValue.failure_fact()
+    );
+    let mut cause: &(dyn Error + 'static) = &failure;
+    loop {
+        if let Some(actual) = cause.downcast_ref::<SortByLengthMismatch>() {
+            assert_eq!(
+                (actual.row, actual.source_elements, actual.key_elements),
+                (0, 2, 1)
+            );
+            break;
+        }
+        cause = cause.source().expect("original size mismatch author");
     }
 }

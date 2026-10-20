@@ -25,13 +25,14 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::time::Instant;
 
-use novarocks_spi::connector::read_stack::ConnectorPreparationControl;
+use novarocks_spi::connector::read_stack::{ConnectorPreparationControl, ConnectorPreparationExit};
 
 use crate::ScanPreparationConfig;
 
 pub(super) struct StreamPreparationFlow {
     config: ScanPreparationConfig,
     timer: Arc<ScanPreparationTimer>,
+    changed: tokio::sync::Notify,
     state: Mutex<FlowState>,
 }
 
@@ -152,6 +153,7 @@ impl StreamPreparationFlow {
         Arc::new(Self {
             config,
             timer,
+            changed: tokio::sync::Notify::new(),
             state: Mutex::new(FlowState {
                 closed: false,
                 paused_since: None,
@@ -171,7 +173,7 @@ impl StreamPreparationFlow {
     }
 
     /// Registers a candidate's control. A flow that already stopped stops
-    /// the candidate at once; its drain is observed by [`Self::drained`].
+    /// the candidate at once; its drain is observed by [`Self::observe_exit`].
     pub(super) fn register(&self, control: Arc<dyn ConnectorPreparationControl>) -> u64 {
         let id = {
             let mut state = self.state.lock().expect("typed preparation flow lock");
@@ -182,14 +184,20 @@ impl StreamPreparationFlow {
             id
         };
         self.sync_control(&control);
+        self.changed.notify_waiters();
         id
     }
 
     pub(super) fn unregister(&self, id: u64) {
-        let mut state = self.state.lock().expect("typed preparation flow lock");
-        state.controls.remove(&id);
-        state.retired.remove(&id);
-        state.control_epoch = state.control_epoch.wrapping_add(1);
+        let retired = {
+            let mut state = self.state.lock().expect("typed preparation flow lock");
+            let retired = state.controls.remove(&id);
+            state.retired.remove(&id);
+            state.control_epoch = state.control_epoch.wrapping_add(1);
+            retired
+        };
+        drop(retired);
+        self.changed.notify_waiters();
     }
 
     /// A promoted candidate no longer owns its ready backing, but its old
@@ -230,12 +238,22 @@ impl StreamPreparationFlow {
             .into_iter()
             .filter_map(|(id, control)| control.is_drained().then_some(id))
             .collect::<Vec<_>>();
-        let mut state = self.state.lock().expect("typed preparation flow lock");
-        for id in drained {
-            state.retired.remove(&id);
-            state.controls.remove(&id);
-            state.control_epoch = state.control_epoch.wrapping_add(1);
+        let retired = {
+            let mut state = self.state.lock().expect("typed preparation flow lock");
+            let mut retired = Vec::new();
+            for id in drained {
+                state.retired.remove(&id);
+                if let Some(control) = state.controls.remove(&id) {
+                    retired.push(control);
+                }
+                state.control_epoch = state.control_epoch.wrapping_add(1);
+            }
+            retired
+        };
+        if !retired.is_empty() {
+            self.changed.notify_waiters();
         }
+        drop(retired);
     }
 
     pub(super) fn retained_input_bytes(&self) -> u64 {
@@ -395,7 +413,7 @@ impl StreamPreparationFlow {
     }
 
     /// Stops every candidate, now and whatever registers later, without
-    /// waiting: [`Self::drained`] observes their exit.
+    /// waiting: [`Self::observe_exit`] observes their exit.
     pub(super) fn stop(&self) {
         let controls = {
             let mut state = self.state.lock().expect("typed preparation flow lock");
@@ -407,14 +425,44 @@ impl StreamPreparationFlow {
         for control in &controls {
             self.sync_control(control);
         }
+        self.changed.notify_waiters();
     }
 
-    /// Resolves once every candidate registered now has drained.
-    pub(super) fn drained(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
-        let controls = self.controls();
+    /// Observe the original dynamic set. An active empty snapshot never proves
+    /// future work exited. Every epoch change rebuilds cancellation-safe waits.
+    pub(super) fn observe_exit(
+        self: &Arc<Self>,
+    ) -> impl std::future::Future<Output = ConnectorPreparationExit> + Send + 'static {
+        let original = self.clone();
         async move {
-            for control in controls {
-                control.wait_drained().await;
+            loop {
+                let changed = original.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let (closed, epoch, controls) = {
+                    let state = original.state.lock().expect("typed preparation flow lock");
+                    (
+                        state.closed,
+                        state.control_epoch,
+                        state.controls.values().cloned().collect::<Vec<_>>(),
+                    )
+                };
+                if !closed {
+                    changed.await;
+                    continue;
+                }
+                let joined = futures::future::join_all(
+                    controls.iter().map(|control| control.wait_drained()),
+                );
+                tokio::pin!(joined);
+                tokio::select! {
+                    outcomes = &mut joined => {
+                        if original.state.lock().expect("typed preparation flow lock").control_epoch != epoch { continue; }
+                        return outcomes.into_iter().find(|outcome| matches!(outcome, ConnectorPreparationExit::Unresolved(_)))
+                            .unwrap_or(ConnectorPreparationExit::Exited);
+                    }
+                    _ = &mut changed => {},
+                }
             }
         }
     }
@@ -464,7 +512,7 @@ impl StreamPreparationFlow {
 
 #[cfg(test)]
 mod tests {
-    use std::future::{Future, ready};
+    use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -478,6 +526,7 @@ mod tests {
         reclaims: AtomicUsize,
         stops: AtomicUsize,
         drained: AtomicBool,
+        changed: tokio::sync::Notify,
     }
 
     impl ConnectorPreparationControl for ProbeControl {
@@ -493,6 +542,7 @@ mod tests {
         fn request_stop(&self) {
             self.stops.fetch_add(1, Ordering::AcqRel);
             self.drained.store(true, Ordering::Release);
+            self.changed.notify_waiters();
         }
         fn retained_input_bytes(&self) -> u64 {
             8
@@ -500,8 +550,20 @@ mod tests {
         fn is_drained(&self) -> bool {
             self.drained.load(Ordering::Acquire)
         }
-        fn wait_drained(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-            Box::pin(ready(()))
+        fn wait_drained(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = ConnectorPreparationExit> + Send + '_>> {
+            Box::pin(async move {
+                loop {
+                    let changed = self.changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if self.drained.load(Ordering::Acquire) {
+                        return ConnectorPreparationExit::Exited;
+                    }
+                    changed.await;
+                }
+            })
         }
     }
 
@@ -637,5 +699,134 @@ mod tests {
         control.drained.store(true, Ordering::Release);
         assert_eq!(flow.retired_count(), 0);
         assert_eq!(flow.retained_input_bytes(), 0);
+    }
+    // This owner deliberately separates stop metadata from its real backing's
+    // destruction; no fixture stop flag is treated as a physical exit receipt.
+    struct GatedExitControl {
+        stops: AtomicUsize,
+        polls: AtomicUsize,
+        backing: Mutex<Option<Arc<Vec<u8>>>>,
+        outcome: Mutex<Option<ConnectorPreparationExit>>,
+        changed: tokio::sync::Notify,
+    }
+    impl GatedExitControl {
+        fn new() -> (Arc<Self>, std::sync::Weak<Vec<u8>>) {
+            let backing = Arc::new(vec![7_u8; 8]);
+            let weak = Arc::downgrade(&backing);
+            (
+                Arc::new(Self {
+                    stops: AtomicUsize::new(0),
+                    polls: AtomicUsize::new(0),
+                    backing: Mutex::new(Some(backing)),
+                    outcome: Mutex::new(None),
+                    changed: tokio::sync::Notify::new(),
+                }),
+                weak,
+            )
+        }
+        fn finish(&self) {
+            let backing = self.backing.lock().unwrap().take();
+            drop(backing);
+            *self.outcome.lock().unwrap() = Some(ConnectorPreparationExit::Exited);
+            self.changed.notify_waiters();
+        }
+        fn unknown(&self, cause: novarocks_spi::connector::ConnectorError) {
+            *self.outcome.lock().unwrap() = Some(ConnectorPreparationExit::Unresolved(cause));
+            self.changed.notify_waiters();
+        }
+    }
+    impl ConnectorPreparationControl for GatedExitControl {
+        fn request_pause(&self) {}
+        fn request_resume(&self) {}
+        fn request_reclaim(&self) {}
+        fn request_stop(&self) {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+        }
+        fn retained_input_bytes(&self) -> u64 {
+            self.backing
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(0, |v| v.len() as u64)
+        }
+        fn is_drained(&self) -> bool {
+            matches!(
+                &*self.outcome.lock().unwrap(),
+                Some(ConnectorPreparationExit::Exited)
+            )
+        }
+        fn wait_drained(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = ConnectorPreparationExit> + Send + '_>> {
+            Box::pin(async move {
+                loop {
+                    let notified = self.changed.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    self.polls.fetch_add(1, Ordering::SeqCst);
+                    if let Some(outcome) = self.outcome.lock().unwrap().clone() {
+                        return outcome;
+                    }
+                    notified.await;
+                }
+            })
+        }
+    }
+    #[tokio::test]
+    async fn active_empty_exit_observer_waits_for_close_and_late_registered_real_backing() {
+        let flow = StreamPreparationFlow::new(config(), ScanPreparationTimer::new());
+        let mut observer = Box::pin(flow.observe_exit());
+        assert!(
+            futures::poll!(observer.as_mut()).is_pending(),
+            "an active empty set is not a whole-scope proof"
+        );
+        let (control, backing) = GatedExitControl::new();
+        flow.register(control.clone());
+        flow.stop();
+        let after_stop = futures::poll!(observer.as_mut()).is_pending();
+        let owned_before_exit = backing.upgrade().is_some();
+        let stop_calls = control.stops.load(Ordering::SeqCst);
+        control.finish();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), observer)
+            .await
+            .expect("actual backing exit");
+        assert!(after_stop && owned_before_exit);
+        assert_eq!(stop_calls, 1);
+        assert!(matches!(outcome, ConnectorPreparationExit::Exited));
+        assert!(backing.upgrade().is_none());
+    }
+    #[tokio::test]
+    async fn unknown_child_never_short_circuits_healthy_sibling_or_new_closed_epoch() {
+        let flow = StreamPreparationFlow::new(config(), ScanPreparationTimer::new());
+        let (unknown, unknown_backing) = GatedExitControl::new();
+        let (healthy, healthy_backing) = GatedExitControl::new();
+        flow.register(unknown.clone());
+        flow.register(healthy.clone());
+        let cause = novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Internal,
+            "original gated preparation cleanup remains unresolved",
+        );
+        unknown.unknown(cause.clone());
+        flow.stop();
+        let mut observer = Box::pin(flow.observe_exit());
+        let first_pending = futures::poll!(observer.as_mut()).is_pending();
+        let healthy_polled = healthy.polls.load(Ordering::SeqCst);
+        let (late, late_backing) = GatedExitControl::new();
+        flow.register(late.clone());
+        healthy.finish();
+        let new_epoch_pending = futures::poll!(observer.as_mut()).is_pending();
+        let late_polled = late.polls.load(Ordering::SeqCst);
+        late.finish();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), observer)
+            .await
+            .expect("all known siblings progressed");
+        assert!(first_pending && new_epoch_pending);
+        assert!(healthy_polled > 0 && late_polled > 0);
+        assert!(healthy_backing.upgrade().is_none() && late_backing.upgrade().is_none());
+        assert!(unknown_backing.upgrade().is_some());
+        assert!(
+            matches!(outcome, ConnectorPreparationExit::Unresolved(observed) if observed == cause)
+        );
+        assert_eq!(late.stops.load(Ordering::SeqCst), 1);
     }
 }

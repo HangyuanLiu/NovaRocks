@@ -31,7 +31,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((at, cause)) if trace.len() == at + 1 => Err(cause),
             _ => Ok(()),
         }
@@ -526,12 +526,12 @@ fn every_factory_preserves_original_control_at_entry_preflight_constructor_and_v
         ] {
             for at in 0..trace.len() {
                 let control = Control {
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 assert_eq!(
                     construct(factory, policy(), &control).unwrap_err(),
-                    ConstantError::Control(cause)
+                    ConstantError::Control(cause.clone())
                 );
                 assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
             }
@@ -575,7 +575,7 @@ fn factories_keep_real_metadata_quantum_and_finite_admission_refusal_before_back
     ] {
         let at = trace.iter().position(|units| *units == 256).unwrap();
         let control = Control {
-            refusal: Some((at, cause)),
+            refusal: Some((at, cause.clone())),
             ..Control::default()
         };
         assert_eq!(

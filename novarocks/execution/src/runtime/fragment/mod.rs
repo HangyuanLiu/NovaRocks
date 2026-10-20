@@ -1,5 +1,6 @@
 //! Fragment-lifecycle contracts owned by the execution kernel.
 
+pub mod connector_failure;
 pub mod error;
 pub mod exchange;
 pub mod execution_failure;
@@ -11,6 +12,7 @@ pub mod resources;
 pub mod runtime_state;
 pub mod scan;
 pub mod sink;
+mod sink_failure;
 
 pub use error::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentLaunchError,
@@ -25,7 +27,13 @@ pub use handle::{
 pub use instance::*;
 pub use resources::ExchangeReceiverRetirement;
 
+mod domain_failure;
+pub use domain_failure::SharedDomainFailure;
+
 pub use execution_failure::{
-    ExecutionFailure, ExecutionFailureCause, ExecutionFailureContext, ExecutionResult,
-    PipelineOperation, RequiredExpressionRowError,
+    ExecutionFailure, ExecutionFailureCause, ExecutionFailureContext, ExecutionFailureReporter,
+    ExecutionResult, PipelineOperation, RequiredExpressionRowError,
 };
+
+mod execution_reason;
+pub(crate) use execution_reason::ExecutionReason;

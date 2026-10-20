@@ -31,16 +31,88 @@ use serde_json::Value;
 
 use super::variant::VariantValue;
 
+#[derive(Debug)]
+pub struct VariantEncodeFailure(Box<VariantEncodeCause>);
+#[derive(Debug)]
+enum VariantEncodeCause {
+    Json(serde_json::Error),
+    Variant(super::variant::VariantFailure),
+    Numeric(novarocks_failure_contract::BoundedDetail),
+    Contract(novarocks_failure_contract::BoundedDetail),
+}
+impl VariantEncodeFailure {
+    fn json(source: serde_json::Error) -> Self {
+        Self(Box::new(VariantEncodeCause::Json(source)))
+    }
+    fn numeric(detail: impl std::fmt::Display) -> Self {
+        Self(Box::new(VariantEncodeCause::Numeric(
+            novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+        )))
+    }
+    fn contract(detail: impl std::fmt::Display) -> Self {
+        Self(Box::new(VariantEncodeCause::Contract(
+            novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+        )))
+    }
+}
+impl From<super::variant::VariantFailure> for VariantEncodeFailure {
+    fn from(cause: super::variant::VariantFailure) -> Self {
+        Self(Box::new(VariantEncodeCause::Variant(cause)))
+    }
+}
+impl std::fmt::Display for VariantEncodeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.as_ref() {
+            VariantEncodeCause::Json(cause) => write!(f, "parse_json: invalid JSON: {cause}"),
+            VariantEncodeCause::Variant(cause) => cause.fmt(f),
+            VariantEncodeCause::Numeric(detail) | VariantEncodeCause::Contract(detail) => {
+                f.write_str(detail.as_str())
+            }
+        }
+    }
+}
+impl std::error::Error for VariantEncodeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self.0.as_ref() {
+            VariantEncodeCause::Json(cause) => Some(cause),
+            VariantEncodeCause::Variant(cause) => Some(cause),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for VariantEncodeFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        match self.0.as_ref() {
+            VariantEncodeCause::Variant(cause) => cause.failure_fact(),
+            VariantEncodeCause::Numeric(_) => {
+                novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+            }
+            VariantEncodeCause::Json(_) => {
+                novarocks_functions::DataFailureReason::InvalidEncoding.failure_fact()
+            }
+            VariantEncodeCause::Contract(_) => FailureFact::new(
+                FailureClass::Invariant,
+                FailureReason::new(
+                    domain::TYPE_CONTRACT,
+                    std::num::NonZeroU16::new(65).unwrap(),
+                ),
+            ),
+        }
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for VariantEncodeFailure {}
+
 /// Encode JSON text into NovaRocks' size-prefixed variant payload.
-pub fn encode_json_text_to_variant_bytes(json_text: &str) -> Result<Vec<u8>, String> {
+pub fn encode_json_text_to_variant_bytes(json_text: &str) -> Result<Vec<u8>, VariantEncodeFailure> {
     let value: Value = novarocks_functions::parse_json_core::parse_value(json_text)
-        .map_err(|e| format!("parse_json: invalid JSON: {e}"))?;
+        .map_err(VariantEncodeFailure::json)?;
     encode_json_value_to_variant_bytes(&value)
 }
 
 /// Encode an already-parsed JSON value. Same output shape as
 /// [`encode_json_text_to_variant_bytes`].
-pub fn encode_json_value_to_variant_bytes(value: &Value) -> Result<Vec<u8>, String> {
+pub fn encode_json_value_to_variant_bytes(value: &Value) -> Result<Vec<u8>, VariantEncodeFailure> {
     let mut keys = BTreeSet::new();
     collect_object_keys(value, &mut keys);
     let (metadata, key_to_id) = build_metadata(&keys);
@@ -156,7 +228,7 @@ fn encode_value(
     value: &Value,
     key_to_id: &HashMap<String, u32>,
     out: &mut Vec<u8>,
-) -> Result<(), String> {
+) -> Result<(), VariantEncodeFailure> {
     match value {
         Value::Null => {
             out.push(primitive_header(PT_NULL));
@@ -179,7 +251,9 @@ fn encode_value(
             } else if let Some(f) = n.as_f64() {
                 encode_double(f, out);
             } else {
-                return Err(format!("parse_json: unsupported numeric literal: {n}"));
+                return Err(VariantEncodeFailure::numeric(format_args!(
+                    "parse_json: unsupported numeric literal: {n}"
+                )));
             }
         }
         Value::String(s) => {
@@ -235,7 +309,7 @@ fn encode_array(
     items: &[Value],
     key_to_id: &HashMap<String, u32>,
     out: &mut Vec<u8>,
-) -> Result<(), String> {
+) -> Result<(), VariantEncodeFailure> {
     let mut payload = Vec::new();
     let mut end_offsets = Vec::with_capacity(items.len());
     for item in items {
@@ -267,13 +341,15 @@ fn encode_object(
     map: &serde_json::Map<String, Value>,
     key_to_id: &HashMap<String, u32>,
     out: &mut Vec<u8>,
-) -> Result<(), String> {
+) -> Result<(), VariantEncodeFailure> {
     // Sort fields by field_id (matches StarRocks: std::map<uint32_t, ...>).
     let mut ordered: BTreeMap<u32, &Value> = BTreeMap::new();
     for (k, v) in map {
-        let id = *key_to_id
-            .get(k)
-            .ok_or_else(|| format!("parse_json: variant metadata missing field: {k}"))?;
+        let id = *key_to_id.get(k).ok_or_else(|| {
+            VariantEncodeFailure::contract(format_args!(
+                "parse_json: variant metadata missing field: {k}"
+            ))
+        })?;
         ordered.insert(id, v);
     }
 
@@ -485,5 +561,25 @@ mod tests {
             .map(|i| meta.get_key(i).unwrap())
             .collect();
         assert_eq!(keys, vec!["alpha", "beta", "mid", "zeta"]);
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+    use std::error::Error;
+    #[test]
+    fn variant_encoder_retains_parser_source_without_input_backing() {
+        let text = std::sync::Arc::new(String::from("{malformed"));
+        let weak = std::sync::Arc::downgrade(&text);
+        let cause = encode_json_text_to_variant_bytes(text.as_str()).unwrap_err();
+        assert!(cause.source().unwrap().is::<serde_json::Error>());
+        drop(text);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(
+            cause.failure_fact(),
+            novarocks_functions::DataFailureReason::InvalidEncoding.failure_fact()
+        );
     }
 }

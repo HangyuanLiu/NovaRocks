@@ -37,7 +37,7 @@ impl PureCompileControl for Control {
         let mut t = self.trace.lock().unwrap();
         let at = t.len();
         t.push(n);
-        if let Some((i, c)) = self.fail
+        if let Some((i, c)) = self.fail.clone()
             && i == at
         {
             Err(c)
@@ -148,7 +148,7 @@ fn actual_flow_success_and_ordinary_prefixes_keep_the_first_control_without_nest
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let (out, actual) = run(duplicate, Some((at, cause)));
+                let (out, actual) = run(duplicate, Some((at, cause.clone())));
                 assert!(matches!(out,Err(ExpressionControlFlowError::Control(c))if c==cause));
                 assert_eq!(actual, trace[..=at]);
             }

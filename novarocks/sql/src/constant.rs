@@ -41,6 +41,9 @@ pub(crate) fn admit_syntax_constant(
     let result = (|| {
         novarocks_functions::validate_function_value_type_observed(value_type, &mut work).map_err(
             |error| match error {
+                novarocks_functions::KernelFailure::CompileControl(cause) => {
+                    ConstantError::Control(cause)
+                }
                 novarocks_functions::KernelFailure::Cancelled => {
                     ConstantError::Control(novarocks_type_contract::CompileControlError::Cancelled)
                 }
@@ -50,7 +53,7 @@ pub(crate) fn admit_syntax_constant(
                 novarocks_functions::KernelFailure::ResourceExhausted => ConstantError::Control(
                     novarocks_type_contract::CompileControlError::ResourceExhausted,
                 ),
-                error => ConstantError::Arrow(error.to_string()),
+                error => ConstantError::from_domain(error),
             },
         )?;
         let field = Arc::new(arrow::datatypes::Field::new(
@@ -210,7 +213,7 @@ pub(crate) fn admit_syntax_constant(
                             ))?;
                         let array = <$array>::from(vec![coefficient])
                             .with_precision_and_scale(*precision, *scale)
-                            .map_err(|error| ConstantError::Arrow(error.to_string()))?;
+                            .map_err(ConstantError::arrow_validation)?;
                         work.flush()?;
                         ConstantValue::from_scalar_array(
                             field,
@@ -234,14 +237,7 @@ pub(crate) fn admit_syntax_constant(
         work.flush()?;
         Ok(checked)
     })();
-    if matches!(
-        result,
-        Err(ConstantError::Control(_) | ConstantError::Limit(_))
-    ) {
-        return result;
-    }
-    work.finish()?;
-    result
+    work.finish_result(result, ConstantError::from)
 }
 
 /// Read exact plain SQL spelling into the declared unscaled coefficient.

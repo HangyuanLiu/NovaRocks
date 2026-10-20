@@ -62,7 +62,7 @@ impl PureCompileControl for Control {
             .is_none_or(|(counts, stage)| counts.stage.load(Ordering::Relaxed) == *stage);
         if stage_matches
             && (!self.positive_only || units > 0)
-            && let Some(failure) = self.failure
+            && let Some(failure) = self.failure.clone()
         {
             Err(failure)
         } else {
@@ -742,7 +742,7 @@ fn entry_and_bounded_wrapper_or_owner_refinement_failures_keep_typed_compile_cat
             for stage in [None, Some(1)] {
                 owner.reset();
                 let control = Control {
-                    failure: Some(failure),
+                    failure: Some(failure.clone()),
                     positive_only: stage.is_some(),
                     stage: stage.map(|stage| (owner.counts.clone(), stage)),
                     ..Default::default()
@@ -775,7 +775,7 @@ fn entry_and_bounded_wrapper_or_owner_refinement_failures_keep_typed_compile_cat
             }
             owner.reset();
             let control = Control {
-                failure: Some(failure),
+                failure: Some(failure.clone()),
                 positive_only: true,
                 ..Default::default()
             };
@@ -820,7 +820,7 @@ fn bounded_prepare_control_failures_are_outer_kernel_failures_and_allocate_no_in
         for positive_only in [false, true] {
             owner.reset();
             let control = Control {
-                failure: Some(failure),
+                failure: Some(failure.clone()),
                 positive_only,
                 stage: Some((owner.counts.clone(), 2)),
                 ..Default::default()
@@ -834,7 +834,7 @@ fn bounded_prepare_control_failures_are_outer_kernel_failures_and_allocate_no_in
             )
             .unwrap_err();
             assert!(
-                matches!(error,FunctionSpecializationFailure::Kernel(actual) if actual==expected)
+                matches!(error,FunctionSpecializationFailure::Control(actual) if actual==failure)
             );
             owner.assert_calls(1, 1);
             assert!(

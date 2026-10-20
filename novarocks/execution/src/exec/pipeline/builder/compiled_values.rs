@@ -27,6 +27,7 @@
 //! from its constant cells and its evaluated cells; no cell is cast, coerced
 //! or defaulted here. All rows are emitted from the one source driver.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use std::sync::Arc;
 
 use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionOwner};
@@ -47,8 +48,10 @@ use novarocks_type_contract::{ValueSchemaCreation, arrow_data_types_exact_observ
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all};
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::shape::{Source, SourceKernel, SourceStart};
+use crate::exec::pipeline::step::{NextStep, StepResult};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
@@ -69,17 +72,24 @@ impl CompiledValuesSourceFactory {
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Self, String> {
-        let graph_node = program
-            .graph()
-            .nodes()
-            .get(node.index())
-            .ok_or("compiled Values node is absent")?;
+    ) -> crate::runtime::fragment::ExecutionResult<Self> {
+        let graph_node = program.graph().nodes().get(node.index()).ok_or_else(|| {
+            crate::exec::fragment::error::program_binding_failure(
+                crate::exec::fragment::error::FragmentBindingErrorKind::MissingAssignment,
+                "compiled Values node is absent",
+            )
+        })?;
         let ProgramNodeKind::Values { values } = graph_node.kind() else {
-            return Err("compiled node is not a Values source".to_string());
+            return Err(crate::exec::fragment::error::program_binding_failure(
+                crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment,
+                "compiled node is not a Values source",
+            ));
         };
         if !values.layout().is_typed() {
-            return Err("compiled Values require their complete frozen layout".into());
+            return Err(crate::exec::fragment::error::program_binding_failure(
+                crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment,
+                "compiled Values require their complete frozen layout",
+            ));
         }
         Ok(Self {
             name: format!("COMPILED_VALUES (node={})", node.index()),
@@ -96,7 +106,7 @@ impl OperatorFactory for CompiledValuesSourceFactory {
     }
 
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        Box::new(CompiledValuesSource {
+        Box::new(Source::new(CompiledValuesSource {
             name: self.name.clone(),
             program: Arc::clone(&self.program),
             node: self.node,
@@ -104,8 +114,7 @@ impl OperatorFactory for CompiledValuesSourceFactory {
             construction: None,
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             driver_id,
-            emitted: false,
-        })
+        }))
     }
 
     fn is_source(&self) -> bool {
@@ -121,10 +130,9 @@ struct CompiledValuesSource {
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     control: RuntimeKernelControl,
     driver_id: i32,
-    emitted: bool,
 }
 
-impl Operator for CompiledValuesSource {
+impl OperatorLifecycle for CompiledValuesSource {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -172,52 +180,31 @@ impl Operator for CompiledValuesSource {
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.emitted
-    }
 }
 
-impl ProcessorOperator for CompiledValuesSource {
-    fn need_input(&self) -> bool {
-        false
-    }
-
-    fn has_output(&self) -> bool {
-        !self.emitted
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-        Err("compiled Values source does not accept input".into())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if self.emitted {
-            return Ok(None);
+impl SourceKernel for CompiledValuesSource {
+    fn start(&self) -> SourceStart {
+        if self.driver_id != 0 {
+            SourceStart::Finished
+        } else {
+            SourceStart::Ready
         }
-        self.emitted = true;
+    }
+    fn poll_output(
+        &mut self,
+        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<StepResult> {
         // The source pipeline has one driver; every row comes from it, so the
         // cells are evaluated once and rows keep their frozen order.
         if self.driver_id != 0 {
-            return Ok(None);
+            return Ok(StepResult::new(None, NextStep::Finished, 0));
         }
         let output = self
             .output
             .as_ref()
             .ok_or_else(|| invalid("compiled Values source was not prepared"))?;
-        materialize(&self.program, self.node, output, &self.control).map(Some)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        Ok(())
+        let chunk = materialize(&self.program, self.node, output, &self.control)?;
+        Ok(StepResult::new(Some(chunk), NextStep::Finished, 0))
     }
 }
 
@@ -226,17 +213,18 @@ fn reserve<T>(
     owner: &dyn InputConstructionOwner,
     work: &mut Work<'_>,
 ) -> ExecutionResult<Vec<T>> {
-    let layout = std::alloc::Layout::array::<T>(count).map_err(|_| {
-        ConstructionFailure::Resource(
-            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
-        )
-    })?;
+    let layout = values_array_layout::<T>(count)?;
     work.flush()?;
     owner.request(layout)?;
     let mut values = Vec::new();
-    values
-        .try_reserve_exact(count)
-        .map_err(|_| KernelFailure::ResourceExhausted)?;
+    values.try_reserve_exact(count).map_err(|source| {
+        ExecutionFailure::from_domain(
+            novarocks_functions::allocation_failure::AllocationRefusal::new(
+                "reserve compiled Values assembly",
+                source,
+            ),
+        )
+    })?;
     work.flush()?;
     Ok(values)
 }
@@ -244,11 +232,7 @@ fn copy_failure(error: CopyConstructionError<ConstructionFailure>) -> ExecutionF
     match error {
         CopyConstructionError::Creator(cause) => cause.into(),
         CopyConstructionError::Resource(cause) => ConstructionFailure::Resource(cause).into(),
-        CopyConstructionError::Copy(CopyError::Control(cause)) => cause.into(),
-        CopyConstructionError::Copy(CopyError::Extent) => KernelFailure::ResourceExhausted.into(),
-        CopyConstructionError::Copy(CopyError::Invalid(_) | CopyError::Unsupported(_)) => {
-            invalid("Values column carrier lacks selected-copy preflight")
-        }
+        CopyConstructionError::Copy(cause) => cause.into_kernel().into(),
     }
 }
 
@@ -305,7 +289,9 @@ fn materialize(
         Vec::new(),
         &RecordBatchOptions::new().with_row_count(Some(1)),
     )
-    .map_err(|error| ExecutionFailure::from(format!("compiled Values empty port: {error}")))?;
+    .map_err(|source| {
+        ExecutionFailure::from_domain(ValuesConstructionFailure::EmptyPort(source))
+    })?;
     // Row-major: the first failing cell is the one v1 would have reported.
     let mut evaluated = reserve(dynamic.len(), owner.as_ref(), &mut work)?;
     for cell in dynamic {
@@ -405,8 +391,9 @@ fn materialize(
             work.step()?;
         }
         work.flush()?;
-        let column = interleave(&borrowed, &choices)
-            .map_err(|error| ExecutionFailure::from(format!("compiled Values column: {error}")))?;
+        let column = interleave(&borrowed, &choices).map_err(|source| {
+            ExecutionFailure::from_domain(ValuesConstructionFailure::Column { ordinal, source })
+        })?;
         work.flush()?;
         columns.push(column);
     }
@@ -446,5 +433,144 @@ impl<'a> Work<'a> {
     }
     fn observe(&mut self, boundary: bool) -> Result<(), KernelFailure> {
         if boundary { self.flush() } else { self.step() }
+    }
+}
+
+/// The compiled Values author owns failures at its actual Arrow assembly
+/// sites. An allocation or kernel refusal takes its original typed path.
+#[derive(Debug)]
+enum ValuesConstructionFailure {
+    ArrayLayout {
+        count: usize,
+        width: usize,
+        source: std::alloc::LayoutError,
+    },
+    EmptyPort(arrow::error::ArrowError),
+    Column {
+        ordinal: usize,
+        source: arrow::error::ArrowError,
+    },
+}
+impl std::fmt::Display for ValuesConstructionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ArrayLayout {
+                count,
+                width,
+                source,
+            } => write!(
+                f,
+                "compiled Values backing requires {} bytes: {source}",
+                *count as u128 * *width as u128
+            ),
+            Self::EmptyPort(source) => write!(f, "compiled Values empty port: {source}"),
+            Self::Column { ordinal, source } => {
+                write!(f, "compiled Values column {ordinal}: {source}")
+            }
+        }
+    }
+}
+impl std::error::Error for ValuesConstructionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ArrayLayout { source, .. } => Some(source),
+            Self::EmptyPort(source) | Self::Column { source, .. } => Some(source),
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ValuesConstructionFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        use novarocks_failure_contract::{
+            RepresentationBoundary, RepresentationFacts, RepresentationLayout, domain,
+        };
+        if let Self::ArrayLayout { count, width, .. } = self {
+            return FailureFact::new(
+                FailureClass::Representation,
+                ExecutionReason::ValuesArrayBacking.reason(),
+            )
+            .with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::SingleOutput,
+                layout: RepresentationLayout {
+                    domain: domain::EXECUTION,
+                    code: std::num::NonZeroU16::new(556).unwrap(),
+                },
+                required: u64::try_from(*count as u128 * *width as u128).ok(),
+                extent_limit: Some(isize::MAX as u64),
+                representable_prefix: None,
+            });
+        }
+        let (reason, source) = match self {
+            Self::EmptyPort(source) => (ExecutionReason::ValuesEmptyPort, source),
+            Self::Column { source, .. } => (ExecutionReason::ValuesColumnAssembly, source),
+            Self::ArrayLayout { .. } => unreachable!("layout returned its own representation fact"),
+        };
+        if matches!(source, arrow::error::ArrowError::MemoryError(_)) {
+            FailureFact::new(
+                FailureClass::Resource,
+                ExecutionReason::ValuesArrowAllocation.reason(),
+            )
+        } else {
+            FailureFact::new(FailureClass::Invariant, reason.reason())
+        }
+    }
+}
+
+fn values_array_layout<T>(count: usize) -> ExecutionResult<std::alloc::Layout> {
+    std::alloc::Layout::array::<T>(count).map_err(|source| {
+        ExecutionFailure::from_domain(ValuesConstructionFailure::ArrayLayout {
+            count,
+            width: size_of::<T>(),
+            source,
+        })
+    })
+}
+#[cfg(test)]
+mod allocation_domain_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+    #[test]
+    fn values_array_geometry_refuses_before_funding_and_retains_real_layout_error() {
+        assert_eq!(values_array_layout::<u64>(0).unwrap().size(), 0);
+        assert_eq!(values_array_layout::<u64>(3).unwrap().size(), 24);
+        let count = isize::MAX as usize + 1;
+        let error = values_array_layout::<u8>(count).unwrap_err();
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Representation);
+        assert!(fact.resource().is_none());
+        let extent = fact.representation().unwrap();
+        assert_eq!(extent.boundary, RepresentationBoundary::SingleOutput);
+        assert_eq!(extent.required, Some(count as u64));
+        assert_eq!(extent.extent_limit, Some(isize::MAX as u64));
+        assert_eq!(extent.representable_prefix, None);
+        let crate::runtime::fragment::ExecutionFailureCause::Domain(shared) = error.cause() else {
+            panic!("the original Values author");
+        };
+        let original = shared.downcast_ref::<ValuesConstructionFailure>().unwrap();
+        assert!(
+            std::error::Error::source(original)
+                .unwrap()
+                .is::<std::alloc::LayoutError>()
+        );
+    }
+    #[test]
+    fn values_arrow_memory_preserves_its_actual_variant_separately_from_frozen_shape() {
+        let error = ValuesConstructionFailure::Column {
+            ordinal: 7,
+            source: arrow::error::ArrowError::MemoryError("original allocator refusal".into()),
+        };
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
+        assert!(error.failure_fact().resource().is_none());
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<arrow::error::ArrowError>()
+        );
+        let shape = ValuesConstructionFailure::Column {
+            ordinal: 7,
+            source: arrow::error::ArrowError::SchemaError("wrong frozen field".into()),
+        };
+        assert_eq!(shape.failure_fact().class(), FailureClass::Invariant);
     }
 }

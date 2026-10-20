@@ -634,7 +634,7 @@ mod tests {
             work_units: u32,
         ) -> Result<(), novarocks_type_contract::CompileControlError> {
             self.units.lock().unwrap().push(work_units);
-            if let Some((point, error)) = self.stop {
+            if let Some((point, error)) = self.stop.clone() {
                 let stop = match point {
                     StopPoint::Entry => work_units == 0,
                     StopPoint::Batch => work_units == 256,
@@ -664,7 +664,7 @@ mod tests {
         impl PureCompileControl for OneShotControl {
             fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
                 if units == 17 && !self.fired.swap(true, Ordering::SeqCst) {
-                    return Err(self.failure);
+                    return Err(self.failure.clone());
                 }
                 if self.fired.load(Ordering::SeqCst) {
                     self.successful_after_failure.fetch_add(1, Ordering::SeqCst);
@@ -699,7 +699,7 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let control = OneShotControl {
-                failure,
+                failure: failure.clone(),
                 fired: AtomicBool::new(false),
                 successful_after_failure: AtomicUsize::new(0),
             };
@@ -791,7 +791,7 @@ mod tests {
             for point in [StopPoint::Entry, StopPoint::Batch, StopPoint::Finish] {
                 let control = ObservedControl {
                     units: Default::default(),
-                    stop: Some((point, error)),
+                    stop: Some((point, error.clone())),
                 };
                 let mut ctx = RewriteContext::for_query_with_settings(
                     Default::default(),
@@ -802,7 +802,10 @@ mod tests {
                     visits: Default::default(),
                 };
                 let failure = rewrite_with_rule(wide_union(), &rule, &mut ctx).unwrap_err();
-                assert_eq!(failure, crate::compiler::SqlCompileError::from(error));
+                assert_eq!(
+                    failure,
+                    crate::compiler::SqlCompileError::from(error.clone())
+                );
                 assert!(
                     ctx.trace().events().is_empty(),
                     "control must not become a rule diagnostic"
@@ -898,7 +901,7 @@ mod tests {
             fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
                 self.units.lock().unwrap().push(units);
                 if units == 256 && !self.fired.swap(true, Ordering::SeqCst) {
-                    return Err(self.error);
+                    return Err(self.error.clone());
                 }
                 Ok(())
             }
@@ -909,7 +912,7 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let control = OneShotBatch {
-                error,
+                error: error.clone(),
                 fired: AtomicBool::new(false),
                 units: Default::default(),
             };

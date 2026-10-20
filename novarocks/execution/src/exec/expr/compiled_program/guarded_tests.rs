@@ -1408,6 +1408,7 @@ pub(crate) struct TemporalInvocationDataProbe {
     pub shape: novarocks_type_contract::TemporalSourceShape,
     pub stage: usize,
     pub message: String,
+    pub fact: novarocks_failure_contract::FailureFact,
     pub invocation_rows: Vec<usize>,
     pub affected_rows: Vec<usize>,
     pub prior_errors: Vec<(usize, String)>,
@@ -1436,6 +1437,7 @@ pub(crate) fn record_temporal_invocation_data(
     shape: novarocks_type_contract::TemporalSourceShape,
     stage: usize,
     message: &str,
+    fact: novarocks_failure_contract::FailureFact,
     invocation_rows: &[usize],
     affected_ordinals: &[usize],
     prior_errors: &BTreeMap<usize, novarocks_functions::RowDataError>,
@@ -1446,6 +1448,7 @@ pub(crate) fn record_temporal_invocation_data(
                 shape,
                 stage,
                 message: message.to_owned(),
+                fact,
                 invocation_rows: invocation_rows.to_vec(),
                 affected_rows: affected_ordinals
                     .iter()

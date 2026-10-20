@@ -17,6 +17,7 @@
 use super::common::{NumericArrayView, cast_output};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{ArrayRef, Float64Array};
 use novarocks_functions::builtin::numeric_binary_core::{NumericBinaryOp, evaluate_binary_rows};
 use std::sync::Arc;
@@ -27,7 +28,7 @@ fn eval_binary_f64<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     operation: NumericBinaryOp,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let left = arena.eval(args[0], chunk)?;
     let right = arena.eval(args[1], chunk)?;
     let left_view = NumericArrayView::new(&left)?;
@@ -59,9 +60,9 @@ fn eval_binary_f64<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         },
         || Ok(()),
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(ExecutionFailure::from)?;
     let out = Arc::new(Float64Array::from(values)) as ArrayRef;
-    Ok((cast_output(out, arena.data_type(expr)))?)
+    cast_output(out, arena.data_type(expr))
 }
 
 pub fn eval_atan2<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -69,8 +70,8 @@ pub fn eval_atan2<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_binary_f64(arena, expr, args, chunk, NumericBinaryOp::Atan2))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_binary_f64(arena, expr, args, chunk, NumericBinaryOp::Atan2)
 }
 
 pub fn eval_fmod<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -78,8 +79,8 @@ pub fn eval_fmod<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_binary_f64(arena, expr, args, chunk, NumericBinaryOp::Fmod))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_binary_f64(arena, expr, args, chunk, NumericBinaryOp::Fmod)
 }
 
 pub fn eval_pow<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -87,8 +88,8 @@ pub fn eval_pow<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_binary_f64(arena, expr, args, chunk, NumericBinaryOp::Pow))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_binary_f64(arena, expr, args, chunk, NumericBinaryOp::Pow)
 }
 
 #[cfg(test)]

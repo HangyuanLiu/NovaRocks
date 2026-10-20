@@ -41,7 +41,7 @@ fn strict_rejects_duplicate_slot_id() {
         ),
     ])
     .expect_err("duplicate slot ids should fail");
-    assert!(err.contains("duplicate slot id"), "err={}", err);
+    assert!(err.to_string().contains("duplicate slot id"), "err={}", err);
 }
 
 #[test]
@@ -98,14 +98,21 @@ fn typed_chunk_zero_channels_retains_positive_row_count() {
     use novarocks_type_contract::ValueTypeStorageLifetime;
     let schema =
         Arc::new(ChunkSchema::try_new_typed(Vec::new(), ValueTypeStorageLifetime::pure()).unwrap());
-    let chunk =
-        Chunk::try_new_typed_with_columns_observed::<String, _>(schema, Vec::new(), 37, |_| Ok(()))
-            .unwrap();
+    let chunk = Chunk::try_new_typed_with_columns_observed::<
+        crate::runtime::fragment::ExecutionFailure,
+        _,
+    >(schema, Vec::new(), 37, |_| Ok(()))
+    .unwrap();
     assert_eq!(chunk.len(), 37);
     assert_eq!(chunk.columns().len(), 0);
     assert_eq!(
         chunk
-            .slice_typed_observed::<String, _>(3, 9, ValueTypeStorageLifetime::pure(), |_| Ok(()))
+            .slice_typed_observed::<crate::runtime::fragment::ExecutionFailure, _>(
+                3,
+                9,
+                ValueTypeStorageLifetime::pure(),
+                |_| Ok(())
+            )
             .unwrap()
             .len(),
         9
@@ -147,12 +154,10 @@ fn typed_chunk_normalizes_actual_arrays_and_shares_semantics_and_payload() {
         storage.clone(),
     );
     let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], storage).unwrap());
-    let chunk = Chunk::try_new_typed_with_columns_observed::<String, _>(
-        schema.clone(),
-        vec![array.clone()],
-        1,
-        |_| Ok(()),
-    )
+    let chunk = Chunk::try_new_typed_with_columns_observed::<
+        crate::runtime::fragment::ExecutionFailure,
+        _,
+    >(schema.clone(), vec![array.clone()], 1, |_| Ok(()))
     .unwrap();
     assert!(Arc::ptr_eq(&schema, &chunk.chunk_schema_ref()));
     assert!(
@@ -179,12 +184,10 @@ fn typed_chunk_normalizes_actual_arrays_and_shares_semantics_and_payload() {
                 .unwrap()
         )
     );
-    let unchanged = Chunk::try_new_typed_with_columns_observed::<String, _>(
-        schema,
-        chunk.columns().to_vec(),
-        1,
-        |_| Ok(()),
-    )
+    let unchanged = Chunk::try_new_typed_with_columns_observed::<
+        crate::runtime::fragment::ExecutionFailure,
+        _,
+    >(schema, chunk.columns().to_vec(), 1, |_| Ok(()))
     .unwrap();
     assert!(Arc::ptr_eq(&chunk.columns()[0], &unchanged.columns()[0]));
     let DataType::List(original) = array.data_type() else {
@@ -215,16 +218,23 @@ fn typed_chunk_refusal_and_required_null_do_not_widen_or_mutate_source() {
         storage.clone(),
     );
     let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], storage.clone()).unwrap());
-    let refused = Chunk::try_new_typed_with_columns_observed::<String, _>(
-        schema,
-        vec![input.clone()],
-        1,
-        |step| match step {
-            ArrayNormalizationStep::RebuildField { .. } => Err("construction refused".into()),
-            _ => Ok(()),
-        },
+    let refused = Chunk::try_new_typed_with_columns_observed::<
+        crate::runtime::fragment::ExecutionFailure,
+        _,
+    >(schema, vec![input.clone()], 1, |step| match step {
+        ArrayNormalizationStep::RebuildField { .. } => {
+            Err(crate::runtime::fragment::ExecutionFailure::from(
+                novarocks_functions::KernelFailure::Cancelled,
+            ))
+        }
+        _ => Ok(()),
+    });
+    assert_eq!(
+        refused.unwrap_err(),
+        crate::runtime::fragment::ExecutionFailure::from(
+            novarocks_functions::KernelFailure::Cancelled
+        )
     );
-    assert_eq!(refused.unwrap_err(), "construction refused");
     let DataType::List(field) = input.data_type() else {
         panic!("list")
     };
@@ -238,14 +248,12 @@ fn typed_chunk_refusal_and_required_null_do_not_widen_or_mutate_source() {
     );
     let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], storage).unwrap());
     let nulls: ArrayRef = Arc::new(Int32Array::from(vec![None]));
-    let error = Chunk::try_new_typed_with_columns_observed::<String, _>(
-        schema.clone(),
-        vec![nulls],
-        1,
-        |_| Ok(()),
-    )
+    let error = Chunk::try_new_typed_with_columns_observed::<
+        crate::runtime::fragment::ExecutionFailure,
+        _,
+    >(schema.clone(), vec![nulls], 1, |_| Ok(()))
     .unwrap_err();
-    assert!(error.contains("contains nulls"));
+    assert!(error.to_string().contains("contains nulls"));
     assert!(!schema.slots()[0].nullable());
 }
 
@@ -330,19 +338,26 @@ fn typed_slice_releases_intermediate_wrapper_hold_and_keeps_shared_creation_hold
         pure.clone(),
     );
     let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap());
-    let original = Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
-        schema,
-        vec![array],
-        2,
-        hold(&original_released),
-        |_| Ok(()),
-    )
+    let original = Chunk::try_new_typed_with_columns_owned_observed::<
+        crate::runtime::fragment::ExecutionFailure,
+        _,
+    >(schema, vec![array], 2, hold(&original_released), |_| Ok(()))
     .unwrap();
     let first = original
-        .slice_typed_observed::<String, _>(0, 2, hold(&first_released), |_| Ok(()))
+        .slice_typed_observed::<crate::runtime::fragment::ExecutionFailure, _>(
+            0,
+            2,
+            hold(&first_released),
+            |_| Ok(()),
+        )
         .unwrap();
     let second = first
-        .slice_typed_observed::<String, _>(1, 1, hold(&second_released), |_| Ok(()))
+        .slice_typed_observed::<crate::runtime::fragment::ExecutionFailure, _>(
+            1,
+            1,
+            hold(&second_released),
+            |_| Ok(()),
+        )
         .unwrap();
     drop(original);
     drop(first);
@@ -365,7 +380,7 @@ fn typed_required_dictionary_uses_referenced_values_nulls_and_slice_coordinates(
             DictionaryArray::<Int32Type>::try_new(Int32Array::from(keys), values.clone()).unwrap(),
         )
     };
-    let bind = |array: ArrayRef| -> Result<Chunk, String> {
+    let bind = |array: ArrayRef| -> crate::runtime::fragment::ExecutionResult<Chunk> {
         let storage = ValueTypeStorageLifetime::pure();
         let value = ValueTypeRef::try_new(ValueKind::String, false, storage.clone()).unwrap();
         let slot = typed_slot(
@@ -383,7 +398,12 @@ fn typed_required_dictionary_uses_referenced_values_nulls_and_slice_coordinates(
     };
     let referenced = encoded(vec![0]);
     assert_eq!(referenced.null_count(), 0);
-    assert!(bind(referenced).unwrap_err().contains("contains nulls"));
+    assert!(
+        bind(referenced)
+            .unwrap_err()
+            .to_string()
+            .contains("contains nulls")
+    );
     let unused_null = encoded(vec![1, 1]);
     assert_eq!(bind(unused_null).unwrap().len(), 2);
     let source = encoded(vec![1, 0, 1]);
@@ -391,6 +411,7 @@ fn typed_required_dictionary_uses_referenced_values_nulls_and_slice_coordinates(
     assert!(
         bind(source.slice(1, 1))
             .unwrap_err()
+            .to_string()
             .contains("contains nulls")
     );
     assert_eq!(bind(source.slice(2, 1)).unwrap().len(), 1);
@@ -434,7 +455,10 @@ fn typed_nested_required_dictionary_respects_struct_parent_null_mask() {
         value,
         storage.clone(),
     );
-    let source = Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+    let source = Chunk::try_new_typed_with_columns_owned_observed::<
+        crate::runtime::fragment::ExecutionFailure,
+        _,
+    >(
         Arc::new(ChunkSchema::try_new_typed(vec![slot], storage.clone()).unwrap()),
         vec![parent],
         2,
@@ -443,11 +467,21 @@ fn typed_nested_required_dictionary_respects_struct_parent_null_mask() {
     )
     .unwrap();
     let null_parent = source
-        .slice_typed_observed::<String, _>(0, 1, storage.clone(), |_| Ok(()))
+        .slice_typed_observed::<crate::runtime::fragment::ExecutionFailure, _>(
+            0,
+            1,
+            storage.clone(),
+            |_| Ok(()),
+        )
         .unwrap();
     assert!(null_parent.columns()[0].is_null(0));
     let valid_parent = source
-        .slice_typed_observed::<String, _>(1, 1, storage, |_| Ok(()))
+        .slice_typed_observed::<crate::runtime::fragment::ExecutionFailure, _>(
+            1,
+            1,
+            storage,
+            |_| Ok(()),
+        )
         .unwrap();
     assert!(!valid_parent.columns()[0].is_null(0));
     assert!(
@@ -478,27 +512,29 @@ fn typed_required_dictionary_observes_bounded_rows_and_stops_on_refusal() {
     );
     let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], storage.clone()).unwrap());
     let mut rows = Vec::new();
-    let refused = Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
-        schema,
-        vec![array],
-        2050,
-        storage,
-        |step| {
-            if let ArrayNormalizationStep::InspectDictionaryRows {
-                row_start,
-                row_count,
-                ..
-            } = step
-            {
-                rows.push((row_start, row_count));
-                if row_start == 1024 {
-                    return Err("row observation refused".into());
-                }
+    let refused = Chunk::try_new_typed_with_columns_owned_observed::<
+        crate::runtime::fragment::ExecutionFailure,
+        _,
+    >(schema, vec![array], 2050, storage, |step| {
+        if let ArrayNormalizationStep::InspectDictionaryRows {
+            row_start,
+            row_count,
+            ..
+        } = step
+        {
+            rows.push((row_start, row_count));
+            if row_start == 1024 {
+                return Err(novarocks_functions::KernelFailure::Cancelled.into());
             }
-            Ok(())
-        },
-    )
+        }
+        Ok(())
+    })
     .unwrap_err();
-    assert_eq!(refused, "row observation refused");
+    assert_eq!(
+        refused,
+        crate::runtime::fragment::ExecutionFailure::from(
+            novarocks_functions::KernelFailure::Cancelled
+        )
+    );
     assert_eq!(rows, vec![(0, 1024), (1024, 1024)]);
 }

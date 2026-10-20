@@ -30,6 +30,7 @@ mod expression_program;
 mod expression_roots;
 pub use expression_program::ExpressionProgram;
 mod expressions;
+mod failure_projection;
 mod layout;
 mod lexical_bindings;
 mod primitives;

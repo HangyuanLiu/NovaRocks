@@ -167,7 +167,7 @@ fn raw_pair(spec: &ScalarDiffSpec, rows: Option<&[usize]>) -> (Raw, Raw) {
     };
     let legacy = capture(|| match call.evaluate_legacy_inner(rows) {
         Ok(a) => Raw::Values(a, vec![]),
-        Err(e) => Raw::Error(e),
+        Err(e) => Raw::Error(e.to_string()),
     });
     let selection = rows.map_or_else(
         || Selection::all(call.rows),

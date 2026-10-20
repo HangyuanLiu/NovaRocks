@@ -59,7 +59,10 @@ fn invocation(columns: &[ArrayRef], target: Option<DataType>) -> (ExprArena, Exp
     };
     (arena, output, args)
 }
-fn evaluate(columns: Vec<ArrayRef>, target: Option<DataType>) -> Result<ArrayRef, String> {
+fn evaluate(
+    columns: Vec<ArrayRef>,
+    target: Option<DataType>,
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     let (arena, expr, args) = invocation(&columns, target);
     eval_xx_hash3_128(&arena, expr, &args, &chunk(columns))
 }
@@ -190,11 +193,14 @@ fn legacy_xx_hash3_128_baseline_strict_null_and_admission_before_null_or_zero_ro
                 ],
                 None
             )
-            .unwrap_err(),
+            .unwrap_err()
+            .to_string(),
             "xx_hash3_128: arg1 must be VARCHAR or VARBINARY"
         );
         assert_eq!(
-            evaluate(vec![Arc::new(NullArray::new(rows))], None).unwrap_err(),
+            evaluate(vec![Arc::new(NullArray::new(rows))], None)
+                .unwrap_err()
+                .to_string(),
             "xx_hash3_128: arg0 must be VARCHAR or VARBINARY"
         );
     }
@@ -205,7 +211,9 @@ fn legacy_xx_hash3_128_baseline_early_admission_error_precedes_later_child_error
     let (mut arena, expr, mut args) = invocation(&arrays, None);
     args.push(arena.push_typed(ExprNode::SlotId(SlotId::new(999)), DataType::Utf8));
     assert_eq!(
-        eval_xx_hash3_128(&arena, expr, &args, &chunk(arrays)).unwrap_err(),
+        eval_xx_hash3_128(&arena, expr, &args, &chunk(arrays))
+            .unwrap_err()
+            .to_string(),
         "xx_hash3_128: arg0 must be VARCHAR or VARBINARY"
     );
 }
@@ -239,7 +247,13 @@ fn legacy_xx_hash3_128_baseline_original_output_cast_and_full_error() {
     let field = "very_long_target_".to_string() + &"x".repeat(1025);
     let target = DataType::Struct(vec![Field::new(&field, DataType::Int64, true)].into());
     let error = evaluate(vec![input], Some(target)).unwrap_err();
-    assert!(error.starts_with("xx_hash3_128: failed to cast output:"));
-    assert!(error.contains(&field));
-    assert!(error.len() > 512);
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert!(error.detail().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
+    let mut source: &dyn std::error::Error = &error;
+    while !source.is::<arrow::error::ArrowError>() {
+        source = source.source().unwrap();
+    }
+    assert!(source.to_string().contains(&field));
+    assert!(source.to_string().len() > 512);
 }

@@ -209,7 +209,15 @@ fn source_authority_direct_constructor_refusal_preserves_the_paid_raw_source_ali
             control.allocator().unwrap(),
             &mut work,
         );
-        assert!(matches!(result, Err(KernelFailure::ResourceExhausted)));
+        let error = result.err().expect("the actual metadata host must refuse");
+        let fact = novarocks_failure_contract::FailureProjection::failure_fact(&error);
+        assert_eq!(
+            fact.class(),
+            novarocks_failure_contract::FailureClass::Resource
+        );
+        let resource = fact.resource().expect("actual tracker refusal");
+        assert_eq!(resource.limit, Some(1));
+        assert!(resource.requested.unwrap() > 1);
         assert_eq!(
             tracker.current(),
             stock,

@@ -62,7 +62,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -359,7 +359,7 @@ fn array_match_compile_callbacks_preserve_primary_causes_on_success_and_rejectio
                 ] {
                     let control = CompileControl {
                         trace: Mutex::new(vec![]),
-                        refusal: Some((stop, cause)),
+                        refusal: Some((stop, cause.clone())),
                     };
                     let error = prepared_for_test_with_control(
                         name,

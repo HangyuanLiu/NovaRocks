@@ -1872,7 +1872,7 @@ fn build_expected_output_schema(
                     None,
                     novarocks_type_contract::ValueTypeStorageLifetime::pure(),
                 )
-                .map_err(contract_error)
+                .map_err(|source| contract_error(source.to_string()))
             })
             .collect::<Result<Vec<_>, DistributedQueryError>>()?;
         Arc::new(
@@ -1880,7 +1880,7 @@ fn build_expected_output_schema(
                 slots,
                 novarocks_type_contract::ValueTypeStorageLifetime::pure(),
             )
-            .map_err(contract_error)?,
+            .map_err(|source| contract_error(source.to_string()))?,
         )
     };
     Ok(ExpectedOutputSchema {
@@ -1911,13 +1911,15 @@ mod tests {
             novarocks_execution::runtime::mem_tracker::MemTracker::new_root("root consumer fixture"),
             std::sync::Arc::new(novarocks_execution::runtime::runtime_state::RuntimeErrorState::default()),
         ).map_err(|e|e.to_string())?;
-        registry.try_register_expected_chunk_schema_with_binding(
-            key,
-            1,
-            schema.clone(),
-            ExchangeColumnBinding::Positional,
-            factory,
-        )?;
+        registry
+            .try_register_expected_chunk_schema_with_binding(
+                key,
+                1,
+                schema.clone(),
+                ExchangeColumnBinding::Positional,
+                factory,
+            )
+            .map_err(|source| source.to_string())?;
         registry
             .decode_chunks_for_sender(key, ExchangeSenderIdentity::local(1, 1), payload)
             .map_err(|e| e.to_string())

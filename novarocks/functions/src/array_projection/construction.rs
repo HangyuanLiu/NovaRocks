@@ -24,7 +24,9 @@
 //! arrow-data/data.rs::{ArrayData,ArrayDataBuilder}. The shared private-buffer
 //! owner bound is the existing root_array_storage contract, not a new mirror.
 
-use super::ArrayNormalizationStep;
+use super::{
+    ArrayNormalizationStep, ArrayProjectionFailure, ArrayProjectionViolation, StringOffsetWidth,
+};
 
 fn dictionary_values(source: &dyn Array) -> Option<&ArrayRef> {
     use arrow_array::types::{
@@ -74,33 +76,42 @@ type Request<'a, E> = dyn FnMut(Layout) -> Result<(), E> + 'a;
 type Opaque<'a, E> = dyn FnMut(ArrayProjectionOpaqueBound) -> Result<(), E> + 'a;
 type Work<'a, E> = dyn FnMut(usize) -> Result<(), E> + 'a;
 
-fn overflow() -> String {
-    "Arrow construction observation overflow".to_owned()
+fn overflow() -> ArrayProjectionFailure {
+    ArrayProjectionFailure::RequestArithmetic
 }
-fn add(a: usize, b: usize) -> Result<usize, String> {
+fn add(a: usize, b: usize) -> Result<usize, ArrayProjectionFailure> {
     a.checked_add(b).ok_or_else(overflow)
 }
-fn mul(a: usize, b: usize) -> Result<usize, String> {
+fn mul(a: usize, b: usize) -> Result<usize, ArrayProjectionFailure> {
     a.checked_mul(b).ok_or_else(overflow)
 }
-fn array<T, E: From<String>>(n: usize, request: &mut Request<'_, E>) -> Result<(), E> {
+fn array<T, E: From<ArrayProjectionFailure>>(
+    n: usize,
+    request: &mut Request<'_, E>,
+) -> Result<(), E> {
     if n != 0 {
-        request(Layout::array::<T>(n).map_err(|_| overflow())?)?;
+        request(
+            Layout::array::<T>(n).map_err(|source| ArrayProjectionFailure::ArrayLayout {
+                count: n,
+                width: std::mem::size_of::<T>(),
+                source,
+            })?,
+        )?;
     }
     Ok(())
 }
-fn arc<T, E: From<String>>(request: &mut Request<'_, E>) -> Result<(), E> {
+fn arc<T, E: From<ArrayProjectionFailure>>(request: &mut Request<'_, E>) -> Result<(), E> {
     request(
         novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<T>())
-            .map_err(|error| E::from(format!("Arrow public wrapper request: {error:?}")))?,
+            .map_err(|error| E::from(ArrayProjectionFailure::Layout(error)))?,
     )
 }
-fn bitmap_bound(rows: usize) -> Result<usize, String> {
+fn bitmap_bound(rows: usize) -> Result<usize, ArrayProjectionFailure> {
     // MutableBuffer's locked source rounds a nonzero bitmap payload to 64 B.
     let bytes = add(rows, 7)? / 8;
     Ok(mul(add(bytes, 63)? / 64, 64)?)
 }
-fn clone_parameters<E: From<String>>(
+fn clone_parameters<E: From<ArrayProjectionFailure>>(
     ty: &DataType,
     request: &mut Request<'_, E>,
     work: &mut Work<'_, E>,
@@ -108,7 +119,9 @@ fn clone_parameters<E: From<String>>(
 ) -> Result<(), E> {
     work(1)?;
     if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(E::from(overflow()));
+        return Err(E::from(ArrayProjectionFailure::ValueType(
+            novarocks_type_contract::ValueTypeError::TooDeep,
+        )));
     }
     if let DataType::Dictionary(key, value) = ty {
         request(Layout::new::<DataType>())?;
@@ -120,7 +133,7 @@ fn clone_parameters<E: From<String>>(
     Ok(())
 }
 
-pub fn observe_array_normalization_construction<E: From<String>>(
+pub fn observe_array_normalization_construction<E: From<ArrayProjectionFailure>>(
     step: ArrayNormalizationStep<'_>,
     request: &mut Request<'_, E>,
     opaque: &mut Opaque<'_, E>,
@@ -168,10 +181,9 @@ pub fn observe_array_normalization_construction<E: From<String>>(
                         .as_any()
                         .downcast_ref::<StringArray>()
                         .ok_or_else(|| {
-                            E::from(
-                                "validated String wrapper has a different physical array"
-                                    .to_owned(),
-                            )
+                            E::from(ArrayProjectionFailure::Contract(
+                                ArrayProjectionViolation::PhysicalWrapper,
+                            ))
                         })?;
                     arc::<StringArray, E>(request)?;
                     (array.values().len(), array.offsets().len())
@@ -181,18 +193,17 @@ pub fn observe_array_normalization_construction<E: From<String>>(
                         .as_any()
                         .downcast_ref::<LargeStringArray>()
                         .ok_or_else(|| {
-                            E::from(
-                                "validated LargeString wrapper has a different physical array"
-                                    .to_owned(),
-                            )
+                            E::from(ArrayProjectionFailure::Contract(
+                                ArrayProjectionViolation::PhysicalWrapper,
+                            ))
                         })?;
                     arc::<LargeStringArray, E>(request)?;
                     (array.values().len(), array.offsets().len())
                 }
                 _ => {
-                    return Err(E::from(
-                        "validated String wrapper requires UTF-8 offsets".to_owned(),
-                    ));
+                    return Err(E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::StringOffsets,
+                    )));
                 }
             };
             opaque(ArrayProjectionOpaqueBound {
@@ -207,7 +218,7 @@ pub fn observe_array_normalization_construction<E: From<String>>(
     }
 }
 
-fn type_bound<E: From<String>>(
+fn type_bound<E: From<ArrayProjectionFailure>>(
     ty: &DataType,
     opaque: &mut Opaque<'_, E>,
     work: &mut Work<'_, E>,
@@ -233,20 +244,24 @@ fn type_bound<E: From<String>>(
     })
 }
 
-fn datatype_nodes<E: From<String>>(
+fn datatype_nodes<E: From<ArrayProjectionFailure>>(
     ty: &DataType,
     depth: usize,
     work: &mut Work<'_, E>,
 ) -> Result<usize, E> {
     work(1)?;
     if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(E::from(overflow()));
+        return Err(E::from(ArrayProjectionFailure::ValueType(
+            novarocks_type_contract::ValueTypeError::TooDeep,
+        )));
     }
     let mut sum = 1usize;
     let mut child = |ty: &DataType| -> Result<(), E> {
         sum = add(sum, datatype_nodes(ty, depth + 1, work)?)?;
         if sum > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
-            return Err(E::from(overflow()));
+            return Err(E::from(ArrayProjectionFailure::ValueType(
+                novarocks_type_contract::ValueTypeError::TooManyNodes,
+            )));
         }
         Ok(())
     };
@@ -277,7 +292,7 @@ fn datatype_nodes<E: From<String>>(
     }
     Ok(sum)
 }
-fn array_bound<E: From<String>>(
+fn array_bound<E: From<ArrayProjectionFailure>>(
     source: &ArrayRef,
     target: &DataType,
     request: &mut Request<'_, E>,
@@ -319,7 +334,9 @@ fn array_bound<E: From<String>>(
                     .as_any()
                     .downcast_ref::<StructArray>()
                     .ok_or_else(|| {
-                        E::from("observed Struct wrapper is not an Arrow StructArray".to_owned())
+                        E::from(ArrayProjectionFailure::Contract(
+                            ArrayProjectionViolation::PhysicalWrapper,
+                        ))
                     })?;
                 array::<ArrayRef, E>(fields.len(), request)?;
                 arc::<StructArray, E>(request)?;
@@ -329,13 +346,17 @@ fn array_bound<E: From<String>>(
             }
             DataType::Map(entries, _) => {
                 let actual = source.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
-                    E::from("observed Map wrapper is not an Arrow MapArray".to_owned())
+                    E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::PhysicalWrapper,
+                    ))
                 })?;
                 array::<ArrayRef, E>(2, request)?;
                 arc::<StructArray, E>(request)?;
                 arc::<MapArray, E>(request)?;
                 let DataType::Struct(fields) = entries.data_type() else {
-                    return Err(E::from(overflow()));
+                    return Err(E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::MapEntriesType,
+                    )));
                 };
                 for (field, child) in fields.iter().zip(actual.entries().columns()) {
                     inspect_required(field, child)?;
@@ -343,7 +364,9 @@ fn array_bound<E: From<String>>(
             }
             DataType::List(field) => {
                 let actual = source.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                    E::from("observed List wrapper is not an Arrow ListArray".to_owned())
+                    E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::PhysicalWrapper,
+                    ))
                 })?;
                 arc::<ListArray, E>(request)?;
                 inspect_required(field, actual.values())?;
@@ -353,9 +376,9 @@ fn array_bound<E: From<String>>(
                     .as_any()
                     .downcast_ref::<LargeListArray>()
                     .ok_or_else(|| {
-                        E::from(
-                            "observed LargeList wrapper is not an Arrow LargeListArray".to_owned(),
-                        )
+                        E::from(ArrayProjectionFailure::Contract(
+                            ArrayProjectionViolation::PhysicalWrapper,
+                        ))
                     })?;
                 arc::<LargeListArray, E>(request)?;
                 inspect_required(field, actual.values())?;
@@ -365,10 +388,9 @@ fn array_bound<E: From<String>>(
                     .as_any()
                     .downcast_ref::<FixedSizeListArray>()
                     .ok_or_else(|| {
-                        E::from(
-                            "observed FixedSizeList wrapper is not an Arrow FixedSizeListArray"
-                                .to_owned(),
-                        )
+                        E::from(ArrayProjectionFailure::Contract(
+                            ArrayProjectionViolation::PhysicalWrapper,
+                        ))
                     })?;
                 arc::<FixedSizeListArray, E>(request)?;
                 inspect_required(field, actual.values())?;
@@ -392,7 +414,7 @@ fn array_bound<E: From<String>>(
     }
     metadata_fallback(source, target, opaque, work, true)
 }
-fn metadata_fallback<E: From<String>>(
+fn metadata_fallback<E: From<ArrayProjectionFailure>>(
     source: &ArrayRef,
     target: &DataType,
     opaque: &mut Opaque<'_, E>,
@@ -427,7 +449,7 @@ fn metadata_fallback<E: From<String>>(
     })
 }
 
-fn borrowed_array_span<E: From<String>>(
+fn borrowed_array_span<E: From<ArrayProjectionFailure>>(
     source: &dyn Array,
     depth: usize,
     nodes: &mut usize,
@@ -439,10 +461,15 @@ fn borrowed_array_span<E: From<String>>(
     };
     work(1)?;
     *nodes = add(*nodes, 1)?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH
-        || *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES
-    {
-        return Err(E::from(overflow()));
+    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+        return Err(E::from(ArrayProjectionFailure::ValueType(
+            novarocks_type_contract::ValueTypeError::TooDeep,
+        )));
+    }
+    if *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
+        return Err(E::from(ArrayProjectionFailure::ValueType(
+            novarocks_type_contract::ValueTypeError::TooManyNodes,
+        )));
     }
     let mut span = source.len();
     let mut child = |array: &dyn Array| -> Result<(), E> {
@@ -465,7 +492,9 @@ fn borrowed_array_span<E: From<String>>(
         child(values.as_ref())?;
     } else if let Some(array) = source.as_any().downcast_ref::<UnionArray>() {
         let DataType::Union(fields, _) = source.data_type() else {
-            return Err(E::from(overflow()));
+            return Err(E::from(ArrayProjectionFailure::Contract(
+                ArrayProjectionViolation::PhysicalWrapper,
+            )));
         };
         for (id, _) in fields.iter() {
             child(array.child(id).as_ref())?;
@@ -480,7 +509,20 @@ fn borrowed_array_span<E: From<String>>(
     Ok(span)
 }
 
-fn decode<E: From<String>>(
+fn decoded_string_bytes(
+    required: u128,
+    width: StringOffsetWidth,
+) -> Result<usize, ArrayProjectionFailure> {
+    if required > u128::from(width.limit()) {
+        return Err(ArrayProjectionFailure::DecodedStringExtent {
+            required: u64::try_from(required).ok(),
+            width,
+        });
+    }
+    usize::try_from(required).map_err(|_| ArrayProjectionFailure::RequestArithmetic)
+}
+
+fn decode<E: From<ArrayProjectionFailure>>(
     source: &ArrayRef,
     target: &DataType,
     request: &mut Request<'_, E>,
@@ -491,17 +533,19 @@ fn decode<E: From<String>>(
         .as_any()
         .downcast_ref::<DictionaryArray<Int32Type>>()
         .ok_or_else(|| {
-            E::from("decode observation requires admitted Int32 string dictionary".to_owned())
+            E::from(ArrayProjectionFailure::Contract(
+                ArrayProjectionViolation::NonInt32Dictionary,
+            ))
         })?;
-    let mut bytes = 0usize;
+    let mut bytes = 0u128;
     // Offsets remain borrowed. Do not collect an auxiliary length vector.
     let (width, wrapper) = match (dict.values().data_type(), target) {
-        (DataType::Utf8, DataType::Utf8) => (4, 0),
-        (DataType::LargeUtf8, DataType::LargeUtf8) => (8, 1),
+        (DataType::Utf8, DataType::Utf8) => (StringOffsetWidth::I32, 0),
+        (DataType::LargeUtf8, DataType::LargeUtf8) => (StringOffsetWidth::I64, 1),
         _ => {
-            return Err(E::from(
-                "decode observation does not authorize another encoding".to_owned(),
-            ));
+            return Err(E::from(ArrayProjectionFailure::Contract(
+                ArrayProjectionViolation::DecodeEncoding,
+            )));
         }
     };
     // The direct loop duplicates the finite take_bytes sizing pass, preserving
@@ -513,39 +557,62 @@ fn decode<E: From<String>>(
         if dict.keys().is_null(at) {
             continue;
         }
-        let key = usize::try_from(dict.keys().value(at))
-            .map_err(|_| E::from("negative dictionary key during observation".to_owned()))?;
+        let key = usize::try_from(dict.keys().value(at)).map_err(|_| {
+            E::from(ArrayProjectionFailure::Contract(
+                ArrayProjectionViolation::NegativeDictionaryKey,
+            ))
+        })?;
         if key >= dict.values().len() {
-            return Err(E::from("dictionary key exceeds observed values".to_owned()));
+            return Err(E::from(ArrayProjectionFailure::Contract(
+                ArrayProjectionViolation::DictionaryKeyBounds,
+            )));
         }
         if dict.values().is_null(key) {
             continue;
         }
-        let length = if wrapper == 0 {
-            let values = dict
-                .values()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("observed Utf8 carrier");
-            usize::try_from(values.value_offsets()[key + 1] - values.value_offsets()[key])
-                .map_err(|_| overflow())?
-        } else {
-            let values = dict
-                .values()
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .expect("observed LargeUtf8 carrier");
-            usize::try_from(values.value_offsets()[key + 1] - values.value_offsets()[key])
-                .map_err(|_| overflow())?
-        };
-        bytes = add(bytes, length)?;
+        let length =
+            if wrapper == 0 {
+                let values = dict
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        E::from(ArrayProjectionFailure::Contract(
+                            ArrayProjectionViolation::PhysicalWrapper,
+                        ))
+                    })?;
+                usize::try_from(values.value_offsets()[key + 1] - values.value_offsets()[key])
+                    .map_err(|_| {
+                        E::from(ArrayProjectionFailure::Contract(
+                            ArrayProjectionViolation::InvalidStringOffsets,
+                        ))
+                    })?
+            } else {
+                let values = dict
+                    .values()
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .ok_or_else(|| {
+                        E::from(ArrayProjectionFailure::Contract(
+                            ArrayProjectionViolation::PhysicalWrapper,
+                        ))
+                    })?;
+                usize::try_from(values.value_offsets()[key + 1] - values.value_offsets()[key])
+                    .map_err(|_| {
+                        E::from(ArrayProjectionFailure::Contract(
+                            ArrayProjectionViolation::InvalidStringOffsets,
+                        ))
+                    })?
+            };
+        bytes = bytes.checked_add(length as u128).ok_or_else(|| {
+            E::from(ArrayProjectionFailure::DecodedStringExtent {
+                required: None,
+                width,
+            })
+        })?;
     }
-    if (width == 4 && bytes > i32::MAX as usize) || bytes > i64::MAX as usize {
-        return Err(E::from(
-            "decoded strings exceed their frozen offset representation".to_owned(),
-        ));
-    }
-    if width == 4 {
+    let bytes = decoded_string_bytes(bytes, width)?;
+    if width == StringOffsetWidth::I32 {
         array::<i32, E>(add(dict.len(), 1)?, request)?;
     } else {
         array::<i64, E>(add(dict.len(), 1)?, request)?;
@@ -586,7 +653,7 @@ mod validated_string_tests {
             let mut requests = Vec::new();
             let mut bounds = Vec::new();
             let mut work_units = Vec::new();
-            observe_array_normalization_construction::<String>(
+            observe_array_normalization_construction::<crate::KernelFailure>(
                 ArrayNormalizationStep::ValidateStringWrapper {
                     path: &[],
                     source: &source,
@@ -635,12 +702,12 @@ mod validated_string_tests {
             );
             assert_eq!(work_units, vec![0]);
             let mut called = false;
-            let error = observe_array_normalization_construction::<String>(
+            let error = observe_array_normalization_construction::<crate::KernelFailure>(
                 ArrayNormalizationStep::ValidateStringWrapper {
                     path: &[],
                     source: &source,
                 },
-                &mut |_| Err("original wrapper refusal".to_owned()),
+                &mut |_| Err(crate::KernelFailure::ResourceExhausted),
                 &mut |_| {
                     called = true;
                     Ok(())
@@ -648,8 +715,68 @@ mod validated_string_tests {
                 &mut |_| Ok(()),
             )
             .unwrap_err();
-            assert_eq!(error, "original wrapper refusal");
+            assert_eq!(error, crate::KernelFailure::ResourceExhausted);
             assert!(!called);
         }
+    }
+}
+
+#[cfg(test)]
+mod extent_failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn decoded_bytes_check_the_complete_output_before_any_request() {
+        for width in [StringOffsetWidth::I32, StringOffsetWidth::I64] {
+            let limit = u128::from(width.limit());
+            assert_eq!(decoded_string_bytes(limit, width).unwrap(), limit as usize);
+            let failure = decoded_string_bytes(limit + 1, width).unwrap_err();
+            assert_eq!(failure.failure_fact().class(), FailureClass::Representation);
+            let facts = failure.failure_fact().representation().unwrap();
+            assert_eq!(facts.required, Some((limit + 1) as u64));
+            assert_eq!(facts.extent_limit, Some(limit as u64));
+        }
+        let failure =
+            decoded_string_bytes(u64::MAX as u128 + 1, StringOffsetWidth::I64).unwrap_err();
+        assert_eq!(
+            failure.failure_fact().representation().unwrap().required,
+            None
+        );
+    }
+    #[test]
+    fn impossible_array_backing_preserves_geometry_and_never_calls_the_host() {
+        for count in [usize::MAX, isize::MAX as usize / 8 + 1] {
+            let failure = array::<u64, ArrayProjectionFailure>(count, &mut |_| {
+                panic!("an impossible Layout must not reach the host")
+            })
+            .unwrap_err();
+            assert!(
+                matches!(failure, ArrayProjectionFailure::ArrayLayout { count: actual, width: 8, .. } if actual == count)
+            );
+            let fact = failure.failure_fact();
+            assert_eq!(fact.class(), FailureClass::Representation);
+            assert!(fact.resource().is_none());
+            let extent = fact.representation().unwrap();
+            assert_eq!(extent.required, u64::try_from(count as u128 * 8).ok());
+            assert_eq!(extent.extent_limit, Some(isize::MAX as u64));
+            assert_eq!(extent.representable_prefix, None);
+            assert!(
+                std::error::Error::source(&failure)
+                    .unwrap()
+                    .is::<std::alloc::LayoutError>()
+            );
+        }
+        assert_eq!(
+            ArrayProjectionFailure::RequestArithmetic
+                .failure_fact()
+                .class(),
+            FailureClass::Resource
+        );
+        assert!(
+            ArrayProjectionFailure::RequestArithmetic
+                .failure_fact()
+                .representation()
+                .is_none()
+        );
     }
 }

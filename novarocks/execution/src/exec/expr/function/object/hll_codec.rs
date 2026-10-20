@@ -17,13 +17,13 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, Int64Builder, LargeBinaryArray, LargeStringArray,
-    StringArray,
+    Array, ArrayRef, BinaryArray, Int64Builder, LargeBinaryArray, LargeStringArray, StringArray,
 };
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::agg::cardinality_from_serialized_hll;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use novarocks_functions::aggregate_scalar::BinaryResultBuilder;
 use novarocks_types::value::hll::encode_hll_empty;
 
 pub fn eval_hll_empty<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -31,12 +31,15 @@ pub fn eval_hll_empty<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     _args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    let mut builder = BinaryBuilder::new();
-    for _ in 0..chunk.len() {
-        builder.append_value(encode_hll_empty());
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    if !_args.is_empty() {
+        return Err(expression_contract("hll_empty requires no arguments"));
     }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
+    let mut builder = BinaryResultBuilder::new();
+    for _ in 0..chunk.len() {
+        builder.append_value(encode_hll_empty())?;
+    }
+    Ok(Arc::new(builder.finish()?) as ArrayRef)
 }
 
 pub fn eval_hll_serialize<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -44,12 +47,15 @@ pub fn eval_hll_serialize<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     if args.len() != 1 {
-        return Err((format!("hll_serialize expects 1 argument, got {}", args.len())).into());
+        return Err(expression_contract(format_args!(
+            "hll_serialize expects 1 argument, got {}",
+            args.len()
+        )));
     }
     let input = arena.eval(args[0], chunk)?;
-    Ok((copy_as_binary(&input))?)
+    copy_as_binary(&input)
 }
 
 pub fn eval_hll_deserialize<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -57,12 +63,15 @@ pub fn eval_hll_deserialize<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     if args.len() != 1 {
-        return Err((format!("hll_deserialize expects 1 argument, got {}", args.len())).into());
+        return Err(expression_contract(format_args!(
+            "hll_deserialize expects 1 argument, got {}",
+            args.len()
+        )));
     }
     let input = arena.eval(args[0], chunk)?;
-    Ok((copy_as_binary(&input))?)
+    copy_as_binary(&input)
 }
 
 pub fn eval_hll_cardinality<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -70,9 +79,12 @@ pub fn eval_hll_cardinality<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     if args.len() != 1 {
-        return Err((format!("hll_cardinality expects 1 argument, got {}", args.len())).into());
+        return Err(expression_contract(format_args!(
+            "hll_cardinality expects 1 argument, got {}",
+            args.len()
+        )));
     }
 
     let input = arena.eval(args[0], chunk)?;
@@ -89,70 +101,73 @@ pub fn eval_hll_cardinality<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     Ok(Arc::new(out.finish()) as ArrayRef)
 }
 
-fn serialized_hll_bytes(array: &dyn Array, row: usize) -> Result<&[u8], String> {
+fn serialized_hll_bytes(
+    array: &dyn Array,
+    row: usize,
+) -> crate::runtime::fragment::ExecutionResult<&[u8]> {
     if let Some(values) = array.as_any().downcast_ref::<BinaryArray>() {
         return Ok(values.value(row));
     }
     if let Some(values) = array.as_any().downcast_ref::<LargeBinaryArray>() {
         return Ok(values.value(row));
     }
-    Err(format!(
+    Err(expression_contract(format_args!(
         "hll_cardinality expects Binary or LargeBinary input, got {:?}",
         array.data_type()
-    ))
+    )))
 }
 
-fn copy_as_binary(input: &ArrayRef) -> Result<ArrayRef, String> {
+fn copy_as_binary(input: &ArrayRef) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     if let Some(arr) = input.as_any().downcast_ref::<BinaryArray>() {
-        let mut builder = BinaryBuilder::new();
+        let mut builder = BinaryResultBuilder::new();
         for row in 0..arr.len() {
             if arr.is_null(row) {
-                builder.append_null();
+                builder.append_null()?;
             } else {
-                builder.append_value(arr.value(row));
+                builder.append_value(arr.value(row))?;
             }
         }
-        return Ok(Arc::new(builder.finish()) as ArrayRef);
+        return Ok(Arc::new(builder.finish()?) as ArrayRef);
     }
 
     if let Some(arr) = input.as_any().downcast_ref::<StringArray>() {
-        let mut builder = BinaryBuilder::new();
+        let mut builder = BinaryResultBuilder::new();
         for row in 0..arr.len() {
             if arr.is_null(row) {
-                builder.append_null();
+                builder.append_null()?;
             } else {
-                builder.append_value(arr.value(row).as_bytes());
+                builder.append_value(arr.value(row).as_bytes())?;
             }
         }
-        return Ok(Arc::new(builder.finish()) as ArrayRef);
+        return Ok(Arc::new(builder.finish()?) as ArrayRef);
     }
 
     if let Some(arr) = input.as_any().downcast_ref::<LargeBinaryArray>() {
-        let mut builder = BinaryBuilder::new();
+        let mut builder = BinaryResultBuilder::new();
         for row in 0..arr.len() {
             if arr.is_null(row) {
-                builder.append_null();
+                builder.append_null()?;
             } else {
-                builder.append_value(arr.value(row));
+                builder.append_value(arr.value(row))?;
             }
         }
-        return Ok(Arc::new(builder.finish()) as ArrayRef);
+        return Ok(Arc::new(builder.finish()?) as ArrayRef);
     }
 
     if let Some(arr) = input.as_any().downcast_ref::<LargeStringArray>() {
-        let mut builder = BinaryBuilder::new();
+        let mut builder = BinaryResultBuilder::new();
         for row in 0..arr.len() {
             if arr.is_null(row) {
-                builder.append_null();
+                builder.append_null()?;
             } else {
-                builder.append_value(arr.value(row).as_bytes());
+                builder.append_value(arr.value(row).as_bytes())?;
             }
         }
-        return Ok(Arc::new(builder.finish()) as ArrayRef);
+        return Ok(Arc::new(builder.finish()?) as ArrayRef);
     }
 
-    Err(format!(
+    Err(expression_contract(format_args!(
         "hll_serialize/hll_deserialize expects VARCHAR/BINARY input, got {:?}",
         input.data_type()
-    ))
+    )))
 }

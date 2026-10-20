@@ -1575,6 +1575,7 @@ fn validate_selection(
 
 fn binding_kernel_failure(error: crate::KernelFailure) -> FunctionBindingError {
     match error {
+        crate::KernelFailure::CompileControl(cause) => cause.into(),
         crate::KernelFailure::Cancelled => CompileControlError::Cancelled.into(),
         crate::KernelFailure::DeadlineExceeded => CompileControlError::DeadlineExceeded.into(),
         crate::KernelFailure::ResourceExhausted => CompileControlError::ResourceExhausted.into(),
@@ -1615,26 +1616,13 @@ fn finish_created_binding_work<T, H>(
     result: Result<T, FunctionBindingCreationFailure<H>>,
     work: CompileCheckpoints<'_>,
 ) -> Result<T, FunctionBindingCreationFailure<H>> {
-    if matches!(
-        &result,
-        Err(FunctionBindingCreationFailure::Creator(_)
-            | FunctionBindingCreationFailure::Resource(_)
-            | FunctionBindingCreationFailure::Binding(FunctionBindingError::Control(_)))
-    ) {
-        return result;
-    }
-    work.finish()?;
-    result
+    work.finish_result(result, FunctionBindingCreationFailure::from)
 }
 fn finish_binding_work<T>(
     result: Result<T, FunctionBindingError>,
     work: CompileCheckpoints<'_>,
 ) -> Result<T, FunctionBindingError> {
-    if matches!(result, Err(FunctionBindingError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    work.finish_result(result, FunctionBindingError::from)
 }
 
 pub(crate) fn digest_binding_definition(

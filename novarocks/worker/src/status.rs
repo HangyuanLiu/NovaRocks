@@ -28,8 +28,24 @@
 //! "a metrics producer must not mutate lifecycle state" a property of the
 //! type, not of a review comment.
 
+use crate::task_conclusion::{PreparedTaskConclusion, TaskConclusionState};
+use crate::task_diagnostics::{
+    DiagnosticRecordOutcome, PreparedCleanupDiagnostic, TaskSecondaryDiagnostics,
+    TaskSecondaryDiagnosticsSnapshot,
+};
+use novarocks_execution::runtime::{
+    execution_health::ExecutionHealth,
+    fragment::ExecutionFailure,
+    observable::Observable,
+    task_control::{TaskExecutionControl, TaskExecutionPort},
+};
+use novarocks_execution_contract::{
+    AcceptedTaskConclusion, ConclusionAcceptance, ConclusionDecision, TaskConclusion,
+    TaskConclusionPort, TaskConclusionProposal, TaskFailurePhase,
+};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::{
@@ -73,12 +89,16 @@ pub enum StatusAdvance {
     Throttled,
     /// The task is already terminal. The first terminal wins.
     AlreadyTerminal(TaskState),
+    /// An accepted conclusion kept its cause; this later proposal lost.
+    KeptConclusion(TaskState),
     /// The move is not in the state machine.
     Illegal { from: TaskState, to: TaskState },
     /// The proposed snapshot is not a legal value.
     Rejected(TaskStatusError),
     /// This task published `u64::MAX` versions.
     VersionExhausted,
+    /// A neutral failure summary cannot supply an originating Task cause.
+    MissingFailureSource,
 }
 
 impl StatusAdvance {
@@ -93,6 +113,8 @@ impl StatusAdvance {
 #[derive(Debug)]
 struct OwnedStatus {
     current: TaskStatus,
+    conclusions: TaskConclusionState,
+    secondary_diagnostics: TaskSecondaryDiagnostics,
     output: TaskOutputFacts,
     resources: TaskResourceFacts,
     writer: Option<TaskWriterFacts>,
@@ -104,11 +126,183 @@ struct OwnedStatus {
     last_publication: MonotonicInstant,
     metrics_pending: bool,
     convergence: TaskConvergence,
+    // Original runtime receipts remain independent from whole-Task publication.
+    // Started opaque disposal may finish normally; never discard an arrived
+    // real receipt or infer it from a timeout, terminal status, or health.
+    runtime_actual_stopped_received: bool,
+    runtime_resources_converged_received: bool,
     /// Snapshots stay here until the creation transaction commits, so a
     /// creation that rolls back never leaves an observable task behind.
     released_to_observers: bool,
     buffered: Option<TaskStatus>,
     buffered_convergence: Option<TaskConvergenceReceipt>,
+    // A root/control transaction can accept without waking its producers
+    // until its own closed facts are installed. Every contributor uses this
+    // same fence; accepting a concurrent refinement never waits for it.
+    publication_fences: usize,
+    deferred_conclusion_notify: bool,
+    deferred_status_notify: bool,
+}
+
+/// One status transaction. The only buffered snapshot is still owned by the
+/// Task acceptance lock. The guard installs that immutable snapshot while
+/// locked, then unlocks before waking an observer. Retirement can never read a
+/// terminal owner ahead of its installed snapshot, and callbacks can reenter.
+/// Early returns obey the same publication boundary.
+struct StatusTransaction<'a> {
+    owner: &'a TaskStatusOwner,
+    state: Option<MutexGuard<'a, OwnedStatus>>,
+    starting_generation: Option<std::num::NonZeroU64>,
+}
+impl std::ops::Deref for StatusTransaction<'_> {
+    type Target = OwnedStatus;
+    fn deref(&self) -> &OwnedStatus {
+        self.state.as_deref().expect("live status transaction")
+    }
+}
+impl std::ops::DerefMut for StatusTransaction<'_> {
+    fn deref_mut(&mut self) -> &mut OwnedStatus {
+        self.state.as_deref_mut().expect("live status transaction")
+    }
+}
+/// Installation precedes notification. The enclosing owner may retain this
+/// value across its own fence and publish only after releasing that fence.
+pub(crate) struct PendingStatusPublication<'a> {
+    owner: &'a TaskStatusOwner,
+    conclusion_changed: bool,
+    status_changed: bool,
+    convergence: Option<novarocks_execution_contract::TaskConvergenceReceipt>,
+}
+fn publish_status(
+    owner: &TaskStatusOwner,
+    conclusion_changed: bool,
+    status_changed: bool,
+    convergence: Option<novarocks_execution_contract::TaskConvergenceReceipt>,
+) {
+    // Install every deferred owner fact before synchronous lifecycle
+    // callbacks can reenter retirement. Status snapshots were installed
+    // under the acceptance transaction; convergence is readiness-independent.
+    if let Some(receipt) = convergence {
+        owner.source.publish_task_convergence(receipt);
+    }
+    if conclusion_changed {
+        owner.conclusion_changed.notify_all();
+        owner.stop_observable.notify_observers();
+    }
+    if status_changed {
+        owner.source.notify_status_publication();
+    }
+}
+impl PendingStatusPublication<'_> {
+    pub(crate) fn publish(self) {
+        publish_status(
+            self.owner,
+            self.conclusion_changed,
+            self.status_changed,
+            self.convergence,
+        );
+    }
+}
+impl<'a> StatusTransaction<'a> {
+    fn detach_publication(&mut self) -> PendingStatusPublication<'a> {
+        let mut state = self.state.take().expect("live status transaction");
+        let status_changed = state.released_to_observers
+            && state
+                .buffered
+                .take()
+                .is_some_and(|status| self.owner.source.install_status(status));
+        let conclusion_changed = state.conclusions.generation() != self.starting_generation;
+        if conclusion_changed {
+            self.owner.conclusion_present.store(true, Ordering::Release);
+        }
+        state.deferred_conclusion_notify |= conclusion_changed;
+        state.deferred_status_notify |= status_changed;
+        let (conclusion_changed, status_changed, convergence) = if state.publication_fences == 0 {
+            (
+                std::mem::take(&mut state.deferred_conclusion_notify),
+                std::mem::take(&mut state.deferred_status_notify),
+                if state.released_to_observers {
+                    state.buffered_convergence.take()
+                } else {
+                    None
+                },
+            )
+        } else {
+            (false, false, None)
+        };
+        drop(state);
+        PendingStatusPublication {
+            owner: self.owner,
+            conclusion_changed,
+            status_changed,
+            convergence,
+        }
+    }
+}
+impl Drop for StatusTransaction<'_> {
+    fn drop(&mut self) {
+        if self.state.is_some() {
+            self.detach_publication().publish();
+        }
+    }
+}
+
+/// Both notifications and rejected source destruction belong outside every
+/// enclosing lifecycle fence. This value never publishes from Drop: dropping
+/// it while unwinding a fenced mutation must not invoke a reentrant callback.
+#[must_use = "publish the accepted conclusion after releasing enclosing lifecycle fences"]
+pub(crate) struct PendingTaskConclusion<'a> {
+    accepted: ConclusionAcceptance<ExecutionFailure>,
+    discarded: Option<PreparedTaskConclusion>,
+    publication: PendingStatusPublication<'a>,
+}
+impl PendingTaskConclusion<'_> {
+    pub(crate) fn acceptance(&self) -> &ConclusionAcceptance<ExecutionFailure> {
+        &self.accepted
+    }
+
+    pub(crate) fn publish(self) -> ConclusionAcceptance<ExecutionFailure> {
+        let Self {
+            accepted,
+            discarded,
+            publication,
+        } = self;
+        publication.publish();
+        drop(discarded);
+        accepted
+    }
+}
+
+/// An owned publication can leave the registry fence without borrowing its
+/// task map. It holds no payload and makes no lifecycle decision of its own.
+#[must_use = "publish after the registry/root closed facts are installed and unlocked"]
+pub(crate) struct OwnedTaskConclusion {
+    owner: Arc<TaskStatusOwner>,
+    accepted: ConclusionAcceptance<ExecutionFailure>,
+    discarded: Option<PreparedTaskConclusion>,
+}
+impl OwnedTaskConclusion {
+    pub(crate) fn acceptance(&self) -> &ConclusionAcceptance<ExecutionFailure> {
+        &self.accepted
+    }
+    pub(crate) fn publish(self) -> ConclusionAcceptance<ExecutionFailure> {
+        let Self {
+            owner,
+            accepted,
+            discarded,
+        } = self;
+        {
+            let mut state = owner.transaction();
+            state.publication_fences = state
+                .publication_fences
+                .checked_sub(1)
+                .expect("owned Task publication releases its live fence exactly once");
+        }
+        // The last enclosing fence flushes all contributors' notifications
+        // through StatusTransaction, after dropping the Task acceptance lock.
+        drop(discarded);
+        accepted
+    }
 }
 
 /// The serializer of one task's status.
@@ -117,7 +311,12 @@ pub struct TaskStatusOwner {
     source: Arc<TaskStatusSource>,
     clock: Arc<dyn WorkerMonotonicClock>,
     throttle: Duration,
+    execution_health: Arc<ExecutionHealth>,
+    preparation: Arc<crate::task_preparation::TaskPreparationScope>,
     state: Mutex<OwnedStatus>,
+    conclusion_present: AtomicBool,
+    conclusion_changed: Condvar,
+    stop_observable: Arc<Observable>,
 }
 
 impl fmt::Debug for TaskStatusOwner {
@@ -140,7 +339,35 @@ impl TaskStatusOwner {
         source: Arc<TaskStatusSource>,
         clock: Arc<dyn WorkerMonotonicClock>,
         throttle: Duration,
+        execution_health: Arc<ExecutionHealth>,
     ) -> Self {
+        let preparation = Arc::new(crate::task_preparation::TaskPreparationScope::new(
+            identity,
+            Arc::clone(&execution_health),
+        ));
+        Self::from_preparation_scope(
+            identity,
+            source,
+            clock,
+            throttle,
+            execution_health,
+            preparation,
+        )
+    }
+
+    pub(crate) fn from_preparation_scope(
+        identity: TaskIdentity,
+        source: Arc<TaskStatusSource>,
+        clock: Arc<dyn WorkerMonotonicClock>,
+        throttle: Duration,
+        execution_health: Arc<ExecutionHealth>,
+        preparation: Arc<crate::task_preparation::TaskPreparationScope>,
+    ) -> Self {
+        assert_eq!(
+            preparation.identity(),
+            identity,
+            "one preparation reservation identity"
+        );
         let current = TaskStatus::created(identity);
         let now = clock.now();
         Self {
@@ -148,8 +375,12 @@ impl TaskStatusOwner {
             source,
             clock,
             throttle,
+            execution_health,
+            preparation,
             state: Mutex::new(OwnedStatus {
                 current: current.clone(),
+                conclusions: TaskConclusionState::default(),
+                secondary_diagnostics: TaskSecondaryDiagnostics::default(),
                 output: TaskOutputFacts::default(),
                 resources: TaskResourceFacts::empty(),
                 writer: None,
@@ -161,24 +392,56 @@ impl TaskStatusOwner {
                 last_publication: now,
                 metrics_pending: false,
                 convergence: TaskConvergence::new(),
+                runtime_actual_stopped_received: false,
+                runtime_resources_converged_received: false,
                 released_to_observers: false,
                 buffered: Some(current),
                 buffered_convergence: None,
+                publication_fences: 0,
+                deferred_conclusion_notify: false,
+                deferred_status_notify: false,
             }),
+            conclusion_present: AtomicBool::new(false),
+            conclusion_changed: Condvar::new(),
+            stop_observable: Arc::new(Observable::new()),
         }
+    }
+
+    pub(crate) fn preparation_scope(&self) -> &crate::task_preparation::TaskPreparationScope {
+        &self.preparation
+    }
+    pub(crate) fn preparation_scope_arc(
+        &self,
+    ) -> Arc<crate::task_preparation::TaskPreparationScope> {
+        Arc::clone(&self.preparation)
     }
 
     /// Makes this task's snapshots observable. Called once, at the exact
     /// linearization point of its creation acknowledgement.
     pub fn release_to_observers(&self) {
-        let mut state = self.state.lock().expect("task status lock");
-        state.released_to_observers = true;
-        if let Some(status) = state.buffered.take() {
-            self.source.publish(status);
+        self.transaction().released_to_observers = true;
+    }
+
+    fn transaction(&self) -> StatusTransaction<'_> {
+        let state = self.state.lock().expect("task status lock");
+        let starting_generation = state.conclusions.generation();
+        StatusTransaction {
+            owner: self,
+            state: Some(state),
+            starting_generation,
         }
-        if let Some(receipt) = state.buffered_convergence.take() {
-            self.source.publish_task_convergence(receipt);
-        }
+    }
+
+    /// A phase-scoped view of this exact acceptance owner. No new latch is
+    /// introduced, and neither a RuntimeState nor result payload is captured.
+    pub fn execution_control(
+        self: &Arc<Self>,
+        phase: TaskFailurePhase,
+    ) -> Arc<TaskExecutionControl> {
+        Arc::new(
+            TaskExecutionControl::new(self.identity, self.clone(), phase)
+                .expect("Task control binds its exact status owner"),
+        )
     }
 
     pub const fn identity(&self) -> TaskIdentity {
@@ -193,19 +456,38 @@ impl TaskStatusOwner {
     /// This control fact bypasses metric throttling and remains present in
     /// every later snapshot, including terminal snapshots.
     pub fn note_installed(&self) -> StatusAdvance {
+        let (result, publication) = self.prepare_installed();
+        publication.publish();
+        result
+    }
+    pub(crate) fn prepare_installed(&self) -> (StatusAdvance, PendingStatusPublication<'_>) {
         let now = self.clock.now();
-        let mut state = self.state.lock().expect("task status lock");
+        let mut state = self.transaction();
+        let result = self.note_installed_locked(&mut state, now);
+        let publication = state.detach_publication();
+        (result, publication)
+    }
+    fn note_installed_locked(
+        &self,
+        state: &mut OwnedStatus,
+        now: MonotonicInstant,
+    ) -> StatusAdvance {
         if state.current.installed() {
             return StatusAdvance::Published(state.current.version());
         }
         if state.current.is_terminal() {
             return StatusAdvance::AlreadyTerminal(state.current.state());
         }
+        // The Context caller's earlier stop observation is not an installation
+        // fence. Serialize this irreversible fact with the accepted conclusion.
+        if state.conclusions.current().is_some() {
+            return StatusAdvance::KeptConclusion(state.current.state());
+        }
         let Some(version) = state.current.version().next() else {
             return StatusAdvance::VersionExhausted;
         };
         let next = match self.compose(
-            &state,
+            state,
             version,
             state.current.state(),
             state.current.termination().cloned(),
@@ -213,7 +495,7 @@ impl TaskStatusOwner {
             Ok(next) => next.with_installed(),
             Err(error) => return StatusAdvance::Rejected(error),
         };
-        self.commit_locked(&mut state, next, now);
+        self.commit_locked(state, next, now);
         StatusAdvance::Published(version)
     }
 
@@ -262,7 +544,7 @@ impl TaskStatusOwner {
 
     /// Records the final Worker-owned retirement transition.
     pub fn retire(&self) -> Result<TaskConvergenceSnapshot, TaskConvergenceRejection> {
-        let mut state = self.state.lock().expect("task status lock");
+        let mut state = self.transaction();
         Ok(state.convergence.retire()?.snapshot())
     }
 
@@ -281,36 +563,35 @@ impl TaskStatusOwner {
         output: TaskOutputFacts,
     ) -> StatusAdvance {
         let now = self.clock.now();
-        let mut state = self.state.lock().expect("task status lock");
+        let mut state = self.transaction();
         self.advance_locked(&mut state, now, to, termination, output)
     }
 
     /// Concludes this task on the termination that wins, in one step.
     ///
-    /// `proposal` is the caller's own termination. Under this owner's lock it
-    /// competes exactly as a separate lifecycle proposal would: it applies
-    /// when the state machine allows it — a task that has not started
-    /// terminating, or a cancellation that an abort or a failure supersedes —
-    /// and otherwise loses to the termination already in progress, whose cause
-    /// is kept. The winning termination is then completed with `output` as its
-    /// independent output fact.
-    ///
-    /// A caller that decided its proposal from its own earlier snapshot of
-    /// the stand-down therefore cannot turn its conclusion into an illegal
-    /// move when that stand-down escalated in the meantime.
+    /// `proposal` competes under this owner's lock using the shared accepted
+    /// conclusion rule. Cancellation, originating failure and nonderived abort
+    /// keep their first accepted cause; only a derived peer placeholder may be
+    /// refined by an originating failure. The accepted termination completes
+    /// with `output` as its independent output fact.
     pub fn conclude_termination(
         &self,
         proposal: TerminationDetail,
         output: TaskOutputFacts,
     ) -> StatusAdvance {
         let now = self.clock.now();
-        let mut state = self.state.lock().expect("task status lock");
+        let mut state = self.transaction();
         let from = state.current.state();
         if from.is_terminal() {
             return StatusAdvance::AlreadyTerminal(from);
         }
+        if failure_needs_source(&state, &proposal) {
+            return StatusAdvance::MissingFailureSource;
+        }
         let terminating = terminating_state_of(&proposal);
-        if classify_task_transition(from, terminating) == TaskTransition::Apply {
+        if termination_decision(&state, &proposal)
+            != novarocks_execution_contract::ConclusionDecision::Keep
+        {
             let Some(version) = state.current.version().next() else {
                 return StatusAdvance::VersionExhausted;
             };
@@ -334,7 +615,7 @@ impl TaskStatusOwner {
     /// execution owner has not yet been told.
     pub fn conclude_success(&self, output: TaskOutputFacts) -> StatusAdvance {
         let now = self.clock.now();
-        let mut state = self.state.lock().expect("task status lock");
+        let mut state = self.transaction();
         let from = state.current.state();
         if from.is_terminal() {
             return StatusAdvance::AlreadyTerminal(from);
@@ -390,12 +671,28 @@ impl TaskStatusOwner {
         state: &mut OwnedStatus,
         now: MonotonicInstant,
         to: TaskState,
-        termination: Option<TerminationDetail>,
+        mut termination: Option<TerminationDetail>,
         output: TaskOutputFacts,
     ) -> StatusAdvance {
         let from = state.current.state();
         if from.is_terminal() {
             return StatusAdvance::AlreadyTerminal(from);
+        }
+        if termination
+            .as_ref()
+            .is_some_and(|detail| failure_needs_source(state, detail))
+        {
+            return StatusAdvance::MissingFailureSource;
+        }
+        if terminal_state_of(from) == Some(to) {
+            termination = state.current.termination().cloned();
+        } else if let Some(proposed) = termination.as_ref() {
+            if state.conclusions.current() != Some(&TaskConclusion::Terminated(proposed.clone()))
+                && termination_decision(state, proposed)
+                    == novarocks_execution_contract::ConclusionDecision::Keep
+            {
+                return StatusAdvance::KeptConclusion(from);
+            }
         }
         match classify_task_transition(from, to) {
             TaskTransition::AlreadyTerminal => StatusAdvance::AlreadyTerminal(from),
@@ -439,7 +736,7 @@ impl TaskStatusOwner {
         writer: Option<TaskWriterFacts>,
     ) -> StatusAdvance {
         let now = self.clock.now();
-        let mut state = self.state.lock().expect("task status lock");
+        let mut state = self.transaction();
         if state.current.is_terminal() {
             return StatusAdvance::AlreadyTerminal(state.current.state());
         }
@@ -455,7 +752,7 @@ impl TaskStatusOwner {
     /// delayed, never lost.
     pub fn flush_throttled_metrics(&self) -> StatusAdvance {
         let now = self.clock.now();
-        let mut state = self.state.lock().expect("task status lock");
+        let mut state = self.transaction();
         if !state.metrics_pending || state.current.is_terminal() {
             return StatusAdvance::Throttled;
         }
@@ -474,7 +771,7 @@ impl TaskStatusOwner {
         payload: Arc<dyn CodecOwnedContent>,
     ) -> StatusAdvance {
         let now = self.clock.now();
-        let mut state = self.state.lock().expect("task status lock");
+        let mut state = self.transaction();
         if state.current.is_terminal() {
             return StatusAdvance::AlreadyTerminal(state.current.state());
         }
@@ -493,59 +790,30 @@ impl TaskStatusOwner {
     /// converging on its own failure keeps that failure as its cause.
     pub fn force_conclusion(&self, cause: AbortCause) -> bool {
         let now = self.clock.now();
-        let mut state = self.state.lock().expect("task status lock");
+        let mut state = self.transaction();
         if state.current.is_terminal() {
             return false;
         }
-        let current = state.current.state();
-        let steps: &[(TaskState, TerminationDetail)] = &if current.is_failure() {
-            let Some(TerminationDetail::Failed(failure)) = state.current.termination().cloned()
-            else {
-                return false;
-            };
-            [(TaskState::Failed, TerminationDetail::Failed(failure))]
-        } else {
-            [(TaskState::Aborted, TerminationDetail::Aborted(cause))]
-        };
-        if !current.is_failure() && !current.is_abort() {
-            // `ABORTING` is the only legal way into `ABORTED` from a state
-            // that has not started terminating.
+        if state.current.termination().is_none() {
             let Some(version) = state.current.version().next() else {
                 return false;
             };
-            match self.compose(
+            let Ok(next) = self.compose(
                 &state,
                 version,
                 TaskState::Aborting,
                 Some(TerminationDetail::Aborted(cause)),
-            ) {
-                Ok(next) => self.commit_locked(&mut state, next, now),
-                Err(_) => return false,
-            }
-        }
-        for (task_state, detail) in steps {
-            let Some(version) = state.current.version().next() else {
+            ) else {
                 return false;
             };
-            let Ok(next) = self.compose(&state, version, *task_state, Some(detail.clone())) else {
-                return false;
-            };
-            if next.is_terminal() {
-                state.final_info = FinalTaskInfo::try_new(
-                    self.identity,
-                    next.clone(),
-                    state.operator_statistics.clone(),
-                    state.operator_statistics_truncated,
-                )
-                .ok();
-                state
-                    .convergence
-                    .note_conclusion_stable()
-                    .expect("a live task accepts its stable conclusion");
-            }
             self.commit_locked(&mut state, next, now);
         }
-        true
+        // Grace expiration fixes the accepted logical conclusion. It cannot
+        // replace cancellation or an earlier abort, and proves no work exited.
+        matches!(
+            self.complete_termination_locked(&mut state, now, TaskOutputFacts::default()),
+            StatusAdvance::Published(_)
+        )
     }
 
     /// Records that the root result stream reached end of stream.
@@ -562,7 +830,7 @@ impl TaskStatusOwner {
     /// that its output drained.
     pub fn note_root_result_drained(&self) -> StatusAdvance {
         let now = self.clock.now();
-        let mut state = self.state.lock().expect("task status lock");
+        let mut state = self.transaction();
         let from = state.current.state();
         let advance = match classify_root_drain(from) {
             // The stable conclusion does not close the convergence ledger.
@@ -624,7 +892,7 @@ impl TaskStatusOwner {
     }
 
     fn record_operator_statistics(&self, statistics: Vec<OperatorStatistics>) {
-        let mut state = self.state.lock().expect("task status lock");
+        let mut state = self.transaction();
         let mut statistics = statistics;
         if statistics.len() > FINAL_TASK_INFO_MAX_OPERATORS {
             statistics.truncate(FINAL_TASK_INFO_MAX_OPERATORS);
@@ -635,7 +903,7 @@ impl TaskStatusOwner {
 
     fn release_output(&self) {
         let progressed = {
-            let mut state = self.state.lock().expect("task status lock");
+            let mut state = self.transaction();
             matches!(
                 state
                     .convergence
@@ -649,43 +917,67 @@ impl TaskStatusOwner {
         }
     }
 
-    fn note_actual_stopped(&self) {
-        let receipt = {
-            let mut state = self.state.lock().expect("task status lock");
-            match state
+    fn apply_runtime_exit_receipts_locked(&self, state: &mut OwnedStatus) -> bool {
+        if !self.preparation.allows_runtime_exit_publication() {
+            return false;
+        }
+        if state.runtime_actual_stopped_received {
+            if let TaskConvergenceAdvance::Advanced(snapshot) = state
                 .convergence
                 .note_actual_stopped()
-                .expect("a live task accepts actual-stop evidence")
+                .expect("a live task accepts original actual-stop evidence")
             {
-                TaskConvergenceAdvance::Advanced(snapshot) => {
-                    let version = TaskConvergenceVersion::new(snapshot.version())
-                        .expect("advanced convergence has a nonzero version");
-                    let receipt = TaskConvergenceReceipt::actual_stopped(self.identity, version);
-                    if state.released_to_observers {
-                        Some(receipt)
-                    } else {
-                        state.buffered_convergence = Some(receipt);
-                        None
-                    }
-                }
-                TaskConvergenceAdvance::Idempotent(_) => None,
+                let version = TaskConvergenceVersion::new(snapshot.version())
+                    .expect("advanced convergence has a nonzero version");
+                state.buffered_convergence = Some(TaskConvergenceReceipt::actual_stopped(
+                    self.identity,
+                    version,
+                ));
             }
-        };
-        if let Some(receipt) = receipt {
-            self.source.publish_task_convergence(receipt);
         }
-    }
-
-    fn note_resources_converged(&self) {
-        let progressed = {
-            let mut state = self.state.lock().expect("task status lock");
-            matches!(
+        state.runtime_resources_converged_received
+            && matches!(
                 state
                     .convergence
                     .note_resources_converged()
-                    .expect("runtime resources converge only after actual stop"),
+                    .expect("original runtime resources follow original actual stop"),
                 TaskConvergenceAdvance::Advanced(_)
             )
+    }
+    fn note_actual_stopped(&self) {
+        let resources_progressed = {
+            let mut state = self.transaction();
+            state.runtime_actual_stopped_received = true;
+            self.apply_runtime_exit_receipts_locked(&mut state)
+        };
+        if resources_progressed {
+            self.source.note_progress();
+        }
+    }
+    fn note_resources_converged(&self) {
+        let progressed = {
+            let mut state = self.transaction();
+            assert!(
+                state.runtime_actual_stopped_received,
+                "runtime resources require their original actual-stop receipt"
+            );
+            state.runtime_resources_converged_received = true;
+            self.apply_runtime_exit_receipts_locked(&mut state)
+        };
+        if progressed {
+            self.source.note_progress();
+        }
+    }
+    pub(crate) fn runtime_actual_stopped_received(&self) -> bool {
+        self.state
+            .lock()
+            .expect("task status lock")
+            .runtime_actual_stopped_received
+    }
+    pub(crate) fn refresh_preparation_exit_receipts(&self) {
+        let progressed = {
+            let mut state = self.transaction();
+            self.apply_runtime_exit_receipts_locked(&mut state)
         };
         if progressed {
             self.source.note_progress();
@@ -744,20 +1036,293 @@ impl TaskStatusOwner {
     }
 
     fn commit_locked(&self, state: &mut OwnedStatus, next: TaskStatus, now: MonotonicInstant) {
+        // Control and success enter the same receipt slot as rich failures.
+        // A Failed projection is legal only after the actual source was
+        // submitted through TaskConclusionPort under this same transaction.
+        let projected = next
+            .termination()
+            .cloned()
+            .map(TaskConclusion::Terminated)
+            .or_else(|| (next.state() == TaskState::Finished).then_some(TaskConclusion::Succeeded));
+        if let Some(projected) = projected {
+            if state.conclusions.current() != Some(&projected) {
+                let proposal = match projected {
+                    TaskConclusion::Succeeded => TaskConclusionProposal::Succeeded,
+                    TaskConclusion::Terminated(TerminationDetail::Canceled(reason)) => {
+                        TaskConclusionProposal::Canceled(reason)
+                    }
+                    TaskConclusion::Terminated(TerminationDetail::Aborted(cause)) => {
+                        TaskConclusionProposal::Aborted(cause)
+                    }
+                    TaskConclusion::Terminated(TerminationDetail::Failed(_)) => {
+                        panic!("Task failure projection requires its accepted original source")
+                    }
+                };
+                let (accepted, discarded) = state.conclusions.accept(
+                    self.identity,
+                    PreparedTaskConclusion::new(proposal),
+                    false,
+                );
+                assert_ne!(
+                    accepted.decision,
+                    ConclusionDecision::Keep,
+                    "status cannot overwrite an accepted Task conclusion"
+                );
+                assert!(discarded.is_none());
+            }
+        }
         state.current = next.clone();
         state.metrics_pending = false;
         state.last_publication = now;
-        if state.released_to_observers {
-            self.source.publish(next);
-            return;
-        }
-        // Pre-commit snapshots coalesce exactly the way the source's delivery
-        // slot does: an older non-current snapshot no observer has seen may be
-        // dropped, and a terminal one may not be superseded.
+        // The transaction installs before unlocking and notifies afterwards.
+        // Pre-creation snapshots remain buffered until the creation commits.
+        // Snapshots no observer has seen may coalesce; a terminal may not be
+        // superseded. The source rejects delayed older versions after unlock.
         let queued_terminal = state.buffered.as_ref().is_some_and(TaskStatus::is_terminal);
         if !queued_terminal {
             state.buffered = Some(next);
         }
+    }
+}
+
+/// Evaluates a proposal from the immutable cause already held by this owner.
+/// There is no second latch or priority policy in the lifecycle projection.
+fn termination_decision(
+    state: &OwnedStatus,
+    proposed: &TerminationDetail,
+) -> novarocks_execution_contract::ConclusionDecision {
+    use novarocks_execution_contract::{TaskConclusion, decide_conclusion};
+    decide_conclusion(
+        state.conclusions.current(),
+        &TaskConclusion::Terminated(proposed.clone()),
+    )
+}
+
+/// Neutral status is an observation, never the missing original source.
+fn failure_needs_source(state: &OwnedStatus, proposed: &TerminationDetail) -> bool {
+    let proposed = TaskConclusion::Terminated(proposed.clone());
+    matches!(
+        &proposed,
+        TaskConclusion::Terminated(TerminationDetail::Failed(_))
+    ) && state.conclusions.current() != Some(&proposed)
+        && novarocks_execution_contract::decide_conclusion(state.conclusions.current(), &proposed)
+            != ConclusionDecision::Keep
+}
+
+impl TaskConclusionPort<ExecutionFailure> for TaskStatusOwner {
+    fn identity(&self) -> TaskIdentity {
+        self.identity
+    }
+    fn accepted(&self) -> Option<Arc<AcceptedTaskConclusion<ExecutionFailure>>> {
+        self.state
+            .lock()
+            .expect("task status lock")
+            .conclusions
+            .accepted()
+    }
+    fn submit(
+        &self,
+        proposal: TaskConclusionProposal<ExecutionFailure>,
+    ) -> ConclusionAcceptance<ExecutionFailure> {
+        let candidate = PreparedTaskConclusion::new(proposal);
+        self.submit_prepared(candidate, false).publish()
+    }
+}
+impl TaskStatusOwner {
+    /// Worker-local only: Task retirement export and wire projection are not
+    /// connected to these secondary records. Snapshotting changes no lifecycle.
+    pub fn secondary_diagnostics(&self) -> TaskSecondaryDiagnosticsSnapshot {
+        self.state
+            .lock()
+            .expect("task status lock")
+            .secondary_diagnostics
+            .snapshot()
+    }
+
+    fn report_cleanup(&self, mut prepared: PreparedCleanupDiagnostic) -> DiagnosticRecordOutcome {
+        let outcome = {
+            let mut state = self.transaction();
+            // Never submit/accept here, even if the Task has no conclusion or
+            // only a derived peer placeholder. Cleanup cannot claim actual exit.
+            state.secondary_diagnostics.record(prepared.record_mut())
+        };
+        drop(prepared);
+        outcome
+    }
+
+    pub(crate) fn submit_prepared_owned(
+        self: &Arc<Self>,
+        candidate: PreparedTaskConclusion,
+    ) -> OwnedTaskConclusion {
+        let PendingTaskConclusion {
+            accepted,
+            discarded,
+            publication,
+        } = self.submit_prepared(candidate, true);
+        // No notification escapes the Task-wide fence. The owned effect is
+        // its release obligation, not a second source of acceptance rules.
+        publication.publish();
+        OwnedTaskConclusion {
+            owner: Arc::clone(self),
+            accepted,
+            discarded,
+        }
+    }
+
+    /// A preparation body's publication/disposal tail can outlive Installed.
+    /// Prepare both bounded projections before locking, then choose the legal
+    /// lifecycle phase at the same transaction that accepts its original cause.
+    /// Execution means installation committed, never that a driver ran.
+    pub(crate) fn report_preparation_body_failure(
+        &self,
+        cause: ExecutionFailure,
+    ) -> ConclusionAcceptance<ExecutionFailure> {
+        let preparation = PreparedTaskConclusion::new(TaskConclusionProposal::Failed {
+            cause: cause.clone(),
+            phase: TaskFailurePhase::Preparation,
+        });
+        let installed = PreparedTaskConclusion::new(TaskConclusionProposal::Failed {
+            cause,
+            phase: TaskFailurePhase::Execution,
+        });
+        let (pending, unused) =
+            self.submit_prepared_with_installed(preparation, Some(installed), false);
+        let accepted = pending.publish();
+        // The unselected rich projection and any losing source leave only
+        // after the acceptance lock and its detached notification have exited.
+        drop(unused);
+        accepted
+    }
+
+    /// Accept through the same Task transaction while a caller installs its
+    /// own closed fact. Publish after all enclosing fences have been released.
+    /// The caller retains this value outside that fenced scope, including its
+    /// unwind path; no callback or rejected source is run under that fence.
+    fn submit_prepared(
+        &self,
+        candidate: PreparedTaskConclusion,
+        fence_publication: bool,
+    ) -> PendingTaskConclusion<'_> {
+        let (pending, unused) =
+            self.submit_prepared_with_installed(candidate, None, fence_publication);
+        debug_assert!(unused.is_none(), "no alternate lifecycle projection");
+        pending
+    }
+
+    fn submit_prepared_with_installed(
+        &self,
+        mut candidate: PreparedTaskConclusion,
+        mut installed: Option<PreparedTaskConclusion>,
+        fence_publication: bool,
+    ) -> (PendingTaskConclusion<'_>, Option<PreparedTaskConclusion>) {
+        // The caller evaluates producer facts/diagnostics before every
+        // enclosing fence. Acceptance only installs that prepared candidate.
+        let (accepted, discarded, publication) = {
+            let mut state = self.transaction();
+            if state.current.installed()
+                && let Some(installed) = installed.as_mut()
+            {
+                std::mem::swap(&mut candidate, installed);
+            }
+            if fence_publication {
+                state.publication_fences = state
+                    .publication_fences
+                    .checked_add(1)
+                    .expect("live Task publication fence count");
+            }
+            if matches!(candidate.conclusion(), TaskConclusion::Succeeded)
+                && state.conclusions.current().is_none()
+            {
+                assert!(
+                    state.output.responsibility_complete()
+                        && state.convergence.snapshot().actual_stopped(),
+                    "Task success submission requires actual stopped and completed output facts"
+                );
+            }
+            let sealed = state.current.is_terminal();
+            let (accepted, mut discarded) =
+                state.conclusions.accept(self.identity, candidate, sealed);
+            // Only a losing originating proposal is secondary. Stop observations
+            // carry no prepared record and cannot create a diagnostic storm.
+            if accepted.decision == ConclusionDecision::Keep
+                && let Some(candidate) = discarded.as_mut()
+                && candidate.late_diagnostic_mut().is_some()
+            {
+                state
+                    .secondary_diagnostics
+                    .record(candidate.late_diagnostic_mut());
+            }
+            if accepted.decision != ConclusionDecision::Keep {
+                let (to, detail, output) = match accepted.accepted.neutral().conclusion() {
+                    TaskConclusion::Succeeded => (TaskState::Finished, None, state.output),
+                    TaskConclusion::Terminated(detail) => (
+                        terminating_state_of(detail),
+                        Some(detail.clone()),
+                        TaskOutputFacts::default(),
+                    ),
+                };
+                let advance = self.advance_locked(&mut state, self.clock.now(), to, detail, output);
+                assert!(
+                    matches!(
+                        advance,
+                        StatusAdvance::Published(_)
+                            | StatusAdvance::Republished(_)
+                            | StatusAdvance::VersionExhausted
+                    ),
+                    "accepted Task conclusion must project to its lifecycle: {advance:?}"
+                );
+            }
+            let publication = state.detach_publication();
+            (accepted, discarded, publication)
+        };
+        (
+            PendingTaskConclusion {
+                accepted,
+                discarded,
+                publication,
+            },
+            installed,
+        )
+    }
+}
+impl TaskExecutionPort for TaskStatusOwner {
+    fn execution_health(
+        &self,
+    ) -> Arc<novarocks_execution::runtime::execution_health::ExecutionHealth> {
+        self.execution_health.clone()
+    }
+    fn report_cleanup(&self, cause: &ExecutionFailure, phase: TaskFailurePhase) {
+        let prepared = PreparedCleanupDiagnostic::from_failure(cause, phase);
+        let _ = TaskStatusOwner::report_cleanup(self, prepared);
+    }
+    fn report_unresolved_exit(
+        &self,
+        fact: novarocks_execution_contract::failure::FailureFact,
+        phase: TaskFailurePhase,
+    ) {
+        self.execution_health.report_unresolved(
+            novarocks_execution::runtime::execution_health::ExecutionExitOrigin::Task {
+                identity: self.identity,
+                phase,
+            },
+            fact,
+        );
+    }
+    fn is_stopped(&self) -> bool {
+        self.conclusion_present.load(Ordering::Acquire)
+    }
+    fn stop_observable(&self) -> Arc<Observable> {
+        Arc::clone(&self.stop_observable)
+    }
+    fn wait_until_stopped(&self, duration: Duration) -> bool {
+        let state = self.state.lock().expect("task status lock");
+        let (state, _) = self
+            .conclusion_changed
+            .wait_timeout_while(state, duration, |state| {
+                state.conclusions.current().is_none()
+            })
+            .expect("Task conclusion wait");
+        state.conclusions.current().is_some()
     }
 }
 
@@ -800,6 +1365,27 @@ impl TaskStatusReporter {
         self.owner.current()
     }
 
+    /// Submit the actual local cause through this Task's sole acceptance
+    /// transaction. Phase is explicit; a control observation is not intent.
+    pub fn report_failure(
+        &self,
+        cause: ExecutionFailure,
+        phase: TaskFailurePhase,
+    ) -> ConclusionAcceptance<ExecutionFailure> {
+        self.owner
+            .submit(TaskConclusionProposal::Failed { cause, phase })
+    }
+
+    /// Record a prepared cleanup effect without competing for the conclusion.
+    /// Prepare by borrowing its real source before all enclosing lifecycle fences.
+    pub fn report_cleanup(&self, prepared: PreparedCleanupDiagnostic) -> DiagnosticRecordOutcome {
+        self.owner.report_cleanup(prepared)
+    }
+
+    pub fn secondary_diagnostics(&self) -> TaskSecondaryDiagnosticsSnapshot {
+        self.owner.secondary_diagnostics()
+    }
+
     pub fn running(&self) -> StatusAdvance {
         self.owner
             .advance(TaskState::Running, None, TaskOutputFacts::default())
@@ -814,7 +1400,7 @@ impl TaskStatusReporter {
     /// output responsibility, so this cannot report success for a task that
     /// still owes output.
     pub fn finished(&self, output: TaskOutputFacts) -> StatusAdvance {
-        self.owner.advance(TaskState::Finished, None, output)
+        self.owner.conclude_success(output)
     }
 
     pub fn canceling(&self, reason: CancelReason) -> StatusAdvance {
@@ -1074,6 +1660,7 @@ mod task_convergence_tests {
             Arc::clone(&source),
             Arc::new(crate::ManualClock::new()),
             Duration::from_millis(250),
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
         );
 
         owner.note_actual_stopped();
@@ -1091,6 +1678,684 @@ mod task_convergence_tests {
 
 #[cfg(test)]
 mod conclusion_tests {
+    use novarocks_execution_contract::failure::FailureProjection;
+
+    #[test]
+    fn independent_constructed_metadata_does_not_retain_the_actual_worker_task() {
+        use novarocks_execution::{
+            exec::{
+                chunk::{Chunk, ChunkSchema},
+                pipeline::operator::input_construction::{
+                    InputConstructionProfile, try_runtime_input_construction_factory,
+                },
+            },
+            runtime::{mem_tracker::MemTracker, runtime_state::RuntimeErrorState},
+        };
+        use novarocks_type_contract::ValueTypeStorageLifetime;
+        let owner = Arc::new(owner());
+        let weak_task = Arc::downgrade(&owner);
+        let control = Arc::new(RuntimeErrorState::for_task(
+            owner.execution_control(TaskFailurePhase::Execution),
+        ));
+        let tracker = MemTracker::new_root("independent metadata has no Task capability");
+        let factory = try_runtime_input_construction_factory(
+            InputConstructionProfile {
+                max_requests: 256,
+                max_request_bytes: 1024 * 1024,
+                max_opaque_requests: 256,
+                max_opaque_bytes: 1024 * 1024,
+                max_work: 1024 * 1024,
+                max_depth: 64,
+            },
+            tracker.clone(),
+            control,
+        )
+        .unwrap();
+        let storage = ValueTypeStorageLifetime::pure();
+        let input = Chunk::try_new_typed_with_columns_owned_observed::<ExecutionFailure, _>(
+            Arc::new(ChunkSchema::try_new_typed(vec![], storage.clone()).unwrap()),
+            vec![],
+            1,
+            storage,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let scope = factory.begin_input_construction(&input).unwrap();
+        let metadata = scope.storage_lifetime();
+        drop(owner);
+        drop(factory);
+        assert!(
+            weak_task.upgrade().is_some(),
+            "actual construction scope still owns work control"
+        );
+        drop(scope);
+        assert!(
+            weak_task.upgrade().is_none(),
+            "independent metadata must not retain Task control"
+        );
+        assert!(
+            tracker.current() > 0,
+            "independent metadata retains its own storage responsibility"
+        );
+        drop(metadata);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn core_runtime_delegates_to_the_actual_worker_task_and_keeps_its_original_source() {
+        use novarocks_execution::runtime::runtime_state::RuntimeErrorState;
+        use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
+        use std::sync::atomic::AtomicUsize;
+        let owner = Arc::new(owner());
+        owner.release_to_observers();
+        let runtime = Arc::new(RuntimeErrorState::for_task(
+            owner.execution_control(TaskFailurePhase::Execution),
+        ));
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let count = callbacks.clone();
+        let weak_runtime = Arc::downgrade(&runtime);
+        let weak_owner = Arc::downgrade(&owner);
+        owner.stop_observable().add_observer(Arc::new(move || {
+            let owner = weak_owner.upgrade().unwrap();
+            assert!(
+                owner.state.try_lock().is_ok(),
+                "runtime notification is outside the actual Task acceptance lock"
+            );
+            let runtime = weak_runtime.upgrade().unwrap();
+            let observed = runtime.error().unwrap();
+            let accepted = owner.accepted().unwrap();
+            if let Some(original) = accepted.originating_failure() {
+                assert!(std::ptr::eq(observed.cause(), original.cause()));
+            } else {
+                assert_eq!(
+                    observed.failure_fact().evidence(),
+                    FailureEvidence::StopObservation
+                );
+            }
+            count.fetch_add(1, Ordering::Release);
+        }));
+        owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        assert_eq!(owner.state(), TaskState::Aborting);
+        runtime.set_error(runtime.error().unwrap());
+        assert_eq!(callbacks.load(Ordering::Acquire), 1);
+        let original: ExecutionFailure =
+            novarocks_functions::KernelFailure::ResourceExhausted.into();
+        runtime.set_error(original.clone());
+        assert_eq!(callbacks.load(Ordering::Acquire), 2);
+        assert_eq!(owner.state(), TaskState::Failing);
+        assert!(std::ptr::eq(
+            owner
+                .accepted()
+                .unwrap()
+                .originating_failure()
+                .unwrap()
+                .cause(),
+            original.cause()
+        ));
+        assert!(std::ptr::eq(
+            runtime.error().unwrap().cause(),
+            original.cause()
+        ));
+        assert!(
+            !owner.convergence().actual_stopped(),
+            "failure notification is not physical work exit"
+        );
+        runtime.set_error(novarocks_functions::KernelFailure::Cancelled);
+        assert_eq!(callbacks.load(Ordering::Acquire), 2);
+        assert!(std::ptr::eq(
+            runtime.error().unwrap().cause(),
+            original.cause()
+        ));
+    }
+
+    #[test]
+    fn core_runtime_cannot_replace_an_actual_worker_cancellation_with_a_later_failure() {
+        use novarocks_execution::runtime::runtime_state::RuntimeErrorState;
+        use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
+        let owner = Arc::new(owner());
+        let runtime =
+            RuntimeErrorState::for_task(owner.execution_control(TaskFailurePhase::Execution));
+        let canceled = owner.submit(TaskConclusionProposal::Canceled(
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        runtime.set_error(novarocks_functions::KernelFailure::ResourceExhausted);
+        assert!(Arc::ptr_eq(&canceled.accepted, &owner.accepted().unwrap()));
+        assert!(owner.accepted().unwrap().originating_failure().is_none());
+        assert_eq!(
+            runtime.error().unwrap().failure_fact().evidence(),
+            FailureEvidence::StopObservation
+        );
+        assert!(!owner.convergence().actual_stopped());
+    }
+
+    // These tests exercise the production TaskStatusOwner, not the Core view's
+    // fixture owner. Its existing mutex owns receipt, lifecycle and stop view.
+    #[test]
+    fn accepted_task_freezes_exact_producer_facts_without_retaining_source_in_neutral_clone() {
+        use novarocks_execution_contract::failure::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct ActualSource {
+            fact: FailureFact,
+            drops: Arc<AtomicUsize>,
+            projections: Arc<AtomicUsize>,
+        }
+        impl std::fmt::Display for ActualSource {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("private-provider-credential")
+            }
+        }
+        impl std::error::Error for ActualSource {}
+        impl FailureProjection for ActualSource {
+            fn failure_fact(&self) -> FailureFact {
+                let call = self.projections.fetch_add(1, Ordering::AcqRel);
+                assert_eq!(
+                    call, 0,
+                    "Task publication and diagnostics reuse one authored snapshot"
+                );
+                self.fact
+            }
+        }
+        impl Drop for ActualSource {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let fact = FailureFact::new(
+            FailureClass::Representation,
+            FailureReason::new(
+                std::num::NonZeroU16::new(65534).unwrap(),
+                std::num::NonZeroU16::new(65535).unwrap(),
+            ),
+        )
+        .with_row_position(FailureRowPosition {
+            selected_ordinal: 0,
+            batch_row: u64::MAX,
+        })
+        .with_resource(ResourceFacts {
+            request_scope: Some(ResourceScope::Operator),
+            constraint_scope: Some(ResourceScope::Process),
+            dimension: ResourceDimension::Items,
+            requested: Some(0),
+            required_growth: None,
+            limit: Some(u64::MAX),
+            live: None,
+            committed: Some(0),
+        })
+        .with_representation(RepresentationFacts {
+            boundary: RepresentationBoundary::SingleOutput,
+            layout: RepresentationLayout {
+                domain: std::num::NonZeroU16::new(65535).unwrap(),
+                code: std::num::NonZeroU16::new(1).unwrap(),
+            },
+            required: Some(0),
+            extent_limit: None,
+            representable_prefix: Some(0),
+        });
+        let drops = Arc::new(AtomicUsize::new(0));
+        let projections = Arc::new(AtomicUsize::new(0));
+        let source = ExecutionFailure::from_domain(ActualSource {
+            fact,
+            drops: drops.clone(),
+            projections: projections.clone(),
+        });
+        let owner = owner();
+        let peer = owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let accepted = owner.submit(TaskConclusionProposal::Failed {
+            cause: source.clone(),
+            phase: TaskFailurePhase::Preparation,
+        });
+        assert_eq!(accepted.decision, ConclusionDecision::RefineDerived);
+        assert_eq!(projections.load(Ordering::Acquire), 1);
+        assert!(std::ptr::eq(
+            accepted.accepted.originating_failure().unwrap().cause(),
+            source.cause(),
+        ));
+        let TaskConclusion::Terminated(TerminationDetail::Failed(neutral)) =
+            accepted.accepted.neutral().conclusion()
+        else {
+            panic!("authored failure")
+        };
+        let neutral = neutral.clone();
+        assert_eq!(neutral.fact(), fact);
+        assert_eq!(neutral.phase(), TaskFailurePhase::Preparation);
+        assert!(
+            !neutral
+                .detail()
+                .as_str()
+                .contains("private-provider-credential")
+        );
+        let canceled = owner.submit(TaskConclusionProposal::Canceled(
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        assert!(Arc::ptr_eq(&accepted.accepted, &canceled.accepted));
+        assert_eq!(drops.load(Ordering::Acquire), 0);
+        drop(canceled);
+        drop(accepted);
+        drop(peer);
+        drop(source);
+        drop(owner);
+        assert_eq!(
+            drops.load(Ordering::Acquire),
+            1,
+            "only the original rich source owns provider state"
+        );
+        assert_eq!(
+            neutral.fact(),
+            fact,
+            "neutral metadata survives actual source teardown"
+        );
+    }
+
+    #[test]
+    fn task_port_keeps_one_original_receipt_and_refines_only_a_live_peer_placeholder() {
+        let owner = Arc::new(owner());
+        let control = owner.execution_control(TaskFailurePhase::Preparation);
+        let peer = owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        assert_eq!(owner.state(), TaskState::Aborting);
+        assert_eq!(peer.accepted.neutral().generation().get(), 1);
+        let cleanup = ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted);
+        assert_eq!(
+            TaskStatusReporter::new(owner.clone()).report_cleanup(
+                PreparedCleanupDiagnostic::from_failure(&cleanup, TaskFailurePhase::Execution),
+            ),
+            DiagnosticRecordOutcome::Stored
+        );
+        assert!(Arc::ptr_eq(&peer.accepted, &owner.accepted().unwrap()));
+        let observation = control.error().unwrap();
+        let kept = control.report_failure(observation);
+        assert_eq!(kept.decision, ConclusionDecision::Keep);
+        assert!(Arc::ptr_eq(&peer.accepted, &kept.accepted));
+        let original =
+            ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted);
+        let refined = control.report_failure(original.clone());
+        assert_eq!(refined.decision, ConclusionDecision::RefineDerived);
+        assert_eq!(refined.accepted.neutral().generation().get(), 2);
+        assert!(std::ptr::eq(
+            refined.accepted.originating_failure().unwrap().cause(),
+            original.cause()
+        ));
+        assert!(std::ptr::eq(
+            control.error().unwrap().cause(),
+            original.cause()
+        ));
+        let secondary = owner.secondary_diagnostics();
+        assert_eq!(
+            secondary.entries().len(),
+            1,
+            "only explicit cleanup is secondary"
+        );
+        assert_eq!(
+            secondary.entries().next().unwrap().role(),
+            crate::TaskDiagnosticRole::Cleanup
+        );
+        assert_eq!(secondary.dropped(), 0);
+        assert_eq!(owner.state(), TaskState::Failing);
+        let TaskConclusion::Terminated(TerminationDetail::Failed(failure)) =
+            refined.accepted.neutral().conclusion()
+        else {
+            panic!("original failure receipt required");
+        };
+        assert_eq!(failure.phase(), TaskFailurePhase::Preparation);
+        assert_eq!(failure.category(), TaskFailureCategory::ResourceExhausted);
+        assert!(!owner.convergence().actual_stopped());
+        owner.force_conclusion(AbortCause::LeaseExpired);
+        assert_eq!(owner.state(), TaskState::Failed);
+        assert!(!owner.convergence().actual_stopped());
+        assert!(Arc::ptr_eq(&refined.accepted, &owner.accepted().unwrap()));
+    }
+
+    #[test]
+    fn task_port_defers_callbacks_until_the_enclosing_closed_fact_is_installed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let owner = Arc::new(owner());
+        owner.release_to_observers();
+        let gate = Arc::new(std::sync::Mutex::new(false));
+        let observed = Arc::new(AtomicUsize::new(0));
+        let weak = Arc::downgrade(&owner);
+        let (closed, callbacks) = (gate.clone(), observed.clone());
+        owner.stop_observable().add_observer(Arc::new(move || {
+            let owner = weak.upgrade().unwrap();
+            assert!(
+                owner.state.try_lock().is_ok(),
+                "Task acceptance lock released"
+            );
+            assert!(*closed.try_lock().expect("outer fence released"));
+            assert!(owner.accepted().unwrap().originating_failure().is_some());
+            callbacks.fetch_add(1, Ordering::SeqCst);
+        }));
+        let candidate = PreparedTaskConclusion::new(TaskConclusionProposal::Failed {
+            cause: novarocks_functions::KernelFailure::ResourceExhausted.into(),
+            phase: TaskFailurePhase::Preparation,
+        });
+        // The retained publication lives outside the enclosing lock's scope.
+        let pending = {
+            let mut closed = gate.lock().unwrap();
+            let pending = owner.submit_prepared_owned(candidate);
+            assert!(owner.accepted().unwrap().originating_failure().is_some());
+            assert_eq!(observed.load(Ordering::SeqCst), 0);
+            *closed = true;
+            pending
+        };
+        let accepted = pending.publish();
+        assert_eq!(accepted.decision, ConclusionDecision::Accept);
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        assert!(!owner.convergence().actual_stopped());
+    }
+
+    #[test]
+    fn a_concurrent_originating_refinement_obeys_the_same_outer_publication_fence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let owner = Arc::new(owner());
+        owner.release_to_observers();
+        let closed = Arc::new(std::sync::Mutex::new(false));
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let (read_closed, observed) = (closed.clone(), callbacks.clone());
+        let weak = Arc::downgrade(&owner);
+        owner.stop_observable().add_observer(Arc::new(move || {
+            assert!(
+                *read_closed
+                    .try_lock()
+                    .expect("all contributors wait for the outer fence")
+            );
+            let owner = weak.upgrade().unwrap();
+            assert!(owner.accepted().unwrap().originating_failure().is_some());
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
+        let candidate = PreparedTaskConclusion::new(TaskConclusionProposal::Aborted(
+            AbortCause::PeerTaskFailed,
+        ));
+        let pending = {
+            let mut closed = closed.lock().unwrap();
+            let pending = owner.submit_prepared_owned(candidate);
+            let driver = owner.clone();
+            let refined = std::thread::spawn(move || {
+                driver.submit(TaskConclusionProposal::Failed {
+                    cause: novarocks_functions::KernelFailure::ResourceExhausted.into(),
+                    phase: TaskFailurePhase::Execution,
+                })
+            })
+            .join()
+            .expect("the producer report itself remains nonblocking");
+            assert_eq!(refined.decision, ConclusionDecision::RefineDerived);
+            assert!(Arc::ptr_eq(&refined.accepted, &owner.accepted().unwrap()));
+            assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+            *closed = true;
+            pending
+        };
+        pending.publish();
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        assert!(!owner.convergence().actual_stopped());
+    }
+
+    #[test]
+    fn nested_task_publication_fences_flush_only_after_the_last_owner_releases() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let owner = Arc::new(owner());
+        owner.release_to_observers();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let observed = callbacks.clone();
+        owner.stop_observable().add_observer(Arc::new(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
+        let first = owner.submit_prepared_owned(PreparedTaskConclusion::new(
+            TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed),
+        ));
+        let second = owner.submit_prepared_owned(PreparedTaskConclusion::new(
+            TaskConclusionProposal::Failed {
+                cause: novarocks_functions::KernelFailure::ResourceExhausted.into(),
+                phase: TaskFailurePhase::Execution,
+            },
+        ));
+        assert_eq!(
+            second.acceptance().decision,
+            ConclusionDecision::RefineDerived
+        );
+        let current = owner.accepted().unwrap();
+        let original = first.publish();
+        assert_eq!(original.decision, ConclusionDecision::Accept);
+        assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+        assert!(Arc::ptr_eq(&current, &owner.accepted().unwrap()));
+        assert!(!owner.convergence().actual_stopped());
+        second.publish();
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        assert!(Arc::ptr_eq(&current, &owner.accepted().unwrap()));
+        assert!(!owner.convergence().actual_stopped());
+    }
+
+    #[test]
+    fn actual_stop_is_visible_to_its_owner_before_fenced_convergence_is_published() {
+        let owner = Arc::new(owner());
+        owner.release_to_observers();
+        let pending = owner.submit_prepared_owned(PreparedTaskConclusion::new(
+            TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed),
+        ));
+        let revision = owner.source.revision();
+        let weak = Arc::downgrade(&owner);
+        owner.stop_observable().add_observer(Arc::new(move || {
+            // A reentrant lifecycle observer must see all deferred owner
+            // facts, including actual-stop replay, before it may retire them.
+            let owner = weak.upgrade().unwrap();
+            assert!(owner.convergence().actual_stopped());
+            assert!(
+                owner.source.revision() > revision,
+                "convergence is installed before lifecycle callbacks"
+            );
+        }));
+        owner.note_actual_stopped();
+        assert!(owner.convergence().actual_stopped());
+        assert_eq!(owner.source.revision(), revision);
+        pending.publish();
+        assert!(owner.source.revision() > revision);
+        let published = owner.source.revision();
+        owner.note_actual_stopped();
+        assert_eq!(owner.source.revision(), published);
+    }
+
+    #[test]
+    fn task_port_acceptance_is_visible_while_notification_is_still_running() {
+        use std::sync::Barrier;
+        let owner = Arc::new(owner());
+        owner.release_to_observers();
+        let control = owner.execution_control(TaskFailurePhase::Execution);
+        let entered = Arc::new(Barrier::new(2));
+        let leave = Arc::new(Barrier::new(2));
+        let weak = Arc::downgrade(&owner);
+        let unlocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (a, b, checked) = (entered.clone(), leave.clone(), unlocked.clone());
+        owner.stop_observable().add_observer(Arc::new(move || {
+            let owner = weak.upgrade().unwrap();
+            checked.store(
+                owner.state.try_lock().is_ok(),
+                std::sync::atomic::Ordering::Release,
+            );
+            a.wait();
+            b.wait();
+        }));
+        let worker = owner.clone();
+        let job = std::thread::spawn(move || {
+            worker.submit(TaskConclusionProposal::Canceled(
+                CancelReason::UpstreamNoLongerNeeded,
+            ))
+        });
+        entered.wait();
+        assert!(unlocked.load(std::sync::atomic::Ordering::Acquire));
+        assert!(control.is_stopped());
+        assert!(control.wait_until_stopped(Duration::ZERO));
+        let first = control.accepted().unwrap();
+        assert_eq!(
+            owner.current().termination(),
+            Some(&TerminationDetail::Canceled(
+                CancelReason::UpstreamNoLongerNeeded
+            ))
+        );
+        let later =
+            control.report_failure(novarocks_functions::KernelFailure::ResourceExhausted.into());
+        assert_eq!(later.decision, ConclusionDecision::Keep);
+        assert!(Arc::ptr_eq(&first, &later.accepted));
+        leave.wait();
+        assert!(Arc::ptr_eq(&first, &job.join().unwrap().accepted));
+        assert!(!owner.convergence().actual_stopped());
+    }
+
+    #[derive(Debug)]
+    struct TaskPortDropProbe {
+        owner: std::sync::Weak<TaskStatusOwner>,
+        dropped_unlocked: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl std::fmt::Display for TaskPortDropProbe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("private resource diagnostic")
+        }
+    }
+    impl std::error::Error for TaskPortDropProbe {}
+    impl novarocks_execution_contract::failure::FailureProjection for TaskPortDropProbe {
+        fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+            use novarocks_execution_contract::failure::*;
+            FailureFact::new(
+                FailureClass::Resource,
+                FailureReason::new(domain::WORKER, std::num::NonZeroU16::new(65000).unwrap()),
+            )
+        }
+    }
+    impl Drop for TaskPortDropProbe {
+        fn drop(&mut self) {
+            let owner = self.owner.upgrade().unwrap();
+            self.dropped_unlocked.store(
+                owner.state.try_lock().is_ok(),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+    }
+    #[derive(Debug)]
+    struct EnclosingFenceProbe {
+        inner: TaskPortDropProbe,
+        gate: Arc<std::sync::Mutex<()>>,
+    }
+    impl std::fmt::Display for EnclosingFenceProbe {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.inner.fmt(f)
+        }
+    }
+    impl std::error::Error for EnclosingFenceProbe {}
+    impl novarocks_execution_contract::failure::FailureProjection for EnclosingFenceProbe {
+        fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+            assert!(
+                self.gate.try_lock().is_ok(),
+                "projection runs outside the enclosing fence"
+            );
+            self.inner.failure_fact()
+        }
+    }
+    impl Drop for EnclosingFenceProbe {
+        fn drop(&mut self) {
+            assert!(
+                self.gate.try_lock().is_ok(),
+                "discard runs outside the enclosing fence"
+            );
+        }
+    }
+    #[test]
+    fn task_port_retains_a_losing_source_until_the_enclosing_fence_is_released() {
+        for full in [false, true] {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let owner = Arc::new(owner());
+            owner.submit(TaskConclusionProposal::Canceled(
+                CancelReason::UpstreamNoLongerNeeded,
+            ));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let gate = Arc::new(std::sync::Mutex::new(()));
+            if full {
+                let reporter = TaskStatusReporter::new(owner.clone());
+                for _ in 0..4 {
+                    let cause = ExecutionFailure::from(
+                        novarocks_functions::KernelFailure::ResourceExhausted,
+                    );
+                    assert_eq!(
+                        reporter.report_cleanup(PreparedCleanupDiagnostic::from_failure(
+                            &cause,
+                            TaskFailurePhase::Execution,
+                        )),
+                        DiagnosticRecordOutcome::Stored
+                    );
+                }
+            }
+            let source = EnclosingFenceProbe {
+                inner: TaskPortDropProbe {
+                    owner: Arc::downgrade(&owner),
+                    dropped_unlocked: dropped.clone(),
+                },
+                gate: gate.clone(),
+            };
+            let candidate = PreparedTaskConclusion::new(TaskConclusionProposal::Failed {
+                cause: ExecutionFailure::from_domain(source),
+                phase: TaskFailurePhase::Preparation,
+            });
+            let pending = {
+                let _fence = gate.lock().unwrap();
+                let pending = owner.submit_prepared_owned(candidate);
+                assert_eq!(pending.acceptance().decision, ConclusionDecision::Keep);
+                assert!(!dropped.load(Ordering::Acquire));
+                pending
+            };
+            assert!(!dropped.load(Ordering::Acquire));
+            let kept = pending.publish();
+            assert_eq!(kept.decision, ConclusionDecision::Keep);
+            assert!(dropped.load(Ordering::Acquire));
+            let snapshot = owner.secondary_diagnostics();
+            assert_eq!(snapshot.entries().len(), if full { 4 } else { 1 });
+            assert_eq!(snapshot.dropped(), u64::from(full));
+            assert!(!owner.convergence().actual_stopped());
+        }
+    }
+
+    #[test]
+    fn task_port_drops_a_losing_actual_source_after_unlocking() {
+        let owner = Arc::new(owner());
+        owner.submit(TaskConclusionProposal::Canceled(
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let original = ExecutionFailure::from_domain(TaskPortDropProbe {
+            owner: Arc::downgrade(&owner),
+            dropped_unlocked: dropped.clone(),
+        });
+        let held = owner
+            .execution_control(TaskFailurePhase::Execution)
+            .report_failure(original);
+        assert_eq!(held.decision, ConclusionDecision::Keep);
+        assert!(held.accepted.originating_failure().is_none());
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+        let snapshot = owner.secondary_diagnostics();
+        let diagnostic = snapshot.entries().next().unwrap();
+        assert_eq!(diagnostic.role(), crate::TaskDiagnosticRole::LateFailure);
+        assert_eq!(diagnostic.phase(), TaskFailurePhase::Execution);
+        assert_eq!(
+            diagnostic.fact().class(),
+            novarocks_execution_contract::failure::FailureClass::Resource
+        );
+        assert_eq!(diagnostic.fact().reason().code(), 65000);
+        assert_eq!(diagnostic.detail(), "Resource failure (reason 10:65000)");
+        assert!(!diagnostic.detail().contains("private resource diagnostic"));
+        assert_eq!(snapshot.dropped(), 0);
+    }
+
+    #[test]
+    fn task_port_does_not_accept_a_neutral_failure_as_its_original_source() {
+        let owner = owner();
+        assert_eq!(
+            owner.advance(
+                TaskState::Failing,
+                Some(failed("only a status summary")),
+                TaskOutputFacts::default()
+            ),
+            StatusAdvance::MissingFailureSource
+        );
+        assert!(owner.accepted().is_none());
+        assert_eq!(owner.state(), TaskState::Planned);
+        assert!(!TaskExecutionPort::is_stopped(&owner));
+    }
+
     use super::*;
     use novarocks_execution_contract::task_execution::status::{SafeDetail, TaskFailureCategory};
     use novarocks_types::identity::{
@@ -1113,12 +2378,19 @@ mod conclusion_tests {
             Arc::new(TaskStatusSource::new()),
             Arc::new(crate::ManualClock::new()),
             Duration::from_millis(250),
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
         )
     }
 
     fn failure(detail: &str) -> TaskFailure {
         TaskFailure::new(
-            TaskFailureCategory::Execution,
+            novarocks_execution_contract::failure::FailureFact::new(
+                novarocks_execution_contract::failure::FailureClass::Data,
+                novarocks_execution_contract::failure::FailureReason::new(
+                    std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                    std::num::NonZeroU16::new(1).unwrap(),
+                ),
+            ),
             SafeDetail::new(detail).expect("bounded detail"),
         )
     }
@@ -1135,25 +2407,76 @@ mod conclusion_tests {
         TerminationDetail::Failed(failure(detail))
     }
 
+    /// A proposal fixture owns its actual source from construction onward.
+    /// Expected status is an oracle, never input for rebuilding that source.
+    #[derive(Clone, Debug)]
+    struct TerminationFixture {
+        expected: TerminationDetail,
+        source: Option<ExecutionFailure>,
+    }
+    impl TerminationFixture {
+        fn command(expected: TerminationDetail) -> Self {
+            assert!(!matches!(expected, TerminationDetail::Failed(_)));
+            Self {
+                expected,
+                source: None,
+            }
+        }
+        fn producer(source: novarocks_functions::KernelFailure) -> Self {
+            let source = ExecutionFailure::from(source);
+            let expected = TerminationDetail::Failed(TaskFailure::new_in_phase(
+                source.failure_fact(),
+                source.safe_detail(),
+                TaskFailurePhase::Execution,
+            ));
+            Self {
+                expected,
+                source: Some(source),
+            }
+        }
+        fn submit(&self, owner: &TaskStatusOwner) -> ConclusionAcceptance<ExecutionFailure> {
+            let proposal = match (&self.expected, &self.source) {
+                (TerminationDetail::Canceled(reason), None) => {
+                    TaskConclusionProposal::Canceled(*reason)
+                }
+                (TerminationDetail::Aborted(cause), None) => {
+                    TaskConclusionProposal::Aborted(*cause)
+                }
+                (TerminationDetail::Failed(_), Some(cause)) => TaskConclusionProposal::Failed {
+                    cause: cause.clone(),
+                    phase: TaskFailurePhase::Execution,
+                },
+                _ => panic!("a fixture cannot reconstruct a cause from a summary"),
+            };
+            owner.submit(proposal)
+        }
+    }
+    fn resource_fixture() -> TerminationFixture {
+        TerminationFixture::producer(novarocks_functions::KernelFailure::ResourceExhausted)
+    }
+    fn internal_fixture() -> TerminationFixture {
+        TerminationFixture::producer(novarocks_functions::KernelFailure::Internal(
+            novarocks_functions::KernelDiagnostic::new("actual test producer failure"),
+        ))
+    }
+
     #[derive(Clone, Debug)]
     enum Start {
         /// Accepted but not installed: the shape a rolled-back creation has.
         Planned,
         Running,
-        Terminating(TerminationDetail),
+        Terminating(TerminationFixture),
     }
 
     fn start(start: &Start) -> TaskStatusOwner {
         let owner = owner();
-        let enter = |detail: &TerminationDetail| {
-            assert!(matches!(
-                owner.advance(
-                    terminating_state_of(detail),
-                    Some(detail.clone()),
-                    TaskOutputFacts::default()
-                ),
-                StatusAdvance::Published(_)
-            ));
+        let enter = |fixture: &TerminationFixture| {
+            let accepted = fixture.submit(&owner);
+            assert_eq!(accepted.decision, ConclusionDecision::Accept);
+            assert_eq!(
+                accepted.accepted.neutral().conclusion(),
+                &TaskConclusion::Terminated(fixture.expected.clone())
+            );
         };
         match start {
             Start::Planned => {}
@@ -1194,12 +2517,14 @@ mod conclusion_tests {
     /// progress completes with its own cause.
     #[test]
     fn termination_proposals_complete_the_stand_down_that_won() {
-        let first_cancel = canceled(CancelReason::UpstreamNoLongerNeeded);
-        let first_abort = aborted(AbortCause::LeaseExpired);
-        let first_failure = failed("first failure");
-        let late_cancel = canceled(CancelReason::UpstreamNoLongerNeeded);
-        let late_abort = aborted(AbortCause::PeerTaskFailed);
-        let late_failure = failed("late failure");
+        let first_cancel =
+            TerminationFixture::command(canceled(CancelReason::UpstreamNoLongerNeeded));
+        let first_abort = TerminationFixture::command(aborted(AbortCause::LeaseExpired));
+        let first_failure = resource_fixture();
+        let late_cancel =
+            TerminationFixture::command(canceled(CancelReason::UpstreamNoLongerNeeded));
+        let late_abort = TerminationFixture::command(aborted(AbortCause::PeerTaskFailed));
+        let late_failure = internal_fixture();
         let cases = [
             (Start::Planned, late_cancel.clone(), late_cancel.clone()),
             (Start::Planned, late_abort.clone(), late_abort.clone()),
@@ -1207,7 +2532,6 @@ mod conclusion_tests {
             (Start::Running, late_cancel.clone(), late_cancel.clone()),
             (Start::Running, late_abort.clone(), late_abort.clone()),
             (Start::Running, late_failure.clone(), late_failure.clone()),
-            // An abort or a failure supersedes a cancellation in progress.
             (
                 Start::Terminating(first_cancel.clone()),
                 late_cancel.clone(),
@@ -1216,15 +2540,13 @@ mod conclusion_tests {
             (
                 Start::Terminating(first_cancel.clone()),
                 late_abort.clone(),
-                late_abort.clone(),
+                first_cancel.clone(),
             ),
             (
                 Start::Terminating(first_cancel.clone()),
                 late_failure.clone(),
-                late_failure.clone(),
+                first_cancel.clone(),
             ),
-            // A stale cancellation, a second abort, or a failure cannot
-            // rewrite an abort that already won.
             (
                 Start::Terminating(first_abort.clone()),
                 late_cancel.clone(),
@@ -1259,24 +2581,107 @@ mod conclusion_tests {
         for (start_state, proposal, winner) in cases {
             let context = format!("{start_state:?} + {proposal:?}");
             let owner = start(&start_state);
+            proposal.submit(&owner);
             assert!(
                 matches!(
-                    owner.conclude_termination(proposal.clone(), TaskOutputFacts::default()),
+                    owner.conclude_termination(
+                        proposal.expected.clone(),
+                        TaskOutputFacts::default()
+                    ),
                     StatusAdvance::Published(_)
                 ),
                 "{context}"
             );
-            let terminal = terminal_state_of(terminating_state_of(&winner)).expect("terminal");
-            assert_concluded(&owner, terminal, Some(winner), &context);
-
+            let terminal =
+                terminal_state_of(terminating_state_of(&winner.expected)).expect("terminal");
+            assert_concluded(&owner, terminal, Some(winner.expected.clone()), &context);
+            if let Some(source) = &winner.source {
+                assert!(std::ptr::eq(
+                    owner
+                        .accepted()
+                        .unwrap()
+                        .originating_failure()
+                        .unwrap()
+                        .cause(),
+                    source.cause()
+                ));
+            }
             let settled = owner.current();
             assert_eq!(
-                owner.conclude_termination(proposal, TaskOutputFacts::default()),
+                owner.conclude_termination(proposal.expected, TaskOutputFacts::default()),
                 StatusAdvance::AlreadyTerminal(terminal),
                 "{context}: the first terminal wins"
             );
             assert_eq!(owner.current(), settled, "{context}");
         }
+    }
+
+    #[test]
+    fn forced_logical_convergence_keeps_each_accepted_cause_without_claiming_actual_exit() {
+        for winner in [
+            TerminationFixture::command(canceled(CancelReason::UpstreamNoLongerNeeded)),
+            TerminationFixture::command(aborted(AbortCause::QueryFailed)),
+            TerminationFixture::command(aborted(AbortCause::PeerTaskFailed)),
+            resource_fixture(),
+        ] {
+            let owner = start(&Start::Terminating(winner.clone()));
+            assert!(owner.force_conclusion(AbortCause::LeaseExpired));
+            assert_concluded(
+                &owner,
+                terminal_state_of(terminating_state_of(&winner.expected)).unwrap(),
+                Some(winner.expected.clone()),
+                "forced convergence keeps acceptance",
+            );
+            assert!(!owner.convergence().actual_stopped());
+            let stable = owner.current();
+            assert!(!owner.force_conclusion(AbortCause::QueryFailed));
+            assert_eq!(owner.current(), stable);
+        }
+    }
+
+    #[test]
+    fn only_an_originating_failure_refines_a_live_derived_placeholder() {
+        let derived = aborted(AbortCause::PeerTaskFailed);
+        let owner = start(&Start::Terminating(TerminationFixture::command(
+            derived.clone(),
+        )));
+        for proposal in [
+            canceled(CancelReason::UpstreamNoLongerNeeded),
+            aborted(AbortCause::LeaseExpired),
+        ] {
+            assert_eq!(
+                owner.advance(
+                    terminating_state_of(&proposal),
+                    Some(proposal),
+                    TaskOutputFacts::default()
+                ),
+                StatusAdvance::KeptConclusion(TaskState::Aborting)
+            );
+            assert_eq!(owner.current().termination(), Some(&derived));
+        }
+        let original = resource_fixture();
+        assert_eq!(
+            original.submit(&owner).decision,
+            ConclusionDecision::RefineDerived
+        );
+        let later = internal_fixture();
+        assert_eq!(later.submit(&owner).decision, ConclusionDecision::Keep);
+        owner.conclude_termination(later.expected, TaskOutputFacts::default());
+        assert_concluded(
+            &owner,
+            TaskState::Failed,
+            Some(original.expected),
+            "originating refinement only",
+        );
+        assert!(std::ptr::eq(
+            owner
+                .accepted()
+                .unwrap()
+                .originating_failure()
+                .unwrap()
+                .cause(),
+            original.source.unwrap().cause()
+        ));
     }
 
     #[test]
@@ -1301,17 +2706,13 @@ mod conclusion_tests {
         assert!(owner.current().output().responsibility_complete());
 
         for winner in [
-            canceled(CancelReason::UpstreamNoLongerNeeded),
-            aborted(AbortCause::PeerTaskFailed),
-            failed("own failure"),
+            TerminationFixture::command(canceled(CancelReason::UpstreamNoLongerNeeded)),
+            TerminationFixture::command(aborted(AbortCause::PeerTaskFailed)),
+            resource_fixture(),
         ] {
             let context = format!("{winner:?}");
             let owner = start(&Start::Running);
-            owner.advance(
-                terminating_state_of(&winner),
-                Some(winner.clone()),
-                TaskOutputFacts::default(),
-            );
+            winner.submit(&owner);
             assert!(
                 matches!(
                     owner.conclude_success(TaskOutputFacts::new(true)),
@@ -1319,12 +2720,757 @@ mod conclusion_tests {
                 ),
                 "{context}"
             );
-            let terminal = terminal_state_of(terminating_state_of(&winner)).expect("terminal");
-            assert_concluded(&owner, terminal, Some(winner), &context);
+            let terminal =
+                terminal_state_of(terminating_state_of(&winner.expected)).expect("terminal");
+            assert_concluded(&owner, terminal, Some(winner.expected), &context);
             assert!(
                 owner.current().output().responsibility_complete(),
                 "{context}: a sink that ran to success keeps that fact"
             );
+        }
+    }
+    #[test]
+    fn cleanup_records_borrow_real_sources_without_accepting_or_releasing_work() {
+        use crate::TaskDiagnosticRole;
+        use novarocks_execution_contract::failure::FailureProjection;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let check = |owner: &Arc<TaskStatusOwner>| {
+            let before = owner.current();
+            let before_convergence = owner.convergence();
+            let accepted = owner.accepted();
+            let callbacks = Arc::new(AtomicUsize::new(0));
+            let count = callbacks.clone();
+            owner.stop_observable().add_observer(Arc::new(move || {
+                count.fetch_add(1, Ordering::Release);
+            }));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let source = ExecutionFailure::from_domain(TaskPortDropProbe {
+                owner: Arc::downgrade(owner),
+                dropped_unlocked: dropped.clone(),
+            });
+            let fact = source.failure_fact();
+            let prepared =
+                PreparedCleanupDiagnostic::from_failure(&source, TaskFailurePhase::Execution);
+            assert_eq!(
+                TaskStatusReporter::new(owner.clone()).report_cleanup(prepared),
+                DiagnosticRecordOutcome::Stored
+            );
+            assert!(
+                !dropped.load(Ordering::Acquire),
+                "cleanup only borrowed its real source"
+            );
+            let snapshot = owner.secondary_diagnostics();
+            let diagnostic = snapshot.entries().next().unwrap();
+            assert_eq!(diagnostic.role(), TaskDiagnosticRole::Cleanup);
+            assert_eq!(diagnostic.phase(), TaskFailurePhase::Execution);
+            assert_eq!(diagnostic.fact(), fact);
+            assert_eq!(diagnostic.detail(), source.safe_detail().as_str());
+            assert!(!diagnostic.detail().contains("private resource diagnostic"));
+            drop(source);
+            assert!(
+                dropped.load(Ordering::Acquire),
+                "the neutral snapshot cannot retain the real source"
+            );
+            assert_eq!(owner.current(), before);
+            assert_eq!(owner.convergence(), before_convergence);
+            assert_eq!(callbacks.load(Ordering::Acquire), 0);
+            match accepted {
+                Some(accepted) => assert!(Arc::ptr_eq(&accepted, &owner.accepted().unwrap())),
+                None => assert!(owner.accepted().is_none()),
+            }
+        };
+
+        let empty = Arc::new(owner());
+        check(&empty);
+        assert!(
+            !empty.is_stopped(),
+            "cleanup cannot manufacture a Task stop"
+        );
+
+        let peer = Arc::new(owner());
+        let control = peer.execution_control(TaskFailurePhase::Preparation);
+        let receipt = peer.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        check(&peer);
+        for _ in 0..32 {
+            let observation = control.error().unwrap();
+            let kept = control.report_failure(observation);
+            assert_eq!(kept.decision, ConclusionDecision::Keep);
+            assert!(Arc::ptr_eq(&receipt.accepted, &kept.accepted));
+        }
+        assert_eq!(peer.secondary_diagnostics().entries().len(), 1);
+        assert_eq!(
+            peer.secondary_diagnostics().dropped(),
+            0,
+            "stop observations are not late origin reports"
+        );
+        let origin = ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted);
+        let refined = control.report_failure(origin.clone());
+        assert_eq!(refined.decision, ConclusionDecision::RefineDerived);
+        assert_eq!(refined.accepted.neutral().generation().get(), 2);
+        assert!(std::ptr::eq(
+            refined.accepted.originating_failure().unwrap().cause(),
+            origin.cause()
+        ));
+        assert_eq!(
+            peer.secondary_diagnostics().entries().len(),
+            1,
+            "legal refinement is not secondary"
+        );
+
+        let canceled = Arc::new(owner());
+        canceled.submit(TaskConclusionProposal::Canceled(
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        check(&canceled);
+
+        let succeeded = Arc::new(start(&Start::Running));
+        succeeded.note_actual_stopped();
+        succeeded.conclude_success(TaskOutputFacts::new(true));
+        assert_eq!(
+            succeeded.accepted().unwrap().neutral().conclusion(),
+            &TaskConclusion::Succeeded
+        );
+        check(&succeeded);
+    }
+
+    #[test]
+    fn late_and_cleanup_reports_share_four_slots_without_changing_the_winner() {
+        use crate::TaskDiagnosticRole;
+        use novarocks_execution_contract::failure::FailureProjection;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let owner = Arc::new(owner());
+        owner.release_to_observers();
+        let first = owner.submit(TaskConclusionProposal::Canceled(
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        let stable = owner.current();
+        let convergence = owner.convergence();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let count = callbacks.clone();
+        owner.stop_observable().add_observer(Arc::new(move || {
+            count.fetch_add(1, Ordering::Release);
+        }));
+        let reporter = TaskStatusReporter::new(owner.clone());
+        for index in 0..6 {
+            let source =
+                ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted);
+            if index % 2 == 0 {
+                let expected = if index < 4 {
+                    DiagnosticRecordOutcome::Stored
+                } else {
+                    DiagnosticRecordOutcome::Dropped
+                };
+                assert_eq!(
+                    reporter.report_cleanup(PreparedCleanupDiagnostic::from_failure(
+                        &source,
+                        TaskFailurePhase::Execution,
+                    )),
+                    expected
+                );
+            } else {
+                let kept = reporter.report_failure(source, TaskFailurePhase::Preparation);
+                assert_eq!(kept.decision, ConclusionDecision::Keep);
+                assert!(Arc::ptr_eq(&first.accepted, &kept.accepted));
+            }
+        }
+        let snapshot = reporter.secondary_diagnostics();
+        assert_eq!(snapshot.entries().len(), 4);
+        assert_eq!(snapshot.dropped(), 2);
+        let expected_fact =
+            ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted)
+                .failure_fact();
+        for (index, diagnostic) in snapshot.entries().enumerate() {
+            assert_eq!(diagnostic.fact(), expected_fact);
+            assert_eq!(
+                diagnostic.role(),
+                if index % 2 == 0 {
+                    TaskDiagnosticRole::Cleanup
+                } else {
+                    TaskDiagnosticRole::LateFailure
+                }
+            );
+            assert_eq!(
+                diagnostic.phase(),
+                if index % 2 == 0 {
+                    TaskFailurePhase::Execution
+                } else {
+                    TaskFailurePhase::Preparation
+                }
+            );
+        }
+        assert_eq!(owner.current(), stable);
+        assert_eq!(owner.convergence(), convergence);
+        assert_eq!(callbacks.load(Ordering::Acquire), 0);
+        assert!(Arc::ptr_eq(&first.accepted, &owner.accepted().unwrap()));
+    }
+
+    #[test]
+    fn concurrent_cleanup_observations_only_consume_the_same_bounded_local_journal() {
+        let owner = Arc::new(owner());
+        let accepted = owner.submit(TaskConclusionProposal::Canceled(
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        let stable = owner.current();
+        let convergence = owner.convergence();
+        let jobs = (0..16)
+            .map(|_| {
+                let reporter = TaskStatusReporter::new(owner.clone());
+                std::thread::spawn(move || {
+                    let cause = ExecutionFailure::from(
+                        novarocks_functions::KernelFailure::ResourceExhausted,
+                    );
+                    let prepared = PreparedCleanupDiagnostic::from_failure(
+                        &cause,
+                        TaskFailurePhase::Execution,
+                    );
+                    reporter.report_cleanup(prepared)
+                })
+            })
+            .collect::<Vec<_>>();
+        let stored = jobs
+            .into_iter()
+            .map(|job| job.join().unwrap())
+            .filter(|outcome| *outcome == DiagnosticRecordOutcome::Stored)
+            .count();
+        assert_eq!(stored, 4);
+        let snapshot = owner.secondary_diagnostics();
+        assert_eq!(snapshot.entries().len(), 4);
+        assert_eq!(snapshot.dropped(), 12);
+        assert_eq!(owner.current(), stable);
+        assert_eq!(owner.convergence(), convergence);
+        assert!(Arc::ptr_eq(&accepted.accepted, &owner.accepted().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod publication_boundary_tests {
+    use super::*;
+    use novarocks_types::identity::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        task::{Context, Poll, Wake, Waker},
+    };
+
+    struct ReentrantObserver {
+        owner: Arc<TaskStatusOwner>,
+        wakes: AtomicUsize,
+        locked: AtomicBool,
+    }
+    impl Wake for ReentrantObserver {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::Relaxed);
+            // A notifier is allowed to synchronously schedule a callback.
+            // Check the lock without risking a deadlocked test on regression.
+            if self.owner.state.try_lock().is_err() {
+                self.locked.store(true, Ordering::Release);
+            }
+        }
+    }
+    #[test]
+    fn creation_lifecycle_and_metric_notifications_run_after_the_owner_unlocks() {
+        let execution =
+            QueryExecutionId::new(QueryId::new(3902, 1), AttemptId::new(1).unwrap()).unwrap();
+        let identity = TaskIdentity::new(
+            execution,
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            BackendProcessId::new_v7(),
+        );
+        let source = Arc::new(TaskStatusSource::new());
+        let owner = Arc::new(TaskStatusOwner::new(
+            identity,
+            source.clone(),
+            Arc::new(crate::ManualClock::new()),
+            Duration::ZERO,
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
+        ));
+        let observer = Arc::new(ReentrantObserver {
+            owner: owner.clone(),
+            wakes: AtomicUsize::new(0),
+            locked: AtomicBool::new(false),
+        });
+        // Installation is required before RUNNING and is still withheld from
+        // observers until this real creation transaction commits.
+        assert!(matches!(
+            owner.note_installed(),
+            StatusAdvance::Published(_)
+        ));
+        let waker = Waker::from(observer.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut pending = Box::pin(source.next_task_event_owned());
+        assert!(matches!(pending.as_mut().poll(&mut context), Poll::Pending));
+        owner.release_to_observers();
+        assert!(matches!(
+            pending.as_mut().poll(&mut context),
+            Poll::Ready(Some(_))
+        ));
+        for _ in 0..2 {
+            let mut pending = Box::pin(source.next_task_event_owned());
+            assert!(matches!(pending.as_mut().poll(&mut context), Poll::Pending));
+            if owner.state() == TaskState::Planned {
+                assert!(matches!(
+                    owner.advance(TaskState::Running, None, TaskOutputFacts::default()),
+                    StatusAdvance::Published(_)
+                ));
+            } else {
+                assert!(matches!(
+                    owner.report_metrics(TaskResourceFacts::empty(), None),
+                    StatusAdvance::Republished(_)
+                ));
+            }
+            assert!(matches!(
+                pending.as_mut().poll(&mut context),
+                Poll::Ready(Some(_))
+            ));
+        }
+        assert_eq!(observer.wakes.load(Ordering::Acquire), 3);
+        assert!(!observer.locked.load(Ordering::Acquire));
+    }
+}
+
+#[cfg(test)]
+mod exit_health_port_tests {
+    use super::*;
+    use novarocks_execution::runtime::execution_health::ExecutionExitOrigin;
+    use novarocks_execution_contract::failure::FailureProjection;
+
+    #[test]
+    fn execution_control_reports_to_the_injected_health_without_refining_peer_or_stopping_work() {
+        let identity = TaskIdentity::new(
+            novarocks_types::QueryExecutionId::new(
+                novarocks_types::QueryId::new(5101, 5102),
+                novarocks_types::AttemptId::new(1).unwrap(),
+            )
+            .unwrap(),
+            novarocks_types::StageId::new(1).unwrap(),
+            novarocks_types::TaskId::new(1).unwrap(),
+            novarocks_types::BackendProcessId::new_v7(),
+        );
+        let health =
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default());
+        let owner = Arc::new(TaskStatusOwner::new(
+            identity,
+            Arc::new(TaskStatusSource::new()),
+            Arc::new(crate::ManualClock::new()),
+            Duration::ZERO,
+            health.clone(),
+        ));
+        let accepted = owner
+            .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
+            .accepted;
+        let before = owner.current();
+        let convergence = owner.convergence();
+        let cause = ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted);
+        let control = owner.execution_control(TaskFailurePhase::Execution);
+        control.report_cleanup(&cause);
+        control.report_unresolved_exit(&cause);
+        let fault = health.failure().unwrap();
+        assert_eq!(
+            fault.origin(),
+            ExecutionExitOrigin::Task {
+                identity,
+                phase: TaskFailurePhase::Execution
+            }
+        );
+        assert_eq!(fault.fact(), cause.failure_fact());
+        assert_eq!(owner.current(), before);
+        assert_eq!(owner.convergence(), convergence);
+        assert!(Arc::ptr_eq(&accepted, &owner.accepted().unwrap()));
+        assert!(owner.accepted().unwrap().originating_failure().is_none());
+        let diagnostics = owner.secondary_diagnostics();
+        assert_eq!(diagnostics.entries().len(), 1);
+        assert_eq!(
+            diagnostics.entries().next().unwrap().role(),
+            crate::TaskDiagnosticRole::Cleanup
+        );
+        let refined = control.report_failure(cause);
+        assert_eq!(
+            refined.decision,
+            novarocks_execution_contract::ConclusionDecision::RefineDerived
+        );
+    }
+}
+
+#[cfg(test)]
+mod preparation_runtime_receipt_tests {
+    use super::*;
+    use crate::task_preparation::PreparationUnwindRole;
+    use novarocks_types::identity::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PrimaryDrop {
+        data: Arc<Vec<u8>>,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        secondary: bool,
+        secondary_drops: Arc<AtomicUsize>,
+    }
+    struct SecondaryDrop(Arc<Vec<u8>>, Arc<AtomicUsize>);
+    impl Drop for SecondaryDrop {
+        fn drop(&mut self) {
+            self.1.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    impl Drop for PrimaryDrop {
+        fn drop(&mut self) {
+            self.entered.send(()).unwrap();
+            self.release.recv().unwrap();
+            if self.secondary {
+                std::panic::panic_any(SecondaryDrop(
+                    self.data.clone(),
+                    self.secondary_drops.clone(),
+                ));
+            }
+        }
+    }
+    fn actual_runtime_receipt_during_primary_drop(secondary: bool) {
+        let execution =
+            QueryExecutionId::new(QueryId::new(59_230, 1), AttemptId::new(1).unwrap()).unwrap();
+        let owner = Arc::new(TaskStatusOwner::new(
+            TaskIdentity::new(
+                execution,
+                StageId::new(1).unwrap(),
+                TaskId::new(1).unwrap(),
+                BackendProcessId::new_v7(),
+            ),
+            Arc::new(TaskStatusSource::new()),
+            Arc::new(crate::ManualClock::new()),
+            Duration::ZERO,
+            Arc::new(ExecutionHealth::default()),
+        ));
+        owner.release_to_observers();
+        let scope = owner.preparation_scope_arc();
+        let data = Arc::new(vec![93u8; 16 * 1024]);
+        let weak_body_data = Arc::downgrade(&data);
+        let secondary_drops = Arc::new(AtomicUsize::new(0));
+        let (entered, did_enter) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        scope.retain_body_panic(
+            PreparationUnwindRole::Preparation,
+            Box::new(PrimaryDrop {
+                data,
+                entered,
+                release: released,
+                secondary,
+                secondary_drops: secondary_drops.clone(),
+            }),
+        );
+        let disposer_scope = scope.clone();
+        let disposer = std::thread::spawn(move || {
+            disposer_scope.dispose_body_panic(PreparationUnwindRole::Preparation)
+        });
+        did_enter.recv().unwrap();
+        let runtime_data = Arc::new(vec![94u8; 16 * 1024]);
+        let weak_runtime_data = Arc::downgrade(&runtime_data);
+        let reporter = TaskStatusReporter::new(owner.clone());
+        let runtime = std::thread::spawn(move || {
+            drop(runtime_data);
+            reporter.note_actual_stopped();
+            reporter.note_resources_converged();
+            drop(reporter);
+        });
+        // Always release and join both real jobs before reporting an oracle
+        // failure, so a failed receipt assertion cannot strand their gate.
+        let runtime_result = runtime.join();
+        let pending = owner.convergence();
+        let receipt_retained = owner.runtime_actual_stopped_received();
+        let no_public_receipt = owner
+            .source
+            .latest_task_convergence(owner.identity())
+            .is_none();
+        release.send(()).unwrap();
+        let disposer_result = disposer.join();
+        scope.body_exited();
+        let finished = scope.complete_empty_after_actual_runtime_exit(
+            owner.runtime_actual_stopped_received(),
+            || owner.refresh_preparation_exit_receipts(),
+        );
+        assert!(runtime_result.is_ok() && disposer_result.is_ok());
+        assert!(
+            weak_runtime_data.upgrade().is_none(),
+            "actual runtime data exited before its original receipt"
+        );
+        assert!(receipt_retained && no_public_receipt);
+        assert!(
+            !pending.actual_stopped() && !pending.resources_converged(),
+            "Started opaque disposal is Pending rather than TaskStopped"
+        );
+        assert_eq!(secondary_drops.load(Ordering::Acquire), 0);
+        if secondary {
+            assert!(!finished);
+            assert!(weak_body_data.upgrade().is_some());
+            assert!(
+                !owner.convergence().actual_stopped() && !owner.convergence().resources_converged()
+            );
+            assert!(
+                owner
+                    .source
+                    .latest_task_convergence(owner.identity())
+                    .is_none()
+            );
+            assert_eq!(
+                owner
+                    .execution_health
+                    .failure()
+                    .unwrap()
+                    .fact()
+                    .reason()
+                    .code(),
+                161
+            );
+        } else {
+            assert!(finished);
+            assert!(weak_body_data.upgrade().is_none());
+            assert!(
+                owner.convergence().actual_stopped() && owner.convergence().resources_converged()
+            );
+            assert!(
+                owner
+                    .source
+                    .latest_task_convergence(owner.identity())
+                    .is_some(),
+                "original prep finish publishes the retained real receipt without replaying runtime cleanup"
+            );
+            assert!(owner.execution_health.is_healthy());
+        }
+    }
+    #[test]
+    fn a_real_runtime_receipt_waits_for_primary_payload_drop_then_publishes_once() {
+        actual_runtime_receipt_during_primary_drop(false);
+    }
+    #[test]
+    fn a_real_runtime_receipt_remains_retained_but_unpublished_after_secondary_drop_unresolved() {
+        actual_runtime_receipt_during_primary_drop(true);
+    }
+}
+
+#[cfg(test)]
+mod preparation_body_phase_tests {
+    use super::*;
+    use novarocks_execution_contract::failure::{FailureFact, FailureProjection};
+    use novarocks_types::identity::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+    use std::sync::{Barrier, Weak};
+
+    fn owner() -> Arc<TaskStatusOwner> {
+        Arc::new(TaskStatusOwner::new(
+            TaskIdentity::new(
+                QueryExecutionId::new(QueryId::new(91, 147), AttemptId::new(1).unwrap()).unwrap(),
+                StageId::new(1).unwrap(),
+                TaskId::new(1).unwrap(),
+                BackendProcessId::new_v7(),
+            ),
+            Arc::new(TaskStatusSource::new()),
+            Arc::new(crate::ManualClock::new()),
+            Duration::ZERO,
+            Arc::new(ExecutionHealth::default()),
+        ))
+    }
+    fn source() -> ExecutionFailure {
+        ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted)
+    }
+    fn assert_original_failure(
+        owner: &TaskStatusOwner,
+        installed: bool,
+        expected_phase: TaskFailurePhase,
+        expected: FailureFact,
+    ) {
+        let status = owner.current();
+        assert_eq!(status.installed(), installed);
+        assert_eq!(status.state(), TaskState::Failing);
+        let Some(TerminationDetail::Failed(failure)) = status.termination() else {
+            panic!("the original body failure remains its only conclusion")
+        };
+        assert_eq!(failure.phase(), expected_phase);
+        assert_eq!(failure.fact(), expected);
+        let accepted = owner.accepted().unwrap();
+        assert_eq!(
+            accepted.originating_failure().unwrap().failure_fact(),
+            expected
+        );
+        let TaskConclusion::Terminated(TerminationDetail::Failed(failure)) =
+            accepted.neutral().conclusion()
+        else {
+            panic!("the same Task accepts the original failure")
+        };
+        assert_eq!(failure.phase(), expected_phase);
+        assert_eq!(failure.fact(), expected);
+        // Neither lifecycle phase nor logical failure invents actual runtime exit.
+        assert!(!owner.runtime_actual_stopped_received());
+        assert!(!owner.convergence().actual_stopped());
+        assert!(!owner.convergence().resources_converged());
+    }
+    #[test]
+    fn original_body_failure_before_installation_keeps_preparation_and_blocks_late_installed() {
+        let owner = owner();
+        let original = source();
+        let fact = original.failure_fact();
+        let pointer = original.cause() as *const _;
+        let accepted = owner.report_preparation_body_failure(original);
+        assert_eq!(accepted.decision, ConclusionDecision::Accept);
+        assert_eq!(
+            accepted.accepted.originating_failure().unwrap().cause() as *const _,
+            pointer
+        );
+        let before = owner.current();
+        // This is the real setter a caller can enter after its stale stop read.
+        assert_eq!(
+            owner.note_installed(),
+            StatusAdvance::KeptConclusion(TaskState::Failing)
+        );
+        assert_eq!(owner.current(), before);
+        assert_original_failure(&owner, false, TaskFailurePhase::Preparation, fact);
+    }
+    #[test]
+    fn original_installed_before_body_failure_selects_execution_without_running_the_runtime() {
+        let owner = owner();
+        assert!(matches!(
+            owner.note_installed(),
+            StatusAdvance::Published(_)
+        ));
+        assert_eq!(owner.current().state(), TaskState::Planned);
+        let original = source();
+        let fact = original.failure_fact();
+        let pointer = original.cause() as *const _;
+        let accepted = owner.report_preparation_body_failure(original);
+        assert_eq!(accepted.decision, ConclusionDecision::Accept);
+        assert_eq!(
+            accepted.accepted.originating_failure().unwrap().cause() as *const _,
+            pointer
+        );
+        assert_original_failure(&owner, true, TaskFailurePhase::Execution, fact);
+        // Same-identity Installed replay retains its irreversible historical fact.
+        assert_eq!(
+            owner.note_installed(),
+            StatusAdvance::Published(owner.current().version())
+        );
+    }
+    #[test]
+    fn concurrent_original_installed_and_body_failure_have_exactly_one_legal_linearization() {
+        for _ in 0..64 {
+            let owner = owner();
+            let start = Arc::new(Barrier::new(2));
+            let installer = owner.clone();
+            let installer_start = start.clone();
+            let installed = std::thread::spawn(move || {
+                installer_start.wait();
+                installer.note_installed()
+            });
+            let reporter = owner.clone();
+            let original = source();
+            let fact = original.failure_fact();
+            let accepted = std::thread::spawn(move || {
+                start.wait();
+                reporter.report_preparation_body_failure(original)
+            });
+            let installation = installed
+                .join()
+                .expect("the actual installation setter exits");
+            let accepted = accepted.join().expect("the actual failure author exits");
+            assert_eq!(accepted.decision, ConclusionDecision::Accept);
+            match installation {
+                StatusAdvance::Published(_) => {
+                    assert_original_failure(&owner, true, TaskFailurePhase::Execution, fact)
+                }
+                StatusAdvance::KeptConclusion(TaskState::Failing) => {
+                    assert_original_failure(&owner, false, TaskFailurePhase::Preparation, fact)
+                }
+                other => panic!("unexpected actual installation result: {other:?}"),
+            }
+        }
+    }
+    #[test]
+    fn earlier_cancellation_and_peer_placeholder_keep_the_original_priority_rules() {
+        for installed in [false, true] {
+            for peer in [false, true] {
+                let owner = owner();
+                if installed {
+                    owner.note_installed();
+                }
+                let first = if peer {
+                    owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
+                } else {
+                    owner.submit(TaskConclusionProposal::Canceled(
+                        CancelReason::UpstreamNoLongerNeeded,
+                    ))
+                };
+                let stable = owner.current();
+                let original = source();
+                let fact = original.failure_fact();
+                let phase = if installed {
+                    TaskFailurePhase::Execution
+                } else {
+                    TaskFailurePhase::Preparation
+                };
+                let late = owner.report_preparation_body_failure(original);
+                if peer {
+                    assert_eq!(late.decision, ConclusionDecision::RefineDerived);
+                    assert_original_failure(&owner, installed, phase, fact);
+                } else {
+                    assert_eq!(late.decision, ConclusionDecision::Keep);
+                    assert!(Arc::ptr_eq(&first.accepted, &late.accepted));
+                    assert_eq!(owner.current(), stable);
+                    let diagnostics = owner.secondary_diagnostics();
+                    assert_eq!(diagnostics.entries().len(), 1);
+                    let late = diagnostics.entries().next().unwrap();
+                    assert_eq!(late.phase(), phase);
+                    assert_eq!(late.fact(), fact);
+                }
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct DropProbe {
+        owner: Weak<TaskStatusOwner>,
+        sample: Arc<Mutex<Option<bool>>>,
+    }
+    impl fmt::Display for DropProbe {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("actual losing source disposal probe")
+        }
+    }
+    impl std::error::Error for DropProbe {}
+    impl FailureProjection for DropProbe {
+        fn failure_fact(&self) -> FailureFact {
+            source().failure_fact()
+        }
+    }
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            let unlocked = self.owner.upgrade().unwrap().state.try_lock().is_ok();
+            *self.sample.lock().unwrap() = Some(unlocked);
+        }
+    }
+    #[test]
+    fn unselected_and_losing_rich_candidates_destroy_their_original_source_after_unlock() {
+        for installed in [false, true] {
+            let owner = owner();
+            if installed {
+                owner.note_installed();
+            }
+            let original = owner.submit(TaskConclusionProposal::Canceled(
+                CancelReason::UpstreamNoLongerNeeded,
+            ));
+            let sample = Arc::new(Mutex::new(None));
+            let late =
+                owner.report_preparation_body_failure(ExecutionFailure::from_domain(DropProbe {
+                    owner: Arc::downgrade(&owner),
+                    sample: sample.clone(),
+                }));
+            assert_eq!(late.decision, ConclusionDecision::Keep);
+            assert!(Arc::ptr_eq(&original.accepted, &late.accepted));
+            assert_eq!(*sample.lock().unwrap(), Some(true));
         }
     }
 }

@@ -66,36 +66,40 @@ impl PreparedWriteSetLedger {
     /// Charge one canonical commit fragment. Reaching a bound is legal;
     /// exceeding it is `ResourceExhausted` and never a truncation.
     pub fn reserve_fragment(&mut self, fragment_bytes: usize) -> Result<(), ConnectorError> {
+        use super::failure::WriteSetRefusal;
+        use novarocks_failure_contract::ResourceDimension;
         if fragment_bytes > MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "connector commit fragment exceeds the frozen single-fragment budget",
-            ));
+            return Err(WriteSetRefusal::Fragment {
+                requested: fragment_bytes,
+            }
+            .into());
         }
         let entries = self.entries.checked_add(1).ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "connector prepared write set entry count overflowed",
-            )
+            ConnectorError::from(WriteSetRefusal::Arithmetic {
+                dimension: ResourceDimension::Items,
+                live: self.entries,
+                requested: 1,
+            })
         })?;
         if entries > MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "connector prepared write set exceeds the frozen entry budget",
-            ));
+            return Err(WriteSetRefusal::Entries { live: self.entries }.into());
         }
         let bytes = self.bytes.checked_add(fragment_bytes).ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "connector prepared write set byte total overflowed",
-            )
+            ConnectorError::from(WriteSetRefusal::Arithmetic {
+                dimension: ResourceDimension::Bytes,
+                live: self.bytes,
+                requested: fragment_bytes,
+            })
         })?;
         if bytes > MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "connector prepared write set exceeds the frozen byte budget",
-            ));
+            return Err(WriteSetRefusal::Bytes {
+                live: self.bytes,
+                requested: fragment_bytes,
+            }
+            .into());
         }
+        // All constraints accepted this one fragment. No refused request
+        // mutates either dimension of the complete prepared-write set.
         self.bytes = bytes;
         self.entries = entries;
         Ok(())
@@ -151,10 +155,10 @@ impl WriteRowCountAccumulator {
 
     pub fn add(&mut self, rows: u64) -> Result<(), ConnectorError> {
         self.0 = self.0.checked_add(rows).ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "connector write row count overflowed",
-            )
+            ConnectorError::from(super::failure::WriteCountFailure::Total {
+                left: self.0,
+                right: rows,
+            })
         })?;
         Ok(())
     }
@@ -335,6 +339,68 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn actual_ledger_refusals_preserve_dimension_known_values_and_atomic_state() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, ResourceDimension};
+        let mut fragment = PreparedWriteSetLedger::new();
+        let over = MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1;
+        let error = fragment.reserve_fragment(over).unwrap_err();
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        assert_eq!(fact.reason().code(), 43);
+        let resource = fact.resource().unwrap();
+        assert_eq!(
+            (
+                resource.requested,
+                resource.limit,
+                resource.live,
+                resource.committed
+            ),
+            (
+                Some(over as u64),
+                Some(MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES as u64),
+                None,
+                None
+            )
+        );
+        assert_eq!(fragment, PreparedWriteSetLedger::new());
+        let mut entries = PreparedWriteSetLedger::new();
+        for _ in 0..MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES {
+            entries.reserve_fragment(0).unwrap();
+        }
+        let settled = entries;
+        let error = entries.reserve_fragment(0).unwrap_err();
+        assert_eq!(entries, settled);
+        let resource = error.failure_fact().resource().unwrap();
+        assert_eq!(resource.dimension, ResourceDimension::Items);
+        assert_eq!(
+            (resource.requested, resource.live, resource.limit),
+            (
+                Some(1),
+                Some(MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES as u64),
+                Some(MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES as u64)
+            )
+        );
+        let mut bytes = PreparedWriteSetLedger::new();
+        for _ in 0..MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES / MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES {
+            bytes
+                .reserve_fragment(MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES)
+                .unwrap();
+        }
+        let settled = bytes;
+        let error = bytes.reserve_fragment(1).unwrap_err();
+        assert_eq!(bytes, settled);
+        let resource = error.failure_fact().resource().unwrap();
+        assert_eq!(resource.dimension, ResourceDimension::Bytes);
+        assert_eq!(
+            (resource.requested, resource.live, resource.limit),
+            (
+                Some(1),
+                Some(MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES as u64),
+                Some(MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES as u64)
+            )
+        );
+    }
     #[test]
     fn ledger_accepts_the_exact_bounds_and_rejects_one_more() {
         let mut ledger = PreparedWriteSetLedger::new();

@@ -43,7 +43,10 @@ fn setup(array: ArrayRef) -> (ExprArena, Vec<ExprId>, Chunk) {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[slot]).unwrap();
     (arena, vec![id], Chunk::new_with_chunk_schema(batch, cs))
 }
-fn raw(array: ArrayRef, output: Option<DataType>) -> Result<ArrayRef, String> {
+fn raw(
+    array: ArrayRef,
+    output: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (mut arena, args, chunk) = setup(array);
     let id = output
         .map(|t| arena.push_typed(ExprNode::SlotId(SlotId::new(999)), t))
@@ -139,7 +142,7 @@ fn original_cardinality_slices_empty_and_all_null_parents() {
 #[test]
 fn original_cardinality_exact_wrong_carrier_and_output_cast_errors() {
     assert_eq!(
-        raw(Arc::new(Int32Array::from(vec![1])), None).unwrap_err(),
+        (raw(Arc::new(Int32Array::from(vec![1])), None).unwrap_err()).to_string(),
         "cardinality expects ARRAY or MAP, got Int32"
     );
     let a = fixture(nums(), true, false);
@@ -171,42 +174,47 @@ fn original_cardinality_exact_wrong_carrier_and_output_cast_errors() {
         .unwrap_err()
         .to_string();
     assert_eq!(
-        raw(a, Some(target)).unwrap_err(),
+        (raw(a, Some(target)).unwrap_err()).to_string(),
         format!("cardinality: failed to cast output: {cause}")
     );
 }
 #[test]
-fn original_cardinality_only_first_argument_is_evaluated_and_error_is_unwrapped() {
-    let (mut arena, mut args, chunk) = setup(fixture(nums(), true, false));
+fn cardinality_prepared_arity_precedes_child_work_and_one_child_keeps_its_source() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let (mut arena, args, chunk) = setup(fixture(nums(), true, false));
     let invalid = arena.push_typed(ExprNode::SlotId(SlotId::new(987)), DataType::Int32);
-    args.push(invalid);
-    assert_eq!(
-        counts(
-            &super::function::map::eval_cardinality(&arena, ExprId(usize::MAX), &args, &chunk)
-                .unwrap()
-        ),
-        vec![Some(2), Some(0), None, Some(1)]
-    );
+    let valid =
+        super::function::map::eval_cardinality(&arena, ExprId(usize::MAX), &args, &chunk).unwrap();
+    assert_eq!(counts(&valid), vec![Some(2), Some(0), None, Some(1)]);
+    for bad in [vec![], vec![args[0], invalid]] {
+        let error =
+            super::function::map::eval_cardinality(&arena, ExprId(usize::MAX), &bad, &chunk)
+                .unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            error.failure_fact().reason(),
+            crate::runtime::fragment::ExecutionReason::ExpressionContract.reason()
+        );
+    }
     let expected = arena.eval(invalid, &chunk).unwrap_err();
-    assert_eq!(
+    let observed =
         super::function::map::eval_cardinality(&arena, ExprId(usize::MAX), &[invalid], &chunk)
-            .unwrap_err(),
-        expected
-    );
+            .unwrap_err();
+    assert_eq!(observed.failure_fact(), expected.failure_fact());
+    assert_eq!(observed.detail(), expected.detail());
 }
+
 #[test]
-fn original_cardinality_zero_arguments_retains_original_index_panic() {
+fn cardinality_zero_arguments_are_a_typed_prepared_contract_failure() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
     let (arena, _, chunk) = setup(Arc::new(StringArray::from(vec!["source"])));
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        super::function::map::eval_cardinality(&arena, ExprId(usize::MAX), &[], &chunk)
-    }))
-    .unwrap_err();
-    let text = panic
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| panic.downcast_ref::<&str>().copied())
-        .unwrap();
-    assert_eq!(text, "index out of bounds: the len is 0 but the index is 0");
+    let error = super::function::map::eval_cardinality(&arena, ExprId(usize::MAX), &[], &chunk)
+        .unwrap_err();
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(
+        error.failure_fact().reason(),
+        crate::runtime::fragment::ExecutionReason::ExpressionContract.reason()
+    );
 }
 
 #[test]
@@ -248,9 +256,9 @@ fn original_cardinality_noncanonical_large_list_and_null_root_are_raw_errors() {
         None,
     ));
     let expected = format!("cardinality expects ARRAY or MAP, got {:?}", a.data_type());
-    assert_eq!(raw(a, None).unwrap_err(), expected);
+    assert_eq!((raw(a, None).unwrap_err()).to_string(), expected);
     assert_eq!(
-        raw(Arc::new(NullArray::new(1)), None).unwrap_err(),
+        (raw(Arc::new(NullArray::new(1)), None).unwrap_err()).to_string(),
         "cardinality expects ARRAY or MAP, got Null"
     );
 }

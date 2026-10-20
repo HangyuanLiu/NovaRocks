@@ -59,12 +59,12 @@
 //!
 //! With [`ErrorMessageCheck::LegacyContainsPure`] (the default) each attributed
 //! legacy diagnostic must also contain the pure row error message, as the
-//! original arithmetic oracle requires. Outer pure failures (control,
-//! resource, internal or invalid-program) are never data errors and always
-//! fail the comparison. Aggregates have no row-error channel (owners declare
-//! `NotRowEvaluated`), so the aggregate harness requires the same outcome
-//! class: both succeed with equal results, or both fail with an operational
-//! data failure.
+//! original arithmetic oracle requires. Outer failures retain their actual
+//! source and must match the reference's complete nominal fact and bounded
+//! producer diagnostic; they never become row errors. Fixture failures and
+//! panics have no runtime fact. Whole-invocation Data additionally preserves
+//! its exact activated source domain. Aggregates have no row-error channel;
+//! their failures follow the same source comparison rule.
 //!
 //! # Usage
 //!
@@ -84,7 +84,10 @@
 
 pub(crate) mod aggregate;
 pub(crate) mod generate;
+mod reference_failure;
 pub(crate) mod temporal;
+use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureProjection};
+use reference_failure::ReferenceFailure;
 
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -1001,6 +1004,22 @@ enum PureScalarOutcome {
     InvocationData(novarocks_functions::ScalarInvocationData),
 }
 
+#[derive(Debug)]
+enum PureScalarFailure {
+    Kernel(KernelFailure),
+    Fixture(novarocks_functions::EvaluationContractError),
+    Panicked(String),
+}
+impl std::fmt::Display for PureScalarFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Kernel(source) => source.fmt(f),
+            Self::Fixture(source) => write!(f, "selection fixture failed: {source}"),
+            Self::Panicked(message) => write!(f, "pure kernel panicked: {message}"),
+        }
+    }
+}
+
 fn prepare_scalar(
     catalog: &EngineFunctionCatalog,
     spec: &ScalarDiffSpec,
@@ -1142,8 +1161,11 @@ impl ScalarCall<'_> {
                 }
                 match self.evaluate_legacy(rows) {
                     Err(original)
-                        if !original.starts_with(LEGACY_PANIC_PREFIX)
-                            && original == data.message() =>
+                        if original
+                            .original()
+                            .is_some_and(|(fact, _)| fact == data.failure_fact())
+                            && BoundedDetail::truncating_display(&original)
+                                == BoundedDetail::truncating(data.message()) =>
                     {
                         summary.legacy_batch_errors += 1;
                     }
@@ -1159,7 +1181,21 @@ impl ScalarCall<'_> {
                 return;
             }
             Err(failure) => {
-                details.push(format!("{label}: pure outer failure: {failure}"));
+                let legacy = self.evaluate_legacy(rows);
+                let matches = match (&legacy, &failure) {
+                    (Err(reference), PureScalarFailure::Kernel(cause)) => {
+                        reference.matches_kernel(cause)
+                    }
+                    _ => false,
+                };
+                if matches {
+                    summary.legacy_batch_errors += 1;
+                } else {
+                    details.push(format!(
+                        "{label}: pure outer failure differs from reference {:?}: {failure}",
+                        legacy.err()
+                    ));
+                }
                 return;
             }
         };
@@ -1198,7 +1234,7 @@ impl ScalarCall<'_> {
         &self,
         prepared: &PreparedScalarDiff,
         rows: Option<&[usize]>,
-    ) -> Result<PureScalarOutcome, String> {
+    ) -> Result<PureScalarOutcome, PureScalarFailure> {
         let arguments = if prepared.contract().value_argument_types().len() == 0 {
             Vec::new()
         } else {
@@ -1211,12 +1247,12 @@ impl ScalarCall<'_> {
         let selection = match rows {
             None => Selection::all(self.rows),
             Some(rows) => {
-                Selection::try_sparse(self.rows, rows).map_err(|error| error.to_string())?
+                Selection::try_sparse(self.rows, rows).map_err(PureScalarFailure::Fixture)?
             }
         };
         let run = catch_unwind(AssertUnwindSafe(|| {
             let host = Some(
-                crate::exec::operators::compiled_aggregate::differential_aggregate_state_allocator(
+                crate::runtime::tracked_state_allocator::differential_aggregate_state_allocator(
                     crate::runtime::mem_tracker::MemTracker::new_root(
                         "pure-differential-scalar-state",
                     ),
@@ -1226,14 +1262,14 @@ impl ScalarCall<'_> {
                 PreparedScalarDiff::Kernel(p) => {
                     let mut instance =
                         ScalarEvaluationInstance::instantiate_with_allocator(Arc::clone(p), host)
-                            .map_err(|error| error.to_string())?;
+                            .map_err(PureScalarFailure::Kernel)?;
                     instance
                         .evaluate(selection, &arguments, &HarnessControl)
-                        .map_err(|error| error.to_string())?
+                        .map_err(PureScalarFailure::Kernel)?
                 }
                 PreparedScalarDiff::Invocation(p) => {
                     let mut instance = novarocks_functions::InvocationScalarEvaluationInstance::instantiate_with_allocator(Arc::clone(p), host)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(PureScalarFailure::Kernel)?;
                     match instance.evaluate(
                         selection,
                         &arguments,
@@ -1245,7 +1281,7 @@ impl ScalarCall<'_> {
                             return Ok(PureScalarOutcome::InvocationData(data));
                         }
                         Err(novarocks_functions::ScalarInvocationFailure::Kernel(cause)) => {
-                            return Err(cause.to_string());
+                            return Err(PureScalarFailure::Kernel(cause));
                         }
                     }
                 }
@@ -1256,16 +1292,19 @@ impl ScalarCall<'_> {
                 errors: errors.into_vec(),
             }))
         }));
-        run.unwrap_or_else(|panic| Err(format!("pure kernel panicked: {}", panic_message(&panic))))
+        run.unwrap_or_else(|panic| Err(PureScalarFailure::Panicked(panic_message(&panic))))
     }
 
     /// The legacy call over the given original rows (all rows when `None`).
-    fn evaluate_legacy(&self, rows: Option<&[usize]>) -> Result<ArrayRef, String> {
-        let run = catch_unwind(AssertUnwindSafe(|| self.evaluate_legacy_inner(rows)));
-        run.unwrap_or_else(|panic| Err(format!("{LEGACY_PANIC_PREFIX}{}", panic_message(&panic))))
+    fn evaluate_legacy(&self, rows: Option<&[usize]>) -> Result<ArrayRef, ReferenceFailure> {
+        let run = catch_unwind(AssertUnwindSafe(|| {
+            self.evaluate_legacy_inner(rows)
+                .map_err(ReferenceFailure::Source)
+        }));
+        run.unwrap_or_else(|panic| Err(ReferenceFailure::Panicked(panic_message(&panic))))
     }
 
-    fn evaluate_legacy_inner(&self, rows: Option<&[usize]>) -> Result<ArrayRef, String> {
+    fn evaluate_legacy_inner(&self, rows: Option<&[usize]>) -> ReferenceFixtureResult<ArrayRef> {
         let spec = self.spec;
         let num_rows = rows.map_or(self.rows, <[_]>::len);
         let indices =
@@ -1302,8 +1341,7 @@ impl ScalarCall<'_> {
                             // dictionary backing before the legacy function runs.
                             values.slice(rows[0], rows.len())
                         }
-                        (_, Some(indices)) => take(values.as_ref(), indices, None)
-                            .map_err(|error| format!("harness gather failed: {error}"))?,
+                        (_, Some(indices)) => take(values.as_ref(), indices, None)?,
                         (Some(_), None) => unreachable!("selection indices authored above"),
                     };
                     let slot = SlotId::new(index as u32 + 1);
@@ -1354,13 +1392,10 @@ impl ScalarCall<'_> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let chunk_schema = Arc::new(ChunkSchema::try_new_typed(slots, storage)?);
-        let chunk = Chunk::try_new_typed_with_columns_observed::<String, _>(
-            chunk_schema,
-            columns,
-            num_rows,
-            |_| Ok(()),
-        )
-        .map_err(|error| format!("harness batch failed: {error}"))?;
+        let chunk = Chunk::try_new_typed_with_columns_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(chunk_schema, columns, num_rows, |_| Ok(()))?;
         let node = match self.legacy_kind {
             ScalarLegacyImplementation::Function(kind) => ExprNode::FunctionCall {
                 kind,
@@ -1371,9 +1406,14 @@ impl ScalarCall<'_> {
             },
         };
         let call = arena.push_value_typed(node, self.result_type.clone());
-        arena.eval(call, &chunk)
+        Ok(arena.eval(call, &chunk)?)
     }
 }
+
+/// Test fixture construction and original execution have different error
+/// authors. The diagnostic comparison renders them only at the transcript
+/// boundary; this type grants no Data, masking, retry or Task authority.
+type ReferenceFixtureResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 pub(crate) const LEGACY_PANIC_PREFIX: &str = "legacy evaluator panicked: ";
 
@@ -1485,8 +1525,8 @@ pub(crate) struct SelectionOutcome {
 /// legacy call over one original row. Mismatch lines are appended to `found`.
 pub(crate) fn compare_selection(
     facts: SelectionComparison<'_>,
-    legacy_batch: Result<ArrayRef, String>,
-    mut legacy_row: impl FnMut(usize) -> Result<ArrayRef, String>,
+    legacy_batch: Result<ArrayRef, ReferenceFailure>,
+    mut legacy_row: impl FnMut(usize) -> Result<ArrayRef, ReferenceFailure>,
     pure: &PureSelection,
     found: &mut Vec<String>,
 ) -> SelectionOutcome {
@@ -1539,8 +1579,14 @@ pub(crate) fn compare_selection(
         }
         Err(batch_error) => {
             outcome.legacy_batch_error = true;
-            if batch_error.starts_with(LEGACY_PANIC_PREFIX) {
-                found.push(batch_error);
+            let Some((batch_fact, _)) = batch_error.original() else {
+                found.push(format!(
+                    "reference has no runtime domain fact: {batch_error}"
+                ));
+                return outcome;
+            };
+            if batch_fact.class() != FailureClass::Data {
+                found.push(format!("outer reference failure cannot be attributed as row Data: {batch_fact:?}: {batch_error}"));
                 return outcome;
             }
             if pure.errors.is_empty() {
@@ -1552,12 +1598,22 @@ pub(crate) fn compare_selection(
             for (ordinal, row) in facts.rows.iter().copied().enumerate() {
                 match (legacy_row(row), pure_error(ordinal)) {
                     (Err(legacy), Some(error)) => {
+                        let Some((reference_fact, diagnostic)) = legacy.original() else {
+                            found.push(format!(
+                                "row {row}: reference has no runtime domain fact: {legacy}"
+                            ));
+                            continue;
+                        };
+                        if reference_fact != error.failure_fact() {
+                            found.push(format!("row {row}: original Data reasons differ: reference {reference_fact:?}, pure {:?}", error.failure_fact()));
+                            continue;
+                        }
                         attributed += 1;
                         outcome.attributed_row_errors += 1;
-                        if legacy.starts_with(LEGACY_PANIC_PREFIX) {
-                            found.push(format!("row {row}: {legacy}"));
-                        } else if facts.messages == ErrorMessageCheck::LegacyContainsPure
-                            && !legacy.contains(error.message())
+                        if facts.messages == ErrorMessageCheck::LegacyContainsPure
+                            && !BoundedDetail::truncating_display(&diagnostic)
+                                .as_str()
+                                .contains(BoundedDetail::truncating(error.message()).as_str())
                         {
                             found.push(format!(
                                 "row {row}: legacy diagnostic `{legacy}` does not contain pure row error `{}`",

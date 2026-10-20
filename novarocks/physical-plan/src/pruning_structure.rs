@@ -89,7 +89,7 @@ pub struct PruningDomainWitness {
     pub sources: Box<[PruningSourceWitness]>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PruningStructureError {
     Control(CompileControlError),
     Source(PredicateSourceError),
@@ -113,7 +113,15 @@ impl fmt::Display for PruningStructureError {
         write!(f, "invalid pruning structure: {self:?}")
     }
 }
-impl std::error::Error for PruningStructureError {}
+impl std::error::Error for PruningStructureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Source(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<CompileControlError> for PruningStructureError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)

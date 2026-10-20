@@ -28,7 +28,7 @@ fn evaluate(
     inputs: Vec<ArrayRef>,
     result_type: DataType,
     child_policy: Option<DecimalOverflowPolicy>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let fields = inputs
         .iter()
         .enumerate()
@@ -104,37 +104,59 @@ fn legacy_extrema_baseline_zero_rows_still_rejects_late_numeric_carrier() {
                 DataType::Float64,
                 None,
             )
-            .unwrap_err();
-            assert_eq!(error, format!("unsupported numeric type: {bad:?}"));
+            .unwrap_err()
+            .to_string();
+            assert_eq!(
+                error,
+                novarocks_failure_contract::BoundedDetail::truncating_display(format_args!(
+                    "unsupported numeric type: {bad:?}"
+                ))
+                .as_str()
+            );
         }
     }
 }
 #[test]
-fn legacy_extrema_baseline_full_source_and_target_diagnostics() {
+fn extrema_diagnostics_are_bounded_and_original_output_cast_is_retained() {
+    use novarocks_failure_contract::{BoundedDetail, FailureClass, FailureProjection};
+    use novarocks_functions::math_numeric::{MathNumericError, NumericArrayFailure};
     let name = "very_long_field_".to_string() + &"x".repeat(900);
     let bad = DataType::Struct(vec![Field::new(&name, DataType::Int64, true)].into());
     for operation in ["greatest", "least"] {
-        let error = evaluate(
+        let failure = evaluate(
             operation,
             vec![new_null_array(&bad, 1)],
             DataType::Float64,
             None,
         )
         .unwrap_err();
-        assert_eq!(error, format!("unsupported numeric type: {bad:?}"));
-        assert!(error.len() > 512);
-        let error = evaluate(
-            operation,
-            vec![Arc::new(Float64Array::from(vec![1.0]))],
-            bad.clone(),
-            None,
-        )
-        .unwrap_err();
-        assert!(error.starts_with("math: failed to cast output:"));
-        assert!(error.contains(&name));
-        assert!(error.len() > 512);
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            failure.detail(),
+            BoundedDetail::truncating_display(format_args!("unsupported numeric type: {bad:?}"))
+                .as_str()
+        );
+        assert!(failure.detail().len() <= 512);
+        assert_eq!(
+            original_source::<NumericArrayFailure>(&failure).failure_fact(),
+            failure.failure_fact()
+        );
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![1.0]));
+        let expected = arrow::compute::cast(&values, &bad).unwrap_err();
+        let failure = evaluate(operation, vec![values], bad.clone(), None).unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert!(matches!(
+            original_source::<MathNumericError>(&failure),
+            MathNumericError::OutputCast(_)
+        ));
+        assert!(failure.detail().starts_with("math: failed to cast output:"));
+        assert!(failure.detail().len() <= 512);
+        let source = original_source::<arrow::error::ArrowError>(&failure);
+        assert_eq!(source.to_string(), expected.to_string());
+        assert!(source.to_string().contains(&name));
     }
 }
+
 #[test]
 fn legacy_extrema_baseline_finite_f64_to_f32_overflow_is_null() {
     for name in ["greatest", "least"] {
@@ -218,9 +240,24 @@ fn legacy_extrema_baseline_exact_null_target_retains_full_batch_cast_failure_eve
                     DataType::Null,
                     None
                 )
-                .unwrap_err(),
+                .unwrap_err()
+                .to_string(),
                 expected
             );
         }
+    }
+}
+
+fn original_source<'a, T: std::error::Error + 'static>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> &'a T {
+    let mut source = error;
+    loop {
+        if let Some(original) = source.downcast_ref::<T>() {
+            return original;
+        }
+        source = source
+            .source()
+            .expect("original domain source must survive propagation");
     }
 }

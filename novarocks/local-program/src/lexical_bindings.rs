@@ -95,7 +95,7 @@ impl<K, V> std::ops::Deref for LexicalMap<K, V> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProgramLexicalBindingError {
     Control(CompileControlError),
     ValueType(ValueTypeError),

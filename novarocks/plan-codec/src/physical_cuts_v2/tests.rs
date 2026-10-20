@@ -35,7 +35,7 @@ impl PureCompileControl for Control {
         assert!(u <= 256);
         let mut t = self.trace.lock().unwrap();
         let at = t.len();
-        let stop = *self.stop.lock().unwrap();
+        let stop = self.stop.lock().unwrap().clone();
         if let Some((s, _)) = stop {
             assert!(at <= s, "callback after refusal");
         }
@@ -857,7 +857,7 @@ fn every_actual_success_and_ordinary_tail_callback_preserves_three_primary_cause
             assert!(!baseline.is_empty());
             for at in 0..baseline.len() {
                 for cause in CAUSES {
-                    c.reset(Some((at, cause)));
+                    c.reset(Some((at, cause.clone())));
                     assert!(
                         matches!(run(&c,if receiving{CompilePhase::Decode}else{CompilePhase::Encode},call),Err(E::Control(e)) if e==cause)
                     );
@@ -1040,7 +1040,7 @@ fn actual_wide_imports_preserve_order_and_sample_real_quantum() {
             .expect("real owned source loops reach quantum");
         for at in [0, quantum, baseline.len() - 1] {
             for cause in CAUSES {
-                c.reset(Some((at, cause)));
+                c.reset(Some((at, cause.clone())));
                 assert!(
                     matches!(run(&c,if receiving{CompilePhase::Decode}else{CompilePhase::Encode},call),Err(E::Control(e)) if e==cause)
                 );

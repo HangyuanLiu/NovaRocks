@@ -456,6 +456,99 @@ impl fmt::Display for EstablishIssueError {
 
 impl std::error::Error for EstablishIssueError {}
 
+impl novarocks_execution_contract::failure::FailureProjection for EstablishIssueError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, domain,
+        };
+        let (class, code, observed_stop) = match self {
+            Self::ActivationExecutionMismatch => (FailureClass::Invariant, 72, false),
+            Self::IdentityMismatch => (FailureClass::Invariant, 72, false),
+            Self::TicketDoesNotAuthorizeRequest => (FailureClass::Invariant, 72, false),
+            Self::UnknownContext => (FailureClass::Invariant, 73, false),
+            Self::ConflictingAdmissionIssue => (FailureClass::Invariant, 74, false),
+            Self::ConflictingTicket => (FailureClass::Invariant, 74, false),
+            Self::ConflictingWorkerSettlement => (FailureClass::Invariant, 74, false),
+            Self::InvalidAdmissionSettlement => (FailureClass::Invariant, 75, false),
+            Self::AdmissionTimeInFuture => (FailureClass::Invariant, 76, false),
+            Self::FutureAuthorization => (FailureClass::Invariant, 76, false),
+            Self::RetainedRequestMissing => (FailureClass::Invariant, 77, false),
+            Self::WrongState => (FailureClass::Control, 78, false),
+            Self::EstablishNotSettled => (FailureClass::Control, 78, false),
+            Self::AdmissionReplayClosed => (FailureClass::Control, 79, true),
+            Self::IssueAuthorityRevoked => (FailureClass::Control, 79, true),
+            Self::EventChannelClosed => (FailureClass::Control, 79, true),
+            Self::AdmissionIssueBudgetExhausted => (FailureClass::Resource, 80, false),
+            Self::AuthorizationBudgetExhausted => (FailureClass::Resource, 80, false),
+            Self::AuthorizationGenerationExhausted => (FailureClass::Invariant, 81, false),
+            Self::TicketExpired => (FailureClass::Control, 82, false),
+            Self::AdmissionRejected => (FailureClass::Control, 83, false),
+            Self::EstablishRejected => (FailureClass::Control, 83, false),
+        };
+        let reason = FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap());
+        if observed_stop {
+            FailureFact::stop_observation(reason)
+        } else {
+            FailureFact::new(class, reason)
+        }
+    }
+}
+
+impl EstablishIssueError {
+    /// Bounded diagnostic authored here; no foreign Display becomes safe detail.
+    pub fn safe_detail(&self) -> novarocks_execution_contract::SafeDetail {
+        let message = match self {
+            Self::ActivationExecutionMismatch => {
+                "attempt activation and query context name different executions"
+            }
+            Self::IdentityMismatch => "Establish event does not match its authorized request",
+            Self::TicketDoesNotAuthorizeRequest => {
+                "held admission ticket does not authorize the Establish request"
+            }
+            Self::UnknownContext => "Establish issue names a context with no held ticket",
+            Self::ConflictingAdmissionIssue => {
+                "query context admission was issued with conflicting immutable facts"
+            }
+            Self::ConflictingTicket => "query context already holds a different admission ticket",
+            Self::ConflictingWorkerSettlement => {
+                "Establish issue received conflicting Worker settlements"
+            }
+            Self::InvalidAdmissionSettlement => {
+                "admission settlement does not match its exact request or outcome shape"
+            }
+            Self::AdmissionTimeInFuture => {
+                "admission issue time is later than the actor monotonic time"
+            }
+            Self::FutureAuthorization => {
+                "Establish event names an authorization generation not yet issued"
+            }
+            Self::RetainedRequestMissing => {
+                "Establish replay authority lost its immutable request instance"
+            }
+            Self::WrongState => "Establish issue is not allowed in the current ledger state",
+            Self::EstablishNotSettled => "required Establish operations are not all settled",
+            Self::AdmissionReplayClosed => "settled admission operation is closed to reissue",
+            Self::IssueAuthorityRevoked => {
+                "Establish issue authority was revoked before transport ownership"
+            }
+            Self::EventChannelClosed => "Establish issue actor event channel is closed",
+            Self::AdmissionIssueBudgetExhausted => {
+                "query context admission issue budget is exhausted"
+            }
+            Self::AuthorizationBudgetExhausted => {
+                "Establish issue authorization budget is exhausted"
+            }
+            Self::AuthorizationGenerationExhausted => {
+                "bounded Establish authorization generation could not advance"
+            }
+            Self::TicketExpired => "admission ticket expired before Establish issue authorization",
+            Self::AdmissionRejected => "Worker rejected query context admission",
+            Self::EstablishRejected => "Worker rejected a required Establish operation",
+        };
+        novarocks_execution_contract::SafeDetail::truncating(message)
+    }
+}
+
 #[derive(Debug)]
 struct EstablishIssueRecord {
     activation: AttemptActivationIdentity,
@@ -2216,10 +2309,19 @@ mod tests {
         );
         let _late = submission.transport_unknown().unwrap();
         ledger.drain_events().unwrap();
-        assert!(matches!(
-            ledger.reauthorize_issue(activation, context, now),
-            Err(EstablishIssueError::AuthorizationBudgetExhausted)
-        ));
+        let error = ledger
+            .reauthorize_issue(activation, context, now)
+            .unwrap_err();
+        assert_eq!(error, EstablishIssueError::AuthorizationBudgetExhausted);
+        use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        assert_eq!(
+            fact.resource(),
+            None,
+            "the unit refusal stores no measured sizes"
+        );
+        assert_eq!(fact.representation(), None);
     }
 
     #[tokio::test]
@@ -2384,10 +2486,27 @@ mod tests {
             .unwrap();
         drop(permit);
         ledger.drain_events().unwrap();
-        assert!(matches!(
-            ledger.reauthorize_issue(activation, context, expiry),
-            Err(EstablishIssueError::TicketExpired)
-        ));
+        let error = ledger
+            .reauthorize_issue(activation, context, expiry)
+            .unwrap_err();
+        assert_eq!(error, EstablishIssueError::TicketExpired);
+        use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+        let actor_error = LogicalExecutionActorError::Establish(error);
+        let registry_error =
+            crate::coordination::LogicalExecutionRuntimeRegistryError::Actor(actor_error);
+        assert_eq!(actor_error.failure_fact(), error.failure_fact());
+        assert_eq!(registry_error.failure_fact(), error.failure_fact());
+        assert_eq!(registry_error.safe_detail(), error.safe_detail());
+        assert_eq!(error.failure_fact().class(), FailureClass::Control);
+        let input = crate::execution_error::ExecutionFailureInput::new(
+            registry_error.failure_fact(),
+            registry_error.safe_detail(),
+            crate::execution_error::ExecutionFailureSite::Coordinator,
+        );
+        assert_eq!(
+            input.attempt_class(),
+            super::super::AttemptFailureClass::ExecutionFailure
+        );
     }
 
     #[tokio::test]

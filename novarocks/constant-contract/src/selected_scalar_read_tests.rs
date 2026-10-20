@@ -36,7 +36,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push((phase, units));
-        match self.refuse {
+        match self.refuse.clone() {
             Some((at, error)) if trace.len() == at + 1 => Err(error),
             _ => Ok(()),
         }
@@ -211,7 +211,7 @@ fn borrowed_utf8_all_original_refusals_preserve_exact_prefix_on_success_and_ordi
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    refuse: Some((at, cause)),
+                    refuse: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 assert!(

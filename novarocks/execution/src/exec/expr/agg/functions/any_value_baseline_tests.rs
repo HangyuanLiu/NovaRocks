@@ -53,7 +53,11 @@ impl LegacyState {
     fn pointer(&mut self) -> AggStatePtr {
         self.raw.as_mut_ptr() as AggStatePtr
     }
-    fn update(&mut self, input: &ArrayRef, merge: bool) -> Result<(), String> {
+    fn update(
+        &mut self,
+        input: &ArrayRef,
+        merge: bool,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let pointers = vec![self.pointer(); input.len()];
         let view = AggInputView::Any(input);
         if merge {
@@ -223,7 +227,7 @@ fn legacy_any_value_unsupported_empty_state_keeps_full_error_and_rollback() {
     let mut state = LegacyState::new(DataType::UInt64, Arc::clone(&tracker));
     let input: ArrayRef = Arc::new(UInt64Array::from(vec![1]));
     assert_eq!(
-        state.update(&input, false).unwrap_err(),
+        (state.update(&input, false).unwrap_err()).to_string(),
         "unsupported tracked scalar type: UInt64"
     );
     assert_eq!(tracker.current(), 0);
@@ -253,9 +257,11 @@ fn legacy_any_value_nested_allocation_refusal_releases_partial_value_and_keeps_s
         ],
         None,
     ));
-    assert_eq!(
-        state.update(&rejected, false).unwrap_err(),
-        "ResourceExhausted: reserve aggregate byte value: aggregate allocation was rejected by memory tracker legacy-any-value-nested-oom or the system allocator"
+    crate::exec::expr::agg::functions::common::assert_collection_refusal::<
+        allocator_api2::collections::TryReserveError,
+    >(
+        &(state.update(&rejected, false).unwrap_err()),
+        "reserve aggregate byte value",
     );
     assert_eq!(tracker.current(), 0);
     assert!(state.output(false).is_null(0));

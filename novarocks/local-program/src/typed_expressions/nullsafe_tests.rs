@@ -375,7 +375,7 @@ fn nullsafe_wide_exact_metadata_walk_preserves_every_three_cause_callback_prefix
         for at in 0..expected.len() {
             let control = Trace {
                 at: Some(at),
-                cause,
+                cause: cause.clone(),
                 seen: Mutex::default(),
                 refused: Mutex::new(false),
             };
@@ -419,7 +419,7 @@ fn nullsafe_ordinary_invalid_definition_tail_preserves_typed_control_without_ret
     ] {
         let control = Trace {
             at: Some(trace.len() - 1),
-            cause,
+            cause: cause.clone(),
             seen: Mutex::default(),
             refused: Mutex::new(false),
         };

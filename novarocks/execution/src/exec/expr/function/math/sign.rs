@@ -17,6 +17,7 @@
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::ArrayRef;
 use novarocks_functions::builtin::numeric_elementary::{
     NumericElementaryOp, evaluate_legacy_numeric_elementary,
@@ -29,14 +30,14 @@ pub fn eval_sign<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let arguments = [arena.eval(args[0], chunk)?];
     let out =
         evaluate_legacy_numeric_elementary(NumericElementaryOp::Sign, &arguments, chunk.len())
-            .map_err(|error| error.to_string())?;
+            .map_err(ExecutionFailure::from)?;
     // The shared core returns the original Int64 SIGN carrier before this
     // legacy cast; the selected owner separately projects the same value to f64.
-    Ok((super::common::cast_output(out, arena.data_type(expr)))?)
+    super::common::cast_output(out, arena.data_type(expr))
 }
 
 #[cfg(test)]

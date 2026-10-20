@@ -1009,3 +1009,36 @@ fn advance(
     }
     Ok(turn)
 }
+
+impl novarocks_execution_contract::failure::FailureProjection for WriteCommitCodecError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let (class, code) = match self {
+            Self::Schema => (FailureClass::Invariant, 200),
+            Self::Kind => (FailureClass::Data, 201),
+            Self::Shape => (FailureClass::Data, 202),
+            Self::Target => (FailureClass::Data, 203),
+            Self::RowCount => (FailureClass::Data, 204),
+            Self::DuplicateSummary => (FailureClass::Invariant, 205),
+            Self::MissingSummary => (FailureClass::Invariant, 206),
+            Self::FragmentLimit => (FailureClass::Resource, 207),
+            Self::ArtifactLimit => (FailureClass::Resource, 208),
+            Self::FieldIds => (FailureClass::Data, 209),
+            Self::BlobType => (FailureClass::Data, 210),
+            Self::BodyLimit => (FailureClass::Resource, 211),
+            Self::PropertyLimit => (FailureClass::Resource, 212),
+            Self::PropertyKey => (FailureClass::Data, 213),
+            Self::NullValue => (FailureClass::Data, 214),
+            Self::TruncatedHeader => (FailureClass::Data, 215),
+            Self::HeaderVersion => (FailureClass::Data, 216),
+            Self::RecordLength => (FailureClass::Data, 217),
+            Self::TruncatedRecord => (FailureClass::Data, 218),
+            Self::TrailingRecordBytes => (FailureClass::Data, 219),
+            Self::Failed => (FailureClass::Invariant, 220),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}

@@ -40,7 +40,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -98,7 +98,7 @@ fn full_prefixes(mut invoke: impl FnMut(&Control) -> Result<(), Error>) {
     for at in 0..positive.len() {
         for cause in CAUSES {
             let control = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(matches!(invoke(&control), Err(Error::Control(actual)) if actual == cause));
@@ -385,7 +385,7 @@ fn payload_namespace_ordinary_failure_and_lookup_tails_keep_primary_control_with
         for at in 0..positive.len() {
             for cause in CAUSES {
                 let control = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 assert!(matches!(invoke(&control), Err(Error::Control(actual)) if actual == cause));
@@ -403,7 +403,7 @@ fn payload_namespace_ordinary_failure_and_lookup_tails_keep_primary_control_with
         for at in prepared_callbacks..positive.len() {
             for cause in CAUSES {
                 let control = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 let token = encode_connector_payloads(&source, SOURCE, limits(), &control).unwrap();
@@ -429,7 +429,7 @@ fn payload_namespace_real_wide_index_and_payload_copy_observe_actual_quantum() {
         .unwrap();
     for cause in CAUSES {
         let control = Control {
-            stop: Some((at, cause)),
+            stop: Some((at, cause.clone())),
             ..Control::default()
         };
         assert!(

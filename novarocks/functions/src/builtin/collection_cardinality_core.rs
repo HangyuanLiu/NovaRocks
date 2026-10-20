@@ -20,16 +20,16 @@ use super::{
     collection_offset_count::{self, OffsetCountFailure},
 };
 use arrow_array::{Array, ArrayRef, ListArray, MapArray};
-fn offsets(array: &dyn Array) -> Result<&[i32], String> {
+fn offsets(array: &dyn Array) -> Result<&[i32], crate::KernelFailure> {
     if let Some(map) = array.as_any().downcast_ref::<MapArray>() {
         Ok(map.value_offsets())
     } else if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
         Ok(list.value_offsets())
     } else {
-        Err(format!(
+        Err(super::collection_arrow::contract(format_args!(
             "cardinality expects ARRAY or MAP, got {:?}",
             array.data_type()
-        ))
+        )))
     }
 }
 pub fn count_observed<E>(

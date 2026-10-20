@@ -64,6 +64,7 @@ impl TaskExecutionMetrics for NativeTaskExecutionPorts {
 
 /// Builds the Native role-local effects injected into the Worker task owner.
 pub fn backend_task_execution_ports(
+    execution_health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
     #[cfg(novarocks_dev_controls)] observations: Option<
         Arc<crate::test_observation_controls::NativeObservationControls>,
     >,
@@ -75,7 +76,7 @@ pub fn backend_task_execution_ports(
     let observer: Arc<dyn TaskProtocolObserver> = adapter.clone();
     let result_lifecycle: Arc<dyn TaskResultLifecycle> = adapter.clone();
     let metrics: Arc<dyn TaskExecutionMetrics> = adapter;
-    TaskExecutionPorts::new(observer, result_lifecycle, metrics)
+    TaskExecutionPorts::new(observer, result_lifecycle, metrics, execution_health)
 }
 
 #[cfg(novarocks_dev_controls)]

@@ -49,7 +49,7 @@ pub trait CompiledSchemaMetadataScope {
         body: B,
     ) -> ExecutionResult<ChunkSchemaRef>
     where
-        B: FnOnce() -> Result<ChunkSchemaRef, String>;
+        B: FnOnce() -> Result<ChunkSchemaRef, crate::exec::chunk::ChunkConstructionFailure>;
 }
 
 /// Borrowed only while the original synchronous graph is being prepared.
@@ -67,7 +67,7 @@ impl CompiledSchemaMetadataScope for DirectCompiledSchemaMetadataScope {
         _: B,
     ) -> ExecutionResult<ChunkSchemaRef>
     where
-        B: FnOnce() -> Result<ChunkSchemaRef, String>,
+        B: FnOnce() -> Result<ChunkSchemaRef, crate::exec::chunk::ChunkConstructionFailure>,
     {
         unreachable!("the explicit Direct metadata mode never invokes a host")
     }
@@ -75,13 +75,27 @@ impl CompiledSchemaMetadataScope for DirectCompiledSchemaMetadataScope {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PreparationMetadataFailure {
+    MissingCompiledSite,
+    SchemaRequest(crate::exec::chunk::CompiledSchemaRequestFailure),
     Request(novarocks_type_contract::MetadataRequestError),
     Host(super::preparation_memory::PreparationMemoryRefusal),
+}
+impl PreparationMetadataFailure {
+    pub(crate) fn detail(&self) -> &str {
+        match self {
+            Self::MissingCompiledSite => "operator has no compiled schema preparation site",
+            Self::SchemaRequest(source) => source.detail(),
+            Self::Request(_) => "metadata preparation request failed",
+            Self::Host(_) => "metadata preparation host refused",
+        }
+    }
 }
 impl std::fmt::Display for PreparationMetadataFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MissingCompiledSite => f.write_str(self.detail()),
             Self::Request(error) => write!(f, "metadata preparation request: {error}"),
+            Self::SchemaRequest(error) => error.fmt(f),
             Self::Host(error) => error.fmt(f),
         }
     }
@@ -89,7 +103,9 @@ impl std::fmt::Display for PreparationMetadataFailure {
 impl std::error::Error for PreparationMetadataFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::MissingCompiledSite => None,
             Self::Request(error) => Some(error),
+            Self::SchemaRequest(error) => Some(error),
             Self::Host(error) => Some(error),
         }
     }
@@ -105,7 +121,7 @@ pub fn prepare_operator_schema_for_test(
     let (program, site) = operator
         .compiled_schema_preparation_site()
         .map(|(program, site)| (Arc::clone(program), site))
-        .ok_or("operator has no compiled schema preparation site")?;
+        .ok_or(PreparationMetadataFailure::MissingCompiledSite)?;
     let node = match site {
         CompiledSchemaSite::Project(node) | CompiledSchemaSite::AnalyticOutput(node) => node,
         CompiledSchemaSite::FinalResult => program.graph().root(),
@@ -116,4 +132,18 @@ pub fn prepare_operator_schema_for_test(
         program.graph().nodes()[node.index()].output_layout(),
         &mut || operator.prepare(),
     )
+}
+
+impl novarocks_failure_contract::FailureProjection for PreparationMetadataFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        match self {
+            Self::MissingCompiledSite => novarocks_failure_contract::FailureFact::new(
+                novarocks_failure_contract::FailureClass::Invariant,
+                crate::runtime::fragment::ExecutionReason::MissingCompiledSchemaSite.reason(),
+            ),
+            Self::Request(cause) => cause.failure_fact(),
+            Self::SchemaRequest(cause) => cause.failure_fact(),
+            Self::Host(cause) => cause.failure_fact(),
+        }
+    }
 }

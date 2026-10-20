@@ -35,7 +35,7 @@ impl PureCompileControl for Control {
         let mut observed = self.observations.lock().unwrap();
         let ordinal = observed.iter().filter(|(seen, _)| *seen == phase).count();
         observed.push((phase, units));
-        match self.failure {
+        match self.failure.clone() {
             Some((target, at, cause)) if target == phase && ordinal == at => Err(cause),
             _ => Ok(()),
         }
@@ -200,7 +200,7 @@ fn public_semantics_control_refusal_precedes_result_publication_in_both_directio
         for phase in [CompilePhase::Encode, CompilePhase::Decode] {
             for at in [0, 1] {
                 let control = Control {
-                    failure: Some((phase, at, error)),
+                    failure: Some((phase, at, error.clone())),
                     ..Default::default()
                 };
                 let result = if phase == CompilePhase::Encode {
@@ -214,7 +214,7 @@ fn public_semantics_control_refusal_precedes_result_publication_in_both_directio
                     )
                     .map(|_| ())
                 };
-                assert_eq!(result, Err(SemanticsCodecError::Control(error)));
+                assert_eq!(result, Err(SemanticsCodecError::Control(error.clone())));
                 assert_eq!(
                     control
                         .observations
@@ -236,7 +236,7 @@ fn ordinary_decode_failure_observes_completed_tail_and_preserves_control_categor
     impl PureCompileControl for PositiveRefusal {
         fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             if phase == CompilePhase::Decode && units > 0 {
-                Err(self.0)
+                Err(self.0.clone())
             } else {
                 Ok(())
             }
@@ -275,7 +275,7 @@ fn ordinary_decode_failure_observes_completed_tail_and_preserves_control_categor
                 package.fragment(),
                 package.expression_uses(),
                 &bad,
-                &PositiveRefusal(error),
+                &PositiveRefusal(error.clone()),
             )
             .map(|_| ());
             assert_eq!(result, Err(SemanticsCodecError::Control(error)));
@@ -290,15 +290,15 @@ fn nested_owner_control_failures_keep_the_original_semantics_codec_category() {
         CompileControlError::DeadlineExceeded,
         CompileControlError::ResourceExhausted,
     ] {
-        let root = RootUseBindingError::Roots(ExpressionRootError::Control(error));
+        let root = RootUseBindingError::Roots(ExpressionRootError::Control(error.clone()));
         for projected in [
-            SemanticsCodecError::from(FrozenCallError::Roots(root)),
+            SemanticsCodecError::from(FrozenCallError::Roots(root.clone())),
             SemanticsCodecError::from(ControlCodecError::Roots(root)),
             SemanticsCodecError::from(FrozenPruningError::Structure(
-                PruningStructureError::Source(PredicateSourceError::Control(error)),
+                PruningStructureError::Source(PredicateSourceError::Control(error.clone())),
             )),
         ] {
-            assert_eq!(projected, SemanticsCodecError::Control(error));
+            assert_eq!(projected, SemanticsCodecError::Control(error.clone()));
         }
     }
 }

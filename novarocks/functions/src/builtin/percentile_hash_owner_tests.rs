@@ -310,8 +310,8 @@ fn hash_native_n1_sparse_slice_compact_and_nonzero_constant_pool() {
         assert_eq!(
             binary(out.values()),
             vec![
-                crate::percentile_hash_core::encode_numeric(Some(11.0)),
-                crate::percentile_hash_core::encode_numeric(Some(17.0))
+                crate::percentile_hash_core::encode_numeric(Some(11.0)).unwrap(),
+                crate::percentile_hash_core::encode_numeric(Some(17.0)).unwrap()
             ]
         );
         drop(out);
@@ -347,7 +347,8 @@ fn hash_native_n1_sparse_slice_compact_and_nonzero_constant_pool() {
         let out = kernel
             .evaluate(Selection::all(3), &arguments, &Control::default())
             .unwrap();
-        let expected = crate::percentile_hash_core::encode_numeric((ordinal == 1).then_some(17.0));
+        let expected =
+            crate::percentile_hash_core::encode_numeric((ordinal == 1).then_some(17.0)).unwrap();
         assert_eq!(binary(out.values()), vec![expected; 3]);
         drop(out);
         drop(kernel);
@@ -478,7 +479,7 @@ struct CompileRefusal(CompileControlError);
 impl PureCompileControl for CompileRefusal {
     fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
-        Err(self.0)
+        Err(self.0.clone())
     }
 }
 #[test]
@@ -495,8 +496,20 @@ fn hash_native_n1_compile_three_causes_are_not_row_data() {
         ),
     ] {
         let uses = [Some(ExpressionUseId::new(42))];
-        assert!(matches!(prepare_with(1,&uses,&CompileRefusal(cause)),
-            Err(FunctionSpecializationFailure::Control(c)) if c==cause));
-        assert_eq!(crate::kernel_control::compile_failure(cause), expected);
+        assert!(
+            matches!(prepare_with(1,&uses,&CompileRefusal(cause.clone())),
+            Err(FunctionSpecializationFailure::Control(c)) if c==cause)
+        );
+        let original_fact = novarocks_failure_contract::FailureProjection::failure_fact(&cause);
+        let actual = crate::kernel_control::compile_failure(cause.clone());
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&actual),
+            original_fact
+        );
+        assert_eq!(
+            original_fact.class(),
+            novarocks_failure_contract::FailureProjection::failure_fact(&expected).class()
+        );
+        assert_eq!(actual, KernelFailure::CompileControl(cause));
     }
 }

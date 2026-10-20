@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::exec::expr::expression_contract;
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::ArrayRef;
 use std::collections::HashMap;
 
@@ -45,56 +47,41 @@ pub fn eval_variant_function<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let canonical = VARIANT_FUNCTIONS
         .iter()
         .find_map(|(alias, target)| (*alias == name).then_some(*target))
         .unwrap_or(name);
     match canonical {
-        "parse_json" => Ok((super::parse_json::eval_parse_json(arena, expr, args, chunk))?),
-        "json_query" => Ok((super::get_variant::eval_json_query(arena, expr, args, chunk))?),
-        "variant_query" => Ok((super::get_variant::eval_variant_query(arena, expr, args, chunk))?),
-        "get_variant_bool" => {
-            Ok((super::get_variant::eval_get_variant_bool(arena, expr, args, chunk))?)
-        }
-        "get_json_bool" => {
-            Ok((super::get_variant::eval_get_variant_bool(arena, expr, args, chunk))?)
-        }
-        "get_variant_int" => {
-            Ok((super::get_variant::eval_get_variant_int(arena, expr, args, chunk))?)
-        }
+        "parse_json" => super::parse_json::eval_parse_json(arena, expr, args, chunk),
+        "json_query" => super::get_variant::eval_json_query(arena, expr, args, chunk),
+        "variant_query" => super::get_variant::eval_variant_query(arena, expr, args, chunk),
+        "get_variant_bool" => super::get_variant::eval_get_variant_bool(arena, expr, args, chunk),
+        "get_json_bool" => super::get_variant::eval_get_variant_bool(arena, expr, args, chunk),
+        "get_variant_int" => super::get_variant::eval_get_variant_int(arena, expr, args, chunk),
         "get_variant_double" => {
-            Ok((super::get_variant::eval_get_variant_double(arena, expr, args, chunk))?)
+            super::get_variant::eval_get_variant_double(arena, expr, args, chunk)
         }
-        "get_json_double" => {
-            Ok((super::get_variant::eval_get_variant_double(arena, expr, args, chunk))?)
-        }
+        "get_json_double" => super::get_variant::eval_get_variant_double(arena, expr, args, chunk),
         "get_variant_string" => {
-            Ok((super::get_variant::eval_get_variant_string(arena, expr, args, chunk))?)
+            super::get_variant::eval_get_variant_string(arena, expr, args, chunk)
         }
-        "get_json_string" => {
-            Ok((super::get_variant::eval_get_variant_string(arena, expr, args, chunk))?)
-        }
-        "json_exists" => Ok((super::get_variant::eval_json_exists(arena, expr, args, chunk))?),
-        "json_length" => Ok((super::get_variant::eval_json_length(arena, expr, args, chunk))?),
-        "get_variant_date" => {
-            Ok((super::get_variant::eval_get_variant_date(arena, expr, args, chunk))?)
-        }
+        "get_json_string" => super::get_variant::eval_get_variant_string(arena, expr, args, chunk),
+        "json_exists" => super::get_variant::eval_json_exists(arena, expr, args, chunk),
+        "json_length" => super::get_variant::eval_json_length(arena, expr, args, chunk),
+        "get_variant_date" => super::get_variant::eval_get_variant_date(arena, expr, args, chunk),
         "get_variant_datetime" => {
-            Ok((super::get_variant::eval_get_variant_datetime(arena, expr, args, chunk))?)
+            super::get_variant::eval_get_variant_datetime(arena, expr, args, chunk)
         }
-        "get_variant_time" => {
-            Ok((super::get_variant::eval_get_variant_time(arena, expr, args, chunk))?)
-        }
-        "json_keys" => Ok((super::json_keys::eval_json_keys(arena, expr, args, chunk))?),
-        "variant_typeof" => {
-            Ok((super::variant_typeof::eval_variant_typeof(arena, expr, args, chunk))?)
-        }
-        "variant_get" => Ok((super::variant_get::eval_variant_get(arena, expr, args, chunk))?),
-        "try_variant_get" => {
-            Ok((super::variant_get::eval_try_variant_get(arena, expr, args, chunk))?)
-        }
-        other => Err((format!("unsupported variant function: {}", other)).into()),
+        "get_variant_time" => super::get_variant::eval_get_variant_time(arena, expr, args, chunk),
+        "json_keys" => super::json_keys::eval_json_keys(arena, expr, args, chunk),
+        "variant_typeof" => super::variant_typeof::eval_variant_typeof(arena, expr, args, chunk),
+        "variant_get" => super::variant_get::eval_variant_get(arena, expr, args, chunk),
+        "try_variant_get" => super::variant_get::eval_try_variant_get(arena, expr, args, chunk),
+        other => Err(expression_contract(format_args!(
+            "unsupported variant function: {}",
+            other
+        ))),
     }
 }
 

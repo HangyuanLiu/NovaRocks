@@ -44,11 +44,15 @@ impl KernelEvaluationControl for NumericControl {
 }
 fn numeric_work<T>(
     f: impl FnOnce(&mut EvaluationCheckpoints<'_>) -> Result<T, numeric_core::DistinctComputationError>,
-) -> Result<T, String> {
-    let mut w = EvaluationCheckpoints::new(&NumericControl);
-    let result = f(&mut w);
-    w.finish().map_err(|e| e.to_string())?;
-    result.map_err(numeric_core::DistinctComputationError::into_legacy_message)
+) -> crate::runtime::fragment::ExecutionResult<T> {
+    let mut work = EvaluationCheckpoints::new(&NumericControl);
+    let result = f(&mut work);
+    let finish = work.finish();
+    let result = result.map_err(|source| {
+        crate::runtime::fragment::ExecutionFailure::from(source.into_kernel_failure())
+    })?;
+    finish?;
+    Ok(result)
 }
 impl numeric_core::NumericDistinctSet for DistinctSet {
     fn len(&self) -> usize {
@@ -63,10 +67,10 @@ struct NumericBuffer<'a> {
     allocator: &'a AggregateAllocator,
 }
 impl numeric_core::NumericDistinctBuffer for NumericBuffer<'_> {
-    fn reserve_exact(&mut self, size: usize) -> Result<(), String> {
-        self.out.try_reserve_exact(size).map_err(|_| {
+    fn reserve_exact(&mut self, size: usize) -> Result<(), KernelFailure> {
+        self.out.try_reserve_exact(size).map_err(|source| {
             self.allocator
-                .allocation_error("reserve distinct serialization")
+                .allocation_error("reserve distinct serialization", source)
         })
     }
     fn append(&mut self, bytes: &[u8]) {
@@ -101,13 +105,14 @@ impl DistinctSet {
         }
     }
 
-    fn insert(&mut self, value: &[u8]) -> Result<(), String> {
+    fn insert(&mut self, value: &[u8]) -> Result<(), KernelFailure> {
         if self.values.contains(&DistinctLookup(value)) {
             return Ok(());
         }
-        self.values
-            .try_reserve(1)
-            .map_err(|_| self.allocator.allocation_error("reserve distinct hash set"))?;
+        self.values.try_reserve(1).map_err(|source| {
+            self.allocator
+                .allocation_error("reserve distinct hash set", source)
+        })?;
         let value = aggregate_bytes(self.allocator.clone(), value)?;
         self.values.insert(value);
         Ok(())
@@ -140,7 +145,9 @@ unsafe fn get_set<'a>(ptr: *const u8) -> &'a DistinctSet {
     unsafe { &*(ptr.cast::<DistinctSet>()) }
 }
 
-fn serialize_set(set: &DistinctSet) -> Result<AggregateVec<u8>, String> {
+fn serialize_set(
+    set: &DistinctSet,
+) -> Result<AggregateVec<u8>, crate::runtime::fragment::ExecutionFailure> {
     let mut out = AggregateVec::new_in(set.allocator.clone());
     numeric_work(|w| {
         numeric_core::serialize_set_into(
@@ -154,15 +161,14 @@ fn serialize_set(set: &DistinctSet) -> Result<AggregateVec<u8>, String> {
     })?;
     Ok(out)
 }
-fn numeric_key_width(t: &DataType) -> Result<usize, String> {
-    numeric_core::numeric_key_width(t)
-        .map_err(numeric_core::DistinctComputationError::into_legacy_message)
+fn numeric_key_width(t: &DataType) -> Result<usize, crate::runtime::fragment::ExecutionFailure> {
+    numeric_core::numeric_key_width(t).map_err(|source| source.into_kernel_failure().into())
 }
 fn visit_serialized_keys(
     bytes: &[u8],
     width: usize,
-    mut visit: impl FnMut(&[u8]) -> Result<(), String>,
-) -> Result<(), String> {
+    mut visit: impl FnMut(&[u8]) -> Result<(), KernelFailure>,
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     numeric_work(|w| {
         numeric_core::visit_serialized_keys(bytes, width, w, |value| {
             visit(value).map_err(Into::into)
@@ -173,14 +179,14 @@ fn sum_from_set(
     set: &DistinctSet,
     input: &DataType,
     output: &DataType,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     numeric_work(|w| numeric_core::sum_from_set(set, input, output, w))
 }
 fn avg_from_set(
     set: &DistinctSet,
     input: &DataType,
     output: &DataType,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     numeric_work(|w| numeric_core::avg_from_set(set, input, output, w))
 }
 
@@ -190,9 +196,12 @@ impl AggregateFunction for MultiDistinctNumericAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let data_type =
-            input_type.ok_or_else(|| "distinct numeric input type missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let data_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "distinct numeric input type missing",
+            )
+        })?;
         let is_avg = func.name == "multi_distinct_avg";
         let kind = if is_avg {
             AggKind::MultiDistinctAvg
@@ -201,12 +210,16 @@ impl AggregateFunction for MultiDistinctNumericAgg {
         };
 
         if input_is_intermediate {
-            let sig = super::super::agg_type_signature(func)
-                .ok_or_else(|| "multi_distinct_sum type signature missing".to_string())?;
-            let output_type = sig
-                .output_type
-                .as_ref()
-                .ok_or_else(|| "multi_distinct_sum output type signature missing".to_string())?;
+            let sig = super::super::agg_type_signature(func).ok_or_else(|| {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "multi_distinct_sum type signature missing",
+                )
+            })?;
+            let output_type = sig.output_type.as_ref().ok_or_else(|| {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "multi_distinct_sum output type signature missing",
+                )
+            })?;
             return Ok(AggSpec {
                 kind,
                 output_type: output_type.clone(),
@@ -226,10 +239,20 @@ impl AggregateFunction for MultiDistinctNumericAgg {
                 | DataType::Float64 => DataType::Float64,
                 DataType::Decimal128(..) => {
                     novarocks_type_contract::canonical_agg_decimal_type("avg", data_type)
-                        .ok_or_else(|| "distinct avg decimal output type missing".to_string())?
+                        .ok_or_else(|| {
+                            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                                "distinct avg decimal output type missing",
+                            )
+                        })?
                 }
                 DataType::Decimal256(precision, scale) => DataType::Decimal256(*precision, *scale),
-                other => return Err(format!("distinct avg unsupported input type: {other:?}")),
+                other => {
+                    return Err(
+                        crate::exec::expr::agg::functions::aggregate_binding_contract(
+                            format_args!("distinct avg unsupported input type: {other:?}"),
+                        ),
+                    );
+                }
             }
         } else {
             match data_type {
@@ -244,17 +267,18 @@ impl AggregateFunction for MultiDistinctNumericAgg {
                     data_type,
                 )
                 .ok_or_else(|| {
-                    format!(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
                         "multi_distinct_sum unsupported decimal input type: {:?}",
                         data_type
-                    )
+                    ))
                 })?,
                 DataType::Decimal256(precision, scale) => DataType::Decimal256(*precision, *scale),
                 other => {
-                    return Err(format!(
-                        "multi_distinct_sum unsupported input type: {:?}",
-                        other
-                    ));
+                    return Err(
+                        crate::exec::expr::agg::functions::aggregate_binding_contract(
+                            format_args!("multi_distinct_sum unsupported input type: {:?}", other),
+                        ),
+                    );
                 }
             }
         };
@@ -281,10 +305,12 @@ impl AggregateFunction for MultiDistinctNumericAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "multi_distinct_sum input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "multi_distinct_sum input missing",
+            )
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -292,14 +318,17 @@ impl AggregateFunction for MultiDistinctNumericAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "multi_distinct_sum merge input missing".to_string())?;
-        let bin = arr
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "multi_distinct_sum merge input missing",
+            )
+        })?;
+        let bin = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "failed to downcast to BinaryArray",
+            )
+        })?;
         Ok(AggInputView::Binary(bin))
     }
 
@@ -315,9 +344,11 @@ impl AggregateFunction for MultiDistinctNumericAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let tracker = tracker.ok_or_else(|| {
-            "allocation-tracked numeric distinct state requires a memory tracker".to_string()
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "allocation-tracked numeric distinct state requires a memory tracker",
+            )
         })?;
         unsafe { ptr.cast::<DistinctSet>().write(DistinctSet::new(tracker)) };
         Ok(())
@@ -341,9 +372,11 @@ impl AggregateFunction for MultiDistinctNumericAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("numeric distinct batch input type mismatch".to_string());
+            return Err(super::super::views::aggregate_input_contract(
+                "numeric distinct batch input type mismatch",
+            ));
         };
         numeric_work(|work| {
             for (row, &base) in state_ptrs.iter().enumerate() {
@@ -363,18 +396,21 @@ impl AggregateFunction for MultiDistinctNumericAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Binary(arr) = input else {
-            return Err("numeric distinct merge input type mismatch".to_string());
+            return Err(super::super::views::aggregate_input_contract(
+                "numeric distinct merge input type mismatch",
+            ));
         };
         for (row, &base) in state_ptrs.iter().enumerate() {
             if arr.is_null(row) {
                 continue;
             }
-            let input_type = spec
-                .input_arg_type
-                .as_ref()
-                .ok_or_else(|| "distinct numeric logical input signature missing".to_string())?;
+            let input_type = spec.input_arg_type.as_ref().ok_or_else(|| {
+                super::super::views::aggregate_input_contract(
+                    "distinct numeric logical input signature missing",
+                )
+            })?;
             let width = numeric_key_width(input_type)?;
             let set = unsafe { get_set_mut((base as *mut u8).add(offset)) };
             visit_serialized_keys(arr.value(row), width, |value| set.insert(value))?;
@@ -388,7 +424,7 @@ impl AggregateFunction for MultiDistinctNumericAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         if output_intermediate {
             let mut builder = BinaryBuilder::new();
             let mut payload_bytes = 0usize;
@@ -398,22 +434,20 @@ impl AggregateFunction for MultiDistinctNumericAgg {
                     builder.append_null();
                 } else {
                     let encoded = serialize_set(set)?;
-                    payload_bytes = payload_bytes
-                        .checked_add(encoded.len())
-                        .filter(|bytes| *bytes <= i32::MAX as usize)
-                        .ok_or_else(|| {
-                            "distinct state batch exceeds the Binary offset domain".to_string()
-                        })?;
+                    payload_bytes =
+                        numeric_core::checked_state_batch_bytes(payload_bytes, encoded.len())
+                            .map_err(|source| source.into_kernel_failure())?;
                     builder.append_value(encoded);
                 }
             }
             return Ok(std::sync::Arc::new(builder.finish()));
         }
 
-        let input_type = spec
-            .input_arg_type
-            .as_ref()
-            .ok_or_else(|| "multi_distinct_sum input_arg_type missing".to_string())?;
+        let input_type = spec.input_arg_type.as_ref().ok_or_else(|| {
+            super::super::views::aggregate_input_contract(
+                "multi_distinct_sum input_arg_type missing",
+            )
+        })?;
 
         let mut arrays = Vec::with_capacity(group_states.len());
         for &base in group_states {
@@ -429,7 +463,11 @@ impl AggregateFunction for MultiDistinctNumericAgg {
         // Each array is a single-value array. Concatenate into a batch.
         let values: Vec<&dyn arrow::array::Array> = arrays.iter().map(|a| a.as_ref()).collect();
         // Use concat to combine single-value arrays.
-        arrow::compute::kernels::concat::concat(&values).map_err(|e| e.to_string())
+        arrow::compute::kernels::concat::concat(&values).map_err(|source| {
+            numeric_core::DistinctComputationError::OutputConcat(source)
+                .into_kernel_failure()
+                .into()
+        })
     }
 }
 
@@ -438,6 +476,7 @@ mod tests {
     use super::*;
     use arrow::array::Int64Array;
     use arrow::datatypes::DataType;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
     use std::mem::MaybeUninit;
 
     // Exercise sealed selected-binding kernels, local serialization, tree merge,
@@ -832,11 +871,8 @@ mod tests {
         let retained = tracker.current();
         // One encoded i64 needs count + key length + key bytes = 16 bytes.
         tracker.install_limit_once(retained + 15).unwrap();
-        assert!(
-            serialize_set(&set)
-                .unwrap_err()
-                .contains("ResourceExhausted")
-        );
+        let error = serialize_set(&set).unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
         assert_eq!(tracker.current(), retained);
         assert_eq!(set.len(), 1);
         drop(set);
@@ -865,7 +901,10 @@ mod tests {
             &[state.as_mut_ptr() as AggStatePtr],
             &AggInputView::Any(&values),
         );
-        assert!(result.unwrap_err().contains("ResourceExhausted"));
+        assert_eq!(
+            result.unwrap_err().failure_fact().class(),
+            FailureClass::Resource
+        );
         assert_eq!(unsafe { state.assume_init_ref() }.len(), 0);
         assert_eq!(tracker.current(), 0);
         MultiDistinctNumericAgg.drop_state(&spec, state.as_mut_ptr().cast());
@@ -975,7 +1014,7 @@ mod tests {
         let error = MultiDistinctNumericAgg
             .update_batch(&spec, 0, &[state.as_mut_ptr() as AggStatePtr], &input)
             .expect_err("hash allocation must be rejected before mutation");
-        assert!(error.contains("ResourceExhausted"), "{error}");
+        assert_eq!(error.failure_fact().class(), FailureClass::Resource);
         assert_eq!(unsafe { state.assume_init_ref() }.retained_bytes(), 0);
         assert_eq!(tracker.current(), 0);
 

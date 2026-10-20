@@ -65,7 +65,7 @@ pub enum ExchangeRouteDelivery {
     Delivered,
     NormallyClosed(NormalClosedInbound),
     Refused(String),
-    Receiver(novarocks_execution::runtime::exchange::ExchangeReceiveFailure),
+    Receiver(novarocks_execution::runtime::exchange::ExchangeFailure),
 }
 
 impl ExchangeRouteClaim {

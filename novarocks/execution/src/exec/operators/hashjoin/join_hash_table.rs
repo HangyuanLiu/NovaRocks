@@ -40,6 +40,81 @@ use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
 use crate::runtime::mem_tracker::MemTracker;
 
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+
+#[derive(Debug)]
+struct JoinHashTableContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for JoinHashTableContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for JoinHashTableContract {}
+impl novarocks_failure_contract::FailureProjection for JoinHashTableContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::JoinHashTableContract.reason(),
+        )
+    }
+}
+fn table_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(JoinHashTableContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+#[derive(Debug)]
+struct JoinRowIndexCapacity {
+    current: usize,
+    incoming: usize,
+}
+impl std::fmt::Display for JoinRowIndexCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "join row index capacity exceeded: live={} incoming={} maximum={}",
+            self.current,
+            self.incoming,
+            u32::MAX
+        )
+    }
+}
+impl std::error::Error for JoinRowIndexCapacity {}
+impl novarocks_failure_contract::FailureProjection for JoinRowIndexCapacity {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, ResourceDimension, ResourceFacts, ResourceScope,
+        };
+        FailureFact::new(
+            FailureClass::Resource,
+            crate::runtime::fragment::ExecutionReason::JoinRowIndexCapacity.reason(),
+        )
+        .with_resource(ResourceFacts {
+            request_scope: Some(ResourceScope::Operator),
+            constraint_scope: Some(ResourceScope::Operator),
+            dimension: ResourceDimension::Positions,
+            requested: u64::try_from(self.incoming).ok(),
+            required_growth: u64::try_from(self.incoming).ok(),
+            limit: Some(u32::MAX as u64),
+            live: u64::try_from(self.current).ok(),
+            committed: None,
+        })
+    }
+}
+/// ROW_NONE consumes the all-ones reference, so valid indices end one below
+/// it. This is an index-position bound, not a memory grant or SQL arithmetic.
+pub(super) fn checked_row_count(current: usize, incoming: usize) -> ExecutionResult<usize> {
+    let next = current as u128 + incoming as u128;
+    if next > u32::MAX as u128 {
+        Err(ExecutionFailure::from_domain(JoinRowIndexCapacity {
+            current,
+            incoming,
+        }))
+    } else {
+        Ok(next as usize)
+    }
+}
+
 const ENABLE_GROUP_KEY_OPTIMIZATIONS: bool = true;
 const ROW_NONE: u32 = u32::MAX;
 
@@ -48,14 +123,14 @@ pub(crate) enum SerializedRows {
 }
 
 impl SerializedRows {
-    fn row_bytes(&self, row: usize) -> Result<&[u8], String> {
+    fn row_bytes(&self, row: usize) -> Result<&[u8], ExecutionFailure> {
         match self {
             Self::Fallback(rows) => rows.get(row).map(|v| v.as_slice()).ok_or_else(|| {
-                format!(
+                table_contract(format_args!(
                     "fallback join row missing at row={} (rows={})",
                     row,
                     rows.len()
-                )
+                ))
             }),
         }
     }
@@ -114,16 +189,16 @@ impl JoinHashTable {
         key_types: Vec<DataType>,
         null_safe_eq: Vec<bool>,
         tracker: Arc<MemTracker>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ExecutionFailure> {
         if key_types.is_empty() {
-            return Err("join hash table requires join keys".to_string());
+            return Err(table_contract("join hash table requires join keys"));
         }
         if key_types.len() != null_safe_eq.len() {
-            return Err(format!(
+            return Err(table_contract(format_args!(
                 "join hash table null-safe key count mismatch: key_types={} flags={}",
                 key_types.len(),
                 null_safe_eq.len()
-            ));
+            )));
         }
         let key_table = KeyTable::new_with_tracker(
             key_types,
@@ -131,7 +206,7 @@ impl JoinHashTable {
             MemTracker::new_child("KeyTable", &tracker),
         )?;
         if key_table.key_strategy() == GroupKeyStrategy::Scalar {
-            return Err("join hash table requires join keys".to_string());
+            return Err(table_contract("join hash table requires join keys"));
         }
         Ok(Self {
             key_table,
@@ -188,30 +263,30 @@ impl JoinHashTable {
     pub(crate) fn build_rows_or_fallback(
         &self,
         arrays: &[arrow::array::ArrayRef],
-    ) -> Result<SerializedRows, String> {
+    ) -> Result<SerializedRows, ExecutionFailure> {
         self.key_table
             .build_rows_fallback(arrays)
             .map(SerializedRows::Fallback)
     }
 
-    pub(crate) fn group_rows_slice(&self, group_id: usize) -> Result<&[u32], String> {
+    pub(crate) fn group_rows_slice(&self, group_id: usize) -> Result<&[u32], ExecutionFailure> {
         let offsets = self
             .group_offsets
             .as_ref()
-            .ok_or_else(|| "join group offsets missing".to_string())?;
+            .ok_or_else(|| table_contract("join group offsets missing"))?;
         let rows = self
             .group_rows
             .as_ref()
-            .ok_or_else(|| "join group rows missing".to_string())?;
-        if group_id + 1 >= offsets.len() {
-            return Err("join group id out of bounds".to_string());
+            .ok_or_else(|| table_contract("join group rows missing"))?;
+        if group_id >= offsets.len().saturating_sub(1) {
+            return Err(table_contract("join group id out of bounds"));
         }
         let start = offsets[group_id] as usize;
         let end = offsets[group_id + 1] as usize;
         Ok(&rows[start..end])
     }
 
-    pub(crate) fn group_build_rows(&self, group_id: usize) -> Result<&[u32], String> {
+    pub(crate) fn group_build_rows(&self, group_id: usize) -> Result<&[u32], ExecutionFailure> {
         self.group_rows_slice(group_id)
     }
 
@@ -219,28 +294,29 @@ impl JoinHashTable {
         &mut self,
         key_arrays: &[arrow::array::ArrayRef],
         num_rows: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExecutionFailure> {
         if self.group_offsets.is_some() || self.group_rows.is_some() {
-            return Err("join hash table already finalized".to_string());
+            return Err(table_contract("join hash table already finalized"));
         }
         if key_arrays.len() != self.key_table.key_types().len() {
-            return Err("join key length mismatch".to_string());
+            return Err(table_contract("join key length mismatch"));
         }
         for (array, expected) in key_arrays.iter().zip(self.key_table.key_types()) {
+            if array.len() != num_rows {
+                return Err(table_contract(format_args!(
+                    "join build key length mismatch: array={} rows={}",
+                    array.len(),
+                    num_rows
+                )));
+            }
             if array.data_type() != expected {
-                return Err("join key type mismatch".to_string());
+                return Err(table_contract("join key type mismatch"));
             }
         }
         if num_rows == 0 {
             return Ok(());
         }
-        let next_row_count = self
-            .row_count
-            .checked_add(num_rows)
-            .ok_or_else(|| "join build row count overflow".to_string())?;
-        if next_row_count > u32::MAX as usize {
-            return Err("join build row count overflow".to_string());
-        }
+        let next_row_count = checked_row_count(self.row_count, num_rows)?;
         let base_row_id = self.row_count as u32;
         self.row_next.resize(next_row_count, ROW_NONE);
         self.row_count = next_row_count;
@@ -252,7 +328,7 @@ impl JoinHashTable {
             GroupKeyStrategy::OneNumber => {
                 let view = key_views
                     .first()
-                    .ok_or_else(|| "join one number key view missing".to_string())?;
+                    .ok_or_else(|| table_contract("join one number key view missing"))?;
                 let hashes = self.key_table.build_one_number_hashes(view, num_rows)?;
                 for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
                     if row_has_forbidden_null(&key_views, row, &self.null_safe_eq) {
@@ -265,9 +341,9 @@ impl JoinHashTable {
             GroupKeyStrategy::OneString => {
                 let view = key_views
                     .first()
-                    .ok_or_else(|| "join one string key view missing".to_string())?;
+                    .ok_or_else(|| table_contract("join one string key view missing"))?;
                 let GroupKeyArrayView::Utf8(arr) = view else {
-                    return Err("join one string key expects Utf8 view".to_string());
+                    return Err(table_contract("join one string key expects Utf8 view"));
                 };
                 let hashes = self.key_table.build_group_hashes(&key_views, num_rows)?;
                 for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
@@ -343,14 +419,16 @@ impl JoinHashTable {
                 }
             }
             GroupKeyStrategy::Scalar => {
-                return Err("join hash table does not support empty keys".to_string());
+                return Err(table_contract(
+                    "join hash table does not support empty keys",
+                ));
             }
         }
         self.refresh_accounting();
         Ok(())
     }
 
-    pub(crate) fn finalize_groups(&mut self) -> Result<(), String> {
+    pub(crate) fn finalize_groups(&mut self) -> Result<(), ExecutionFailure> {
         if self.group_offsets.is_some() || self.group_rows.is_some() {
             return Ok(());
         }
@@ -360,11 +438,11 @@ impl JoinHashTable {
             let mut row = *self
                 .group_head
                 .get(group_id)
-                .ok_or_else(|| "join group id out of bounds".to_string())?;
+                .ok_or_else(|| table_contract("join group id out of bounds"))?;
             while row != ROW_NONE {
                 *count = count
                     .checked_add(1)
-                    .ok_or_else(|| "join group row count overflow".to_string())?;
+                    .ok_or_else(|| table_contract("join group row count overflow"))?;
                 row = self.next_row(row)?;
             }
         }
@@ -375,7 +453,7 @@ impl JoinHashTable {
         for count in &counts {
             total = total
                 .checked_add(*count)
-                .ok_or_else(|| "join group rows overflow".to_string())?;
+                .ok_or_else(|| table_contract("join group rows overflow"))?;
             offsets.push(total);
         }
 
@@ -385,19 +463,19 @@ impl JoinHashTable {
             let mut row = *self
                 .group_head
                 .get(group_id)
-                .ok_or_else(|| "join group id out of bounds".to_string())?;
+                .ok_or_else(|| table_contract("join group id out of bounds"))?;
             while row != ROW_NONE {
                 let slot = *write_pos
                     .get(group_id)
-                    .ok_or_else(|| "join group id out of bounds".to_string())?;
+                    .ok_or_else(|| table_contract("join group id out of bounds"))?;
                 let idx = slot as usize;
                 if idx >= rows.len() {
-                    return Err("join group row index out of bounds".to_string());
+                    return Err(table_contract("join group row index out of bounds"));
                 }
                 rows[idx] = row;
                 write_pos[group_id] = slot
                     .checked_add(1)
-                    .ok_or_else(|| "join group row count overflow".to_string())?;
+                    .ok_or_else(|| table_contract("join group row count overflow"))?;
                 row = self.next_row(row)?;
             }
         }
@@ -412,11 +490,15 @@ impl JoinHashTable {
         &self,
         row_bytes: &[u8],
         hash: u64,
-    ) -> Result<Option<usize>, String> {
+    ) -> Result<Option<usize>, ExecutionFailure> {
         self.key_table.lookup_serialized(row_bytes, hash)
     }
 
-    pub(crate) fn lookup_one_string(&self, key: &str, hash: u64) -> Result<Option<usize>, String> {
+    pub(crate) fn lookup_one_string(
+        &self,
+        key: &str,
+        hash: u64,
+    ) -> Result<Option<usize>, ExecutionFailure> {
         self.key_table.lookup_one_string(key, hash)
     }
 
@@ -429,12 +511,12 @@ impl JoinHashTable {
         view: &GroupKeyArrayView<'_>,
         hashes: &[u64],
         nulls: &[bool],
-    ) -> Result<Vec<Option<usize>>, String> {
+    ) -> Result<Vec<Option<usize>>, ExecutionFailure> {
         if hashes.len() != nulls.len() {
-            return Err("join lookup batch length mismatch".to_string());
+            return Err(table_contract("join lookup batch length mismatch"));
         }
         let GroupKeyArrayView::Utf8(arr) = view else {
-            return Err("join one string key expects Utf8 view".to_string());
+            return Err(table_contract("join one string key expects Utf8 view"));
         };
         let mut group_ids = vec![None; hashes.len()];
         for row in 0..hashes.len() {
@@ -456,7 +538,7 @@ impl JoinHashTable {
         view: &GroupKeyArrayView<'_>,
         row: usize,
         hash: u64,
-    ) -> Result<Option<usize>, String> {
+    ) -> Result<Option<usize>, ExecutionFailure> {
         self.key_table.lookup_one_number(view, row, hash)
     }
 
@@ -465,9 +547,9 @@ impl JoinHashTable {
         view: &GroupKeyArrayView<'_>,
         hashes: &[u64],
         nulls: &[bool],
-    ) -> Result<Vec<Option<usize>>, String> {
+    ) -> Result<Vec<Option<usize>>, ExecutionFailure> {
         if hashes.len() != nulls.len() {
-            return Err("join lookup batch length mismatch".to_string());
+            return Err(table_contract("join lookup batch length mismatch"));
         }
         let mut group_ids = vec![None; hashes.len()];
         for row in 0..hashes.len() {
@@ -484,7 +566,7 @@ impl JoinHashTable {
         views: &[GroupKeyArrayView<'_>],
         row: usize,
         hash: u64,
-    ) -> Result<Option<usize>, String> {
+    ) -> Result<Option<usize>, ExecutionFailure> {
         self.key_table.lookup_fixed_size(views, row, hash)
     }
 
@@ -493,9 +575,9 @@ impl JoinHashTable {
         views: &[GroupKeyArrayView<'_>],
         hashes: &[u64],
         nulls: &[bool],
-    ) -> Result<Vec<Option<usize>>, String> {
+    ) -> Result<Vec<Option<usize>>, ExecutionFailure> {
         if hashes.len() != nulls.len() {
-            return Err("join lookup batch length mismatch".to_string());
+            return Err(table_contract("join lookup batch length mismatch"));
         }
         let mut group_ids = vec![None; hashes.len()];
         for row in 0..hashes.len() {
@@ -512,7 +594,7 @@ impl JoinHashTable {
         views: &[GroupKeyArrayView<'_>],
         row: usize,
         hash: u64,
-    ) -> Result<Option<usize>, String> {
+    ) -> Result<Option<usize>, ExecutionFailure> {
         self.key_table.lookup_compressed(views, row, hash)
     }
 
@@ -523,9 +605,9 @@ impl JoinHashTable {
         rows: Option<&SerializedRows>,
         hashes: &[u64],
         nulls: &[bool],
-    ) -> Result<Vec<Option<usize>>, String> {
+    ) -> Result<Vec<Option<usize>>, ExecutionFailure> {
         if hashes.len() != nulls.len() || hashes.len() != keys.len() {
-            return Err("join lookup batch length mismatch".to_string());
+            return Err(table_contract("join lookup batch length mismatch"));
         }
         let mut group_ids = vec![None; hashes.len()];
         for row in 0..hashes.len() {
@@ -535,7 +617,7 @@ impl JoinHashTable {
             let group_id = if keys[row] {
                 self.lookup_compressed(views, row, hashes[row])?
             } else {
-                let rows = rows.ok_or_else(|| "join row data missing".to_string())?;
+                let rows = rows.ok_or_else(|| table_contract("join row data missing"))?;
                 let row_bytes = rows.row_bytes(row)?;
                 self.lookup_serialized(row_bytes, hashes[row])?
             };
@@ -549,9 +631,9 @@ impl JoinHashTable {
         rows: &SerializedRows,
         hashes: &[u64],
         nulls: &[bool],
-    ) -> Result<Vec<Option<usize>>, String> {
+    ) -> Result<Vec<Option<usize>>, ExecutionFailure> {
         if hashes.len() != nulls.len() {
-            return Err("join lookup batch length mismatch".to_string());
+            return Err(table_contract("join lookup batch length mismatch"));
         }
         let mut group_ids = vec![None; hashes.len()];
         for row in 0..hashes.len() {
@@ -564,36 +646,36 @@ impl JoinHashTable {
         Ok(group_ids)
     }
 
-    fn handle_lookup(&mut self, lookup: KeyLookup, row_id: u32) -> Result<(), String> {
+    fn handle_lookup(&mut self, lookup: KeyLookup, row_id: u32) -> Result<(), ExecutionFailure> {
         if lookup.is_new {
             if lookup.group_id != self.group_head.len() {
-                return Err("join group id out of bounds".to_string());
+                return Err(table_contract("join group id out of bounds"));
             }
             self.group_head.push(ROW_NONE);
         }
         self.link_row(lookup.group_id, row_id)
     }
 
-    fn link_row(&mut self, group_id: usize, row_id: u32) -> Result<(), String> {
+    fn link_row(&mut self, group_id: usize, row_id: u32) -> Result<(), ExecutionFailure> {
         let head = self
             .group_head
             .get(group_id)
             .copied()
-            .ok_or_else(|| "join group id out of bounds".to_string())?;
+            .ok_or_else(|| table_contract("join group id out of bounds"))?;
         let slot = row_id as usize;
         if slot >= self.row_next.len() {
-            return Err("join row id out of bounds".to_string());
+            return Err(table_contract("join row id out of bounds"));
         }
         self.row_next[slot] = head;
         self.group_head[group_id] = row_id;
         Ok(())
     }
 
-    fn next_row(&self, row_id: u32) -> Result<u32, String> {
+    fn next_row(&self, row_id: u32) -> Result<u32, ExecutionFailure> {
         self.row_next
             .get(row_id as usize)
             .copied()
-            .ok_or_else(|| "join row id out of bounds".to_string())
+            .ok_or_else(|| table_contract("join row id out of bounds"))
     }
 
     fn refresh_accounting(&mut self) {
@@ -631,5 +713,61 @@ impl Drop for JoinHashTable {
         if let Some(tracker) = self.mem_tracker.as_ref() {
             tracker.release(self.accounted_bytes);
         }
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection, ResourceDimension};
+
+    #[test]
+    fn row_index_limit_is_resource_and_does_not_reserve_the_sentinel() {
+        assert_eq!(
+            checked_row_count(u32::MAX as usize - 1, 1).unwrap(),
+            u32::MAX as usize
+        );
+        assert_eq!(
+            checked_row_count(u32::MAX as usize, 0).unwrap(),
+            u32::MAX as usize
+        );
+        let error = checked_row_count(u32::MAX as usize, 1).unwrap_err();
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        let resource = fact.resource().unwrap();
+        assert_eq!(resource.dimension, ResourceDimension::Positions);
+        assert_eq!(resource.live, Some(u32::MAX as u64));
+        assert_eq!(resource.requested, Some(1));
+        assert_eq!(resource.limit, Some(u32::MAX as u64));
+        assert_eq!(resource.committed, None);
+        assert!(checked_row_count(usize::MAX, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn invalid_build_shape_is_rejected_before_row_storage_changes() {
+        let tracker = MemTracker::new_root("join-shape-refusal");
+        let weak = Arc::downgrade(&tracker);
+        let mut table = JoinHashTable::new_with_tracker(
+            vec![DataType::Int32],
+            vec![false],
+            Arc::clone(&tracker),
+        )
+        .unwrap();
+        let arrays: Vec<arrow::array::ArrayRef> =
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1]))];
+        let array_weak = Arc::downgrade(&arrays[0]);
+        let before = tracker.current();
+        let error = table.add_build_rows(&arrays, 2).unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(table.row_count, 0);
+        assert!(table.row_next.is_empty());
+        assert_eq!(tracker.current(), before);
+        drop(arrays);
+        assert!(array_weak.upgrade().is_none());
+        drop(table);
+        assert_eq!(tracker.current(), 0);
+        drop(tracker);
+        assert!(weak.upgrade().is_none());
+        assert!(!error.detail().is_empty());
     }
 }

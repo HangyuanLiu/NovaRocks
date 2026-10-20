@@ -21,9 +21,11 @@ use crate::aggregate_scalar::{
     AggScalarValue, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue,
 };
 use crate::exact_percentile_failure::{
-    LegacyPercentileFailure, PercentileDataRecipe, PercentileFailureSink,
+    PercentileDataRecipe, PercentileFailureSink, RequiredPercentileFailure,
 };
-use crate::percentile_input::{PercentileInputDiagnostic, numeric_value_at, payload_bytes_at};
+use crate::percentile_input::{
+    PercentileInputDiagnostic, numeric_value_at_with_failure, payload_bytes_at_with_failure,
+};
 use allocator_api2::vec::Vec as ScalarVec;
 use arrow_array::ArrayRef;
 use arrow_schema::DataType;
@@ -38,44 +40,69 @@ pub trait ExactPercentileAllocator: ScalarStateAllocator {
         &self,
         bytes: usize,
         operation: &str,
-    ) -> Result<Self::ParserReservation, String>;
-    fn reserve_percentile_transient_lossless(
-        &self,
-        bytes: usize,
-        operation: &str,
-    ) -> Result<Self::ParserReservation, crate::aggregate_scalar::ScalarStateError> {
-        self.reserve_percentile_transient(bytes, operation)
-            .map_err(crate::aggregate_scalar::ScalarStateError::Legacy)
-    }
-    fn percentile_allocation_failure(
-        &self,
-        operation: &str,
-    ) -> crate::aggregate_scalar::ScalarStateError {
-        crate::aggregate_scalar::ScalarStateError::Legacy(
-            self.percentile_allocation_error(operation),
-        )
-    }
-    fn percentile_allocation_error(&self, operation: &str) -> String {
-        self.scalar_allocation_error(operation).to_string()
-    }
+    ) -> Result<Self::ParserReservation, crate::KernelFailure>;
 }
-fn scalar_bytes_legacy<A: ExactPercentileAllocator>(
+fn scalar_bytes<A: ExactPercentileAllocator>(
     allocator: A,
     bytes: &[u8],
-) -> Result<ScalarVec<u8, A>, String> {
+) -> Result<ScalarVec<u8, A>, crate::KernelFailure> {
     crate::aggregate_scalar::scalar_bytes(allocator, bytes, &mut ScalarWork::new(None))
-        .map_err(|error| error.to_string())
+        .map_err(Into::into)
+}
+/// serde has its own fixed error type. The synchronous decode owns this one
+/// stack slot, so an allocation/control refusal never travels through text.
+#[derive(Default)]
+struct DecodeRefusal(std::cell::RefCell<Option<crate::KernelFailure>>);
+impl DecodeRefusal {
+    fn serde_error<E: serde::de::Error>(&self, source: crate::KernelFailure) -> E {
+        let mut first = self.0.borrow_mut();
+        if first.is_none() {
+            *first = Some(source);
+        }
+        E::custom("exact percentile state allocation refused")
+    }
+    fn take(&self) -> Option<crate::KernelFailure> {
+        self.0.borrow_mut().take()
+    }
 }
 fn compare_scalar_values(
     left: &AggScalarValue,
     right: &AggScalarValue,
-) -> Result<std::cmp::Ordering, String> {
-    crate::aggregate_scalar_fingerprint::compare_scalar_values(
-        left,
-        right,
-        &mut ScalarWork::new(None),
+) -> Result<std::cmp::Ordering, crate::KernelFailure> {
+    use crate::aggregate_scalar::ScalarOrdering;
+    // Preserve the original percentile stable ordering for NaN and mixed
+    // kinds. An actual callback failure is not an ordering policy.
+    Ok(
+        match crate::aggregate_scalar_fingerprint::compare_scalar_values_partial(
+            left,
+            right,
+            &mut ScalarWork::new(None),
+        )? {
+            ScalarOrdering::Ordered(order) => order,
+            ScalarOrdering::UnorderedFloat | ScalarOrdering::MismatchedKinds => {
+                std::cmp::Ordering::Equal
+            }
+        },
     )
-    .map_err(|error| error.to_string())
+}
+fn sort_scalar_values(values: &mut [AggScalarValue]) -> Result<(), crate::KernelFailure> {
+    let mut primary = None;
+    values.sort_by(|left, right| {
+        if primary.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        match compare_scalar_values(left, right) {
+            Ok(order) => order,
+            Err(cause) => {
+                primary = Some(cause);
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+    match primary {
+        Some(cause) => Err(cause),
+        None => Ok(()),
+    }
 }
 pub(crate) const EXACT_PERCENTILE_MAGIC: u8 = 0xC3;
 pub(crate) const EXACT_PERCENTILE_VERSION: u8 = 1;
@@ -105,18 +132,19 @@ impl<A: ExactPercentileAllocator> ExactPercentileState<A> {
         }
     }
 
-    pub fn push(&mut self, value: TrackedAggScalarValue<A>) -> Result<(), String> {
-        self.push_with_sink(value, &mut LegacyPercentileFailure)
+    pub fn push(&mut self, value: TrackedAggScalarValue<A>) -> Result<(), crate::KernelFailure> {
+        self.push_with_sink(value, &mut RequiredPercentileFailure)
     }
     pub fn push_with_sink<S: PercentileFailureSink<A>>(
         &mut self,
         value: TrackedAggScalarValue<A>,
         sink: &mut S,
     ) -> Result<(), S::Error> {
-        self.values.try_reserve(1).map_err(|_| {
+        self.values.try_reserve(1).map_err(|source| {
             sink.scalar(
                 self.allocator
-                    .percentile_allocation_failure("reserve exact percentile value"),
+                    .scalar_allocation_error("reserve exact percentile value", source)
+                    .into(),
             )
         })?;
         self.values.push(value);
@@ -189,18 +217,28 @@ impl<A: ExactPercentileAllocator> Serialize for ExactStateWire<'_, A> {
     }
 }
 
-pub fn encode_state<A: ExactPercentileAllocator>(state: &ExactPercentileState<A>) -> Vec<u8> {
-    let payload =
-        serde_json::to_vec(&ExactStateWire(state)).expect("serialize exact percentile state");
-    let mut out = Vec::with_capacity(2 + payload.len());
+pub fn encode_state<A: ExactPercentileAllocator>(
+    state: &ExactPercentileState<A>,
+) -> Result<Vec<u8>, crate::KernelFailure> {
+    let payload = serde_json::to_vec(&ExactStateWire(state))
+        .map_err(crate::exact_percentile_failure::json_encode_failure)?;
+    let size = crate::exact_percentile_failure::byte_extent(2 + payload.len() as u128)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(size).map_err(|source| {
+        crate::KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+            "reserve encoded exact percentile state",
+            source,
+        ))
+    })?;
     out.push(EXACT_PERCENTILE_MAGIC);
     out.push(EXACT_PERCENTILE_VERSION);
     out.extend_from_slice(&payload);
-    out
+    Ok(out)
 }
 
 struct ValuesSeed<'a, A: ExactPercentileAllocator> {
     allocator: &'a A,
+    refusal: &'a DecodeRefusal,
 }
 
 impl<'de, A: ExactPercentileAllocator> DeserializeSeed<'de> for ValuesSeed<'_, A> {
@@ -212,6 +250,7 @@ impl<'de, A: ExactPercentileAllocator> DeserializeSeed<'de> for ValuesSeed<'_, A
     {
         struct ValuesVisitor<'a, A: ExactPercentileAllocator> {
             allocator: &'a A,
+            refusal: &'a DecodeRefusal,
         }
 
         impl<'de, A: ExactPercentileAllocator> Visitor<'de> for ValuesVisitor<'_, A> {
@@ -229,11 +268,14 @@ impl<'de, A: ExactPercentileAllocator> DeserializeSeed<'de> for ValuesSeed<'_, A
                 while let Some(value) =
                     sequence.next_element::<BorrowedSerializableScalar<'de>>()?
                 {
-                    values.try_reserve(1).map_err(|_| {
-                        serde::de::Error::custom(
-                            self.allocator.percentile_allocation_error(
-                                "reserve decoded exact percentile value",
-                            ),
+                    values.try_reserve(1).map_err(|source| {
+                        self.refusal.serde_error(
+                            self.allocator
+                                .scalar_allocation_error(
+                                    "reserve decoded exact percentile value",
+                                    source,
+                                )
+                                .into(),
                         )
                     })?;
                     let value = match value {
@@ -244,8 +286,8 @@ impl<'de, A: ExactPercentileAllocator> DeserializeSeed<'de> for ValuesSeed<'_, A
                             TrackedAggScalarValue::Float64(value)
                         }
                         BorrowedSerializableScalar::Utf8(value) => TrackedAggScalarValue::Utf8(
-                            scalar_bytes_legacy(self.allocator.clone(), value.as_bytes())
-                                .map_err(serde::de::Error::custom)?,
+                            scalar_bytes(self.allocator.clone(), value.as_bytes())
+                                .map_err(|source| self.refusal.serde_error(source))?,
                         ),
                         BorrowedSerializableScalar::Date32(value) => {
                             TrackedAggScalarValue::Date32(value)
@@ -265,12 +307,14 @@ impl<'de, A: ExactPercentileAllocator> DeserializeSeed<'de> for ValuesSeed<'_, A
 
         deserializer.deserialize_seq(ValuesVisitor {
             allocator: self.allocator,
+            refusal: self.refusal,
         })
     }
 }
 
 struct StateSeed<'a, A: ExactPercentileAllocator> {
     allocator: &'a A,
+    refusal: &'a DecodeRefusal,
 }
 
 impl<'de, A: ExactPercentileAllocator> DeserializeSeed<'de> for StateSeed<'_, A> {
@@ -282,6 +326,7 @@ impl<'de, A: ExactPercentileAllocator> DeserializeSeed<'de> for StateSeed<'_, A>
     {
         struct StateVisitor<'a, A: ExactPercentileAllocator> {
             allocator: &'a A,
+            refusal: &'a DecodeRefusal,
         }
 
         impl<'de, A: ExactPercentileAllocator> Visitor<'de> for StateVisitor<'_, A> {
@@ -303,6 +348,7 @@ impl<'de, A: ExactPercentileAllocator> DeserializeSeed<'de> for StateSeed<'_, A>
                         "values" => {
                             values = Some(map.next_value_seed(ValuesSeed {
                                 allocator: self.allocator,
+                                refusal: self.refusal,
                             })?)
                         }
                         _ => {
@@ -322,6 +368,7 @@ impl<'de, A: ExactPercentileAllocator> DeserializeSeed<'de> for StateSeed<'_, A>
             &["rate", "values"],
             StateVisitor {
                 allocator: self.allocator,
+                refusal: self.refusal,
             },
         )
     }
@@ -330,8 +377,8 @@ impl<'de, A: ExactPercentileAllocator> DeserializeSeed<'de> for StateSeed<'_, A>
 pub fn decode_state_into<A: ExactPercentileAllocator>(
     payload: &[u8],
     allocator: &A,
-) -> Result<(Option<f64>, ScalarVec<TrackedAggScalarValue<A>, A>), String> {
-    decode_state_into_with_sink(payload, allocator, &mut LegacyPercentileFailure)
+) -> Result<(Option<f64>, ScalarVec<TrackedAggScalarValue<A>, A>), crate::KernelFailure> {
+    decode_state_into_with_sink(payload, allocator, &mut RequiredPercentileFailure)
 }
 pub fn decode_state_into_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
     payload: &[u8],
@@ -355,27 +402,32 @@ pub fn decode_state_into_with_sink<A: ExactPercentileAllocator, S: PercentileFai
     // forms are each bounded by the complete payload. State-owned values are
     // separately charged by A, so 2 * payload is a complete
     // bound for parser-private live scratch.
-    let scratch_bound = payload
-        .len()
-        .checked_mul(2)
-        .ok_or_else(|| sink.data(PercentileDataRecipe::ScratchOverflow))?;
+    let scratch_bound = crate::exact_percentile_failure::byte_extent(2 * payload.len() as u128)
+        .map_err(|source| sink.scalar(source))?;
     let _scratch = allocator
-        .reserve_percentile_transient_lossless(
+        .reserve_percentile_transient(
             scratch_bound,
             "reserve exact percentile JSON parser scratch",
         )
         .map_err(|error| sink.scalar(error))?;
     let mut deserializer = serde_json::Deserializer::from_slice(&payload[2..]);
-    StateSeed { allocator }
-        .deserialize(&mut deserializer)
-        .map_err(|error| sink.json(&error, allocator))
+    let refusal = DecodeRefusal::default();
+    let result = StateSeed {
+        allocator,
+        refusal: &refusal,
+    }
+    .deserialize(&mut deserializer);
+    match refusal.take() {
+        Some(source) => Err(sink.scalar(source)),
+        None => result.map_err(|error| sink.json(error, allocator)),
+    }
 }
 
 pub fn apply_rate<A: ExactPercentileAllocator>(
     state: &mut ExactPercentileState<A>,
     rate: f64,
-) -> Result<(), String> {
-    apply_rate_with_sink(state, rate, &mut LegacyPercentileFailure)
+) -> Result<(), crate::KernelFailure> {
+    apply_rate_with_sink(state, rate, &mut RequiredPercentileFailure)
 }
 pub fn apply_rate_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
     state: &mut ExactPercentileState<A>,
@@ -402,8 +454,8 @@ pub fn apply_rate_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSin
 
 pub fn validate_exact_scalar<A: ExactPercentileAllocator>(
     value: TrackedAggScalarValue<A>,
-) -> Result<TrackedAggScalarValue<A>, String> {
-    validate_exact_scalar_with_sink(value, &mut LegacyPercentileFailure)
+) -> Result<TrackedAggScalarValue<A>, crate::KernelFailure> {
+    validate_exact_scalar_with_sink(value, &mut RequiredPercentileFailure)
 }
 pub fn validate_exact_scalar_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
     value: TrackedAggScalarValue<A>,
@@ -454,7 +506,7 @@ pub fn update_from_arrays<A: ExactPercentileAllocator>(
     value_row: usize,
     rates: &ArrayRef,
     rate_row: usize,
-) -> Result<(), String> {
+) -> Result<(), crate::KernelFailure> {
     update_from_arrays_with_sink(
         state,
         values,
@@ -462,7 +514,7 @@ pub fn update_from_arrays<A: ExactPercentileAllocator>(
         rates,
         rate_row,
         &mut ScalarWork::new(None),
-        &mut LegacyPercentileFailure,
+        &mut RequiredPercentileFailure,
     )
 }
 pub fn update_from_arrays_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
@@ -474,9 +526,9 @@ pub fn update_from_arrays_with_sink<A: ExactPercentileAllocator, S: PercentileFa
     work: &mut ScalarWork<'_, '_>,
     sink: &mut S,
 ) -> Result<(), S::Error> {
-    if let Some(rate) = numeric_value_at(rates, rate_row, PercentileInputDiagnostic::ExactUpdate)
-        .map_err(|error| sink.reader(error))?
-    {
+    if let Some(rate) = numeric_value_at_with_failure(rates, rate_row, &mut |source| {
+        sink.reader(source.into_failure(PercentileInputDiagnostic::ExactUpdate))
+    })? {
         apply_rate_with_sink(state, rate, sink)?;
     }
     let Some(value) = crate::aggregate_scalar::tracked_scalar_from_array(
@@ -485,7 +537,7 @@ pub fn update_from_arrays_with_sink<A: ExactPercentileAllocator, S: PercentileFa
         &state.allocator,
         work,
     )
-    .map_err(|error| sink.scalar(error))?
+    .map_err(|error| sink.scalar(error.into()))?
     else {
         return Ok(());
     };
@@ -498,14 +550,14 @@ pub fn merge_from_array<A: ExactPercentileAllocator>(
     array: &ArrayRef,
     row: usize,
     diagnostic: ExactMergeDiagnostic,
-) -> Result<(), String> {
+) -> Result<(), crate::KernelFailure> {
     merge_from_array_with_sink(
         state,
         array,
         row,
         diagnostic,
         &mut ScalarWork::new(None),
-        &mut LegacyPercentileFailure,
+        &mut RequiredPercentileFailure,
     )
 }
 pub fn merge_from_array_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
@@ -520,27 +572,29 @@ pub fn merge_from_array_with_sink<A: ExactPercentileAllocator, S: PercentileFail
         ExactMergeDiagnostic::Update => PercentileInputDiagnostic::ExactUpdate,
         ExactMergeDiagnostic::Merge => PercentileInputDiagnostic::ExactMerge,
     };
-    let Some(payload) =
-        payload_bytes_at(array, row, context).map_err(|error| sink.reader(error))?
+    let Some(payload) = payload_bytes_at_with_failure(array, row, &mut |source| {
+        sink.reader(source.into_failure(context))
+    })?
     else {
         return Ok(());
     };
-    work.flush().map_err(|error| sink.scalar(error))?;
+    work.flush().map_err(|error| sink.scalar(error.into()))?;
     let (rate, incoming) = decode_state_into_with_sink(payload, &state.allocator, sink)?;
     if let Some(rate) = rate {
         apply_rate_with_sink(state, rate, sink)?;
     }
-    work.flush().map_err(|error| sink.scalar(error))?;
-    state.values.try_reserve(incoming.len()).map_err(|_| {
+    work.flush().map_err(|error| sink.scalar(error.into()))?;
+    state.values.try_reserve(incoming.len()).map_err(|source| {
         sink.scalar(
             state
                 .allocator
-                .percentile_allocation_failure("reserve merged exact percentile values"),
+                .scalar_allocation_error("reserve merged exact percentile values", source)
+                .into(),
         )
     })?;
     // Extend remains the original owned-vector operation, observed as opaque work.
     state.values.extend(incoming);
-    work.flush().map_err(|error| sink.scalar(error))?;
+    work.flush().map_err(|error| sink.scalar(error.into()))?;
     Ok(())
 }
 #[derive(Clone, Copy, Debug)]
@@ -552,12 +606,12 @@ pub enum ExactMergeDiagnostic {
 pub fn finalize_cont<A: ExactPercentileAllocator>(
     state: &ExactPercentileState<A>,
     output_type: &DataType,
-) -> Result<Option<AggScalarValue>, String> {
+) -> Result<Option<AggScalarValue>, crate::KernelFailure> {
     finalize_cont_with_sink(
         state,
         output_type,
         &mut ScalarWork::new(None),
-        &mut LegacyPercentileFailure,
+        &mut RequiredPercentileFailure,
     )
 }
 pub fn finalize_cont_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
@@ -575,12 +629,10 @@ pub fn finalize_cont_with_sink<A: ExactPercentileAllocator, S: PercentileFailure
         .iter()
         .map(|value| crate::aggregate_scalar::tracked_scalar_to_output(value, work))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| sink.scalar(error))?;
-    work.flush().map_err(|error| sink.scalar(error))?;
-    values.sort_by(|left, right| {
-        compare_scalar_values(left, right).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    work.flush().map_err(|error| sink.scalar(error))?;
+        .map_err(|error| sink.scalar(error.into()))?;
+    work.flush().map_err(|error| sink.scalar(error.into()))?;
+    sort_scalar_values(&mut values).map_err(|cause| sink.scalar(cause.into()))?;
+    work.flush().map_err(|error| sink.scalar(error.into()))?;
 
     if values.len() == 1 || rate == 1.0 {
         return match output_type {
@@ -620,11 +672,11 @@ pub fn finalize_cont_with_sink<A: ExactPercentileAllocator, S: PercentileFailure
 
 pub fn finalize_disc<A: ExactPercentileAllocator>(
     state: &ExactPercentileState<A>,
-) -> Result<Option<AggScalarValue>, String> {
+) -> Result<Option<AggScalarValue>, crate::KernelFailure> {
     finalize_disc_with_sink(
         state,
         &mut ScalarWork::new(None),
-        &mut LegacyPercentileFailure,
+        &mut RequiredPercentileFailure,
     )
 }
 pub fn finalize_disc_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
@@ -641,15 +693,171 @@ pub fn finalize_disc_with_sink<A: ExactPercentileAllocator, S: PercentileFailure
         .iter()
         .map(|value| crate::aggregate_scalar::tracked_scalar_to_output(value, work))
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| sink.scalar(error))?;
-    work.flush().map_err(|error| sink.scalar(error))?;
-    values.sort_by(|left, right| {
-        compare_scalar_values(left, right).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    work.flush().map_err(|error| sink.scalar(error))?;
+        .map_err(|error| sink.scalar(error.into()))?;
+    work.flush().map_err(|error| sink.scalar(error.into()))?;
+    sort_scalar_values(&mut values).map_err(|cause| sink.scalar(cause.into()))?;
+    work.flush().map_err(|error| sink.scalar(error.into()))?;
     if values.len() == 1 || rate == 1.0 {
         return Ok(values.last().cloned());
     }
     let index = (((values.len() - 1) as f64) * rate).ceil() as usize;
     Ok(values.get(index).cloned())
+}
+
+#[cfg(test)]
+mod refusal_journal_tests {
+    use super::*;
+    use crate::{KernelDiagnostic, KernelFailure};
+    use allocator_api2::alloc::{AllocError, Allocator, Global};
+    use std::{
+        alloc::Layout,
+        ptr::NonNull,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+    /// This causal probe deliberately has no host error journal. Only the
+    /// real failing allocation's synchronous continuation knows its cause.
+    #[derive(Clone, Debug)]
+    struct AllocatorProbe {
+        stop_at: usize,
+        source: KernelFailure,
+        attempts: Arc<AtomicUsize>,
+        releases: Arc<AtomicUsize>,
+    }
+    unsafe impl Allocator for AllocatorProbe {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            let at = self.attempts.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                at <= self.stop_at,
+                "allocation continued after its first refusal"
+            );
+            if at == self.stop_at {
+                return Err(AllocError);
+            }
+            Global.allocate(layout)
+        }
+        unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            unsafe { Global.deallocate(pointer, layout) };
+        }
+    }
+    impl ScalarStateAllocator for AllocatorProbe {
+        fn scalar_allocation_error<E: crate::allocation_failure::AllocationRefusalSource>(
+            &self,
+            _: &str,
+            _source: E,
+        ) -> crate::KernelFailure {
+            self.source.clone()
+        }
+    }
+    impl ExactPercentileAllocator for AllocatorProbe {
+        type ParserReservation = ();
+        fn reserve_percentile_transient(&self, _: usize, _: &str) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+    }
+    struct SourceSink;
+    impl PercentileFailureSink<AllocatorProbe> for SourceSink {
+        type Error = KernelFailure;
+        fn scalar(&mut self, source: KernelFailure) -> KernelFailure {
+            source
+        }
+        fn data(&mut self, recipe: PercentileDataRecipe<'_, AllocatorProbe>) -> KernelFailure {
+            panic!("allocation refusal was converted to data: {recipe}")
+        }
+        fn reader(&mut self, message: KernelFailure) -> KernelFailure {
+            panic!("allocation refusal was converted to reader text: {message}")
+        }
+        fn json(&mut self, error: serde_json::Error, _: &AllocatorProbe) -> KernelFailure {
+            panic!("allocation refusal escaped through serde text: {error}")
+        }
+    }
+    #[test]
+    fn serde_refusals_keep_each_original_cause_without_an_allocator_side_channel() {
+        use novarocks_failure_contract::{FailureProjection, FailureReason, domain};
+        let sources = [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::InvalidProgram(KernelDiagnostic::new("original plan refusal")),
+            KernelFailure::Internal(KernelDiagnostic::new("original invariant refusal")),
+            KernelFailure::Operational(KernelDiagnostic::new("original unexpected refusal")),
+            KernelFailure::InstanceFailed,
+            KernelFailure::Capacity(crate::KernelCapacityRefusal::new(
+                FailureReason::new(domain::MEMORY, std::num::NonZeroU16::new(8).unwrap()),
+                128,
+                64,
+                128,
+            )),
+        ];
+        let mut payload = vec![EXACT_PERCENTILE_MAGIC, EXACT_PERCENTILE_VERSION];
+        payload.extend_from_slice(br#"{"rate":0.5,"values":[{"Utf8":"hello"}]}"#);
+        // First the values vector, then its owned UTF8 value. Both actual
+        // allocation sites must unwind through the same typed decode slot.
+        for stop_at in 0..2 {
+            for source in &sources {
+                let allocator = AllocatorProbe {
+                    stop_at,
+                    source: source.clone(),
+                    attempts: Arc::new(AtomicUsize::new(0)),
+                    releases: Arc::new(AtomicUsize::new(0)),
+                };
+                let error =
+                    decode_state_into_with_sink(&payload, &allocator, &mut SourceSink).unwrap_err();
+                assert_eq!(&error, source);
+                assert_eq!(error.failure_fact(), source.failure_fact());
+                assert_eq!(allocator.attempts.load(Ordering::SeqCst), stop_at + 1);
+                assert_eq!(allocator.releases.load(Ordering::SeqCst), stop_at);
+            }
+        }
+    }
+    fn source_chain_has<T: std::error::Error + 'static>(cause: &KernelFailure) -> bool {
+        let mut source: &(dyn std::error::Error + 'static) = cause;
+        loop {
+            if source.is::<T>() {
+                return true;
+            }
+            let Some(next) = source.source() else {
+                return false;
+            };
+            source = next;
+        }
+    }
+    #[test]
+    fn exact_percentile_codec_keeps_real_serde_sources_and_distinct_failure_facts() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let allocator = AllocatorProbe {
+            stop_at: usize::MAX,
+            source: KernelFailure::Cancelled,
+            attempts: Arc::new(AtomicUsize::new(0)),
+            releases: Arc::new(AtomicUsize::new(0)),
+        };
+        let payload = [EXACT_PERCENTILE_MAGIC, EXACT_PERCENTILE_VERSION, b'{'];
+        let cause = decode_state_into(&payload, &allocator).unwrap_err();
+        assert_eq!(
+            cause.failure_fact(),
+            crate::DataFailureReason::InvalidEncoding.failure_fact()
+        );
+        assert!(source_chain_has::<serde_json::Error>(&cause));
+        let mut state = ExactPercentileState::new(allocator.clone());
+        state.values.push(TrackedAggScalarValue::Bool(true));
+        let cause = encode_state(&state).unwrap_err();
+        assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
+        assert!(source_chain_has::<serde_json::Error>(&cause));
+        drop(state);
+        assert_eq!(
+            allocator.attempts.load(Ordering::SeqCst),
+            allocator.releases.load(Ordering::SeqCst)
+        );
+        let cause =
+            crate::exact_percentile_failure::byte_extent(isize::MAX as u128 + 1).unwrap_err();
+        assert_eq!(cause.failure_fact().class(), FailureClass::Representation);
+        let facts = cause.failure_fact().representation().unwrap();
+        assert_eq!(facts.required, Some(isize::MAX as u64 + 1));
+        assert_eq!(facts.extent_limit, Some(isize::MAX as u64));
+        assert_eq!(facts.representable_prefix, None);
+        assert!(source_chain_has::<std::alloc::LayoutError>(&cause));
+    }
 }

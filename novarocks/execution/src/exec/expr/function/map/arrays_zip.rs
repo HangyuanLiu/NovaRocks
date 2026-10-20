@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
 use arrow::array::{
     Array, ArrayRef, Float32Array, Float64Array, ListArray, StringBuilder, StructArray, make_array,
     new_empty_array,
@@ -43,19 +43,25 @@ fn format_float_for_varchar(value: f64) -> String {
     format!("{value}")
 }
 
-fn cast_float_to_utf8(value_arr: &ArrayRef) -> Result<ArrayRef, String> {
+fn cast_float_to_utf8(value_arr: &ArrayRef) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     let mut out = StringBuilder::new();
+    let mut bytes = 0i32;
     match value_arr.data_type() {
         DataType::Float64 => {
             let arr = value_arr
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "arrays_zip failed to downcast Float64Array".to_string())?;
+                .ok_or_else(|| expression_contract("arrays_zip failed to downcast Float64Array"))?;
             for idx in 0..arr.len() {
                 if arr.is_null(idx) {
                     out.append_null();
                 } else {
-                    out.append_value(format_float_for_varchar(arr.value(idx)));
+                    let text = format_float_for_varchar(arr.value(idx));
+                    bytes = novarocks_functions::aggregate_scalar::checked_utf8_output_offset(
+                        bytes,
+                        text.len(),
+                    )?;
+                    out.append_value(text);
                 }
             }
         }
@@ -63,20 +69,25 @@ fn cast_float_to_utf8(value_arr: &ArrayRef) -> Result<ArrayRef, String> {
             let arr = value_arr
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "arrays_zip failed to downcast Float32Array".to_string())?;
+                .ok_or_else(|| expression_contract("arrays_zip failed to downcast Float32Array"))?;
             for idx in 0..arr.len() {
                 if arr.is_null(idx) {
                     out.append_null();
                 } else {
-                    out.append_value(format_float_for_varchar(arr.value(idx) as f64));
+                    let text = format_float_for_varchar(arr.value(idx) as f64);
+                    bytes = novarocks_functions::aggregate_scalar::checked_utf8_output_offset(
+                        bytes,
+                        text.len(),
+                    )?;
+                    out.append_value(text);
                 }
             }
         }
         _ => {
-            return Err(format!(
+            return Err(expression_contract(format_args!(
                 "arrays_zip float->utf8 cast got non-float input: {:?}",
                 value_arr.data_type()
-            ));
+            )));
         }
     }
     Ok(Arc::new(out.finish()) as ArrayRef)
@@ -87,9 +98,11 @@ pub fn eval_arrays_zip<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     if args.is_empty() {
-        return Err(("arrays_zip expects at least one argument".to_string()).into());
+        return Err(expression_contract(
+            "arrays_zip expects at least one argument",
+        ));
     }
 
     let mut list_arrays: Vec<Option<ArrayRef>> = Vec::with_capacity(args.len());
@@ -101,22 +114,28 @@ pub fn eval_arrays_zip<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             value_arrays.push(new_empty_array(&DataType::Null));
             continue;
         }
-        let list = arr
-            .as_any()
-            .downcast_ref::<ListArray>()
-            .ok_or_else(|| format!("arrays_zip expects ListArray, got {:?}", arr.data_type()))?;
+        let list = arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+            expression_contract(format_args!(
+                "arrays_zip expects ListArray, got {:?}",
+                arr.data_type()
+            ))
+        })?;
+        crate::exec::expr::function::array::common::validate_rows(
+            arr.len(),
+            chunk.len(),
+            "arrays_zip input",
+        )?;
         value_arrays.push(list.values().clone());
         list_arrays.push(Some(arr));
     }
 
     let (list_field, struct_fields) = resolve_output_type(arena.data_type(expr), &value_arrays)?;
     if struct_fields.len() != value_arrays.len() {
-        return Err((format!(
+        return Err(expression_contract(format_args!(
             "arrays_zip output struct field count mismatch: expected {}, got {}",
             value_arrays.len(),
             struct_fields.len()
-        ))
-        .into());
+        )));
     }
 
     for (idx, value_arr) in value_arrays.iter_mut().enumerate() {
@@ -127,12 +146,7 @@ pub fn eval_arrays_zip<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             {
                 cast_float_to_utf8(value_arr)?
             } else {
-                cast(value_arr, expected).map_err(|e| {
-                    format!(
-                        "arrays_zip failed to cast field {} to {:?}: {}",
-                        idx, expected, e
-                    )
-                })?
+                cast(value_arr, expected).map_err(crate::exec::expr::cast::cast_arrow_failure)?
             };
         }
     }
@@ -161,7 +175,7 @@ pub fn eval_arrays_zip<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let list = list_arr
                 .as_any()
                 .downcast_ref::<ListArray>()
-                .ok_or_else(|| "arrays_zip internal list downcast failed".to_string())?;
+                .ok_or_else(|| expression_contract("arrays_zip internal list downcast failed"))?;
             let row_idx = super::common::row_index(row, list.len());
             row_indices.push(row_idx);
             if list.is_null(row_idx) {
@@ -181,6 +195,10 @@ pub fn eval_arrays_zip<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             continue;
         }
 
+        current = novarocks_functions::aggregate_scalar::checked_list_output_offset(
+            current as i32,
+            max_len,
+        )? as i64;
         for element_idx in 0..max_len {
             for (array_idx, list_arr) in list_arrays.iter().enumerate() {
                 let Some(list_arr) = list_arr else {
@@ -189,7 +207,9 @@ pub fn eval_arrays_zip<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 let list = list_arr
                     .as_any()
                     .downcast_ref::<ListArray>()
-                    .ok_or_else(|| "arrays_zip internal list downcast failed".to_string())?;
+                    .ok_or_else(|| {
+                        expression_contract("arrays_zip internal list downcast failed")
+                    })?;
                 let row_idx = row_indices[array_idx];
                 let offsets = list.value_offsets();
                 let start = offsets[row_idx] as usize;
@@ -201,10 +221,6 @@ pub fn eval_arrays_zip<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                     mutables[array_idx].extend_nulls(1);
                 }
             }
-            current += 1;
-            if current > i32::MAX as i64 {
-                return Err(("arrays_zip offset overflow".to_string()).into());
-            }
         }
 
         out_offsets.push(current as i32);
@@ -215,34 +231,46 @@ pub fn eval_arrays_zip<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         .into_iter()
         .map(|m| make_array(m.freeze()))
         .collect();
-    let out_struct = StructArray::new(struct_fields, struct_columns, None);
-    let out = ListArray::new(
+    let out_struct =
+        StructArray::try_new(struct_fields, struct_columns, None).map_err(|source| {
+            crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+                "arrays_zip StructArray",
+                source,
+            )
+        })?;
+    let out = ListArray::try_new(
         list_field,
         OffsetBuffer::new(out_offsets.into()),
         Arc::new(out_struct),
         null_builder.finish(),
-    );
+    )
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "arrays_zip ListArray",
+            source,
+        )
+    })?;
     Ok(Arc::new(out))
 }
 
 fn resolve_output_type(
     output_type: Option<&DataType>,
     values: &[ArrayRef],
-) -> Result<(Arc<Field>, Fields), String> {
+) -> crate::runtime::fragment::ExecutionResult<(Arc<Field>, Fields)> {
     match output_type {
         Some(DataType::List(item_field)) => {
             let DataType::Struct(fields) = item_field.data_type() else {
-                return Err(format!(
+                return Err(expression_contract(format_args!(
                     "arrays_zip output element type must be Struct, got {:?}",
                     item_field.data_type()
-                ));
+                )));
             };
             Ok((item_field.clone(), fields.clone()))
         }
-        Some(other) => Err(format!(
+        Some(other) => Err(expression_contract(format_args!(
             "arrays_zip output type must be List, got {:?}",
             other
-        )),
+        ))),
         None => {
             let fields: Fields = values
                 .iter()

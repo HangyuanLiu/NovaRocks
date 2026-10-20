@@ -515,7 +515,7 @@ impl PureCompileControl for Trace {
         assert!(completed <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push(completed);
-        if let Some((ordinal, error)) = self.fail_at {
+        if let Some((ordinal, error)) = self.fail_at.clone() {
             if trace.len() == ordinal + 1 {
                 return Err(error);
             }
@@ -554,7 +554,7 @@ fn real_variadic_owner_keeps_entry_quantum_and_tail_three_control_causes() {
         ] {
             let stop = Trace {
                 trace: Mutex::new(Vec::new()),
-                fail_at: Some((ordinal, error)),
+                fail_at: Some((ordinal, error.clone())),
             };
             assert!(
                 matches!(owner.validate_and_refine(exact, &stop), Err(FunctionEffectOwnerError::Control(actual)) if actual == error)
@@ -594,7 +594,7 @@ fn ordinary_owner_refusal_observes_completed_tail_and_preserves_control() {
     ] {
         let stop = Trace {
             trace: Mutex::new(Vec::new()),
-            fail_at: Some((1, error)),
+            fail_at: Some((1, error.clone())),
         };
         assert!(
             matches!(owner.validate_and_refine(exact, &stop), Err(FunctionEffectOwnerError::Control(actual)) if actual == error)
@@ -658,13 +658,13 @@ fn actual_fresh_and_frozen_factories_keep_original_control_at_every_boundary() {
             ] {
                 let stop = Trace {
                     trace: Mutex::new(Vec::new()),
-                    fail_at: Some((ordinal, error)),
+                    fail_at: Some((ordinal, error.clone())),
                 };
                 let result = run(&stop);
                 // Refinement returns CompileControlError directly; the shared
                 // exact call-contract constructor preserves the same cause
                 // through its existing KernelFailure port.
-                let preserves_cause = match (&result, error) {
+                let preserves_cause = match (&result, error.clone()) {
                     (Err(FunctionSpecializationFailure::Control(actual)), expected) => {
                         *actual == expected
                     }

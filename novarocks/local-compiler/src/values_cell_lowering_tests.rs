@@ -470,7 +470,7 @@ fn values_cast_cells_observe_every_original_compile_refusal() {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let refused = Control::refusing(position, cause);
+            let refused = Control::refusing(position, cause.clone());
             is_control(direct(&package, &lowered, &refused).unwrap_err(), cause);
             assert_eq!(refused.trace(), trace[..position]);
         }

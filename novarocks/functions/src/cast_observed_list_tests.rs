@@ -148,7 +148,7 @@ fn legacy(a: &ArrayRef, ty: &DataType) -> ArrayRef {
     let DataType::List(field) = ty else {
         unreachable!()
     };
-    crate::list_cast_core::cast(a, field, &mut |child, target| {
+    crate::list_cast_core::cast::<KernelFailure>(a, field, &mut |child, target| {
         Ok(crate::list_cast_core::null_source(child.len(), target))
     })
     .unwrap()
@@ -480,28 +480,48 @@ fn list_cast_recipe_constant_null_root_broadcast_and_nested_logical_identity_gua
 }
 
 #[test]
-fn list_cast_core_raw_child_error_text_is_complete_and_no_observation_footer_is_added() {
+fn list_cast_core_keeps_the_exact_child_failure_and_has_no_observation_footer() {
+    #[derive(Debug)]
+    enum CallerFailure {
+        Original(Arc<String>),
+        Domain(crate::list_cast_core::ListCastFailure),
+    }
+    impl From<crate::list_cast_core::ListCastFailure> for CallerFailure {
+        fn from(cause: crate::list_cast_core::ListCastFailure) -> Self {
+            Self::Domain(cause)
+        }
+    }
     let a = input(true, 3);
     let DataType::List(field) = target(true, "7") else {
         unreachable!()
     };
-    let message = format!("original child error {}", "x".repeat(2048));
-    assert_eq!(
-        crate::list_cast_core::cast(&a, &field, &mut |_, _| Err(message.clone())).unwrap_err(),
-        message
-    );
+    let message = Arc::new(format!("original child error {}", "x".repeat(2048)));
+    let cause = crate::list_cast_core::cast(&a, &field, &mut |_, _| {
+        Err(CallerFailure::Original(Arc::clone(&message)))
+    })
+    .unwrap_err();
+    let CallerFailure::Original(actual) = cause else {
+        panic!("child source was replaced");
+    };
+    assert!(Arc::ptr_eq(&actual, &message));
     let mut calls = 0;
     let result = crate::list_cast_core::cast_observed(
         &a,
         &field,
-        &mut |_, _| Err(crate::list_cast_core::ListCastError::Data(message.clone())),
+        &mut |_, _| {
+            Err(crate::list_cast_core::ListCastError::Host(
+                CallerFailure::Original(Arc::clone(&message)),
+            ))
+        },
         &mut |_| {
             calls += 1;
-            Ok::<_, std::convert::Infallible>(())
+            Ok::<_, CallerFailure>(())
         },
     );
-    assert!(
-        matches!(result,Err(crate::list_cast_core::ListCastError::Data(actual)) if actual==message)
-    );
+    let Err(crate::list_cast_core::ListCastError::Host(CallerFailure::Original(actual))) = result
+    else {
+        panic!("child source was replaced");
+    };
+    assert!(Arc::ptr_eq(&actual, &message));
     assert_eq!(calls, 1);
 }

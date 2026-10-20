@@ -22,8 +22,9 @@
 //! resource behavior, with no timing, performance gate or product controller.
 
 use super::*;
+use crate::exec::pipeline::{shape::StepOperator, test_driver::TestDriver};
 
-fn populated(f: &Fixture, tracker: Arc<MemTracker>) -> CompiledGroupedTopNProcessor {
+fn populated(f: &Fixture, tracker: Arc<MemTracker>) -> GroupedTopNStep {
     let factory = CompiledGroupedTopNProcessorFactory::try_new(
         f.program.clone(),
         f.grouped,
@@ -34,24 +35,23 @@ fn populated(f: &Fixture, tracker: Arc<MemTracker>) -> CompiledGroupedTopNProces
     processor.set_mem_tracker(tracker);
     prepare_typed_fixture_operator(&mut processor);
     let state = RuntimeState::default();
+    let mut calls = TestDriver::new(&mut processor, &state);
     // Independent Partial processors preserve each original contribution.
     for offset in 0..f.input.len() {
         for chunk in partial_chunks(f, offset, 1) {
-            processor.push_chunk(&state, chunk).unwrap();
+            calls.input_without_output(chunk).unwrap();
         }
     }
-    assert!(!processor.has_output());
+    assert!(matches!(calls.next(), NextStep::NeedInput));
+    drop(calls);
     processor
 }
 
-fn drain(processor: &mut CompiledGroupedTopNProcessor) -> Vec<Chunk> {
+fn drain(processor: &mut GroupedTopNStep) -> Vec<Chunk> {
     let state = RuntimeState::default();
-    processor.set_finishing(&state).unwrap();
-    let mut output = Vec::new();
-    while let Some(chunk) = processor.pull_chunk(&state).unwrap() {
-        output.push(chunk);
-    }
-    output
+    let mut calls = TestDriver::new(processor, &state);
+    calls.signal_eos().unwrap();
+    calls.collect_until_finished().unwrap()
 }
 
 fn text_fixture(keys: &[String], limit: usize) -> Fixture {
@@ -143,7 +143,7 @@ fn compiled_grouped_topn_sum_intermediate_remains_exact_before_final_and_evictio
 }
 
 #[test]
-fn compiled_grouped_topn_retained_sum_overflow_is_only_a_final_operational_failure() {
+fn compiled_grouped_topn_retained_sum_overflow_is_only_a_final_data_failure() {
     let f = sum_fixture(&[(1, i64::MAX), (1, 1), (2, 5)]);
     let tracker = MemTracker::new_root("grouped-overflowing-sum-intermediate");
     let mut processor = populated(&f, tracker.clone());
@@ -155,10 +155,18 @@ fn compiled_grouped_topn_retained_sum_overflow_is_only_a_final_operational_failu
     );
     let final_tracker = MemTracker::new_root("grouped-sum-overflow-final");
     let error = try_final_chunks_tracked(&f, intermediate, final_tracker.clone()).unwrap_err();
-    let ExecutionFailureCause::Kernel(KernelFailure::Operational(message)) = error.cause() else {
-        panic!("unexpected SUM failure: {error:?}")
+    use novarocks_failure_contract::FailureProjection;
+    assert_eq!(
+        error.failure_fact(),
+        novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+    );
+    assert_eq!(error.detail(), "sum result overflows BIGINT");
+    let ExecutionFailureCause::Kernel(KernelFailure::Source(original)) = error.cause() else {
+        panic!("SUM must retain its domain-owned source: {error:?}");
     };
-    assert_eq!(message.message(), "sum result overflows BIGINT");
+    assert_eq!(original.failure_fact(), error.failure_fact());
+    let source = std::error::Error::source(original).expect("original SUM domain cause");
+    assert_eq!(source.to_string(), "sum result overflows BIGINT");
     drop(error);
     drop(processor);
     drop(f);
@@ -167,9 +175,97 @@ fn compiled_grouped_topn_retained_sum_overflow_is_only_a_final_operational_failu
 }
 
 #[test]
-fn compiled_grouped_topn_later_finish_refusal_destroys_the_unpublished_success_prefix() {
+fn compiled_grouped_topn_steps_publish_one_candidate_per_grant_without_prefilling_outputs() {
+    use crate::exec::pipeline::{
+        input::RawInput,
+        shape::StepOperator,
+        step::{InputResult, NextStep},
+        step_context::{StepContext, TurnWork},
+    };
+    let f = text_fixture(&["a".into(), "z".into()], 2);
+    let tracker = MemTracker::new_root("grouped-step-candidate-output");
+    let mut processor = populated(&f, tracker.clone());
+    let control = RuntimeErrorState::default();
+    let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 0);
+    processor
+        .finish(&mut StepContext::new(&control, &mut work))
+        .unwrap();
+    let ready = processor
+        .drive(&mut StepContext::new(&control, &mut work))
+        .unwrap();
+    assert!(ready.output.is_none());
+    assert!(matches!(ready.next, NextStep::Runnable));
+    let before = tracker.allocated();
+    let blocked = processor
+        .drive(&mut StepContext::new(&control, &mut work))
+        .unwrap();
+    assert!(blocked.output.is_none());
+    assert!(matches!(blocked.next, NextStep::Yield));
+    assert_eq!(tracker.allocated(), before);
+    assert_eq!(processor.kernel_for_test().emission, Some(0));
+    work.begin_turn(1).unwrap();
+    let first = processor
+        .drive(&mut StepContext::new(&control, &mut work))
+        .unwrap();
+    assert!(matches!(first.next, NextStep::Runnable));
+    let first = first.output.expect("first granted candidate");
+    assert_eq!(
+        array_key(first.record_batch().column(0), 0),
+        Some(KeyCell::Text("a".into()))
+    );
+    let before = tracker.allocated();
+    let blocked = processor
+        .drive(&mut StepContext::new(&control, &mut work))
+        .unwrap();
+    assert!(blocked.output.is_none());
+    assert!(matches!(blocked.next, NextStep::Yield));
+    assert_eq!(tracker.allocated(), before);
+    assert_eq!(processor.kernel_for_test().emission, Some(1));
+    work.begin_turn(1).unwrap();
+    let last = processor
+        .drive(&mut StepContext::new(&control, &mut work))
+        .unwrap();
+    assert!(matches!(last.next, NextStep::Finished));
+    let last = last.output.expect("last granted candidate");
+    assert_eq!(
+        array_key(last.record_batch().column(0), 0),
+        Some(KeyCell::Text("z".into()))
+    );
+    assert!(
+        processor
+            .drive(&mut StepContext::new(&control, &mut work))
+            .unwrap()
+            .output
+            .is_none()
+    );
+    let input = f.input.clone();
+    let source = input.columns()[0].clone();
+    let InputResult::Rejected {
+        input: returned, ..
+    } = processor.try_push(
+        &mut StepContext::new(&control, &mut work),
+        RawInput::for_test(input),
+    )
+    else {
+        panic!("a completed candidate cursor must return new input");
+    };
+    assert!(Arc::ptr_eq(
+        &source,
+        &returned.original_for_test().columns()[0]
+    ));
+    drop(processor);
+    assert!(tracker.current() > 0);
+    drop(first);
+    assert!(tracker.current() > 0);
+    drop(last);
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
+fn compiled_grouped_topn_later_emission_refusal_keeps_published_prefix_and_discards_remaining_work()
+{
     // A real successful two-key run supplies generous observed headroom for
-    // the same pending width, first key and installed owners. This observes
+    // the same candidate width, first key and installed owners. This observes
     // host accounting only; it is neither a physical peak nor a byte guard.
     let control_fixture = text_fixture(&["a".into(), "z".into()], 2);
     let control_tracker = MemTracker::new_root("grouped-finish-positive-control");
@@ -212,24 +308,65 @@ fn compiled_grouped_topn_later_finish_refusal_destroys_the_unpublished_success_p
     let limit = tracker.current().checked_add(headroom).unwrap();
     tracker.install_limit_once(limit).unwrap();
     let state = RuntimeState::default();
-    let first = processor.set_finishing(&state).unwrap_err();
+    let mut calls = TestDriver::new(&mut processor, &state);
+    calls.signal_eos().unwrap();
+    let published = calls
+        .advance_to_boundary()
+        .map(|step| step.output)
+        .unwrap()
+        .expect("first complete candidate");
     assert_eq!(
-        first.cause(),
-        &ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted)
+        array_key(published.record_batch().column(0), 0),
+        Some(KeyCell::Text("a".into()))
     );
-    assert!(!processor.has_output());
-    assert!(processor.candidates.is_none());
-    assert!(processor.pending.is_none());
-    assert!(processor.instances.is_none());
+    let first = calls
+        .advance_to_boundary()
+        .map(|step| step.output)
+        .unwrap_err();
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&first);
+    assert_eq!(
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Resource
+    );
+    let resource = fact
+        .resource()
+        .expect("the actual host retains its numerical refusal");
+    assert_eq!(resource.limit, Some(limit as u64));
+    assert!(resource.requested.unwrap() > 0);
+    assert!(resource.committed.unwrap() > limit as u64);
+    assert!(
+        calls
+            .advance_to_boundary()
+            .unwrap_err()
+            .same_occurrence(&first)
+    );
+    assert!(calls.operator().kernel_for_test().candidates.is_none());
+    assert!(calls.operator().kernel_for_test().emission.is_none());
+    assert!(calls.operator().kernel_for_test().instances.is_none());
+    assert!(
+        tracker.current() > 0,
+        "the published candidate still owns its actual output"
+    );
+    assert_eq!(
+        array_key(published.record_batch().column(0), 0),
+        Some(KeyCell::Text("a".into()))
+    );
+    drop(published);
     assert_eq!(
         tracker.current(),
         0,
-        "real unpublished output and states dropped"
+        "unpublished work dropped; the last published alias exited"
     );
-    assert_eq!(processor.pull_chunk(&state).unwrap_err(), first);
-    assert_eq!(processor.set_finishing(&state).unwrap_err(), first);
-    processor.cancel();
-    assert_eq!(processor.close().unwrap_err(), first);
+    assert_eq!(
+        calls
+            .advance_to_boundary()
+            .map(|step| step.output)
+            .unwrap_err(),
+        first
+    );
+    assert_eq!(calls.signal_eos().unwrap_err(), first);
+    calls.operator_mut().cancel();
+    calls.operator_mut().close().unwrap();
 }
 
 #[test]
@@ -266,13 +403,14 @@ fn compiled_grouped_topn_second_call_merge_data_survives_state_drop_and_keeps_fi
     processor.set_mem_tracker(tracker.clone());
     prepare_typed_fixture_operator(&mut processor);
     let state = RuntimeState::default();
+    let mut calls = TestDriver::new(&mut processor, &state);
     for chunk in partial_chunks(&f, 0, 1) {
-        processor.push_chunk(&state, chunk).unwrap();
+        calls.input_without_output(chunk).unwrap();
     }
     let chunks = partial_chunks(&f, 1, 1);
     assert_eq!(chunks.len(), 1);
-    let first = processor
-        .push_chunk(&state, chunks.into_iter().next().unwrap())
+    let first = calls
+        .input_without_output(chunks.into_iter().next().unwrap())
         .unwrap_err();
     let ExecutionFailureCause::InvocationData(data) = first.cause() else {
         panic!("unexpected second-call failure: {first:?}")
@@ -301,14 +439,26 @@ fn compiled_grouped_topn_second_call_merge_data_survives_state_drop_and_keeps_fi
     assert_eq!(data.input_rows(), [0]);
     assert_eq!(data.state_indices(), [0]);
     assert_eq!(data.emission_row_capacity(), None);
-    assert!(!processor.has_output());
-    assert!(processor.candidates.is_none());
-    assert!(processor.pending.is_none());
-    assert!(processor.instances.is_none());
-    assert_eq!(processor.pull_chunk(&state).unwrap_err(), first);
-    assert_eq!(processor.set_finishing(&state).unwrap_err(), first);
-    processor.cancel();
-    assert_eq!(processor.close().unwrap_err(), first);
+    assert!(
+        calls
+            .advance_to_boundary()
+            .unwrap_err()
+            .same_occurrence(&first)
+    );
+    assert!(calls.operator().kernel_for_test().candidates.is_none());
+    assert!(calls.operator().kernel_for_test().emission.is_none());
+    assert!(calls.operator().kernel_for_test().instances.is_none());
+    assert_eq!(
+        calls
+            .advance_to_boundary()
+            .map(|step| step.output)
+            .unwrap_err(),
+        first
+    );
+    assert_eq!(calls.signal_eos().unwrap_err(), first);
+    calls.operator_mut().cancel();
+    calls.operator_mut().close().unwrap();
+    drop(calls);
     drop(processor);
     drop(factory);
     drop(f);
@@ -320,8 +470,27 @@ fn compiled_grouped_topn_second_call_merge_data_survives_state_drop_and_keeps_fi
         data.message(),
         "merge aggregate state: min_n/max_n limit mismatch while merging states: 2 vs 3"
     );
+    assert_eq!(state.error(), Some(first.clone()));
     drop(first);
-    assert_eq!(tracker.current(), 0);
+    assert!(
+        tracker.current() > 0,
+        "early failure observation retains the original finite Data backing"
+    );
+    let observed = state.error().unwrap();
+    let ExecutionFailureCause::InvocationData(data) = observed.cause() else {
+        panic!("the early report lost its original Data cause");
+    };
+    assert_eq!(
+        data.message(),
+        "merge aggregate state: min_n/max_n limit mismatch while merging states: 2 vs 3"
+    );
+    drop(observed);
+    drop(state);
+    assert_eq!(
+        tracker.current(),
+        0,
+        "the last error owner releases its actual finite backing"
+    );
 }
 
 #[test]
@@ -336,7 +505,8 @@ fn compiled_grouped_topn_actual_storage_refuses_replacement_coexistence_and_new_
         let tracker = MemTracker::new_root("grouped-owned-storage-refusal");
         let mut processor = populated(&f, tracker.clone());
         let before = tracker.current();
-        let set = processor.candidates.as_mut().unwrap();
+        let kernel = processor.kernel_for_test_mut();
+        let set = kernel.candidates.as_mut().unwrap();
         let original_keys = set
             .entries
             .iter()
@@ -355,10 +525,18 @@ fn compiled_grouped_topn_actual_storage_refuses_replacement_coexistence_and_new_
                 let limit =
                     before - i64::try_from(old).unwrap() + i64::try_from(replacement).unwrap();
                 tracker.install_limit_once(limit).unwrap();
-                assert!(set.entries.try_reserve_exact(capacity).is_err());
+                let refusal = set
+                    .entries
+                    .try_reserve_exact(capacity)
+                    .expect_err("replacement must coexist with the old block");
                 assert_eq!(set.entries.capacity(), capacity);
                 assert_eq!(set.entries.len(), len);
-                KernelFailure::ResourceExhausted
+                KernelFailure::from_domain(
+                    novarocks_functions::allocation_failure::AllocationRefusal::new(
+                        "grouped test original container replacement",
+                        refusal,
+                    ),
+                )
             }
             "key" => {
                 let key = &mut set.entries[0].key;
@@ -367,24 +545,46 @@ fn compiled_grouped_topn_actual_storage_refuses_replacement_coexistence_and_new_
                 let limit = before - i64::try_from(capacity).unwrap()
                     + i64::try_from(len + capacity).unwrap();
                 tracker.install_limit_once(limit).unwrap();
-                assert!(key.try_reserve_exact(capacity).is_err());
+                let refusal = key
+                    .try_reserve_exact(capacity)
+                    .expect_err("replacement must coexist with the old key");
                 assert_eq!(key.capacity(), capacity);
                 assert_eq!(key.len(), len);
-                KernelFailure::ResourceExhausted
+                KernelFailure::from_domain(
+                    novarocks_functions::allocation_failure::AllocationRefusal::new(
+                        "grouped test original container replacement",
+                        refusal,
+                    ),
+                )
             }
             "inline-state" => {
-                let handle = processor.plan.calls[0].handle.clone();
+                let handle = kernel.plan.calls[0].handle.clone();
                 let layout = handle.state_layout().pad_to_align();
                 assert!(layout.size() > 0);
                 tracker
                     .install_limit_once(before + i64::try_from(layout.size()).unwrap() - 1)
                     .unwrap();
-                OwnedAggregateState::try_new(handle, set.host.clone(), &processor.control)
-                    .unwrap_err()
+                OwnedAggregateState::try_new(handle, set.host.clone(), &kernel.control).unwrap_err()
             }
             _ => unreachable!(),
         };
-        assert_eq!(failure, KernelFailure::ResourceExhausted);
+        let fact = novarocks_failure_contract::FailureProjection::failure_fact(&failure);
+        assert_eq!(
+            fact.class(),
+            novarocks_failure_contract::FailureClass::Resource
+        );
+        let resource = fact
+            .resource()
+            .expect("the actual refusal retains available fields");
+        assert!(resource.requested.unwrap() > 0);
+        if storage == "inline-state" {
+            assert_eq!(resource.limit, Some(tracker.limit() as u64));
+        } else {
+            assert_eq!(
+                resource.limit, None,
+                "the erased allocator refusal has no quota identity"
+            );
+        }
         assert_eq!(
             tracker.current(),
             before,
@@ -397,17 +597,20 @@ fn compiled_grouped_topn_actual_storage_refuses_replacement_coexistence_and_new_
                 .collect::<Vec<_>>(),
             original_keys
         );
-        let first = processor.latch::<()>(Err(failure.into())).unwrap_err();
-        assert!(!processor.has_output());
+        let first = kernel.latch::<()>(Err(failure.into())).unwrap_err();
+        assert!(processor.drive_for_test(&RuntimeState::default()).is_err());
         assert_eq!(
             tracker.current(),
             0,
             "real storage and typed states destroyed"
         );
         assert_eq!(
-            processor.pull_chunk(&RuntimeState::default()).unwrap_err(),
+            processor
+                .drive_for_test(&RuntimeState::default())
+                .map(|step| step.output)
+                .unwrap_err(),
             first
         );
-        assert_eq!(processor.close().unwrap_err(), first);
+        processor.close().unwrap();
     }
 }

@@ -108,7 +108,58 @@ impl std::fmt::Display for QueryMemoryAccountError {
         }
     }
 }
-impl std::error::Error for QueryMemoryAccountError {}
+impl std::error::Error for QueryMemoryAccountError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Capacity(source) => Some(source),
+            Self::MissingContext => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryContextRegistrationError {
+    NativeContextKeyRequired,
+    NativeFragmentKeyRequired,
+    MissingRequiredContext,
+}
+impl std::fmt::Display for QueryContextRegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NativeContextKeyRequired => "native context requires a native execution key",
+            Self::NativeFragmentKeyRequired => {
+                "native finst registration requires a native execution key"
+            }
+            Self::MissingRequiredContext => "required QueryContext is missing",
+        })
+    }
+}
+impl std::error::Error for QueryContextRegistrationError {}
+impl novarocks_execution_contract::failure::FailureProjection for QueryContextRegistrationError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use crate::failure_reason::WorkerFailureReason as R;
+        use novarocks_execution_contract::failure::*;
+        let reason = match self {
+            Self::NativeContextKeyRequired => R::QueryContextNativeKey,
+            Self::NativeFragmentKeyRequired => R::QueryFragmentNativeKey,
+            Self::MissingRequiredContext => R::QueryContextMissing,
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for QueryMemoryAccountError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        match self {
+            Self::MissingContext => {
+                QueryContextRegistrationError::MissingRequiredContext.failure_fact()
+            }
+            Self::Capacity(source) => {
+                novarocks_memory_failure::CapacityFailureProjection::new(source).failure_fact()
+            }
+        }
+    }
+}
 
 #[allow(
     dead_code,
@@ -524,7 +575,7 @@ impl QueryContextManager {
         return_error_if_not_exist: bool,
         delivery_expire: Duration,
         query_expire: Duration,
-    ) -> Result<(), String> {
+    ) -> Result<(), QueryContextRegistrationError> {
         self.get_or_register_internal(
             query_id,
             return_error_if_not_exist,
@@ -540,7 +591,7 @@ impl QueryContextManager {
         return_error_if_not_exist: bool,
         delivery_expire: Duration,
         query_expire: Duration,
-    ) -> Result<(), String> {
+    ) -> Result<(), QueryContextRegistrationError> {
         self.get_or_register_internal_with_generation(
             query_id,
             return_error_if_not_exist,
@@ -558,7 +609,7 @@ impl QueryContextManager {
         return_error_if_not_exist: bool,
         delivery_expire: Duration,
         query_expire: Duration,
-    ) -> Result<(), String> {
+    ) -> Result<(), QueryContextRegistrationError> {
         self.get_or_register_internal_with_generation(
             query_id,
             return_error_if_not_exist,
@@ -637,9 +688,9 @@ impl QueryContextManager {
         return_error_if_not_exist: bool,
         delivery_expire: Duration,
         query_expire: Duration,
-    ) -> Result<(), String> {
+    ) -> Result<(), QueryContextRegistrationError> {
         let Some(attempt) = execution.native_attempt_id() else {
-            return Err("native context requires a native execution key".to_string());
+            return Err(QueryContextRegistrationError::NativeContextKeyRequired);
         };
         self.get_or_register_internal_with_generation(
             execution.query_id(),
@@ -658,9 +709,9 @@ impl QueryContextManager {
         return_error_if_not_exist: bool,
         delivery_expire: Duration,
         query_expire: Duration,
-    ) -> Result<(), String> {
+    ) -> Result<(), QueryContextRegistrationError> {
         let Some(attempt) = execution.native_attempt_id() else {
-            return Err("native context requires a native execution key".to_string());
+            return Err(QueryContextRegistrationError::NativeContextKeyRequired);
         };
         self.get_or_register_internal_with_generation(
             execution.query_id(),
@@ -708,7 +759,7 @@ impl QueryContextManager {
         return_error_if_not_exist: bool,
         delivery_expire: Duration,
         query_expire: Duration,
-    ) -> Result<(), String> {
+    ) -> Result<(), QueryContextRegistrationError> {
         self.get_or_register_internal(
             query_id,
             return_error_if_not_exist,
@@ -725,7 +776,7 @@ impl QueryContextManager {
         delivery_expire: Duration,
         query_expire: Duration,
         increment: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), QueryContextRegistrationError> {
         self.get_or_register_internal_with_generation(
             query_id,
             return_error_if_not_exist,
@@ -750,7 +801,7 @@ impl QueryContextManager {
         increment: bool,
         generation: QueryContextGeneration,
         _native_runtime_filter_lifecycle: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), QueryContextRegistrationError> {
         let execution = QueryContextGeneration::execution_key(query_id, generation);
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         if let Some(existing) = guard.active.get_mut(&execution) {
@@ -767,7 +818,7 @@ impl QueryContextManager {
             return Ok(());
         }
         if return_error_if_not_exist {
-            return Err("Query terminates prematurely (missing QueryContext)".to_string());
+            return Err(QueryContextRegistrationError::MissingRequiredContext);
         }
         let mut ctx =
             QueryContext::new_with_generation(query_id, generation, delivery_expire, query_expire);
@@ -855,13 +906,13 @@ impl QueryContextManager {
         &self,
         finst_id: UniqueId,
         execution: QueryExecutionKey,
-    ) -> Result<(), String> {
+    ) -> Result<(), QueryContextRegistrationError> {
         if execution.native_attempt_id().is_none() {
-            return Err("native finst registration requires a native execution key".to_string());
+            return Err(QueryContextRegistrationError::NativeFragmentKeyRequired);
         }
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         if !guard.active.contains_key(&execution) {
-            return Err("QueryContext not found".to_string());
+            return Err(QueryContextRegistrationError::MissingRequiredContext);
         }
         guard.finst_to_query.insert(finst_id, execution);
         Ok(())
@@ -1280,7 +1331,12 @@ mod fragment_cancellation_boundary_tests {
         let manager = QueryContextManager::new_for_test();
         let query_id = QueryId::new(86_101, 86_102);
         let finst_id = UniqueId::new(86_103, 86_104);
-        let completion = FragmentCompletion::new(1);
+        let completion = FragmentCompletion::new(
+            1,
+            std::sync::Arc::new(
+                novarocks_execution::runtime::runtime_state::RuntimeErrorState::default(),
+            ),
+        );
         manager.register_finst(finst_id, query_id);
 
         assert_eq!(

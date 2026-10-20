@@ -109,7 +109,7 @@ pub const MAX_PROFILE_REFERENCES: usize = 262_144;
 pub struct ProgramProvenance {
     operators: Arc<BTreeMap<LocalOperatorId, LocalOperatorProvenance>>,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProvenanceError {
     Control(CompileControlError),
     Empty,
@@ -131,7 +131,14 @@ impl fmt::Display for ProvenanceError {
         write!(f, "invalid program provenance: {self:?}")
     }
 }
-impl std::error::Error for ProvenanceError {}
+impl std::error::Error for ProvenanceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<CompileControlError> for ProvenanceError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)
@@ -568,7 +575,7 @@ mod tests {
                 // Preflight=1, nodes=300, source=1: threshold=512 therefore
                 // fails while moving the canonical node set into owned data.
                 if completed >= 512 {
-                    Err(self.fail)
+                    Err(self.fail.clone())
                 } else {
                     Ok(())
                 }
@@ -585,7 +592,7 @@ mod tests {
             entry.lowered_nodes = (0..300).map(ProgramNodeId::new).collect();
             let control = After {
                 completed: AtomicUsize::new(0),
-                fail,
+                fail: fail.clone(),
             };
             assert!(
                 matches!(ProgramProvenance::try_new(vec![entry], 300, &sources, &control), Err(ProvenanceError::Control(error)) if error == fail)

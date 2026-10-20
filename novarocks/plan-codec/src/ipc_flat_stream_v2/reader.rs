@@ -67,7 +67,7 @@ pub struct FlatReaderResourceFacts {
 #[derive(Debug)]
 pub enum FlatReaderError {
     Projection(FlatPoolResourceError),
-    Arrow(String),
+    Arrow(arrow::error::ArrowError),
 }
 impl From<FlatPoolResourceError> for FlatReaderError {
     fn from(error: FlatPoolResourceError) -> Self {
@@ -83,11 +83,18 @@ impl std::fmt::Display for FlatReaderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Projection(e) => e.fmt(f),
-            Self::Arrow(e) => f.write_str(e),
+            Self::Arrow(e) => e.fmt(f),
         }
     }
 }
-impl std::error::Error for FlatReaderError {}
+impl std::error::Error for FlatReaderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Projection(source) => Some(source),
+            Self::Arrow(source) => Some(source),
+        }
+    }
+}
 impl From<TypeCodecError> for FlatReaderError {
     fn from(error: TypeCodecError) -> Self {
         Self::Projection(error.into())
@@ -990,7 +997,7 @@ impl<'a, 'f> FlatConstantStream<'a, 'f> {
         );
         // Formatting the ordinary Arrow error is part of the already checked
         // diagnostic envelope. Observe the same original control afterwards.
-        let read = read.map_err(|e| FlatReaderError::Arrow(e.to_string()));
+        let read = read.map_err(FlatReaderError::Arrow);
         work.flush()?;
         let decoded = read?;
         if admission.is_some() {

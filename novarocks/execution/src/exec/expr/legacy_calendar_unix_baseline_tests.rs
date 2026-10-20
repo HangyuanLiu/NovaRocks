@@ -47,7 +47,11 @@ fn chunk(columns: Vec<ArrayRef>) -> Chunk {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     Chunk::new_with_chunk_schema(batch, schema)
 }
-fn eval(name: &'static str, columns: Vec<ArrayRef>, result: DataType) -> Result<ArrayRef, String> {
+fn eval(
+    name: &'static str,
+    columns: Vec<ArrayRef>,
+    result: DataType,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut arena = ExprArena::default();
     let args = columns
         .iter()
@@ -144,7 +148,7 @@ fn legacy_calendar_unix_baseline_argument_forms_are_utc_and_floor_negative_fract
 fn legacy_calendar_unix_baseline_argument_type_error_is_original_full_carrier_diagnostic() {
     let source: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
     assert_eq!(
-        eval("unix_timestamp", vec![source], DataType::Int64).unwrap_err(),
+        (eval("unix_timestamp", vec![source], DataType::Int64).unwrap_err()).to_string(),
         "unsupported datetime input type: Boolean"
     );
 }
@@ -280,38 +284,47 @@ fn legacy_calendar_unix_baseline_ntz_raw_interval_profiles_and_error_text_remain
     );
     let value: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
     assert_eq!(
-        eval("to_datetime_ntz", vec![Arc::clone(&value)], micro_type()).unwrap_err(),
+        (eval("to_datetime_ntz", vec![Arc::clone(&value)], micro_type()).unwrap_err()).to_string(),
         "to_datetime expects int"
     );
     assert_eq!(
-        eval(
+        (eval(
             "to_datetime_ntz",
             vec![ints(vec![Some(1)]), value],
             micro_type()
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "to_datetime expects int"
     );
 }
 
 #[test]
-fn legacy_calendar_unix_baseline_ntz_requested_seconds_and_date32_keep_microsecond_carrier() {
+fn to_datetime_ntz_requires_frozen_microseconds_and_converts_seconds_exactly() {
+    let input = ints(vec![Some(1), Some(-1), None]);
     assert_micros(
-        eval(
-            "to_datetime_ntz",
-            vec![ints(vec![Some(1), Some(-1), None])],
-            DataType::Timestamp(TimeUnit::Second, None),
-        )
-        .unwrap(),
-        vec![Some(1), Some(-1), None],
+        eval("to_datetime_ntz", vec![input.clone()], micro_type()).unwrap(),
+        vec![Some(1_000_000), Some(-1_000_000), None],
     );
-    assert_micros(
-        eval(
-            "to_datetime_ntz",
-            vec![ints(vec![Some(1), Some(-1), None])],
-            DataType::Date32,
+    for target in [
+        DataType::Timestamp(TimeUnit::Second, None),
+        DataType::Date32,
+    ] {
+        assert_frozen_calendar_contract(
+            eval("to_datetime_ntz", vec![input.clone()], target).unwrap_err(),
+        );
+    }
+}
+
+fn assert_frozen_calendar_contract(failure: crate::runtime::fragment::ExecutionFailure) {
+    use novarocks_failure_contract::{
+        FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+    };
+    assert_eq!(
+        failure.failure_fact(),
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(274).unwrap())
         )
-        .unwrap(),
-        vec![None, None, None],
     );
 }

@@ -24,6 +24,10 @@
 //! retained key therefore keeps all its contributions. No function math,
 //! expression arena, arrival tie or all-groups table lives here.
 
+use crate::exec::fragment::error::{
+    FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
+};
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use std::{cmp::Ordering, sync::Arc};
 
 use arrow::array::{Array, ArrayRef, Decimal128Array};
@@ -52,8 +56,14 @@ use super::sort::creation::SortCreation;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, OutputColumnMetadata};
 use crate::exec::expr::agg::{AggregateAllocator, AggregateVec};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{HydrateInput, Transform, TransformKernel},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
@@ -108,8 +118,8 @@ pub(crate) struct CompiledGroupedTopNProcessorFactory {
     error: Arc<RuntimeErrorState>,
 }
 impl CompiledGroupedTopNProcessorFactory {
-    fn processor(&self) -> CompiledGroupedTopNProcessor {
-        CompiledGroupedTopNProcessor {
+    fn processor(&self) -> GroupedTopNStep {
+        Transform::hydrating(CompiledGroupedTopNProcessor {
             name: self.name.clone(),
             plan: self.plan.clone(),
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
@@ -118,22 +128,21 @@ impl CompiledGroupedTopNProcessorFactory {
             output: None,
             instances: None,
             candidates: None,
-            pending: None,
-            finishing: false,
-            finished: false,
+            emission: None,
             failed: None,
-        }
+        })
     }
     pub(crate) fn try_new(
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Self, String> {
-        let graph_node = program
-            .graph()
-            .nodes()
-            .get(node.index())
-            .ok_or_else(|| "compiled GroupedTopN node is absent".to_owned())?;
+    ) -> ExecutionResult<Self> {
+        let graph_node = program.graph().nodes().get(node.index()).ok_or_else(|| {
+            program_binding_failure(
+                PlanBindingKind::MissingAssignment,
+                "compiled GroupedTopN node is absent",
+            )
+        })?;
         let ProgramNodeKind::GroupedTopN {
             group_by,
             order_by,
@@ -144,10 +153,16 @@ impl CompiledGroupedTopNProcessorFactory {
             ..
         } = graph_node.kind()
         else {
-            return Err("compiled node is not a GroupedTopN".into());
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                "compiled node is not a GroupedTopN",
+            ));
         };
         if !graph_node.output_layout().is_typed() {
-            return Err("compiled GroupedTopN requires its complete output layout".into());
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                "compiled GroupedTopN requires its complete output layout",
+            ));
         }
         let output_layout = graph_node.output_layout().clone();
         let mut sites = Vec::new();
@@ -155,8 +170,8 @@ impl CompiledGroupedTopNProcessorFactory {
             sites.push(ProgramExpressionRootSite::Node {
                 node,
                 role: ProgramNodeExpressionRole::TopNGroup {
-                    group: u32::try_from(group)
-                        .map_err(|_| "GroupedTopN group ordinal exhausted")?,
+                    group: novarocks_local_program::checked_program_ordinal(group)
+                        .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?,
                 },
             });
         }
@@ -166,13 +181,16 @@ impl CompiledGroupedTopNProcessorFactory {
             let site = ProgramExpressionRootSite::Node {
                 node,
                 role: ProgramNodeExpressionRole::TopNOrder {
-                    key: u32::try_from(ordinal)
-                        .map_err(|_| "GroupedTopN rank ordinal exhausted")?,
+                    key: novarocks_local_program::checked_program_ordinal(ordinal)
+                        .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?,
                 },
             };
             let ty = root_value_type(&program, site)?;
             if !comparator.supports_value_type(&ty) {
-                return Err("GroupedTopN key is outside its exact comparison domain".into());
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    "GroupedTopN key is outside its exact comparison domain",
+                ));
             }
             let normalized =
                 if ty.logical_type() == novarocks_type_contract::ValueLogicalType::LargeInt {
@@ -192,17 +210,24 @@ impl CompiledGroupedTopNProcessorFactory {
         }
         let mut calls = Vec::new();
         for (ordinal, source) in functions.iter().enumerate() {
-            let call = u32::try_from(ordinal).map_err(|_| "GroupedTopN call ordinal exhausted")?;
+            let call = novarocks_local_program::checked_program_ordinal(ordinal)
+                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
             let Some(ProgramStateTemplate::Aggregate { scope, kernel }) =
                 program.state_template(ProgramCallSite::TopNState { node, call })
             else {
-                return Err("GroupedTopN call has no exact prepared aggregate".into());
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    "GroupedTopN call has no exact prepared aggregate",
+                ));
             };
             if scope != (ProgramAggregateCallScope::TopNState { node, call })
                 || kernel.contract().phase() != AggregateKernelPhase::Intermediate
                 || source.inputs.len() != 1
             {
-                return Err("GroupedTopN call differs from its Intermediate state scope".into());
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    "GroupedTopN call differs from its Intermediate state scope",
+                ));
             }
             calls.push(CallPlan {
                 handle: kernel.clone(),
@@ -304,6 +329,8 @@ fn locate(
     Ok(Err(lo))
 }
 
+type GroupedTopNStep = Transform<CompiledGroupedTopNProcessor, HydrateInput>;
+
 struct CompiledGroupedTopNProcessor {
     name: String,
     plan: Plan,
@@ -313,15 +340,13 @@ struct CompiledGroupedTopNProcessor {
     output: Option<ChunkSchemaRef>,
     instances: Option<Vec<CompiledExpressionInstance>>,
     candidates: Option<Candidates>,
-    pending: Option<AggregateVec<Chunk>>,
-    finishing: bool,
-    finished: bool,
+    emission: Option<usize>,
     failed: Option<ExecutionFailure>,
 }
 impl CompiledGroupedTopNProcessor {
     fn release_owned(&mut self) {
         self.candidates = None;
-        self.pending = None;
+        self.emission = None;
         self.instances = None;
     }
     fn latch<T>(&mut self, result: ExecutionResult<T>) -> ExecutionResult<T> {
@@ -332,8 +357,6 @@ impl CompiledGroupedTopNProcessor {
             Ok(value) => Ok(value),
             Err(error) => {
                 self.failed = Some(error.clone());
-                self.finishing = true;
-                self.finished = true;
                 self.release_owned();
                 Err(error)
             }
@@ -512,11 +535,13 @@ impl CompiledGroupedTopNProcessor {
         drop(library);
         Ok(())
     }
-    fn emit(&mut self) -> ExecutionResult<()> {
+    fn emit_candidate(&self, index: usize) -> ExecutionResult<Chunk> {
         self.control.checkpoint(0)?;
-        let Some(set) = self.candidates.as_ref() else {
-            return Ok(());
-        };
+        let set = self
+            .candidates
+            .as_ref()
+            .expect("an emission cursor retains candidates");
+        let candidate = &set.entries[index];
         let output = self
             .output
             .as_ref()
@@ -525,86 +550,79 @@ impl CompiledGroupedTopNProcessor {
             .construction
             .as_ref()
             .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-        let mut pending = AggregateVec::new_in(set.allocator.clone());
-        reserve(&mut pending, set.entries.len())?;
-        for candidate in &set.entries {
-            let library = ArrowWorkBudget::admit(
-                Arc::clone(&set.host),
-                ArrowWorkShape {
-                    rows: 1,
-                    cells: add(self.plan.groups, self.plan.calls.len())?,
-                    payload_bytes: candidate.key.len(),
-                    fields: add(self.plan.groups, self.plan.calls.len())?,
-                    buffers: multiply(add(self.plan.groups, self.plan.calls.len())?, 3)?,
-                },
-            )?;
-            self.control.checkpoint(0)?;
-            let parsed = set.encoder.parser.parse(&candidate.key);
-            let decoded = set
-                .encoder
-                .converter
-                .convert_rows([parsed])
-                .map_err(arrow_failure)?;
-            self.control.checkpoint(0)?;
-            let mut keys = AggregateVec::new_in(set.allocator.clone());
-            reserve(&mut keys, self.plan.groups)?;
-            keys.resize_with(self.plan.groups, || None);
-            for (rank, array) in decoded.into_iter().enumerate() {
-                let array = if self.plan.rank_types[rank].logical_type()
-                    == novarocks_type_contract::ValueLogicalType::LargeInt
-                {
-                    let decimal = array
-                        .as_any()
-                        .downcast_ref::<Decimal128Array>()
-                        .ok_or_else(|| {
-                            internal("GroupedTopN LARGEINT rank did not restore signed i128")
-                        })?;
-                    let value = [if decimal.is_null(0) {
-                        None
-                    } else {
-                        Some(decimal.value(0))
-                    }];
-                    novarocks_types::largeint::array_from_i128_observed(&value, &mut |_| {
-                        self.control.checkpoint(0)
-                    })?
-                    .map_err(arrow_failure)?
+        let library = ArrowWorkBudget::admit(
+            Arc::clone(&set.host),
+            ArrowWorkShape {
+                rows: 1,
+                cells: add(self.plan.groups, self.plan.calls.len())?,
+                payload_bytes: candidate.key.len(),
+                fields: add(self.plan.groups, self.plan.calls.len())?,
+                buffers: multiply(add(self.plan.groups, self.plan.calls.len())?, 3)?,
+            },
+        )?;
+        self.control.checkpoint(0)?;
+        let parsed = set.encoder.parser.parse(&candidate.key);
+        let decoded = set
+            .encoder
+            .converter
+            .convert_rows([parsed])
+            .map_err(arrow_failure)?;
+        self.control.checkpoint(0)?;
+        let mut keys = AggregateVec::new_in(set.allocator.clone());
+        reserve(&mut keys, self.plan.groups)?;
+        keys.resize_with(self.plan.groups, || None);
+        for (rank, array) in decoded.into_iter().enumerate() {
+            let array = if self.plan.rank_types[rank].logical_type()
+                == novarocks_type_contract::ValueLogicalType::LargeInt
+            {
+                let decimal = array
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| {
+                        internal("GroupedTopN LARGEINT rank did not restore signed i128")
+                    })?;
+                let value = [if decimal.is_null(0) {
+                    None
                 } else {
-                    array
-                };
-                let group = self.plan.permutation[rank];
-                keys[group] = Some(retain_new_key_array(array, &library, &self.control)?);
-            }
-            let width = add(self.plan.groups, self.plan.calls.len())?;
-            // Establish the keeper before unpublished columns/batch. On any
-            // error, reverse local Drop frees the actual container first.
-            let column_metadata =
-                OutputColumnMetadata::try_new(width, Arc::clone(&set.host), &self.control)?;
-            let mut columns = Vec::new();
-            columns
-                .try_reserve_exact(width)
-                .map_err(|_| KernelFailure::ResourceExhausted)?;
-            for key in keys {
-                columns.push(key.ok_or_else(|| internal("GroupedTopN restored key is absent"))?);
-            }
-            for state in &candidate.states {
-                columns.push(state.emit_evaluation(1, &self.control)?);
-            }
-            let batch =
-                RecordBatch::try_new(output.arrow_schema_ref(), columns).map_err(arrow_failure)?;
-            self.control.checkpoint(0)?;
-            pending.push(Chunk::try_new_with_output_column_metadata(
-                batch,
-                Arc::clone(output),
-                column_metadata,
-                creation.begin_typed_construction(output)?.as_ref(),
-            )?);
-            // Output's actual source/call custody survives this temporary loan.
-            drop(library);
+                    Some(decimal.value(0))
+                }];
+                novarocks_types::largeint::array_from_i128_observed(&value, &mut |_| {
+                    self.control.checkpoint(0)
+                })?
+            } else {
+                array
+            };
+            let group = self.plan.permutation[rank];
+            keys[group] = Some(retain_new_key_array(array, &library, &self.control)?);
         }
-        // Publish only after ALL emissions succeed. A changed prefix cannot
-        // be exposed or resumed after a later call/key error.
-        self.pending = Some(pending);
-        Ok(())
+        let width = add(self.plan.groups, self.plan.calls.len())?;
+        // Establish the keeper before unpublished columns/batch. On any
+        // error, reverse local Drop frees the actual container first.
+        let column_metadata =
+            OutputColumnMetadata::try_new(width, Arc::clone(&set.host), &self.control)?;
+        let mut columns = Vec::new();
+        columns
+            .try_reserve_exact(width)
+            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        for key in keys {
+            columns.push(key.ok_or_else(|| internal("GroupedTopN restored key is absent"))?);
+        }
+        for state in &candidate.states {
+            columns.push(state.emit_evaluation(1, &self.control)?);
+        }
+        let batch =
+            RecordBatch::try_new(output.arrow_schema_ref(), columns).map_err(arrow_failure)?;
+        self.control.checkpoint(0)?;
+        let result = Chunk::try_new_with_output_column_metadata(
+            batch,
+            Arc::clone(output),
+            column_metadata,
+            creation.begin_typed_construction(output)?.as_ref(),
+        )?;
+        // Only this complete candidate is published; later candidates remain
+        // in the operator continuation and cannot be replayed after failure.
+        drop(library);
+        Ok(result)
     }
 }
 impl Drop for CompiledGroupedTopNProcessor {
@@ -612,7 +630,7 @@ impl Drop for CompiledGroupedTopNProcessor {
         self.release_owned();
     }
 }
-impl Operator for CompiledGroupedTopNProcessor {
+impl OperatorLifecycle for CompiledGroupedTopNProcessor {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -642,92 +660,97 @@ impl Operator for CompiledGroupedTopNProcessor {
         self.control.bind_mem_tracker(Arc::clone(&tracker));
         self.tracker = Some(tracker);
     }
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.release_owned();
+        Ok(())
     }
     fn close(&mut self) -> ExecutionResult<()> {
-        self.finishing = true;
-        self.finished = true;
-        self.release_owned();
-        self.failed.clone().map_or(Ok(()), Err)
+        self.begin_exit()
     }
     fn cancel(&mut self) {
-        if self.failed.is_none() {
-            self.failed = Some(KernelFailure::Cancelled.into());
-        }
-        self.finishing = true;
-        self.finished = true;
         self.release_owned();
     }
     fn on_driver_failure(&mut self) {
-        self.cancel();
+        self.release_owned();
     }
 }
-impl ProcessorOperator for CompiledGroupedTopNProcessor {
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.failed.is_none()
-    }
-    fn has_output(&self) -> bool {
-        self.failed.is_none()
-            && self
-                .pending
-                .as_ref()
-                .is_some_and(|pending| !pending.is_empty())
-    }
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+impl InputEncodingPolicy for CompiledGroupedTopNProcessor {}
+impl TransformKernel for CompiledGroupedTopNProcessor {
+    fn apply(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
         if let Some(error) = &self.failed {
             return Err(error.clone());
         }
-        let result = if self.finishing || self.finished {
-            Err(internal("GroupedTopN received input after finishing"))
-        } else if chunk.is_empty() {
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        let result = if chunk.is_empty() {
             self.control.checkpoint(0).map_err(Into::into)
         } else {
             self.consume(&chunk)
         };
-        self.latch(result)
+        if let Err(error) = &result {
+            ctx.report_failure(error.clone());
+        }
+        self.latch(result)?;
+        Ok(StepResult::new(None, NextStep::NeedInput, rows))
     }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         if let Some(error) = &self.failed {
             return Err(error.clone());
         }
-        let result = self.control.checkpoint(0).map_err(Into::into);
-        self.latch(result)?;
-        let output = self.pending.as_mut().and_then(|pending| {
-            if pending.is_empty() {
-                None
-            } else {
-                Some(pending.remove(0))
-            }
-        });
-        if self.finishing && !self.has_output() {
-            self.pending = None;
-            self.finished = true;
+        let Some(index) = self.emission else {
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
+        };
+        if !ctx.work().try_consume(1) {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
-        Ok(output)
+        let result = ctx.perform(
+            crate::runtime::fragment::PipelineOperation::Finishing,
+            |_| self.emit_candidate(index),
+        );
+        if let Err(error) = &result {
+            ctx.report_failure(error.clone());
+        }
+        let output = self.latch(result)?;
+        let next = if index + 1
+            == self
+                .candidates
+                .as_ref()
+                .expect("candidate cursor is live")
+                .entries
+                .len()
+        {
+            self.release_owned();
+            NextStep::Finished
+        } else {
+            self.emission = Some(index + 1);
+            NextStep::Runnable
+        };
+        Ok(StepResult::new(Some(output), next, 0))
     }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         if let Some(error) = &self.failed {
             return Err(error.clone());
         }
-        if self.finishing || self.finished {
-            return Ok(());
+        let result: ExecutionResult<()> = self.control.checkpoint(0).map_err(Into::into);
+        if let Err(error) = &result {
+            ctx.report_failure(error.clone());
         }
-        self.finishing = true;
-        let result = self.emit();
         self.latch(result)?;
-        self.candidates = None;
         self.instances = None;
-        if !self.has_output() {
-            self.pending = None;
-            self.finished = true;
+        if self
+            .candidates
+            .as_ref()
+            .is_none_or(|set| set.entries.is_empty())
+        {
+            self.release_owned();
+            Ok(StepResult::new(None, NextStep::Finished, 0))
+        } else {
+            self.emission = Some(0);
+            Ok(StepResult::new(None, NextStep::Runnable, 0))
         }
-        Ok(())
     }
 }

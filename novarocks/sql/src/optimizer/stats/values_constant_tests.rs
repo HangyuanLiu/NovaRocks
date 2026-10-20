@@ -37,7 +37,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push(units);
-        match self.refuse {
+        match self.refuse.clone() {
             Some((at, cause)) if trace.len() == at + 1 => Err(cause),
             _ => Ok(()),
         }

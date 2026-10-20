@@ -27,13 +27,15 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
+use crate::exec::pipeline::shape::{Source, SourceKernel, SourceStart};
+use crate::exec::pipeline::step::{NextStep, StepResult};
 use crate::runtime::fragment::ExecutionResult;
 
 use crate::exec::chunk::Chunk;
 
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::runtime_state::RuntimeState;
 
 /// Factory for VALUES source operators that emit literal plan rows.
 pub struct ValuesSourceFactory {
@@ -45,7 +47,8 @@ impl ValuesSourceFactory {
     pub(crate) fn new_typed(
         values: novarocks_local_program::StaticValues,
         node_id: i32,
-    ) -> Result<typed_values_source::TypedValuesSourceFactory, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<typed_values_source::TypedValuesSourceFactory>
+    {
         typed_values_source::TypedValuesSourceFactory::try_new(values, node_id)
     }
 
@@ -65,13 +68,12 @@ impl OperatorFactory for ValuesSourceFactory {
     }
 
     fn create(&self, dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        Box::new(ValuesSourceOperator {
+        Box::new(Source::new(ValuesSourceOperator {
             name: self.name.clone(),
-            chunk: self.chunk.clone(),
+            chunk: Some(self.chunk.clone()),
             _dop: dop.max(1),
             driver_id: driver_id.max(0),
-            emitted: false,
-        })
+        }))
     }
 
     fn is_source(&self) -> bool {
@@ -81,53 +83,39 @@ impl OperatorFactory for ValuesSourceFactory {
 
 struct ValuesSourceOperator {
     name: String,
-    chunk: Chunk,
+    chunk: Option<Chunk>,
     _dop: i32,
     driver_id: i32,
-    emitted: bool,
 }
 
-impl Operator for ValuesSourceOperator {
+impl OperatorLifecycle for ValuesSourceOperator {
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.emitted
-    }
 }
 
-impl ProcessorOperator for ValuesSourceOperator {
-    fn need_input(&self) -> bool {
-        false
-    }
-
-    fn has_output(&self) -> bool {
-        !self.is_finished()
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-        Err("values source operator does not accept input"
-            .to_string()
-            .into())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if self.emitted {
-            return Ok(None);
+impl SourceKernel for ValuesSourceOperator {
+    fn start(&self) -> SourceStart {
+        if self.driver_id != 0 {
+            SourceStart::Finished
+        } else {
+            SourceStart::Ready
         }
-        self.emitted = true;
-        let len = self.chunk.len();
+    }
+    fn poll_output(
+        &mut self,
+        _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = self.chunk.take().ok_or_else(|| {
+            novarocks_functions::KernelFailure::InvalidProgram(
+                novarocks_functions::KernelDiagnostic::new(
+                    "literal Values output was already transferred",
+                ),
+            )
+        })?;
+        let len = chunk.len();
         if len == 0 {
-            return Ok(None);
+            return Ok(StepResult::new(None, NextStep::Finished, 0));
         }
         // Emit all rows from driver 0 only. VALUES chunks are small literal
         // data and do not benefit from parallelism.  Concentrating all rows in
@@ -135,13 +123,9 @@ impl ProcessorOperator for ValuesSourceOperator {
         // critical for deterministic AUTO_INCREMENT ID assignment.
         let driver_id = self.driver_id.max(0) as usize;
         if driver_id != 0 {
-            return Ok(None);
+            return Ok(StepResult::new(None, NextStep::Finished, 0));
         }
-        Ok(Some(self.chunk.clone()))
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        Ok(())
+        Ok(StepResult::new(Some(chunk), NextStep::Finished, 0))
     }
 }
 

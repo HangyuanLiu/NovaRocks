@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field};
@@ -91,7 +93,12 @@ pub fn eval_arrays_overlap<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(expression_contract(
+            "arrays_overlap requires exactly 2 prepared argument(s)",
+        ));
+    }
     let arr1 = arena.eval(args[0], chunk)?;
     let arr2 = arena.eval(args[1], chunk)?;
     if matches!(arr1.data_type(), DataType::Null) || matches!(arr2.data_type(), DataType::Null) {
@@ -101,19 +108,19 @@ pub fn eval_arrays_overlap<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         .as_any()
         .downcast_ref::<arrow::array::ListArray>()
         .ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "arrays_overlap expects ListArray, got {:?}",
                 arr1.data_type()
-            )
+            ))
         })?;
     let list2 = arr2
         .as_any()
         .downcast_ref::<arrow::array::ListArray>()
         .ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "arrays_overlap expects ListArray, got {:?}",
                 arr2.data_type()
-            )
+            ))
         })?;
 
     let mut values1 = list1.values().clone();
@@ -123,31 +130,19 @@ pub fn eval_arrays_overlap<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         let right_type = values2.data_type().clone();
         if let Some(target_type) = common_overlap_value_type(&left_type, &right_type) {
             values1 =
-                super::common::cast_with_special_rules(&values1, &target_type, "arrays_overlap")
-                    .map_err(|e| {
-                        format!(
-                            "arrays_overlap failed to cast left type {:?} -> {:?}: {}",
-                            left_type, target_type, e
-                        )
-                    })?;
+                super::common::cast_with_special_rules(&values1, &target_type, "arrays_overlap")?;
             values2 =
-                super::common::cast_with_special_rules(&values2, &target_type, "arrays_overlap")
-                    .map_err(|e| {
-                        format!(
-                            "arrays_overlap failed to cast right type {:?} -> {:?}: {}",
-                            right_type, target_type, e
-                        )
-                    })?;
-        } else if let Ok(casted) = cast(&values2, &left_type) {
-            values2 = casted;
-        } else if let Ok(casted) = cast(&values1, &right_type) {
-            values1 = casted;
+                super::common::cast_with_special_rules(&values2, &target_type, "arrays_overlap")?;
+        } else if arrow::compute::can_cast_types(&right_type, &left_type) {
+            values2 =
+                cast(&values2, &left_type).map_err(crate::exec::expr::cast::cast_arrow_failure)?;
+        } else if arrow::compute::can_cast_types(&left_type, &right_type) {
+            values1 =
+                cast(&values1, &right_type).map_err(crate::exec::expr::cast::cast_arrow_failure)?;
         } else {
-            return Err((format!(
-                "arrays_overlap type mismatch after coercion attempts: {:?} vs {:?}",
-                left_type, right_type
-            ))
-            .into());
+            return Err(expression_contract(format_args!(
+                "arrays_overlap has no admitted coercion: {left_type:?} vs {right_type:?}"
+            )));
         }
     }
     let offsets1 = list1.value_offsets();

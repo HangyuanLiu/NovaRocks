@@ -20,7 +20,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, BinaryArray, Int64Builder, ListBuilder};
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
 
 fn row_index(row: usize, len: usize) -> usize {
     if len == 1 { 0 } else { row }
@@ -31,19 +31,30 @@ pub fn eval_bitmap_to_array<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "bitmap_to_array requires exactly one argument",
+        ));
+    }
     let input = arena.eval(args[0], chunk)?;
     let arr = input
         .as_any()
         .downcast_ref::<BinaryArray>()
         .ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "bitmap_to_array expects BITMAP/BINARY input, got {:?}",
                 input.data_type()
-            )
+            ))
         })?;
 
     let mut builder = ListBuilder::new(Int64Builder::new());
+    let mut count = 0i32;
+    crate::exec::expr::function::array::common::validate_rows(
+        arr.len(),
+        chunk.len(),
+        "bitmap_to_array input",
+    )?;
     for row in 0..chunk.len() {
         let idx = row_index(row, arr.len());
         if arr.is_null(idx) {
@@ -51,9 +62,15 @@ pub fn eval_bitmap_to_array<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             continue;
         }
         let values = bitmap::decode_bitmap(arr.value(idx))?;
+        count =
+            novarocks_functions::aggregate_scalar::checked_list_output_offset(count, values.len())?;
         for value in values {
-            let value = i64::try_from(value)
-                .map_err(|_| format!("bitmap_to_array value {} exceeds BIGINT range", value))?;
+            let value = i64::try_from(value).map_err(|source| {
+                super::bitmap_functions::bitmap_numeric_range(
+                    format_args!("bitmap_to_array value {value} exceeds BIGINT range"),
+                    source,
+                )
+            })?;
             builder.values().append_value(value);
         }
         builder.append(true);

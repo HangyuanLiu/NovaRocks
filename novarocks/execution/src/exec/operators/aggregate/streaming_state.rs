@@ -85,10 +85,23 @@ impl AggregateStreamingState {
         notify.arm();
     }
 
-    /// Pull a chunk from the buffer. Called by the Source operator.
-    pub(crate) fn poll_chunk(&self) -> Option<Chunk> {
+    /// Dequeue and observe the final producer under one lock.
+    pub(crate) fn next_chunk(&self) -> crate::exec::pipeline::shape::SourceRead {
+        use crate::exec::pipeline::shape::SourceRead;
         let mut guard = self.inner.lock().expect("streaming state lock");
-        guard.chunks.pop_front()
+        match guard.chunks.pop_front() {
+            Some(chunk) => SourceRead::Chunk(chunk),
+            None if guard.sink_finished => SourceRead::Finished,
+            None => SourceRead::Pending,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poll_chunk(&self) -> Option<Chunk> {
+        match self.next_chunk() {
+            crate::exec::pipeline::shape::SourceRead::Chunk(chunk) => Some(chunk),
+            _ => None,
+        }
     }
 
     /// Returns true if the buffer has chunks available.

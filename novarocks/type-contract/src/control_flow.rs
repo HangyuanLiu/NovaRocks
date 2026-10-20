@@ -167,7 +167,7 @@ impl<T> ControlFlowOwned<T> {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExpressionControlFlowError {
     Control(CompileControlError),
     TooManyItems,
@@ -186,7 +186,14 @@ impl fmt::Display for ExpressionControlFlowError {
         write!(f, "invalid expression control flow: {self:?}")
     }
 }
-impl std::error::Error for ExpressionControlFlowError {}
+impl std::error::Error for ExpressionControlFlowError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<CompileControlError> for ExpressionControlFlowError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)
@@ -217,7 +224,7 @@ impl<D: Copy> ExpressionControlFlow<D> {
             &mut work,
         );
         if let Err(ExpressionControlFlowError::Control(cause)) = &parts {
-            return Err((*cause).into());
+            return Err(cause.clone().into());
         }
         work.finish()?;
         let (domains, uses, roots, references) = parts?;
@@ -958,7 +965,7 @@ mod tests {
         fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             self.observations.lock().unwrap().push((phase, units));
             if units > 0
-                && let Some(failure) = self.fail
+                && let Some(failure) = self.fail.clone()
             {
                 return Err(failure);
             }
@@ -1074,7 +1081,7 @@ mod tests {
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let owner = control(Some(failure));
+                let owner = control(Some(failure.clone()));
                 let uses = (0..1000).map(|id| invocation(id, 1000)).collect();
                 assert_eq!(
                     ExpressionControlFlow::try_new(

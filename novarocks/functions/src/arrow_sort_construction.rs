@@ -295,7 +295,7 @@ impl<H, W: FnMut(bool) -> Result<(), H>> Walk<'_, '_, H, W> {
                 | DataType::RunEndEncoded(_, _)
                 | DataType::Union(_, _)
                 | DataType::Dictionary(_, _) => return Err(LayoutResourceError::SourceModel.into()),
-                _ => return Err(CopyError::Unsupported(array.data_type().clone()).into()),
+                _ => return Err(CopyError::unsupported(array.data_type()).into()),
             }
         };
         self.opaque(capture_upper(
@@ -407,7 +407,7 @@ fn source_coverage<H>(
         | DataType::RunEndEncoded(_, _)
         | DataType::Union(_, _)
         | DataType::Dictionary(_, _) => Err(LayoutResourceError::SourceModel.into()),
-        _ => Err(CopyError::Unsupported(array.data_type().clone()).into()),
+        _ => Err(CopyError::unsupported(array.data_type()).into()),
     }
 }
 /// Preflight structures of ONE original Arrow lexsort_to_indices call. Caller

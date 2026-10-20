@@ -31,7 +31,14 @@ use novarocks_execution::runtime::fragment::io::{
     ResultWriteAdmission, ResultWriteCredit, RootResultWriteSpec,
 };
 use novarocks_execution_contract::TaskOutputFacts;
-use novarocks_execution_contract::root_result::{RootReadOutcome, RootResultRead};
+use novarocks_execution_contract::failure::{
+    FailureClass, FailureFact, FailureReason, ResourceDimension, ResourceFacts, ResourceScope,
+    domain,
+};
+use novarocks_execution_contract::native_result_support::NativeResultSupportGeometry;
+use novarocks_execution_contract::root_result::{
+    RootReadDeferral, RootReadOutcome, RootReadRefusal, RootReadResponse, RootResultRead,
+};
 use novarocks_execution_contract::task_execution::creation::{
     CreationContent, FrozenBytes, PreparedTaskFacts, TaskCreationInput,
 };
@@ -54,7 +61,7 @@ use novarocks_execution_contract::task_execution::operation::{
 use novarocks_execution_contract::task_execution::status::{AbortCause, CancelReason};
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_native_adapter::root_result_reader::{
-    NativeRootReadRefusal, NativeRootReadResponse, NativeRootResultReader, NativeRootResultReply,
+    NativeRootReadResponse, NativeRootResultReader, NativeRootResultReply,
 };
 use novarocks_result_contract::{
     ClientRenderSchema, FrozenRootOutput, NativeRenderType, RenderColumn, RenderField,
@@ -185,7 +192,7 @@ impl TaskExecutionHost for Host {
         &self,
         _: &TaskDescriptor,
         _: TaskCreationInput,
-        _preparation_stop: novarocks_worker::TaskPreparationStopView,
+        _preparation_stop: novarocks_worker::TaskPreparationContext<'_>,
     ) -> Result<PreparedTaskInstallation, HostRejection> {
         if let Some(gate) = &self.gate {
             gate.wait();
@@ -265,6 +272,8 @@ impl Fixture {
         };
         let limits = WorkerResultRetainedLimits::try_new(256 * 1024 * 1024, PROCESS).unwrap();
         let budget = ResultRetainedBudget::new(limits.per_process());
+        let health =
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default());
         let root = RootResultChannel::try_open(
             RootResultWriteSpec {
                 task: identity,
@@ -272,6 +281,7 @@ impl Fixture {
             },
             Arc::clone(&budget),
             limits,
+            Arc::clone(&health),
         )
         .unwrap();
         let host = Arc::new(Host {
@@ -285,7 +295,7 @@ impl Fixture {
             Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
             Arc::new(ContextHost),
             Arc::clone(&host) as Arc<dyn TaskExecutionHost>,
-            TaskExecutionPorts::new(Arc::new(Noop), Arc::new(Noop), Arc::new(Noop)),
+            TaskExecutionPorts::new(Arc::new(Noop), Arc::new(Noop), Arc::new(Noop), health),
         );
         let lease = || LeaseValidFor::new(Duration::from_secs(10)).unwrap();
         let ticket = registry
@@ -379,7 +389,7 @@ impl Fixture {
             builder.output()[..6].copy_from_slice(b"\x02\0\0\0\x011");
             self.root.publish_segment(builder, 6, true).unwrap();
         }
-        drop(producer);
+        producer.finish_encoder();
         let reporter = self.host.reporter.lock().unwrap().as_ref().unwrap().clone();
         reporter.running();
         reporter.finished(TaskOutputFacts::new(true));
@@ -421,11 +431,79 @@ fn granted(admission: ResultWriteAdmission) -> ResultWriteCredit {
 fn owned(response: NativeRootReadResponse) -> NativeRootResultReply {
     match response {
         NativeRootReadResponse::Owned(reply) => reply,
+        NativeRootReadResponse::Deferred(reason) => panic!("read deferred: {reason:?}"),
         NativeRootReadResponse::Refused(reason) => panic!("read refused: {reason:?}"),
         NativeRootReadResponse::AwaitTerminalControl { accepted_consumed } => {
             panic!("sealed at {accepted_consumed}")
         }
     }
+}
+fn assert_binding(response: &RootReadResponse, request: &RootResultRead) {
+    assert_eq!(response.root_task(), request.root_task());
+    assert_eq!(response.profile(), request.profile());
+    assert_eq!(response.kind(), request.kind());
+    response.validate().unwrap();
+}
+fn deferred(response: NativeRootReadResponse, request: &RootResultRead) -> RootReadDeferral {
+    let NativeRootReadResponse::Deferred(deferred) = response else {
+        panic!("expected an actual deferral without an ACK receipt");
+    };
+    let response = RootReadResponse::Deferred(deferred);
+    assert_binding(&response, request);
+    let RootReadResponse::Deferred(deferred) = response else {
+        unreachable!()
+    };
+    deferred.reason()
+}
+fn refused(response: NativeRootReadResponse, request: &RootResultRead) -> RootReadRefusal {
+    let NativeRootReadResponse::Refused(refused) = response else {
+        panic!("expected a domain refusal without an ACK receipt");
+    };
+    assert_binding(&RootReadResponse::Refused(refused.clone()), request);
+    refused
+}
+fn read_holders_busy() -> RootReadDeferral {
+    let positions = NativeResultSupportGeometry::V1.root_live_send_holders;
+    RootReadDeferral::ReadHoldersBusy(ResourceFacts {
+        request_scope: Some(ResourceScope::Request),
+        constraint_scope: Some(ResourceScope::Task),
+        dimension: ResourceDimension::Positions,
+        requested: Some(1),
+        required_growth: None,
+        limit: Some(positions),
+        live: None,
+        committed: Some(positions),
+    })
+}
+fn send_backing_busy() -> RootReadDeferral {
+    RootReadDeferral::SendBackingBusy(ResourceFacts {
+        request_scope: Some(ResourceScope::Request),
+        constraint_scope: None,
+        dimension: ResourceDimension::Bytes,
+        requested: Some(COPY as u64),
+        required_growth: None,
+        limit: None,
+        live: None,
+        committed: None,
+    })
+}
+fn send_metadata_busy(requested: usize, committed: usize) -> RootReadDeferral {
+    RootReadDeferral::SendMetadataBusy(ResourceFacts {
+        request_scope: Some(ResourceScope::Request),
+        constraint_scope: Some(ResourceScope::Task),
+        dimension: ResourceDimension::Bytes,
+        requested: Some(requested as u64),
+        required_growth: None,
+        limit: Some(FIXED as u64),
+        live: None,
+        committed: Some(committed as u64),
+    })
+}
+fn root_refusal_fact(code: u16) -> FailureFact {
+    FailureFact::new(
+        FailureClass::Data,
+        FailureReason::new(domain::WORKER, std::num::NonZeroU16::new(code).unwrap()),
+    )
 }
 async fn pending<F: Future>(future: std::pin::Pin<&mut F>) {
     let mut future = future;
@@ -508,10 +586,10 @@ async fn two_send_positions_follow_last_exported_owner() {
     let owner = first.ownership();
     let second = owned(fixture.reader.read(&request).await);
     drop(first);
-    assert!(matches!(
-        fixture.reader.read(&request).await,
-        NativeRootReadResponse::Refused(NativeRootReadRefusal::Busy)
-    ));
+    assert_eq!(
+        deferred(fixture.reader.read(&request).await, &request),
+        read_holders_busy()
+    );
     drop(owner);
     let third = owned(fixture.reader.read(&request).await);
     drop(second);
@@ -543,10 +621,10 @@ async fn shared_process_and_root_pregrants_refuse_without_leaking_read_positions
     let fixture = Fixture::new(false);
     let request = fixture.request(Some(1), 0, 1);
     let process = fixture.fill_process(PROCESS - FIXED - COPY + 1);
-    assert!(matches!(
-        fixture.reader.read(&request).await,
-        NativeRootReadResponse::Refused(NativeRootReadRefusal::BackingCapacity)
-    ));
+    assert_eq!(
+        deferred(fixture.reader.read(&request).await, &request),
+        send_backing_busy()
+    );
     assert!(fixture.root.physical_idle());
     drop(process);
     let root = granted(
@@ -555,10 +633,10 @@ async fn shared_process_and_root_pregrants_refuse_without_leaking_read_positions
             .try_reserve(256 * 1024 * 1024 - FIXED - COPY + 1)
             .unwrap(),
     );
-    assert!(matches!(
-        fixture.reader.read(&request).await,
-        NativeRootReadResponse::Refused(NativeRootReadRefusal::BackingCapacity)
-    ));
+    assert_eq!(
+        deferred(fixture.reader.read(&request).await, &request),
+        send_backing_busy()
+    );
     drop(root);
     drop(owned(fixture.reader.read(&request).await));
     assert!(fixture.root.physical_idle());
@@ -593,10 +671,20 @@ async fn fixed_metadata_refusal_does_not_apply_ack_or_keep_admission() {
     // Reserve almost all fixed metadata, independently of data capacity.
     let metadata = fixture.root.try_reserve_metadata(FIXED - 8192).unwrap();
     let request = fixture.request(None, 1, 1);
-    assert!(matches!(
-        fixture.reader.read(&request).await,
-        NativeRootReadResponse::Refused(NativeRootReadRefusal::MetadataCapacity)
-    ));
+    let committed = fixture
+        .root
+        .try_ownership_snapshot()
+        .unwrap()
+        .unwrap()
+        .metadata_bytes;
+    assert_eq!(
+        deferred(fixture.reader.read(&request).await, &request),
+        send_metadata_busy(
+            novarocks_native_adapter::root_result_reader::native_root_send_metadata_bytes()
+                + 2 * RootProfileV1::ENVELOPE_BYTES,
+            committed,
+        )
+    );
     assert_eq!(fixture.root.snapshot().consumed_through, 0);
     drop(metadata);
     assert!(
@@ -619,10 +707,10 @@ async fn two_ack_only_sends_share_one_fixed_reservation_each() {
     let second = owned(fixture.reader.read(&request).await);
     assert_eq!(first.ownership().backing_capacity_bytes(), 8192);
     assert_eq!(second.ownership().backing_capacity_bytes(), 8192);
-    assert!(matches!(
-        fixture.reader.read(&request).await,
-        NativeRootReadResponse::Refused(NativeRootReadRefusal::Busy)
-    ));
+    assert_eq!(
+        deferred(fixture.reader.read(&request).await, &request),
+        read_holders_busy()
+    );
     drop(first);
     drop(second);
     drop(filler);
@@ -657,10 +745,10 @@ async fn acknowledged_original_alias_still_blocks_copy_pregrant() {
     drop(reply);
     let filler = fixture.fill_process(PROCESS - FIXED - COPY);
     let request = fixture.request(Some(2), 1, 1);
-    assert!(matches!(
-        fixture.reader.read(&request).await,
-        NativeRootReadResponse::Refused(NativeRootReadRefusal::BackingCapacity)
-    ));
+    assert_eq!(
+        deferred(fixture.reader.read(&request).await, &request),
+        send_backing_busy()
+    );
     assert_eq!(
         fixture.root.snapshot().consumed_through,
         1,
@@ -792,10 +880,9 @@ async fn identity_and_output_mismatch_are_typed_without_fallback() {
         Duration::from_millis(1),
     )
     .unwrap();
-    assert!(matches!(
-        fixture.reader.read(&request).await,
-        NativeRootReadResponse::Refused(NativeRootReadRefusal::UnknownRoot)
-    ));
+    let refusal = refused(fixture.reader.read(&request).await, &request);
+    assert_eq!(refusal.fact(), root_refusal_fact(165));
+    assert!(refusal.detail().as_str().len() <= 512);
     let request = RootResultRead::try_new(
         task,
         RootProfileId::V1,
@@ -805,10 +892,9 @@ async fn identity_and_output_mismatch_are_typed_without_fallback() {
         Duration::from_millis(1),
     )
     .unwrap();
-    assert!(matches!(
-        fixture.reader.read(&request).await,
-        NativeRootReadResponse::Refused(NativeRootReadRefusal::Mismatch)
-    ));
+    let refusal = refused(fixture.reader.read(&request).await, &request);
+    assert_eq!(refusal.fact(), root_refusal_fact(43));
+    assert!(refusal.detail().as_str().len() <= 512);
     assert!(fixture.root.physical_idle());
 }
 
@@ -819,11 +905,28 @@ async fn installation_in_progress_is_preparing_without_new_read_holder() {
     let creator = Arc::clone(&fixture);
     let job = std::thread::spawn(move || creator.install());
     gate.entered();
-    assert!(matches!(
-        fixture.reader.read(&fixture.request(Some(1), 0, 1)).await,
-        NativeRootReadResponse::Refused(NativeRootReadRefusal::Preparing)
-    ));
+    let request = fixture.request(Some(1), 0, 1);
+    assert_eq!(
+        deferred(fixture.reader.read(&request).await, &request),
+        RootReadDeferral::Preparing,
+    );
     assert!(fixture.root.physical_idle());
+    let mut body = root_result_unary(&fixture.reader, unary_request(&request))
+        .await
+        .into_body();
+    let data = unary_data(&mut body).await;
+    assert_eq!(
+        unary_decoded_response(&data, &request, 0),
+        RootReadResponse::Deferred(
+            novarocks_execution_contract::root_result::RootReadDeferred::for_request(
+                &request,
+                RootReadDeferral::Preparing,
+            )
+        ),
+    );
+    assert!(fixture.root.physical_idle());
+    drop(data);
+    drop(body);
     gate.open();
     job.join().unwrap();
     drop(owned(
@@ -1078,7 +1181,11 @@ fn unary_request(read: &RootResultRead) -> axum::http::Request<axum::body::Body>
     bytes.extend_from_slice(&(message.encoded_len() as u32).to_be_bytes());
     message.encode(&mut bytes).unwrap();
     axum::http::Request::builder()
-        .uri("/novarocks.NovaRocksGrpc/FetchTaskResult")
+        .uri(
+            novarocks_proto_codec::native_rpc::NativeRpcMethod::FetchRootResult
+                .contract()
+                .path,
+        )
         .header("content-type", "application/grpc")
         .body(axum::body::Body::from(bytes))
         .unwrap()
@@ -1098,6 +1205,30 @@ fn unary_message(data: &Bytes) -> wire::FetchRootResultResponse {
         data.len() - 5
     );
     Message::decode(&data[5..]).unwrap()
+}
+
+fn unary_receipt(message: wire::FetchRootResultResponse) -> wire::RootReadReceipt {
+    match message.result {
+        Some(wire::fetch_root_result_response::Result::Reply(receipt)) => receipt,
+        other => panic!("expected a wire ACK receipt, got {other:?}"),
+    }
+}
+fn unary_decoded_response(
+    data: &Bytes,
+    request: &RootResultRead,
+    maximum_delivered_consumed: u64,
+) -> RootReadResponse {
+    let raw = &data[5..];
+    novarocks_task_codec::resource_preflight::check_root_result_reply(raw).unwrap();
+    let response = novarocks_task_codec::root_result::decode_response(
+        unary_message(data),
+        request,
+        maximum_delivered_consumed,
+        novarocks_proto_codec::FieldPath::root("root_reply"),
+    )
+    .unwrap();
+    assert_binding(&response, request);
+    response
 }
 
 #[tokio::test]
@@ -1146,13 +1277,15 @@ async fn unary_last_data_slice_outlives_body_and_context_seal() {
     let mut body = response.into_body();
     let data = unary_data(&mut body).await;
     let message = unary_message(&data);
-    let decoded = novarocks_task_codec::root_result::decode_reply(
+    let RootReadResponse::Reply(decoded) = novarocks_task_codec::root_result::decode_response(
         message,
         &fixture.request(Some(1), 0, 1),
         0,
         novarocks_proto_codec::FieldPath::root("root_reply"),
     )
-    .unwrap();
+    .unwrap() else {
+        panic!("expected an actual ACK receipt");
+    };
     let RootReadOutcome::Data(payload) = decoded.outcome else {
         panic!("Data")
     };
@@ -1193,11 +1326,11 @@ async fn unary_ack_only_encodes_from_metadata_when_process_data_pool_is_full() {
     assert_eq!(SEND_ALLOC_COUNT.with(Cell::get), 2);
     let mut body = response.into_body();
     let data = unary_data(&mut body).await;
-    let message = unary_message(&data);
+    let message = unary_receipt(unary_message(&data));
     assert_eq!(message.accepted_consumed_sequence, 1);
     assert_eq!(
         message.outcome,
-        Some(wire::fetch_root_result_response::Outcome::AckOnly(true))
+        Some(wire::root_read_receipt::Outcome::AckOnly(true))
     );
     drop(body);
     assert!(!fixture.root.physical_idle());
@@ -1218,30 +1351,53 @@ async fn unary_extra_metadata_is_pregranted_before_ack_or_projection() {
     let reader_metadata =
         novarocks_native_adapter::root_result_reader::native_root_send_metadata_bytes()
             + 2 * RootProfileV1::ENVELOPE_BYTES;
-    let FrozenRootOutput::ClientRows(schema) = fixture.root.spec().contract.output() else {
-        panic!("ClientRows")
-    };
-    // The old reader alone still fits; the actual unary transport does not.
+    // Core owner layout is independent of the wire envelope. Account the
+    // actual already reserved metadata at this cut, then leave exactly the
+    // reader-only demand; the unary transport's additional demand must fail.
+    let committed_metadata = fixture
+        .root
+        .try_ownership_snapshot()
+        .unwrap()
+        .unwrap()
+        .metadata_bytes;
     let metadata = fixture
         .root
-        .try_reserve_metadata(
-            FIXED - RootProfileV1::ENVELOPE_BYTES - schema.backing_bytes() - reader_metadata,
-        )
+        .try_reserve_metadata(FIXED - committed_metadata - reader_metadata)
         .unwrap();
     drop(owned(
         fixture.reader.read(&fixture.request(None, 0, 1)).await,
     ));
-    let response =
-        root_result_unary(&fixture.reader, unary_request(&fixture.request(None, 1, 1))).await;
-    assert_eq!(response.headers()["grpc-status"], "8");
+    let committed = fixture
+        .root
+        .try_ownership_snapshot()
+        .unwrap()
+        .unwrap()
+        .metadata_bytes;
+    let read = fixture.request(None, 1, 1);
+    let response = root_result_unary(&fixture.reader, unary_request(&read)).await;
+    assert!(!response.headers().contains_key("grpc-status"));
     assert_eq!(fixture.root.snapshot().consumed_through, 0);
-    drop(response);
+    let mut body = response.into_body();
+    let data = unary_data(&mut body).await;
+    let response = unary_decoded_response(&data, &read, 1);
+    assert_eq!(response, RootReadResponse::Deferred(
+        novarocks_execution_contract::root_result::RootReadDeferred::for_request(
+            &read,
+            send_metadata_busy(
+                reader_metadata + novarocks_native_adapter::root_result_unary::native_root_unary_metadata_bytes(),
+                committed,
+            ),
+        ),
+    ));
+    assert_eq!(fixture.root.snapshot().consumed_through, 0);
+    drop(data);
+    drop(body);
     drop(metadata);
     let mut body = root_result_unary(&fixture.reader, unary_request(&fixture.request(None, 1, 1)))
         .await
         .into_body();
     assert_eq!(
-        unary_message(&unary_data(&mut body).await).accepted_consumed_sequence,
+        unary_receipt(unary_message(&unary_data(&mut body).await)).accepted_consumed_sequence,
         1
     );
     drop(body);
@@ -1285,11 +1441,11 @@ async fn unary_closed_route_preserves_actual_ack_without_new_root_holder() {
     let mut body = root_result_unary(&fixture.reader, unary_request(&fixture.request(None, 1, 1)))
         .await
         .into_body();
-    let message = unary_message(&unary_data(&mut body).await);
+    let message = unary_receipt(unary_message(&unary_data(&mut body).await));
     assert_eq!(message.accepted_consumed_sequence, 0);
     assert_eq!(
         message.outcome,
-        Some(wire::fetch_root_result_response::Outcome::AwaitTerminalControl(true))
+        Some(wire::root_read_receipt::Outcome::AwaitTerminalControl(true))
     );
     drop(old_credit);
     assert!(
@@ -1308,7 +1464,19 @@ async fn unary_two_bodies_hold_two_read_positions_before_first_poll() {
     let first = root_result_unary(&fixture.reader, unary_request(&read)).await;
     let second = root_result_unary(&fixture.reader, unary_request(&read)).await;
     let third = root_result_unary(&fixture.reader, unary_request(&read)).await;
-    assert_eq!(third.headers()["grpc-status"], "8");
+    assert!(!third.headers().contains_key("grpc-status"));
+    let mut third = third.into_body();
+    let third_data = unary_data(&mut third).await;
+    assert_eq!(
+        unary_decoded_response(&third_data, &read, 0),
+        RootReadResponse::Deferred(
+            novarocks_execution_contract::root_result::RootReadDeferred::for_request(
+                &read,
+                read_holders_busy(),
+            )
+        ),
+    );
+    drop(third_data);
     drop(third);
     drop(first);
     let replacement = root_result_unary(&fixture.reader, unary_request(&read)).await;
@@ -1332,7 +1500,7 @@ async fn unary_maximum_segment_is_one_copy_without_buffer_growth() {
     }
     builder.output()[..4].copy_from_slice(&((count - 4) as u32).to_le_bytes());
     fixture.root.publish_segment(builder, count, true).unwrap();
-    drop(producer);
+    producer.finish_encoder();
     start_send_probe(SEGMENT);
     let mut body = root_result_unary(
         &fixture.reader,
@@ -1345,8 +1513,8 @@ async fn unary_maximum_segment_is_one_copy_without_buffer_growth() {
     assert_eq!(SEND_ALLOC_COUNT.with(Cell::get), 1);
     assert_eq!(SEND_REALLOC_COUNT.with(Cell::get), 0);
     assert!(data.len() > RootProfileV1::SEGMENT_BYTES && data.len() <= SEGMENT);
-    let message = unary_message(&data);
-    let Some(wire::fetch_root_result_response::Outcome::Data(payload)) = message.outcome else {
+    let message = unary_receipt(unary_message(&data));
+    let Some(wire::root_read_receipt::Outcome::Data(payload)) = message.outcome else {
         panic!("Data")
     };
     assert_eq!(payload.body.len(), count);
@@ -1395,13 +1563,15 @@ async fn unary_count_only_end_uses_the_same_frozen_codec_without_row_payload() {
         .await
         .into_body();
     let message = unary_message(&unary_data(&mut body).await);
-    let reply = novarocks_task_codec::root_result::decode_reply(
+    let RootReadResponse::Reply(reply) = novarocks_task_codec::root_result::decode_response(
         message,
         &read,
         0,
         novarocks_proto_codec::FieldPath::root("root_reply"),
     )
-    .unwrap();
+    .unwrap() else {
+        panic!("expected an actual ACK receipt");
+    };
     let RootReadOutcome::End(end) = reply.outcome else {
         panic!("End")
     };
@@ -1437,13 +1607,15 @@ async fn unary_actual_large_data_backing_survives_all_nonfinal_clone_and_short_s
     assert!(data.len() > 5 && data.len() < SEGMENT / 1024);
     assert_eq!(before.live_alias(data.as_ptr(), 1), allocation);
     let message = unary_message(&data);
-    let decoded = novarocks_task_codec::root_result::decode_reply(
+    let RootReadResponse::Reply(decoded) = novarocks_task_codec::root_result::decode_response(
         message,
         &fixture.request(Some(1), 0, 1),
         0,
         novarocks_proto_codec::FieldPath::root("root_reply"),
     )
-    .unwrap();
+    .unwrap() else {
+        panic!("expected an actual ACK receipt");
+    };
     let RootReadOutcome::Data(payload) = decoded.outcome else {
         panic!("Data")
     };
@@ -1532,11 +1704,11 @@ async fn unary_ack_same_size_decoder_and_send_backings_are_distinct_until_last_d
     // Freed decoder and live send storage may legally reuse the same address.
     // Their distinct ordinal/lifecycle facts, not pointer inequality, identify
     // this response's actual DATA allocation.
-    let message = unary_message(&data);
+    let message = unary_receipt(unary_message(&data));
     assert_eq!(message.accepted_consumed_sequence, 1);
     assert_eq!(
         message.outcome,
-        Some(wire::fetch_root_result_response::Outcome::AckOnly(true))
+        Some(wire::root_read_receipt::Outcome::AckOnly(true))
     );
     let clone = data.clone();
     let last = data.slice(5..6);
@@ -1559,4 +1731,104 @@ async fn unary_ack_same_size_decoder_and_send_backings_are_distinct_until_last_d
     assert!(fixture.root.physical_idle());
     drop(fixture.fill_process(SEGMENT));
     drop(filler);
+}
+
+#[tokio::test]
+async fn unary_backing_deferral_has_no_ack_receipt_after_actual_ack_applies() {
+    let fixture = UnaryFixture::new(false);
+    fixture.finish();
+    let original = owned(fixture.reader.read(&fixture.request(Some(1), 0, 1)).await);
+    let RootReadOutcome::Data(data) = &original.reply().outcome else {
+        panic!("Data")
+    };
+    let alias = data.body().clone();
+    drop(original);
+    let filler = fixture.fill_process(PROCESS - FIXED - COPY - fixture.header_bytes());
+    let read = fixture.request(Some(2), 1, 1);
+    let response = root_result_unary(&fixture.reader, unary_request(&read)).await;
+    assert!(!response.headers().contains_key("grpc-status"));
+    let mut body = response.into_body();
+    let raw = unary_data(&mut body).await;
+    assert!(matches!(
+        unary_message(&raw).result,
+        Some(wire::fetch_root_result_response::Result::Deferred(_)),
+    ));
+    assert_eq!(
+        unary_decoded_response(&raw, &read, 1),
+        RootReadResponse::Deferred(
+            novarocks_execution_contract::root_result::RootReadDeferred::for_request(
+                &read,
+                send_backing_busy(),
+            )
+        ),
+    );
+    assert_eq!(
+        fixture.root.snapshot().consumed_through,
+        1,
+        "the real ACK applied before copy admission"
+    );
+    assert!(
+        !fixture.root.physical_idle(),
+        "the actual original Data alias remains live"
+    );
+    assert!(matches!(
+        fixture.budget.try_reserve_process(COPY).unwrap(),
+        ResultWriteAdmission::Blocked
+    ));
+    drop(raw);
+    drop(body);
+    drop(alias);
+    let replay = owned(fixture.reader.read(&read).await);
+    assert_eq!(
+        replay.reply().accepted_consumed,
+        1,
+        "replaying the same cumulative ACK is idempotent"
+    );
+    assert!(matches!(replay.reply().outcome, RootReadOutcome::End(_)));
+    drop(replay);
+    assert!(fixture.root.physical_idle());
+    drop(fixture.fill_process(COPY));
+    drop(filler);
+}
+
+#[tokio::test]
+async fn unary_unknown_root_refusal_carries_original_domain_fact_without_ack() {
+    let fixture = UnaryFixture::new(false);
+    let actual = fixture.root.spec().task;
+    let unknown = TaskIdentity::new(
+        actual.query_execution_id(),
+        actual.stage_id(),
+        TaskId::new(2).unwrap(),
+        actual.backend_process_id(),
+    );
+    let read = RootResultRead::try_new(
+        unknown,
+        RootProfileId::V1,
+        RootOutputKind::ClientRows,
+        NonZeroU64::new(1),
+        0,
+        Duration::from_millis(1),
+    )
+    .unwrap();
+    let response = root_result_unary(&fixture.reader, unary_request(&read)).await;
+    assert!(!response.headers().contains_key("grpc-status"));
+    let mut body = response.into_body();
+    let data = unary_data(&mut body).await;
+    assert!(matches!(
+        unary_message(&data).result,
+        Some(wire::fetch_root_result_response::Result::Refused(_))
+    ));
+    let RootReadResponse::Refused(refusal) = unary_decoded_response(&data, &read, 0) else {
+        panic!("expected the real unknown-root domain refusal");
+    };
+    assert_eq!(refusal.fact(), root_refusal_fact(165));
+    assert!(refusal.detail().as_str().len() <= 512);
+    assert_eq!(fixture.root.snapshot().consumed_through, 0);
+    assert!(
+        fixture.root.physical_idle(),
+        "no Root read position was minted for the unknown task"
+    );
+    drop(data);
+    drop(body);
+    drop(fixture.fill_process(PROCESS - FIXED - fixture.header_bytes()));
 }

@@ -36,11 +36,78 @@ pub struct MetadataOwnerLimits {
     pub construction_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MetadataOwnerError {
     CapacityExceeded,
-    AllocationFailed,
+    AllocationFailed(novarocks_failure_contract::SharedFailureCause),
     DuplicateKey,
+    MissingFieldOrigin,
+}
+impl MetadataOwnerError {
+    fn allocation_failed(source: std::collections::TryReserveError) -> Self {
+        Self::AllocationFailed(novarocks_failure_contract::SharedFailureCause::new(
+            MetadataReservationFailure(source),
+        ))
+    }
+}
+#[derive(Debug)]
+struct MetadataReservationFailure(std::collections::TryReserveError);
+impl std::fmt::Display for MetadataReservationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "metadata owner collection reservation failed: {}",
+            self.0
+        )
+    }
+}
+impl std::error::Error for MetadataReservationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for MetadataReservationFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(domain::METADATA, std::num::NonZeroU16::new(2).unwrap()),
+        )
+    }
+}
+
+impl std::fmt::Display for MetadataOwnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::CapacityExceeded => "metadata owner construction exceeds its capacity profile",
+            Self::AllocationFailed(_) => "metadata owner collection reservation failed",
+            Self::DuplicateKey => "metadata owner construction contains a duplicate key",
+            Self::MissingFieldOrigin => "metadata origin is absent for the exact field identity",
+        })
+    }
+}
+impl std::error::Error for MetadataOwnerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AllocationFailed(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for MetadataOwnerError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        let (class, code) = match self {
+            Self::CapacityExceeded => (FailureClass::Resource, 1),
+            Self::AllocationFailed(source) => return source.failure_fact(),
+            Self::DuplicateKey => (FailureClass::Invariant, 3),
+            Self::MissingFieldOrigin => (FailureClass::Invariant, 4),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::METADATA, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
 }
 
 /// Owns a newly reserved map which has never had an entry removed. Its table
@@ -89,7 +156,7 @@ impl ArrowMetadataOwner {
         let mut metadata = HashMap::new();
         metadata
             .try_reserve(entries.len())
-            .map_err(|_| MetadataOwnerError::AllocationFailed)?;
+            .map_err(MetadataOwnerError::allocation_failed)?;
         for (key, value) in entries {
             if metadata.insert(key, value).is_some() {
                 return Err(MetadataOwnerError::DuplicateKey);
@@ -266,7 +333,7 @@ fn clone_known_metadata(
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(count)
-        .map_err(|_| MetadataOwnerError::AllocationFailed)?;
+        .map_err(MetadataOwnerError::allocation_failed)?;
     for (key, value) in source {
         entries.push((key.clone(), value.clone()));
     }
@@ -397,7 +464,7 @@ impl FieldMetadataOrigins {
         }
         let owner = self
             .owner_for(field)
-            .ok_or(MetadataOwnerError::CapacityExceeded)?;
+            .ok_or(MetadataOwnerError::MissingFieldOrigin)?;
         owners.push(owner.clone());
         self.collect_type(
             field.data_type(),
@@ -490,5 +557,55 @@ impl FieldMetadataOrigins {
     /// fields/maps and this wrapper's inline size.
     pub fn index_backing_bytes(&self) -> usize {
         self.owners.len() * size_of::<MetadataOwnedField>() + 4 * size_of::<usize>()
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn actual_standard_reservation_source_survives_clone_without_inferred_quota() {
+        use std::error::Error;
+        let source = Vec::<u8>::new().try_reserve(usize::MAX).unwrap_err();
+        let failure = MetadataOwnerError::allocation_failed(source);
+        let copied = failure.clone();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Resource);
+        assert_eq!(failure.failure_fact().reason().code(), 2);
+        assert!(failure.failure_fact().resource().is_none());
+        let source = failure.source().unwrap().source().unwrap();
+        let copied_source = copied.source().unwrap().source().unwrap();
+        assert!(std::ptr::eq(source, copied_source));
+        assert!(
+            source
+                .source()
+                .unwrap()
+                .is::<std::collections::TryReserveError>()
+        );
+    }
+    #[test]
+    fn actual_capacity_and_duplicate_key_refusals_project_distinct_original_facts() {
+        let limits = MetadataOwnerLimits {
+            entries: 0,
+            construction_bytes: usize::MAX,
+        };
+        let capacity =
+            ArrowMetadataOwner::try_new(vec![("key".into(), "value".into())], limits).unwrap_err();
+        assert_eq!(capacity, MetadataOwnerError::CapacityExceeded);
+        assert_eq!(capacity.failure_fact().class(), FailureClass::Resource);
+        assert_eq!(capacity.failure_fact().reason().domain(), 8);
+        assert_eq!(capacity.failure_fact().reason().code(), 1);
+        let duplicate = ArrowMetadataOwner::try_new(
+            vec![("key".into(), "one".into()), ("key".into(), "two".into())],
+            MetadataOwnerLimits {
+                entries: 2,
+                construction_bytes: usize::MAX,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(duplicate, MetadataOwnerError::DuplicateKey);
+        assert_eq!(duplicate.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(duplicate.failure_fact().reason().code(), 3);
+        assert_eq!(capacity.failure_fact().resource(), None);
     }
 }

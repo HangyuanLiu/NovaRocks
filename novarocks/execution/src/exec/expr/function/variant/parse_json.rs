@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::exec::expr::expression_contract;
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{ArrayRef, StringArray};
 use novarocks_functions::Selection;
 
@@ -24,15 +26,18 @@ pub fn eval_parse_json<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     if args.len() != 1 {
-        return Err((format!("parse_json expects 1 argument, got {}", args.len())).into());
+        return Err(expression_contract(format_args!(
+            "parse_json expects 1 argument, got {}",
+            args.len()
+        )));
     }
     let input = arena.eval(args[0], chunk)?;
     let arr = input
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "parse_json expects VARCHAR input".to_string())?;
+        .ok_or_else(|| expression_contract("parse_json expects VARCHAR input"))?;
 
     Ok(novarocks_functions::parse_json_core::evaluate_original(
         arr,

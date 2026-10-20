@@ -65,7 +65,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "observation after original primary refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -275,7 +275,7 @@ fn recursive_model_exact_limits_reject_before_any_reader_array_is_created() {
         let trace = good.trace();
         assert!(trace.len() >= 2);
         for cause in CAUSES {
-            let refuse = Control::refusing(trace.len() - 1, cause);
+            let refuse = Control::refusing(trace.len() - 1, cause.clone());
             assert!(matches!(admitted(&input, 1 << 20, smaller, &refuse),
                 Err(FlatPoolResourceError::Control(actual)) if actual == cause));
             assert_eq!(refuse.trace(), trace);
@@ -321,7 +321,7 @@ fn recursive_model_every_original_entry_quantum_and_tail_refusal_keeps_exact_pri
     );
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(
                 matches!(admitted(&input, 1 << 20, reader_limits(), &control),
                 Err(FlatPoolResourceError::Control(actual)) if actual == cause),
@@ -572,7 +572,7 @@ fn recursive_sparse_metadata_invoice_and_k_work_refuse_before_constant_preflight
     assert!(source_only.trace().last().unwrap().1 > 0);
     for at in 0..control.trace().len() {
         for cause in CAUSES {
-            let refuse = Control::refusing(at, cause);
+            let refuse = Control::refusing(at, cause.clone());
             assert!(matches!(admitted(&input, sparse_invoice, limits, &refuse),
                 Err(FlatPoolResourceError::Control(actual)) if actual == cause));
             assert_eq!(refuse.trace(), control.trace()[..=at]);
@@ -613,7 +613,7 @@ fn recursive_actual_long_source_names_preserve_every_original_control_prefix() {
     assert!(trace.iter().any(|(_, units)| *units == 256));
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let refuse = Control::refusing(at, cause);
+            let refuse = Control::refusing(at, cause.clone());
             assert!(
                 matches!(admitted(&input, 1 << 20, reader_limits(), &refuse),
                 Err(FlatPoolResourceError::Control(actual)) if actual == cause),

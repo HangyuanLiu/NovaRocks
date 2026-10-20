@@ -22,7 +22,7 @@ use crate::kernel_input::EvaluationCheckpoints;
 use crate::{AggregateCallContract, AggregateKernelPhase, KernelFailure, Selection};
 use allocator_api2::vec::Vec as HostVec;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// A transport identity, never an attribution to one input or output row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +45,8 @@ struct InvocationDataInner {
     contract: Arc<AggregateCallContract>,
     domain: AggregateDomain,
     diagnostic: HostDiagnostic,
+    reason: crate::DataFailureReason,
+    source: OnceLock<KernelFailure>,
 }
 #[derive(Clone, Debug)]
 pub struct InvocationData(HostShared<InvocationDataInner>);
@@ -58,8 +60,29 @@ impl InvocationData {
         diagnostic: HostDiagnostic,
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<Self, KernelFailure> {
+        Self::prepare_aggregate_with_reason(
+            allocator,
+            contract,
+            phase,
+            selection,
+            mapping,
+            diagnostic,
+            crate::DataFailureReason::InvalidValue,
+            work,
+        )
+    }
+    pub(crate) fn prepare_aggregate_with_reason(
+        allocator: &HostAggregateAllocator,
+        contract: Arc<AggregateCallContract>,
+        phase: AggregateInvocationPhase,
+        selection: Selection<'_>,
+        mapping: &[usize],
+        diagnostic: HostDiagnostic,
+        reason: crate::DataFailureReason,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<Self, KernelFailure> {
         Self::prepare_domain(
-            allocator, contract, phase, selection, mapping, None, diagnostic, work,
+            allocator, contract, phase, selection, mapping, None, diagnostic, reason, work,
         )
     }
     fn prepare_domain(
@@ -70,6 +93,7 @@ impl InvocationData {
         mapping: &[usize],
         emission_row_capacity: Option<usize>,
         diagnostic: HostDiagnostic,
+        reason: crate::DataFailureReason,
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<Self, KernelFailure> {
         if mapping.len() != selection.len() {
@@ -106,6 +130,8 @@ impl InvocationData {
                     states,
                 },
                 diagnostic,
+                reason,
+                source: OnceLock::new(),
             },
             allocator.clone(),
             work,
@@ -117,6 +143,21 @@ impl InvocationData {
         diagnostic: HostDiagnostic,
         work: &mut EvaluationCheckpoints<'_>,
     ) -> Result<Self, KernelFailure> {
+        Self::prepare_emission_with_reason(
+            allocator,
+            context,
+            diagnostic,
+            crate::DataFailureReason::InvalidValue,
+            work,
+        )
+    }
+    pub(crate) fn prepare_emission_with_reason(
+        allocator: &HostAggregateAllocator,
+        context: &crate::AggregateEmissionContext<'_>,
+        diagnostic: HostDiagnostic,
+        reason: crate::DataFailureReason,
+        work: &mut EvaluationCheckpoints<'_>,
+    ) -> Result<Self, KernelFailure> {
         Self::prepare_domain(
             allocator,
             Arc::clone(context.contract()),
@@ -125,8 +166,26 @@ impl InvocationData {
             context.state_indices(),
             Some(context.row_capacity()),
             diagnostic,
+            reason,
             work,
         )
+    }
+    pub fn original_source(&self) -> Option<&KernelFailure> {
+        self.0.source.get()
+    }
+    pub(crate) fn with_whole_value_source(self, source: KernelFailure) -> Self {
+        let _ = self.0.source.set(source);
+        self
+    }
+    pub(crate) fn projected_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::FailureProjection;
+        self.original_source().map_or_else(
+            || self.0.reason.failure_fact(),
+            FailureProjection::failure_fact,
+        )
+    }
+    pub fn reason(&self) -> novarocks_failure_contract::FailureReason {
+        self.projected_fact().reason()
     }
     pub fn message(&self) -> &str {
         self.0.diagnostic.message()
@@ -169,6 +228,8 @@ impl PartialEq for InvocationData {
     fn eq(&self, other: &Self) -> bool {
         self.same_backing(other)
             || (Arc::ptr_eq(&self.0.contract, &other.0.contract)
+                && self.projected_fact() == other.projected_fact()
+                && self.original_source() == other.original_source()
                 && self.message() == other.message()
                 && self.aggregate_call_phase() == other.aggregate_call_phase()
                 && self.aggregate_phase() == other.aggregate_phase()
@@ -184,7 +245,12 @@ impl fmt::Display for InvocationData {
         f.write_str(self.message())
     }
 }
-impl std::error::Error for InvocationData {}
+impl std::error::Error for InvocationData {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.original_source()
+            .map(|cause| cause as &(dyn std::error::Error + 'static))
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EvaluationFailure {
     Kernel(KernelFailure),
@@ -216,17 +282,15 @@ impl std::error::Error for EvaluationFailure {
         })
     }
 }
-/// Data ends the current invocation immediately. Calling code must pass a
-/// closure: evaluating a footer before calling this author would be too late.
+/// Every originating outer failure ends fallible post-validation. Calling
+/// code must pass a lazy closure; real state/resource cleanup stays with its
+/// original owners and is not an optional lifecycle post-validation.
 pub(crate) fn finish_evaluation_lifecycle<T>(
     result: Result<T, EvaluationFailure>,
     post: impl FnOnce() -> Result<(), KernelFailure>,
 ) -> Result<T, EvaluationFailure> {
     match result {
-        Err(data @ EvaluationFailure::InvocationData(_)) => Err(data),
+        Err(original) => Err(original),
         Ok(value) => post().map(|()| value).map_err(Into::into),
-        Err(EvaluationFailure::Kernel(cause)) => {
-            crate::aggregate_kernel::finish_lifecycle(Err(cause), post()).map_err(Into::into)
-        }
     }
 }

@@ -260,13 +260,13 @@ fn real_owner_and_runtime_refuse_foreign_nominal_carrier_and_shape() {
         let args = [EvaluatedArgument::Column(array)];
         assert!(matches!(
             kernel.evaluate(Selection::all(2), &args, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
     }
     let mut kernel = instance(false);
     assert!(matches!(
         kernel.evaluate(Selection::all(1), &[], &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
 }
 
@@ -290,7 +290,7 @@ fn foreign_or_poisoned_compact_selection_cannot_be_consumed() {
         let args = [EvaluatedArgument::SelectedColumn(compact)];
         assert!(matches!(
             kernel.evaluate(selection, &args, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
     }
 }

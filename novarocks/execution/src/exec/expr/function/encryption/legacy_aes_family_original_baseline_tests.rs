@@ -62,7 +62,7 @@ pub(crate) fn raw(
     encrypt: bool,
     arrays: Vec<ArrayRef>,
     target: DataType,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (mut arena, args, chunk) = setup(arrays);
     let name = if encrypt {
         "aes_encrypt"
@@ -235,7 +235,7 @@ fn legacy_aes_original_null_empty_key_mode_iv_aad_error_precedence() {
         )
         .unwrap_err();
         assert_eq!(
-            err,
+            (err).to_string(),
             if encrypt {
                 "aes_encrypt: requires GCM mode to use AAD parameter"
             } else {
@@ -267,17 +267,18 @@ fn legacy_aes_original_arity_and_eager_normalization_before_row_null() {
         };
         for count in [1, 3, 6] {
             assert_eq!(
-                raw(
+                (raw(
                     encrypt,
                     (0..count).map(|_| strings(vec![None])).collect(),
                     DataType::Utf8
                 )
-                .unwrap_err(),
+                .unwrap_err())
+                .to_string(),
                 format!("{label} expects 2, 4, or 5 arguments")
             );
         }
         assert_eq!(
-            raw(
+            (raw(
                 encrypt,
                 vec![
                     strings(vec![None]),
@@ -285,7 +286,8 @@ fn legacy_aes_original_arity_and_eager_normalization_before_row_null() {
                 ],
                 DataType::Utf8
             )
-            .unwrap_err(),
+            .unwrap_err())
+            .to_string(),
             format!("{label}: arg1 must be VARCHAR or VARBINARY")
         );
         let (mut arena, args, chunk) = setup(vec![strings(vec![None])]);
@@ -303,7 +305,7 @@ fn legacy_aes_original_arity_and_eager_normalization_before_row_null() {
             eval_aes_decrypt(&arena, expr, &args, &chunk)
         }
         .unwrap_err();
-        assert_eq!(err, "invalid ExprId");
+        assert_eq!((err).to_string(), "invalid ExprId");
     }
 }
 #[test]

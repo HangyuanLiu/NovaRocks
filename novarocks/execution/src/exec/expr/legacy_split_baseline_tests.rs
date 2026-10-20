@@ -47,7 +47,10 @@ fn setup(columns: Vec<ArrayRef>) -> (ExprArena, Vec<ExprId>, Chunk) {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     (arena, args, Chunk::new_with_chunk_schema(batch, schema))
 }
-fn raw(name: &str, columns: Vec<ArrayRef>) -> Result<ArrayRef, String> {
+fn raw(
+    name: &str,
+    columns: Vec<ArrayRef>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (arena, args, chunk) = setup(columns);
     eval_string_function(name, &arena, ExprId(usize::MAX), &args, &chunk)
 }
@@ -167,25 +170,27 @@ fn original_split_nulls_slices_and_empty_output_shape() {
 fn original_split_exact_type_errors_even_all_null_and_empty() {
     for rows in [0, 3] {
         assert_eq!(
-            raw(
+            (raw(
                 "split",
                 vec![
                     new_null_array(&DataType::Int64, rows),
                     new_null_array(&DataType::Utf8, rows)
                 ]
             )
-            .unwrap_err(),
+            .unwrap_err())
+            .to_string(),
             "split: first argument must be a string array"
         );
         assert_eq!(
-            raw(
+            (raw(
                 "split",
                 vec![
                     new_null_array(&DataType::Utf8, rows),
                     new_null_array(&DataType::Null, rows)
                 ]
             )
-            .unwrap_err(),
+            .unwrap_err())
+            .to_string(),
             "split: second argument must be a string array"
         );
     }
@@ -195,17 +200,17 @@ fn original_split_child_evaluation_precedes_type_admission() {
     let (mut arena, args, chunk) = setup(vec![Arc::new(Int64Array::from(vec![Some(1)]))]);
     let missing = arena.push_typed(ExprNode::SlotId(SlotId::new(99)), DataType::Utf8);
     let expected = arena.eval(missing, &chunk).unwrap_err();
-    assert_eq!(
-        eval_string_function(
-            "split",
-            &arena,
-            ExprId(usize::MAX),
-            &[args[0], missing],
-            &chunk
-        )
-        .unwrap_err(),
-        expected
-    );
+    let observed = eval_string_function(
+        "split",
+        &arena,
+        ExprId(usize::MAX),
+        &[args[0], missing],
+        &chunk,
+    )
+    .unwrap_err();
+    use novarocks_failure_contract::FailureProjection;
+    assert_eq!(observed.failure_fact(), expected.failure_fact());
+    assert_eq!(observed.detail(), expected.detail());
 }
 #[test]
 fn original_split_tail_ignored_and_zero_one_arity_panics() {

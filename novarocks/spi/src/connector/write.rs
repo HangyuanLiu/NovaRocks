@@ -54,6 +54,10 @@ const CONNECTOR_MANAGED_PARTITION_SPEC_OBSERVATION_DOMAIN: &[u8] =
 const CONNECTOR_MANAGED_PARTITION_SPEC_REPLACEMENT_ID_DOMAIN: &[u8] =
     b"novarocks.connector-managed-partition-spec-replacement-id.v1\0";
 
+#[path = "write_evidence_failure.rs"]
+mod evidence_failure;
+use evidence_failure::WriteEvidenceFailure;
+
 /// Resolved per-fragment bounds for evidence returned by a distributed write.
 ///
 /// This is intentionally an application input rather than a connector wire
@@ -132,32 +136,36 @@ impl WriteCommitEvidenceLedger {
     /// Reserve before the caller makes evidence visible to a later terminal
     /// report. A failed reservation leaves the ledger unchanged.
     pub fn reserve(&self, bytes: usize, entries: usize) -> Result<(), ConnectorError> {
-        let mut usage = self.usage.lock().map_err(|error| {
-            ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                format!("lock write commit evidence ledger: {error}"),
-            )
-        })?;
+        let mut usage = self
+            .usage
+            .lock()
+            .map_err(|_| WriteEvidenceFailure::Poisoned.into_connector())?;
         let next_bytes = usage.bytes.checked_add(bytes).ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "write commit evidence byte accounting overflowed",
-            )
+            WriteEvidenceFailure::Arithmetic {
+                dimension: novarocks_failure_contract::ResourceDimension::Bytes,
+                requested: bytes,
+                committed: usage.bytes,
+                limit: self.limits.max_bytes,
+            }
+            .into_connector()
         })?;
         let next_entries = usage.entries.checked_add(entries).ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "write commit evidence entry accounting overflowed",
-            )
+            WriteEvidenceFailure::Arithmetic {
+                dimension: novarocks_failure_contract::ResourceDimension::Items,
+                requested: entries,
+                committed: usage.entries,
+                limit: self.limits.max_entries,
+            }
+            .into_connector()
         })?;
         if next_bytes > self.limits.max_bytes || next_entries > self.limits.max_entries {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                format!(
-                    "write commit evidence exceeds fragment budget: bytes {next_bytes}/{} entries {next_entries}/{}",
-                    self.limits.max_bytes, self.limits.max_entries
-                ),
-            ));
+            return Err(WriteEvidenceFailure::Budget {
+                requested_bytes: bytes,
+                requested_entries: entries,
+                committed: *usage,
+                limits: self.limits,
+            }
+            .into_connector());
         }
         *usage = WriteCommitEvidenceUsage {
             bytes: next_bytes,
@@ -171,12 +179,10 @@ impl WriteCommitEvidenceLedger {
     }
 
     pub fn usage(&self) -> Result<WriteCommitEvidenceUsage, ConnectorError> {
-        self.usage.lock().map(|usage| *usage).map_err(|error| {
-            ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                format!("lock write commit evidence ledger: {error}"),
-            )
-        })
+        self.usage
+            .lock()
+            .map(|usage| *usage)
+            .map_err(|_| WriteEvidenceFailure::Poisoned.into_connector())
     }
 
     pub fn same_instance(&self, other: &Self) -> bool {

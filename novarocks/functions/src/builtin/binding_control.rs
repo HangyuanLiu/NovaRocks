@@ -26,6 +26,7 @@ use novarocks_type_contract::{
 
 pub(super) fn type_error(error: KernelFailure) -> FunctionBindingError {
     match error {
+        KernelFailure::CompileControl(cause) => cause.into(),
         KernelFailure::Cancelled => CompileControlError::Cancelled.into(),
         KernelFailure::DeadlineExceeded => CompileControlError::DeadlineExceeded.into(),
         KernelFailure::ResourceExhausted => CompileControlError::ResourceExhausted.into(),

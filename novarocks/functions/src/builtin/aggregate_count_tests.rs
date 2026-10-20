@@ -42,7 +42,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -1122,17 +1122,20 @@ fn aggregate_count_all_actual_compile_and_runtime_prefixes_preserve_first_cause(
                 CompileControlError::Cancelled,
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
+                CompileControlError::from_domain(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
             ] {
                 let ctrl = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                 };
                 let result = prepare(&ctrl);
-                assert!(
-                    matches!(result,Err(FunctionSpecializationFailure::Control(actual)) if actual==cause)
-                        || matches!(result,Err(FunctionSpecializationFailure::Kernel(ref actual)) if matches!((cause,actual),
-                    (CompileControlError::Cancelled,KernelFailure::Cancelled)|(CompileControlError::DeadlineExceeded,KernelFailure::DeadlineExceeded)|(CompileControlError::ResourceExhausted,KernelFailure::ResourceExhausted)))
-                );
+                match &result {
+                    Err(FunctionSpecializationFailure::Control(actual))
+                    | Err(FunctionSpecializationFailure::Kernel(KernelFailure::CompileControl(
+                        actual,
+                    ))) => assert_eq!(actual, &cause),
+                    other => panic!("original compile control source changed: {other:?}"),
+                }
                 assert_eq!(*ctrl.trace.lock().unwrap(), trace[..=stop]);
             }
         }

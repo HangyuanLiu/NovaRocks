@@ -38,7 +38,7 @@ impl PureCompileControl for Trace {
         let mut calls = self.calls.lock().unwrap();
         let index = calls.len();
         calls.push((phase, work));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((at, cause)) if at == index => Err(cause),
             _ => Ok(()),
         }
@@ -78,10 +78,10 @@ fn every_callback<T: Debug, E: Debug + PartialEq>(
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let refusing = Trace::new(Some((at, cause)));
+            let refusing = Trace::new(Some((at, cause.clone())));
             assert_eq!(
                 run(&refusing).unwrap_err(),
-                control_error(cause),
+                control_error(cause.clone()),
                 "callback {at}, cause {cause:?}"
             );
             assert_eq!(

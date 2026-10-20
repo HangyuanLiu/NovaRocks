@@ -16,27 +16,96 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{Array, ArrayRef, BooleanArray, new_null_array};
 use arrow::compute::kernels::cast;
 use arrow::compute::kernels::cmp::eq;
 use arrow::compute::kernels::zip::zip;
 use arrow::datatypes::DataType;
 
+#[derive(Debug)]
+struct CaseArrayFailure(arrow::error::ArrowError);
+impl std::fmt::Display for CaseArrayFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for CaseArrayFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for CaseArrayFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use arrow::error::ArrowError;
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        let (class, reason) = match self.0 {
+            ArrowError::MemoryError(_) | ArrowError::ArithmeticOverflow(_) => {
+                (FailureClass::Resource, ExecutionReason::CaseArrayAllocation)
+            }
+            ArrowError::OffsetOverflowError(_) => (
+                FailureClass::Representation,
+                ExecutionReason::CaseArrayOffset,
+            ),
+            ArrowError::IoError(..) => (
+                FailureClass::Unexpected,
+                ExecutionReason::CaseArrayUnexpected,
+            ),
+            _ => (FailureClass::Invariant, ExecutionReason::CaseArrayContract),
+        };
+        let fact = FailureFact::new(class, reason.reason());
+        if matches!(self.0, ArrowError::OffsetOverflowError(_)) {
+            fact.with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::SingleOutput,
+                layout: RepresentationLayout {
+                    domain: domain::EXECUTION,
+                    code: std::num::NonZeroU16::new(34).unwrap(),
+                },
+                required: None,
+                extent_limit: None,
+                representable_prefix: None,
+            })
+        } else {
+            fact
+        }
+    }
+}
+fn case_arrow_failure(source: arrow::error::ArrowError) -> ExecutionFailure {
+    ExecutionFailure::from_domain(CaseArrayFailure(source))
+}
+
 // CASE expression for Arrow arrays
 pub fn eval_case<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
+    expr: ExprId,
     has_case_expr: bool,
     has_else_expr: bool,
     children: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
+    let header = usize::from(has_case_expr) + usize::from(has_else_expr);
+    if children.len() < header + 2 || (children.len() - header) % 2 != 0 {
+        return Err(super::expression_contract(
+            "CASE_EXPR requires complete WHEN/THEN pairs and its declared optional operands",
+        ));
+    }
+    let result_type = arena
+        .data_type(expr)
+        .ok_or_else(|| super::expression_contract("CASE_EXPR is missing its frozen result type"))?
+        .clone();
     let len = chunk.len();
     let mut idx = 0usize;
 
     // If has_case_expr, first child is the case expression to compare
     let case_expr = if has_case_expr {
         if children.is_empty() {
-            return Err(("CASE_EXPR: missing case expression".to_string()).into());
+            return Err(super::expression_contract(
+                "CASE_EXPR: missing case expression",
+            ));
         }
         let expr = children[idx];
         idx += 1;
@@ -52,16 +121,12 @@ pub fn eval_case<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         None
     };
 
-    let result_type = resolve_case_result_type(arena, children, idx, has_else_expr, chunk)?;
-    if matches!(result_type, DataType::Null) {
-        return Ok(new_null_array(&result_type, len));
-    }
-
     let mut result = if has_else_expr && !children.is_empty() {
         let else_expr = children[children.len() - 1];
         let else_array = arena.eval(else_expr, chunk)?;
         if else_array.data_type() != &result_type {
-            cast(else_array.as_ref(), &result_type).map_err(|e| e.to_string())?
+            cast(else_array.as_ref(), &result_type)
+                .map_err(crate::exec::expr::cast::cast_arrow_failure)?
         } else {
             else_array
         }
@@ -89,7 +154,7 @@ pub fn eval_case<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             // Cast condition value to match case expression type for comparison
             let condition_array = if condition_array.data_type() != case_arr.data_type() {
                 cast(condition_array.as_ref(), case_arr.data_type())
-                    .map_err(|e| format!("CASE WHEN type cast: {e}"))?
+                    .map_err(crate::exec::expr::cast::cast_arrow_failure)?
             } else {
                 condition_array
             };
@@ -97,7 +162,7 @@ pub fn eval_case<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 &case_arr.as_ref() as &dyn arrow::array::Datum,
                 &condition_array.as_ref() as &dyn arrow::array::Datum,
             )
-            .map_err(|e| e.to_string())?
+            .map_err(case_arrow_failure)?
         } else {
             let condition_array = arena.eval(condition_expr, chunk)?;
             condition_array_to_bool(&condition_array)?
@@ -105,7 +170,8 @@ pub fn eval_case<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
         let value_array = arena.eval(value_expr, chunk)?;
         let value_array = if value_array.data_type() != &result_type {
-            cast(value_array.as_ref(), &result_type).map_err(|e| e.to_string())?
+            cast(value_array.as_ref(), &result_type)
+                .map_err(crate::exec::expr::cast::cast_arrow_failure)?
         } else {
             value_array
         };
@@ -115,57 +181,29 @@ pub fn eval_case<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             &value_array.as_ref() as &dyn arrow::array::Datum,
             &result.as_ref() as &dyn arrow::array::Datum,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(case_arrow_failure)?;
     }
 
     Ok(result)
 }
 
-fn resolve_case_result_type<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
-    arena: &__Eval,
-    children: &[ExprId],
-    start: usize,
-    has_else_expr: bool,
-    chunk: &Chunk,
-) -> Result<DataType, __Eval::Error> {
-    let end = if has_else_expr && !children.is_empty() {
-        children.len() - 1
-    } else {
-        children.len()
-    };
-
-    let mut value_idx = start;
-    while value_idx + 1 < end {
-        let value_expr = children[value_idx + 1];
-        let array = arena.eval(value_expr, chunk)?;
-        if !matches!(array.data_type(), DataType::Null) {
-            return Ok(array.data_type().clone());
-        }
-        value_idx += 2;
-    }
-
-    if has_else_expr && !children.is_empty() {
-        let else_expr = children[children.len() - 1];
-        let array = arena.eval(else_expr, chunk)?;
-        return Ok(array.data_type().clone());
-    }
-
-    Ok(DataType::Null)
-}
-
-fn condition_array_to_bool(array: &ArrayRef) -> Result<BooleanArray, String> {
+fn condition_array_to_bool(array: &ArrayRef) -> Result<BooleanArray, ExecutionFailure> {
     let len = array.len();
     match array.data_type() {
         DataType::Boolean => array
             .as_any()
             .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| "failed to downcast condition to BooleanArray".to_string())
+            .ok_or_else(|| {
+                super::expression_contract("failed to downcast condition to BooleanArray")
+            })
             .cloned(),
         DataType::Int64 => {
             let arr = array
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| "failed to downcast condition to Int64Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast condition to Int64Array")
+                })?;
             let values: Vec<Option<bool>> = (0..len)
                 .map(|i| {
                     if arr.is_null(i) {
@@ -181,7 +219,9 @@ fn condition_array_to_bool(array: &ArrayRef) -> Result<BooleanArray, String> {
             let arr = array
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| "failed to downcast condition to Float64Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast condition to Float64Array")
+                })?;
             let values: Vec<Option<bool>> = (0..len)
                 .map(|i| {
                     if arr.is_null(i) {
@@ -193,15 +233,56 @@ fn condition_array_to_bool(array: &ArrayRef) -> Result<BooleanArray, String> {
                 .collect();
             Ok(BooleanArray::from_iter(values))
         }
-        _ => Err(format!(
+        _ => Err(super::expression_contract(format_args!(
             "case: condition must be boolean, int64, or float64, got {:?}",
             array.data_type()
-        )),
+        ))),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn case_uses_frozen_wider_result_instead_of_first_then_array_type() {
+        use arrow::array::Float64Array;
+        let chunk = make_i32_chunk(SlotId(1), vec![Some(0)]);
+        let mut arena = ExprArena::default();
+        let no = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Bool(false)),
+            DataType::Boolean,
+        );
+        let yes = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Bool(true)),
+            DataType::Boolean,
+        );
+        let narrow = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(1)), DataType::Int32);
+        let wide = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Float64(1.75)),
+            DataType::Float64,
+        );
+        let other = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Float64(2.5)),
+            DataType::Float64,
+        );
+        let expr = arena.push_typed(
+            ExprNode::Case {
+                has_case_expr: false,
+                has_else_expr: true,
+                children: vec![no, narrow, yes, wide, other],
+            },
+            DataType::Float64,
+        );
+        let result = arena.eval(expr, &chunk).unwrap();
+        assert_eq!(
+            result
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            1.75
+        );
+    }
+
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::array::{Int32Array, StringArray};

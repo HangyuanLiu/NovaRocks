@@ -17,7 +17,8 @@
 
 //! Child-reference probes forward every actual block and opaque reservation
 //! to the production expression host. Ledger storage is test diagnostics only.
-use super::{MemTracker, expression_allocation_host};
+use super::MemTracker;
+use crate::runtime::tracked_state_allocator::expression_allocation_host;
 use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, Int16Array, Int32Array, Int64Array, ListArray, MapArray,
     RunArray, StructArray, UnionArray,
@@ -361,10 +362,11 @@ fn by_copy_child_scratch_host_actual_tracker_capacity_refusal_rolls_back() {
     tr.install_limit_once(required_peak - 1).unwrap();
     let host = Host::new(tr.clone(), None);
     let control = Control::new(tr, None);
-    assert!(matches!(
-        evaluate(array.as_ref(), &indices, &host, &control),
-        Err(CopyError::Control(KernelFailure::ResourceExhausted))
-    ));
+    let Err(CopyError::Control(refusal)) = evaluate(array.as_ref(), &indices, &host, &control)
+    else {
+        panic!("the real child scratch host must refuse");
+    };
+    super::opaque_memory_host_tests::assert_tracker_refusal(&refusal, required_peak - 1, None);
     assert_released(&host);
 }
 #[test]

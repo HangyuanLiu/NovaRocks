@@ -45,7 +45,7 @@ struct Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         self.observations.lock().unwrap().push((phase, units));
-        if let Some(error) = self.stop
+        if let Some(error) = self.stop.clone()
             && (!self.positive_only || units > 0)
         {
             return Err(error);
@@ -1024,7 +1024,7 @@ fn entry_and_mid_quantum_compile_failures_keep_exact_outer_categories() {
     ] {
         for positive_only in [false, true] {
             let control = Control {
-                stop: Some(error),
+                stop: Some(error.clone()),
                 positive_only,
                 observations: Mutex::default(),
             };
@@ -1035,7 +1035,7 @@ fn entry_and_mid_quantum_compile_failures_keep_exact_outer_categories() {
                     fixture.calls.clone(),
                     &control
                 ),
-                Err(FrozenCallError::Control(error))
+                Err(FrozenCallError::Control(error.clone()))
             );
             let observations = control.observations.lock().unwrap();
             assert_eq!(observations[0], (CompilePhase::Validate, 0));
@@ -1044,13 +1044,13 @@ fn entry_and_mid_quantum_compile_failures_keep_exact_outer_categories() {
             }
             drop(observations);
             let control = Control {
-                stop: Some(error),
+                stop: Some(error.clone()),
                 positive_only,
                 observations: Mutex::default(),
             };
             assert_eq!(
                 checked.validate_fragment(&fixture.fragment, &fixture.uses, &control),
-                Err(FrozenCallError::Control(error))
+                Err(FrozenCallError::Control(error.clone()))
             );
             let observations = control.observations.lock().unwrap();
             if positive_only {

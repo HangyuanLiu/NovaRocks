@@ -164,7 +164,7 @@ mod tests {
             FieldPath::root("context_convergence"),
         )
         .expect_err("identity is mandatory");
-        assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(error.kind(), &ProtocolErrorKind::MissingField);
 
         let mut zero_version = encoded.clone();
         zero_version.version = 0;
@@ -173,7 +173,7 @@ mod tests {
             FieldPath::root("context_convergence"),
         )
         .expect_err("receipt version must be nonzero");
-        assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(error.kind(), &ProtocolErrorKind::InvalidValue);
 
         let mut unknown_state = encoded;
         unknown_state.state = i32::MAX;
@@ -182,7 +182,7 @@ mod tests {
             FieldPath::root("context_convergence"),
         )
         .expect_err("state set is closed");
-        assert_eq!(error.kind(), ProtocolErrorKind::InvalidEnum);
+        assert_eq!(error.kind(), &ProtocolErrorKind::InvalidEnum);
     }
 
     #[test]
@@ -206,7 +206,7 @@ mod tests {
             FieldPath::root("context_convergence_cursor"),
         )
         .expect_err("cursor identity is mandatory");
-        assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(error.kind(), &ProtocolErrorKind::MissingField);
     }
 
     #[test]
@@ -233,7 +233,7 @@ mod tests {
             FieldPath::root("subscribe_task_status"),
         )
         .expect_err("legacy decoder must not ignore a convergence cursor");
-        assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(error.kind(), &ProtocolErrorKind::InvalidValue);
     }
 
     #[test]
@@ -251,6 +251,6 @@ mod tests {
 
         let error = decode_status_event(&encoded, FieldPath::root("task_status_event"))
             .expect_err("legacy decoder must not ignore a convergence event");
-        assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(error.kind(), &ProtocolErrorKind::InvalidValue);
     }
 }

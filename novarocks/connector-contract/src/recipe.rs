@@ -67,7 +67,14 @@ impl fmt::Display for ConnectorReadRelationRecipeError {
     }
 }
 
-impl Error for ConnectorReadRelationRecipeError {}
+impl std::error::Error for ConnectorReadRelationRecipeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Header(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorRecipeHostAddress {

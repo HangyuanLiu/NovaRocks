@@ -54,7 +54,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after primary");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -298,7 +298,8 @@ fn hand(name: &str, ignore: bool) -> [Option<i32>; 6] {
 }
 fn compile_cause(error: FunctionSpecializationFailure) -> CompileControlError {
     match error {
-        FunctionSpecializationFailure::Control(cause) => cause,
+        FunctionSpecializationFailure::Control(cause)
+        | FunctionSpecializationFailure::Kernel(KernelFailure::CompileControl(cause)) => cause,
         FunctionSpecializationFailure::Kernel(KernelFailure::Cancelled) => {
             CompileControlError::Cancelled
         }
@@ -805,19 +806,46 @@ fn every_compile_callback_keeps_three_primary_causes_on_success_and_ordinary_off
                 DecimalOverflowPolicy::OutputNull,
             );
             let baseline = CompileControl::default();
-            assert_eq!(
-                fixture.prepare(options(true), &baseline).is_ok(),
-                offset == Some(1)
-            );
+            let original = fixture.prepare(options(true), &baseline);
+            assert_eq!(original.is_ok(), offset == Some(1));
             let trace = baseline.trace.lock().unwrap().clone();
             assert!(trace.len() > 2);
-            assert_eq!(trace.last().unwrap().1, 0, "original catalogue exit");
-            if offset == Some(-1) {
+            if offset == Some(1) {
+                assert_eq!(trace.last().unwrap().1, 0, "successful catalogue exit");
+            } else {
+                // The leaf's own tail remains observable. The enclosing
+                // catalogue preserves its Err without a later zero footer.
                 assert_eq!(
-                    trace[trace.len() - 2].1,
-                    1,
-                    "negative-offset own ordinary tail"
+                    trace.last().unwrap().1,
+                    u32::from(offset == Some(-1)),
+                    "original leaf ordinary tail"
                 );
+                let FunctionSpecializationFailure::Kernel(expected) = original.unwrap_err() else {
+                    panic!("ordinary offset refusal must retain the original kernel author");
+                };
+                let message = if offset == Some(-1) {
+                    "LEAD/LAG offset must be non-negative"
+                } else {
+                    "LEAD/LAG offset must be a non-NULL integer constant"
+                };
+                assert_eq!(expected, crate::kernel_control::invalid(message));
+                for cause in [
+                    CompileControlError::Cancelled,
+                    CompileControlError::DeadlineExceeded,
+                    CompileControlError::ResourceExhausted,
+                ] {
+                    let control = CompileControl {
+                        trace: Mutex::default(),
+                        refusal: Some((trace.len(), cause)),
+                    };
+                    let FunctionSpecializationFailure::Kernel(actual) =
+                        fixture.prepare(options(true), &control).unwrap_err()
+                    else {
+                        panic!("a later optional callback replaced the ordinary offset refusal");
+                    };
+                    assert_eq!(actual, expected);
+                    assert_eq!(*control.trace.lock().unwrap(), trace);
+                }
             }
             for at in 0..trace.len() {
                 for cause in [
@@ -827,7 +855,7 @@ fn every_compile_callback_keeps_three_primary_causes_on_success_and_ordinary_off
                 ] {
                     let control = CompileControl {
                         trace: Mutex::default(),
-                        refusal: Some((at, cause)),
+                        refusal: Some((at, cause.clone())),
                     };
                     assert_eq!(
                         compile_cause(fixture.prepare(options(true), &control).unwrap_err()),
@@ -869,7 +897,7 @@ fn every_compile_callback_keeps_three_primary_causes_on_success_and_ordinary_off
             ] {
                 let control = CompileControl {
                     trace: Mutex::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert_eq!(
                     compile_cause(fixture.prepare(options(false), &control).unwrap_err()),
@@ -1162,14 +1190,21 @@ fn original_contract_full_input_capacity_and_unsupported_copy_refuse_without_fal
     let arguments = [EvaluatedArgument::Column(&union)];
     // The original shared take author refuses padding a Union with a null
     // index. Required setup exposes this even before an empty output demand.
-    assert!(matches!(
-        WindowEvaluationPartition::begin(
-            prepared.clone(),
-            geometry(&prepared, &arguments, &peers, &frames),
-            &Control::default()
-        ),
-        Err(KernelFailure::InvalidProgram(_))
-    ));
+    let error = match WindowEvaluationPartition::begin(
+        prepared.clone(),
+        geometry(&prepared, &arguments, &peers, &frames),
+        &Control::default(),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("Union null-index copy must be refused before output demand"),
+    };
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(
+        error.failure_fact(),
+        crate::selected_copy::CopyError::Invalid("independent copy contract oracle").failure_fact(),
+    );
+    assert!(std::error::Error::source(&error).is_some());
 }
 
 fn default_fixture(
@@ -1360,7 +1395,7 @@ fn default_complete_setup_and_selected_copy_preserve_every_original_control_pref
             ] {
                 let control = CompileControl {
                     trace: Mutex::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert_eq!(
                     compile_cause(fixture.prepare(options(false), &control).unwrap_err()),

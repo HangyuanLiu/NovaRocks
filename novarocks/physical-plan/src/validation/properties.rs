@@ -1049,7 +1049,7 @@ fn derive_fragment_output_properties_core(
                 .map_err(FragmentPropertyError::Structure)
         };
         if let Err(FragmentPropertyError::Control(cause)) = &structure {
-            return Err(FragmentPropertyError::Control(*cause));
+            return Err(FragmentPropertyError::Control(cause.clone()));
         }
         work.step()?;
         work.flush()?;

@@ -179,19 +179,28 @@ SELECT k1, d1, f1, cast(d1 as tinyint), cast(f1 as tinyint) FROM t1 ORDER BY k1;
 
 -- query 25
 -- ALLOW_THROW_EXCEPTION: cast double to bigint, float to int (overflow expected)
--- @expect_error=conflict with range of
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.numeric_out_of_range
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
 USE ${case_db};
 SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as bigint), cast(f1 as int) FROM t1 ORDER BY k1;
 
 -- query 26
 -- ALLOW_THROW_EXCEPTION: cast double to smallint, float to smallint (overflow expected)
--- @expect_error=conflict with range of
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.numeric_out_of_range
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
 USE ${case_db};
 SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as smallint), cast(f1 as smallint) FROM t1 WHERE k1 >= 11 ORDER BY k1;
 
 -- query 27
 -- ALLOW_THROW_EXCEPTION: cast double to tinyint, float to tinyint (overflow expected)
--- @expect_error=conflict with range of
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.numeric_out_of_range
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
 USE ${case_db};
 SELECT /*+SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION')*/ k1, d1, f1, cast(d1 as tinyint), cast(f1 as tinyint) FROM t1 WHERE k1 >= 18 ORDER BY k1;
 

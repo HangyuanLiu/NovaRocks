@@ -139,7 +139,7 @@ fn caller_owned_known_header_and_emit_requests_precede_late_control_and_foreign_
         let (node, wire) = vec![(source(), expected())].into_iter().next().unwrap();
         for receiving in [false, true] {
             for late in CAUSES {
-                c.arm(Some((1, late)));
+                c.arm(Some((1, late.clone())));
                 let mut work = CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
                 for _ in 0..255 {
                     work.step().unwrap();
@@ -283,7 +283,7 @@ fn caller_owned_all_actual_small_prefixes_and_wide_nested_quantum() {
                 for at in 0..baseline.len() {
                     for cause in CAUSES {
                         assert!(
-                            matches!(invoke(receiving,ordinary,Some((at,cause))),Err(Error::Control(actual)) if actual==cause)
+                            matches!(invoke(receiving,ordinary,Some((at,cause.clone()))),Err(Error::Control(actual)) if actual==cause)
                         );
                         assert_eq!(c.trace(), baseline[..=at]);
                     }
@@ -378,7 +378,7 @@ fn caller_owned_all_actual_small_prefixes_and_wide_nested_quantum() {
             for at in [0, quantum, baseline.len() - 1] {
                 for cause in CAUSES {
                     assert!(
-                        matches!(run(Some((at,cause))),Err(Error::Control(actual)) if actual==cause)
+                        matches!(run(Some((at,cause.clone()))),Err(Error::Control(actual)) if actual==cause)
                     );
                     assert_eq!(c.trace(), baseline[..=at]);
                 }
@@ -410,7 +410,7 @@ fn caller_owned_empty_inner_headers_refuse_before_floor_pending_quantum() {
             for receiving in [false, true] {
                 for late in CAUSES {
                     for local_limit in [false, true] {
-                        c.arm(Some((1, late)));
+                        c.arm(Some((1, late.clone())));
                         let mut work =
                             CompileCheckpoints::try_new(&c, CompilePhase::LowerProgram).unwrap();
                         for _ in 0..255 {

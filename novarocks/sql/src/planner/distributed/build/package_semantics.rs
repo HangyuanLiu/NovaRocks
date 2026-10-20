@@ -93,7 +93,35 @@ impl fmt::Display for PackageSemanticsError {
         }
     }
 }
-impl std::error::Error for PackageSemanticsError {}
+impl std::error::Error for PackageSemanticsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(cause) => Some(cause),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for PackageSemanticsError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+        };
+        let (class, code) = match self {
+            Self::Control(cause) => return cause.failure_fact(),
+            Self::Occurrence(_) => (FailureClass::Invariant, 7),
+            Self::Journal(_) => (FailureClass::Invariant, 8),
+            Self::Effects(_) => (FailureClass::Invariant, 9),
+            Self::UnsupportedCapability(_) => (FailureClass::Unsupported, 10),
+            Self::Pruning(_) => (FailureClass::Invariant, 11),
+            Self::PolicyMismatch(_) => (FailureClass::Invariant, 12),
+            Self::InvalidSource(_) => (FailureClass::Invariant, 13),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::SQL, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
 impl From<CompileControlError> for PackageSemanticsError {
     fn from(cause: CompileControlError) -> Self {
         Self::Control(cause)

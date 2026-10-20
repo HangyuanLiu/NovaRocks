@@ -124,7 +124,7 @@ fn shared_crc32_legacy_four_carriers_preserve_original_unsigned_checksum() {
     ];
     for array in arrays {
         assert_eq!(
-            evaluate_legacy(&array).unwrap().to_data(),
+            evaluate_required(&array).unwrap().to_data(),
             Int64Array::from(vec![
                 Some(3421780262),
                 None,
@@ -136,12 +136,13 @@ fn shared_crc32_legacy_four_carriers_preserve_original_unsigned_checksum() {
     }
 }
 #[test]
-fn shared_crc32_legacy_unsupported_dtype_keeps_full_string_before_diagnostics() {
+fn shared_crc32_unsupported_dtype_keeps_nominal_fact_and_bounded_diagnostics() {
     let field = Arc::new(arrow_schema::Field::new(
         "long_field_".repeat(128),
         DataType::Int64,
         true,
     ));
+    let weak_field = Arc::downgrade(&field);
     let array = Arc::new(arrow_array::StructArray::from(vec![(
         field,
         Arc::new(Int64Array::from(vec![None])) as ArrayRef,
@@ -151,8 +152,25 @@ fn shared_crc32_legacy_unsupported_dtype_keeps_full_string_before_diagnostics() 
         array.data_type()
     );
     assert!(expected.len() > 512);
-    assert_eq!(
-        evaluate_legacy(&array).unwrap_err().as_bytes(),
-        expected.as_bytes()
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let weak_array = Arc::downgrade(&array);
+    let failure = evaluate_required(&array).unwrap_err();
+    drop(array);
+    assert!(weak_array.upgrade().is_none());
+    assert!(weak_field.upgrade().is_none());
+    use std::error::Error;
+    assert!(
+        failure
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .is::<CrcFailure>()
     );
+    assert_eq!(
+        failure.to_string(),
+        novarocks_failure_contract::BoundedDetail::truncating_display(&expected).to_string()
+    );
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(failure.failure_fact().reason().code(), 360);
 }

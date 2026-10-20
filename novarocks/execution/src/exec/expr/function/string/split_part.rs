@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{Array, ArrayRef, StringArray};
 use std::sync::Arc;
 
@@ -26,7 +27,7 @@ pub fn eval_split_part<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let _ = expr;
     let str_arr = arena.eval(args[0], chunk)?;
     let delim_arr = arena.eval(args[1], chunk)?;
@@ -34,11 +35,11 @@ pub fn eval_split_part<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let s_arr = str_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "split_part expects string".to_string())?;
+        .ok_or_else(|| expression_contract("split_part expects string"))?;
     let d_arr = delim_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "split_part expects string".to_string())?;
+        .ok_or_else(|| expression_contract("split_part expects string"))?;
     let i_arr = downcast_int_arg_array(&idx_arr, "split_part")?;
     let len = s_arr.len();
     let mut out = Vec::with_capacity(len);

@@ -41,7 +41,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         events.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -253,7 +253,7 @@ fn prefixes<T>(call: impl Fn(&Control) -> Result<T, Error>, success: bool, wide:
         for cause in CAUSES {
             let control = Control {
                 events: Mutex::new(vec![]),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(matches!(call(&control),Err(Error::Control(actual)) if actual==cause));
             assert_eq!(control.trace(), events[..=at]);
@@ -594,7 +594,7 @@ fn envelope_known_numeric_resource_has_no_later_cancel_or_deadline_callback() {
     for cause in CAUSES {
         let control = Control {
             events: Mutex::new(vec![]),
-            stop: Some((1, cause)),
+            stop: Some((1, cause.clone())),
         };
         let mut l = limits();
         l.max_list_items = 0;
@@ -736,7 +736,7 @@ fn caller_envelope_known_root_requests_and_source_overflow_precede_pending_contr
                 for overflow in [false, true] {
                     let control = Control {
                         events: Mutex::new(Vec::new()),
-                        stop: Some((1, cause)),
+                        stop: Some((1, cause.clone())),
                     };
                     let mut work =
                         CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();

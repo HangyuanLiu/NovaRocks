@@ -20,6 +20,8 @@
 //! deliberately excludes Arrow arrays, casts, rendering, serialization and
 //! runtime kernels so contract consumers do not acquire those capabilities.
 
+mod failure_projection;
+
 mod between;
 pub use between::*;
 mod arithmetic;
@@ -83,9 +85,9 @@ pub use carrier_parameters::{CarrierParameterError, validate_arrow_carrier_param
 pub use coercion::{wider_type, wider_type_with_construction};
 pub use comparison::{ComparisonOperator, OrderedComparisonAlgorithm};
 pub use comparison_coercion::{
-    comparison_common_type, comparison_common_value_type, decimal_compare_type,
-    value_type_for_common_layout, value_type_for_common_layout_with_construction,
-    wider_comparison_value_type,
+    ComparisonCoercionFailure, comparison_common_type, comparison_common_value_type,
+    decimal_compare_type, value_type_for_common_layout,
+    value_type_for_common_layout_with_construction, wider_comparison_value_type,
 };
 pub use compile_control::{
     CompileCheckpoints, CompileControlError, CompilePhase, MAX_UNOBSERVED_COMPILE_WORK,
@@ -133,7 +135,9 @@ pub use value_arithmetic::{
     arithmetic_result_value_shape_with_op, arithmetic_result_value_type_with_op,
     is_integer_value_type, is_numeric_value_type,
 };
-pub use value_projection::{arrow_type_equals_ignoring_metadata, variant_get_target_type};
+pub use value_projection::{
+    VariantTargetTypeError, arrow_type_equals_ignoring_metadata, variant_get_target_type,
+};
 
 pub use window::{WindowBound, WindowFrame, WindowFrameExclusion, WindowFrameUnits};
 

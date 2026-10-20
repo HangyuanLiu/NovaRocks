@@ -724,32 +724,17 @@ impl<K: PreparedAggregateKernel> ErasedAggregateOps for TypedOps<K> {
             Some(&context),
             control,
         );
-        if self.invocation_data && result.is_err() {
-            return finish_observation(&observed, result, self.invocation_data);
-        }
-        if matches!(
-            &result,
-            Err(EvaluationFailure::InvocationData(_)
-                | EvaluationFailure::Kernel(
-                    KernelFailure::Cancelled
-                        | KernelFailure::DeadlineExceeded
-                        | KernelFailure::ResourceExhausted
-                ))
-        ) {
-            return finish_observation(&observed, result, self.invocation_data);
-        }
-        let post = (|| {
-            self.validate_metadata()?;
-            let mut work = EvaluationCheckpoints::new(control);
-            for state in typed {
-                self.validate_retained(state)?;
-                work.step()?;
-            }
-            work.finish()
-        })();
         finish_observation(
             &observed,
-            finish_evaluation_lifecycle(result, || post),
+            finish_evaluation_lifecycle(result, || {
+                self.validate_metadata()?;
+                let mut work = EvaluationCheckpoints::new(control);
+                for state in typed {
+                    self.validate_retained(state)?;
+                    work.step()?;
+                }
+                work.finish()
+            }),
             self.invocation_data,
         )
     }

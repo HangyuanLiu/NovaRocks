@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::cast::cast_with_special_rules;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::cast_with_special_rules;
+use crate::exec::expr::{ExprArena, ExprId, expression_contract};
 use arrow::array::{Array, ArrayRef, ListArray, MapArray, StructArray, make_array};
 use arrow::datatypes::{DataType, Field};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
@@ -28,7 +28,12 @@ pub fn eval_map_from_arrays<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(expression_contract(
+            "map_from_arrays requires exactly 2 arguments",
+        ));
+    }
     let _ = chunk;
     let key_arr = arena.eval(args[0], chunk)?;
     let value_arr = arena.eval(args[1], chunk)?;
@@ -37,28 +42,27 @@ pub fn eval_map_from_arrays<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         .as_any()
         .downcast_ref::<ListArray>()
         .ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "map_from_arrays expects ListArray keys, got {:?}",
                 key_arr.data_type()
-            )
+            ))
         })?;
     let value_list = value_arr
         .as_any()
         .downcast_ref::<ListArray>()
         .ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "map_from_arrays expects ListArray values, got {:?}",
                 value_arr.data_type()
-            )
+            ))
         })?;
 
     if key_list.len() != value_list.len() {
-        return Err((format!(
+        return Err(expression_contract(format_args!(
             "map_from_arrays length mismatch: keys={} values={}",
             key_list.len(),
             value_list.len()
-        ))
-        .into());
+        )));
     }
 
     let key_values = key_list.values();
@@ -91,19 +95,19 @@ pub fn eval_map_from_arrays<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         let key_len = key_end - key_start;
         let value_len = value_end - value_start;
         if key_len != value_len {
-            return Err(("Key and value arrays must be the same length".to_string()).into());
+            return Err(super::common::length_mismatch(row, key_len, value_len));
         }
 
         if key_len > 0 {
+            current = novarocks_functions::aggregate_scalar::checked_map_output_offset(
+                current as i32,
+                key_len,
+            )? as i64;
             for idx in 0..key_len {
                 let key_idx = key_start + idx;
                 let value_idx = value_start + idx;
                 key_mutable.extend(0, key_idx, key_idx + 1);
                 value_mutable.extend(0, value_idx, value_idx + 1);
-            }
-            current += key_len as i64;
-            if current > i32::MAX as i64 {
-                return Err(("map_from_arrays offset overflow".to_string()).into());
             }
         }
         offsets.push(current as i32);
@@ -119,39 +123,30 @@ pub fn eval_map_from_arrays<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         "map_from_arrays",
     )?;
     let DataType::Struct(fields) = map_field.data_type() else {
-        return Err(("map_from_arrays map entries type must be Struct".to_string()).into());
+        return Err(expression_contract(
+            "map_from_arrays map entries type must be Struct",
+        ));
     };
     if fields.len() != 2 {
-        return Err(("map_from_arrays map entries type must have 2 fields".to_string()).into());
+        return Err(expression_contract(
+            "map_from_arrays map entries type must have 2 fields",
+        ));
     }
 
     let key_field = fields[0].clone();
     let value_field = fields[1].clone();
     if out_keys.data_type() != key_field.data_type() {
-        out_keys = cast_with_special_rules(&out_keys, key_field.data_type()).map_err(|e| {
-            format!(
-                "map_from_arrays failed to cast keys to output type {:?}: {}",
-                key_field.data_type(),
-                e
-            )
-        })?;
+        out_keys = cast_with_special_rules(&out_keys, key_field.data_type())?;
     }
     if out_values.data_type() != value_field.data_type() {
-        out_values =
-            cast_with_special_rules(&out_values, value_field.data_type()).map_err(|e| {
-                format!(
-                    "map_from_arrays failed to cast values to output type {:?}: {}",
-                    value_field.data_type(),
-                    e
-                )
-            })?;
+        out_values = cast_with_special_rules(&out_values, value_field.data_type())?;
     }
 
     // Design: ADR-0183 (docs/adr/ADR-0183-map-keys-are-non-null-and-unique.md)
     // Only keys assembled for non-NULL Map rows participate. Coercion may
     // introduce NULL, but it cannot widen the frozen key field's nullability.
     if out_keys.logical_null_count() > 0 {
-        return Err(super::common::MAP_KEY_NULL_MESSAGE.to_string().into());
+        return Err(super::common::null_key());
     }
     let entries_fields = fields.clone();
     let entries_fields = if out_values.data_type() != value_field.data_type() {
@@ -165,19 +160,31 @@ pub fn eval_map_from_arrays<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     } else {
         entries_fields
     };
-    let entries = StructArray::new(entries_fields.clone(), vec![out_keys, out_values], None);
+    let entries = StructArray::try_new(entries_fields.clone(), vec![out_keys, out_values], None)
+        .map_err(|source| {
+            crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+                "map_from_arrays StructArray",
+                source,
+            )
+        })?;
     let map_field = Arc::new(Field::new(
         map_field.name(),
         DataType::Struct(entries_fields),
         map_field.is_nullable(),
     ));
-    let map = MapArray::new(
+    let map = MapArray::try_new(
         map_field,
         OffsetBuffer::new(offsets.into()),
         entries,
         null_builder.finish(),
         ordered,
-    );
+    )
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "map_from_arrays MapArray",
+            source,
+        )
+    })?;
 
     Ok(Arc::new(map) as ArrayRef)
 }
@@ -192,6 +199,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Fields, Int32Type, Schema};
     use arrow::record_batch::RecordBatch;
     use arrow_buffer::{NullBuffer, OffsetBuffer};
+    use novarocks_failure_contract::FailureProjection;
     use novarocks_types::SlotId;
     use std::sync::Arc;
 
@@ -207,7 +215,7 @@ mod tests {
         keys: ListArray,
         values: ListArray,
         output_type: DataType,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         let key_type = keys.data_type().clone();
         let value_type = values.data_type().clone();
         let batch = RecordBatch::try_new(
@@ -252,8 +260,10 @@ mod tests {
         ]);
 
         assert_eq!(
-            evaluate(keys, values, map_type(DataType::Int32)).unwrap_err(),
-            "map key must not be NULL"
+            evaluate(keys, values, map_type(DataType::Int32))
+                .unwrap_err()
+                .failure_fact(),
+            super::super::common::null_key().failure_fact()
         );
     }
 
@@ -268,8 +278,10 @@ mod tests {
         let values = ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![Some(10)])]);
 
         assert_eq!(
-            evaluate(keys, values, map_type(DataType::Int32)).unwrap_err(),
-            "map key must not be NULL"
+            evaluate(keys, values, map_type(DataType::Int32))
+                .unwrap_err()
+                .failure_fact(),
+            super::super::common::null_key().failure_fact()
         );
     }
 

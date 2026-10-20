@@ -53,11 +53,11 @@ impl LegacyState {
     fn pointer(&mut self) -> AggStatePtr {
         self.raw.as_mut_ptr() as AggStatePtr
     }
-    fn update(&mut self, input: &ArrayRef) -> Result<(), String> {
+    fn update(&mut self, input: &ArrayRef) -> crate::runtime::fragment::ExecutionResult<()> {
         let pointers = vec![self.pointer(); input.len()];
         MaxMinByAgg.update_batch(&self.spec, 0, &pointers, &AggInputView::Any(input))
     }
-    fn merge(&mut self, input: &ArrayRef) -> Result<(), String> {
+    fn merge(&mut self, input: &ArrayRef) -> crate::runtime::fragment::ExecutionResult<()> {
         let pointers = vec![self.pointer(); input.len()];
         let array = Some(input.clone());
         let view = MaxMinByAgg.build_merge_view(&self.spec, &array)?;
@@ -215,10 +215,9 @@ fn legacy_by_losing_candidate_allocates_value_before_comparison_and_preserves_pr
         let error = state
             .update(&strings(vec!["012345678"], vec![loser]))
             .unwrap_err();
-        assert_eq!(
-            error,
-            "ResourceExhausted: reserve aggregate byte value: aggregate allocation was rejected by memory tracker legacy-by-loser-oom or the system allocator"
-        );
+        crate::exec::expr::agg::functions::common::assert_collection_refusal::<
+            allocator_api2::collections::TryReserveError,
+        >(&(error), "reserve aggregate byte value");
         assert_eq!(tracker.current(), 4);
         let out = state.output(false);
         assert_eq!(
@@ -270,7 +269,7 @@ fn legacy_by_nan_first_is_admitted_later_comparison_fails_and_signed_zero_ties()
                 None,
             ))
             .unwrap_err();
-        assert_eq!(error, "float comparison is not ordered");
+        assert_eq!((error).to_string(), "float comparison is not ordered");
         assert_eq!(int_value(&mut state), Some(11));
         let out = state.output(true);
         assert_eq!(out.to_data(), original.to_data());
@@ -328,7 +327,10 @@ fn legacy_by_codec_exact_wire_merge_tie_and_complete_malformed_diagnostics() {
                 "max_by/min_by merge input has trailing bytes",
             ),
         ] {
-            assert_eq!(state.merge(&binary(&bytes)).unwrap_err(), message);
+            assert_eq!(
+                (state.merge(&binary(&bytes)).unwrap_err()).to_string(),
+                message
+            );
             assert_eq!(int_value(&mut state), Some(51));
             assert_eq!(tracker.current(), 0);
         }
@@ -350,7 +352,7 @@ fn legacy_by_invalid_utf8_decode_releases_candidate_and_keeps_complete_error() {
     wire.extend_from_slice(&1u32.to_le_bytes());
     wire.push(255);
     assert_eq!(
-        state.merge(&binary(&wire)).unwrap_err(),
+        (state.merge(&binary(&wire)).unwrap_err()).to_string(),
         "invalid utf-8 sequence of 1 bytes from index 0"
     );
     assert_eq!(tracker.current(), 4);

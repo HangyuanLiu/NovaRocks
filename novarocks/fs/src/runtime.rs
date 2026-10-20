@@ -162,6 +162,8 @@ pub trait FileIoRuntime: Send + Sync {
 }
 
 pub trait FileTaskSpawner: Send + Sync {
+    /// On Err no job was delivered, and destruction of the supplied future
+    /// and its captures has returned. Panic is not a NoJob exit receipt.
     fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask>;
 
     /// Run one synchronous job somewhere other than the caller's thread.
@@ -195,12 +197,7 @@ impl FileTask {
     /// wait that is dropped leaves the task owning, and aborting on drop, its
     /// work, and a later wait still observes the same exit.
     pub async fn drain(&mut self) -> FileResult<()> {
-        let Some(join) = self.join.as_mut() else {
-            return Ok(());
-        };
-        let outcome = join.await;
-        self.join = None;
-        match outcome {
+        match futures::future::poll_fn(|cx| self.poll_drain(cx)).await {
             Ok(()) => Ok(()),
             Err(error) if error.is_cancelled() => {
                 Err(FileError::cancelled("file task was cancelled before drain"))
@@ -210,6 +207,25 @@ impl FileTask {
                 "file task failed before drain",
                 error,
             )),
+        }
+    }
+
+    /// Poll the same original join without moving or aborting pending work.
+    /// The owner must save a ready panic JoinError before any foreign callback;
+    /// it can contain opaque payloads and is not an execution failure source.
+    pub fn poll_drain(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), tokio::task::JoinError>> {
+        let Some(join) = self.join.as_mut() else {
+            return std::task::Poll::Ready(Ok(()));
+        };
+        match Pin::new(join).poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(outcome) => {
+                self.join = None;
+                std::task::Poll::Ready(outcome)
+            }
         }
     }
 
@@ -456,6 +472,39 @@ mod tests {
         receiver.await.expect("task started");
         task.abort_and_drain().await.expect("task drained");
         assert!(exited.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn cancelled_pending_drain_keeps_original_join_and_captured_input_until_real_exit() {
+        let input = Arc::new(vec![7_u8; 8]);
+        let weak = Arc::downgrade(&input);
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let mut task = FileTask::new(tokio::spawn(async move {
+            let _ = gate.await;
+            drop(input);
+        }));
+        let mut first_wait = Box::pin(task.drain());
+        let pending = futures::poll!(first_wait.as_mut()).is_pending();
+        drop(first_wait);
+        let retained_join = task.join.is_some();
+        let retained_input = weak.upgrade().is_some();
+        let _ = release.send(());
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            futures::future::poll_fn(|cx| task.poll_drain(cx)),
+        )
+        .await
+        .expect("original join wake");
+        assert!(pending && retained_join && retained_input);
+        outcome.expect("normal physical exit");
+        assert!(task.join.is_none());
+        assert!(weak.upgrade().is_none());
+        assert!(
+            task.poll_drain(&mut std::task::Context::from_waker(
+                futures::task::noop_waker_ref()
+            ))
+            .is_ready()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

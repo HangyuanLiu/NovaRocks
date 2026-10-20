@@ -100,7 +100,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         s.trace.push((phase, units));
-        match s.stop {
+        match s.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -970,7 +970,7 @@ fn prefixes(c: &Control, action: impl Fn() -> Result<(), Error>) {
     assert!(baseline_result.is_ok() || matches!(baseline_result, Err(Error::InvalidShape(_))));
     for at in 0..baseline.len() {
         for cause in CAUSES {
-            c.arm(Some((at, cause)));
+            c.arm(Some((at, cause.clone())));
             assert!(matches!(action(),Err(Error::Control(actual)) if actual==cause));
             assert_eq!(c.trace(), baseline[..=at]);
         }
@@ -1624,7 +1624,7 @@ fn table_write_each_actual_small_prepare_emit_and_ordinary_tail_prefix_keeps_thr
                 for cause in CAUSES {
                     c.disarm();
                     let p = prepare_table_write_node_decode(&wire, r, a, SOURCE, limits()).unwrap();
-                    c.arm(Some((at, cause)));
+                    c.arm(Some((at, cause.clone())));
                     assert!(matches!(p.emit(),Err(Error::Control(actual)) if actual==cause));
                     assert_eq!(c.trace(), baseline[..=at]);
                 }
@@ -1640,7 +1640,7 @@ fn table_write_each_actual_small_prepare_emit_and_ordinary_tail_prefix_keeps_thr
                     c.disarm();
                     let p = prepare_table_write_node_encode(&n, v, e, ids.view(), SOURCE, limits())
                         .unwrap();
-                    c.arm(Some((at, cause)));
+                    c.arm(Some((at, cause.clone())));
                     assert!(matches!(p.emit(),Err(Error::Control(actual)) if actual==cause));
                     assert_eq!(c.trace(), baseline[..=at]);
                 }
@@ -1666,7 +1666,7 @@ fn table_write_wide_real_fields_and_group_constants_sample_quantum_and_numeric_p
         .collect::<Vec<_>>()
         .into_boxed_slice();
     let ids = Ids::new(&n);
-    f.with(&n,&c,|v,e,r,a|{c.arm(None);let (wire,_) =encode_table_write_node(&n,v,e,ids.view(),SOURCE,limits()).unwrap();let baseline=c.trace();assert!(baseline.iter().any(|(_,u)|*u==256));for at in [0,baseline.len()/2,baseline.len()-1]{for cause in CAUSES{c.arm(Some((at,cause)));assert!(matches!(encode_table_write_node(&n,v,e,ids.view(),SOURCE,limits()),Err(Error::Control(actual)) if actual==cause));assert_eq!(c.trace(),baseline[..=at]);}}c.arm(None);let owned=decode_table_write_node(&wire,r,a,SOURCE,limits()).unwrap().0;assert_eq!(owned,n);let mut tiny=limits();tiny.node.max_allocation_requests=0;c.arm(None);assert!(matches!(prepare_table_write_node_encode(&n,v,e,ids.view(),SOURCE,tiny),Err(Error::Control(CompileControlError::ResourceExhausted))));let numeric_prefix=c.trace();for cause in CAUSES{c.arm(Some((numeric_prefix.len(),cause)));assert!(matches!(prepare_table_write_node_encode(&n,v,e,ids.view(),SOURCE,tiny),Err(Error::Control(CompileControlError::ResourceExhausted))));assert_eq!(c.trace(),numeric_prefix);} });
+    f.with(&n,&c,|v,e,r,a|{c.arm(None);let (wire,_) =encode_table_write_node(&n,v,e,ids.view(),SOURCE,limits()).unwrap();let baseline=c.trace();assert!(baseline.iter().any(|(_,u)|*u==256));for at in [0,baseline.len()/2,baseline.len()-1]{for cause in CAUSES{c.arm(Some((at,cause.clone())));assert!(matches!(encode_table_write_node(&n,v,e,ids.view(),SOURCE,limits()),Err(Error::Control(actual)) if actual==cause));assert_eq!(c.trace(),baseline[..=at]);}}c.arm(None);let owned=decode_table_write_node(&wire,r,a,SOURCE,limits()).unwrap().0;assert_eq!(owned,n);let mut tiny=limits();tiny.node.max_allocation_requests=0;c.arm(None);assert!(matches!(prepare_table_write_node_encode(&n,v,e,ids.view(),SOURCE,tiny),Err(Error::Control(CompileControlError::ResourceExhausted))));let numeric_prefix=c.trace();for cause in CAUSES{c.arm(Some((numeric_prefix.len(),cause)));assert!(matches!(prepare_table_write_node_encode(&n,v,e,ids.view(),SOURCE,tiny),Err(Error::Control(CompileControlError::ResourceExhausted))));assert_eq!(c.trace(),numeric_prefix);} });
     let mut n = finisher(true);
     let g = finish_spec(&mut n).grouped_unpivot.as_mut().unwrap();
     g.mappings[0].constants = (0..320)
@@ -1714,7 +1714,7 @@ fn table_write_wide_real_fields_and_group_constants_sample_quantum_and_numeric_p
             assert_eq!(call.output_value_id,Some(if i%2==0{u32::MAX}else{0}));
         }
         for at in [0,quantum,send_trace.len()-1]{for cause in CAUSES{
-            c.arm(Some((at,cause)));
+            c.arm(Some((at,cause.clone())));
             assert!(matches!(encode_table_write_node(&n,v,e,ids.view(),source,limits()),Err(Error::Control(actual)) if actual==cause));
             assert_eq!(c.trace(),send_trace[..=at]);
         }}
@@ -1733,7 +1733,7 @@ fn table_write_wide_real_fields_and_group_constants_sample_quantum_and_numeric_p
             match &call.binding.function.argument_types[0]{FunctionArgumentType::Value(t)=>assert_eq!(*t,dictionary()),_=>panic!()}
         }
         for at in [0,quantum,read_trace.len()-1]{for cause in CAUSES{
-            c.arm(Some((at,cause)));
+            c.arm(Some((at,cause.clone())));
             assert!(matches!(decode_table_write_node(&wire,r,a,source,limits()),Err(Error::Control(actual)) if actual==cause));
             assert_eq!(c.trace(),read_trace[..=at]);
         }}
@@ -1797,7 +1797,7 @@ fn table_write_parent_whole_writer_and_finish_exact_replay_and_control_prefixes(
                 }
                 for at in 0..trace.len() {
                     for cause in CAUSES {
-                        c.arm(Some((at, cause)));
+                        c.arm(Some((at, cause.clone())));
                         assert!(matches!(run(limits(), &mut vec![]), Err(Error::Control(actual)) if actual == cause));
                         assert_eq!(c.trace(), trace[..=at]);
                     }

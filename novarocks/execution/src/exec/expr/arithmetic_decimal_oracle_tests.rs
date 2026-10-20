@@ -96,7 +96,10 @@ fn compare_legacy_rows(
     right_logical: ValueLogicalType,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> (Result<ArrayRef, String>, Vec<ArithmeticRowResult>) {
+) -> (
+    Result<ArrayRef, crate::runtime::fragment::ExecutionFailure>,
+    Vec<ArithmeticRowResult>,
+) {
     let left_type = value_type(&left, left_logical);
     let right_type = value_type(&right, right_logical);
     let result_type =
@@ -195,7 +198,7 @@ fn compare_legacy_rows(
             for (row, value) in rows.iter().enumerate() {
                 if let ArithmeticRowResult::RowError(error) = value {
                     assert_eq!(error.selected_ordinal(), row);
-                    assert_eq!(diagnostic, error.message());
+                    assert_eq!((diagnostic).detail(), error.message());
                     errors += 1;
                 }
             }
@@ -213,7 +216,10 @@ fn compare_physical(
     right: ArrayRef,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> (Result<ArrayRef, String>, Vec<ArithmeticRowResult>) {
+) -> (
+    crate::runtime::fragment::ExecutionResult<ArrayRef>,
+    Vec<ArithmeticRowResult>,
+) {
     compare_legacy_rows(
         operator,
         left,

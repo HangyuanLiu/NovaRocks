@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, ListArray, StringArray,
@@ -28,7 +30,7 @@ fn sum_i64_rows<T, F>(
     values: &T,
     chunk_len: usize,
     mut value_at: F,
-) -> Vec<Option<i64>>
+) -> ExecutionResult<Vec<Option<i64>>>
 where
     T: Array,
     F: FnMut(&T, usize) -> i64,
@@ -51,11 +53,13 @@ where
                 continue;
             }
             has_value = true;
-            sum += value_at(values, idx);
+            sum = sum.checked_add(value_at(values, idx)).ok_or_else(|| {
+                super::common::numeric_failure("array_sum integer accumulation overflow")
+            })?;
         }
         out.push(has_value.then_some(sum));
     }
-    out
+    Ok(out)
 }
 
 fn sum_f64_rows<T, F>(
@@ -128,10 +132,10 @@ fn sum_i128_rows<T, F>(
     values: &T,
     chunk_len: usize,
     mut value_at: F,
-) -> Result<Vec<Option<i128>>, String>
+) -> ExecutionResult<Vec<Option<i128>>>
 where
     T: Array,
-    F: FnMut(&T, usize) -> Result<i128, String>,
+    F: FnMut(&T, usize) -> ExecutionResult<i128>,
 {
     let offsets = list.value_offsets();
     let mut out = Vec::with_capacity(chunk_len);
@@ -152,30 +156,30 @@ where
             }
             has_value = true;
             let v = value_at(values, idx)?;
-            sum = sum
-                .checked_add(v)
-                .ok_or_else(|| "array_sum overflow in i128 accumulation".to_string())?;
+            sum = sum.checked_add(v).ok_or_else(|| {
+                super::common::numeric_failure("array_sum overflow in i128 accumulation")
+            })?;
         }
         out.push(has_value.then_some(sum));
     }
     Ok(out)
 }
 
-fn rescale_decimal_value(value: i128, from_scale: i8, to_scale: i8) -> Result<i128, String> {
+fn rescale_decimal_value(value: i128, from_scale: i8, to_scale: i8) -> ExecutionResult<i128> {
     if from_scale == to_scale {
         return Ok(value);
     }
     if to_scale > from_scale {
         let factor = 10_i128
-            .checked_pow((to_scale - from_scale) as u32)
-            .ok_or_else(|| "array_sum decimal rescale overflow".to_string())?;
+            .checked_pow((i16::from(to_scale) - i16::from(from_scale)) as u32)
+            .ok_or_else(|| super::common::numeric_failure("array_sum decimal rescale overflow"))?;
         return value
             .checked_mul(factor)
-            .ok_or_else(|| "array_sum decimal rescale overflow".to_string());
+            .ok_or_else(|| super::common::numeric_failure("array_sum decimal rescale overflow"));
     }
     let divisor = 10_i128
-        .checked_pow((from_scale - to_scale) as u32)
-        .ok_or_else(|| "array_sum decimal rescale overflow".to_string())?;
+        .checked_pow((i16::from(from_scale) - i16::from(to_scale)) as u32)
+        .ok_or_else(|| super::common::numeric_failure("array_sum decimal rescale overflow"))?;
     Ok(value / divisor)
 }
 
@@ -184,12 +188,20 @@ pub fn eval_array_sum<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "array_sum has an invalid prepared argument count",
+        ));
+    }
     let arr = arena.eval(args[0], chunk)?;
-    let list = arr
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| format!("array_sum expects ListArray, got {:?}", arr.data_type()))?;
+    let list = arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+        expression_contract(format_args!(
+            "array_sum expects ListArray, got {:?}",
+            arr.data_type()
+        ))
+    })?;
+    super::common::validate_rows(list.len(), chunk.len(), "array_sum input")?;
     let values = list.values();
 
     let out = match values.data_type() {
@@ -202,7 +214,7 @@ pub fn eval_array_sum<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 |a, idx| {
                     if a.value(idx) { 1 } else { 0 }
                 },
-            ))) as ArrayRef
+            )?)) as ArrayRef
         }
         arrow::datatypes::DataType::Int8 => {
             let values = values.as_any().downcast_ref::<Int8Array>().unwrap();
@@ -211,7 +223,7 @@ pub fn eval_array_sum<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 values,
                 chunk.len(),
                 |a, idx| a.value(idx) as i64,
-            ))) as ArrayRef
+            )?)) as ArrayRef
         }
         arrow::datatypes::DataType::Int16 => {
             let values = values.as_any().downcast_ref::<Int16Array>().unwrap();
@@ -220,7 +232,7 @@ pub fn eval_array_sum<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 values,
                 chunk.len(),
                 |a, idx| a.value(idx) as i64,
-            ))) as ArrayRef
+            )?)) as ArrayRef
         }
         arrow::datatypes::DataType::Int32 => {
             let values = values.as_any().downcast_ref::<Int32Array>().unwrap();
@@ -229,7 +241,7 @@ pub fn eval_array_sum<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 values,
                 chunk.len(),
                 |a, idx| a.value(idx) as i64,
-            ))) as ArrayRef
+            )?)) as ArrayRef
         }
         arrow::datatypes::DataType::Int64 => {
             let values = values.as_any().downcast_ref::<Int64Array>().unwrap();
@@ -238,7 +250,7 @@ pub fn eval_array_sum<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 values,
                 chunk.len(),
                 |a, idx| a.value(idx),
-            ))) as ArrayRef
+            )?)) as ArrayRef
         }
         arrow::datatypes::DataType::Float32 => {
             let values = values.as_any().downcast_ref::<Float32Array>().unwrap();
@@ -284,7 +296,12 @@ pub fn eval_array_sum<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             };
             let out = Decimal128Array::from(sums)
                 .with_precision_and_scale(out_precision, out_scale)
-                .map_err(|e| e.to_string())?;
+                .map_err(|source| {
+                    crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+                        "array_sum decimal metadata",
+                        source,
+                    )
+                })?;
             Arc::new(out) as ArrayRef
         }
         arrow::datatypes::DataType::FixedSizeBinary(width)
@@ -295,15 +312,45 @@ pub fn eval_array_sum<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 "array_sum LARGEINT values",
             )?;
             let sums = sum_i128_rows(list, values, chunk.len(), |a, idx| {
-                novarocks_types::largeint::value_at(a, idx)
+                novarocks_types::largeint::value_at(a, idx).map_err(ExecutionFailure::from)
             })?;
             novarocks_types::largeint::array_from_i128(&sums)?
         }
-        other => return Err((format!("array_sum unsupported element type: {:?}", other)).into()),
+        other => {
+            return Err(expression_contract(format_args!(
+                "array_sum unsupported element type: {:?}",
+                other
+            )));
+        }
     };
 
     let adjusted_output_type = arena
         .data_type(expr)
         .map(|t| super::common::adjust_legacy_decimalv2_target_type(values.data_type(), t));
     Ok((super::common::cast_output(out, adjusted_output_type.as_ref(), "array_sum"))?)
+}
+
+#[cfg(test)]
+mod numeric_properties {
+    use super::*;
+    use arrow::array::ListBuilder;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn signed_integer_overflow_is_a_typed_failure_instead_of_profile_dependent_wrap() {
+        let mut b = ListBuilder::new(arrow::array::Int64Builder::new());
+        b.values().append_value(i64::MAX);
+        b.values().append_value(1);
+        b.append(true);
+        let list = b.finish();
+        let values = list.values().as_any().downcast_ref::<Int64Array>().unwrap();
+        let error = sum_i64_rows(&list, values, 1, |a, i| a.value(i)).unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Data);
+        assert_eq!(
+            error.failure_fact(),
+            novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+        );
+        assert_eq!(rescale_decimal_value(-125, 2, 1).unwrap(), -12);
+        assert!(rescale_decimal_value(i128::MAX, 0, 1).is_err());
+        assert!(rescale_decimal_value(1, i8::MIN, i8::MAX).is_err());
+    }
 }

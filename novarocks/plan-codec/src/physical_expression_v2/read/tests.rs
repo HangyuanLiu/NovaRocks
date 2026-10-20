@@ -80,7 +80,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after originating refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -637,7 +637,7 @@ fn prefixes(
         }
         for cause in CAUSES {
             let control = Control {
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 ..Default::default()
             };
             assert!(

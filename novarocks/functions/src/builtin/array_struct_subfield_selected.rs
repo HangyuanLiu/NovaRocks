@@ -50,7 +50,7 @@ pub(super) fn evaluate_scoped<'a>(
             &mut work,
         )?;
         return Err(failure
-            .with_original_message("array_struct_subfield", |args| diagnostic.diagnostic(args)));
+            .with_original_message("array_struct_subfield", |args| diagnostic.value_error(args)));
     }
     let [source, names] = input.sources() else {
         return Err(crate::kernel_control::invalid(

@@ -92,7 +92,7 @@ fn dynamic_pending_request_refusal_stops_before_growth() {
     let mut visits = 0;
     let mut allocation = |_, _| {
         allocations += 1;
-        Err::<(), _>(cause)
+        Err::<(), _>(cause.clone())
     };
     let result = original_dynamic_pending_allocation_requests_observed(
         &mut || {

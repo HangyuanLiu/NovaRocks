@@ -148,8 +148,11 @@ fn by_window_original_function_major_error_order_across_partitions() {
     )
     .unwrap();
     let error = state.compute_outputs(&[chunk], None).unwrap_err();
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(error.failure_fact().class(), FailureClass::Data);
+    assert_eq!(error.failure_fact().reason().code(), 40);
     assert_eq!(
-        error,
+        error.to_string(),
         "window function #0: update aggregate state: float comparison is not ordered"
     );
 }

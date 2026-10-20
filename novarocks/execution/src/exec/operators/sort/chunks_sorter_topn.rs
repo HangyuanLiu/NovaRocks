@@ -19,6 +19,7 @@
 //! This module hosts generic topn logic and rank-like semantics.
 //! Heap specialization lives in `chunks_sorter_heap_sort`.
 
+use super::operation_failure::{self as failure, Operation};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -83,7 +84,7 @@ pub(crate) fn sort_chunks_topn(
     let converter = build_row_converter(order_by, &boundary_keys, creation)?;
     let boundary_rows = converter
         .convert_columns(&boundary_keys)
-        .map_err(|e| e.to_string())?;
+        .map_err(|source| failure::arrow(Operation::EncodeRows, source))?;
     let boundary_idx = boundary_chunk.len() - 1;
     let boundary_key = boundary_rows.row(boundary_idx).owned();
 
@@ -149,7 +150,7 @@ pub(crate) fn sort_chunks_rank(
     let converter = build_row_converter(order_by, &boundary_keys, creation)?;
     let boundary_rows = converter
         .convert_columns(&boundary_keys)
-        .map_err(|e| e.to_string())?;
+        .map_err(|source| failure::arrow(Operation::EncodeRows, source))?;
     let boundary_idx = boundary_chunk.len() - 1;
     let boundary_key = boundary_rows.row(boundary_idx).owned();
 
@@ -206,7 +207,7 @@ pub(crate) fn sort_chunks_dense_rank(
     let converter = build_row_converter(order_by, &key_columns, creation)?;
     let rows = converter
         .convert_columns(&key_columns)
-        .map_err(|e| e.to_string())?;
+        .map_err(|source| failure::arrow(Operation::EncodeRows, source))?;
     let mut dense_rank = 1usize;
     let mut cutoff = 0usize;
     for idx in 0..sorted.len() {
@@ -403,7 +404,9 @@ fn sort_chunks_by_order(
     creation: &SortCreation<'_>,
 ) -> crate::runtime::fragment::ExecutionResult<Chunk> {
     if chunks.is_empty() {
-        return Err("sort_chunks_by_order requires non-empty chunks".into());
+        return Err(failure::contract(
+            "sort_chunks_by_order requires non-empty chunks",
+        ));
     }
     creation.verify_chunks(chunks)?;
     let owner = creation.begin(&chunks[0])?;
@@ -443,12 +446,11 @@ fn filter_chunk_by_boundary(
     let key_columns = eval_order_by_columns(arena, order_by, chunk, creation)?;
     let rows = converter
         .convert_columns(&key_columns)
-        .map_err(|e| e.to_string())?;
+        .map_err(|source| failure::arrow(Operation::EncodeRows, source))?;
     let mut indices = Vec::<u32>::new();
     for row_idx in 0..chunk.len() {
         if rows.row(row_idx).owned().cmp(boundary_key) != Ordering::Greater {
-            let idx = u32::try_from(row_idx)
-                .map_err(|_| format!("row index {} exceeds UInt32Array range", row_idx))?;
+            let idx = failure::row_index(row_idx)?;
             indices.push(idx);
         }
     }
@@ -525,11 +527,7 @@ pub(crate) fn sort_chunks_partition_topn(
             row_equal_on_keys(&order_keys, start + a, start + b).unwrap_or(false)
         });
         for local in 0..cutoff {
-            keep_indices.push(
-                u32::try_from(start + local).map_err(|_| {
-                    format!("row index {} exceeds UInt32Array range", start + local)
-                })?,
-            );
+            keep_indices.push(failure::row_index(start + local)?);
         }
     }
     if keep_indices.is_empty() {

@@ -24,7 +24,7 @@ fn payload(count: usize) -> Vec<u8> {
     for n in 0..count {
         digest::add_value(&mut state, n as f64).unwrap();
     }
-    digest::encode_state(&state)
+    digest::encode_state(&state).unwrap()
 }
 fn packed(values: ArrayRef, rates: ArrayRef, extra: usize, root_null: bool) -> ArrayRef {
     let mut fields = vec![
@@ -52,6 +52,16 @@ fn assert_data(
         panic!("original whole-call Data")
     };
     assert_eq!(data.message(), phase.message(expected).to_string());
+}
+fn assert_contract(result: EvaluationFailure, expected: &str) {
+    let EvaluationFailure::Kernel(cause) = result else {
+        panic!("physical input contract refusal");
+    };
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(&cause).class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert_eq!(cause.to_string(), expected);
 }
 #[test]
 fn percentile_union_private_all_phases_binary_writer_and_empty_state() {
@@ -120,7 +130,7 @@ fn percentile_union_private_all_phases_binary_writer_and_empty_state() {
                 .downcast_ref::<BinaryArray>()
                 .unwrap()
                 .value(0),
-            digest::encode_state(&state.core)
+            digest::encode_state(&state.core).unwrap()
         );
         drop(output);
         drop(state);
@@ -219,10 +229,9 @@ fn percentile_union_private_packed_full_fields_root_null_and_empty_validation() 
                 &Control::default(),
             )
             .unwrap_err();
-            assert_data(
+            assert_contract(
                 error,
                 "percentile_approx: percentile_approx expects STRUCT(value, quantile[, compression]) input",
-                crate::aggregate_format::AggregateFailureStage::Update,
             );
             assert_eq!(state.core.digest.count(), 0.);
             assert!(!state.failed);
@@ -232,7 +241,7 @@ fn percentile_union_private_packed_full_fields_root_null_and_empty_validation() 
     }
 }
 #[test]
-fn percentile_union_private_full_type_data_null_and_sparse_constant_addresses() {
+fn percentile_union_private_type_contract_null_and_sparse_constant_addresses() {
     let long = DataType::List(Arc::new(Field::new(
         "unsupported".repeat(80),
         DataType::UInt32,
@@ -277,11 +286,7 @@ fn percentile_union_private_full_type_data_null_and_sparse_constant_addresses() 
             &Control::default(),
         )
         .unwrap_err();
-        assert_data(
-            error,
-            &expected,
-            crate::aggregate_format::AggregateFailureStage::Update,
-        );
+        assert_contract(error, &expected.to_string());
         assert!(state.failed);
         drop(state);
         assert_eq!(host.ledger.lock().unwrap().bytes, 0);
@@ -410,7 +415,7 @@ fn percentile_union_private_original_payload_errors_and_state_latch() {
             .unwrap_err();
             assert_data(
                 error,
-                &expected,
+                &expected.to_string(),
                 if phase.consumes_logical_arguments() {
                     crate::aggregate_format::AggregateFailureStage::Update
                 } else {
@@ -616,7 +621,7 @@ fn percentile_union_private_compile_three_real_source_causes() {
     struct Refuse(CompileControlError);
     impl PureCompileControl for Refuse {
         fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-            Err(self.0)
+            Err(self.0.clone())
         }
     }
     let catalog = super::super::super::catalogue::percentile_union_private_test_catalog();
@@ -640,7 +645,7 @@ fn percentile_union_private_compile_three_real_source_causes() {
                     "percentile_union",
                     FunctionKind::Aggregate,
                     request,
-                    &Refuse(cause)
+                    &Refuse(cause.clone())
                 )
                 .unwrap_err(),
             FunctionBindingError::Control(cause)

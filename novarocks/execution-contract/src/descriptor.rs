@@ -563,6 +563,28 @@ impl fmt::Display for DescriptorError {
 
 impl std::error::Error for DescriptorError {}
 
+impl crate::failure::FailureProjection for DescriptorError {
+    fn failure_fact(&self) -> crate::failure::FailureFact {
+        use crate::failure::{FailureClass, FailureFact, FailureReason, domain};
+        let code = match self {
+            Self::SenderOrdinalOutOfRange { .. } => 1020,
+            Self::EdgeWithoutDestinations(_) => 1021,
+            Self::EdgeDestinationNodeMismatch(_) => 1022,
+            Self::DuplicateEdgeDestination(_) => 1023,
+            Self::InboundWithoutSources(_) => 1024,
+            Self::DuplicateInboundSource(_) => 1025,
+            Self::InvalidInboundSenderOrdinals { .. } => 1026,
+            Self::DuplicateEdgeId => 1027,
+            Self::DuplicateInboundNode => 1028,
+            Self::DuplicateSplitPlanNode(_) => 1029,
+        };
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::PROTOCOL, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+
 /// The protocol facts one task is addressed by.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskDescriptor {
@@ -1061,5 +1083,21 @@ mod tests {
         assert_eq!(descriptor.pipeline_dop().get(), 4);
         assert!(descriptor.accepts_split_plan_node(PlanNodeId::new(3).expect("nonnegative")));
         assert!(!descriptor.accepts_split_plan_node(PlanNodeId::new(4).expect("nonnegative")));
+    }
+}
+
+#[cfg(test)]
+mod descriptor_failure_projection_tests {
+    use super::*;
+    use crate::failure::{FailureClass, FailureProjection, domain};
+    #[test]
+    fn invalid_sender_geometry_is_a_descriptor_invariant_not_capacity() {
+        for (ordinal, count) in [(0, 0), (1, 1), (u32::MAX, u32::MAX)] {
+            let fact = DescriptorError::SenderOrdinalOutOfRange { ordinal, count }.failure_fact();
+            assert_eq!(fact.class(), FailureClass::Invariant);
+            assert_eq!(fact.reason().domain(), domain::PROTOCOL.get());
+            assert_eq!(fact.reason().code(), 1020);
+            assert_eq!(fact.resource(), None);
+        }
     }
 }

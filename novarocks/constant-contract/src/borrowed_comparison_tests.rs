@@ -39,7 +39,7 @@ impl PureCompileControl for Control {
             assert!(index <= at, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((at, cause)) if index == at => Err(cause),
             _ => Ok(()),
         }
@@ -120,7 +120,7 @@ fn prefixes<T>(run: impl Fn(&Control) -> Result<T, ConstantError>) {
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(run(&control), Err(ConstantError::Control(actual)) if actual == cause)

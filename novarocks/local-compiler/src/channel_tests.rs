@@ -869,7 +869,7 @@ impl PureCompileControl for CallbackControl {
         trace.push((phase, units));
         if trace.len() == self.stop_at {
             *refused = true;
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -897,7 +897,7 @@ fn every_actual_value_channel_callback_and_ordinary_tail_preserves_primary_contr
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = CallbackControl::new(cause, index);
+            let control = CallbackControl::new(cause.clone(), index);
             let result = compile_fragment(validate(), &functions, options(1), &control);
             assert!(
                 matches!(result, Err(FragmentCompileError::Control(actual)) if actual == cause),
@@ -932,7 +932,7 @@ fn every_actual_value_channel_callback_and_ordinary_tail_preserves_primary_contr
         CompileControlError::DeadlineExceeded,
         CompileControlError::ResourceExhausted,
     ] {
-        let control = CallbackControl::new(cause, ordinary.len());
+        let control = CallbackControl::new(cause.clone(), ordinary.len());
         assert!(matches!(
             compile_fragment(validate(), &functions, options(1), &control),
             Err(FragmentCompileError::Control(actual)) if actual == cause

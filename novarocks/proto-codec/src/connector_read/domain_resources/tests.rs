@@ -37,7 +37,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut e = self.events.lock().unwrap();
         let at = e.len();
-        let stop = *self.stop.lock().unwrap();
+        let stop = self.stop.lock().unwrap().clone();
         if let Some((stop, _)) = stop {
             assert!(at <= stop, "callback after primary refusal");
         }
@@ -150,7 +150,7 @@ fn decoder_prefunds_original_path_and_conditional_sort_requests_without_changing
     let DomainCodecError::Protocol(error) = error else {
         panic!("original protocol error")
     };
-    assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
+    assert_eq!(error.kind(), &ProtocolErrorKind::MissingField);
     assert_eq!(error.path().to_string(), "domain.values.ranges[0].low");
 }
 #[test]
@@ -171,7 +171,7 @@ fn every_actual_success_and_ordinary_callback_keeps_original_control_and_footer(
         assert!(!trace.is_empty());
         for at in 0..trace.len() {
             for cause in CAUSES {
-                let (out, actual) = run(raw, Some((at, cause)));
+                let (out, actual) = run(raw, Some((at, cause.clone())));
                 assert!(matches!(out,Err(DomainCodecError::Control(c))if c==cause));
                 assert_eq!(actual, &trace[..=at]);
             }
@@ -268,7 +268,7 @@ fn original_scalar_and_type_paths_have_independent_requests_and_error_oracles() 
     wrong_type.kind = 0;
     let error = super::super::value::decode_value_type(&wrong_type, FieldPath::root("scalar_type"))
         .unwrap_err();
-    assert_eq!(error.kind(), ProtocolErrorKind::InvalidEnum);
+    assert_eq!(error.kind(), &ProtocolErrorKind::InvalidEnum);
     assert_eq!(error.path().to_string(), "scalar_type.kind");
     let raw = dto::Value {
         value: Some(dto::value::Value::Varbinary(vec![0, 255, 7])),
@@ -291,7 +291,7 @@ fn original_scalar_and_type_paths_have_independent_requests_and_error_oracles() 
         FieldPath::root("scalar_value"),
     )
     .unwrap_err();
-    assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+    assert_eq!(error.kind(), &ProtocolErrorKind::InvalidValue);
     assert_eq!(error.path().to_string(), "scalar_value");
     // Decimal's eager exact-length path has completed before the later invalid
     // precision path. Both original path allocations are covered, not B-based.
@@ -314,7 +314,7 @@ fn original_scalar_and_type_paths_have_independent_requests_and_error_oracles() 
         FieldPath::root("decimal"),
     )
     .unwrap_err();
-    assert_eq!(e.kind(), ProtocolErrorKind::OutOfRange);
+    assert_eq!(e.kind(), &ProtocolErrorKind::OutOfRange);
     assert_eq!(e.path().to_string(), "decimal.decimal");
 }
 

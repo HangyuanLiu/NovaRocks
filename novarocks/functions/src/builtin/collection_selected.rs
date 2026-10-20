@@ -36,11 +36,7 @@ pub(super) enum Operation {
     MapLookup,
 }
 pub(super) fn copy_error(error: CopyError) -> KernelFailure {
-    match error {
-        CopyError::Control(cause) => cause,
-        CopyError::Extent => KernelFailure::ResourceExhausted,
-        other => internal(&format!("selected collection copy: {other}")),
-    }
+    error.into_kernel()
 }
 fn value<'a>(arg: &'a FunctionArgumentType) -> Result<&'a FunctionValueType, KernelFailure> {
     match arg {
@@ -220,9 +216,11 @@ pub(super) fn compact(
     let indices = UInt64Array::from(indices);
     let values =
         arrow_select::take::take(argument.array().as_ref(), &indices, None).map_err(|cause| {
-            internal(&format!(
-                "collection exact selected projection failed: {cause}"
-            ))
+            super::collection_arrow::arrow_failure(
+                "collection exact selected projection",
+                super::collection_arrow::ArrowSite::Take,
+                cause,
+            )
         })?;
     work.borrow_mut().flush()?;
     Ok(values)
@@ -244,17 +242,6 @@ pub(super) fn evaluate<'a>(
         let selection = input.selection();
         match operation {
             Operation::ArrayLiteral => {
-                let rows_plus_one = selection
-                    .len()
-                    .checked_add(1)
-                    .ok_or(KernelFailure::ResourceExhausted)?;
-                Layout::array::<i32>(rows_plus_one)
-                    .map_err(|_| KernelFailure::ResourceExhausted)?;
-                let slots = selection
-                    .len()
-                    .checked_mul(input.arguments().len())
-                    .ok_or(KernelFailure::ResourceExhausted)?;
-                i32::try_from(slots).map_err(|_| KernelFailure::ResourceExhausted)?;
                 let mut inputs = ArrayLiteralInputs::from_output(
                     Some(target.data_type()),
                     selection.len(),
@@ -262,32 +249,31 @@ pub(super) fn evaluate<'a>(
                     &mut observer,
                 )
                 .map_err(|failure| match failure {
-                    ConstructionFailure::Control(cause) => cause,
-                    ConstructionFailure::Data(error) => internal(&error.legacy_message()),
+                    ConstructionFailure::Caller(cause) => cause,
+                    ConstructionFailure::Domain(error) => KernelFailure::from_domain(error),
                 })?;
                 for argument in input.arguments() {
                     work.borrow_mut().step()?;
                     let array = compact(*argument, selection, &work)?;
                     inputs.push_evaluated(array, &mut observer).map_err(
                         |failure| match failure {
-                            ConstructionFailure::Control(cause) => cause,
-                            ConstructionFailure::Data(error) => internal(&error.legacy_message()),
+                            ConstructionFailure::Caller(cause) => cause,
+                            ConstructionFailure::Domain(error) => KernelFailure::from_domain(error),
                         },
                     )?;
                 }
                 let values = inputs
                     .finish(
                         |_, _| {
-                            Err(
-                                "exact selected array literal cannot invoke an implicit coercion"
-                                    .to_string(),
-                            )
+                            Err(invalid(
+                                "exact selected array literal cannot invoke an implicit coercion",
+                            ))
                         },
                         &mut observer,
                     )
                     .map_err(|failure| match failure {
-                        ConstructionFailure::Control(cause) => cause,
-                        ConstructionFailure::Data(error) => internal(&error.legacy_message()),
+                        ConstructionFailure::Caller(cause) => cause,
+                        ConstructionFailure::Domain(error) => KernelFailure::from_domain(error),
                     })?;
                 SelectedValues::try_new(selection, target.data_type(), values, Box::default())
                     .map_err(|_| {
@@ -298,8 +284,7 @@ pub(super) fn evaluate<'a>(
                 let [map, key] = input.arguments() else {
                     return Err(invalid("map lookup requires two evaluated arguments"));
                 };
-                let inputs = MapLookupInputs::new(map.array(), key.array(), None)
-                    .map_err(|error| internal(&error))?;
+                let inputs = MapLookupInputs::new(map.array(), key.array(), None)?;
                 Layout::array::<Option<u32>>(selection.len())
                     .map_err(|_| KernelFailure::ResourceExhausted)?;
                 let mut errors = reserve::<RowDataError>(selection.len(), &work)?;
@@ -322,29 +307,28 @@ pub(super) fn evaluate<'a>(
                     },
                     Some(target.data_type()),
                     |values, indices| {
-                        let mut exact_indices = reserve::<Option<u64>>(indices.len(), &work)?;
-                        for index in indices {
-                            work.borrow_mut().step()?;
-                            exact_indices.push(index.map(u64::from));
-                        }
-                        selected_copy::preflight_take(values, &exact_indices, |boundary| {
-                            if boundary {
-                                work.borrow_mut().flush()
-                            } else {
-                                work.borrow_mut().step()
-                            }
-                        })
+                        selected_copy::preflight_original_take(
+                            values,
+                            selected_copy::CopyIndexView::UInt32(indices),
+                            |boundary| {
+                                if boundary {
+                                    work.borrow_mut().flush()
+                                } else {
+                                    work.borrow_mut().step()
+                                }
+                            },
+                        )
                         .map_err(copy_error)
                     },
-                    |ordinal, message| {
-                        errors.push(RowDataError::new(ordinal, &message));
+                    |ordinal, cause| {
+                        errors.push(RowDataError::from_domain(ordinal, cause)?);
                         Ok(())
                     },
                     &mut observer,
                 )
                 .map_err(|failure| match failure {
                     MapLookupFailure::Control(cause) => cause,
-                    MapLookupFailure::Data(message) => internal(&message),
+                    MapLookupFailure::Operation(cause) => cause,
                 })?;
                 SelectedValues::try_new(
                     selection,

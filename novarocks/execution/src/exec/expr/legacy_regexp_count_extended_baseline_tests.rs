@@ -44,7 +44,10 @@ fn chunk(columns: Vec<ArrayRef>) -> Chunk {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     Chunk::new_with_chunk_schema(batch, schema)
 }
-fn eval(name: &str, columns: Vec<ArrayRef>) -> Result<ArrayRef, String> {
+fn eval(
+    name: &str,
+    columns: Vec<ArrayRef>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut arena = ExprArena::default();
     let args = columns
         .iter()
@@ -122,7 +125,7 @@ fn legacy_regexp_count_literal_invalid_is_lazy_null_masked_and_empty_masked() {
         let result =
             eval_string_function("regexp_count", &arena, source, &[source, literal], &input);
         if values.iter().any(Option::is_some) {
-            assert_eq!(result.unwrap_err(), expected);
+            assert_eq!((result.unwrap_err()).to_string(), expected);
         } else {
             assert_rows(result.unwrap(), vec![None; values.len()]);
         }
@@ -141,9 +144,9 @@ fn legacy_regexp_count_raw_null_carriers_and_static_downcasts_keep_full_message(
     }
     let large: ArrayRef = Arc::new(LargeStringArray::from(vec![Some("a"), None]));
     for arrays in [vec![large.clone(), null.clone()], vec![null, large]] {
-        assert_eq!(
+        super::legacy_regexp_count_long_error_baseline_tests::assert_regex_contract(
             eval("regexp_count", arrays).unwrap_err(),
-            "regexp_count expects string"
+            "regexp_count expects string",
         );
     }
 }

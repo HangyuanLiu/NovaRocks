@@ -15,35 +15,36 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, BinaryArray, StringArray};
-use novarocks_functions::builtin::string_extended::{StringOperation, evaluate_legacy};
+use novarocks_functions::builtin::string_extended::{StringOperation, evaluate_required};
 
 pub fn eval_to_binary<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     if args.len() != 1 && args.len() != 2 {
-        return Err(("to_binary expects 1 or 2 arguments".to_string()).into());
+        return Err(expression_contract("to_binary expects 1 or 2 arguments"));
     }
 
     let input = arena.eval(args[0], chunk)?;
     input
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "to_binary expects VARCHAR as first argument".to_string())?;
+        .ok_or_else(|| expression_contract("to_binary expects VARCHAR as first argument"))?;
     let mut inputs = vec![input];
     if args.len() == 2 {
         let format = arena.eval(args[1], chunk)?;
         format
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| "to_binary expects VARCHAR format argument".to_string())?;
+            .ok_or_else(|| expression_contract("to_binary expects VARCHAR format argument"))?;
         inputs.push(format);
     }
-    let output = evaluate_legacy(StringOperation::ToBinary, &inputs, chunk.len())?;
+    let output = evaluate_required(StringOperation::ToBinary, &inputs, chunk.len())?;
     // The v1 shell's declared carrier controls its Latin1 projection.
     let binary = output
         .as_any()
@@ -53,5 +54,6 @@ pub fn eval_to_binary<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         .iter()
         .map(|value| value.map(<[u8]>::to_vec))
         .collect();
-    Ok((super::common::build_bytes_output_latin1(values, arena.data_type(expr)))?)
+    super::common::build_bytes_output_latin1(values, arena.data_type(expr))
+        .map_err(ExecutionFailure::from)
 }

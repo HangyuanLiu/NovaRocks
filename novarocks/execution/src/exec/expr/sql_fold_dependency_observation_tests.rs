@@ -49,8 +49,7 @@ enum ErrorTag {
     Evaluation,
     Control,
     Constant,
-    InvalidType,
-    Preparation,
+    Source,
 }
 #[derive(Debug)]
 enum Outcome {
@@ -129,7 +128,9 @@ fn calculate(
     )
     .unwrap();
     let chunk = Chunk::try_new_with_chunk_schema(batch, schema).unwrap();
-    let output = arena.eval(root, &chunk)?;
+    let output = arena
+        .eval(root, &chunk)
+        .map_err(SqlConstantEvaluationError::from_domain)?;
     assert_eq!(output.len(), 1);
     assert_eq!(
         output.data_type().clone(),
@@ -155,7 +156,7 @@ impl SqlFoldDependencyObserver for Probe {
         input: SqlFoldDependencyInput<'_>,
         _: &dyn PureCompileControl,
     ) -> Result<(), CompileControlError> {
-        if let Some(cause) = self.refuse_start {
+        if let Some(cause) = self.refuse_start.clone() {
             return Err(cause);
         }
         let (source_result_constraint, source_constraint_origin, source_decimal_policy) =
@@ -229,11 +230,10 @@ impl SqlFoldDependencyObserver for Probe {
                         (ErrorTag::Evaluation, message.len(), None)
                     }
                     SqlConstantEvaluationError::Control(cause) => {
-                        (ErrorTag::Control, 0, Some(*cause))
+                        (ErrorTag::Control, 0, Some(cause.clone()))
                     }
                     SqlConstantEvaluationError::Constant(_) => (ErrorTag::Constant, 0, None),
-                    SqlConstantEvaluationError::InvalidType(_) => (ErrorTag::InvalidType, 0, None),
-                    SqlConstantEvaluationError::Preparation(_) => (ErrorTag::Preparation, 0, None),
+                    SqlConstantEvaluationError::Source(_) => (ErrorTag::Source, 0, None),
                 };
                 Outcome::Error {
                     tag,
@@ -293,15 +293,22 @@ static CONSTANT_ERROR: ExistingEvaluator = ExistingEvaluator {
         ConstantError::Invalid("original constant refusal"),
     )),
 };
-static TYPE_ERROR: ExistingEvaluator = ExistingEvaluator {
-    mode: Mode::Fail(SqlConstantEvaluationError::InvalidType(
+static TYPE_ERROR: LazyLock<ExistingEvaluator> = LazyLock::new(|| ExistingEvaluator {
+    mode: Mode::Fail(SqlConstantEvaluationError::from_domain(
         novarocks_type_contract::ValueTypeError::TooDeep,
     )),
-};
+});
 static PREPARATION_ERROR: LazyLock<ExistingEvaluator> = LazyLock::new(|| ExistingEvaluator {
-    mode: Mode::Fail(SqlConstantEvaluationError::Preparation(
+    mode: Mode::Fail(SqlConstantEvaluationError::from_domain(
         novarocks_functions::KernelFailure::InvalidProgram(
             novarocks_functions::KernelDiagnostic::new("original preparation refusal"),
+        ),
+    )),
+});
+static PROJECTED_SOURCE_ERROR: LazyLock<ExistingEvaluator> = LazyLock::new(|| ExistingEvaluator {
+    mode: Mode::Fail(SqlConstantEvaluationError::from_domain(
+        crate::runtime::fragment::ExecutionFailure::from(
+            novarocks_functions::KernelFailure::ResourceExhausted,
         ),
     )),
 });
@@ -528,7 +535,7 @@ fn sql_fold_dependency_start_control_refusal_has_no_evaluation_or_completion() {
         CompileControlError::ResourceExhausted,
     ] {
         let observer = Arc::new(Probe {
-            refuse_start: Some(cause),
+            refuse_start: Some(cause.clone()),
             ..Probe::new()
         });
         let error = compile_typed(
@@ -586,7 +593,7 @@ fn sql_fold_dependency_original_control_errors_stay_first_and_typed() {
 fn sql_fold_dependency_original_static_failure_classes_and_text_unchanged() {
     for calculator in [
         &CONSTANT_ERROR as &'static dyn SqlConstantEvaluator,
-        &TYPE_ERROR,
+        &*TYPE_ERROR,
         &*PREPARATION_ERROR,
     ] {
         let observer = probe();
@@ -599,12 +606,57 @@ fn sql_fold_dependency_original_static_failure_classes_and_text_unchanged() {
         assert!(matches!(
             &receipts[0].outcome,
             Some(Outcome::Error {
-                tag: ErrorTag::Constant | ErrorTag::InvalidType | ErrorTag::Preparation,
+                tag: ErrorTag::Constant | ErrorTag::Source,
                 ..
             })
         ));
     }
 }
+#[test]
+fn sql_fold_dependency_projected_source_keeps_identity_and_does_not_mint_control() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let observer = probe();
+    let actual = compile_typed(
+        "SELECT upper('projected')",
+        &*PROJECTED_SOURCE_ERROR,
+        Some(observer.clone()),
+    )
+    .unwrap_err();
+    let original =
+        compile_typed("SELECT upper('projected')", &*PROJECTED_SOURCE_ERROR, None).unwrap_err();
+    use novarocks_sql::compiler::{SqlCompileError, SqlCompileProgressError};
+    use std::error::Error;
+    assert!(
+        actual
+            .source()
+            .unwrap()
+            .downcast_ref::<SqlCompileError>()
+            .is_some()
+    );
+    let unwrap_source = |error| match error {
+        SqlCompileProgressError::Compile(SqlCompileError::CompilationSource(source)) => source,
+        _ => panic!("projected resource source must propagate"),
+    };
+    let source = unwrap_source(actual);
+    assert_eq!(source, unwrap_source(original));
+    assert_eq!(source.failure_fact().class(), FailureClass::Resource);
+    assert!(
+        source
+            .downcast_ref::<crate::runtime::fragment::ExecutionFailure>()
+            .is_some()
+    );
+    let receipts = observer.receipts.lock().unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert!(matches!(
+        &receipts[0].outcome,
+        Some(Outcome::Error {
+            tag: ErrorTag::Source,
+            control: None,
+            ..
+        })
+    ));
+}
+
 #[test]
 fn sql_fold_dependency_query_owned_receipts_are_isolated_and_released() {
     let left = probe();

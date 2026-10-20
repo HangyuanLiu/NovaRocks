@@ -28,17 +28,21 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::exec::chunk::Chunk;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::exec::pipeline::schedule::observer::Observable;
+use crate::exec::pipeline::{
+    input::{PreparedInput, RawInput},
+    shape::{SinkKernel, SinkStep, Transform},
+    step::{AdmissionNext, NextStep, WaitFact, WaitReason},
+    step_context::StepContext,
+};
 use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::runtime_state::RuntimeState;
 
 use super::distinct_set_shared::{DistinctSetSemantics, DistinctSetSharedState};
 
@@ -65,14 +69,13 @@ impl<S: DistinctSetSemantics> OperatorFactory for DistinctSetSinkFactory<S> {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(DistinctSetSinkOperator::<S> {
+        Box::new(Transform::hydrating(DistinctSetSinkOperator::<S> {
             name: self.name.clone(),
             stage: self.stage,
             state: self.state.clone(),
-            finished: false,
             mem_tracker: None,
             _semantics: PhantomData,
-        })
+        }))
     }
 
     fn is_sink(&self) -> bool {
@@ -84,12 +87,11 @@ struct DistinctSetSinkOperator<S: DistinctSetSemantics> {
     name: String,
     stage: usize,
     state: DistinctSetSharedState<S>,
-    finished: bool,
     mem_tracker: Option<Arc<MemTracker>>,
     _semantics: PhantomData<S>,
 }
 
-impl<S: DistinctSetSemantics> Operator for DistinctSetSinkOperator<S> {
+impl<S: DistinctSetSemantics> OperatorLifecycle for DistinctSetSinkOperator<S> {
     fn name(&self) -> &str {
         &self.name
     }
@@ -97,61 +99,51 @@ impl<S: DistinctSetSemantics> Operator for DistinctSetSinkOperator<S> {
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
         self.mem_tracker = Some(tracker);
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
 }
-
-impl<S: DistinctSetSemantics> ProcessorOperator for DistinctSetSinkOperator<S> {
-    fn need_input(&self) -> bool {
-        !self.is_finished() && self.state.controller().is_stage_ready(self.stage)
-    }
-
-    fn has_output(&self) -> bool {
-        false
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.finished || chunk.is_empty() {
-            return Ok(());
+impl<S: DistinctSetSemantics> InputEncodingPolicy for DistinctSetSinkOperator<S> {}
+impl<S: DistinctSetSemantics> SinkKernel for DistinctSetSinkOperator<S> {
+    fn admission(
+        &self,
+        _: &mut StepContext<'_>,
+        _: &RawInput,
+    ) -> ExecutionResult<Option<AdmissionNext>> {
+        let observable = self.state.controller().observable();
+        let observed_generation = observable.generation();
+        if self.state.controller().is_stage_ready(self.stage) {
+            return Ok(None);
         }
-        if self.stage == 0 {
-            let tracker = self.mem_tracker.as_ref().ok_or_else(|| {
-                "distinct set key-table memory tracker must be bound before ingestion".to_string()
-            })?;
-            self.state.ingest_build(&chunk, Arc::clone(tracker))?;
-        } else {
-            self.state.ingest_probe(self.stage, &chunk)?;
-        }
-        Ok(())
+        Ok(Some(AdmissionNext::Wait(WaitFact {
+            reason: WaitReason::Dependency,
+            observable,
+            observed_generation,
+            deadline: None,
+        })))
     }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(None)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
+    fn consume(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<SinkStep> {
+        let chunk = input.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        if !chunk.is_empty() {
+            if self.stage == 0 {
+                let tracker = self.mem_tracker.as_ref().ok_or_else(|| {
+                    novarocks_functions::KernelFailure::InvalidProgram(
+                        novarocks_functions::KernelDiagnostic::new(
+                            "distinct set key-table memory tracker is not bound",
+                        ),
+                    )
+                })?;
+                self.state.ingest_build(&chunk, Arc::clone(tracker))?;
+            } else {
+                self.state.ingest_probe(self.stage, &chunk)?;
+            }
         }
-        self.finished = true;
+        Ok(SinkStep::new(NextStep::NeedInput, rows))
+    }
+    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
         self.state.finish_stage(self.stage)?;
-        Ok(())
-    }
-
-    fn sink_observable(&self) -> Option<Arc<Observable>> {
-        if self.finished {
-            return None;
-        }
-        Some(self.state.controller().observable())
+        Ok(SinkStep::new(NextStep::Finished, 0))
     }
 }

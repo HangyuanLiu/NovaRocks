@@ -34,6 +34,9 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use std::collections::BTreeMap;
+#[path = "state_codec_failure.rs"]
+mod failure;
+pub use failure::StateCodecFailure;
 
 pub const STATE_VERSION_V1: u8 = 0x01;
 const CANONICAL_F32_NAN_BITS: u32 = 0x7FC0_0000;
@@ -64,7 +67,7 @@ pub fn encode_count_state(count: i64) -> Vec<u8> {
     out
 }
 
-pub fn decode_count_state(bytes: &[u8]) -> Result<i64, String> {
+pub fn decode_count_state(bytes: &[u8]) -> Result<i64, StateCodecFailure> {
     if is_empty_state(bytes) {
         return Ok(0);
     }
@@ -80,7 +83,7 @@ pub fn encode_bool_state(count_true: i64, count_false: i64) -> Vec<u8> {
     out
 }
 
-pub fn decode_bool_state(bytes: &[u8]) -> Result<(i64, i64), String> {
+pub fn decode_bool_state(bytes: &[u8]) -> Result<(i64, i64), StateCodecFailure> {
     if is_empty_state(bytes) {
         return Ok((0, 0));
     }
@@ -96,7 +99,7 @@ pub fn encode_sum_int64(row_count: i64, sum: i64) -> Vec<u8> {
     out
 }
 
-pub fn decode_sum_int64(bytes: &[u8]) -> Result<(i64, i64), String> {
+pub fn decode_sum_int64(bytes: &[u8]) -> Result<(i64, i64), StateCodecFailure> {
     if is_empty_state(bytes) {
         return Ok((0, 0));
     }
@@ -112,7 +115,7 @@ pub fn encode_sum_decimal128(row_count: i64, sum: i128) -> Vec<u8> {
     out
 }
 
-pub fn decode_sum_decimal128(bytes: &[u8]) -> Result<(i64, i128), String> {
+pub fn decode_sum_decimal128(bytes: &[u8]) -> Result<(i64, i128), StateCodecFailure> {
     if is_empty_state(bytes) {
         return Ok((0, 0));
     }
@@ -135,7 +138,10 @@ pub struct MultisetEntry {
 
 /// Serializes entries in supplied order; callers that need persistent canonical
 /// state should pass normalized/sorted entries, typically from `union_multisets`.
-pub fn encode_multiset(entries: &[MultisetEntry], key_dtype: &DataType) -> Result<Vec<u8>, String> {
+pub fn encode_multiset(
+    entries: &[MultisetEntry],
+    key_dtype: &DataType,
+) -> Result<Vec<u8>, StateCodecFailure> {
     let key_type_tag = key_type_tag_for_data_type(key_dtype)?;
     if entries.is_empty() {
         return Ok(Vec::new());
@@ -155,16 +161,16 @@ pub fn encode_multiset(entries: &[MultisetEntry], key_dtype: &DataType) -> Resul
 pub fn decode_multiset_with_key_type(
     bytes: &[u8],
     key_dtype: &DataType,
-) -> Result<Vec<MultisetEntry>, String> {
+) -> Result<Vec<MultisetEntry>, StateCodecFailure> {
     let (tag_dtype, entries) = decode_multiset_self_describing(bytes)?;
     if is_empty_state(bytes) {
         return Ok(entries);
     }
     let tag = key_type_tag_for_data_type(&tag_dtype)?;
     if !key_type_tag_matches_data_type(tag, key_dtype) {
-        return Err(format!(
+        return Err(StateCodecFailure::malformed(format_args!(
             "state_codec: multiset key type tag {tag} does not match expected {key_dtype:?}"
-        ));
+        )));
     }
     Ok(entries)
 }
@@ -173,29 +179,37 @@ pub fn decode_multiset_with_key_type(
 /// vector. The key slice is borrowed from `bytes` and is valid only for the
 /// duration of the callback. This is the allocation-free decode path used by
 /// aggregate states whose owned copies must be created with a query tracker.
-pub fn visit_multiset_with_key_type(
+pub fn visit_multiset_with_key_type<E: From<StateCodecFailure>>(
     bytes: &[u8],
     key_dtype: &DataType,
-    mut visit: impl FnMut(&[u8], i64) -> Result<(), String>,
-) -> Result<(), String> {
+    mut visit: impl FnMut(&[u8], i64) -> Result<(), E>,
+) -> Result<(), E> {
     if is_empty_state(bytes) {
         return Ok(());
     }
     if bytes.first().copied() != Some(STATE_VERSION_V1) {
-        return Err("state_codec: multiset unsupported version byte".to_string());
+        return Err((StateCodecFailure::malformed(
+            "state_codec: multiset unsupported version byte",
+        ))
+        .into());
     }
     let Some((&key_type_tag, rest)) = bytes[1..].split_first() else {
-        return Err("state_codec: multiset missing key type tag".to_string());
+        return Err(
+            (StateCodecFailure::malformed("state_codec: multiset missing key type tag")).into(),
+        );
     };
     if !key_type_tag_matches_data_type(key_type_tag, key_dtype) {
-        return Err(format!(
+        return Err((StateCodecFailure::malformed(format_args!(
             "state_codec: multiset key type tag {key_type_tag} does not match expected {key_dtype:?}"
-        ));
+        ))).into());
     }
     let mut cursor = rest;
     let num_entries = read_uleb128(&mut cursor)?;
     if num_entries == 0 {
-        return Err("state_codec: multiset zero entry count must use empty state".to_string());
+        return Err((StateCodecFailure::malformed(
+            "state_codec: multiset zero entry count must use empty state",
+        ))
+        .into());
     }
     for _ in 0..num_entries {
         let before_key = cursor;
@@ -205,29 +219,38 @@ pub fn visit_multiset_with_key_type(
         visit(&before_key[..key_len], count)?;
     }
     if !cursor.is_empty() {
-        return Err("state_codec: multiset trailing bytes after entries".to_string());
+        return Err((StateCodecFailure::malformed(
+            "state_codec: multiset trailing bytes after entries",
+        ))
+        .into());
     }
     Ok(())
 }
 
 pub fn decode_multiset_self_describing(
     bytes: &[u8],
-) -> Result<(DataType, Vec<MultisetEntry>), String> {
+) -> Result<(DataType, Vec<MultisetEntry>), StateCodecFailure> {
     if is_empty_state(bytes) {
         return Ok((DataType::Null, Vec::new()));
     }
     if bytes.first().copied() != Some(STATE_VERSION_V1) {
-        return Err("state_codec: multiset unsupported version byte".to_string());
+        return Err(StateCodecFailure::malformed(
+            "state_codec: multiset unsupported version byte",
+        ));
     }
 
     let Some((&key_type_tag, rest)) = bytes[1..].split_first() else {
-        return Err("state_codec: multiset missing key type tag".to_string());
+        return Err(StateCodecFailure::malformed(
+            "state_codec: multiset missing key type tag",
+        ));
     };
     let key_dtype = data_type_for_key_type_tag(key_type_tag)?;
     let mut cursor = rest;
     let num_entries = read_uleb128(&mut cursor)?;
     if num_entries == 0 {
-        return Err("state_codec: multiset zero entry count must use empty state".to_string());
+        return Err(StateCodecFailure::malformed(
+            "state_codec: multiset zero entry count must use empty state",
+        ));
     }
     let mut entries = Vec::new();
     for _ in 0..num_entries {
@@ -240,26 +263,32 @@ pub fn decode_multiset_self_describing(
     }
 
     if !cursor.is_empty() {
-        return Err("state_codec: multiset trailing bytes after entries".to_string());
+        return Err(StateCodecFailure::malformed(
+            "state_codec: multiset trailing bytes after entries",
+        ));
     }
     Ok((key_dtype, entries))
 }
 
 #[cfg(test)]
-pub fn decode_multiset(bytes: &[u8]) -> Result<Vec<MultisetEntry>, String> {
+pub fn decode_multiset(bytes: &[u8]) -> Result<Vec<MultisetEntry>, StateCodecFailure> {
     decode_multiset_with_key_type(bytes, &DataType::Int64)
 }
 
 pub fn union_multisets(
     a: &[MultisetEntry],
     b: &[MultisetEntry],
-) -> Result<Vec<MultisetEntry>, String> {
+) -> Result<Vec<MultisetEntry>, StateCodecFailure> {
     let mut counts = BTreeMap::<Vec<u8>, i64>::new();
     for entry in a.iter().chain(b.iter()) {
         let current = counts.entry(entry.key_bytes.clone()).or_default();
-        *current = current.checked_add(entry.count).ok_or_else(|| {
-            "state_codec: multiset count overflow while unioning entries".to_string()
-        })?;
+        *current =
+            current
+                .checked_add(entry.count)
+                .ok_or_else(|| StateCodecFailure::CountOverflow {
+                    current: *current,
+                    incoming: entry.count,
+                })?;
     }
 
     Ok(counts
@@ -269,7 +298,7 @@ pub fn union_multisets(
         .collect())
 }
 
-pub fn key_type_tag_for_data_type(dtype: &DataType) -> Result<u8, String> {
+pub fn key_type_tag_for_data_type(dtype: &DataType) -> Result<u8, StateCodecFailure> {
     match dtype {
         DataType::Boolean => Ok(KEY_TYPE_BOOLEAN),
         DataType::Int8 => Ok(KEY_TYPE_INT8),
@@ -283,13 +312,13 @@ pub fn key_type_tag_for_data_type(dtype: &DataType) -> Result<u8, String> {
         DataType::Timestamp(TimeUnit::Microsecond, _) => Ok(KEY_TYPE_TIMESTAMP_MICROS),
         DataType::Utf8 => Ok(KEY_TYPE_UTF8),
         DataType::LargeUtf8 => Ok(KEY_TYPE_LARGE_UTF8),
-        other => Err(format!(
+        other => Err(StateCodecFailure::contract(format_args!(
             "state_codec: unsupported multiset key type {other:?}"
-        )),
+        ))),
     }
 }
 
-pub fn data_type_for_key_type_tag(tag: u8) -> Result<DataType, String> {
+pub fn data_type_for_key_type_tag(tag: u8) -> Result<DataType, StateCodecFailure> {
     match tag {
         KEY_TYPE_BOOLEAN => Ok(DataType::Boolean),
         KEY_TYPE_INT8 => Ok(DataType::Int8),
@@ -303,7 +332,9 @@ pub fn data_type_for_key_type_tag(tag: u8) -> Result<DataType, String> {
         KEY_TYPE_TIMESTAMP_MICROS => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
         KEY_TYPE_UTF8 => Ok(DataType::Utf8),
         KEY_TYPE_LARGE_UTF8 => Ok(DataType::LargeUtf8),
-        _ => Err(format!("state_codec: unknown multiset key type tag {tag}")),
+        _ => Err(StateCodecFailure::malformed(format_args!(
+            "state_codec: unknown multiset key type tag {tag}"
+        ))),
     }
 }
 
@@ -343,18 +374,20 @@ pub fn write_uleb128(out: &mut Vec<u8>, mut value: u64) {
 /// Reads one canonical ULEB128 value emitted by `write_uleb128`.
 ///
 /// Bytes already inspected are consumed even on error.
-pub fn read_uleb128(cursor: &mut &[u8]) -> Result<u64, String> {
+pub fn read_uleb128(cursor: &mut &[u8]) -> Result<u64, StateCodecFailure> {
     let original = *cursor;
     let mut result: u64 = 0;
     let mut shift = 0u32;
     loop {
         let (&byte, rest) = cursor
             .split_first()
-            .ok_or_else(|| "state_codec: ULEB128 truncated".to_string())?;
+            .ok_or_else(|| StateCodecFailure::malformed("state_codec: ULEB128 truncated"))?;
         *cursor = rest;
         let payload = (byte & 0x7F) as u64;
         if shift >= 64 || payload > (u64::MAX >> shift) {
-            return Err("state_codec: ULEB128 overflow".to_string());
+            return Err(StateCodecFailure::malformed(
+                "state_codec: ULEB128 overflow",
+            ));
         }
         result |= payload << shift;
         if byte & 0x80 == 0 {
@@ -363,13 +396,17 @@ pub fn read_uleb128(cursor: &mut &[u8]) -> Result<u64, String> {
             let mut canonical = Vec::new();
             write_uleb128(&mut canonical, result);
             if consumed != canonical {
-                return Err("state_codec: ULEB128 non-canonical".to_string());
+                return Err(StateCodecFailure::malformed(
+                    "state_codec: ULEB128 non-canonical",
+                ));
             }
             return Ok(result);
         }
         shift += 7;
         if shift >= 64 {
-            return Err("state_codec: ULEB128 too long".to_string());
+            return Err(StateCodecFailure::malformed(
+                "state_codec: ULEB128 too long",
+            ));
         }
     }
 }
@@ -405,7 +442,11 @@ pub enum KeyValue {
     Utf8(String),
 }
 
-pub fn write_key_at(out: &mut Vec<u8>, array: &ArrayRef, idx: usize) -> Result<(), String> {
+pub fn write_key_at(
+    out: &mut Vec<u8>,
+    array: &ArrayRef,
+    idx: usize,
+) -> Result<(), StateCodecFailure> {
     visit_key_bytes_at(array, idx, |bytes| out.extend_from_slice(bytes))
 }
 
@@ -417,7 +458,7 @@ pub fn visit_key_bytes_at(
     array: &ArrayRef,
     idx: usize,
     mut visit: impl FnMut(&[u8]),
-) -> Result<(), String> {
+) -> Result<(), StateCodecFailure> {
     fn emit_uleb128(mut value: u64, visit: &mut impl FnMut(&[u8])) {
         let mut bytes = [0_u8; 10];
         let mut len = 0;
@@ -436,13 +477,15 @@ pub fn visit_key_bytes_at(
         }
     }
     if idx >= array.len() {
-        return Err(format!(
+        return Err(StateCodecFailure::contract(format_args!(
             "state_codec: key index {idx} out of bounds for len {}",
             array.len()
-        ));
+        )));
     }
     if array.is_null(idx) {
-        return Err("state_codec: cannot encode NULL key".to_string());
+        return Err(StateCodecFailure::contract(
+            "state_codec: cannot encode NULL key",
+        ));
     }
 
     match array.data_type() {
@@ -511,11 +554,13 @@ pub fn visit_key_bytes_at(
             visit(bytes);
             Ok(())
         }
-        other => Err(format!("state_codec: unsupported key type {other:?}")),
+        other => Err(StateCodecFailure::contract(format_args!(
+            "state_codec: unsupported key type {other:?}"
+        ))),
     }
 }
 
-pub fn read_key(cursor: &mut &[u8], dtype: &DataType) -> Result<KeyValue, String> {
+pub fn read_key(cursor: &mut &[u8], dtype: &DataType) -> Result<KeyValue, StateCodecFailure> {
     let mut local = *cursor;
     let value =
         match dtype {
@@ -524,7 +569,9 @@ pub fn read_key(cursor: &mut &[u8], dtype: &DataType) -> Result<KeyValue, String
                 match b {
                     0 => Ok(KeyValue::Bool(false)),
                     1 => Ok(KeyValue::Bool(true)),
-                    _ => Err("read_key: non-canonical Boolean".to_string()),
+                    _ => Err(StateCodecFailure::malformed(
+                        "read_key: non-canonical Boolean",
+                    )),
                 }
             }
             DataType::Int8 => Ok(KeyValue::Int8(i8::from_le_bytes(read_fixed::<1>(
@@ -560,19 +607,23 @@ pub fn read_key(cursor: &mut &[u8], dtype: &DataType) -> Result<KeyValue, String
             )),
             DataType::Utf8 | DataType::LargeUtf8 => {
                 let len = read_uleb128(&mut local)?;
-                let len = usize::try_from(len)
-                    .map_err(|_| "read_key: Utf8 length does not fit usize".to_string())?;
+                let len = usize::try_from(len).map_err(|source| StateCodecFailure::Length {
+                    required: len,
+                    source,
+                })?;
                 if local.len() < len {
-                    return Err("read_key: truncated Utf8".to_string());
+                    return Err(StateCodecFailure::malformed("read_key: truncated Utf8"));
                 }
                 let bytes = &local[..len];
                 local = &local[len..];
                 let value = std::str::from_utf8(bytes)
-                    .map_err(|e| format!("read_key: invalid Utf8: {e}"))?
+                    .map_err(StateCodecFailure::Utf8)?
                     .to_string();
                 Ok(KeyValue::Utf8(value))
             }
-            other => Err(format!("read_key: unsupported type {other:?}")),
+            other => Err(StateCodecFailure::contract(format_args!(
+                "read_key: unsupported type {other:?}"
+            ))),
         }?;
     *cursor = local;
     Ok(value)
@@ -581,11 +632,12 @@ pub fn read_key(cursor: &mut &[u8], dtype: &DataType) -> Result<KeyValue, String
 fn downcast_array<'a, T: Array + 'static>(
     array: &'a ArrayRef,
     name: &str,
-) -> Result<&'a T, String> {
-    array
-        .as_any()
-        .downcast_ref::<T>()
-        .ok_or_else(|| format!("state_codec: failed to downcast key array to {name}"))
+) -> Result<&'a T, StateCodecFailure> {
+    array.as_any().downcast_ref::<T>().ok_or_else(|| {
+        StateCodecFailure::contract(format_args!(
+            "state_codec: failed to downcast key array to {name}"
+        ))
+    })
 }
 
 fn canonical_f32_bits(value: f32) -> u32 {
@@ -608,29 +660,42 @@ fn canonical_f64_bits(value: f64) -> u64 {
     }
 }
 
-fn validate_f32_bits(bits: u32) -> Result<(), String> {
+fn validate_f32_bits(bits: u32) -> Result<(), StateCodecFailure> {
     if bits == (-0.0f32).to_bits() {
-        return Err("read_key: non-canonical Float32 negative zero".to_string());
+        return Err(StateCodecFailure::malformed(
+            "read_key: non-canonical Float32 negative zero",
+        ));
     }
     if f32::from_bits(bits).is_nan() && bits != CANONICAL_F32_NAN_BITS {
-        return Err("read_key: non-canonical Float32 NaN".to_string());
+        return Err(StateCodecFailure::malformed(
+            "read_key: non-canonical Float32 NaN",
+        ));
     }
     Ok(())
 }
 
-fn validate_f64_bits(bits: u64) -> Result<(), String> {
+fn validate_f64_bits(bits: u64) -> Result<(), StateCodecFailure> {
     if bits == (-0.0f64).to_bits() {
-        return Err("read_key: non-canonical Float64 negative zero".to_string());
+        return Err(StateCodecFailure::malformed(
+            "read_key: non-canonical Float64 negative zero",
+        ));
     }
     if f64::from_bits(bits).is_nan() && bits != CANONICAL_F64_NAN_BITS {
-        return Err("read_key: non-canonical Float64 NaN".to_string());
+        return Err(StateCodecFailure::malformed(
+            "read_key: non-canonical Float64 NaN",
+        ));
     }
     Ok(())
 }
 
-fn read_fixed<const N: usize>(cursor: &mut &[u8], name: &str) -> Result<[u8; N], String> {
+fn read_fixed<const N: usize>(
+    cursor: &mut &[u8],
+    name: &str,
+) -> Result<[u8; N], StateCodecFailure> {
     if cursor.len() < N {
-        return Err(format!("read_key: truncated {name}"));
+        return Err(StateCodecFailure::malformed(format_args!(
+            "read_key: truncated {name}"
+        )));
     }
     let mut bytes = [0u8; N];
     bytes.copy_from_slice(&cursor[..N]);
@@ -638,17 +703,21 @@ fn read_fixed<const N: usize>(cursor: &mut &[u8], name: &str) -> Result<[u8; N],
     Ok(bytes)
 }
 
-fn validate_fixed_state(bytes: &[u8], expected_len: usize, kind: &str) -> Result<(), String> {
+fn validate_fixed_state(
+    bytes: &[u8],
+    expected_len: usize,
+    kind: &str,
+) -> Result<(), StateCodecFailure> {
     if bytes.first().copied() != Some(STATE_VERSION_V1) {
-        return Err(format!(
+        return Err(StateCodecFailure::malformed(format_args!(
             "state_codec: {kind} state unsupported version byte"
-        ));
+        )));
     }
     if bytes.len() != expected_len {
-        return Err(format!(
+        return Err(StateCodecFailure::malformed(format_args!(
             "state_codec: {kind} state invalid length {}, expected {expected_len}",
             bytes.len()
-        ));
+        )));
     }
     Ok(())
 }
@@ -668,21 +737,25 @@ fn read_i128_at<const OFFSET: usize>(bytes: &[u8]) -> i128 {
 /// Reads one canonical SLEB128 value emitted by `write_sleb128`.
 ///
 /// Bytes already inspected are consumed even on error.
-pub fn read_sleb128(cursor: &mut &[u8]) -> Result<i64, String> {
+pub fn read_sleb128(cursor: &mut &[u8]) -> Result<i64, StateCodecFailure> {
     let original = *cursor;
     let mut result: i64 = 0;
     let mut shift = 0u32;
     loop {
         let (&byte, rest) = cursor
             .split_first()
-            .ok_or_else(|| "state_codec: SLEB128 truncated".to_string())?;
+            .ok_or_else(|| StateCodecFailure::malformed("state_codec: SLEB128 truncated"))?;
         *cursor = rest;
         let payload = byte & 0x7F;
         if shift == 63 && byte & 0x80 == 0 && payload != 0x00 && payload != 0x7F {
-            return Err("state_codec: SLEB128 overflow".to_string());
+            return Err(StateCodecFailure::malformed(
+                "state_codec: SLEB128 overflow",
+            ));
         }
         if shift >= 64 {
-            return Err("state_codec: SLEB128 too long".to_string());
+            return Err(StateCodecFailure::malformed(
+                "state_codec: SLEB128 too long",
+            ));
         }
         result |= (payload as i64) << shift;
         shift += 7;
@@ -696,12 +769,16 @@ pub fn read_sleb128(cursor: &mut &[u8]) -> Result<i64, String> {
             let mut canonical = Vec::new();
             write_sleb128(&mut canonical, result);
             if consumed != canonical {
-                return Err("state_codec: SLEB128 non-canonical".to_string());
+                return Err(StateCodecFailure::malformed(
+                    "state_codec: SLEB128 non-canonical",
+                ));
             }
             return Ok(result);
         }
         if shift >= 64 {
-            return Err("state_codec: SLEB128 too long".to_string());
+            return Err(StateCodecFailure::malformed(
+                "state_codec: SLEB128 too long",
+            ));
         }
     }
 }
@@ -831,13 +908,19 @@ mod fixed_size_tests {
     fn fixed_size_states_reject_wrong_version() {
         let mut count = encode_count_state(42);
         count[0] = 0x02;
-        assert!(decode_count_state(&count).unwrap_err().contains("version"));
+        assert!(
+            decode_count_state(&count)
+                .unwrap_err()
+                .to_string()
+                .contains("version")
+        );
 
         let mut bool_state = encode_bool_state(3, 5);
         bool_state[0] = 0x02;
         assert!(
             decode_bool_state(&bool_state)
                 .unwrap_err()
+                .to_string()
                 .contains("version")
         );
 
@@ -846,6 +929,7 @@ mod fixed_size_tests {
         assert!(
             decode_sum_int64(&sum_int64)
                 .unwrap_err()
+                .to_string()
                 .contains("version")
         );
 
@@ -854,6 +938,7 @@ mod fixed_size_tests {
         assert!(
             decode_sum_decimal128(&sum_decimal128)
                 .unwrap_err()
+                .to_string()
                 .contains("version")
         );
     }
@@ -863,21 +948,25 @@ mod fixed_size_tests {
         assert!(
             decode_count_state(&[STATE_VERSION_V1])
                 .unwrap_err()
+                .to_string()
                 .contains("length")
         );
         assert!(
             decode_bool_state(&[STATE_VERSION_V1])
                 .unwrap_err()
+                .to_string()
                 .contains("length")
         );
         assert!(
             decode_sum_int64(&[STATE_VERSION_V1])
                 .unwrap_err()
+                .to_string()
                 .contains("length")
         );
         assert!(
             decode_sum_decimal128(&[STATE_VERSION_V1])
                 .unwrap_err()
+                .to_string()
                 .contains("length")
         );
     }
@@ -1038,12 +1127,12 @@ mod key_tests {
             (
                 Arc::new(StringArray::from(vec![Some("hello")])),
                 DataType::Utf8,
-                KeyValue::Utf8("hello".to_string()),
+                KeyValue::Utf8("hello".to_owned()),
             ),
             (
                 Arc::new(LargeStringArray::from(vec![Some("large")])),
                 DataType::LargeUtf8,
-                KeyValue::Utf8("large".to_string()),
+                KeyValue::Utf8("large".to_owned()),
             ),
         ];
 
@@ -1060,14 +1149,14 @@ mod key_tests {
     fn key_float64_read_rejects_non_canonical_nan() {
         let mut cursor = &0x7FF8_0000_0000_0001u64.to_le_bytes()[..];
         let err = read_key(&mut cursor, &DataType::Float64).unwrap_err();
-        assert!(err.contains("non-canonical"));
+        assert!(err.to_string().contains("non-canonical"));
     }
 
     #[test]
     fn key_float64_read_rejects_negative_zero() {
         let mut cursor = &(-0.0_f64).to_bits().to_le_bytes()[..];
         let err = read_key(&mut cursor, &DataType::Float64).unwrap_err();
-        assert!(err.contains("non-canonical"));
+        assert!(err.to_string().contains("non-canonical"));
     }
 
     #[test]
@@ -1099,12 +1188,12 @@ mod key_tests {
 
         let mut null_buf = vec![0xAA];
         let err = write_key_at(&mut null_buf, &arr, 1).unwrap_err();
-        assert!(err.contains("NULL key"));
+        assert!(err.to_string().contains("NULL key"));
         assert_eq!(null_buf, vec![0xAA]);
 
         let mut oob_buf = vec![0xBB];
         let err = write_key_at(&mut oob_buf, &arr, 2).unwrap_err();
-        assert!(err.contains("out of bounds"));
+        assert!(err.to_string().contains("out of bounds"));
         assert_eq!(oob_buf, vec![0xBB]);
     }
 
@@ -1113,11 +1202,11 @@ mod key_tests {
         let arr: ArrayRef = Arc::new(BinaryArray::from(vec![Some(&b"ab"[..])]));
         let mut buf = Vec::new();
         let err = write_key_at(&mut buf, &arr, 0).unwrap_err();
-        assert!(err.contains("unsupported key type"));
+        assert!(err.to_string().contains("unsupported key type"));
 
         let mut cursor: &[u8] = &[];
         let err = read_key(&mut cursor, &DataType::Binary).unwrap_err();
-        assert!(err.contains("unsupported type"));
+        assert!(err.to_string().contains("unsupported type"));
     }
 }
 
@@ -1211,6 +1300,7 @@ mod multiset_tests {
         assert!(
             union_multisets(&a, &b)
                 .unwrap_err()
+                .to_string()
                 .contains("count overflow")
         );
     }
@@ -1222,6 +1312,7 @@ mod multiset_tests {
         assert!(
             decode_multiset_with_key_type(&bytes, &DataType::Int64)
                 .unwrap_err()
+                .to_string()
                 .contains("version")
         );
     }
@@ -1236,6 +1327,7 @@ mod multiset_tests {
         assert!(
             decode_multiset_with_key_type(&bytes, &DataType::Int64)
                 .unwrap_err()
+                .to_string()
                 .contains("zero entry count must use empty state")
         );
     }
@@ -1257,6 +1349,7 @@ mod multiset_tests {
         assert!(
             decode_multiset_with_key_type(&bytes, &DataType::Int64)
                 .unwrap_err()
+                .to_string()
                 .contains("trailing")
         );
     }
@@ -1273,6 +1366,7 @@ mod multiset_tests {
         assert!(
             decode_multiset_with_key_type(&bool_bytes, &DataType::Boolean)
                 .unwrap_err()
+                .to_string()
                 .contains("non-canonical")
         );
 
@@ -1286,6 +1380,7 @@ mod multiset_tests {
         assert!(
             decode_multiset_with_key_type(&float_bytes, &DataType::Float64)
                 .unwrap_err()
+                .to_string()
                 .contains("non-canonical")
         );
     }
@@ -1302,6 +1397,7 @@ mod multiset_tests {
         assert!(
             decode_multiset_with_key_type(&bytes, &DataType::Int64)
                 .unwrap_err()
+                .to_string()
                 .contains("SLEB128")
         );
     }
@@ -1319,7 +1415,85 @@ mod multiset_tests {
         assert!(
             decode_multiset_with_key_type(&bytes, &DataType::Boolean)
                 .unwrap_err()
+                .to_string()
                 .contains("key type tag")
         );
+    }
+}
+
+#[cfg(test)]
+mod source_properties {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::{error::Error, sync::Arc};
+    #[test]
+    fn mv_codec_utf8_failure_keeps_actual_validation_source_without_payload_owner() {
+        let bytes = Arc::new(vec![1u8, 0xff]);
+        let weak = Arc::downgrade(&bytes);
+        let cause = read_key(&mut bytes.as_slice(), &DataType::Utf8).unwrap_err();
+        assert_eq!(
+            cause.failure_fact(),
+            novarocks_functions::DataFailureReason::InvalidEncoding.failure_fact()
+        );
+        assert!(cause.source().unwrap().is::<std::str::Utf8Error>());
+        drop(bytes);
+        assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn mv_codec_carrier_contract_is_bounded_and_releases_actual_field_graph() {
+        let field = Arc::new(arrow::datatypes::Field::new(
+            "field resource cancelled".repeat(100),
+            DataType::Int64,
+            true,
+        ));
+        let weak = Arc::downgrade(&field);
+        let ty = DataType::Struct(vec![field.clone()].into());
+        let cause = key_type_tag_for_data_type(&ty).unwrap_err();
+        assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
+        assert!(cause.to_string().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
+        drop(ty);
+        drop(field);
+        assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn mv_codec_union_count_overflow_is_a_numeric_value_failure() {
+        let key = 1_i64.to_le_bytes().to_vec();
+        let cause = union_multisets(
+            &[MultisetEntry {
+                key_bytes: key.clone(),
+                count: i64::MAX,
+            }],
+            &[MultisetEntry {
+                key_bytes: key,
+                count: 1,
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(
+            cause.failure_fact(),
+            novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+        );
+    }
+    #[test]
+    fn mv_codec_visitor_preserves_its_original_typed_control_cause() {
+        let array: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let mut key = Vec::new();
+        write_key_at(&mut key, &array, 0).unwrap();
+        let bytes = encode_multiset(
+            &[MultisetEntry {
+                key_bytes: key,
+                count: 1,
+            }],
+            &DataType::Int64,
+        )
+        .unwrap();
+        let original = crate::runtime::fragment::ExecutionFailure::from(
+            novarocks_functions::KernelFailure::DeadlineExceeded,
+        );
+        let cause =
+            visit_multiset_with_key_type(&bytes, &DataType::Int64, |_, _| Err(original.clone()))
+                .unwrap_err();
+        assert_eq!(cause, original);
+        assert_eq!(cause.failure_fact().class(), FailureClass::Control);
     }
 }

@@ -81,7 +81,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -881,7 +881,7 @@ fn cardinality_required_child_errors_shapes_and_nonnull_promise_are_not_erased()
         let mut kernel = instance(&source);
         assert!(matches!(
             kernel.evaluate(Selection::all(1), &[bad], &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
         let after = Control::default();
         assert_eq!(
@@ -902,7 +902,7 @@ fn cardinality_required_child_errors_shapes_and_nonnull_promise_are_not_erased()
             &[EvaluatedArgument::Column(&null)],
             &Control::default()
         ),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let empty = Selection::try_sparse(4, &[]).unwrap();
     assert!(
@@ -989,7 +989,7 @@ fn cardinality_every_compile_callback_keeps_three_causes_and_ordinary_tail() {
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let error = prepared_for_test_with_control(
                     "cardinality",
@@ -1133,14 +1133,17 @@ fn cardinality_actual_offset_and_null_loops_reach_quantum_with_sampled_first_cau
 
 #[test]
 fn cardinality_output_layout_rejects_unrepresentable_i32_and_validity_before_allocation() {
+    use super::super::collection_offset_count::output_capacity;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
     assert!(output_capacity(0).is_ok());
     assert!(output_capacity(320).is_ok());
-    assert_eq!(
-        output_capacity(usize::MAX),
-        Err(KernelFailure::ResourceExhausted)
-    );
-    assert_eq!(
-        output_capacity(isize::MAX as usize / std::mem::size_of::<i32>() + 1),
-        Err(KernelFailure::ResourceExhausted)
-    );
+    for rows in [
+        usize::MAX,
+        isize::MAX as usize / std::mem::size_of::<i32>() + 1,
+    ] {
+        assert_eq!(
+            output_capacity(rows).unwrap_err().failure_fact().class(),
+            FailureClass::Representation
+        );
+    }
 }

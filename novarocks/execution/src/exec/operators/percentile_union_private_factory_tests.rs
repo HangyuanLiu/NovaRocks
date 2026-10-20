@@ -165,6 +165,7 @@ fn encoded(count: usize) -> Vec<u8> {
         novarocks_functions::approx_percentile_core::add_value(&mut state, n as f64).unwrap();
     }
     novarocks_functions::approx_percentile_core::encode_state(&state)
+        .expect("percentile codec fixture")
 }
 #[test]
 fn percentile_union_private_real_factory_single_partial_final_binary_exact() {
@@ -199,6 +200,7 @@ fn percentile_union_private_real_factory_single_partial_final_binary_exact() {
             .unwrap()
             .value(0),
         novarocks_functions::approx_percentile_core::encode_state(&expected)
+            .expect("percentile codec fixture")
     );
     // The later Final output is a separate owner. Release this already checked
     // Single output before shadowing its binding and testing the final last ref.
@@ -237,6 +239,7 @@ fn percentile_union_private_real_factory_single_partial_final_binary_exact() {
             .unwrap()
             .value(0),
         novarocks_functions::approx_percentile_core::encode_state(&expected)
+            .expect("percentile codec fixture")
     );
     drop(actual);
     drop(left);
@@ -262,7 +265,7 @@ fn percentile_union_private_real_factory_empty_encodes_non_null_state() {
     assert_eq!(tracker.current(), 0);
 }
 #[test]
-fn percentile_union_private_real_factory_whole_long_data_exact_and_drop() {
+fn percentile_union_private_real_factory_long_shape_is_invariant_and_wire_value_is_data() {
     use novarocks_functions::AggregateKernelPhase as P;
     let ty = DataType::List(Arc::new(arrow::datatypes::Field::new(
         "item",
@@ -276,34 +279,76 @@ fn percentile_union_private_real_factory_whole_long_data_exact_and_drop() {
         ),
         true,
     )));
-    let program = union_program(ty.clone(), false);
-    let array = arrow::array::new_null_array(&ty, 1);
-    let expected=novarocks_functions::approx_percentile_aggregate_core::merge_row(
+    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+    let mut invalid_wire = encoded(1);
+    invalid_wire.truncate(2);
+    for (ty, array, class, reason) in [
+        (
+            ty.clone(),
+            arrow::array::new_null_array(&ty, 1),
+            FailureClass::Invariant,
+            395,
+        ),
+        (
+            DataType::Binary,
+            Arc::new(BinaryArray::from_vec(vec![invalid_wire.as_slice()])) as ArrayRef,
+            FailureClass::Data,
+            42,
+        ),
+    ] {
+        let program = union_program(ty, false);
+        let expected=novarocks_functions::approx_percentile_aggregate_core::merge_row(
         &mut novarocks_functions::approx_percentile_core::PercentileState::default(),&array,0,
         novarocks_functions::approx_percentile_aggregate_core::ApproxPercentileDiagnostic::UnweightedUpdate).unwrap_err();
-    let chunk = union_chunk(&program, array);
-    let tracker = MemTracker::new_root("UnionLongFactoryData");
-    {
-        let factory = factory(&program, P::Single);
-        let mut operator = factory.create(1, 0);
-        operator.set_construction_factory(aggregate_fixture::runtime_construction_factory(
-            tracker.clone(),
-            factory.error.clone(),
-        ));
-        operator.set_mem_tracker(tracker.clone());
-        operator.prepare().expect("prepare actual aggregate schema");
-        let result = operator
-            .as_processor_mut()
-            .unwrap()
-            .push_chunk(&RuntimeState::default(), chunk)
+        let chunk = union_chunk(&program, array);
+        let tracker = MemTracker::new_root("UnionLongFactoryData");
+        {
+            let factory = factory(&program, P::Single);
+            let mut operator = factory.create(1, 0);
+            operator.set_construction_factory(aggregate_fixture::runtime_construction_factory(
+                tracker.clone(),
+                factory.error.clone(),
+            ));
+            operator.set_mem_tracker(tracker.clone());
+            operator.prepare().expect("prepare actual aggregate schema");
+            let result = crate::exec::pipeline::test_driver::TestDriver::new(
+                operator.as_mut(),
+                &RuntimeState::default(),
+            )
+            .input_without_output(chunk)
             .unwrap_err();
-        assert_eq!(
-            result.to_string(),
-            novarocks_functions::aggregate_format::AggregateFailureStage::Update
-                .message(&expected)
-                .to_string()
-        );
-        assert!(result.to_string().len() > 512);
+            let fact = result.failure_fact();
+            assert_eq!(fact, expected.failure_fact());
+            assert_eq!(fact.class(), class);
+            assert_eq!(fact.reason().domain(), domain::KERNEL.get());
+            assert_eq!(fact.reason().code(), reason);
+            assert!(fact.resource().is_none());
+            assert!(fact.representation().is_none());
+            match class {
+                FailureClass::Invariant => {
+                    assert_eq!(result.detail(), expected.to_string());
+                    assert!(result.detail().len() <= 512);
+                }
+                FailureClass::Data => {
+                    assert_eq!(
+                        result.to_string(),
+                        novarocks_functions::aggregate_format::AggregateFailureStage::Update
+                            .message(&expected)
+                            .to_string()
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                crate::exec::pipeline::test_driver::TestDriver::new(
+                    operator.as_mut(),
+                    &RuntimeState::default()
+                )
+                .advance_to_boundary()
+                .unwrap_err()
+                .same_occurrence(&result)
+            );
+        }
+        assert_eq!(tracker.current(), 0);
     }
-    assert_eq!(tracker.current(), 0);
 }

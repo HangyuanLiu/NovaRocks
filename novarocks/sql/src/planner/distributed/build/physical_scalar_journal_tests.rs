@@ -61,7 +61,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after the original refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -358,7 +358,7 @@ fn scalar_journal_foreign_source_and_every_actual_callback_preserve_original_cau
         for stop in 0..trace.len() {
             for cause in CAUSES {
                 let control = Control {
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert!(

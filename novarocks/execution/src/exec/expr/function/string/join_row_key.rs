@@ -21,8 +21,9 @@ use arrow::array::{Array, ArrayRef, BinaryArray, Int64Array, LargeBinaryArray, S
 use arrow::datatypes::DataType;
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprArena, ExprId, expression_contract};
 use crate::exec::mv::stable_join_row_key;
+use crate::runtime::fragment::ExecutionResult;
 
 enum BinaryInput<'a> {
     Binary(&'a BinaryArray),
@@ -50,7 +51,12 @@ pub fn eval_join_row_key<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 4 {
+        return Err(expression_contract(
+            "join_row_key requires four prepared arguments",
+        ));
+    }
     let left_uuid_array = arena.eval(args[0], chunk)?;
     let left_row_id_array = arena.eval(args[1], chunk)?;
     let right_uuid_array = arena.eval(args[2], chunk)?;
@@ -62,6 +68,7 @@ pub fn eval_join_row_key<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let right_row_id = int64_input(&right_row_id_array, "right_row_id")?;
 
     let mut values = Vec::with_capacity(chunk.len());
+    let mut output_offset = 0;
     for row in 0..chunk.len() {
         if left_object_id.is_null(row)
             || left_row_id.is_null(row)
@@ -71,45 +78,56 @@ pub fn eval_join_row_key<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             values.push(None);
             continue;
         }
-        values.push(Some(stable_join_row_key(
+        let value = stable_join_row_key(
             left_object_id.value(row),
             left_row_id.value(row),
             right_object_id.value(row),
             right_row_id.value(row),
-        )));
+        );
+        output_offset = novarocks_functions::aggregate_scalar::checked_utf8_output_offset(
+            output_offset,
+            value.len(),
+        )?;
+        values.push(Some(value));
     }
 
     Ok(Arc::new(StringArray::from(values)) as ArrayRef)
 }
 
-fn binary_input<'a>(array: &'a ArrayRef, arg_name: &str) -> Result<BinaryInput<'a>, String> {
+fn binary_input<'a>(array: &'a ArrayRef, arg_name: &str) -> ExecutionResult<BinaryInput<'a>> {
     match array.data_type() {
         DataType::Binary => Ok(BinaryInput::Binary(
             array
                 .as_any()
                 .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| format!("join_row_key: failed to downcast {arg_name} to Binary"))?,
+                .ok_or_else(|| {
+                    expression_contract(format_args!(
+                        "join_row_key: failed to downcast {arg_name} to Binary"
+                    ))
+                })?,
         )),
         DataType::LargeBinary => Ok(BinaryInput::LargeBinary(
             array
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()
                 .ok_or_else(|| {
-                    format!("join_row_key: failed to downcast {arg_name} to LargeBinary")
+                    expression_contract(format_args!(
+                        "join_row_key: failed to downcast {arg_name} to LargeBinary"
+                    ))
                 })?,
         )),
-        other => Err(format!(
+        other => Err(expression_contract(format_args!(
             "join_row_key expects {arg_name} to be BINARY or LARGE_BINARY, got {other:?}"
-        )),
+        ))),
     }
 }
 
-fn int64_input<'a>(array: &'a ArrayRef, arg_name: &str) -> Result<&'a Int64Array, String> {
+fn int64_input<'a>(array: &'a ArrayRef, arg_name: &str) -> ExecutionResult<&'a Int64Array> {
     array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-        format!(
+        expression_contract(format_args!(
             "join_row_key expects {arg_name} to be BIGINT, got {:?}",
             array.data_type()
-        )
+        ))
     })
 }
 

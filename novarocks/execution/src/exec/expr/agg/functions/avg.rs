@@ -44,7 +44,9 @@ fn is_count_type(data_type: &DataType) -> bool {
     )
 }
 
-fn avg_spec_from_input_type(data_type: &DataType) -> Result<AggSpec, String> {
+fn avg_spec_from_input_type(
+    data_type: &DataType,
+) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
     match data_type {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Ok(AggSpec {
             kind: AggKind::AvgInt,
@@ -78,31 +80,41 @@ fn avg_spec_from_input_type(data_type: &DataType) -> Result<AggSpec, String> {
             input_arg_type: None,
             count_all: false,
         }),
-        other => Err(format!("avg unsupported input type: {:?}", other)),
+        other => Err(
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "avg unsupported input type: {:?}",
+                other
+            )),
+        ),
     }
 }
 
 fn avg_spec_from_intermediate_type(
     func: &AggFunction,
     data_type: &DataType,
-) -> Result<AggSpec, String> {
+) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
     // StarRocks avg intermediate is often a VARBINARY/VARCHAR blob.
     // When the intermediate is opaque (Binary/Utf8), we must rely on FE type signature.
     match data_type {
         DataType::Binary | DataType::Utf8 => {
-            let sig = agg_type_signature(func)
-                .ok_or_else(|| "avg intermediate type signature missing".to_string())?;
-            let output_type = sig
-                .output_type
-                .as_ref()
-                .ok_or_else(|| "avg intermediate output_type signature missing".to_string())?;
+            let sig = agg_type_signature(func).ok_or_else(|| {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "avg intermediate type signature missing",
+                )
+            })?;
+            let output_type = sig.output_type.as_ref().ok_or_else(|| {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "avg intermediate output_type signature missing",
+                )
+            })?;
 
             match output_type {
                 DataType::Decimal128(p, s) => {
-                    let input_arg_type = sig
-                        .input_arg_type
-                        .clone()
-                        .ok_or_else(|| "avg intermediate input_arg_type missing".to_string())?;
+                    let input_arg_type = sig.input_arg_type.clone().ok_or_else(|| {
+                        crate::exec::expr::agg::functions::aggregate_binding_contract(
+                            "avg intermediate input_arg_type missing",
+                        )
+                    })?;
                     Ok(AggSpec {
                         kind: AggKind::AvgDecimal128,
                         output_type: DataType::Decimal128(*p, *s),
@@ -112,10 +124,11 @@ fn avg_spec_from_intermediate_type(
                     })
                 }
                 DataType::Decimal256(p, s) => {
-                    let input_arg_type = sig
-                        .input_arg_type
-                        .clone()
-                        .ok_or_else(|| "avg intermediate input_arg_type missing".to_string())?;
+                    let input_arg_type = sig.input_arg_type.clone().ok_or_else(|| {
+                        crate::exec::expr::agg::functions::aggregate_binding_contract(
+                            "avg intermediate input_arg_type missing",
+                        )
+                    })?;
                     Ok(AggSpec {
                         kind: AggKind::AvgDecimal256,
                         output_type: DataType::Decimal256(*p, *s),
@@ -126,7 +139,9 @@ fn avg_spec_from_intermediate_type(
                 }
                 DataType::Float64 => {
                     let arg0 = sig.input_arg_type.as_ref().ok_or_else(|| {
-                        "avg intermediate input_arg_type signature is required".to_string()
+                        crate::exec::expr::agg::functions::aggregate_binding_contract(
+                            "avg intermediate input_arg_type signature is required",
+                        )
                     })?;
                     let kind = match arg0 {
                         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
@@ -134,10 +149,14 @@ fn avg_spec_from_intermediate_type(
                         }
                         DataType::Float32 | DataType::Float64 => AggKind::AvgFloat,
                         other => {
-                            return Err(format!(
-                                "avg intermediate input_arg_type unsupported: {:?}",
-                                other
-                            ));
+                            return Err(
+                                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                                    format_args!(
+                                        "avg intermediate input_arg_type unsupported: {:?}",
+                                        other
+                                    ),
+                                ),
+                            );
                         }
                     };
                     Ok(AggSpec {
@@ -148,23 +167,31 @@ fn avg_spec_from_intermediate_type(
                         count_all: false,
                     })
                 }
-                other => Err(format!(
-                    "avg intermediate output type unsupported: {:?}",
-                    other
-                )),
+                other => Err(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                        "avg intermediate output type unsupported: {:?}",
+                        other
+                    )),
+                ),
             }
         }
         DataType::Struct(fields) => {
             if fields.len() != 2 {
-                return Err("avg intermediate expects 2 fields".to_string());
+                return Err(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(
+                        "avg intermediate expects 2 fields",
+                    ),
+                );
             }
             let sum_type = fields[0].data_type();
             let count_type = fields[1].data_type();
             if !is_count_type(count_type) {
-                return Err(format!(
-                    "avg intermediate count type mismatch: {:?}",
-                    count_type
-                ));
+                return Err(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                        "avg intermediate count type mismatch: {:?}",
+                        count_type
+                    )),
+                );
             }
             match sum_type {
                 DataType::Float64 | DataType::Float32 => Ok(AggSpec {
@@ -188,16 +215,20 @@ fn avg_spec_from_intermediate_type(
                     input_arg_type: None,
                     count_all: false,
                 }),
-                other => Err(format!(
-                    "avg intermediate sum type unsupported: {:?}",
-                    other
-                )),
+                other => Err(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                        "avg intermediate sum type unsupported: {:?}",
+                        other
+                    )),
+                ),
             }
         }
-        other => Err(format!(
-            "avg intermediate unsupported input type: {:?}",
-            other
-        )),
+        other => Err(
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "avg intermediate unsupported input type: {:?}",
+                other
+            )),
+        ),
     }
 }
 
@@ -207,17 +238,25 @@ impl AggregateFunction for AvgAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         if input_is_intermediate {
             if let Some(data_type) = input_type {
                 avg_spec_from_intermediate_type(func, data_type)
             } else {
-                Err("avg intermediate input type missing".to_string())
+                Err(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(
+                        "avg intermediate input type missing",
+                    ),
+                )
             }
         } else if let Some(data_type) = input_type {
             avg_spec_from_input_type(data_type)
         } else {
-            Err("avg input type missing".to_string())
+            Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "avg input type missing",
+                ),
+            )
         }
     }
 
@@ -243,33 +282,37 @@ impl AggregateFunction for AvgAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         match spec.kind {
             AggKind::AvgInt => {
-                let arr = array
-                    .as_ref()
-                    .ok_or_else(|| "int input missing".to_string())?;
+                let arr = array.as_ref().ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract("int input missing")
+                })?;
                 Ok(AggInputView::Int(IntArrayView::new(arr)?))
             }
             AggKind::AvgFloat => {
-                let arr = array
-                    .as_ref()
-                    .ok_or_else(|| "float input missing".to_string())?;
+                let arr = array.as_ref().ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract("float input missing")
+                })?;
                 Ok(AggInputView::Float(FloatArrayView::new(arr)?))
             }
             AggKind::AvgDecimal128 => {
-                let arr = array
-                    .as_ref()
-                    .ok_or_else(|| "utf8 input missing".to_string())?;
+                let arr = array.as_ref().ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract("utf8 input missing")
+                })?;
                 Ok(AggInputView::Utf8(Utf8ArrayView::new(arr)?))
             }
             AggKind::AvgDecimal256 => {
-                let arr = array
-                    .as_ref()
-                    .ok_or_else(|| "decimal256 input missing".to_string())?;
+                let arr = array.as_ref().ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract(
+                        "decimal256 input missing",
+                    )
+                })?;
                 Ok(AggInputView::Any(arr))
             }
-            _ => Err("avg input type mismatch".to_string()),
+            _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "avg input type mismatch",
+            )),
         }
     }
 
@@ -277,27 +320,33 @@ impl AggregateFunction for AvgAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         match spec.kind {
             AggKind::AvgInt | AggKind::AvgFloat => {
-                let arr = array
-                    .as_ref()
-                    .ok_or_else(|| "avg input missing".to_string())?;
+                let arr = array.as_ref().ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract("avg input missing")
+                })?;
                 if matches!(arr.data_type(), DataType::Binary) {
                     Ok(AggInputView::Binary(
-                        arr.as_any()
-                            .downcast_ref::<BinaryArray>()
-                            .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?,
+                        arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+                            crate::exec::expr::agg::views::aggregate_input_contract(
+                                "failed to downcast to BinaryArray",
+                            )
+                        })?,
                     ))
                 } else if matches!(arr.data_type(), DataType::Utf8) {
                     Ok(AggInputView::Utf8(Utf8ArrayView::new(arr)?))
                 } else {
-                    let struct_arr = arr
-                        .as_any()
-                        .downcast_ref::<StructArray>()
-                        .ok_or_else(|| "failed to downcast to StructArray".to_string())?;
+                    let struct_arr =
+                        arr.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+                            crate::exec::expr::agg::views::aggregate_input_contract(
+                                "failed to downcast to StructArray",
+                            )
+                        })?;
                     if struct_arr.num_columns() != 2 {
-                        return Err("avg intermediate expects 2 fields".to_string());
+                        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                            "avg intermediate expects 2 fields",
+                        ));
                     }
                     let sum = struct_arr.column(0);
                     let count = struct_arr.column(1);
@@ -310,31 +359,41 @@ impl AggregateFunction for AvgAgg {
                 }
             }
             AggKind::AvgDecimal128 => {
-                let arr = array
-                    .as_ref()
-                    .ok_or_else(|| "avg input missing".to_string())?;
+                let arr = array.as_ref().ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract("avg input missing")
+                })?;
                 if matches!(arr.data_type(), DataType::Binary) {
                     Ok(AggInputView::Binary(
-                        arr.as_any()
-                            .downcast_ref::<BinaryArray>()
-                            .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?,
+                        arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+                            crate::exec::expr::agg::views::aggregate_input_contract(
+                                "failed to downcast to BinaryArray",
+                            )
+                        })?,
                     ))
                 } else if matches!(arr.data_type(), DataType::Utf8) {
                     Ok(AggInputView::Utf8(Utf8ArrayView::new(arr)?))
                 } else {
-                    let struct_arr = arr
-                        .as_any()
-                        .downcast_ref::<StructArray>()
-                        .ok_or_else(|| "failed to downcast to StructArray".to_string())?;
+                    let struct_arr =
+                        arr.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+                            crate::exec::expr::agg::views::aggregate_input_contract(
+                                "failed to downcast to StructArray",
+                            )
+                        })?;
                     if struct_arr.num_columns() != 2 {
-                        return Err("avg decimal intermediate expects 2 fields".to_string());
+                        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                            "avg decimal intermediate expects 2 fields",
+                        ));
                     }
                     let sum = struct_arr.column(0);
                     let count = struct_arr.column(1);
-                    let sum_view = sum
-                        .as_any()
-                        .downcast_ref::<Decimal128Array>()
-                        .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
+                    let sum_view =
+                        sum.as_any()
+                            .downcast_ref::<Decimal128Array>()
+                            .ok_or_else(|| {
+                                crate::exec::expr::agg::views::aggregate_input_contract(
+                                    "failed to downcast to Decimal128Array",
+                                )
+                            })?;
                     let count_view = IntArrayView::new(count)?;
                     Ok(AggInputView::AvgDecimalState(AvgDecimalStateView {
                         sums: sum_view,
@@ -343,14 +402,16 @@ impl AggregateFunction for AvgAgg {
                 }
             }
             AggKind::AvgDecimal256 => {
-                let arr = array
-                    .as_ref()
-                    .ok_or_else(|| "avg input missing".to_string())?;
+                let arr = array.as_ref().ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract("avg input missing")
+                })?;
                 if matches!(arr.data_type(), DataType::Binary) {
                     Ok(AggInputView::Binary(
-                        arr.as_any()
-                            .downcast_ref::<BinaryArray>()
-                            .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?,
+                        arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+                            crate::exec::expr::agg::views::aggregate_input_contract(
+                                "failed to downcast to BinaryArray",
+                            )
+                        })?,
                     ))
                 } else if matches!(arr.data_type(), DataType::Utf8) {
                     Ok(AggInputView::Utf8(Utf8ArrayView::new(arr)?))
@@ -358,7 +419,9 @@ impl AggregateFunction for AvgAgg {
                     Ok(AggInputView::Any(arr))
                 }
             }
-            _ => Err("avg merge input type mismatch".to_string()),
+            _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "avg merge input type mismatch",
+            )),
         }
     }
 
@@ -400,17 +463,21 @@ impl AggregateFunction for AvgAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         match spec.kind {
             AggKind::AvgInt => {
                 if !matches!(input, AggInputView::Int(_)) {
-                    return Err("avg int input type mismatch".to_owned());
+                    return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                        "avg int input type mismatch",
+                    ));
                 }
                 super::aggregate_basic_adapter::update(spec, offset, state_ptrs, input, None)
             }
             AggKind::AvgFloat => {
                 if !matches!(input, AggInputView::Float(_)) {
-                    return Err("avg float input type mismatch".to_owned());
+                    return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                        "avg float input type mismatch",
+                    ));
                 }
                 super::aggregate_basic_adapter::update(spec, offset, state_ptrs, input, None)
             }
@@ -420,17 +487,23 @@ impl AggregateFunction for AvgAgg {
                         match spec.input_arg_type.as_ref() {
                             Some(DataType::Decimal128(_, scale)) => *scale,
                             other => {
-                                return Err(format!(
-                                    "avg decimal arg0 type missing/mismatch: {:?}",
-                                    other
-                                ));
+                                return Err(
+                                    crate::exec::expr::agg::views::aggregate_input_contract(
+                                        format_args!(
+                                            "avg decimal arg0 type missing/mismatch: {:?}",
+                                            other
+                                        ),
+                                    ),
+                                );
                             }
                         }
                     } else {
                         avg_decimal_sum_scale(&spec.intermediate_type, &spec.output_type)?
                     };
                 if !matches!(input, AggInputView::Utf8(Utf8ArrayView::Decimal128(..))) {
-                    return Err("avg decimal input type mismatch".to_owned());
+                    return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                        "avg decimal input type mismatch",
+                    ));
                 }
                 super::aggregate_basic_adapter::update(
                     spec,
@@ -446,22 +519,27 @@ impl AggregateFunction for AvgAgg {
                         match spec.input_arg_type.as_ref() {
                             Some(DataType::Decimal256(_, scale)) => *scale,
                             other => {
-                                return Err(format!(
-                                    "avg decimal256 arg0 type missing/mismatch: {:?}",
-                                    other
-                                ));
+                                return Err(
+                                    crate::exec::expr::agg::views::aggregate_input_contract(
+                                        format_args!(
+                                            "avg decimal256 arg0 type missing/mismatch: {:?}",
+                                            other
+                                        ),
+                                    ),
+                                );
                             }
                         }
                     } else {
                         avg_decimal_sum_scale(&spec.intermediate_type, &spec.output_type)?
                     };
                 let AggInputView::Any(a) = input else {
-                    return Err("avg decimal256 input type mismatch".to_owned());
+                    return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                        "avg decimal256 input type mismatch",
+                    ));
                 };
                 if !matches!(a.data_type(), DataType::Decimal256(..)) {
-                    return Err(format!(
-                        "avg decimal256 input type mismatch: {:?}",
-                        a.data_type()
+                    return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                        format_args!("avg decimal256 input type mismatch: {:?}", a.data_type()),
                     ));
                 }
                 super::aggregate_basic_adapter::update(
@@ -472,7 +550,9 @@ impl AggregateFunction for AvgAgg {
                     Some(sum_scale),
                 )
             }
-            _ => Err("avg update kind mismatch".to_string()),
+            _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "avg update kind mismatch",
+            )),
         }
     }
 
@@ -482,7 +562,7 @@ impl AggregateFunction for AvgAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let valid = match spec.kind {
             AggKind::AvgInt | AggKind::AvgFloat => matches!(
                 input,
@@ -496,24 +576,30 @@ impl AggregateFunction for AvgAgg {
                 input,
                 AggInputView::Any(_) | AggInputView::Binary(_) | AggInputView::Utf8(_)
             ),
-            _ => return Err("avg merge kind mismatch".to_owned()),
+            _ => {
+                return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                    "avg merge kind mismatch",
+                ));
+            }
         };
         if !valid {
-            return Err(match spec.kind {
-                AggKind::AvgDecimal128 => "avg decimal merge input type mismatch",
-                AggKind::AvgDecimal256 => "avg decimal256 merge input type mismatch",
-                _ => "avg merge input type mismatch",
-            }
-            .to_owned());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                match spec.kind {
+                    AggKind::AvgDecimal128 => "avg decimal merge input type mismatch",
+                    AggKind::AvgDecimal256 => "avg decimal256 merge input type mismatch",
+                    _ => "avg merge input type mismatch",
+                },
+            ));
         }
         if let AggInputView::Utf8(v) = input {
             if !matches!(v, Utf8ArrayView::Utf8(_)) {
-                return Err(match spec.kind {
-                    AggKind::AvgDecimal128 => "avg decimal intermediate type mismatch",
-                    AggKind::AvgDecimal256 => "avg decimal256 intermediate type mismatch",
-                    _ => "avg intermediate type mismatch",
-                }
-                .to_owned());
+                return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                    match spec.kind {
+                        AggKind::AvgDecimal128 => "avg decimal intermediate type mismatch",
+                        AggKind::AvgDecimal256 => "avg decimal256 intermediate type mismatch",
+                        _ => "avg intermediate type mismatch",
+                    },
+                ));
             }
         }
         super::aggregate_basic_adapter::merge(spec, offset, state_ptrs, input)
@@ -525,7 +611,7 @@ impl AggregateFunction for AvgAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         super::aggregate_basic_adapter::build(spec, offset, group_states, output_intermediate)
     }
 }

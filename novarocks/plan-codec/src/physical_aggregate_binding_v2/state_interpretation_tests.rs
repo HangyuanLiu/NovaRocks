@@ -27,7 +27,7 @@ impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
         self.units.lock().unwrap().push(units);
-        self.refuse.map_or(Ok(()), Err)
+        self.refuse.clone().map_or(Ok(()), Err)
     }
 }
 #[test]
@@ -130,7 +130,7 @@ fn receipt_codec_keeps_control_cause_and_bounded_observation_on_long_keys() {
         CompileControlError::ResourceExhausted,
     ] {
         let control = Control {
-            refuse: Some(cause),
+            refuse: Some(cause.clone()),
             ..Default::default()
         };
         assert!(

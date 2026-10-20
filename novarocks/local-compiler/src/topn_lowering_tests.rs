@@ -598,7 +598,7 @@ fn actual_closed_partial_final_topn_package_lowers_both_phases_and_keeps_origina
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(is_control(
                 &compile(package.clone(), &control).unwrap_err(),
                 cause
@@ -624,7 +624,7 @@ fn topn_actual_public_and_shared_key_component_preserve_all_small_control_prefix
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let control = Control::refusing(at, cause);
+                let control = Control::refusing(at, cause.clone());
                 assert!(is_control(
                     &component(&package, &control, missing).unwrap_err(),
                     cause
@@ -642,7 +642,7 @@ fn topn_actual_public_and_shared_key_component_preserve_all_small_control_prefix
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(is_control(
                 &compile(package.clone(), &control).unwrap_err(),
                 cause
@@ -675,7 +675,7 @@ fn topn_320_order_occurrences_cross_real_quantum_and_sample_entry_boundary_tail_
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(is_control(
                 &compile(package.clone(), &control).unwrap_err(),
                 cause

@@ -48,7 +48,7 @@ impl PureCompileControl for FinalControl {
             assert!(at <= stop, "callback after original finalization refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -115,7 +115,7 @@ fn prefixes(input: &FragmentPackageInput, succeeds: bool, all: bool) {
         for cause in CAUSES {
             let control = FinalControl {
                 trace: Mutex::new(vec![]),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(finish(input, &control), Err(FragmentPackageError::Control(actual)) if actual == cause)

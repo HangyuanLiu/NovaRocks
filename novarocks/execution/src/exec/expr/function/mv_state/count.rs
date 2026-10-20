@@ -20,17 +20,20 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, BinaryBuilder, BooleanBuilder, Int64Array, Int64Builder};
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use crate::exec::mv::state_codec::{decode_count_state, encode_count_state};
 
 use super::common::{binary_value_or_empty, row_count, row_index};
 
-pub fn count_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
+pub fn count_state_union(
+    a: &[u8],
+    b: &[u8],
+) -> Result<Vec<u8>, crate::runtime::fragment::ExecutionFailure> {
     let left = decode_count_state(a)?;
     let right = decode_count_state(b)?;
     let total = left
         .checked_add(right)
-        .ok_or_else(|| "count_state_union count overflow".to_string())?;
+        .ok_or_else(|| super::failure::numeric("count_state_union count overflow"))?;
     if total == 0 {
         Ok(Vec::new())
     } else {
@@ -38,11 +41,11 @@ pub fn count_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-pub fn count_state_visible(s: &[u8]) -> Result<i64, String> {
-    decode_count_state(s)
+pub fn count_state_visible(s: &[u8]) -> Result<i64, crate::runtime::fragment::ExecutionFailure> {
+    Ok(decode_count_state(s)?)
 }
 
-pub fn state_all_zero(s: &[u8]) -> Result<bool, String> {
+pub fn state_all_zero(s: &[u8]) -> Result<bool, crate::runtime::fragment::ExecutionFailure> {
     count_state_visible(s).map(|count| count == 0)
 }
 
@@ -51,13 +54,16 @@ pub fn eval_count_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if args.len() != 2 {
-        return Err((format!("count_state_union expects 2 arguments, got {}", args.len())).into());
+        return Err(super::failure::contract(format_args!(
+            "count_state_union expects 2 arguments, got {}",
+            args.len()
+        )));
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    Ok((eval_count_state_union_arrays(&lhs, &rhs))?)
+    eval_count_state_union_arrays(&lhs, &rhs)
 }
 
 pub fn eval_count_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -65,12 +71,15 @@ pub fn eval_count_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Siz
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if args.len() != 1 {
-        return Err((format!("count_state_visible expects 1 argument, got {}", args.len())).into());
+        return Err(super::failure::contract(format_args!(
+            "count_state_visible expects 1 argument, got {}",
+            args.len()
+        )));
     }
     let input = arena.eval(args[0], chunk)?;
-    Ok((eval_count_state_visible_array(&input))?)
+    eval_count_state_visible_array(&input)
 }
 
 pub fn eval_state_all_zero<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -78,26 +87,37 @@ pub fn eval_state_all_zero<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if args.len() != 1 {
-        return Err((format!("state_all_zero expects 1 argument, got {}", args.len())).into());
+        return Err(super::failure::contract(format_args!(
+            "state_all_zero expects 1 argument, got {}",
+            args.len()
+        )));
     }
     let input = arena.eval(args[0], chunk)?;
-    Ok((eval_state_all_zero_array(&input))?)
+    eval_state_all_zero_array(&input)
 }
 
-pub fn eval_count_state_union_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {
+pub fn eval_count_state_union_arrays(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = row_count("count_state_union", lhs.len(), rhs.len())?;
     let mut builder = BinaryBuilder::new();
+    let mut extent = super::failure::StateOutputTally::default();
     for row in 0..rows {
         let left = binary_value_or_empty(lhs, row_index(row, lhs.len())?, "count_state_union", 0)?;
         let right = binary_value_or_empty(rhs, row_index(row, rhs.len())?, "count_state_union", 1)?;
-        builder.append_value(count_state_union(left, right)?);
+        let payload = count_state_union(left, right)?;
+        extent.append(payload.len())?;
+        builder.append_value(payload);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-pub fn eval_count_state_visible_array(input: &ArrayRef) -> Result<ArrayRef, String> {
+pub fn eval_count_state_visible_array(
+    input: &ArrayRef,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut builder = Int64Builder::new();
     for row in 0..input.len() {
         let state = binary_value_or_empty(input, row, "count_state_visible", 0)?;
@@ -106,7 +126,9 @@ pub fn eval_count_state_visible_array(input: &ArrayRef) -> Result<ArrayRef, Stri
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-pub fn eval_state_all_zero_array(input: &ArrayRef) -> Result<ArrayRef, String> {
+pub fn eval_state_all_zero_array(
+    input: &ArrayRef,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut builder = BooleanBuilder::new();
     match input.data_type() {
         arrow::datatypes::DataType::Binary | arrow::datatypes::DataType::LargeBinary => {
@@ -116,18 +138,17 @@ pub fn eval_state_all_zero_array(input: &ArrayRef) -> Result<ArrayRef, String> {
             }
         }
         arrow::datatypes::DataType::Int64 => {
-            let counts = input
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "state_all_zero downcast Int64Array failed for arg 0".to_string())?;
+            let counts = input.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                super::failure::contract("state_all_zero downcast Int64Array failed for arg 0")
+            })?;
             for row in 0..input.len() {
                 builder.append_value(counts.is_null(row) || counts.value(row) == 0);
             }
         }
         other => {
-            return Err(format!(
+            return Err(super::failure::contract(format_args!(
                 "state_all_zero expects Binary, LargeBinary, or Int64 input for arg 0, got {other:?}"
-            ));
+            )));
         }
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
@@ -253,6 +274,6 @@ mod tests {
     #[test]
     fn state_all_zero_rejects_invalid_count_state_bytes() {
         let err = state_all_zero(&[0x01]).expect_err("invalid count state should fail");
-        assert!(err.contains("Count"), "{err}");
+        assert!(err.to_string().contains("Count"), "{err}");
     }
 }

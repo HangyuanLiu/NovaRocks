@@ -17,11 +17,39 @@
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::decimal::{div_round_i128, pow10_i128};
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{Array, ArrayRef, Decimal128Array, Float64Array, Int64Array};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use novarocks_functions::builtin::round_core::round_float_to_integer as round_double_to_int;
 use std::sync::Arc;
+
+#[derive(Debug)]
+struct RoundCastFailure {
+    context: &'static str,
+    source: ExecutionFailure,
+}
+impl std::fmt::Display for RoundCastFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.context, self.source.detail())
+    }
+}
+impl std::error::Error for RoundCastFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for RoundCastFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        self.source.failure_fact()
+    }
+}
+fn round_cast_failure(context: &'static str, source: arrow::error::ArrowError) -> ExecutionFailure {
+    ExecutionFailure::from_domain(RoundCastFailure {
+        context,
+        source: crate::exec::expr::cast::cast_arrow_failure(source),
+    })
+}
 
 /// Round a double value to d decimal places.
 /// Returns DOUBLE.
@@ -65,7 +93,11 @@ fn round_double_to_decimals(value: f64, decimals: i64) -> f64 {
 
 /// Round a decimal value to d decimal places.
 /// Returns Decimal128 with the target scale.
-fn round_decimal(value: i128, original_scale: i8, target_scale: i8) -> Result<i128, String> {
+fn round_decimal(
+    value: i128,
+    original_scale: i8,
+    target_scale: i8,
+) -> Result<i128, ExecutionFailure> {
     let scale_diff = target_scale as i32 - original_scale as i32;
 
     if scale_diff == 0 {
@@ -74,13 +106,15 @@ fn round_decimal(value: i128, original_scale: i8, target_scale: i8) -> Result<i1
     } else if scale_diff > 0 {
         // Scale up: multiply by 10^scale_diff
         let factor = pow10_i128(scale_diff as usize)?;
-        value
-            .checked_mul(factor)
-            .ok_or_else(|| "decimal overflow in round".to_string())
+        value.checked_mul(factor).ok_or_else(|| {
+            ExecutionFailure::from(
+                novarocks_functions::legacy_decimal::DecimalMathFailure::Overflow,
+            )
+        })
     } else {
         // Scale down: divide by 10^(-scale_diff) with rounding
         let factor = pow10_i128((-scale_diff) as usize)?;
-        Ok(div_round_i128(value, factor))
+        Ok(div_round_i128(value, factor)?)
     }
 }
 
@@ -95,11 +129,11 @@ pub fn eval_round<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     value_expr: ExprId,
     decimals_expr: Option<ExprId>,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let value_arr = arena.eval(value_expr, chunk)?;
     let output_type = arena
         .data_type(expr)
-        .ok_or_else(|| "round: missing output type".to_string())?;
+        .ok_or_else(|| crate::exec::expr::expression_contract("round: missing output type"))?;
 
     // Handle single-argument round(x) - round to nearest integer
     if decimals_expr.is_none() {
@@ -109,13 +143,18 @@ pub fn eval_round<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 let f64_arr = if matches!(value_arr.data_type(), DataType::Float64) {
                     value_arr
                 } else {
-                    cast(&value_arr, &DataType::Float64)
-                        .map_err(|e| format!("round: failed to cast to Float64: {}", e))?
+                    cast(&value_arr, &DataType::Float64).map_err(|source| {
+                        round_cast_failure("round: failed to cast to Float64:", source)
+                    })?
                 };
                 let f64_arr = f64_arr
                     .as_any()
                     .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| "round: failed to downcast to Float64Array".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::expr::expression_contract(
+                            "round: failed to downcast to Float64Array",
+                        )
+                    })?;
 
                 let len = f64_arr.len();
                 let mut values = Vec::with_capacity(len);
@@ -134,7 +173,11 @@ pub fn eval_round<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 let dec_arr = value_arr
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
-                    .ok_or_else(|| "round: failed to downcast to Decimal128Array".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::expr::expression_contract(
+                            "round: failed to downcast to Decimal128Array",
+                        )
+                    })?;
                 let (_, original_scale) = match value_arr.data_type() {
                     DataType::Decimal128(p, s) => (*p, *s),
                     _ => unreachable!(),
@@ -142,11 +185,10 @@ pub fn eval_round<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 let (out_precision, out_scale) = match output_type {
                     DataType::Decimal128(p, s) => (*p, *s),
                     _ => {
-                        return Err((format!(
+                        return Err(crate::exec::expr::expression_contract(format_args!(
                             "round: expected Decimal128 output type, got {:?}",
                             output_type
-                        ))
-                        .into());
+                        )));
                     }
                 };
 
@@ -163,17 +205,22 @@ pub fn eval_round<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 }
                 let array = Decimal128Array::from(values)
                     .with_precision_and_scale(out_precision, out_scale)
-                    .map_err(|e| format!("round: failed to create Decimal128Array: {}", e))?;
+                    .map_err(crate::exec::expr::cast::cast_construct_failure)?;
                 Ok(Arc::new(array) as ArrayRef)
             }
             _ => {
                 // Cast to Float64 and round
-                let f64_arr = cast(&value_arr, &DataType::Float64)
-                    .map_err(|e| format!("round: failed to cast to Float64: {}", e))?;
+                let f64_arr = cast(&value_arr, &DataType::Float64).map_err(|source| {
+                    round_cast_failure("round: failed to cast to Float64:", source)
+                })?;
                 let f64_arr = f64_arr
                     .as_any()
                     .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| "round: failed to downcast to Float64Array".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::expr::expression_contract(
+                            "round: failed to downcast to Float64Array",
+                        )
+                    })?;
 
                 let len = f64_arr.len();
                 let mut values = Vec::with_capacity(len);
@@ -191,7 +238,9 @@ pub fn eval_round<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     } else {
         // Two arguments: round(x, d)
         let Some(decimals_expr) = decimals_expr else {
-            return Err(("round: missing decimal argument".to_string()).into());
+            return Err(crate::exec::expr::expression_contract(
+                "round: missing decimal argument",
+            ));
         };
         let decimals_arr = arena.eval(decimals_expr, chunk)?;
 
@@ -201,25 +250,29 @@ pub fn eval_round<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         // Check if decimals is constant (length 1) or per-row (length matches value)
         let decimals_is_constant = decimals_arr.len() == 1;
         if !decimals_is_constant && decimals_arr.len() != len {
-            return Err((format!(
+            return Err(crate::exec::expr::expression_contract(format_args!(
                 "round: decimals array length {} does not match value array length {}",
                 decimals_arr.len(),
                 len
-            ))
-            .into());
+            )));
         }
 
         // Cast decimals to Int64 for processing
         let decimals_i64_arr = if matches!(decimals_arr.data_type(), DataType::Int64) {
             decimals_arr
         } else {
-            cast(&decimals_arr, &DataType::Int64)
-                .map_err(|e| format!("round: failed to cast decimals to Int64: {}", e))?
+            cast(&decimals_arr, &DataType::Int64).map_err(|source| {
+                round_cast_failure("round: failed to cast decimals to Int64:", source)
+            })?
         };
         let decimals_i64 = decimals_i64_arr
             .as_any()
             .downcast_ref::<Int64Array>()
-            .ok_or_else(|| "round: failed to downcast decimals to Int64Array".to_string())?;
+            .ok_or_else(|| {
+                crate::exec::expr::expression_contract(
+                    "round: failed to downcast decimals to Int64Array",
+                )
+            })?;
 
         match value_arr.data_type() {
             DataType::Decimal128(_, _) => {
@@ -227,7 +280,11 @@ pub fn eval_round<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 let dec_arr = value_arr
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
-                    .ok_or_else(|| "round: failed to downcast to Decimal128Array".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::expr::expression_contract(
+                            "round: failed to downcast to Decimal128Array",
+                        )
+                    })?;
                 let (_, original_scale) = match value_arr.data_type() {
                     DataType::Decimal128(p, s) => (*p, *s),
                     _ => unreachable!(),
@@ -235,11 +292,10 @@ pub fn eval_round<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 let (out_precision, out_scale) = match output_type {
                     DataType::Decimal128(p, s) => (*p, *s),
                     _ => {
-                        return Err((format!(
+                        return Err(crate::exec::expr::expression_contract(format_args!(
                             "round: expected Decimal128 output type, got {:?}",
                             output_type
-                        ))
-                        .into());
+                        )));
                     }
                 };
 
@@ -269,12 +325,14 @@ pub fn eval_round<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                     // in target_scale, but output array uses out_scale.
                     let adjusted = if target_scale < out_scale {
                         let factor = pow10_i128((out_scale - target_scale) as usize)?;
-                        rounded
-                            .checked_mul(factor)
-                            .ok_or("decimal overflow in round adjust")?
+                        rounded.checked_mul(factor).ok_or_else(|| {
+                            ExecutionFailure::from(
+                                novarocks_functions::legacy_decimal::DecimalMathFailure::Overflow,
+                            )
+                        })?
                     } else if target_scale > out_scale {
                         let factor = pow10_i128((target_scale - out_scale) as usize)?;
-                        div_round_i128(rounded, factor)
+                        div_round_i128(rounded, factor)?
                     } else {
                         rounded
                     };
@@ -282,7 +340,7 @@ pub fn eval_round<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 }
                 let array = Decimal128Array::from(values)
                     .with_precision_and_scale(out_precision, out_scale)
-                    .map_err(|e| format!("round: failed to create Decimal128Array: {}", e))?;
+                    .map_err(crate::exec::expr::cast::cast_construct_failure)?;
                 Ok(Arc::new(array) as ArrayRef)
             }
             _ => {
@@ -290,13 +348,18 @@ pub fn eval_round<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 let f64_arr = if matches!(value_arr.data_type(), DataType::Float64) {
                     value_arr
                 } else {
-                    cast(&value_arr, &DataType::Float64)
-                        .map_err(|e| format!("round: failed to cast to Float64: {}", e))?
+                    cast(&value_arr, &DataType::Float64).map_err(|source| {
+                        round_cast_failure("round: failed to cast to Float64:", source)
+                    })?
                 };
                 let f64_arr = f64_arr
                     .as_any()
                     .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| "round: failed to downcast to Float64Array".to_string())?;
+                    .ok_or_else(|| {
+                        crate::exec::expr::expression_contract(
+                            "round: failed to downcast to Float64Array",
+                        )
+                    })?;
 
                 let len = f64_arr.len();
                 let mut values = Vec::with_capacity(len);
@@ -346,7 +409,7 @@ mod legacy_rounding_contract_tests {
         value: ArrayRef,
         digits: Option<Digits>,
         output_type: DataType,
-    ) -> Result<ArrayRef, String> {
+    ) -> Result<ArrayRef, ExecutionFailure> {
         let mut inputs = vec![value];
         let literal = match digits {
             Some(Digits::Column(array)) => {
@@ -662,10 +725,12 @@ mod legacy_rounding_contract_tests {
             )
             .unwrap_err();
             assert!(
-                error.contains("round: failed to cast decimals to Int64:"),
+                error
+                    .detail()
+                    .contains("round: failed to cast decimals to Int64:"),
                 "{error}"
             );
-            assert!(error.contains("Interval"), "{error}");
+            assert!(error.detail().contains("Interval"), "{error}");
         }
     }
 
@@ -730,11 +795,15 @@ mod legacy_rounding_contract_tests {
             )
             .unwrap_err();
             assert!(
-                error.contains("round: failed to cast decimals to Int64:"),
+                error
+                    .detail()
+                    .contains("round: failed to cast decimals to Int64:"),
                 "{error}"
             );
             assert!(
-                error.contains(&format!("The scale {scale} causes overflow.")),
+                error
+                    .detail()
+                    .contains(&format!("The scale {scale} causes overflow.")),
                 "{error}"
             );
         }
@@ -751,11 +820,15 @@ mod legacy_rounding_contract_tests {
                 )
                 .unwrap_err();
                 assert!(
-                    error.contains("round: failed to cast decimals to Int64:"),
+                    error
+                        .detail()
+                        .contains("round: failed to cast decimals to Int64:"),
                     "{error}"
                 );
                 assert!(
-                    error.contains(&format!("The scale {scale} causes overflow.")),
+                    error
+                        .detail()
+                        .contains(&format!("The scale {scale} causes overflow.")),
                     "{error}"
                 );
             }

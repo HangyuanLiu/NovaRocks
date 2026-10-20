@@ -23,11 +23,13 @@ fn shared(args: &[ArrayRef], target: &DataType, left: bool) -> Result<ArrayRef, 
     if rows == 0 {
         return Ok(new_empty_array(target));
     }
-    let expanded = core::expand(&args[0], &args[1], args.get(2), rows, left)?;
+    let expanded = core::expand(&args[0], &args[1], args.get(2), rows, left)
+        .map_err(|error| error.to_string())?;
     if expanded.total_rows == 0 {
         return Ok(new_empty_array(target));
     }
     core::result_column(expanded.values, std::slice::from_ref(target))
+        .map_err(|error| error.to_string())
 }
 fn check(args: Vec<ArrayRef>, target: DataType, left: bool) {
     match (

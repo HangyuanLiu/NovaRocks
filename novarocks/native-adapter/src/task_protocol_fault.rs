@@ -284,19 +284,85 @@ pub const TASK_EXECUTION_FAILURE_DETAIL: &str =
 pub fn task_execution_failure_injected(
     controls: &NativeTestControls,
     identity: TaskIdentity,
+    root_result: bool,
 ) -> Result<Option<NativeFaultClaim>, String> {
-    claim_by_detail(
+    let ordinary = claim_by_detail(
         controls,
         QueryLifecycleFaultKind::TaskExecutionFailure,
         identity.query_execution_id(),
         identity.backend_process_id(),
+    )?;
+    if ordinary.is_some() || !root_result {
+        return Ok(ordinary);
+    }
+    // The caller derives this capability from its actual installed Root channel.
+    // An ordinary Task must leave the Root-only action unclaimed.
+    claim_by_detail(
+        controls,
+        QueryLifecycleFaultKind::RootTaskExecutionFailureBeforeData,
+        identity.query_execution_id(),
+        identity.backend_process_id(),
+    )
+}
+#[derive(Debug)]
+enum TaskExecutionFaultFailure {
+    Injected,
+    PreparedExitInjected,
+    Evidence(novarocks_execution_contract::failure::BoundedDetail),
+}
+impl std::fmt::Display for TaskExecutionFaultFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Injected => f.write_str(TASK_EXECUTION_FAILURE_DETAIL),
+            Self::PreparedExitInjected => f.write_str(
+                "runner-owned task preparation failure injected after kernel preparation",
+            ),
+            Self::Evidence(detail) => {
+                write!(f, "Native task execution fault evidence failed: {detail}")
+            }
+        }
+    }
+}
+impl std::error::Error for TaskExecutionFaultFailure {}
+impl novarocks_execution_contract::failure::FailureProjection for TaskExecutionFaultFailure {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        FailureFact::new(
+            FailureClass::Unexpected,
+            FailureReason::new(
+                domain::NATIVE,
+                std::num::NonZeroU16::new(match self {
+                    Self::Injected | Self::PreparedExitInjected => 20,
+                    Self::Evidence(_) => 21,
+                })
+                .unwrap(),
+            ),
+        )
+    }
+}
+pub fn injected_task_execution_failure() -> novarocks_execution::runtime::fragment::ExecutionFailure
+{
+    novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+        TaskExecutionFaultFailure::Injected,
+    )
+}
+pub(crate) fn injected_prepared_task_failure()
+-> novarocks_execution::runtime::fragment::ExecutionFailure {
+    novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+        TaskExecutionFaultFailure::PreparedExitInjected,
     )
 }
 pub fn record_task_execution_failure(
     identity: TaskIdentity,
     scope: &NativeFaultClaim,
-) -> Result<(), String> {
-    scope.record_hit()?;
+) -> novarocks_execution::runtime::fragment::ExecutionResult<()> {
+    scope.record_hit().map_err(|detail| {
+        novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
+            TaskExecutionFaultFailure::Evidence(
+                novarocks_execution_contract::failure::BoundedDetail::truncating(&detail),
+            ),
+        )
+    })?;
     let execution = identity.query_execution_id();
     eprintln!(
         "NOVAROCKS_TASK_EXECUTION_FAILURE_INJECTED execution_id={}:{}:{} stage={} task={} backend_index={} token={}",
@@ -843,10 +909,14 @@ pub fn create_task_rejected_after_apply(
         scope.backend_index,
         scope.token,
     );
-    encoded.outcome = proto::TaskOperationOutcome::InvalidStateOrRequest as i32;
-    encoded.safe_detail = CREATE_REJECTED_AFTER_APPLY_DETAIL.to_owned();
-    encoded.safe_field_path = None;
-    encoded.ack = None;
+    encoded.result = Some(proto::task_operation_receipt::Result::Verdict(
+        proto::TaskOperationVerdict {
+            outcome: proto::TaskOperationOutcome::InvalidStateOrRequest as i32,
+            safe_detail: CREATE_REJECTED_AFTER_APPLY_DETAIL.to_owned(),
+            safe_field_path: None,
+            ack: None,
+        },
+    ));
     Ok(())
 }
 
@@ -879,7 +949,11 @@ pub fn create_task_receipt_foreign_task(
     if outcome != OperationOutcome::Accepted {
         return Ok(());
     }
-    let Some(proto::task_operation_receipt::Ack::CreateTask(ack)) = encoded.ack.as_mut() else {
+    let Some(proto::task_operation_receipt::Result::Verdict(verdict)) = encoded.result.as_mut()
+    else {
+        return Ok(());
+    };
+    let Some(proto::task_operation_verdict::Ack::CreateTask(ack)) = verdict.ack.as_mut() else {
         return Ok(());
     };
     let Some(wire_identity) = ack.identity.as_mut() else {
@@ -1249,6 +1323,38 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn root_start_action_is_left_unclaimed_by_ordinary_tasks_and_claimed_once_by_root() {
+        let kind = QueryLifecycleFaultKind::RootTaskExecutionFailureBeforeData;
+        let fixture = controlled(kind.as_str());
+        bind_fixture(&fixture, kind);
+        let identity = task(&fixture, 1);
+        assert!(
+            task_execution_failure_injected(&fixture.controls, identity, false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            task_execution_failure_injected(&fixture.controls, identity, true)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            task_execution_failure_injected(&fixture.controls, identity, true)
+                .unwrap()
+                .is_none()
+        );
+        // Claiming is not Task acceptance, nor evidence that the failure ran.
+        assert!(
+            fixture
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .all(|event| event.event != "hit")
+        );
+    }
 
     fn accept_marker(listener: &UnixListener) -> UnixStream {
         listener.set_nonblocking(true).unwrap();

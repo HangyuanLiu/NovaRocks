@@ -216,7 +216,7 @@ fn data(result: Result<ArrayRef, ScalarInvocationFailure>) -> ScalarInvocationDa
 fn array_diagnostic_source_case_sensitive_original_message_and_last_drop() {
     let input = list(1);
     let names: ArrayRef = Arc::new(StringArray::from(vec!["id"]));
-    let original = project(&input, &names, None).unwrap_err();
+    let original = project(&input, &names, None).unwrap_err().to_string();
     assert_eq!(
         original,
         "__array_struct_subfield field 'id' does not exist"
@@ -244,17 +244,16 @@ fn array_diagnostic_source_case_sensitive_original_message_and_last_drop() {
     host.released();
 }
 #[test]
-fn array_diagnostic_source_empty_null_variable_and_actual_debug_text_are_lossless() {
+fn array_diagnostic_source_field_name_values_and_carrier_contracts_are_distinct() {
     let input = list(2);
     let names: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(Vec::<&str>::new())),
         Arc::new(StringArray::from(vec![None::<&str>, Some("ID")])),
         Arc::new(StringArray::from(vec!["ID", "id"])),
-        Arc::new(Int32Array::from(vec![1, 2])),
     ];
     let call = contract();
     for name in names {
-        let original = project(&input, &name, None).unwrap_err();
+        let original = project(&input, &name, None).unwrap_err().to_string();
         let host = Host::with_limit(128 * 1024);
         let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
         let actual = data(invoke(
@@ -270,35 +269,64 @@ fn array_diagnostic_source_empty_null_variable_and_actual_debug_text_are_lossles
         drop(allocator);
         host.released();
     }
-    let field = Field::new("ID", DataType::Int32, false).with_metadata(HashMap::from([(
-        "actual-source".to_string(),
-        "µ actual metadata ".repeat(111),
-    )]));
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let wrong_names: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
+    let host = Host::with_limit(128 * 1024);
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let raw = project(&input, &wrong_names, None).unwrap_err();
+    let error = invoke(
+        &host,
+        &allocator,
+        &call,
+        &input,
+        &wrong_names,
+        &Control::default(),
+    )
+    .unwrap_err();
+    let ScalarInvocationFailure::Kernel(error) = error else {
+        panic!("a physical field-name carrier mismatch must not be invocation Data");
+    };
+    assert_eq!(error.failure_fact(), raw.failure_fact());
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    drop(allocator);
+    host.released();
+    let field = Arc::new(
+        Field::new("ID", DataType::Int32, false).with_metadata(HashMap::from([(
+            "actual-source".to_string(),
+            "µ actual metadata ".repeat(111),
+        )])),
+    );
+    let weak = Arc::downgrade(&field);
     let input: ArrayRef = Arc::new(StructArray::new(
-        vec![Arc::new(field)].into(),
+        vec![field].into(),
         vec![Arc::new(Int32Array::from(vec![1]))],
         None,
     ));
     let names: ArrayRef = Arc::new(StringArray::from(vec!["ID"]));
-    let original = project(&input, &names, None).unwrap_err();
-    assert!(original.len() > crate::MAX_ROW_ERROR_MESSAGE_BYTES);
+    let raw = project(&input, &names, None).unwrap_err();
     let host = Host::with_limit(128 * 1024);
     let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
-    let actual = data(invoke(
+    let error = invoke(
         &host,
         &allocator,
         &call,
         &input,
         &names,
         &Control::default(),
-    ));
-    // Format the SAME actual Arrow source, not a merely equal reconstructed FVT.
-    assert_eq!(actual.message(), original);
-    assert_eq!(actual.retained_admission_bytes(), original.len());
-    drop(actual);
+    )
+    .unwrap_err();
+    let ScalarInvocationFailure::Kernel(error) = error else {
+        panic!("a physical input carrier mismatch must not be invocation Data");
+    };
+    assert_eq!(error.failure_fact(), raw.failure_fact());
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert!(error.to_string().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
+    drop(input);
+    assert!(weak.upgrade().is_none());
     drop(allocator);
     host.released();
 }
+
 #[test]
 fn array_diagnostic_source_every_real_allocation_and_opaque_request_keep_seven_causes() {
     let input = list(1);
@@ -432,7 +460,10 @@ fn array_diagnostic_source_published_data_does_not_run_footer_or_replay() {
         || panic!("published Data must not invoke optional post-control"),
     );
     let actual = data(result);
-    assert_eq!(actual.message(), project(&input, &names, None).unwrap_err());
+    assert_eq!(
+        actual.message(),
+        project(&input, &names, None).unwrap_err().to_string()
+    );
     let again: Result<ArrayRef, _> = latch.execute(|| panic!("no replay"), || panic!("no footer"));
     assert_eq!(
         again.unwrap_err(),
@@ -469,7 +500,7 @@ fn array_diagnostic_source_successful_v1_projection_preserves_original_values_an
 fn array_diagnostic_source_actual_empty_call_keeps_wrongcase_data_without_inventing_activation() {
     let input = list(0);
     let names: ArrayRef = Arc::new(StringArray::from(vec!["id"]));
-    let original = project(&input, &names, None).unwrap_err();
+    let original = project(&input, &names, None).unwrap_err().to_string();
     let host = Host::with_limit(128 * 1024);
     let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
     let call = contract();

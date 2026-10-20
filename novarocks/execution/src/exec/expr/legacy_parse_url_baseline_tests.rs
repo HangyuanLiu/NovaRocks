@@ -52,7 +52,10 @@ fn setup(inputs: Vec<ArrayRef>) -> (ExprArena, Vec<ExprId>, Chunk) {
         .collect();
     (arena, args, chunk)
 }
-fn raw(inputs: Vec<ArrayRef>, target: DataType) -> Result<ArrayRef, String> {
+fn raw(
+    inputs: Vec<ArrayRef>,
+    target: DataType,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (mut arena, args, chunk) = setup(inputs);
     let expr = arena.push_typed(
         ExprNode::FunctionCall {
@@ -215,7 +218,7 @@ fn legacy_parse_url_original_null_slice_typed_errors_and_evaluation_order() {
             ];
             a[pos] = bad.clone();
             assert_eq!(
-                raw(a, DataType::Utf8).unwrap_err(),
+                (raw(a, DataType::Utf8).unwrap_err()).to_string(),
                 "parse_url expects string"
             );
         }
@@ -226,7 +229,8 @@ fn legacy_parse_url_original_null_slice_typed_errors_and_evaluation_order() {
     ]);
     args[1] = ExprId(usize::MAX);
     assert_eq!(
-        eval_string_function("parse_url", &arena, ExprId(0), &args, &chunk).unwrap_err(),
+        (eval_string_function("parse_url", &arena, ExprId(0), &args, &chunk).unwrap_err())
+            .to_string(),
         "invalid ExprId"
     );
     // Both normal channels are evaluated before type admission; the key is evaluated only afterwards.
@@ -237,7 +241,8 @@ fn legacy_parse_url_original_null_slice_typed_errors_and_evaluation_order() {
     ]);
     args[2] = ExprId(usize::MAX);
     assert_eq!(
-        eval_string_function("parse_url", &arena, ExprId(0), &args, &chunk).unwrap_err(),
+        (eval_string_function("parse_url", &arena, ExprId(0), &args, &chunk).unwrap_err())
+            .to_string(),
         "parse_url expects string"
     );
 }

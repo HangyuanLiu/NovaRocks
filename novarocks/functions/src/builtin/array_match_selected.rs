@@ -19,13 +19,13 @@
 use super::{
     array_literal_core::CollectionObservation,
     array_match_core::{self, MatchFailure, Operation},
-    collection_selected::{compact, reserve},
+    collection_selected::compact,
 };
 use crate::{
-    KernelEvaluationControl, KernelFailure, RowDataError, ScalarCallInput, SelectedValues,
+    KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues,
     kernel_control::internal, kernel_input::EvaluationCheckpoints,
 };
-use arrow_array::{new_empty_array, new_null_array};
+use arrow_array::new_empty_array;
 use std::cell::RefCell;
 pub(super) fn evaluate<'a>(
     operation: Operation,
@@ -77,18 +77,9 @@ pub(super) fn evaluate<'a>(
         let (values, errors) = match result {
             Ok(values) => (values, Box::default()),
             Err(MatchFailure::Control(cause)) => return Err(cause),
-            // Normalizer errors precede all parent decisions in the original vector body.
-            Err(MatchFailure::Data(message)) => {
-                let mut errors = reserve::<RowDataError>(selection.len(), &work)?;
-                for ordinal in 0..selection.len() {
-                    work.borrow_mut().step()?;
-                    errors.push(RowDataError::new(ordinal, &message));
-                }
-                (
-                    new_null_array(target, selection.len()),
-                    errors.into_boxed_slice(),
-                )
-            }
+            // Metadata/cast refusal is outer, before any parent decision;
+            // it cannot be projected into every row's NULL/error mask.
+            Err(MatchFailure::Domain(cause)) => return Err(cause),
         };
         SelectedValues::try_new(selection, target, values, errors)
             .map_err(|_| internal("array match selected result violated its exact contract"))

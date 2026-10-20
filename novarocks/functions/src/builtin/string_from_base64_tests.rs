@@ -70,7 +70,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -368,7 +368,7 @@ fn string_from_base64_compile_success_and_ordinary_tail_preserve_all_callback_ca
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let actual = prepared_for_test_with_control(
                     "from_base64",
@@ -695,7 +695,7 @@ fn string_from_base64_empty_child_journal_bad_shape_address_and_nonnull_poison_n
         let mut kernel = instance("from_base64");
         assert!(matches!(
             kernel.evaluate(Selection::all(1), &bad_arguments, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
         let after = Control::default();
         assert_eq!(
@@ -721,7 +721,7 @@ fn string_from_base64_empty_child_journal_bad_shape_address_and_nonnull_poison_n
                 &[EvaluatedArgument::Column(&null)],
                 &Control::default()
             ),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
 }
 

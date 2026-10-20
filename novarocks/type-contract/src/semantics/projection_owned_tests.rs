@@ -31,7 +31,7 @@ struct Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
-        let stop = *self.stop.lock().unwrap();
+        let stop = self.stop.lock().unwrap().clone();
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
         if let Some((end, _)) = stop {
@@ -258,7 +258,7 @@ fn immutable_projection_success_and_ordinary_actual_callbacks_preserve_first_cau
         assert!(!trace.is_empty());
         for at in 0..trace.len() {
             for cause in CAUSES {
-                c.arm(Some((at, cause)));
+                c.arm(Some((at, cause.clone())));
                 assert_eq!(
                     run(&input, &refs, &c),
                     Err(SemanticParameterProjectionError::Control(cause))
@@ -292,7 +292,7 @@ fn immutable_projection_captured_clone_and_header_refusals_have_no_after_callbac
                     };
                     if reject {
                         before_refusal = c.trace();
-                        return Err(SemanticParameterProjectionError::Control(cause));
+                        return Err(SemanticParameterProjectionError::Control(cause.clone()));
                     }
                     Ok(())
                 },

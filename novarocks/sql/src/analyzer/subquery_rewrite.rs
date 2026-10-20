@@ -2293,7 +2293,7 @@ impl<'a> AnalyzerContext<'a> {
             &probe.value_type.data_type(),
             &item.value_type.data_type(),
         )
-        .map_err(|message| AnalyzeError::type_mismatch(message, span))?
+        .map_err(|message| AnalyzeError::type_mismatch_source(message, span))?
         {
             Some(common) => (
                 cast_null_preserving_target_type(probe, &common, DecimalOverflowPolicy::OutputNull),

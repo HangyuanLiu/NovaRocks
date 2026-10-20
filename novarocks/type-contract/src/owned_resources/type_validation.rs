@@ -113,7 +113,7 @@ mod scratch_tests {
         fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             let mut trace = self.trace.lock().unwrap();
             trace.push(units);
-            if let Some((at, error)) = self.refusal
+            if let Some((at, error)) = self.refusal.clone()
                 && trace.len() == at
             {
                 return Err(error);
@@ -157,7 +157,7 @@ mod scratch_tests {
             for (at, completed) in [(2, 0), (3, 256), (19, crate::MAX_VALUE_TYPE_NODES)] {
                 let control = Control {
                     trace: Mutex::default(),
-                    refusal: Some((at, error)),
+                    refusal: Some((at, error.clone())),
                 };
                 let mut work =
                     CompileCheckpoints::try_new(&control, CompilePhase::LowerProgram).unwrap();
@@ -176,7 +176,7 @@ mod scratch_tests {
                         .all(|slot| *slot == Some((&ty, 7)))
                 );
                 assert_eq!(control.trace.lock().unwrap().len(), at);
-                assert_eq!(work.flush(), Err(error));
+                assert_eq!(work.flush(), Err(error.clone()));
                 assert_eq!(control.trace.lock().unwrap().len(), at);
             }
         }

@@ -91,7 +91,7 @@ fn fixture() -> (
     Arc<MemTracker>,
     Arc<dyn InputConstructionFactory>,
 ) {
-    let state = RuntimeState::new(None, None, None, None, None, None, None);
+    let state = RuntimeState::for_local_execution(None, None, None, None, None, None, None);
     let tracker = MemTracker::new_root("native-values-real-creation");
     let factory = try_runtime_input_construction_factory(
         crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
@@ -111,9 +111,8 @@ fn native_values_share_original_payload_and_last_projection_keeps_creation() {
     operator.set_construction_factory(host.clone());
     operator.prepare().unwrap();
     let output = operator
-        .as_processor_mut()
-        .unwrap()
-        .pull_chunk(&state)
+        .drive_for_test(&state)
+        .map(|step| step.output)
         .unwrap()
         .unwrap();
     assert!(
@@ -144,13 +143,14 @@ fn native_values_keep_original_zero_column_row_count_and_refuse_missing_owner() 
         operator.prepare().unwrap_err().cause(),
         ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
     ));
+    drop(operator);
+    let mut operator = factory.create(1, 0);
     let (state, tracker, host) = fixture();
     operator.set_construction_factory(host.clone());
     operator.prepare().unwrap();
     let output = operator
-        .as_processor_mut()
-        .unwrap()
-        .pull_chunk(&state)
+        .drive_for_test(&state)
+        .map(|step| step.output)
         .unwrap()
         .unwrap();
     assert_eq!(output.len(), 7);
@@ -181,8 +181,10 @@ fn native_values_first_memory_and_original_caller_refusal_have_no_allocation_tai
     let (state, tracker, host) = fixture();
     let mut operator = factory.create(1, 0);
     operator.set_construction_factory(host.clone());
-    let original = ExecutionFailure::from("original Values caller".to_owned())
-        .at_operator(2, PipelineOperation::Admission);
+    let original = ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
+        novarocks_functions::KernelDiagnostic::new(&("original Values caller".to_owned())),
+    ))
+    .at_operator(2, PipelineOperation::Admission);
     state.error_state().set_error(original.clone());
     let before = tracker.allocated();
     let failure = operator.prepare().unwrap_err();

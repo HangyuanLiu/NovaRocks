@@ -311,7 +311,7 @@ pub enum ConstantError {
     Control(CompileControlError),
     Type(ValueTypeError),
     Invalid(&'static str),
-    Arrow(String),
+    Source(novarocks_failure_contract::SharedFailureCause),
     Limit(&'static str),
 }
 impl From<ValueTypeError> for ConstantError {
@@ -328,7 +328,7 @@ impl From<CarrierParameterError> for ConstantError {
     fn from(value: CarrierParameterError) -> Self {
         match value {
             CarrierParameterError::Invalid(message) => Self::Invalid(message),
-            CarrierParameterError::Decimal(error) => Self::Arrow(error.to_string()),
+            CarrierParameterError::Decimal(error) => Self::arrow_validation(error),
         }
     }
 }
@@ -338,11 +338,21 @@ impl fmt::Display for ConstantError {
             Self::Control(e) => e.fmt(f),
             Self::Type(e) => e.fmt(f),
             Self::Invalid(e) | Self::Limit(e) => f.write_str(e),
-            Self::Arrow(e) => f.write_str(e),
+            Self::Source(e) => e.fmt(f),
         }
     }
 }
-impl std::error::Error for ConstantError {}
+impl std::error::Error for ConstantError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Type(source) => Some(source),
+            Self::Source(source) => Some(source),
+            Self::Invalid(_) | Self::Limit(_) => None,
+        }
+    }
+}
+mod failure;
 
 /// Cumulative requests and work of one constant-owner invocation. Source B,
 /// retained input buffers, and IPC reader output requests are excluded. The
@@ -615,11 +625,11 @@ impl<'a, E: PoolFailure> PoolObserver<'a, E> {
             .max(needed)
             .max(minimum);
         let layout = std::alloc::Layout::array::<T>(capacity)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
+            .map_err(|source| ConstantError::array_backing::<T>(capacity, source))?;
         self.request(layout, work)?;
         work.flush()?;
         let result = values.try_reserve_exact(capacity - values.len());
-        result.map_err(|_| CompileControlError::ResourceExhausted)?;
+        result.map_err(ConstantError::allocation)?;
         self.step(work)?;
         work.flush()?;
         Ok(())
@@ -766,7 +776,7 @@ impl ConstantPool {
             &mut work,
         );
         if let Err(ConstantError::Control(error)) = &checked {
-            return Err(ConstantError::Control(*error));
+            return Err(ConstantError::Control(error.clone()));
         }
         work.finish()?;
         let facts = checked?;
@@ -782,7 +792,7 @@ impl ConstantPool {
             &mut work,
         );
         if let Err(ConstantError::Control(error)) = &validated {
-            return Err(ConstantError::Control(*error));
+            return Err(ConstantError::Control(error.clone()));
         }
         work.finish()?;
         let (canonical, data) = validated?;
@@ -983,8 +993,14 @@ impl ConstantPool {
         }
         if !data.child_data().is_empty() {
             observer.request(
-                std::alloc::Layout::array::<ElementMetric>(data.child_data().len())
-                    .map_err(|_| CompileControlError::ResourceExhausted)?,
+                std::alloc::Layout::array::<ElementMetric>(data.child_data().len()).map_err(
+                    |source| {
+                        ConstantError::array_backing::<ElementMetric>(
+                            data.child_data().len(),
+                            source,
+                        )
+                    },
+                )?,
                 work,
             )?;
         }
@@ -1626,7 +1642,7 @@ fn validate_pool_source<E: PoolFailure>(
 }
 fn validate_arrow_data(data: &ArrayData) -> Result<(), ConstantError> {
     data.validate_full()
-        .map_err(|error| ConstantError::Arrow(error.to_string()))
+        .map_err(ConstantError::arrow_validation)
 }
 fn canonical_pool_data<E: PoolFailure>(
     data: ArrayData,
@@ -1849,7 +1865,7 @@ fn scan_data<E: PoolFailure>(
         work.flush()?;
         children
             .try_reserve_exact(data.child_data().len())
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
+            .map_err(ConstantError::allocation)?;
         observer.step(work)?;
         work.flush()?;
     }
@@ -1892,8 +1908,11 @@ fn scan_child<E: PoolFailure>(
     // recursive node entry must not charge the same request a second time.
     if observer.is_parent() && !child.child_data().is_empty() {
         observer.request(
-            std::alloc::Layout::array::<ElementMetric>(child.child_data().len())
-                .map_err(|_| CompileControlError::ResourceExhausted)?,
+            std::alloc::Layout::array::<ElementMetric>(child.child_data().len()).map_err(
+                |source| {
+                    ConstantError::array_backing::<ElementMetric>(child.child_data().len(), source)
+                },
+            )?,
             work,
         )?;
     }
@@ -2209,7 +2228,7 @@ fn validate_values_owned<E: PoolFailure>(
         work.flush()?;
         values
             .try_reserve_exact(1)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
+            .map_err(ConstantError::allocation)?;
         observer.step(work)?;
         work.flush()?;
         values.push(RequiredFrame::Range(data, 0, data.len(), !nullable));
@@ -2998,7 +3017,7 @@ impl ConstantValue {
         let bytes = value.to_be_bytes();
         let array =
             arrow_array::FixedSizeBinaryArray::try_from_iter([bytes.as_slice()].into_iter())
-                .map_err(|error| ConstantError::Arrow(error.to_string()))?;
+                .map_err(ConstantError::arrow_validation)?;
         Self::from_scalar_array(field, ty, array.to_data(), policy, phase, control)
     }
     pub fn from_date32(
@@ -3280,7 +3299,7 @@ impl ConstantValue {
         };
         let array = arrow_array::Decimal128Array::from(vec![value])
             .with_precision_and_scale(*precision, *scale)
-            .map_err(|e| ConstantError::Arrow(e.to_string()))?;
+            .map_err(ConstantError::arrow_validation)?;
         Self::from_scalar_array(field, ty, array.to_data(), policy, phase, control)
     }
     pub fn from_decimal256(
@@ -3299,7 +3318,7 @@ impl ConstantValue {
         };
         let array = arrow_array::Decimal256Array::from(vec![value])
             .with_precision_and_scale(*precision, *scale)
-            .map_err(|e| ConstantError::Arrow(e.to_string()))?;
+            .map_err(ConstantError::arrow_validation)?;
         Self::from_scalar_array(field, ty, array.to_data(), policy, phase, control)
     }
     pub fn null(
@@ -3543,7 +3562,7 @@ fn validate_decimal_value(row: Row<'_>) -> Result<(), ConstantError> {
         ),
         _ => return Ok(()),
     };
-    result.map_err(|e| ConstantError::Arrow(e.to_string()))
+    result.map_err(ConstantError::arrow_decimal_value)
 }
 
 #[cfg(test)]

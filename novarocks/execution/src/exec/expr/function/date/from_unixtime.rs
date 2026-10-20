@@ -16,9 +16,9 @@
 // under the License.
 use super::common::extract_i64_array;
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{Array, ArrayRef, StringArray};
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::DataType;
 use chrono::{DateTime, Local, NaiveDateTime, Utc};
 use novarocks_functions::builtin::calendar_unixtime::{
     TimeZoneSpec, evaluate_legacy_from_unixtime, parse_tz,
@@ -32,14 +32,29 @@ fn eval_from_unixtime_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     units_per_second: i64,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    if !(1..=3).contains(&args.len()) {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "from_unixtime requires one to three arguments",
+            )
+            .into(),
+        );
+    }
+    let output_type = super::common::frozen_type(arena.arena(), expr)?.clone();
+    if !matches!(
+        output_type,
+        DataType::Utf8 | DataType::Date32 | DataType::Timestamp(_, _)
+    ) {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "from_unixtime has an unsupported frozen result type",
+            )
+            .into(),
+        );
+    }
     let values = extract_i64_array(&arena.eval(args[0], chunk)?, "from_unixtime")?;
     let has_format_arg = args.len() > 1;
-    let output_type = match arena.data_type(expr).cloned() {
-        Some(DataType::Null) | None if has_format_arg => DataType::Utf8,
-        Some(DataType::Null) | None => DataType::Timestamp(TimeUnit::Microsecond, None),
-        Some(data_type) => data_type,
-    };
     let format_array = if has_format_arg {
         Some(arena.eval(args[1], chunk)?)
     } else {
@@ -48,10 +63,11 @@ fn eval_from_unixtime_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let format = format_array
         .as_ref()
         .map(|array| {
-            array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "from_unixtime expects string format".to_string())
+            array.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                    "from_unixtime expects string format",
+                )
+            })
         })
         .transpose()?;
     let timezone_array = if has_format_arg && args.len() > 2 {
@@ -62,17 +78,18 @@ fn eval_from_unixtime_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let timezone = timezone_array
         .as_ref()
         .map(|array| {
-            array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "from_unixtime expects string timezone".to_string())
+            array.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                    "from_unixtime expects string timezone",
+                )
+            })
         })
         .transpose()?;
     let default_zone = arena
         .session_time_zone()
         .and_then(parse_tz)
         .unwrap_or(TimeZoneSpec::Local);
-    Ok((evaluate_legacy_from_unixtime(
+    evaluate_legacy_from_unixtime(
         &values,
         format,
         timezone,
@@ -80,7 +97,8 @@ fn eval_from_unixtime_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         units_per_second,
         &output_type,
         project_local,
-    ))?)
+    )
+    .map_err(Into::into)
 }
 #[inline]
 pub fn eval_from_unixtime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -88,14 +106,14 @@ pub fn eval_from_unixtime<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_from_unixtime_inner(arena, expr, args, chunk, 1))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_from_unixtime_inner(arena, expr, args, chunk, 1)
 }
 pub fn eval_from_unixtime_ms<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_from_unixtime_inner(arena, expr, args, chunk, 1000))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_from_unixtime_inner(arena, expr, args, chunk, 1000)
 }

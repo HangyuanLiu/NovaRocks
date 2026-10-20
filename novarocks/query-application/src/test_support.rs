@@ -280,15 +280,17 @@ impl ResultStreamTestProducer {
             }
             _ => 4096,
         };
-        let retained =
-            crate::api::RetainedRootReply::try_new(reply, window.retain_alias(), backing).map_err(
-                |error| {
-                    QueryExecutionError::new(
-                        crate::api::QueryExecutionErrorKind::InvalidRequest,
-                        error.to_string(),
-                    )
-                },
-            )?;
+        let retained = crate::api::RetainedRootReply::try_new(
+            novarocks_execution_contract::root_result::RootReadResponse::Reply(reply),
+            window.retain_alias(),
+            backing,
+        )
+        .map_err(|error| {
+            QueryExecutionError::new(
+                crate::api::QueryExecutionErrorKind::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
         let (delivery, receipt) = crate::api::RootSegmentDelivery::try_new(
             self.execution_id,
             ResultPacketSequence::new(sequence),
@@ -352,8 +354,12 @@ impl ResultStreamTestProducer {
                 _ => return Err(invalid()),
             };
             let retained = std::sync::Arc::new(
-                RetainedRootReply::try_new(reply, window.retain_alias(), backing)
-                    .map_err(|_| invalid())?,
+                RetainedRootReply::try_new(
+                    novarocks_execution_contract::root_result::RootReadResponse::Reply(reply),
+                    window.retain_alias(),
+                    backing,
+                )
+                .map_err(|_| invalid())?,
             );
             let RootReplyView::Data { sequence, body, .. } = retained.outcome() else {
                 return Err(invalid());

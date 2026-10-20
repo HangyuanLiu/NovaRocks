@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, ListArray, make_array};
 use arrow::datatypes::DataType;
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
@@ -27,22 +29,35 @@ pub fn eval_array_remove<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(expression_contract(
+            "array_remove requires exactly 2 prepared argument(s)",
+        ));
+    }
     let arr = arena.eval(args[0], chunk)?;
     let target_arr = arena.eval(args[1], chunk)?;
-    let list = arr
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| format!("array_remove expects ListArray, got {:?}", arr.data_type()))?;
+    let list = arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+        expression_contract(format_args!(
+            "array_remove expects ListArray, got {:?}",
+            arr.data_type()
+        ))
+    })?;
 
     let output_field = match arena.data_type(expr) {
         Some(DataType::List(field)) => field.clone(),
-        _ => match list.data_type() {
+        Some(other) => {
+            return Err(expression_contract(format_args!(
+                "array_remove output type must be List, got {other:?}"
+            )));
+        }
+        None => match list.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(
-                    (format!("array_remove output type must be List, got {:?}", other)).into(),
-                );
+                return Err(expression_contract(format_args!(
+                    "array_remove output type must be List, got {:?}",
+                    other
+                )));
             }
         },
     };
@@ -78,7 +93,7 @@ pub fn eval_array_remove<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let offsets = list.value_offsets();
     let mut out_offsets = Vec::with_capacity(chunk.len() + 1);
     out_offsets.push(0_i32);
-    let mut current: i64 = 0;
+    let mut current = 0i32;
     let mut null_builder = NullBufferBuilder::new(chunk.len());
 
     for row in 0..chunk.len() {
@@ -101,23 +116,28 @@ pub fn eval_array_remove<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 super::common::compare_values_with_null(&values, idx, &targets, target_row, false)?
             };
             if !should_remove {
+                let next =
+                    novarocks_functions::aggregate_scalar::checked_list_output_offset(current, 1)?;
                 mutable.extend(0, idx, idx + 1);
-                current += 1;
+                current = next;
             }
-        }
-        if current > i32::MAX as i64 {
-            return Err(("array_remove offset overflow".to_string()).into());
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();
     }
 
     let out_values = make_array(mutable.freeze());
-    let out = ListArray::new(
+    let out = ListArray::try_new(
         output_field,
         OffsetBuffer::new(out_offsets.into()),
         out_values,
         null_builder.finish(),
-    );
+    )
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "array_remove constructor",
+            source,
+        )
+    })?;
     Ok(Arc::new(out) as ArrayRef)
 }

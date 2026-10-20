@@ -40,7 +40,7 @@ pub(super) fn actual(
     allow: bool,
     policy: DecimalOverflowPolicy,
     datetime: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let ty = input.data_type().clone();
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("input", ty.clone(), true)])),
@@ -254,7 +254,7 @@ fn text_time_original_wrong_target_full_data_text_is_before_child_evaluation() {
             DataType::Time64(TimeUnit::Nanosecond),
         );
         assert_eq!(
-            arena.eval(root, &chunk).unwrap_err(),
+            (arena.eval(root, &chunk).unwrap_err()).to_string(),
             "CAST failed: TIME target must be Time64(Microsecond), got Time64(Nanosecond)"
         );
     }

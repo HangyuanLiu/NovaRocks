@@ -100,6 +100,8 @@ pub use scope::{
     WorkloadShutdown, WorkloadShutdownError, WorkloadShutdownFailure,
 };
 
+mod failure_projection;
+
 /// Admission failures never imply cancellation, physical stop, or release.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkError {

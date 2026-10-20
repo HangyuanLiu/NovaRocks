@@ -14,9 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 use super::super::aggregate_mann_whitney_core::{MannWhitneyInput, MannWhitneyState};
 use super::super::aggregate_mann_whitney_resources::MannSourceParams;
 use super::*;
+use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use crate::opaque_memory::OpaqueAllocationHost;
 use crate::source_custody_resources_tests::{measured, measured_live_bytes, without_recording};
 use crate::*;
@@ -308,10 +310,8 @@ impl MannEmissionAccess for State {
     }
     fn with_core(
         &self,
-        operation: impl FnOnce(
-            &mut MannWhitneyState<HostAggregateAllocator>,
-        ) -> Result<(), ScalarStateError>,
-    ) -> Result<(), ScalarStateError> {
+        operation: impl FnOnce(&mut MannWhitneyState<HostAggregateAllocator>) -> Result<(), MannFailure>,
+    ) -> Result<(), MannFailure> {
         self.renders.set(self.renders.get() + 1);
         let mut core = self
             .core
@@ -440,7 +440,7 @@ fn mann_whitney_emission_original_final_null_gate_results_and_repeated_state_ord
         &[9, 1, 6, 2],
         &[Some(false), Some(false), Some(true), Some(true)],
     );
-    let expected = oracle.core.borrow_mut().build_result();
+    let expected = oracle.core.borrow_mut().build_result().unwrap();
     drop(oracle);
     let states = [&samples, &unknown, &initialized_empty, &samples];
     let result = emit(
@@ -477,7 +477,7 @@ fn mann_whitney_emission_intermediate_serializes_uninitialized_and_exact_origina
     ];
     let expected: Vec<_> = states
         .iter()
-        .map(|s| s.core.borrow_mut().serialize())
+        .map(|s| s.core.borrow_mut().serialize().unwrap())
         .collect();
     let result = emit(
         &host,

@@ -136,7 +136,7 @@ fn unsupported_variable_and_encoded_carriers_are_not_silently_copied_or_retagged
     ] {
         let arrays = vec![arrow_array::new_empty_array(&ty)];
         assert!(
-            matches!(preflight_fixed_interleave(&ty, &arrays, &[], |_| Ok(())), Err(CopyError::Unsupported(actual)) if actual == ty)
+            matches!(preflight_fixed_interleave(&ty, &arrays, &[], |_| Ok(())), Err(CopyError::Unsupported(actual)) if actual.as_str() == CopyError::unsupported(&ty).to_string())
         );
     }
 }
@@ -147,12 +147,12 @@ fn fixed_output_extents_include_rounded_validity_and_check_width_before_allocati
     assert!(fixed_interleave_extent(&DataType::Int64, maximum / 8).is_ok());
     assert!(matches!(
         fixed_interleave_extent(&DataType::Int64, maximum / 8 + 1),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
     assert!(fixed_interleave_extent(&DataType::Decimal256(76, 0), maximum / 32).is_ok());
     assert!(matches!(
         fixed_interleave_extent(&DataType::Decimal256(76, 0), maximum / 32 + 1),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
     for rows in [0, 1, 7, 8, 511, 512, 513] {
         fixed_interleave_extent(&DataType::Boolean, rows).unwrap();
@@ -260,6 +260,6 @@ fn fixed_binary_interleave_preserves_selected_bytes_nulls_and_exact_width() {
     );
     assert!(matches!(
         fixed_interleave_extent(&DataType::FixedSizeBinary(16), isize::MAX as usize / 16 + 1),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
 }

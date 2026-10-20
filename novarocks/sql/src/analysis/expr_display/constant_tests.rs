@@ -36,7 +36,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push((phase, units));
-        match self.refuse {
+        match self.refuse.clone() {
             Some((at, cause)) if trace.len() == at + 1 => Err(cause),
             _ => Ok(()),
         }
@@ -209,7 +209,7 @@ fn selected_display_rejects_foreign_full_type_and_preserves_ordinary_failure_tai
         let at = expected.len() - 1;
         let control = Control {
             trace: Mutex::new(Vec::new()),
-            refuse: Some((at, cause)),
+            refuse: Some((at, cause.clone())),
         };
         assert_eq!(
             typed_expr_display_name(&case(bad.clone()), &control),
@@ -239,7 +239,7 @@ fn every_selected_display_control_refusal_preserves_exact_prefix_without_publica
         ] {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                refuse: Some((at, cause)),
+                refuse: Some((at, cause.clone())),
             };
             assert_eq!(
                 typed_expr_display_name(&expr, &control),
@@ -334,7 +334,7 @@ fn binary_display_preserves_first_control_and_writer_refusal() {
             CompileControlError::ResourceExhausted,
         ] {
             let refused = Control {
-                refuse: Some((at, cause)),
+                refuse: Some((at, cause.clone())),
                 ..Default::default()
             };
             assert_eq!(

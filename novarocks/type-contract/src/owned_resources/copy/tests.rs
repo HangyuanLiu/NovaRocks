@@ -29,7 +29,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         trace.push(units);
         if trace.len() > 1
-            && let Some(cause) = self.later_cause
+            && let Some(cause) = self.later_cause.clone()
         {
             return Err(cause);
         }
@@ -68,7 +68,7 @@ fn successful_reserve_observes_original_exit_control_and_units() {
     for cause in CAUSES {
         let control = Control {
             trace: Mutex::new(Vec::new()),
-            later_cause: Some(cause),
+            later_cause: Some(cause.clone()),
         };
         let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
         work.step().unwrap();
@@ -116,7 +116,7 @@ impl PureCompileControl for PrefixControl {
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
         trace.push(units);
-        if let Some((failure_at, cause)) = self.failure
+        if let Some((failure_at, cause)) = self.failure.clone()
             && at == failure_at
         {
             return Err(cause);
@@ -161,7 +161,7 @@ fn string_copy_every_actual_small_callback_preserves_all_three_primary_causes() 
     assert_eq!(trace, [0, 0, 1, 5]);
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let control = PrefixControl::refusing(at, cause);
+            let control = PrefixControl::refusing(at, cause.clone());
             assert_eq!(
                 copy_in_scope(source, &control),
                 Err(CopyError::Control(cause))
@@ -196,7 +196,7 @@ fn string_copy_multibyte_boundary_and_wide_actual_quantum_preserve_spelling_and_
     );
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let control = PrefixControl::refusing(at, cause);
+            let control = PrefixControl::refusing(at, cause.clone());
             assert_eq!(
                 copy_in_scope(&source, &control),
                 Err(CopyError::Control(cause))

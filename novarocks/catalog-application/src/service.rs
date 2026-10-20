@@ -1510,6 +1510,7 @@ fn connector_error(error: novarocks_spi::connector::ConnectorError) -> CatalogAp
     use novarocks_spi::connector::ConnectorErrorKind;
 
     let kind = match error.kind() {
+        ConnectorErrorKind::Interrupted => CatalogApplicationErrorKind::Interrupted,
         ConnectorErrorKind::InvalidRequest => CatalogApplicationErrorKind::InvalidRequest,
         ConnectorErrorKind::NotFound => CatalogApplicationErrorKind::Unavailable,
         ConnectorErrorKind::Unavailable
@@ -1521,7 +1522,7 @@ fn connector_error(error: novarocks_spi::connector::ConnectorError) -> CatalogAp
         | ConnectorErrorKind::CorruptData
         | ConnectorErrorKind::Internal => CatalogApplicationErrorKind::Internal,
     };
-    CatalogApplicationError::new(kind, error.to_string())
+    CatalogApplicationError::from_domain(kind, error.clone())
 }
 
 fn materialization_error(
@@ -1530,6 +1531,7 @@ fn materialization_error(
     use novarocks_spi::connector::ConnectorMaterializationErrorClass;
 
     let kind = match error.class() {
+        ConnectorMaterializationErrorClass::Interrupted => CatalogApplicationErrorKind::Interrupted,
         ConnectorMaterializationErrorClass::InvalidDefinition => {
             CatalogApplicationErrorKind::InvalidRequest
         }
@@ -1540,13 +1542,29 @@ fn materialization_error(
         | ConnectorMaterializationErrorClass::Cancelled => CatalogApplicationErrorKind::Unavailable,
         ConnectorMaterializationErrorClass::Internal => CatalogApplicationErrorKind::Internal,
     };
-    CatalogApplicationError::new(kind, error.to_string())
+    CatalogApplicationError::from_domain(kind, error.clone())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn catalog_boundary_retains_connector_author_facts_and_occurrence() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_spi::connector::{ConnectorError, ConnectorIdentityError};
+        let raw = ConnectorIdentityError::InvalidWriteTargetOrdinal;
+        let expected = raw.failure_fact();
+        let connector = ConnectorError::from(raw);
+        let error = connector_error(connector.clone());
+        assert_eq!(error.failure_fact(), expected);
+        let source = error.source_failure().expect("original domain source");
+        assert_eq!(source.failure_fact(), expected);
+        assert_eq!(source.downcast_ref::<ConnectorError>(), Some(&connector));
+        let clone = error.clone();
+        assert_eq!(clone.source_failure(), Some(source));
+    }
 
     fn vending_properties() -> Vec<(String, String)> {
         [

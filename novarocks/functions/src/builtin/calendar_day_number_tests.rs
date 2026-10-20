@@ -71,7 +71,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -570,7 +570,7 @@ fn calendar_day_number_null_inactive_empty_and_required_errors_never_bypass_prot
             &[EvaluatedArgument::Scalar(&null)],
             &Control::default()
         ),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let empty = strings(vec![]);
     let mut kernel = instance(&text_type(true));
@@ -580,7 +580,7 @@ fn calendar_day_number_null_inactive_empty_and_required_errors_never_bypass_prot
             &[EvaluatedArgument::Column(&empty)],
             &Control::default()
         ),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let failed = SelectedValues::try_new(
         Selection::all(2),
@@ -596,7 +596,7 @@ fn calendar_day_number_null_inactive_empty_and_required_errors_never_bypass_prot
             &[EvaluatedArgument::SelectedColumn(&failed)],
             &Control::default()
         ),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let after = Control::default();
     assert_eq!(
@@ -680,7 +680,7 @@ fn calendar_day_number_every_compile_callback_preserves_three_primary_causes_and
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let error = prepared_for_test_with_control(
                     "to_days",
@@ -692,14 +692,8 @@ fn calendar_day_number_every_compile_callback_preserves_three_primary_causes_and
                 .unwrap();
                 let actual = match error {
                     FunctionSpecializationFailure::Control(cause) => Some(cause),
-                    FunctionSpecializationFailure::Kernel(KernelFailure::Cancelled) => {
-                        Some(CompileControlError::Cancelled)
-                    }
-                    FunctionSpecializationFailure::Kernel(KernelFailure::DeadlineExceeded) => {
-                        Some(CompileControlError::DeadlineExceeded)
-                    }
-                    FunctionSpecializationFailure::Kernel(KernelFailure::ResourceExhausted) => {
-                        Some(CompileControlError::ResourceExhausted)
+                    FunctionSpecializationFailure::Kernel(KernelFailure::CompileControl(cause)) => {
+                        Some(cause)
                     }
                     _ => None,
                 };
@@ -792,5 +786,223 @@ fn calendar_day_number_every_runtime_callback_keeps_seven_primary_causes_quantum
                 assert!(after.trace.lock().unwrap().is_empty());
             }
         }
+    }
+}
+
+fn with_installed_day_number<T>(
+    source: FunctionValueType,
+    action: impl FnOnce(
+        &super::super::calendar_day_number_owner::CalendarDayNumberOwner,
+        crate::CallEffectInput<'_>,
+        Arc<crate::ScalarCallContract>,
+    ) -> T,
+) -> T {
+    let catalog = super::super::catalogue::builtin_engine_function_catalog();
+    let owner = owner_for_test("to_days");
+    let arguments = [FunctionArgument::Value {
+        value_type: source,
+        constant: None,
+    }];
+    let request = FunctionBindingRequest {
+        arguments: &arguments,
+        logical_argument_count: 1,
+        expected_result_type: None,
+    };
+    let bound = catalog
+        .resolve_bound_user(
+            "to_days",
+            crate::FunctionKind::Scalar,
+            request,
+            crate::binding_test_control(),
+        )
+        .unwrap();
+    let selected = Arc::new(bound.selected);
+    let context = ExpressionEffectContext {
+        use_id: ExpressionUseId::new(841),
+        domain: EvaluationDomainId::new(847),
+        demand: EvaluationDemand::Value,
+    };
+    let uses = [Some(ExpressionUseId::new(842))];
+    let parameters = SemanticParameters::default();
+    let input = crate::CallEffectInput {
+        context,
+        argument_uses: crate::CallArgumentUses::SelectedChannels(&uses),
+        function_id: &bound.function_id,
+        kind: crate::FunctionKind::Scalar,
+        selected: &selected,
+        request,
+        environment: &[],
+        parameters: &parameters,
+        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+        proof_scope: CallProofScope::Domain(context.domain),
+    };
+    let fresh = catalog
+        .prepare_fresh_selected(
+            input,
+            selected.clone(),
+            crate::PureCallPreparation::Scalar {
+                arguments: ScopedExpressionEffects::pure_value(context),
+            },
+            crate::binding_test_control(),
+        )
+        .unwrap();
+    let frozen = catalog
+        .prepare_frozen_selected(
+            input,
+            selected.clone(),
+            fresh.call_contract().effects(),
+            crate::PureCallPreparation::Scalar {
+                arguments: ScopedExpressionEffects::pure_value(context),
+            },
+            crate::binding_test_control(),
+        )
+        .unwrap();
+    assert_eq!(fresh.implementation(), frozen.implementation());
+    let crate::PreparedPureKernel::Scalar(prepared) = fresh.into_prepared() else {
+        panic!("the installed day-number author must produce its real ScalarV1 kernel");
+    };
+    assert!(std::ptr::eq(
+        prepared.contract().selected(),
+        selected.as_ref()
+    ));
+    action(&owner, input, prepared.contract().clone())
+}
+
+#[test]
+fn calendar_day_number_captured_owner_errors_return_without_a_later_compile_callback() {
+    use crate::{FunctionBindingError, FunctionEffectOwner, FunctionEffectOwnerError};
+    for source in profiles(true) {
+        with_installed_day_number(source, |owner, input, contract| {
+            let foreign = crate::FunctionId::try_new("foreign.calendar/day-number/v1").unwrap();
+            for mismatch in 0..3 {
+                let mut wrong = input;
+                match mismatch {
+                    0 => wrong.function_id = &foreign,
+                    1 => wrong.kind = crate::FunctionKind::Aggregate,
+                    2 => wrong.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(999)),
+                    _ => unreachable!(),
+                }
+                let control = CompileControl::default();
+                let error = owner.validate_and_refine(wrong, &control).unwrap_err();
+                let expected = if mismatch < 2 {
+                    FunctionBindingError::UnknownFunction
+                } else {
+                    FunctionBindingError::InvalidBinding("calendar day number has no environment dependencies and requires an exact proof scope".into())
+                };
+                match error {
+                    FunctionEffectOwnerError::Owner(actual) => assert_eq!(actual, expected),
+                    other => panic!("the actual owner error must remain the result: {other:?}"),
+                }
+                assert_eq!(
+                    *control.trace.lock().unwrap(),
+                    [(CompilePhase::FunctionSpecialization, 0)],
+                    "an authored outer failure does not start the pending-work footer"
+                );
+
+                let control = CompileControl::default();
+                let error = owner
+                    .prepare_scalar(wrong, contract.clone(), &control)
+                    .unwrap_err();
+                assert_eq!(
+                    error,
+                    KernelFailure::InvalidProgram(crate::KernelDiagnostic::new(
+                        "calendar day number preparation differs from its exact checked call"
+                    ))
+                );
+                assert_eq!(
+                    *control.trace.lock().unwrap(),
+                    [(CompilePhase::FunctionSpecialization, 0)]
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn calendar_day_number_nested_binding_error_has_no_enclosing_owner_footer() {
+    use crate::{FunctionEffectOwner, FunctionEffectOwnerError};
+    for source in profiles(true) {
+        with_installed_day_number(source, |owner, input, _| {
+            let mut forged = (*input.selected).clone();
+            forged.result_type =
+                FunctionResultType::Scalar(FunctionValueType::new(DataType::Int64, false));
+            let binding_control = CompileControl::default();
+            let expected = owner
+                .validate_selected(&forged, input.request, &binding_control)
+                .unwrap_err();
+            let binding_trace = binding_control.trace.lock().unwrap().clone();
+            assert!(!binding_trace.is_empty());
+            let mut wrong = input;
+            wrong.selected = &forged;
+            let control = CompileControl::default();
+            let error = owner.validate_and_refine(wrong, &control).unwrap_err();
+            match error {
+                FunctionEffectOwnerError::Owner(actual) => assert_eq!(actual, expected),
+                other => panic!("nested binding author error must remain intact: {other:?}"),
+            }
+            let mut expected_trace = vec![
+                (CompilePhase::FunctionSpecialization, 0),
+                (CompilePhase::FunctionSpecialization, 1),
+            ];
+            expected_trace.extend_from_slice(&binding_trace);
+            assert_eq!(
+                *control.trace.lock().unwrap(),
+                expected_trace,
+                "the enclosing owner must not append its zero-tail callback after a nested author failed"
+            );
+        });
+    }
+}
+
+#[test]
+fn calendar_day_number_real_success_flushes_and_each_actual_callback_preserves_original_refusal() {
+    use crate::{FunctionEffectOwner, FunctionEffectOwnerError};
+    for source in profiles(true) {
+        with_installed_day_number(source, |owner, input, contract| {
+            let binding_control = CompileControl::default();
+            owner
+                .validate_selected(input.selected, input.request, &binding_control)
+                .unwrap();
+            let mut expected_trace = vec![
+                (CompilePhase::FunctionSpecialization, 0),
+                (CompilePhase::FunctionSpecialization, 1),
+            ];
+            expected_trace.extend_from_slice(&binding_control.trace.lock().unwrap());
+            expected_trace.push((CompilePhase::FunctionSpecialization, 0));
+            let refined = CompileControl::default();
+            assert_eq!(
+                &owner.validate_and_refine(input, &refined).unwrap(),
+                contract.effects()
+            );
+            assert_eq!(
+                *refined.trace.lock().unwrap(),
+                expected_trace,
+                "success must still flush its real final scope"
+            );
+            let prepared = CompileControl::default();
+            let kernel = owner
+                .prepare_scalar(input, contract.clone(), &prepared)
+                .unwrap();
+            assert!(Arc::ptr_eq(kernel.contract(), &contract));
+            assert_eq!(*prepared.trace.lock().unwrap(), expected_trace);
+            for at in 0..expected_trace.len() {
+                for cause in [
+                    CompileControlError::Cancelled,
+                    CompileControlError::DeadlineExceeded,
+                    CompileControlError::ResourceExhausted,
+                    CompileControlError::from_domain(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
+                ] {
+                    let control = CompileControl { trace: Mutex::new(vec![]), refusal: Some((at, cause.clone())) };
+                    match owner.validate_and_refine(input, &control).unwrap_err() {
+                        FunctionEffectOwnerError::Control(actual) => assert_eq!(actual, cause),
+                        other => panic!("the same-scope compile refusal must stay original: {other:?}"),
+                    }
+                    assert_eq!(*control.trace.lock().unwrap(), expected_trace[..=at]);
+                    let control = CompileControl { trace: Mutex::new(vec![]), refusal: Some((at, cause.clone())) };
+                    assert_eq!(owner.prepare_scalar(input, contract.clone(), &control).unwrap_err(), KernelFailure::CompileControl(cause));
+                    assert_eq!(*control.trace.lock().unwrap(), expected_trace[..=at]);
+                }
+            }
+        });
     }
 }

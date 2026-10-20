@@ -16,7 +16,8 @@
 // under the License.
 use super::common::{NumericArrayView, value_at_i64};
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{Array, ArrayRef, StringArray};
 use std::sync::Arc;
 
@@ -25,7 +26,7 @@ pub fn eval_conv<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let _ = expr;
     let num_arr = arena.eval(args[0], chunk)?;
     let from_arr = arena.eval(args[1], chunk)?;

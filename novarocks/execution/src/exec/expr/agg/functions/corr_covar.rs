@@ -39,11 +39,18 @@ impl AggregateFunction for CovarCorrAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         let name = func.name.as_str();
-        let kind = kind_from_name(name)
-            .ok_or_else(|| format!("unsupported covar/corr function: {name}"))?;
-        let data_type = input_type.ok_or_else(|| format!("{name} input type missing"))?;
+        let kind = kind_from_name(name).ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "unsupported covar/corr function: {name}"
+            ))
+        })?;
+        let data_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "{name} input type missing"
+            ))
+        })?;
 
         if input_is_intermediate {
             return Ok(AggSpec {
@@ -58,7 +65,11 @@ impl AggregateFunction for CovarCorrAgg {
         match data_type {
             DataType::Struct(fields) => {
                 if fields.len() != 2 {
-                    return Err(format!("{name} expects 2 arguments"));
+                    return Err(
+                        crate::exec::expr::agg::functions::aggregate_binding_contract(
+                            format_args!("{name} expects 2 arguments"),
+                        ),
+                    );
                 }
                 Ok(AggSpec {
                     kind,
@@ -68,7 +79,12 @@ impl AggregateFunction for CovarCorrAgg {
                     count_all: false,
                 })
             }
-            other => Err(format!("{name} expects struct input, got {:?}", other)),
+            other => Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "{name} expects struct input, got {:?}",
+                    other
+                )),
+            ),
         }
     }
 
@@ -90,10 +106,10 @@ impl AggregateFunction for CovarCorrAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "covar/corr input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("covar/corr input missing")
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -101,22 +117,24 @@ impl AggregateFunction for CovarCorrAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "covar/corr merge input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "covar/corr merge input missing",
+            )
+        })?;
         match arr.data_type() {
             DataType::Binary => {
-                let bin = arr
-                    .as_any()
-                    .downcast_ref::<BinaryArray>()
-                    .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+                let bin = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+                    crate::exec::expr::agg::views::aggregate_input_contract(
+                        "failed to downcast to BinaryArray",
+                    )
+                })?;
                 Ok(AggInputView::Binary(bin))
             }
             DataType::Utf8 => Ok(AggInputView::Utf8(Utf8ArrayView::new(arr)?)),
-            other => Err(format!(
-                "covar/corr intermediate type mismatch: {:?}",
-                other
+            other => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format!("covar/corr intermediate type mismatch: {:?}", other),
             )),
         }
     }
@@ -147,7 +165,7 @@ impl AggregateFunction for CovarCorrAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         super::aggregate_basic_adapter::update(spec, offset, state_ptrs, input, None)
     }
 
@@ -157,9 +175,11 @@ impl AggregateFunction for CovarCorrAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         if !matches!(input, AggInputView::Binary(_) | AggInputView::Utf8(_)) {
-            return Err("covar/corr merge input type mismatch".to_owned());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "covar/corr merge input type mismatch",
+            ));
         }
         super::aggregate_basic_adapter::merge(spec, offset, state_ptrs, input)
     }
@@ -170,7 +190,7 @@ impl AggregateFunction for CovarCorrAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         super::aggregate_basic_adapter::build(spec, offset, group_states, output_intermediate)
     }
 }

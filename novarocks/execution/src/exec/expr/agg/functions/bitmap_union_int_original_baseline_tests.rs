@@ -24,7 +24,7 @@ struct Original {
     spec: AggSpec,
 }
 impl Original {
-    fn new(name: &str, input: &DataType) -> Result<Self, String> {
+    fn new(name: &str, input: &DataType) -> crate::runtime::fragment::ExecutionResult<Self> {
         let f = AggFunction {
             name: name.into(),
             ..Default::default()
@@ -44,11 +44,11 @@ impl Original {
     fn pointer(&mut self) -> AggStatePtr {
         self.raw.as_mut_ptr() as AggStatePtr
     }
-    fn update(&mut self, a: ArrayRef) -> Result<(), String> {
+    fn update(&mut self, a: ArrayRef) -> crate::runtime::fragment::ExecutionResult<()> {
         let pointers = vec![self.pointer(); a.len()];
         BitmapUnionIntAgg.update_batch(&self.spec, 0, &pointers, &AggInputView::Any(&a))
     }
-    fn merge(&mut self, a: ArrayRef) -> Result<(), String> {
+    fn merge(&mut self, a: ArrayRef) -> crate::runtime::fragment::ExecutionResult<()> {
         let pointers = vec![self.pointer(); a.len()];
         let wrapped = Some(a);
         let input = BitmapUnionIntAgg.build_merge_view(&self.spec, &wrapped)?;
@@ -261,15 +261,20 @@ fn original_bitmap_union_int_merge_first_full_error_and_prior_success_are_preser
                 Some(encode_bitmap(&BTreeSet::from([9])).unwrap()),
             ]))
             .unwrap_err();
-        assert_eq!(error, expected);
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&error),
+            novarocks_failure_contract::FailureProjection::failure_fact(&expected)
+        );
+        assert_eq!(error.to_string(), expected.to_string());
         assert_eq!(s.count(), Some(1));
         assert_eq!(
             decode_bitmap(&s.bytes().unwrap()).unwrap(),
             BTreeSet::from([7])
         );
-        if bad.len() > 512 {
-            assert!(error.len() > 512);
-        }
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&error).class(),
+            novarocks_failure_contract::FailureClass::Data
+        );
     }
 }
 #[test]
@@ -292,11 +297,11 @@ fn original_bitmap_union_int_type_admission_full_error_and_view_order() {
         };
         let expected =
             format!("bitmap aggregate expects BOOLEAN/INTEGER/VARCHAR/BINARY input, got {ty:?}");
-        assert_eq!(
-            BitmapUnionIntAgg
+        crate::exec::expr::agg::functions::common::assert_plan_contract(
+            &(BitmapUnionIntAgg
                 .build_spec_from_type(&f, Some(&ty), false)
-                .unwrap_err(),
-            expected
+                .unwrap_err()),
+            &expected,
         );
         if matches!(ty, DataType::Struct(_)) {
             assert!(expected.len() > 512);
@@ -312,7 +317,7 @@ fn original_bitmap_union_int_type_admission_full_error_and_view_order() {
             AggInputView::Any(_)
         ));
         assert_eq!(
-            BitmapUnionIntAgg.build_merge_view(&spec, &a).err().unwrap(),
+            (BitmapUnionIntAgg.build_merge_view(&spec, &a).err().unwrap()).to_string(),
             "failed to downcast to BinaryArray"
         );
     }
@@ -320,25 +325,25 @@ fn original_bitmap_union_int_type_admission_full_error_and_view_order() {
     let p = s.pointer();
     let wrong = Arc::new(Int32Array::from(vec![1])) as ArrayRef;
     let wrong = AggInputView::Any(&wrong);
-    assert_eq!(
-        BitmapUnionIntAgg
+    crate::exec::expr::agg::functions::common::assert_plan_contract(
+        &(BitmapUnionIntAgg
             .merge_batch(&s.spec, 0, &[p], &wrong)
-            .unwrap_err(),
-        "bitmap_union_int merge input type mismatch"
+            .unwrap_err()),
+        &"bitmap_union_int merge input type mismatch",
     );
-    assert_eq!(
-        BitmapUnionIntAgg
+    crate::exec::expr::agg::functions::common::assert_view_contract(
+        &(BitmapUnionIntAgg
             .build_input_view(&s.spec, &None)
             .err()
-            .unwrap(),
-        "bitmap_union_int input missing"
+            .unwrap()),
+        &"bitmap_union_int input missing",
     );
-    assert_eq!(
-        BitmapUnionIntAgg
+    crate::exec::expr::agg::functions::common::assert_view_contract(
+        &(BitmapUnionIntAgg
             .build_merge_view(&s.spec, &None)
             .err()
-            .unwrap(),
-        "bitmap_union_int intermediate input missing"
+            .unwrap()),
+        &"bitmap_union_int intermediate input missing",
     );
 }
 #[test]
@@ -469,15 +474,17 @@ fn original_bitmap_agg_merge_full_data_and_first_prefix_are_unchanged() {
                 Some(bad.clone()),
                 Some(encode_bitmap(&BTreeSet::from([9])).unwrap())
             ]))
-            .unwrap_err(),
-            expected
+            .unwrap_err()
+            .to_string(),
+            expected.to_string()
         );
         assert_eq!(
             s.bytes().unwrap(),
             encode_bitmap(&BTreeSet::from([7])).unwrap()
         );
-        if bad.len() > 512 {
-            assert!(expected.len() > 512);
-        }
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&expected).class(),
+            novarocks_failure_contract::FailureClass::Data
+        );
     }
 }

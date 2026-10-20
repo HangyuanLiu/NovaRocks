@@ -19,7 +19,8 @@
 //! Its immutable plan facts remain with preparation's owner; every new batch
 //! backing is preflighted before growth under the original last-edge permit.
 
-use crate::runtime::fragment::ExecutionResult;
+use crate::exec::pipeline::operator::OperatorLifecycle;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, ExecutionResult};
 
 use std::mem::size_of;
 use std::sync::Arc;
@@ -44,9 +45,18 @@ use crate::exec::chunk::{
 use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
 use crate::exec::node::unpivot::{UnpivotConstant, UnpivotValueMapping};
 use crate::exec::pipeline::operator::{
-    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator, RootPreparedPull,
+    ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::{AcceptedInput, InputPreparationFailure, PreparedInput, RawInput},
+    shape::{
+        HydrateInput, InputPreparation, PreparationStep, ReceiverPreparation, ReceiverSlot,
+        StepOperator,
+    },
+    step::{AdmissionNext, InputResult, NextStep, RootPending, RootStep, StepResult},
+    step_context::StepContext,
+};
 use crate::runtime::fragment::io::RootInputPermit;
 use crate::runtime::runtime_state::RuntimeState;
 use novarocks_local_program::StaticLayout;
@@ -159,7 +169,7 @@ impl StatisticsMaterializerFactory {
         passthrough_count: usize,
         max_rows: usize,
         max_bytes: usize,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         Self::try_new_from_source(
             StatisticsLiteralSource::Fixture(arena),
             value_slot,
@@ -185,7 +195,7 @@ impl StatisticsMaterializerFactory {
         passthrough_count: usize,
         max_rows: usize,
         max_bytes: usize,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         Self::try_new_from_source(
             StatisticsLiteralSource::Compiled(program),
             value_slot,
@@ -208,7 +218,7 @@ impl StatisticsMaterializerFactory {
         passthrough_count: usize,
         max_rows: usize,
         max_bytes: usize,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let arrow_schema = schema.arrow_schema();
         let fields = arrow_schema.fields();
         let slots = schema.slots();
@@ -223,12 +233,14 @@ impl StatisticsMaterializerFactory {
             || mappings.is_empty()
             || mappings.len() > MAX_CONNECTOR_STATISTICS_ARTIFACTS
         {
-            return Err(
-                "statistics materializer roles or bounds differ from its frozen domain".into(),
-            );
+            return Err(statistics_contract(
+                "statistics materializer roles or bounds differ from its frozen domain",
+            ));
         }
         if !schema.arrow_schema().metadata().is_empty() {
-            return Err("statistics schema metadata must be empty".into());
+            return Err(statistics_contract(
+                "statistics schema metadata must be empty",
+            ));
         }
         let names = ["input_fields", "blob_type", "body", "properties"];
         if fields
@@ -239,25 +251,31 @@ impl StatisticsMaterializerFactory {
             || !matches!(fields[1].data_type(), DataType::Utf8)
             || !matches!(fields[2].data_type(), DataType::Binary)
         {
-            return Err(
-                "statistics materializer output schema differs from its frozen domain".into(),
-            );
+            return Err(statistics_contract(
+                "statistics materializer output schema differs from its frozen domain",
+            ));
         }
         let DataType::List(item) = fields[0].data_type() else {
-            return Err("statistics input_fields must be List<Int32>".into());
+            return Err(statistics_contract(
+                "statistics input_fields must be List<Int32>",
+            ));
         };
         if item.name() != "item"
             || item.is_nullable()
             || !item.metadata().is_empty()
             || !matches!(item.data_type(), DataType::Int32)
         {
-            return Err("statistics field IDs have an invalid item schema".into());
+            return Err(statistics_contract(
+                "statistics field IDs have an invalid item schema",
+            ));
         }
         let DataType::Map(entries, false) = fields[3].data_type() else {
-            return Err("statistics properties must be an unordered Map".into());
+            return Err(statistics_contract(
+                "statistics properties must be an unordered Map",
+            ));
         };
         let DataType::Struct(children) = entries.data_type() else {
-            return Err("statistics map entries must be Struct".into());
+            return Err(statistics_contract("statistics map entries must be Struct"));
         };
         if entries.name() != "entries"
             || entries.is_nullable()
@@ -270,26 +288,31 @@ impl StatisticsMaterializerFactory {
                     || !matches!(f.data_type(), DataType::Utf8)
             })
         {
-            return Err("statistics properties have an invalid entries schema".into());
+            return Err(statistics_contract(
+                "statistics properties have an invalid entries schema",
+            ));
         }
         if let StatisticsSchemaPreparation::Compiled(layout) = &schema {
             if !layout.is_typed() || layout.slots().len() != 4 {
-                return Err("compiled statistics require their complete frozen layout".into());
+                return Err(statistics_contract(
+                    "compiled statistics require their complete frozen layout",
+                ));
             }
             let binding = |ordinal: usize| {
                 layout
                     .value_binding(layout.slots()[ordinal])
-                    .ok_or("compiled statistics value binding is absent")
+                    .ok_or_else(|| {
+                        statistics_contract("compiled statistics value binding is absent")
+                    })
             };
             if !matches!(binding(0)?.value_type().kind(), ValueKind::List(item) if matches!(item.kind(), ValueKind::Scalar(DataType::Int32)))
                 || !matches!(binding(1)?.value_type().kind(), ValueKind::String)
                 || !matches!(binding(2)?.value_type().kind(), ValueKind::Binary)
                 || !matches!(binding(3)?.value_type().kind(), ValueKind::Map { key, value } if matches!(key.kind(), ValueKind::String) && matches!(value.kind(), ValueKind::String))
             {
-                return Err(
-                    "compiled statistics declarations differ from the fixed artifact protocol"
-                        .into(),
-                );
+                return Err(statistics_contract(
+                    "compiled statistics declarations differ from the fixed artifact protocol",
+                ));
             }
         }
         for mapping in &mappings {
@@ -302,10 +325,14 @@ impl StatisticsMaterializerFactory {
                 UnpivotConstant::Utf8Map(properties),
             ] = mapping.constants.as_slice()
             else {
-                return Err("statistics constants differ from the frozen roles".into());
+                return Err(statistics_contract(
+                    "statistics constants differ from the frozen roles",
+                ));
             };
             let Some(blob) = source.blob(*expr_id) else {
-                return Err("statistics blob_type must be an exact UTF8 literal".into());
+                return Err(statistics_contract(
+                    "statistics blob_type must be an exact UTF8 literal",
+                ));
             };
             if ids.is_empty()
                 || ids.len() > MAX_CONNECTOR_STATISTICS_COLUMNS
@@ -313,7 +340,9 @@ impl StatisticsMaterializerFactory {
                 || blob.len() > MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES
                 || !properties.is_empty()
             {
-                return Err("statistics literal exceeds its domain limits".into());
+                return Err(statistics_contract(
+                    "statistics literal exceeds its domain limits",
+                ));
             }
             let mut sorted = [0i32; MAX_CONNECTOR_STATISTICS_COLUMNS];
             sorted[..ids.len()].copy_from_slice(ids);
@@ -323,7 +352,9 @@ impl StatisticsMaterializerFactory {
                     .windows(2)
                     .any(|pair| pair[0] == pair[1])
             {
-                return Err("statistics field IDs must be positive and unique".into());
+                return Err(statistics_contract(
+                    "statistics field IDs must be positive and unique",
+                ));
             }
         }
         // Resolve exact frozen input positions once under preparation's owner.
@@ -334,7 +365,9 @@ impl StatisticsMaterializerFactory {
                 input_slots
                     .iter()
                     .position(|slot| *slot == mapping.input_value_slot_id)
-                    .ok_or("statistics body is absent from the frozen input port")
+                    .ok_or_else(|| {
+                        statistics_contract("statistics body is absent from the frozen input port")
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
         #[cfg(test)]
@@ -358,7 +391,7 @@ impl StatisticsMaterializerFactory {
 /// The original root grant's fixed-backing calculation. Compiled execution
 /// calls it after actual schema preparation; numeric limits and coefficients
 /// are the same as the explicit legacy source adapter.
-fn statistics_fixed_capacity(schema: &ChunkSchemaRef) -> Result<usize, String> {
+fn statistics_fixed_capacity(schema: &ChunkSchemaRef) -> ExecutionResult<usize> {
     let metadata = borrowed_root_chunk_schema_storage(
         &schema,
         RootArrayStorageLimits {
@@ -367,7 +400,7 @@ fn statistics_fixed_capacity(schema: &ChunkSchemaRef) -> Result<usize, String> {
             depth: RootProfileV1::MAX_DEPTH,
         },
     )
-    .map_err(|_| "statistics output metadata has no bounded source proof")?;
+    .map_err(ExecutionFailure::from_domain)?;
     // One extra full metadata copy conservatively covers each actual
     // List/Map/inline Struct DataType alias inspected by the input oracle.
     // Object allowance mirrors that oracle, including inline Map entries.
@@ -388,7 +421,7 @@ fn statistics_fixed_capacity(schema: &ChunkSchemaRef) -> Result<usize, String> {
             n.checked_add(size_of::<Chunk>() + size_of::<RecordBatch>() + size_of::<Workspace>())
         })
         .filter(|&n| n < MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES)
-        .ok_or("statistics fixed backing exceeds its batch profile")?;
+        .ok_or_else(|| statistics_contract("statistics fixed backing exceeds its batch profile"))?;
     Ok(fixed_capacity)
 }
 impl OperatorFactory for StatisticsMaterializerFactory {
@@ -397,6 +430,9 @@ impl OperatorFactory for StatisticsMaterializerFactory {
     }
     fn create(&self, _: i32, _: i32) -> Box<dyn Operator> {
         Box::new(StatisticsMaterializer {
+            receiver: ReceiverSlot::new(StatisticsPreparation::default()),
+            next: NextStep::NeedInput,
+            failure: None,
             definition: self.0.clone(),
             output: self.0.schema.fixture_schema().cloned(),
             fixed_capacity: match &self.0.schema {
@@ -412,11 +448,13 @@ impl OperatorFactory for StatisticsMaterializerFactory {
             body_bytes: 0,
             metadata_bytes: 0,
             finishing: false,
-            finished: false,
         })
     }
 }
 struct StatisticsMaterializer {
+    receiver: ReceiverSlot<StatisticsPreparation>,
+    next: NextStep,
+    failure: Option<crate::runtime::fragment::ExecutionFailure>,
     definition: Arc<Definition>,
     output: Option<ChunkSchemaRef>,
     fixed_capacity: usize,
@@ -428,9 +466,8 @@ struct StatisticsMaterializer {
     body_bytes: usize,
     metadata_bytes: usize,
     finishing: bool,
-    finished: bool,
 }
-impl Operator for StatisticsMaterializer {
+impl OperatorLifecycle for StatisticsMaterializer {
     fn creates_typed_storage(&self) -> bool {
         matches!(
             &self.definition.schema,
@@ -438,6 +475,10 @@ impl Operator for StatisticsMaterializer {
         )
     }
     fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.receiver
+            .preparation_mut()
+            .hydrate
+            .install_factory(factory.clone());
         self.construction = Some(factory);
     }
     fn prepare(&mut self) -> ExecutionResult<()> {
@@ -453,7 +494,7 @@ impl Operator for StatisticsMaterializer {
         let factory = self
             .construction
             .as_ref()
-            .ok_or(ConstructionFailure::MissingOwner)?;
+            .ok_or_else(|| ConstructionFailure::MissingOwner)?;
         let schema = factory.create_compiled_chunk_schema(layout)?;
         let fixed_capacity = statistics_fixed_capacity(&schema)?;
         self.fixed_capacity = fixed_capacity;
@@ -463,85 +504,148 @@ impl Operator for StatisticsMaterializer {
     fn name(&self) -> &str {
         NAME
     }
-    fn is_finished(&self) -> bool {
-        self.finished
+
+    fn set_mem_tracker(&mut self, tracker: Arc<crate::runtime::mem_tracker::MemTracker>) {
+        self.receiver
+            .preparation_mut()
+            .hydrate
+            .install_tracker(tracker);
     }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.cancel();
+        Ok(())
     }
     fn cancel(&mut self) {
+        self.receiver.discard();
         drop(self.workspace.take());
         drop(self.input.take());
-        self.finished = true;
+        self.next = NextStep::Finished;
     }
     fn close(&mut self) -> ExecutionResult<()> {
-        (|| -> Result<(), String> {
-            self.cancel();
-            Ok(())
-        })()
-        .map_err(Into::into)
+        self.begin_exit()
     }
 }
-impl ProcessorOperator for StatisticsMaterializer {
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.input.is_none()
+#[derive(Default)]
+struct StatisticsPreparation {
+    hydrate: HydrateInput,
+}
+struct StatisticsInputPolicy;
+impl InputEncodingPolicy for StatisticsInputPolicy {}
+impl InputPreparation<StatisticsInputPolicy> for StatisticsPreparation {
+    fn admission(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: &RawInput,
+        _: &StatisticsInputPolicy,
+    ) -> ExecutionResult<Option<AdmissionNext>> {
+        HydrateInput::validate_uncovered(input)?;
+        Ok(None)
     }
-    fn has_output(&self) -> bool {
-        self.input.is_some() && !self.finished
+    fn accept(&mut self, raw: RawInput) -> AcceptedInput {
+        self.hydrate.accept_raw(raw)
     }
-    fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+    fn prepare(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: AcceptedInput,
+        policy: &StatisticsInputPolicy,
+    ) -> Result<PreparationStep, InputPreparationFailure> {
+        self.hydrate.prepare_accepted(input, policy)
+    }
+}
+#[derive(Debug)]
+enum StatisticsStepFailure {
+    InputAfterFinish,
+    MissingRootGrant,
+}
+impl std::fmt::Display for StatisticsStepFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InputAfterFinish => "statistics input reached a finished receiver",
+            Self::MissingRootGrant => {
+                "statistics materialization requires the original root input grant"
+            }
+        })
+    }
+}
+impl std::error::Error for StatisticsStepFailure {}
+impl novarocks_failure_contract::FailureProjection for StatisticsStepFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let reason = match self {
+            Self::InputAfterFinish => ExecutionReason::StatisticsInputAfterFinish,
+            Self::MissingRootGrant => ExecutionReason::StatisticsMissingRootGrant,
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+impl StatisticsMaterializer {
+    fn data_next(&self) -> NextStep {
+        if self.input.is_some() || self.receiver.is_occupied() {
+            NextStep::Runnable
+        } else if self.finishing {
+            NextStep::Finished
+        } else {
+            NextStep::NeedInput
+        }
+    }
+    fn fail(
+        &mut self,
+        ctx: &StepContext<'_>,
+        error: crate::runtime::fragment::ExecutionFailure,
+    ) -> crate::runtime::fragment::ExecutionFailure {
+        ctx.report_failure(error.clone());
+        self.failure.get_or_insert(error).clone()
+    }
+    fn validate_input(&self, chunk: &Chunk) -> ExecutionResult<()> {
         if self.output.is_none() {
             return Err(ConstructionFailure::MissingOwner.into());
         }
-        (|| -> Result<(), String> {
-            if !self.need_input() {
-                return Err("statistics input position is full".into());
+        (|| -> ExecutionResult<()> {
+            if self.input.is_some() {
+                return Err(statistics_contract("statistics input position is full"));
             }
             let expanded = chunk
                 .len()
                 .checked_mul(self.definition.mappings.len())
-                .ok_or("statistics expanded row count overflow")?;
+                .ok_or_else(|| statistics_contract("statistics expanded row count overflow"))?;
             if self
                 .rows
                 .checked_add(expanded)
                 .is_none_or(|n| n > MAX_CONNECTOR_STATISTICS_ARTIFACTS)
             {
-                return Err("statistics expanded row count exceeds its domain".into());
+                return Err(statistics_limit(
+                    "statistics expanded row count",
+                    novarocks_failure_contract::ResourceDimension::Items,
+                    self.rows as u128 + expanded as u128,
+                    MAX_CONNECTOR_STATISTICS_ARTIFACTS,
+                ));
             }
             if chunk.chunk_schema_ref().slot_ids() != self.definition.input_slots {
-                return Err("statistics input order differs from its frozen port".into());
+                return Err(statistics_contract(
+                    "statistics input order differs from its frozen port",
+                ));
             }
             for &ordinal in &self.definition.input_ordinals {
                 let array = body_array(&chunk, ordinal)?;
                 if array.len() != chunk.len() {
-                    return Err("statistics body row count differs from input".into());
+                    return Err(statistics_contract(
+                        "statistics body row count differs from input",
+                    ));
                 }
-            }
-            self.cursor = 0;
-            if !chunk.is_empty() {
-                self.input = Some(chunk);
             }
             Ok(())
         })()
-        .map_err(Into::into)
     }
-    fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        (|| -> Result<Option<Chunk>, String> {
-            Err("statistics materialization requires the original root input grant".into())
-        })()
-        .map_err(Into::into)
-    }
-    fn pull_chunk_with_root_input(
-        &mut self,
-        _: &RuntimeState,
-        permit: &RootInputPermit,
-    ) -> ExecutionResult<RootPreparedPull> {
-        (|| -> Result<RootPreparedPull, String> {
+    fn materialize_root(&mut self, permit: &RootInputPermit) -> ExecutionResult<RootStep> {
+        (|| -> ExecutionResult<RootStep> {
             let Some(input) = self.input.as_ref() else {
-                return Ok(RootPreparedPull::Empty);
+                return Ok(RootStep::Complete(StepResult::new(
+                    None,
+                    self.data_next(),
+                    0,
+                )));
             };
             if self.workspace.is_none() {
                 let total = input.len() * self.definition.mappings.len();
@@ -550,7 +654,11 @@ impl ProcessorOperator for StatisticsMaterializer {
                 for flat in self.cursor..total.min(self.cursor + self.definition.batch_rows) {
                     let (ids, blob, body) = record(input, &self.definition, flat)?;
                     if body.len() > MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES {
-                        return Err("statistics body exceeds its artifact limit".into());
+                        return Err(statistics_extent(
+                            "statistics artifact body",
+                            body.len() as u128,
+                            MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES,
+                        ));
                     }
                     let next = sizes.add(ids.len(), blob.len(), body.len())?;
                     if self
@@ -558,23 +666,36 @@ impl ProcessorOperator for StatisticsMaterializer {
                         .checked_add(next.body)
                         .is_none_or(|n| n > MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES)
                     {
-                        return Err("statistics aggregate body exceeds its domain".into());
+                        return Err(statistics_limit(
+                            "statistics result body",
+                            novarocks_failure_contract::ResourceDimension::Bytes,
+                            self.body_bytes as u128 + next.body as u128,
+                            MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES,
+                        ));
                     }
                     if self
                         .metadata_bytes
                         .checked_add(next.metadata(rows + 1)?)
                         .is_none_or(|n| n > 16 * 1024 * 1024)
                     {
-                        return Err("statistics aggregate metadata exceeds its domain".into());
+                        return Err(statistics_limit(
+                            "statistics result metadata",
+                            novarocks_failure_contract::ResourceDimension::Bytes,
+                            self.metadata_bytes as u128 + next.metadata(rows + 1)? as u128,
+                            16 * 1024 * 1024,
+                        ));
                     }
                     let backing = next.capacity(rows + 1, self.fixed_capacity)?;
                     if backing > MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES
                         || backing > permit.retained_bytes()
                     {
                         if rows == 0 {
-                            return Err(
-                                "one statistics record exceeds its pregranted backing".into()
-                            );
+                            return Err(statistics_extent(
+                                "statistics artifact backing",
+                                backing as u128,
+                                MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES
+                                    .min(permit.retained_bytes()),
+                            ));
                         }
                         break;
                     }
@@ -589,28 +710,28 @@ impl ProcessorOperator for StatisticsMaterializer {
                     sizes,
                     permit.generation(),
                 ));
-                return Ok(RootPreparedPull::Yielded);
+                return Ok(RootStep::Pending(RootPending::Yield));
             }
             let workspace = self.workspace.as_mut().unwrap();
             if workspace.generation != permit.generation() {
-                return Err("statistics continuation changed its original grant".into());
+                return Err(statistics_contract(
+                    "statistics continuation changed its original grant",
+                ));
             }
             if workspace.row < workspace.rows {
                 let (examined, work) = workspace.advance(input, &self.definition)?;
                 debug_assert!(examined <= BYTE_QUANTUM && work <= WORK_QUANTUM);
                 // Final offset/array validation gets its own finite turn, even
                 // when this copy used the entire byte quantum.
-                return Ok(RootPreparedPull::Yielded);
+                return Ok(RootStep::Pending(RootPending::Yield));
             }
             let workspace = self.workspace.take().unwrap();
             let rows = workspace.rows;
             let body = workspace.sizes.body;
             let metadata = workspace.sizes.metadata(rows)?;
-            let chunk = workspace.finish(
-                self.output
-                    .as_ref()
-                    .ok_or("statistics output schema has not been prepared")?,
-            )?;
+            let chunk = workspace.finish(self.output.as_ref().ok_or_else(|| {
+                statistics_contract("statistics output schema has not been prepared")
+            })?)?;
             self.cursor += rows;
             self.rows += rows;
             self.body_bytes += body;
@@ -618,46 +739,154 @@ impl ProcessorOperator for StatisticsMaterializer {
             if self.cursor == input.len() * self.definition.mappings.len() {
                 drop(self.input.take());
                 self.cursor = 0;
-                if self.finishing {
-                    self.finished = true;
-                }
             }
-            Ok(RootPreparedPull::Chunk(chunk))
+            Ok(RootStep::Complete(StepResult::new(
+                Some(chunk),
+                self.data_next(),
+                rows as u64,
+            )))
         })()
-        .map_err(Into::into)
-    }
-    fn release_root_pull_workspace(&mut self) {
-        drop(self.workspace.take());
-    }
-    fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
-        (|| -> Result<(), String> {
-            self.finishing = true;
-            self.finished = self.input.is_none();
-            Ok(())
-        })()
-        .map_err(Into::into)
     }
 }
-fn body_array(input: &Chunk, index: usize) -> Result<&BinaryArray, String> {
+impl StepOperator for StatisticsMaterializer {
+    fn initial_step(&self) -> NextStep {
+        self.next.clone()
+    }
+    fn try_push(&mut self, ctx: &mut StepContext<'_>, input: RawInput) -> InputResult {
+        if let Some(failure) = self.failure.clone().or_else(|| ctx.checkpoint().err()) {
+            return InputResult::Rejected { input, failure };
+        }
+        if self.finishing || matches!(self.next, NextStep::Finished) {
+            return InputResult::Rejected {
+                input,
+                failure: crate::runtime::fragment::ExecutionFailure::from_domain(
+                    StatisticsStepFailure::InputAfterFinish,
+                ),
+            };
+        }
+        if !matches!(self.next, NextStep::NeedInput) {
+            return InputResult::Deferred {
+                input,
+                next: AdmissionNext::ResumeExisting,
+            };
+        }
+        let result = self.receiver.try_accept(ctx, input, &StatisticsInputPolicy);
+        if matches!(result, InputResult::Accepted(_)) {
+            self.next = NextStep::Runnable;
+        }
+        result
+    }
+    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        ctx.checkpoint()?;
+        if self.input.is_none() && !self.receiver.is_occupied() {
+            self.next = self.data_next();
+            return Ok(StepResult::new(None, self.next.clone(), 0));
+        }
+        Err(self.fail(
+            ctx,
+            crate::runtime::fragment::ExecutionFailure::from_domain(
+                StatisticsStepFailure::MissingRootGrant,
+            ),
+        ))
+    }
+    fn drive_with_root_input(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        permit: &RootInputPermit,
+    ) -> ExecutionResult<RootStep> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        ctx.checkpoint()?;
+        if !ctx.work().try_consume(1) {
+            self.next = NextStep::Yield;
+            return Ok(RootStep::Pending(RootPending::Yield));
+        }
+        match self.receiver.prepare(ctx, &StatisticsInputPolicy) {
+            Ok(ReceiverPreparation::Ready(input)) => {
+                // Validation borrows the prepared payload; a returned failure is
+                // reported while this owner still retains that payload.
+                if let Err(error) = ctx
+                    .perform(crate::runtime::fragment::PipelineOperation::Push, |_| {
+                        self.validate_input(input.chunk())
+                    })
+                {
+                    return Err(self.fail(ctx, error));
+                }
+                let chunk = input.into_uncovered_chunk()?;
+                self.cursor = 0;
+                if !chunk.is_empty() {
+                    self.input = Some(chunk);
+                }
+            }
+            Ok(ReceiverPreparation::Pending(next)) => {
+                self.next = next.clone();
+                return Ok(RootStep::Pending(match next {
+                    NextStep::Wait(wait) => RootPending::Wait(wait),
+                    NextStep::Yield => RootPending::Yield,
+                    _ => RootPending::Runnable,
+                }));
+            }
+            Err(error) => return Err(self.fail(ctx, error)),
+            Ok(ReceiverPreparation::Empty) => {}
+        }
+        let result = ctx.perform(crate::runtime::fragment::PipelineOperation::Pull, |_| {
+            self.materialize_root(permit)
+        });
+        match result {
+            Ok(step) => {
+                self.next = match &step {
+                    RootStep::Complete(step) => step.next.clone(),
+                    RootStep::Pending(pending) => pending.next(),
+                };
+                Ok(step)
+            }
+            Err(error) => Err(self.fail(ctx, error)),
+        }
+    }
+    fn release_root_workspace(&mut self) {
+        drop(self.workspace.take());
+    }
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<()> {
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        ctx.checkpoint()?;
+        self.finishing = true;
+        if matches!(self.next, NextStep::NeedInput) {
+            self.next = NextStep::Runnable;
+        }
+        Ok(())
+    }
+}
+
+fn body_array(input: &Chunk, index: usize) -> ExecutionResult<&BinaryArray> {
     input
         .record_batch()
         .columns()
         .get(index)
-        .ok_or("statistics body ordinal is absent")?
+        .ok_or_else(|| statistics_contract("statistics body ordinal is absent"))?
         .as_any()
         .downcast_ref::<BinaryArray>()
-        .ok_or_else(|| "statistics aggregate must produce an exact BinaryArray".into())
+        .ok_or_else(|| {
+            statistics_contract("statistics aggregate must produce an exact BinaryArray")
+        })
 }
 fn record<'a>(
     input: &'a Chunk,
     definition: &'a Definition,
     flat: usize,
-) -> Result<(&'a [i32], &'a str, &'a [u8]), String> {
+) -> ExecutionResult<(&'a [i32], &'a str, &'a [u8])> {
     let mapping = &definition.mappings[flat / input.len()];
     let row = flat % input.len();
     let array = body_array(input, definition.input_ordinals[flat / input.len()])?;
     if array.is_null(row) {
-        return Err("statistics aggregate produced a null body".into());
+        return Err(statistics_contract(
+            "statistics aggregate produced a null body",
+        ));
     }
     let UnpivotConstant::Int32List(ids) = &mapping.constants[0] else {
         unreachable!()
@@ -677,52 +906,52 @@ struct Sizes {
     body: usize,
 }
 impl Sizes {
-    fn metadata(self, rows: usize) -> Result<usize, String> {
+    fn metadata(self, rows: usize) -> ExecutionResult<usize> {
         rows.checked_mul(24)
             .and_then(|n| n.checked_add(self.ids.checked_mul(4)?))
             .and_then(|n| n.checked_add(self.blob))
-            .ok_or_else(|| "statistics metadata size overflow".into())
+            .ok_or_else(|| statistics_contract("statistics metadata size overflow"))
     }
-    fn add(self, ids: usize, blob: usize, body: usize) -> Result<Self, String> {
+    fn add(self, ids: usize, blob: usize, body: usize) -> ExecutionResult<Self> {
         Ok(Self {
             ids: self
                 .ids
                 .checked_add(ids)
-                .ok_or("statistics ID size overflow")?,
+                .ok_or_else(|| statistics_contract("statistics ID size overflow"))?,
             blob: self
                 .blob
                 .checked_add(blob)
-                .ok_or("statistics label size overflow")?,
+                .ok_or_else(|| statistics_contract("statistics label size overflow"))?,
             body: self
                 .body
                 .checked_add(body)
-                .ok_or("statistics body size overflow")?,
+                .ok_or_else(|| statistics_contract("statistics body size overflow"))?,
         })
     }
-    fn capacity(self, rows: usize, fixed: usize) -> Result<usize, String> {
+    fn capacity(self, rows: usize, fixed: usize) -> ExecutionResult<usize> {
         let offsets = round64(
             (rows + 1)
                 .checked_mul(4)
-                .ok_or("statistics offset overflow")?,
+                .ok_or_else(|| statistics_contract("statistics offset overflow"))?,
         )?;
         fixed
             .checked_add(
                 offsets
                     .checked_mul(4)
-                    .ok_or("statistics offsets capacity overflow")?,
+                    .ok_or_else(|| statistics_contract("statistics offsets capacity overflow"))?,
             )
             .and_then(|n| n.checked_add(round64(self.ids.checked_mul(4)?).ok()?))
             .and_then(|n| n.checked_add(round64(self.blob).ok()?))
             .and_then(|n| n.checked_add(round64(self.body).ok()?))
             .and_then(|n| n.checked_add(2 * 64))
-            .ok_or_else(|| "statistics backing capacity overflow".into())
+            .ok_or_else(|| statistics_contract("statistics backing capacity overflow"))
     }
 }
-fn round64(bytes: usize) -> Result<usize, String> {
+fn round64(bytes: usize) -> ExecutionResult<usize> {
     bytes
         .checked_add(63)
         .map(|n| n & !63)
-        .ok_or_else(|| "statistics alignment capacity overflow".into())
+        .ok_or_else(|| statistics_contract("statistics alignment capacity overflow"))
 }
 struct Workspace {
     start: usize,
@@ -768,7 +997,7 @@ impl Workspace {
         &mut self,
         input: &Chunk,
         definition: &Definition,
-    ) -> Result<(usize, usize), String> {
+    ) -> ExecutionResult<(usize, usize)> {
         let mut examined = 0;
         let mut work = 0;
         // 64 bytes cover record lookup/source offsets and four output offsets;
@@ -826,7 +1055,7 @@ impl Workspace {
         }
         Ok((examined, work))
     }
-    fn finish(self, schema: &ChunkSchemaRef) -> Result<Chunk, String> {
+    fn finish(self, schema: &ChunkSchemaRef) -> ExecutionResult<Chunk> {
         let offsets = |b: MutableBuffer| OffsetBuffer::new(ScalarBuffer::from(Buffer::from(b)));
         let DataType::List(item) = schema.slots()[0].field().data_type() else {
             unreachable!()
@@ -841,12 +1070,10 @@ impl Workspace {
             ScalarBuffer::from(Buffer::from(self.ids)),
             None,
         ));
-        let fields: ArrayRef = Arc::new(ListArray::new(
-            item.clone(),
-            offsets(self.ids_offsets),
-            ids,
-            None,
-        ));
+        let fields: ArrayRef = Arc::new(
+            ListArray::try_new(item.clone(), offsets(self.ids_offsets), ids, None)
+                .map_err(|source| statistics_arrow("statistics input_fields list", source))?,
+        );
         // SAFETY: each source is an immutable Rust str; its bytes are copied
         // unchanged. Offsets are appended only after that whole str, start at
         // zero, are monotone, and end exactly at this preallocated buffer len.
@@ -869,23 +1096,168 @@ impl Workspace {
             )) as ArrayRef
         };
         let entries =
-            StructArray::new(entry_fields.clone(), vec![empty_utf8(), empty_utf8()], None);
-        let properties: ArrayRef = Arc::new(MapArray::new(
-            entries_field.clone(),
-            offsets(self.map_offsets),
-            entries,
-            None,
-            false,
-        ));
+            StructArray::try_new(entry_fields.clone(), vec![empty_utf8(), empty_utf8()], None)
+                .map_err(|source| statistics_arrow("statistics properties entries", source))?;
+        let properties: ArrayRef = Arc::new(
+            MapArray::try_new(
+                entries_field.clone(),
+                offsets(self.map_offsets),
+                entries,
+                None,
+                false,
+            )
+            .map_err(|source| statistics_arrow("statistics properties map", source))?,
+        );
         let batch = RecordBatch::try_new(
             schema.arrow_schema_ref(),
             vec![fields, labels, body, properties],
         )
-        .map_err(|e| format!("statistics batch construction failed: {e}"))?;
-        Chunk::try_new_with_chunk_schema(batch, schema.clone())
+        .map_err(crate::exec::chunk::ChunkConstructionFailure::record_batch)?;
+        Ok(Chunk::try_new_with_chunk_schema(batch, schema.clone())?)
     }
 }
 
+#[derive(Debug)]
+enum StatisticsFailure {
+    Arrow {
+        operation: &'static str,
+        source: arrow::error::ArrowError,
+    },
+    Contract(novarocks_failure_contract::BoundedDetail),
+    Limit {
+        label: &'static str,
+        dimension: novarocks_failure_contract::ResourceDimension,
+        requested: u128,
+        limit: usize,
+    },
+    ArtifactExtent {
+        label: &'static str,
+        required: u128,
+        limit: usize,
+    },
+}
+impl std::fmt::Display for StatisticsFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Arrow { operation, source } => write!(f, "{operation}: {source}"),
+            Self::Contract(detail) => detail.fmt(f),
+            Self::Limit {
+                label,
+                requested,
+                limit,
+                ..
+            } => write!(
+                f,
+                "{label} requested extent {requested} exceeds its limit {limit}"
+            ),
+            Self::ArtifactExtent {
+                label,
+                required,
+                limit,
+            } => write!(
+                f,
+                "{label} extent {required} exceeds its minimum-unit limit {limit}"
+            ),
+        }
+    }
+}
+impl std::error::Error for StatisticsFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Arrow { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for StatisticsFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        match self {
+            Self::Arrow { source, .. } => {
+                let (class, reason) = if matches!(source, arrow::error::ArrowError::MemoryError(_))
+                {
+                    (
+                        FailureClass::Resource,
+                        ExecutionReason::StatisticsArrowAllocation,
+                    )
+                } else {
+                    (
+                        FailureClass::Invariant,
+                        ExecutionReason::StatisticsArrowContract,
+                    )
+                };
+                FailureFact::new(class, reason.reason())
+            }
+            Self::Contract(_) => FailureFact::new(
+                FailureClass::Invariant,
+                ExecutionReason::StatisticsContract.reason(),
+            ),
+            Self::Limit {
+                dimension,
+                requested,
+                limit,
+                ..
+            } => FailureFact::new(
+                FailureClass::Resource,
+                ExecutionReason::StatisticsResultLimit.reason(),
+            )
+            .with_resource(ResourceFacts {
+                request_scope: Some(ResourceScope::Operator),
+                constraint_scope: Some(ResourceScope::Operator),
+                dimension: *dimension,
+                requested: u64::try_from(*requested).ok(),
+                required_growth: None,
+                limit: u64::try_from(*limit).ok(),
+                live: None,
+                committed: None,
+            }),
+            Self::ArtifactExtent {
+                required, limit, ..
+            } => FailureFact::new(
+                FailureClass::Representation,
+                ExecutionReason::StatisticsArtifactExtent.reason(),
+            )
+            .with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::MinimumUnit,
+                layout: RepresentationLayout {
+                    domain: domain::EXECUTION,
+                    code: ExecutionReason::StatisticsArtifactExtent.code(),
+                },
+                required: u64::try_from(*required).ok(),
+                extent_limit: u64::try_from(*limit).ok(),
+                representable_prefix: None,
+            }),
+        }
+    }
+}
+fn statistics_arrow(operation: &'static str, source: arrow::error::ArrowError) -> ExecutionFailure {
+    ExecutionFailure::from_domain(StatisticsFailure::Arrow { operation, source })
+}
+fn statistics_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(StatisticsFailure::Contract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+fn statistics_limit(
+    label: &'static str,
+    dimension: novarocks_failure_contract::ResourceDimension,
+    requested: u128,
+    limit: usize,
+) -> ExecutionFailure {
+    ExecutionFailure::from_domain(StatisticsFailure::Limit {
+        label,
+        dimension,
+        requested,
+        limit,
+    })
+}
+fn statistics_extent(label: &'static str, required: u128, limit: usize) -> ExecutionFailure {
+    ExecutionFailure::from_domain(StatisticsFailure::ArtifactExtent {
+        label,
+        required,
+        limit,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,6 +1275,39 @@ mod tests {
     use novarocks_types::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
+
+    fn with_context<T>(
+        state: &RuntimeState,
+        action: impl FnOnce(&mut StepContext<'_>) -> ExecutionResult<T>,
+    ) -> ExecutionResult<T> {
+        let control = state.error_state();
+        let mut work =
+            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        action(&mut StepContext::new(&control, &mut work))
+    }
+    fn push(
+        step: &mut dyn StepOperator,
+        state: &RuntimeState,
+        chunk: Chunk,
+    ) -> ExecutionResult<()> {
+        with_context(state, |ctx| {
+            match step.try_push(ctx, RawInput::for_test(chunk)) {
+                InputResult::Accepted(result) => result.map(|_| ()),
+                InputResult::Rejected { failure, .. } => Err(failure),
+                InputResult::Deferred { .. } => panic!("fixture receiver has a live continuation"),
+            }
+        })
+    }
+    fn finish(step: &mut dyn StepOperator, state: &RuntimeState) -> ExecutionResult<()> {
+        with_context(state, |ctx| step.finish(ctx))
+    }
+    fn covered(
+        step: &mut dyn StepOperator,
+        state: &RuntimeState,
+        permit: &RootInputPermit,
+    ) -> ExecutionResult<RootStep> {
+        with_context(state, |ctx| step.drive_with_root_input(ctx, permit))
+    }
 
     fn metadata() -> ArrowMetadataOwner {
         ArrowMetadataOwner::try_new(
@@ -950,7 +1355,7 @@ mod tests {
         blob: String,
         max_rows: usize,
         mappings: usize,
-    ) -> Result<StatisticsMaterializerFactory, String> {
+    ) -> ExecutionResult<StatisticsMaterializerFactory> {
         let mut arena = ExprArena::default();
         let expr_id = arena.push_typed(ExprNode::Literal(LiteralValue::Utf8(blob)), DataType::Utf8);
         let mapping = UnpivotValueMapping {
@@ -978,6 +1383,9 @@ mod tests {
     }
     fn operator(factory: StatisticsMaterializerFactory) -> StatisticsMaterializer {
         StatisticsMaterializer {
+            receiver: ReceiverSlot::new(StatisticsPreparation::default()),
+            next: NextStep::NeedInput,
+            failure: None,
             output: factory.0.schema.fixture_schema().cloned(),
             fixed_capacity: match &factory.0.schema {
                 #[cfg(test)]
@@ -993,7 +1401,6 @@ mod tests {
             body_bytes: 0,
             metadata_bytes: 0,
             finishing: false,
-            finished: false,
         }
     }
     fn input(rows: &[&[u8]]) -> (Chunk, std::sync::Weak<BinaryArray>) {
@@ -1030,15 +1437,73 @@ mod tests {
                 FrozenRootOutput::InternalFacts(InternalResultDomain::StatisticsArtifactV1),
             )),
         };
-        let authority = RootInputAuthority::new(&spec);
-        let RootInputAdmission::Granted(permit) = authority
-            .try_acquire(ResultWriteCredit::new(authority.required_bytes(), |_| {}))
-            .unwrap()
+        let authority = RootInputAuthority::new(
+            &spec,
+            Arc::new(crate::runtime::execution_health::ExecutionHealth::new()),
+        );
+        let crate::runtime::fragment::io::RootInputReservationAdmission::Granted(mut reservation) =
+            authority.try_reserve().unwrap()
         else {
+            panic!("one original reservation");
+        };
+        let mut credit = Some(ResultWriteCredit::new(reservation.required_bytes(), |_| {}));
+        let RootInputAdmission::Granted(permit) = reservation.try_bind(&mut credit).unwrap() else {
             panic!("one original grant");
         };
         permit
     }
+    #[test]
+    fn exhausted_shared_allowance_keeps_accepted_input_unprepared_and_retains_the_same_workspace() {
+        let state = RuntimeState::default();
+        let mut source = operator(factory(vec![1], "theta".into(), 1, 1).unwrap());
+        let (input, weak) = input(&[b"body"]);
+        push(&mut source, &state, input).unwrap();
+        let grant = permit();
+        let control = state.error_state();
+        let mut work =
+            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 0);
+        for _ in 0..2 {
+            let result = source
+                .drive_with_root_input(&mut StepContext::new(&control, &mut work), &grant)
+                .unwrap();
+            assert!(matches!(result, RootStep::Pending(RootPending::Yield)));
+            assert!(source.workspace.is_none());
+            assert!(source.input.is_none());
+            assert!(
+                source.receiver.is_occupied(),
+                "the same accepted raw responsibility has not been prepared"
+            );
+            assert!(weak.upgrade().is_some());
+        }
+        work.begin_turn(1).unwrap();
+        assert!(matches!(
+            source
+                .drive_with_root_input(&mut StepContext::new(&control, &mut work), &grant)
+                .unwrap(),
+            RootStep::Pending(RootPending::Yield)
+        ));
+        let original = source.workspace.as_ref().unwrap();
+        let generation = original.generation;
+        let buffer = original.body.as_ptr();
+        let row = original.row;
+        let offset = original.offset;
+        assert!(matches!(
+            source
+                .drive_with_root_input(&mut StepContext::new(&control, &mut work), &grant)
+                .unwrap(),
+            RootStep::Pending(RootPending::Yield)
+        ));
+        let retained = source.workspace.as_ref().unwrap();
+        assert_eq!(retained.generation, generation);
+        assert_eq!(generation, grant.generation());
+        assert_eq!(retained.body.as_ptr(), buffer);
+        assert_eq!((retained.row, retained.offset), (row, offset));
+        source.release_root_workspace();
+        source.cancel();
+        assert!(weak.upgrade().is_none());
+        assert!(state.error().is_none());
+    }
+
     #[test]
     fn unicode_large_body_continues_without_growth_and_finalizes_on_a_separate_turn() {
         let label = "统计λ".repeat(7000);
@@ -1047,11 +1512,11 @@ mod tests {
         let mut source = operator(factory(vec![1, 3, 9], label.clone(), 4096, 1).unwrap());
         let state = RuntimeState::default();
         let permit = permit();
-        source.push_chunk(&state, chunk).unwrap();
-        source.set_finishing(&state).unwrap();
+        push(&mut source, &state, chunk).unwrap();
+        finish(&mut source, &state).unwrap();
         assert!(matches!(
-            source.pull_chunk_with_root_input(&state, &permit).unwrap(),
-            RootPreparedPull::Yielded
+            covered(&mut source, &state, &permit).unwrap(),
+            RootStep::Pending(RootPending::Yield)
         ));
         let reserved = source
             .workspace
@@ -1083,8 +1548,10 @@ mod tests {
             turns += 1;
         }
         assert!(turns > 16);
-        let RootPreparedPull::Chunk(output) =
-            source.pull_chunk_with_root_input(&state, &permit).unwrap()
+        let RootStep::Complete(StepResult {
+            output: Some(output),
+            ..
+        }) = covered(&mut source, &state, &permit).unwrap()
         else {
             panic!("separate finalization turn");
         };
@@ -1122,7 +1589,7 @@ mod tests {
             "actual {actual} exceeds prepaid {reserved}"
         );
         assert!(weak.upgrade().is_none());
-        assert!(source.is_finished());
+        assert!(matches!(source.data_next(), NextStep::Finished));
     }
     fn actual_factory(
         tracker: &Arc<crate::runtime::mem_tracker::MemTracker>,
@@ -1151,28 +1618,29 @@ mod tests {
         values.set_construction_factory(creation.clone());
         values.bind_runtime_state(&state).unwrap();
         values.prepare().unwrap();
-        let input = values
-            .as_processor_mut()
+        let input = with_context(&state, |ctx| values.as_mut().drive(ctx))
             .unwrap()
-            .pull_chunk(&state)
-            .unwrap()
+            .output
             .unwrap();
         let mut operator = graph.pipelines[0].factories[1].create(0, 0);
         assert!(operator.creates_typed_storage());
         operator.set_construction_factory(creation.clone());
         operator.prepare().unwrap();
-        let processor = operator.as_processor_mut().unwrap();
-        processor.push_chunk(&state, input).unwrap();
-        processor.set_finishing(&state).unwrap();
+        let processor = operator.as_mut();
+        push(processor, &state, input).unwrap();
+        finish(processor, &state).unwrap();
         let permit = permit();
         let output = loop {
-            match processor
-                .pull_chunk_with_root_input(&state, &permit)
-                .unwrap()
-            {
-                RootPreparedPull::Yielded => {}
-                RootPreparedPull::Chunk(chunk) => break chunk,
-                RootPreparedPull::Empty => panic!("the admitted body must be emitted"),
+            match covered(processor, &state, &permit).unwrap() {
+                RootStep::Pending(RootPending::Yield) => {}
+                RootStep::Complete(StepResult {
+                    output: Some(chunk),
+                    ..
+                }) => break chunk,
+                RootStep::Complete(StepResult { output: None, .. }) => {
+                    panic!("the admitted body must be emitted")
+                }
+                RootStep::Pending(other) => panic!("unexpected continuation: {other:?}"),
             }
         };
         assert_eq!(
@@ -1459,26 +1927,31 @@ mod tests {
                 source.set_construction_factory(construction.clone());
                 source.bind_runtime_state(&state).unwrap();
                 source.prepare().unwrap();
-                let input = source
-                    .as_processor_mut()
+                let input = with_context(&state, |ctx| source.as_mut().drive(ctx))
                     .unwrap()
-                    .pull_chunk(&state)
-                    .unwrap()
+                    .output
                     .unwrap();
+                let mut invalid = factories[1].create(0, 0);
+                invalid.set_construction_factory(construction.clone());
+                invalid.prepare().unwrap();
+                let invalid_state = RuntimeState::default();
+                push(invalid.as_mut(), &invalid_state, input.clone()).unwrap();
+                assert!(with_context(&invalid_state, |ctx| invalid.as_mut().drive(ctx)).is_err());
+                invalid.cancel();
+                drop(invalid);
                 let mut materializer = factories[1].create(0, 0);
                 materializer.set_construction_factory(construction);
                 materializer.prepare().unwrap();
-                let materializer = materializer.as_processor_mut().unwrap();
-                materializer.push_chunk(&state, input).unwrap();
-                assert!(materializer.pull_chunk(&state).is_err());
+                let materializer = materializer.as_mut();
+                push(materializer, &state, input).unwrap();
                 let permit = permit();
                 loop {
-                    match materializer
-                        .pull_chunk_with_root_input(&state, &permit)
-                        .unwrap()
-                    {
-                        RootPreparedPull::Yielded => {}
-                        RootPreparedPull::Chunk(chunk) => {
+                    match covered(materializer, &state, &permit).unwrap() {
+                        RootStep::Pending(RootPending::Yield) => {}
+                        RootStep::Complete(StepResult {
+                            output: Some(chunk),
+                            ..
+                        }) => {
                             assert_eq!(
                                 chunk
                                     .record_batch()
@@ -1502,7 +1975,10 @@ mod tests {
                             );
                             break;
                         }
-                        RootPreparedPull::Empty => panic!("actual output disappeared"),
+                        RootStep::Complete(StepResult { output: None, .. }) => {
+                            panic!("actual output disappeared")
+                        }
+                        RootStep::Pending(other) => panic!("unexpected continuation: {other:?}"),
                     }
                 }
             }
@@ -1515,21 +1991,24 @@ mod tests {
         let mut source = operator(factory(vec![1], "test".into(), 1, 1).unwrap());
         let bytes = vec![0; 32752];
         let (chunk, _) = input(&[&bytes]);
-        source.push_chunk(&state, chunk).unwrap();
+        push(&mut source, &state, chunk).unwrap();
         let permit = permit();
         assert!(matches!(
-            source.pull_chunk_with_root_input(&state, &permit).unwrap(),
-            RootPreparedPull::Yielded
+            covered(&mut source, &state, &permit).unwrap(),
+            RootStep::Pending(RootPending::Yield)
         ));
         while source.workspace.as_ref().unwrap().row == 0 {
             assert!(matches!(
-                source.pull_chunk_with_root_input(&state, &permit).unwrap(),
-                RootPreparedPull::Yielded
+                covered(&mut source, &state, &permit).unwrap(),
+                RootStep::Pending(RootPending::Yield)
             ));
         }
         assert!(matches!(
-            source.pull_chunk_with_root_input(&state, &permit).unwrap(),
-            RootPreparedPull::Chunk(_)
+            covered(&mut source, &state, &permit).unwrap(),
+            RootStep::Complete(StepResult {
+                output: Some(_),
+                ..
+            })
         ));
     }
     #[test]
@@ -1538,14 +2017,17 @@ mod tests {
         let mut source = operator(factory(vec![1], "theta".into(), 4096, 1).unwrap());
         let bytes = vec![0xff; MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES];
         let (chunk, weak) = input(&[&bytes, &bytes]);
-        source.push_chunk(&state, chunk).unwrap();
-        source.set_finishing(&state).unwrap();
+        push(&mut source, &state, chunk).unwrap();
+        finish(&mut source, &state).unwrap();
         for index in 0..2 {
             let permit = permit();
             loop {
-                match source.pull_chunk_with_root_input(&state, &permit).unwrap() {
-                    RootPreparedPull::Yielded => {}
-                    RootPreparedPull::Chunk(chunk) => {
+                match covered(&mut source, &state, &permit).unwrap() {
+                    RootStep::Pending(RootPending::Yield) => {}
+                    RootStep::Complete(StepResult {
+                        output: Some(chunk),
+                        ..
+                    }) => {
                         assert_eq!(chunk.len(), 1);
                         assert_eq!(
                             chunk
@@ -1570,12 +2052,15 @@ mod tests {
                         );
                         break;
                     }
-                    RootPreparedPull::Empty => panic!("expected bounded artifact"),
+                    RootStep::Complete(StepResult { output: None, .. }) => {
+                        panic!("expected bounded artifact")
+                    }
+                    RootStep::Pending(other) => panic!("unexpected continuation: {other:?}"),
                 }
             }
             assert_eq!(weak.upgrade().is_some(), index == 0);
         }
-        assert!(source.is_finished());
+        assert!(matches!(source.data_next(), NextStep::Finished));
     }
 
     #[test]
@@ -1583,19 +2068,22 @@ mod tests {
         let state = RuntimeState::default();
         let mut source = operator(factory(vec![1], "theta".into(), 1, 2).unwrap());
         let (chunk, _) = input(&[b"a", b"b", b"c"]);
-        source.push_chunk(&state, chunk).unwrap();
-        source.set_finishing(&state).unwrap();
+        push(&mut source, &state, chunk).unwrap();
+        finish(&mut source, &state).unwrap();
         let mut bodies = Vec::new();
         for _ in 0..6 {
             let permit = permit();
             assert!(matches!(
-                source.pull_chunk_with_root_input(&state, &permit).unwrap(),
-                RootPreparedPull::Yielded
+                covered(&mut source, &state, &permit).unwrap(),
+                RootStep::Pending(RootPending::Yield)
             ));
             loop {
-                match source.pull_chunk_with_root_input(&state, &permit).unwrap() {
-                    RootPreparedPull::Yielded => {}
-                    RootPreparedPull::Chunk(chunk) => {
+                match covered(&mut source, &state, &permit).unwrap() {
+                    RootStep::Pending(RootPending::Yield) => {}
+                    RootStep::Complete(StepResult {
+                        output: Some(chunk),
+                        ..
+                    }) => {
                         assert_eq!(chunk.len(), 1);
                         bodies.push(
                             chunk
@@ -1609,51 +2097,67 @@ mod tests {
                         );
                         break;
                     }
-                    RootPreparedPull::Empty => panic!("pending record disappeared"),
+                    RootStep::Complete(StepResult { output: None, .. }) => {
+                        panic!("pending record disappeared")
+                    }
+                    RootStep::Pending(other) => panic!("unexpected continuation: {other:?}"),
                 }
             }
         }
         assert_eq!(bodies, [b"a", b"b", b"c", b"a", b"b", b"c"]);
-        assert!(source.is_finished());
+        assert!(matches!(source.data_next(), NextStep::Finished));
     }
     #[test]
     fn invalid_static_ids_fail_before_materialization_and_dynamic_limits_before_workspace() {
         for ids in [vec![-1], vec![1, 1], Vec::new()] {
-            assert!(factory(ids, "theta".into(), 1, 1).is_err());
+            use novarocks_failure_contract::FailureProjection;
+            let error = match factory(ids, "theta".into(), 1, 1) {
+                Ok(_) => panic!("invalid static IDs must fail"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.failure_fact().class(),
+                novarocks_failure_contract::FailureClass::Invariant
+            );
+            assert_eq!(error.failure_fact().reason().code(), 536);
         }
         let state = RuntimeState::default();
         let mut source = operator(factory(vec![1], "theta".into(), 1, 1).unwrap());
         source.metadata_bytes = 16 * 1024 * 1024;
-        let (chunk, _) = input(&[b"body"]);
-        source.push_chunk(&state, chunk).unwrap();
-        assert!(
-            source
-                .pull_chunk_with_root_input(&state, &permit())
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("metadata")
-        );
+        let (chunk, weak) = input(&[b"body"]);
+        push(&mut source, &state, chunk).unwrap();
+        let failure = covered(&mut source, &state, &permit()).err().unwrap();
+        use novarocks_failure_contract::{FailureClass, FailureProjection, ResourceDimension};
+        assert!(failure.to_string().contains("metadata"));
+        assert_eq!(failure.failure_fact().class(), FailureClass::Resource);
+        let facts = failure.failure_fact().resource().unwrap();
+        assert_eq!(facts.dimension, ResourceDimension::Bytes);
+        assert_eq!(facts.requested, Some(16 * 1024 * 1024 + 33));
+        assert_eq!(facts.limit, Some(16 * 1024 * 1024));
+        assert_eq!(facts.live, None);
+        assert_eq!(facts.committed, None);
         assert!(source.workspace.is_none());
+        source.cancel();
+        assert!(weak.upgrade().is_none());
     }
     #[test]
     fn cancellation_and_generation_conflict_leave_cleanup_under_the_original_grant() {
         let state = RuntimeState::default();
         let mut source = operator(factory(vec![1], "theta".into(), 1, 1).unwrap());
         let (chunk, weak) = input(&[b"body"]);
-        source.push_chunk(&state, chunk).unwrap();
+        push(&mut source, &state, chunk).unwrap();
         let permit = permit();
-        source.pull_chunk_with_root_input(&state, &permit).unwrap();
+        covered(&mut source, &state, &permit).unwrap();
         // An issuer change is validated by the final edge/session; source
         // additionally rejects a changed continuation generation.
         source.workspace.as_mut().unwrap().generation += 1;
-        assert!(source.pull_chunk_with_root_input(&state, &permit).is_err());
+        assert!(covered(&mut source, &state, &permit).is_err());
         assert!(source.workspace.is_some());
-        source.release_root_pull_workspace();
+        source.release_root_workspace();
         assert!(source.workspace.is_none());
         assert!(weak.upgrade().is_some());
         source.cancel();
         assert!(weak.upgrade().is_none());
-        assert!(source.is_finished());
+        assert!(matches!(source.initial_step(), NextStep::Finished));
     }
 }

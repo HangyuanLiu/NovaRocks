@@ -21,6 +21,9 @@
 //! planning, physical DDL, and application-level result carriers deliberately
 //! do not enter this module.
 
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+#[path = "aggregate_state_failure.rs"]
+mod failure;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -67,7 +70,7 @@ pub struct MvAggregateMergeResult {
 pub fn materialize_aggregate_result_chunks(
     chunks: Vec<Chunk>,
     layout: &MvAggregateRuntimeLayout,
-) -> Result<Vec<Chunk>, String> {
+) -> Result<Vec<Chunk>, ExecutionFailure> {
     chunks
         .into_iter()
         .map(|chunk| materialize_aggregate_result_batch(&chunk.record_batch(), layout))
@@ -78,16 +81,22 @@ pub fn materialize_aggregate_result_chunks(
 pub fn load_aggregate_physical_rows(
     chunks: &[Chunk],
     layout: &MvAggregateRuntimeLayout,
-) -> Result<HashMap<String, MvAggregatePhysicalRow>, String> {
+) -> Result<HashMap<String, MvAggregatePhysicalRow>, ExecutionFailure> {
+    load_physical_rows(chunks, layout, failure::RowSet::Physical)
+}
+
+fn load_physical_rows(
+    chunks: &[Chunk],
+    layout: &MvAggregateRuntimeLayout,
+    row_set: failure::RowSet,
+) -> ExecutionResult<HashMap<String, MvAggregatePhysicalRow>> {
     let mut rows = HashMap::new();
     for chunk in chunks {
         for row in load_rows_from_batch(&chunk.record_batch(), layout, false)? {
-            let row_id = row.row_id.clone();
-            if rows.insert(row_id.clone(), row).is_some() {
-                return Err(format!(
-                    "aggregate MV state corruption: duplicate row id `{row_id}`"
-                ));
+            if rows.contains_key(&row.row_id) {
+                return Err(failure::duplicate(row_set, &row.row_id));
             }
+            rows.insert(row.row_id.clone(), row);
         }
     }
     Ok(rows)
@@ -97,7 +106,7 @@ pub fn load_aggregate_physical_rows(
 pub fn load_aggregate_physical_rows_for_delta(
     chunks: &[Chunk],
     layout: &MvAggregateRuntimeLayout,
-) -> Result<Vec<MvAggregatePhysicalRow>, String> {
+) -> Result<Vec<MvAggregatePhysicalRow>, ExecutionFailure> {
     let mut rows = Vec::new();
     for chunk in chunks {
         rows.extend(load_rows_from_batch(&chunk.record_batch(), layout, true)?);
@@ -109,14 +118,8 @@ pub fn load_aggregate_physical_rows_for_delta(
 pub fn build_old_state_map(
     chunks: &[Chunk],
     layout: &MvAggregateRuntimeLayout,
-) -> Result<HashMap<String, MvAggregatePhysicalRow>, String> {
-    load_aggregate_physical_rows(chunks, layout).map_err(|err| {
-        if err.contains("duplicate row id") {
-            format!("active aggregate MV state corruption: duplicate active MV row id: {err}")
-        } else {
-            err
-        }
-    })
+) -> Result<HashMap<String, MvAggregatePhysicalRow>, ExecutionFailure> {
+    load_physical_rows(chunks, layout, failure::RowSet::Active)
 }
 
 /// Merges existing physical rows with state-shaped delta chunks.
@@ -124,7 +127,7 @@ pub fn merge_aggregate_state_batches(
     old_rows: &HashMap<String, MvAggregatePhysicalRow>,
     delta_chunks: &[Chunk],
     layout: &MvAggregateRuntimeLayout,
-) -> Result<Vec<Chunk>, String> {
+) -> Result<Vec<Chunk>, ExecutionFailure> {
     Ok(
         merge_aggregate_state_batches_with_retractions(old_rows, delta_chunks, layout)?
             .upsert_chunks,
@@ -137,7 +140,7 @@ pub fn merge_aggregate_state_batches_with_retractions(
     old_rows: &HashMap<String, MvAggregatePhysicalRow>,
     delta_chunks: &[Chunk],
     layout: &MvAggregateRuntimeLayout,
-) -> Result<MvAggregateMergeResult, String> {
+) -> Result<MvAggregateMergeResult, ExecutionFailure> {
     let old_row_count = old_rows.len();
     let mut merged = old_rows.clone();
     for delta in load_aggregate_physical_rows_for_delta(delta_chunks, layout)? {
@@ -147,10 +150,10 @@ pub fn merge_aggregate_state_batches_with_retractions(
         if row.visible_values.len() != layout.visible_columns().len()
             || row.state_values.len() != layout.state_columns().len()
         {
-            return Err(format!(
+            return Err(failure::contract(format_args!(
                 "aggregate MV state corruption for row id `{}`: row shape does not match layout",
                 row.row_id
-            ));
+            )));
         }
         for (state_index, state_column) in layout.state_columns().iter().enumerate() {
             row.state_values[state_index] = merge_state_value(
@@ -164,15 +167,13 @@ pub fn merge_aggregate_state_batches_with_retractions(
     let mut kept = Vec::new();
     let mut deleted = Vec::new();
     for row in merged.into_values() {
-        if all_count_states_zero(&row, layout) {
+        if all_count_states_zero(&row, layout)? {
             deleted.push(row);
         } else {
             kept.push(row);
         }
     }
-    let row_delta = i64::try_from(kept.len())
-        .and_then(|new_count| i64::try_from(old_row_count).map(|old_count| new_count - old_count))
-        .map_err(|_| "aggregate MV row count overflow".to_string())?;
+    let row_delta = failure::row_count(kept.len())? - failure::row_count(old_row_count)?;
     Ok(MvAggregateMergeResult {
         upsert_chunks: physical_rows_to_chunks(kept, layout)?,
         delete_chunks: physical_rows_to_chunks(deleted, layout)?,
@@ -180,7 +181,10 @@ pub fn merge_aggregate_state_batches_with_retractions(
     })
 }
 
-fn all_count_states_zero(row: &MvAggregatePhysicalRow, layout: &MvAggregateRuntimeLayout) -> bool {
+fn all_count_states_zero(
+    row: &MvAggregatePhysicalRow,
+    layout: &MvAggregateRuntimeLayout,
+) -> ExecutionResult<bool> {
     let mut saw_count = false;
     for (index, column) in layout.state_columns().iter().enumerate() {
         let is_count_role = matches!(
@@ -211,24 +215,25 @@ fn all_count_states_zero(row: &MvAggregatePhysicalRow, layout: &MvAggregateRunti
                 value == 0
             }
             (MvAggregateStateRole::Single, Some(AggScalarValue::Binary(bytes))) => {
-                count_state_visible(&bytes)
-                    .map(|value| value == 0)
-                    .unwrap_or(false)
+                count_state_visible(&bytes)? == 0
             }
-            (MvAggregateStateRole::Single, None) => true,
-            _ => false,
+            _ => {
+                return Err(failure::invalid_state(
+                    "aggregate MV COUNT state has no valid count carrier",
+                ));
+            }
         };
         if !zero {
-            return false;
+            return Ok(false);
         }
     }
-    saw_count
+    Ok(saw_count)
 }
 
 fn materialize_aggregate_result_batch(
     batch: &RecordBatch,
     layout: &MvAggregateRuntimeLayout,
-) -> Result<Chunk, String> {
+) -> Result<Chunk, ExecutionFailure> {
     let visible_outputs = layout.visible_output_order();
     let reordered = reorder_state_shaped_input_batch_by_name(batch, layout, visible_outputs)?;
     let batch = reordered.as_ref().unwrap_or(batch);
@@ -237,12 +242,12 @@ fn materialize_aggregate_result_batch(
         compute_batch_col_indexes(visible_outputs, layout);
     let expected = layout.group_key_source_indexes().len() + layout.state_columns().len();
     if batch.num_columns() != expected {
-        return Err(format!(
+        return Err(failure::contract(format_args!(
             "aggregate MV materialize column count mismatch: batch_columns={} expected={expected} (group_keys={} + state_columns={})",
             batch.num_columns(),
             layout.group_key_source_indexes().len(),
             layout.state_columns().len()
-        ));
+        )));
     }
     let rows = batch.num_rows();
     let mut states = vec![Vec::with_capacity(rows); layout.state_columns().len()];
@@ -287,7 +292,7 @@ fn materialize_aggregate_result_batch(
     }
     chunk_from_batch(
         RecordBatch::try_new(Arc::new(physical_schema(layout)), arrays)
-            .map_err(|error| format!("build aggregate MV physical batch failed: {error}"))?,
+            .map_err(failure::constructor)?,
     )
 }
 
@@ -295,7 +300,7 @@ fn reorder_state_shaped_input_batch_by_name(
     batch: &RecordBatch,
     layout: &MvAggregateRuntimeLayout,
     outputs: &[MvAggregateVisibleOutput],
-) -> Result<Option<RecordBatch>, String> {
+) -> Result<Option<RecordBatch>, ExecutionFailure> {
     let expected = state_shaped_input_fields(layout, outputs)?;
     if batch.num_columns() != expected.len() {
         return Ok(None);
@@ -354,14 +359,14 @@ fn reorder_state_shaped_input_batch_by_name(
         .collect();
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map(Some)
-        .map_err(|error| format!("reorder aggregate MV state-shaped input batch failed: {error}"))
+        .map_err(failure::constructor)
 }
 
 fn validate_state_shaped_input_schema(
     batch: &RecordBatch,
     layout: &MvAggregateRuntimeLayout,
     outputs: &[MvAggregateVisibleOutput],
-) -> Result<(), String> {
+) -> Result<(), ExecutionFailure> {
     let expected = state_shaped_input_fields(layout, outputs)?;
     if batch.num_columns() != expected.len() {
         return Ok(());
@@ -372,7 +377,7 @@ fn validate_state_shaped_input_schema(
         if !actual.name().eq_ignore_ascii_case(field.name())
             || !state_shaped_field_matches(index, actual, field, outputs)
         {
-            return Err(format!(
+            return Err(failure::contract(format_args!(
                 "aggregate MV state-shaped input schema mismatch at column {index}: got {}:{:?}:{} expected {}:{:?}:{}",
                 actual.name(),
                 actual.data_type(),
@@ -380,7 +385,7 @@ fn validate_state_shaped_input_schema(
                 field.name(),
                 field.data_type(),
                 field.is_nullable()
-            ));
+            )));
         }
     }
     Ok(())
@@ -413,19 +418,19 @@ fn state_shaped_field_is_state(index: usize, outputs: &[MvAggregateVisibleOutput
 fn state_shaped_input_fields(
     layout: &MvAggregateRuntimeLayout,
     outputs: &[MvAggregateVisibleOutput],
-) -> Result<Vec<Field>, String> {
+) -> Result<Vec<Field>, ExecutionFailure> {
     let mut fields = Vec::with_capacity(outputs.len() + layout.state_columns().len());
     for output in outputs {
         match output {
             MvAggregateVisibleOutput::GroupKey(index) => {
                 let visible_index = *layout.group_key_source_indexes().get(*index).ok_or_else(
                     || {
-                        format!(
+                        failure::contract(format_args!(
                             "aggregate MV state-shaped schema group key index {index} out of range"
-                        )
+                        ))
                     },
                 )?;
-                let visible = layout.visible_columns().get(visible_index).ok_or_else(|| format!("aggregate MV state-shaped schema visible source index {visible_index} out of range"))?;
+                let visible = layout.visible_columns().get(visible_index).ok_or_else(|| failure::contract(format_args!("aggregate MV state-shaped schema visible source index {visible_index} out of range")))?;
                 fields.push(Field::new(
                     visible.name(),
                     visible.data_type().clone(),
@@ -442,9 +447,9 @@ fn state_shaped_input_fields(
                     })
                     .collect::<Vec<_>>();
                 if states.is_empty() {
-                    return Err(format!(
+                    return Err(failure::contract(format_args!(
                         "aggregate MV state-shaped schema missing state column for aggregate index {index}"
-                    ));
+                    )));
                 }
                 fields.extend(
                     states
@@ -501,7 +506,10 @@ fn compute_batch_col_indexes(
     (group, state)
 }
 
-fn build_row_id_array(batch: &RecordBatch, group_columns: &[usize]) -> Result<ArrayRef, String> {
+fn build_row_id_array(
+    batch: &RecordBatch,
+    group_columns: &[usize],
+) -> Result<ArrayRef, ExecutionFailure> {
     let columns = group_columns
         .iter()
         .map(|index| batch.column(*index).clone())
@@ -513,23 +521,25 @@ fn load_rows_from_batch(
     batch: &RecordBatch,
     layout: &MvAggregateRuntimeLayout,
     allow_negative_counts: bool,
-) -> Result<Vec<MvAggregatePhysicalRow>, String> {
+) -> Result<Vec<MvAggregatePhysicalRow>, ExecutionFailure> {
     let expected = 1 + layout.visible_columns().len() + layout.state_columns().len();
     if batch.num_columns() < expected {
-        return Err(format!(
+        return Err(failure::contract(format_args!(
             "aggregate MV physical column count mismatch: batch_columns={} expected_at_least={expected}",
             batch.num_columns()
-        ));
+        )));
     }
     let row_ids = batch
         .column(0)
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "aggregate MV physical row id column must be Utf8".to_string())?;
+        .ok_or_else(|| failure::contract("aggregate MV physical row id column must be Utf8"))?;
     let mut rows = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
         if row_ids.is_null(row) {
-            return Err("aggregate MV physical row id cannot be NULL".to_string());
+            return Err(failure::invalid_state(
+                "aggregate MV physical row id cannot be NULL",
+            ));
         }
         let visible_values = (0..layout.visible_columns().len())
             .map(|index| agg_scalar_from_array(batch.column(1 + index), row))
@@ -563,22 +573,37 @@ fn validate_loaded_row(
     states: &[Option<AggScalarValue>],
     layout: &MvAggregateRuntimeLayout,
     allow_negative_counts: bool,
-) -> Result<(), String> {
+) -> Result<(), ExecutionFailure> {
     let computed = physical_row_id_from_visible_group_keys(batch, row, layout)?;
     if computed != row_id {
-        return Err(format!(
+        return Err(failure::invalid_state(format_args!(
             "aggregate MV state corruption: stored row id `{row_id}` does not match visible group key row id `{computed}`"
-        ));
+        )));
     }
     for (index, column) in layout.state_columns().iter().enumerate() {
         if column.aggregate_kind() != MvAggregateRuntimeKind::Count {
             continue;
         }
-        let count = match (column.state_role(), states.get(index).cloned().unwrap_or(None)) {
+        let count = match (
+            column.state_role(),
+            states.get(index).cloned().unwrap_or(None),
+        ) {
             (MvAggregateStateRole::RetractionCount, Some(AggScalarValue::Int64(value))) => value,
-            (MvAggregateStateRole::Single, Some(AggScalarValue::Binary(bytes))) => decode_count_state(&bytes).map_err(|error| format!("aggregate MV state corruption: COUNT state column `{}` has invalid VARBINARY for row id `{row_id}`: {error}", column.name()))?,
-            (_, None) => return Err(format!("aggregate MV state corruption: COUNT state column `{}` is NULL for row id `{row_id}`", column.name())),
-            (_, other) => return Err(format!("aggregate MV state corruption: COUNT state column `{}` has invalid value {other:?} for row id `{row_id}`", column.name())),
+            (MvAggregateStateRole::Single, Some(AggScalarValue::Binary(bytes))) => {
+                decode_count_state(&bytes)?
+            }
+            (_, None) => {
+                return Err(failure::invalid_state(format_args!(
+                    "aggregate MV state corruption: COUNT state column `{}` is NULL for row id `{row_id}`",
+                    column.name()
+                )));
+            }
+            (_, other) => {
+                return Err(failure::invalid_state(format_args!(
+                    "aggregate MV state corruption: COUNT state column `{}` has invalid value {other:?} for row id `{row_id}`",
+                    column.name()
+                )));
+            }
         };
         if !allow_negative_counts && (count < 0 || (column.count_star() && count == 0)) {
             let restriction = if column.count_star() {
@@ -586,10 +611,10 @@ fn validate_loaded_row(
             } else {
                 "non-negative"
             };
-            return Err(format!(
+            return Err(failure::invalid_state(format_args!(
                 "aggregate MV state corruption: COUNT state column `{}` must be {restriction} for row id `{row_id}`, got {count}",
                 column.name()
-            ));
+            )));
         }
     }
     Ok(())
@@ -599,7 +624,7 @@ fn physical_row_id_from_visible_group_keys(
     batch: &RecordBatch,
     row: usize,
     layout: &MvAggregateRuntimeLayout,
-) -> Result<String, String> {
+) -> Result<String, ExecutionFailure> {
     let columns = layout
         .group_key_source_indexes()
         .iter()
@@ -611,15 +636,25 @@ fn physical_row_id_from_visible_group_keys(
 fn physical_rows_to_chunks(
     mut rows: Vec<MvAggregatePhysicalRow>,
     layout: &MvAggregateRuntimeLayout,
-) -> Result<Vec<Chunk>, String> {
+) -> Result<Vec<Chunk>, ExecutionFailure> {
     rows.sort_by(|left, right| left.row_id.cmp(&right.row_id));
     let mut arrays =
         Vec::with_capacity(1 + layout.visible_columns().len() + layout.state_columns().len());
-    arrays.push(Arc::new(StringArray::from(
-        rows.iter()
-            .map(|row| row.row_id.as_str())
-            .collect::<Vec<_>>(),
-    )) as ArrayRef);
+    for row in &rows {
+        if row.visible_values.len() != layout.visible_columns().len()
+            || row.state_values.len() != layout.state_columns().len()
+        {
+            return Err(failure::contract(
+                "aggregate MV physical row shape does not match layout",
+            ));
+        }
+    }
+    arrays.push(build_agg_scalar_array(
+        &DataType::Utf8,
+        rows.iter_mut()
+            .map(|row| Some(AggScalarValue::Utf8(std::mem::take(&mut row.row_id))))
+            .collect(),
+    )?);
     for (index, column) in layout.visible_columns().iter().enumerate() {
         arrays.push(build_agg_scalar_array(
             column.data_type(),
@@ -638,16 +673,16 @@ fn physical_rows_to_chunks(
     }
     Ok(vec![chunk_from_batch(
         RecordBatch::try_new(Arc::new(physical_schema(layout)), arrays)
-            .map_err(|error| format!("build aggregate MV merged physical batch failed: {error}"))?,
+            .map_err(failure::constructor)?,
     )?])
 }
 
-fn chunk_from_batch(batch: RecordBatch) -> Result<Chunk, String> {
+fn chunk_from_batch(batch: RecordBatch) -> Result<Chunk, ExecutionFailure> {
     let slot_ids = (1..=batch.num_columns())
-        .map(|index| SlotId::new(index as u32))
-        .collect::<Vec<_>>();
+        .map(|index| failure::slot_index(index).map(SlotId::new))
+        .collect::<ExecutionResult<Vec<_>>>()?;
     let schema = ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slot_ids)?;
-    Chunk::try_new_with_chunk_schema(batch, schema)
+    Chunk::try_new_with_chunk_schema(batch, schema).map_err(Into::into)
 }
 
 fn zero_base_row(
@@ -674,17 +709,13 @@ fn merge_state_value(
     old: Option<AggScalarValue>,
     delta: Option<AggScalarValue>,
     column: &novarocks_types::mv_aggregate_layout::MvAggregateStateColumn,
-) -> Result<Option<AggScalarValue>, String> {
+) -> Result<Option<AggScalarValue>, ExecutionFailure> {
     if column.state_role() == MvAggregateStateRole::RetractionCount {
         let old = int64_state_value(old, column.name())?;
         let delta = int64_state_value(delta, column.name())?;
         return Ok(Some(AggScalarValue::Int64(
-            old.checked_add(delta).ok_or_else(|| {
-                format!(
-                    "aggregate MV state merge overflow for column `{}`",
-                    column.name()
-                )
-            })?,
+            old.checked_add(delta)
+                .ok_or_else(|| failure::count_overflow(old, delta))?,
         )));
     }
     let old = binary_state_value(old, column.name())?;
@@ -696,10 +727,10 @@ fn merge_state_value(
             MvAggregateRuntimeKind::Count => count_state_union(&old, &delta)?,
             MvAggregateRuntimeKind::Sum => sum_state_union(&old, &delta)?,
             MvAggregateRuntimeKind::Avg => {
-                return Err(format!(
+                return Err(failure::contract(format_args!(
                     "aggregate MV AVG state column `{}` must use AvgSum or AvgCount role",
                     column.name()
-                ));
+                )));
             }
             MvAggregateRuntimeKind::Min => min_state_union(&old, &delta)?,
             MvAggregateRuntimeKind::Max => max_state_union(&old, &delta)?,
@@ -714,25 +745,28 @@ fn merge_state_value(
     Ok(Some(AggScalarValue::Binary(merged)))
 }
 
-fn binary_state_value(value: Option<AggScalarValue>, name: &str) -> Result<Vec<u8>, String> {
+fn binary_state_value(
+    value: Option<AggScalarValue>,
+    name: &str,
+) -> Result<Vec<u8>, ExecutionFailure> {
     match value {
         Some(AggScalarValue::Binary(bytes)) => Ok(bytes),
         None => Ok(Vec::new()),
-        other => Err(format!(
+        other => Err(failure::contract(format_args!(
             "aggregate MV state type mismatch for column `{name}`: expected VARBINARY, got {other:?}"
-        )),
+        ))),
     }
 }
 
-fn int64_state_value(value: Option<AggScalarValue>, name: &str) -> Result<i64, String> {
+fn int64_state_value(value: Option<AggScalarValue>, name: &str) -> Result<i64, ExecutionFailure> {
     match value {
         Some(AggScalarValue::Int64(value)) => Ok(value),
-        None => Err(format!(
+        None => Err(failure::invalid_state(format_args!(
             "aggregate MV state corruption: COUNT state column `{name}` is NULL"
-        )),
-        other => Err(format!(
+        ))),
+        other => Err(failure::contract(format_args!(
             "aggregate MV state type mismatch for column `{name}`: expected integer, got {other:?}"
-        )),
+        ))),
     }
 }
 
@@ -762,7 +796,7 @@ fn physical_schema(layout: &MvAggregateRuntimeLayout) -> Schema {
 fn update_visible_values_from_state(
     row: &mut MvAggregatePhysicalRow,
     layout: &MvAggregateRuntimeLayout,
-) -> Result<(), String> {
+) -> Result<(), ExecutionFailure> {
     let mut resolved_avg = vec![false; layout.aggregate_input_types().len()];
     for (index, column) in layout.state_columns().iter().enumerate() {
         if column.state_role() == MvAggregateStateRole::RetractionCount {
@@ -780,10 +814,10 @@ fn update_visible_values_from_state(
                         && candidate.state_role() == MvAggregateStateRole::AvgSum
                 })
                 .ok_or_else(|| {
-                    format!(
+                    failure::contract(format_args!(
                         "aggregate MV AVG state is missing sum column for aggregate index {}",
                         column.aggregate_index()
-                    )
+                    ))
                 })?;
             let count_index = layout
                 .state_columns()
@@ -793,10 +827,10 @@ fn update_visible_values_from_state(
                         && candidate.state_role() == MvAggregateStateRole::AvgCount
                 })
                 .ok_or_else(|| {
-                    format!(
+                    failure::contract(format_args!(
                         "aggregate MV AVG state is missing count column for aggregate index {}",
                         column.aggregate_index()
-                    )
+                    ))
                 })?;
             let sum = binary_state_value(
                 row.state_values[sum_index].clone(),
@@ -825,10 +859,10 @@ fn update_visible_values_from_state(
             Some(AggScalarValue::Binary(bytes)) => bytes.as_slice(),
             None => &[],
             Some(other) => {
-                return Err(format!(
+                return Err(failure::contract(format_args!(
                     "aggregate MV state on column `{}` must be VARBINARY, got {other:?}",
                     column.name()
-                ));
+                )));
             }
         };
         let visible_index = column.visible_source_index();
@@ -853,7 +887,7 @@ fn derive_visible(
     visible_type: &DataType,
     _input_type: Option<&DataType>,
     name: &str,
-) -> Result<Option<AggScalarValue>, String> {
+) -> Result<Option<AggScalarValue>, ExecutionFailure> {
     match kind {
         MvAggregateRuntimeKind::Count => {
             Ok(Some(AggScalarValue::Int64(count_state_visible(state)?)))
@@ -863,26 +897,27 @@ fn derive_visible(
                 let (count, sum) = decode_sum_decimal128(state)?;
                 Ok((count != 0).then_some(AggScalarValue::Decimal128(sum)))
             }
-            _ => {
+            DataType::Int64 => {
                 let (count, sum) = decode_sum_int64(state)?;
                 Ok((count != 0).then_some(AggScalarValue::Int64(sum)))
             }
+            other => Err(failure::contract(format_args!(
+                "aggregate MV SUM visible output must be Int64 or Decimal128, got {other:?}"
+            ))),
         },
-        MvAggregateRuntimeKind::Avg => Err(format!(
+        MvAggregateRuntimeKind::Avg => Err(failure::contract(format_args!(
             "aggregate MV AVG visible column `{name}` must use AvgSum and AvgCount state roles"
-        )),
+        ))),
         MvAggregateRuntimeKind::Min => min_state_visible_key_value(state, visible_type)
-            .map(|value| value.map(key_value_to_agg_scalar))
-            .map_err(|error| format!("derive visible for column `{name}` failed: {error}")),
+            .map(|value| value.map(key_value_to_agg_scalar)),
         MvAggregateRuntimeKind::Max => max_state_visible_key_value(state, visible_type)
-            .map(|value| value.map(key_value_to_agg_scalar))
-            .map_err(|error| format!("derive visible for column `{name}` failed: {error}")),
-        MvAggregateRuntimeKind::BoolOr => bool_or_state_visible(state)
-            .map(|value| value.map(AggScalarValue::Bool))
-            .map_err(|error| format!("derive visible for column `{name}` failed: {error}")),
-        MvAggregateRuntimeKind::BoolAnd => bool_and_state_visible(state)
-            .map(|value| value.map(AggScalarValue::Bool))
-            .map_err(|error| format!("derive visible for column `{name}` failed: {error}")),
+            .map(|value| value.map(key_value_to_agg_scalar)),
+        MvAggregateRuntimeKind::BoolOr => {
+            bool_or_state_visible(state).map(|value| value.map(AggScalarValue::Bool))
+        }
+        MvAggregateRuntimeKind::BoolAnd => {
+            bool_and_state_visible(state).map(|value| value.map(AggScalarValue::Bool))
+        }
         MvAggregateRuntimeKind::CountDistinct => Ok(Some(AggScalarValue::Int64(
             count_distinct_state_visible(state)?,
         ))),
@@ -897,9 +932,9 @@ fn derive_avg_visible_with_count(
     count: i64,
     visible_type: &DataType,
     input_type: Option<&DataType>,
-) -> Result<Option<AggScalarValue>, String> {
+) -> Result<Option<AggScalarValue>, ExecutionFailure> {
     if count < 0 {
-        return Err("AVG count state cannot be negative".to_string());
+        return Err(failure::invalid_state("AVG count state cannot be negative"));
     }
     match visible_type {
         DataType::Float64 => {
@@ -909,10 +944,9 @@ fn derive_avg_visible_with_count(
         }
         DataType::Decimal128(_, output_scale) => {
             let Some(DataType::Decimal128(_, input_scale)) = input_type else {
-                return Err(
-                    "AVG Decimal128 visible derivation requires input decimal scale metadata"
-                        .to_string(),
-                );
+                return Err(failure::contract(
+                    "AVG Decimal128 visible derivation requires input decimal scale metadata",
+                ));
             };
             let (sum_count, sum) = decode_sum_decimal128(sum_state)?;
             validate_avg_sum_count(sum_count, count)?;
@@ -926,27 +960,27 @@ fn derive_avg_visible_with_count(
                 let factor = pow10_i128(difference.unsigned_abs() as usize)?;
                 if difference > 0 {
                     sum.checked_mul(factor)
-                        .ok_or_else(|| "decimal overflow".to_string())?
+                        .ok_or_else(|| failure::scale_overflow(sum, factor))?
                 } else {
                     sum / factor
                 }
             };
             Ok(Some(AggScalarValue::Decimal128(div_round_i128(
                 scaled,
-                count as i128,
-            ))))
+                i128::from(count),
+            )?)))
         }
-        other => Err(format!(
+        other => Err(failure::contract(format_args!(
             "AVG visible derivation unsupported for output type {other:?}"
-        )),
+        ))),
     }
 }
 
-fn validate_avg_sum_count(sum_count: i64, count: i64) -> Result<(), String> {
+fn validate_avg_sum_count(sum_count: i64, count: i64) -> Result<(), ExecutionFailure> {
     if sum_count != count {
-        return Err(format!(
+        return Err(failure::invalid_state(format_args!(
             "AVG sum/count state mismatch: sum_state={sum_count} count_state={count}"
-        ));
+        )));
     }
     Ok(())
 }
@@ -1141,5 +1175,79 @@ mod tests {
             .expect("merged AVG count state");
         assert_eq!(decode_sum_int64(sum.value(0)).unwrap(), (4, 20));
         assert_eq!(decode_count_state(count.value(0)).unwrap(), 4);
+    }
+
+    #[test]
+    fn duplicate_active_row_keeps_corruption_fact_without_retaining_physical_input() {
+        use novarocks_failure_contract::FailureProjection;
+        let layout = layout();
+        let key = Arc::new(Int64Array::from(vec![7])) as ArrayRef;
+        let row_id = crate::exec::mv::group_row_id::aggregate_group_row_id_at(&[key], 0).unwrap();
+        let row = MvAggregatePhysicalRow {
+            row_id,
+            visible_values: vec![
+                Some(AggScalarValue::Int64(7)),
+                Some(AggScalarValue::Int64(2)),
+            ],
+            state_values: vec![Some(AggScalarValue::Binary(encode_count_state(2)))],
+        };
+        let chunks = physical_rows_to_chunks(vec![row.clone(), row], &layout).unwrap();
+        let row_ids = chunks[0].record_batch().column(0).clone();
+        let weak_array = Arc::downgrade(&row_ids);
+        let field = chunks[0].record_batch().schema().fields()[0].clone();
+        let weak_field = Arc::downgrade(&field);
+        let active = build_old_state_map(&chunks, &layout).unwrap_err();
+        let physical = load_aggregate_physical_rows(&chunks, &layout).unwrap_err();
+        assert_eq!(
+            active.failure_fact(),
+            novarocks_functions::DataFailureReason::InvalidEncoding.failure_fact()
+        );
+        assert_eq!(active.failure_fact(), physical.failure_fact());
+        assert!(active.to_string().contains("duplicate active MV row id"));
+        assert!(physical.to_string().contains("duplicate row id"));
+        drop(chunks);
+        drop(row_ids);
+        drop(field);
+        assert!(weak_array.upgrade().is_none());
+        assert!(weak_field.upgrade().is_none());
+    }
+
+    #[test]
+    fn count_zero_detection_returns_actual_codec_failure_without_treating_it_as_live_state() {
+        use novarocks_failure_contract::FailureProjection;
+        use std::error::Error;
+        let layout = layout();
+        let row = MvAggregatePhysicalRow {
+            row_id: "not inspected by count zero detection".into(),
+            visible_values: vec![],
+            state_values: vec![Some(AggScalarValue::Binary(vec![0xff]))],
+        };
+        let failure = all_count_states_zero(&row, &layout).unwrap_err();
+        assert_eq!(
+            failure.failure_fact(),
+            novarocks_functions::DataFailureReason::InvalidEncoding.failure_fact()
+        );
+        let mut source = failure.source();
+        let mut codec = false;
+        while let Some(actual) = source {
+            codec |= actual.is::<crate::exec::mv::state_codec::StateCodecFailure>();
+            source = actual.source();
+        }
+        assert!(codec, "the actual decoder must remain the cause");
+    }
+
+    #[test]
+    fn frozen_sum_output_type_is_not_guessed_from_int64_state_bytes() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let failure = derive_visible(
+            MvAggregateRuntimeKind::Sum,
+            &crate::exec::mv::state_codec::encode_sum_int64(1, 7),
+            &DataType::Float64,
+            None,
+            "numeric overflow resource cancelled",
+        )
+        .unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(failure.failure_fact().reason().code(), 486);
     }
 }

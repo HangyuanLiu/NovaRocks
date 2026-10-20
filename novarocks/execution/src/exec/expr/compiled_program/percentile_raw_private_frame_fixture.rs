@@ -157,7 +157,8 @@ pub(super) fn source_arrays() -> Vec<ArrayRef> {
     for value in [1.0, 2.0, 3.0, 4.0] {
         novarocks_functions::approx_percentile_core::add_value(&mut state, value).unwrap();
     }
-    let bytes = novarocks_functions::approx_percentile_core::encode_state(&state);
+    let bytes = novarocks_functions::approx_percentile_core::encode_state(&state)
+        .expect("percentile frame fixture");
     vec![
         Arc::new(BinaryArray::from(vec![
             Some(b"bad".as_slice()),

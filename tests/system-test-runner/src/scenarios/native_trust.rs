@@ -803,6 +803,9 @@ pub(super) struct GrpcProbe {
     pub(super) http_status: u16,
     pub(super) grpc_status: Option<u16>,
     pub(super) grpc_message: Option<String>,
+    // Only the existing bounded mode captures data, after its original cap check.
+    // None means unobserved; Some(empty) proves a physically empty response body.
+    pub(super) response_body: Option<Vec<u8>>,
 }
 
 /// An authenticated plaintext/IP probe for malformed, metadata-only requests. The
@@ -925,6 +928,7 @@ fn raw_grpc_probe_with_deadline(
                 let header_message = grpc_message(response.headers());
                 let mut body = response.into_body();
                 let mut response_bytes = 0usize;
+                let mut response_body = deadline.map(|_| Vec::new());
                 while let Some(bytes) = body
                     .data()
                     .await
@@ -938,6 +942,9 @@ fn raw_grpc_probe_with_deadline(
                         deadline.is_none() || response_bytes <= 4096,
                         "malformed-request Native response exceeds probe bound"
                     );
+                    if let Some(captured) = response_body.as_mut() {
+                        captured.extend_from_slice(&bytes);
+                    }
                 }
                 let trailer_status = body
                     .trailers()
@@ -951,6 +958,7 @@ fn raw_grpc_probe_with_deadline(
                     http_status,
                     grpc_status,
                     grpc_message,
+                    response_body,
                 })
             };
             let result = match deadline {

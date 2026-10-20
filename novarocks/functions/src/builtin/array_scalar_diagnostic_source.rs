@@ -81,9 +81,12 @@ impl<'work, 'control, 'rows> HostProjectionDiagnostics<'work, 'control, 'rows> {
             self.work,
         )?;
         let mut message = String::new();
-        message
-            .try_reserve_exact(text.len())
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        message.try_reserve_exact(text.len()).map_err(|source| {
+            KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+                "array field-name diagnostic",
+                source,
+            ))
+        })?;
         // Pinned std Global returns the exact requested byte Layout for this
         // empty Vec<u8> growth. This is not a post-allocation permission check.
         // Copy each valid UTF8 scalar without another formatter or decoder.
@@ -96,19 +99,16 @@ impl<'work, 'control, 'rows> HostProjectionDiagnostics<'work, 'control, 'rows> {
         self.work.flush()?;
         // All fallible construction is complete. Publication only moves the
         // original complete String. No work.finish or later diagnostic footer.
-        Ok(slot.publish_original(message))
+        Ok(slot.publish_original(crate::DataFailureReason::InvalidValue, message))
     }
 }
 impl ProjectionPort for HostProjectionDiagnostics<'_, '_, '_> {
     type Failure = ScalarInvocationFailure;
-    fn diagnostic(&mut self, original: fmt::Arguments<'_>) -> Self::Failure {
+    fn value_error(&mut self, original: fmt::Arguments<'_>) -> Self::Failure {
         match self.publish_diagnostic(original) {
             Ok(data) => ScalarInvocationFailure::Data(data),
             Err(cause) => ScalarInvocationFailure::Kernel(cause),
         }
-    }
-    fn arrow_error(&mut self, original: arrow_schema::ArrowError) -> Self::Failure {
-        self.diagnostic(format_args!("{original}"))
     }
     fn step(&mut self) -> Result<(), Self::Failure> {
         self.work.step().map_err(ScalarInvocationFailure::Kernel)

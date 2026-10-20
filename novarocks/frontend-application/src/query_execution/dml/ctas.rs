@@ -42,6 +42,7 @@ use novarocks_spi::connector::{
 };
 use novarocks_user_error::UserError;
 
+use crate::dml::error::DmlExecutionError;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_parser::ast::{
     CreateTableAsSelect, Literal, LiteralKind, PartitionTransform, Query, TablePartition,
@@ -50,6 +51,7 @@ use novarocks_parser::ast::{
 use novarocks_parser::printer;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
+use novarocks_query_application::execution_error::{ExecutionFailureInput, ExecutionFailureSite};
 use novarocks_sql::semantic::ObjectName;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -294,28 +296,75 @@ pub struct CtasFailure {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CtasUserError {
-    UnsupportedCompiledShape(String),
+    Execution(ExecutionFailureInput),
+    Compilation(novarocks_execution_contract::failure::SharedFailureCause),
     Analyze(novarocks_sql::analyze_error::AnalyzeError),
     Control(novarocks_type_contract::CompileControlError),
 }
 
+impl std::fmt::Display for CtasFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for CtasFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.user_error {
+            Some(CtasUserError::Analyze(source)) => Some(source),
+            Some(CtasUserError::Control(source)) => Some(source),
+            Some(CtasUserError::Compilation(source)) => Some(source),
+            Some(CtasUserError::Execution(_)) | None => None,
+        }
+    }
+}
 impl CtasFailure {
-    fn unsupported_compiled_shape(reason: String) -> Self {
+    pub(crate) fn from_execution(input: ExecutionFailureInput) -> Self {
         Self {
-            kind: CtasFailureKind::Unsupported,
-            message:
-                novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(
-                    reason.clone(),
-                )
-                .to_bracketed_user_message(),
-            user_error: Some(CtasUserError::UnsupportedCompiledShape(reason)),
+            kind: CtasFailureKind::Internal,
+            message: input.detail().as_str().to_owned(),
+            user_error: Some(CtasUserError::Execution(input)),
         }
     }
 
-    pub(crate) fn compiled_shape_refusal(&self) -> Option<&str> {
-        match self.user_error.as_ref() {
-            Some(CtasUserError::UnsupportedCompiledShape(reason)) => Some(reason),
-            _ => None,
+    fn from_dml(error: DmlExecutionError) -> Self {
+        match error {
+            DmlExecutionError::Execution(input) => Self::from_execution(input),
+            DmlExecutionError::Compilation(source) => Self {
+                kind: CtasFailureKind::Internal,
+                message: source.detail().to_owned(),
+                user_error: Some(CtasUserError::Compilation(source)),
+            },
+            DmlExecutionError::Control(error) => Self::control(error),
+            DmlExecutionError::Analyze(error) => Self::analyze(error),
+            DmlExecutionError::Engine(error) => internal_failure(error),
+            DmlExecutionError::Cow(error) => {
+                // This private CTAS planner never opens a COW session. Reject
+                // any future violation while still on the original synchronous
+                // command worker, retiring its raw cause under its own holder.
+                let detail = error.retire_on_original_worker(None);
+                let mut failure = internal_failure(
+                    "standard CTAS planning unexpectedly returned a copy-on-write failure",
+                );
+                failure.message.push_str(": ");
+                failure.message.push_str(&detail);
+                failure
+            }
+        }
+    }
+
+    /// Forward the exact runtime input or the compilation author's own fact.
+    /// Compilation diagnostics remain in their original rich source; only a
+    /// fixed safe description crosses the SQL boundary.
+    pub(crate) fn execution_failure(&self) -> Option<ExecutionFailureInput> {
+        use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+        match self.user_error.as_ref()? {
+            CtasUserError::Execution(input) => Some(input.clone()),
+            CtasUserError::Compilation(source) => Some(ExecutionFailureInput::new(
+                source.failure_fact(),
+                SafeDetail::truncating("pure SQL compilation failed in its source domain"),
+                ExecutionFailureSite::Coordinator,
+            )),
+            CtasUserError::Analyze(_) | CtasUserError::Control(_) => None,
         }
     }
 
@@ -347,6 +396,11 @@ impl CtasFailure {
                 Some(error) => Self::control(error),
                 None => Self::analyze(error),
             },
+            SqlCompileError::CompilationSource(source) => Self {
+                kind: CtasFailureKind::Internal,
+                message: source.detail().to_owned(),
+                user_error: Some(CtasUserError::Compilation(source)),
+            },
             error @ (SqlCompileError::InvalidRequest(_) | SqlCompileError::Compilation(_)) => {
                 internal_failure(error.to_string())
             }
@@ -363,16 +417,21 @@ impl CtasFailure {
         &self,
     ) -> Option<novarocks_type_contract::CompileControlError> {
         match self.user_error.as_ref() {
-            Some(CtasUserError::Control(error)) => Some(*error),
+            Some(CtasUserError::Control(error)) => Some(error.clone()),
             Some(CtasUserError::Analyze(error)) => error.control_error(),
-            Some(CtasUserError::UnsupportedCompiledShape(_)) | None => None,
+            Some(CtasUserError::Compilation(source)) => Some(
+                novarocks_type_contract::CompileControlError::Source(source.clone()),
+            ),
+            Some(CtasUserError::Execution(_)) | None => None,
         }
     }
 
     pub(crate) fn user_error(&self, source: Option<&str>) -> Option<UserError> {
         match self.user_error.as_ref()? {
             CtasUserError::Analyze(error) => Some(error.to_user_error(source)),
-            CtasUserError::Control(_) | CtasUserError::UnsupportedCompiledShape(_) => None,
+            CtasUserError::Execution(_)
+            | CtasUserError::Control(_)
+            | CtasUserError::Compilation(_) => None,
         }
     }
 }
@@ -1136,36 +1195,42 @@ impl CtasSourceExecutionGate {
         self.source_artifact.as_ref()
     }
 
-    fn execution_for_plan(&self) -> Result<QueryExecutionContext, String> {
+    fn execution_for_plan(&self) -> Result<QueryExecutionContext, CtasFailure> {
         self.retained_execution
             .lock()
-            .map_err(|error| format!("CTAS execution context lock: {error}"))?
+            .map_err(|error| internal_failure(format!("CTAS execution context lock: {error}")))?
             .as_ref()
             .cloned()
-            .ok_or_else(|| "CTAS admitted execution context was already consumed".to_string())
+            .ok_or_else(|| internal_failure("CTAS admitted execution context was already consumed"))
     }
 
     pub(crate) fn execute_once<T>(
         &self,
         expected_identity: [u8; 32],
-        execute: impl FnOnce(&(dyn Any + Send + Sync), QueryExecutionContext) -> Result<T, String>,
-    ) -> Result<T, String> {
+        execute: impl FnOnce(&(dyn Any + Send + Sync), QueryExecutionContext) -> Result<T, CtasFailure>,
+    ) -> Result<T, CtasFailure> {
         if expected_identity != self.execution_identity {
-            return Err("CTAS prepared write execution identity mismatch".to_string());
+            return Err(internal_failure(
+                "CTAS prepared write execution identity mismatch",
+            ));
         }
         if self
             .executed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return Err("CTAS prepared source has already been executed".to_string());
+            return Err(internal_failure(
+                "CTAS prepared source has already been executed",
+            ));
         }
         let execution = self
             .retained_execution
             .lock()
-            .map_err(|error| format!("CTAS execution context lock: {error}"))?
+            .map_err(|error| internal_failure(format!("CTAS execution context lock: {error}")))?
             .take()
-            .ok_or_else(|| "CTAS admitted execution context was already consumed".to_string())?;
+            .ok_or_else(|| {
+                internal_failure("CTAS admitted execution context was already consumed")
+            })?;
         execute(self.source_artifact(), execution)
     }
 }
@@ -1211,7 +1276,13 @@ pub(crate) fn mutation_failure(failure: ConnectorMutationFailure) -> CtasFailure
 
 fn connector_failure(error: novarocks_spi::connector::ConnectorError) -> CtasFailure {
     use novarocks_spi::connector::ConnectorErrorKind;
+    if error.kind() == ConnectorErrorKind::Interrupted {
+        return CtasFailure::control(novarocks_type_contract::CompileControlError::Source(
+            novarocks_failure_contract::SharedFailureCause::new(error),
+        ));
+    }
     let kind = match error.kind() {
+        ConnectorErrorKind::Interrupted => unreachable!("caller interruption returned above"),
         ConnectorErrorKind::InvalidRequest => CtasFailureKind::InvalidRequest,
         ConnectorErrorKind::NotFound => CtasFailureKind::NotFound,
         ConnectorErrorKind::Unsupported => CtasFailureKind::Unsupported,
@@ -1502,7 +1573,7 @@ fn staged_write_failed(
     target: &dyn CtasWriteTarget,
     message: impl Into<String>,
 ) -> StandardCtasWriteOutcome {
-    staged_write_failure(
+    staged_write_failed_with_failure(
         target,
         CtasFailure {
             kind: CtasFailureKind::Unavailable,
@@ -1512,38 +1583,17 @@ fn staged_write_failed(
     )
 }
 
-fn staged_distributed_write_failed(
-    target: &dyn CtasWriteTarget,
-    context: &str,
-    error: crate::query_execution::contract::DistributedQueryError,
-) -> StandardCtasWriteOutcome {
-    let (reason, code) = crate::dml::error::DmlExecutionError::from(error).into_abort_parts();
-    let message = format!("{context}: {reason}");
-    let failure = if code == Some(novarocks_types::EngineErrorCode::UnsupportedCompiledShape) {
-        CtasFailure::unsupported_compiled_shape(message)
-    } else {
-        CtasFailure {
-            kind: CtasFailureKind::Unavailable,
-            message,
-            user_error: None,
-        }
-    };
-    staged_write_failure(target, failure)
-}
-
-fn staged_write_failure(
+fn staged_write_failed_with_failure(
     target: &dyn CtasWriteTarget,
     mut failure: CtasFailure,
 ) -> StandardCtasWriteOutcome {
+    // This is still the original pre-publication write-unknown latch. Its
+    // business state does not replace an originating runtime failure input.
+    failure.kind = CtasFailureKind::Unavailable;
     if let Err(error) = target.mark_write_unknown() {
         failure.message.push_str(&format!(
             "; standard CTAS target rejected write-unknown transition: {error}"
         ));
-        if let Some(CtasUserError::UnsupportedCompiledShape(reason)) = failure.user_error.as_mut() {
-            reason.push_str(&format!(
-                "; standard CTAS target rejected write-unknown transition: {error}"
-            ));
-        }
     }
     StandardCtasWriteOutcome::KnownUncommitted { failure }
 }
@@ -1972,31 +2022,12 @@ impl CtasEngine for DmlExecutionKernel {
             self,
             planned,
             target_arc.as_ref(),
-            &source.gate.execution_for_plan().map_err(internal_failure)?,
+            &source.gate.execution_for_plan()?,
             source.query_options.clone(),
             &source.connector_context,
             session,
         )
-        .map_err(|error| match error {
-            crate::dml::error::DmlExecutionError::Control(error) => CtasFailure::control(error),
-            crate::dml::error::DmlExecutionError::Analyze(error) => CtasFailure::analyze(error),
-            crate::dml::error::DmlExecutionError::Engine(error) => internal_failure(error),
-            crate::dml::error::DmlExecutionError::UnsupportedCompiledShape(reason) => {
-                CtasFailure::unsupported_compiled_shape(reason)
-            }
-            crate::dml::error::DmlExecutionError::Cow(error) => {
-                // This private CTAS planner never opens a COW session. Reject
-                // any future violation while still on the original synchronous
-                // command worker, retiring its raw cause under its own holder.
-                let detail = error.retire_on_original_worker(None);
-                let mut failure = internal_failure(
-                    "standard CTAS planning unexpectedly returned a copy-on-write failure",
-                );
-                failure.message.push_str(": ");
-                failure.message.push_str(&detail);
-                failure
-            }
-        })?;
+        .map_err(CtasFailure::from_dml)?;
         let attempt_reservation = source
             .attempt_reservation
             .lock()
@@ -2037,16 +2068,22 @@ impl CtasEngine for DmlExecutionKernel {
                 let assembly = prepared
                     .assembly
                     .lock()
-                    .map_err(|error| format!("CTAS prepared write lock: {error}"))?
+                    .map_err(|error| {
+                        internal_failure(format!("CTAS prepared write lock: {error}"))
+                    })?
                     .take()
-                    .ok_or_else(|| "CTAS prepared write was already consumed".to_string())?;
-                let (_service, request) = assembly.into_request()?;
+                    .ok_or_else(|| internal_failure("CTAS prepared write was already consumed"))?;
+                let (_service, request) = assembly.into_request().map_err(CtasFailure::from_dml)?;
                 let attempt_reservation = prepared
                     .attempt_reservation
                     .lock()
-                    .map_err(|error| format!("CTAS attempt reservation lock: {error}"))?
+                    .map_err(|error| {
+                        internal_failure(format!("CTAS attempt reservation lock: {error}"))
+                    })?
                     .take()
-                    .ok_or_else(|| "CTAS attempt reservation was already consumed".to_string())?;
+                    .ok_or_else(|| {
+                        internal_failure("CTAS attempt reservation was already consumed")
+                    })?;
                 // Nothing below can leave the publication in doubt. A staged
                 // write session seals its artifacts without touching the
                 // catalog, so every failure here is proven-uncommitted: the
@@ -2059,20 +2096,18 @@ impl CtasEngine for DmlExecutionKernel {
                 {
                     Ok(outcome) => outcome,
                     Err(error) => {
-                        return Ok(staged_distributed_write_failed(
+                        return Ok(staged_write_failed_with_failure(
                             prepared.target.as_ref(),
-                            "CTAS write did not complete",
-                            error,
+                            CtasFailure::from_dml(DmlExecutionError::from_distributed(error)),
                         ));
                     }
                 };
                 let write = match outcome.into_write() {
                     Ok(write) => write,
                     Err(error) => {
-                        return Ok(staged_distributed_write_failed(
+                        return Ok(staged_write_failed_with_failure(
                             prepared.target.as_ref(),
-                            "CTAS write reached no terminal",
-                            error,
+                            CtasFailure::from_dml(DmlExecutionError::from_distributed(error)),
                         ));
                     }
                 };
@@ -2087,9 +2122,7 @@ impl CtasEngine for DmlExecutionKernel {
             });
         match result {
             Ok(outcome) => outcome,
-            Err(message) => StandardCtasWriteOutcome::KnownUncommitted {
-                failure: internal_failure(message),
-            },
+            Err(failure) => StandardCtasWriteOutcome::KnownUncommitted { failure },
         }
     }
 
@@ -2222,39 +2255,50 @@ mod tests {
 
     #[test]
     fn runtime_refusal_marks_write_unknown_and_keeps_uncommitted_publication_fact() {
-        use novarocks_types::EngineErrorCode;
-        for code in [None, Some(EngineErrorCode::UnsupportedCompiledShape)] {
+        use novarocks_failure_contract::FailureProjection;
+        for original in [
+            novarocks_plan_codec::PhysicalEncodeError::Invalid("unsupported diagnostic".into()),
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                "unsupported diagnostic".into(),
+            ),
+        ] {
+            let expected = original.failure_fact();
             let target = RecordingTarget::default();
-            let error = crate::query_execution::contract::DistributedQueryError::new(
-                crate::query_execution::contract::DistributedQueryErrorKind::Failed,
-                "unsupported diagnostic",
-            )
-            .with_engine_error_code(code);
-            let outcome =
-                staged_distributed_write_failed(&target, "CTAS write did not complete", error);
+            let error =
+                crate::query_execution::contract::DistributedQueryError::from_encode(original);
+            let outcome = staged_write_failed_with_failure(
+                &target,
+                CtasFailure::from_dml(crate::dml::error::DmlExecutionError::from_distributed(
+                    error,
+                )),
+            );
             let StandardCtasWriteOutcome::KnownUncommitted { failure } = outcome else {
-                panic!("publication remains uncommitted");
+                panic!("publication remains uncommitted")
             };
             assert_eq!(target.unknown.load(Ordering::SeqCst), 1);
             assert!(target.bound().is_empty());
-            assert_eq!(failure.compiled_shape_refusal().is_some(), code.is_some());
-            assert!(failure.message.contains("CTAS write did not complete"));
+            assert_eq!(failure.execution_failure().unwrap().fact(), expected);
+            assert_eq!(failure.kind, CtasFailureKind::Unavailable);
         }
     }
 
     #[test]
     fn compiled_capability_retains_its_typed_ctas_cause() {
-        let failure = CtasFailure::unsupported_compiled_shape("change-stream router".into());
-        assert_eq!(failure.kind, CtasFailureKind::Unsupported);
-        assert_eq!(
-            failure.compiled_shape_refusal(),
-            Some("change-stream router")
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let original = novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+            "change-stream router".into(),
         );
-        assert_eq!(
-            failure.message,
-            "[UnsupportedCompiledShape] change-stream router"
+        let expected = original.failure_fact();
+        let failure =
+            CtasFailure::from_dml(crate::dml::error::DmlExecutionError::from_encode(original));
+        assert_eq!(failure.execution_failure().unwrap().fact(), expected);
+        assert_eq!(expected.class(), FailureClass::Unsupported);
+        let Some(CtasUserError::Compilation(source)) = failure.user_error.as_ref() else {
+            panic!("original compilation author must survive")
+        };
+        assert!(
+            matches!(source.downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>(), Some(novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(detail)) if detail == "change-stream router")
         );
-        assert!(failure.compile_control_error().is_none());
         assert!(failure.user_error(None).is_none());
     }
 
@@ -2439,5 +2483,102 @@ mod tests {
         assert_eq!(fixture.session.finish_invocations(), 0);
         assert_eq!(fixture.recorded.lock().expect("recorded").finish, 0);
         assert!(target.bound().is_empty());
+    }
+    #[test]
+    fn a_runtime_failed_ctas_write_keeps_the_input_and_latches_its_original_target() {
+        use crate::dml::error::DmlExecutionError;
+        use crate::query_execution::contract::DistributedQueryError;
+        use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+        let input = ExecutionFailureInput::new(
+            novarocks_functions::KernelFailure::ResourceExhausted.failure_fact(),
+            SafeDetail::truncating("the original CTAS execution exhausted its resources"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let target = RecordingTarget::default();
+        let error = DmlExecutionError::from_distributed(DistributedQueryError::from_execution(
+            input.clone(),
+        ));
+        let outcome = staged_write_failed_with_failure(&target, CtasFailure::from_dml(error));
+        let StandardCtasWriteOutcome::KnownUncommitted { failure } = outcome else {
+            panic!("a failed runtime write cannot publish a table");
+        };
+        assert_eq!(failure.execution_failure(), Some(input));
+        assert_eq!(target.unknown.load(Ordering::SeqCst), 1);
+        assert!(target.bound().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod typed_compile_source_tests {
+    use super::*;
+    use novarocks_execution_contract::failure::{
+        FailureClass, FailureProjection, SharedFailureCause,
+    };
+    use std::error::Error;
+    #[test]
+    fn typed_compile_source_stays_available_without_minting_a_control_intent() {
+        let source = SharedFailureCause::new(novarocks_functions::ConstantError::Limit(
+            "finite constant policy",
+        ));
+        let failure = CtasFailure::from_compile(
+            novarocks_sql::compiler::SqlCompileError::CompilationSource(source.clone()),
+        );
+        let carried = failure
+            .source()
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
+        assert_eq!(carried, &source);
+        assert_eq!(carried.failure_fact().class(), FailureClass::Resource);
+        assert!(
+            carried
+                .downcast_ref::<novarocks_functions::ConstantError>()
+                .is_some()
+        );
+        assert_eq!(failure.compile_control_error(), None);
+        assert_eq!(failure.user_error(None), None);
+    }
+
+    #[test]
+    fn a_failed_ctas_source_gate_forwards_one_input_and_never_reexecutes() {
+        use crate::query_execution::contract::DistributedQueryError;
+        use novarocks_execution_contract::SafeDetail;
+        use novarocks_query_application::{
+            api::BackendTopologySnapshot, cancellation::QueryCancellationSource,
+        };
+        use std::sync::atomic::AtomicUsize;
+        let cancellation = QueryCancellationSource::new();
+        let execution = QueryExecutionContext::new(
+            novarocks_types::ClusterRole::Fe,
+            BackendTopologySnapshot::empty(101),
+            None,
+            cancellation.view(),
+            novarocks_sql::compiler::SessionOptimizerSettings::default(),
+            novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+        );
+        let gate = CtasSourceExecutionGate::new([7; 32], Arc::new(()), execution);
+        let input = ExecutionFailureInput::new(
+            novarocks_functions::KernelFailure::ResourceExhausted.failure_fact(),
+            SafeDetail::truncating("the original runtime failed"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let calls = AtomicUsize::new(0);
+        let failure = gate
+            .execute_once::<()>([7; 32], |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(CtasFailure::from_dml(DmlExecutionError::from_distributed(
+                    DistributedQueryError::from_execution(input.clone()),
+                )))
+            })
+            .unwrap_err();
+        assert_eq!(failure.execution_failure(), Some(input));
+        assert!(
+            gate.execute_once::<()>([7; 32], |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -182,9 +182,9 @@ fn read_u32_le_with_failure<F: HllFailureSink>(
     sink: &mut F,
 ) -> Result<u32, F::Error> {
     let bytes = payload.get(offset..offset + 4).ok_or_else(|| {
-        sink.data(HllDataRecipe {
+        sink.failure(HllFailureRecipe {
             context,
-            detail: HllDataDetail::Truncated(offset),
+            detail: HllFailureDetail::Truncated(offset),
         })
     })?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
@@ -197,9 +197,9 @@ fn require_payload_len_with_failure<F: HllFailureSink>(
     sink: &mut F,
 ) -> Result<(), F::Error> {
     if payload.len() < required {
-        return Err(sink.data(HllDataRecipe {
+        return Err(sink.failure(HllFailureRecipe {
             context,
-            detail: HllDataDetail::Length {
+            detail: HllFailureDetail::Length {
                 required,
                 actual: payload.len(),
             },
@@ -256,21 +256,21 @@ fn payload_profile_with_failure<F: HllFailureSink>(
     let state = payload[6];
     let mode_byte = payload[7];
     if serial_version != HLL_SERIAL_VERSION {
-        return Err(sink.data(HllDataRecipe {
+        return Err(sink.failure(HllFailureRecipe {
             context,
-            detail: HllDataDetail::Version(serial_version),
+            detail: HllFailureDetail::Version(serial_version),
         }));
     }
     if family_id != HLL_FAMILY_ID {
-        return Err(sink.data(HllDataRecipe {
+        return Err(sink.failure(HllFailureRecipe {
             context,
-            detail: HllDataDetail::Family(family_id),
+            detail: HllFailureDetail::Family(family_id),
         }));
     }
     if !(4..=21).contains(&lg_k) {
-        return Err(sink.data(HllDataRecipe {
+        return Err(sink.failure(HllFailureRecipe {
             context,
-            detail: HllDataDetail::LogK(lg_k),
+            detail: HllFailureDetail::LogK(lg_k),
         }));
     }
     let target_type = match (mode_byte >> 2) & 3 {
@@ -278,9 +278,9 @@ fn payload_profile_with_failure<F: HllFailureSink>(
         1 => HllTargetType::Hll6,
         2 => HllTargetType::Hll8,
         value => {
-            return Err(sink.data(HllDataRecipe {
+            return Err(sink.failure(HllFailureRecipe {
                 context,
-                detail: HllDataDetail::Target(value),
+                detail: HllFailureDetail::Target(value),
             }));
         }
     };
@@ -290,9 +290,9 @@ fn payload_profile_with_failure<F: HllFailureSink>(
     match mode_byte & 3 {
         0 => {
             if preamble_ints != 2 || lg_arr != 3 {
-                return Err(sink.data(HllDataRecipe {
+                return Err(sink.failure(HllFailureRecipe {
                     context,
-                    detail: HllDataDetail::ListHeader {
+                    detail: HllFailureDetail::ListHeader {
                         preamble: preamble_ints,
                         lg_arr,
                     },
@@ -300,9 +300,9 @@ fn payload_profile_with_failure<F: HllFailureSink>(
             }
             let coupon_count = usize::from(state);
             if coupon_count > 8 || empty != (coupon_count == 0) {
-                return Err(sink.data(HllDataRecipe {
+                return Err(sink.failure(HllFailureRecipe {
                     context,
-                    detail: HllDataDetail::ListCount,
+                    detail: HllFailureDetail::ListCount,
                 }));
             }
             let read_count = if compact { coupon_count } else { 8 };
@@ -322,16 +322,16 @@ fn payload_profile_with_failure<F: HllFailureSink>(
         }
         1 => {
             if preamble_ints != 3 {
-                return Err(sink.data(HllDataRecipe {
+                return Err(sink.failure(HllFailureRecipe {
                     context,
-                    detail: HllDataDetail::SetPreamble(preamble_ints),
+                    detail: HllFailureDetail::SetPreamble(preamble_ints),
                 }));
             }
             let max_lg_arr = lg_k.saturating_sub(3);
             if !(5..=max_lg_arr).contains(&lg_arr) {
-                return Err(sink.data(HllDataRecipe {
+                return Err(sink.failure(HllFailureRecipe {
                     context,
-                    detail: HllDataDetail::SetLgArr {
+                    detail: HllFailureDetail::SetLgArr {
                         max: max_lg_arr,
                         actual: lg_arr,
                     },
@@ -341,9 +341,9 @@ fn payload_profile_with_failure<F: HllFailureSink>(
             let coupon_count = read_u32_le_with_failure(payload, 8, context, sink)? as usize;
             let capacity = 1usize << lg_arr;
             if coupon_count >= capacity {
-                return Err(sink.data(HllDataRecipe {
+                return Err(sink.failure(HllFailureRecipe {
                     context,
-                    detail: HllDataDetail::SetCount {
+                    detail: HllFailureDetail::SetCount {
                         count: coupon_count,
                         capacity,
                     },
@@ -365,18 +365,18 @@ fn payload_profile_with_failure<F: HllFailureSink>(
         }
         2 => {
             if preamble_ints != 10 {
-                return Err(sink.data(HllDataRecipe {
+                return Err(sink.failure(HllFailureRecipe {
                     context,
-                    detail: HllDataDetail::HllPreamble(preamble_ints),
+                    detail: HllFailureDetail::HllPreamble(preamble_ints),
                 }));
             }
             require_payload_len_with_failure(payload, HLL_PREAMBLE_BYTES, context, sink)?;
             let num_at_cur_min = read_u32_le_with_failure(payload, 32, context, sink)? as usize;
             let aux_count = read_u32_le_with_failure(payload, 36, context, sink)? as usize;
             if num_at_cur_min > k || aux_count > k {
-                return Err(sink.data(HllDataRecipe {
+                return Err(sink.failure(HllFailureRecipe {
                     context,
-                    detail: HllDataDetail::RegisterCount,
+                    detail: HllFailureDetail::RegisterCount,
                 }));
             }
             let (retained_heap_bytes, decode_peak_heap_bytes, body_bytes) = match target_type {
@@ -388,9 +388,9 @@ fn payload_profile_with_failure<F: HllFailureSink>(
                         0
                     } else {
                         1usize.checked_shl(u32::from(lg_arr)).ok_or_else(|| {
-                            sink.data(HllDataRecipe {
+                            sink.failure(HllFailureRecipe {
                                 context,
-                                detail: HllDataDetail::Hll4LgArr(lg_arr),
+                                detail: HllFailureDetail::Hll4LgArr(lg_arr),
                             })
                         })?
                     };
@@ -399,24 +399,27 @@ fn payload_profile_with_failure<F: HllFailureSink>(
                             sink.observe(HllObservation::Step)
                         })?;
                     let aux_body = aux_slots.checked_mul(4).ok_or_else(|| {
-                        sink.data(HllDataRecipe {
+                        sink.failure(HllFailureRecipe {
                             context,
-                            detail: HllDataDetail::AuxOverflow,
+                            detail: HllFailureDetail::AuxOverflow { slots: aux_slots },
                         })
                     })?;
                     let body_bytes = packed.checked_add(aux_body).ok_or_else(|| {
-                        sink.data(HllDataRecipe {
+                        sink.failure(HllFailureRecipe {
                             context,
-                            detail: HllDataDetail::PayloadOverflow,
+                            detail: HllFailureDetail::PayloadOverflow {
+                                packed,
+                                auxiliary: aux_body,
+                            },
                         })
                     })?;
                     (packed + aux_retained, packed + aux_peak, body_bytes)
                 }
                 HllTargetType::Hll6 => {
                     if aux_count != 0 {
-                        return Err(sink.data(HllDataRecipe {
+                        return Err(sink.failure(HllFailureRecipe {
                             context,
-                            detail: HllDataDetail::Hll6Aux,
+                            detail: HllFailureDetail::Hll6Aux,
                         }));
                     }
                     let bytes = 3 * k / 4 + 1;
@@ -424,9 +427,9 @@ fn payload_profile_with_failure<F: HllFailureSink>(
                 }
                 HllTargetType::Hll8 => {
                     if aux_count != 0 {
-                        return Err(sink.data(HllDataRecipe {
+                        return Err(sink.failure(HllFailureRecipe {
                             context,
-                            detail: HllDataDetail::Hll8Aux,
+                            detail: HllFailureDetail::Hll8Aux,
                         }));
                     }
                     (k, k, k)
@@ -449,9 +452,9 @@ fn payload_profile_with_failure<F: HllFailureSink>(
                 decode_peak_heap_bytes,
             })
         }
-        value => Err(sink.data(HllDataRecipe {
+        value => Err(sink.failure(HllFailureRecipe {
             context,
-            detail: HllDataDetail::Mode(value),
+            detail: HllFailureDetail::Mode(value),
         })),
     }
 }
@@ -547,9 +550,9 @@ fn deserialize_hll_with_failure<F: HllFailureSink>(
     {
         sink.observe(HllObservation::OpaqueBoundary)?;
         let result = HllSketch::deserialize(payload).map_err(|err| {
-            sink.data(HllDataRecipe {
+            sink.failure(HllFailureRecipe {
                 context,
-                detail: HllDataDetail::Deserialize(&err),
+                detail: HllFailureDetail::Deserialize(err),
             })
         });
         if result.is_ok() {
@@ -559,8 +562,8 @@ fn deserialize_hll_with_failure<F: HllFailureSink>(
     }
 }
 
-pub fn hll_estimate(payload: &[u8]) -> Result<i64, String> {
-    hll_estimate_with_failure(payload, &mut LegacyHllFailure)
+pub fn hll_estimate(payload: &[u8]) -> Result<i64, ClassifiedHllFailure> {
+    hll_estimate_with_failure(payload, &mut RawHllFailure)
 }
 
 pub fn hll_estimate_with_failure<F: HllFailureSink>(
@@ -608,8 +611,8 @@ impl HllHandle {
     pub fn new_allocation_preflight(
         log_k: u8,
         target_type: HllTargetType,
-    ) -> Result<HllNewPreflight, String> {
-        Self::new_allocation_preflight_with_failure(log_k, target_type, &mut LegacyHllFailure)
+    ) -> Result<HllNewPreflight, ClassifiedHllFailure> {
+        Self::new_allocation_preflight_with_failure(log_k, target_type, &mut RawHllFailure)
     }
 
     pub fn new_allocation_preflight_with_failure<F: HllFailureSink>(
@@ -618,9 +621,9 @@ impl HllHandle {
         sink: &mut F,
     ) -> Result<HllNewPreflight, F::Error> {
         if !(4..=21).contains(&log_k) {
-            return Err(sink.data(HllDataRecipe {
+            return Err(sink.failure(HllFailureRecipe {
                 context: HllDiagnosticContext::Direct,
-                detail: HllDataDetail::NewLogK(log_k),
+                detail: HllFailureDetail::NewLogK(log_k),
             }));
         }
         Ok(HllNewPreflight {
@@ -636,8 +639,8 @@ impl HllHandle {
     pub fn new_under_reservation<G>(
         preflight: &HllNewPreflight,
         _reservation: &G,
-    ) -> Result<(Self, HllAllocationUpperBounds), String> {
-        Self::new_under_reservation_with_failure(preflight, _reservation, &mut LegacyHllFailure)
+    ) -> Result<(Self, HllAllocationUpperBounds), ClassifiedHllFailure> {
+        Self::new_under_reservation_with_failure(preflight, _reservation, &mut RawHllFailure)
     }
 
     pub fn new_under_reservation_with_failure<G, F: HllFailureSink>(
@@ -656,9 +659,9 @@ impl HllHandle {
         sink.observe(HllObservation::OpaqueBoundary)?;
         let handle = HllUnion::new(preflight.log_k)
             .map_err(|err| {
-                sink.data(HllDataRecipe {
+                sink.failure(HllFailureRecipe {
                     context: HllDiagnosticContext::Direct,
-                    detail: HllDataDetail::Create(&err),
+                    detail: HllFailureDetail::Create(err),
                 })
             })
             .map(|sketch_union| Self {
@@ -673,8 +676,11 @@ impl HllHandle {
         Ok((handle, outcome))
     }
 
-    pub fn new_unreserved(log_k: u8, target_type: HllTargetType) -> Result<Self, String> {
-        Self::new_unreserved_with_failure(log_k, target_type, &mut LegacyHllFailure)
+    pub fn new_unreserved(
+        log_k: u8,
+        target_type: HllTargetType,
+    ) -> Result<Self, ClassifiedHllFailure> {
+        Self::new_unreserved_with_failure(log_k, target_type, &mut RawHllFailure)
     }
 
     pub fn new_unreserved_with_failure<F: HllFailureSink>(
@@ -688,8 +694,8 @@ impl HllHandle {
 
     pub fn from_payload_allocation_preflight(
         payload: &[u8],
-    ) -> Result<HllPayloadPreflight, String> {
-        Self::from_payload_allocation_preflight_with_failure(payload, &mut LegacyHllFailure)
+    ) -> Result<HllPayloadPreflight, ClassifiedHllFailure> {
+        Self::from_payload_allocation_preflight_with_failure(payload, &mut RawHllFailure)
     }
 
     pub fn from_payload_allocation_preflight_with_failure<F: HllFailureSink>(
@@ -727,12 +733,12 @@ impl HllHandle {
         payload: &[u8],
         preflight: &HllPayloadPreflight,
         _reservation: &G,
-    ) -> Result<(Self, HllAllocationUpperBounds), String> {
+    ) -> Result<(Self, HllAllocationUpperBounds), ClassifiedHllFailure> {
         Self::from_payload_under_reservation_with_failure(
             payload,
             preflight,
             _reservation,
-            &mut LegacyHllFailure,
+            &mut RawHllFailure,
         )
     }
 
@@ -750,9 +756,9 @@ impl HllHandle {
         let target_type = HllTargetType::from_native(sketch.target_type());
         sink.observe(HllObservation::OpaqueBoundary)?;
         let mut sketch_union = HllUnion::new(sketch.lg_config_k()).map_err(|err| {
-            sink.data(HllDataRecipe {
+            sink.failure(HllFailureRecipe {
                 context: HllDiagnosticContext::Direct,
-                detail: HllDataDetail::Create(&err),
+                detail: HllFailureDetail::Create(err),
             })
         })?;
         sketch_union.update(&sketch);
@@ -768,8 +774,8 @@ impl HllHandle {
         Ok((handle, outcome))
     }
 
-    pub fn from_payload_unreserved(payload: &[u8]) -> Result<Self, String> {
-        Self::from_payload_unreserved_with_failure(payload, &mut LegacyHllFailure)
+    pub fn from_payload_unreserved(payload: &[u8]) -> Result<Self, ClassifiedHllFailure> {
+        Self::from_payload_unreserved_with_failure(payload, &mut RawHllFailure)
     }
 
     pub fn from_payload_unreserved_with_failure<F: HllFailureSink>(
@@ -781,11 +787,10 @@ impl HllHandle {
             .map(|(handle, _)| handle)
     }
 
-    pub fn update_hash_allocation_preflight(&self) -> HllUpdatePreflight {
-        match self.update_hash_allocation_preflight_with_failure(&mut LegacyHllFailure) {
-            Ok(preflight) => preflight,
-            Err(impossible) => panic!("unexpected legacy HLL profile failure: {impossible}"),
-        }
+    pub fn update_hash_allocation_preflight(
+        &self,
+    ) -> Result<HllUpdatePreflight, ClassifiedHllFailure> {
+        self.update_hash_allocation_preflight_with_failure(&mut RawHllFailure)
     }
     pub fn update_hash_allocation_preflight_with_failure<F: HllFailureSink>(
         &self,
@@ -809,12 +814,12 @@ impl HllHandle {
         hash: u64,
         preflight: &HllUpdatePreflight,
         _reservation: &G,
-    ) -> Result<HllAllocationUpperBounds, String> {
+    ) -> Result<HllAllocationUpperBounds, ClassifiedHllFailure> {
         self.update_hash_under_reservation_with_failure(
             hash,
             preflight,
             _reservation,
-            &mut LegacyHllFailure,
+            &mut RawHllFailure,
         )
     }
 
@@ -842,8 +847,8 @@ impl HllHandle {
         })
     }
 
-    pub fn update_hash_unreserved(&mut self, hash: u64) -> Result<(), String> {
-        self.update_hash_unreserved_with_failure(hash, &mut LegacyHllFailure)
+    pub fn update_hash_unreserved(&mut self, hash: u64) -> Result<(), ClassifiedHllFailure> {
+        self.update_hash_unreserved_with_failure(hash, &mut RawHllFailure)
     }
 
     pub fn update_hash_unreserved_with_failure<F: HllFailureSink>(
@@ -859,8 +864,8 @@ impl HllHandle {
     pub fn merge_payload_allocation_preflight(
         &self,
         payload: &[u8],
-    ) -> Result<HllPayloadPreflight, String> {
-        self.merge_payload_allocation_preflight_with_failure(payload, &mut LegacyHllFailure)
+    ) -> Result<HllPayloadPreflight, ClassifiedHllFailure> {
+        self.merge_payload_allocation_preflight_with_failure(payload, &mut RawHllFailure)
     }
 
     pub fn merge_payload_allocation_preflight_with_failure<F: HllFailureSink>(
@@ -895,12 +900,12 @@ impl HllHandle {
         payload: &[u8],
         preflight: &HllPayloadPreflight,
         _reservation: &G,
-    ) -> Result<HllAllocationUpperBounds, String> {
+    ) -> Result<HllAllocationUpperBounds, ClassifiedHllFailure> {
         self.merge_payload_under_reservation_with_failure(
             payload,
             preflight,
             _reservation,
-            &mut LegacyHllFailure,
+            &mut RawHllFailure,
         )
     }
 
@@ -932,8 +937,8 @@ impl HllHandle {
     pub fn merge_payload_unreserved(
         &mut self,
         payload: &[u8],
-    ) -> Result<HllAllocationUpperBounds, String> {
-        self.merge_payload_unreserved_with_failure(payload, &mut LegacyHllFailure)
+    ) -> Result<HllAllocationUpperBounds, ClassifiedHllFailure> {
+        self.merge_payload_unreserved_with_failure(payload, &mut RawHllFailure)
     }
 
     pub fn merge_payload_unreserved_with_failure<F: HllFailureSink>(
@@ -1068,12 +1073,8 @@ impl HllHandle {
         &self,
         preflight: &HllSerializePreflight,
         _reservation: &G,
-    ) -> Result<Vec<u8>, String> {
-        self.serialize_under_reservation_with_failure(
-            preflight,
-            _reservation,
-            &mut LegacyHllFailure,
-        )
+    ) -> Result<Vec<u8>, ClassifiedHllFailure> {
+        self.serialize_under_reservation_with_failure(preflight, _reservation, &mut RawHllFailure)
     }
 
     pub fn serialize_under_reservation_with_failure<G, F: HllFailureSink>(
@@ -1088,8 +1089,8 @@ impl HllHandle {
         self.serialize_with_failure(sink)
     }
 
-    pub fn serialize(&self) -> Result<Vec<u8>, String> {
-        self.serialize_with_failure(&mut LegacyHllFailure)
+    pub fn serialize(&self) -> Result<Vec<u8>, ClassifiedHllFailure> {
+        self.serialize_with_failure(&mut RawHllFailure)
     }
 
     pub fn serialize_with_failure<F: HllFailureSink>(
@@ -1105,8 +1106,8 @@ impl HllHandle {
         Ok(result)
     }
 
-    pub fn estimate(&self) -> Result<i64, String> {
-        self.estimate_with_failure(&mut LegacyHllFailure)
+    pub fn estimate(&self) -> Result<i64, ClassifiedHllFailure> {
+        self.estimate_with_failure(&mut RawHllFailure)
     }
 
     pub fn estimate_with_failure<F: HllFailureSink>(&self, sink: &mut F) -> Result<i64, F::Error> {
@@ -1176,3 +1177,52 @@ impl HllHandle {
 #[cfg(test)]
 #[path = "datasketches_hll_original_tests.rs"]
 mod original_tests;
+
+#[cfg(test)]
+mod typed_generation_failure_tests {
+    use super::*;
+    use crate::KernelFailure;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    struct TypedSink;
+    impl HllFailureSink for TypedSink {
+        type Error = KernelFailure;
+        fn failure(&mut self, source: HllFailureRecipe) -> KernelFailure {
+            match source.classify() {
+                crate::datasketches_hll_failure::ClassifiedHllFailure::Outer(cause) => {
+                    KernelFailure::from_domain(cause)
+                }
+                crate::datasketches_hll_failure::ClassifiedHllFailure::Value(value) => {
+                    panic!("unexpected value failure in the valid generation setup: {value}")
+                }
+            }
+        }
+        fn invariant(&mut self, source: HllInvariantRecipe) -> KernelFailure {
+            KernelFailure::from_domain(source)
+        }
+        fn observe(&mut self, _: HllObservation) -> Result<(), KernelFailure> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn actual_generation_exhaustion_is_typed_and_precedes_the_handle_mutation() {
+        let mut sink = TypedSink;
+        let mut handle =
+            HllHandle::new_unreserved_with_failure(4, HllTargetType::Hll6, &mut sink).unwrap();
+        handle.generation = u64::MAX;
+        let before = handle.serialize_with_failure(&mut sink).unwrap();
+        let preflight = handle
+            .update_hash_allocation_preflight_with_failure(&mut sink)
+            .unwrap();
+        // Deliberately no capacity authority: this semantic refusal must happen
+        // before the operation can perform its mutation or allocation.
+        struct NoLease;
+        let error = handle
+            .update_hash_under_reservation_with_failure(11, &preflight, &NoLease, &mut sink)
+            .unwrap_err();
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Resource);
+        assert_eq!(fact.reason().code(), 183);
+        assert_eq!(handle.generation, u64::MAX);
+        assert_eq!(handle.serialize_with_failure(&mut sink).unwrap(), before);
+    }
+}

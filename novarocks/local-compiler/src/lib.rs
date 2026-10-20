@@ -28,6 +28,7 @@ mod typed_layout;
 mod change_events_lowering_tests;
 mod channels;
 mod creation;
+mod failure_projection;
 pub use creation::FragmentCreationError;
 mod exchange;
 mod expressions;

@@ -20,7 +20,7 @@ use super::*;
 mod fixture;
 use crate::runtime::mem_tracker::MemTracker;
 fn host(tracker: Arc<MemTracker>) -> Arc<dyn novarocks_functions::AggregateStateAllocator> {
-    crate::exec::operators::compiled_aggregate::expression_allocation_host(tracker)
+    crate::runtime::tracked_state_allocator::expression_allocation_host(tracker)
 }
 #[test]
 fn percentile_raw_private_frame_original_values_full_rowdata_sparse_and_host_drop() {
@@ -43,7 +43,7 @@ fn percentile_raw_private_frame_original_values_full_rowdata_sparse_and_host_dro
     let arrays = fixture::source_arrays();
     let expected = novarocks_functions::percentile_approx_raw_core::row(&arrays[0], 0, &arrays[1])
         .unwrap_err();
-    assert_eq!(output.errors()[0].message(), expected);
+    assert_eq!(output.errors()[0].message(), expected.to_string());
     let values = output
         .values()
         .as_any()
@@ -97,10 +97,10 @@ fn percentile_raw_private_frame_missing_host_and_true_budget_failure_latch() {
         Some(host(tracker.clone())),
     )
     .unwrap();
-    assert!(matches!(
-        instance.evaluate(&batch, Selection::all(3), &Control),
-        Err(KernelFailure::ResourceExhausted)
-    ));
+    let refusal = instance
+        .evaluate(&batch, Selection::all(3), &Control)
+        .unwrap_err();
+    crate::runtime_filter::assert_real_tracker_capacity(&refusal, 1);
     assert!(matches!(
         instance.evaluate(&batch, Selection::all(3), &Control),
         Err(KernelFailure::InstanceFailed)

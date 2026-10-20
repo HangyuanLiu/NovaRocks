@@ -35,7 +35,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
         trace.push(units);
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -188,4 +188,32 @@ fn legacy_literal_package_is_an_ordinary_refusal_not_a_silent_conversion() {
         encode_fragment_package(&package, &encode_limits(), &Control::default()),
         Err(PackageEncodeError::Expression(_))
     ));
+}
+
+#[test]
+fn original_sender_refusal_precedes_late_footer_control() {
+    use novarocks_failure_contract::FailureProjection;
+    let package = writer_package();
+    let original_control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&original_control, CompilePhase::Encode).unwrap();
+    let original = encode_fragment_package_in(&package, &encode_limits(), &mut work).unwrap_err();
+    assert!(matches!(original, PackageEncodeError::Expression(_)));
+    let original_trace = original_control.trace.lock().unwrap().clone();
+    assert!(!original_trace.is_empty());
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        let stop = Control {
+            stop: Some((original_trace.len(), cause)),
+            ..Default::default()
+        };
+        let refused = encode_fragment_package(&package, &encode_limits(), &stop).unwrap_err();
+        assert!(matches!(refused, PackageEncodeError::Expression(_)));
+        assert_eq!(refused.to_string(), original.to_string());
+        assert_eq!(refused.failure_fact(), original.failure_fact());
+        assert_eq!(*stop.trace.lock().unwrap(), original_trace);
+        assert!(std::error::Error::source(&refused).is_some());
+    }
 }

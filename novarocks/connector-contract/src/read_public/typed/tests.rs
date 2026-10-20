@@ -197,7 +197,7 @@ impl novarocks_type_contract::PureCompileControl for Control {
             assert!(at <= stop);
         }
         trace.push(units);
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -253,7 +253,7 @@ fn prepared_source_retained_and_real_new_projection_requests_preserve_all_refusa
         ] {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                stop: Some((stop, cause)),
+                stop: Some((stop, cause.clone())),
             };
             assert!(
                 matches!(invoke(&control,&mut |_|Ok(())),Err(PureProviderCompileError::Control(actual)) if actual==cause)
@@ -320,7 +320,7 @@ fn pure_typed_publication_keeps_complete_semantics_and_every_original_control_pr
     ] {
         for stop in 0..expected.len() {
             let control = Control {
-                stop: Some((stop, cause)),
+                stop: Some((stop, cause.clone())),
                 ..Default::default()
             };
             assert!(

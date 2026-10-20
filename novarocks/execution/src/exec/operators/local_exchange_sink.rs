@@ -27,16 +27,20 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::runtime::fragment::ExecutionResult;
-
-use crate::exec::chunk::Chunk;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
-use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::exec::pipeline::schedule::observer::Observable;
-use std::sync::Arc;
-
 use crate::exec::operators::local_exchanger::LocalExchanger;
-use crate::runtime::runtime_state::RuntimeState;
+use crate::exec::pipeline::operator::OperatorLifecycle;
+use crate::exec::pipeline::{
+    input::{PreparedInput, RawInput},
+    operator::{InputEncodingPolicy, Operator},
+    operator_factory::OperatorFactory,
+    schedule::observer::Observable,
+    shape::{ControlStep, SinkKernel, SinkStep, Transform},
+    step::{AdmissionNext, NextStep, WaitFact, WaitReason},
+    step_context::StepContext,
+};
+use crate::runtime::fragment::ExecutionResult;
+use crate::runtime::{mem_tracker::MemTracker, runtime_state::RuntimeState};
+use std::sync::Arc;
 use tracing::debug;
 
 /// Factory for local-exchange sink operators that partition and enqueue chunks locally.
@@ -45,7 +49,6 @@ pub struct LocalExchangeSinkFactory {
     owner_node_id: i32,
     exchanger: Arc<LocalExchanger>,
 }
-
 impl LocalExchangeSinkFactory {
     pub(crate) fn new(owner_node_id: i32, exchanger: Arc<LocalExchanger>) -> Self {
         let name = if owner_node_id >= 0 {
@@ -53,11 +56,6 @@ impl LocalExchangeSinkFactory {
         } else {
             "LOCAL_EXCHANGE_SINK".to_string()
         };
-        debug!(
-            "LocalExchangeSinkFactory created: exchange_id={} owner_node_id={}",
-            exchanger.exchange_id(),
-            owner_node_id,
-        );
         Self {
             name,
             owner_node_id,
@@ -65,40 +63,47 @@ impl LocalExchangeSinkFactory {
         }
     }
 }
-
 impl OperatorFactory for LocalExchangeSinkFactory {
     fn name(&self) -> &str {
         &self.name
     }
-
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        Box::new(LocalExchangeSinkOperator {
+        Box::new(Transform::hydrating(LocalExchangeSinkOperator {
             name: self.name.clone(),
             owner_node_id: self.owner_node_id,
             driver_id,
-            exchanger: Arc::clone(&self.exchanger),
-            finished: false,
+            exchanger: self.exchanger.clone(),
+            producer_finished: false,
             logged_first_input: false,
+            queue_tracker: None,
             construction: None,
-        })
+        }))
     }
-
     fn is_sink(&self) -> bool {
         true
     }
 }
-
 struct LocalExchangeSinkOperator {
     construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     name: String,
     owner_node_id: i32,
     driver_id: i32,
     exchanger: Arc<LocalExchanger>,
-    finished: bool,
+    producer_finished: bool,
     logged_first_input: bool,
+    // Outer Option records installation, including an explicitly untracked
+    // kernel-only fixture. Production binding supplies its query owner.
+    queue_tracker: Option<Option<Arc<MemTracker>>>,
 }
-
-impl Operator for LocalExchangeSinkOperator {
+impl LocalExchangeSinkOperator {
+    fn finish_producer(&mut self) {
+        if !self.producer_finished {
+            self.producer_finished = true;
+            self.exchanger.finish_producer();
+        }
+    }
+}
+impl OperatorLifecycle for LocalExchangeSinkOperator {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -108,120 +113,110 @@ impl Operator for LocalExchangeSinkOperator {
     ) {
         self.construction = Some(factory);
     }
+
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.queue_tracker = Some(self.exchanger.queue_mem_tracker(state));
+        Ok(())
     }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.finish_producer();
+        Ok(())
     }
-
-    fn is_finished(&self) -> bool {
-        // Once every consumer has left, nothing this producer pushes can be
-        // read; reporting finished ends the producer pipeline.
-        self.finished || self.exchanger.all_consumers_closed()
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
+    }
+    fn cancel(&mut self) {
+        self.finish_producer();
     }
 }
-
-impl ProcessorOperator for LocalExchangeSinkOperator {
-    fn need_input(&self) -> bool {
-        !self.is_finished() && self.exchanger.need_input()
-    }
-
-    fn has_output(&self) -> bool {
-        false
-    }
-
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.is_finished() {
-            return Ok(());
+impl InputEncodingPolicy for LocalExchangeSinkOperator {}
+impl SinkKernel for LocalExchangeSinkOperator {
+    fn poll_control(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<ControlStep> {
+        if self.exchanger.all_consumers_closed() {
+            self.finish_producer();
+            Ok(ControlStep::Withdrawn)
+        } else {
+            Ok(ControlStep::Active)
         }
-        if chunk.is_empty() {
-            return Ok(());
+    }
+    fn control_observable(&self) -> Option<Arc<Observable>> {
+        Some(self.exchanger.closed_observable())
+    }
+    fn admission(
+        &self,
+        _: &mut StepContext<'_>,
+        _: &RawInput,
+    ) -> ExecutionResult<Option<AdmissionNext>> {
+        let observable = self.exchanger.sink_observable();
+        let observed_generation = observable.generation();
+        if !self.exchanger.need_input() && !self.exchanger.all_consumers_closed() {
+            Ok(Some(AdmissionNext::Wait(WaitFact {
+                reason: WaitReason::Output,
+                observable,
+                observed_generation,
+                deadline: None,
+            })))
+        } else {
+            Ok(None)
         }
-        if !self.logged_first_input {
+    }
+    fn consume(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<SinkStep> {
+        let chunk = input.into_uncovered_chunk()?;
+        if self.exchanger.all_consumers_closed() {
+            drop(chunk);
+            self.finish_producer();
+            return Ok(SinkStep::new(NextStep::Finished, 0));
+        }
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        if !self.logged_first_input && !chunk.is_empty() {
             self.logged_first_input = true;
             debug!(
                 "LocalExchangeSink first chunk: exchange_id={} owner_node_id={} driver_id={} rows={}",
                 self.exchanger.exchange_id(),
                 self.owner_node_id,
                 self.driver_id,
-                chunk.len()
+                rows
             );
         }
-        Ok(self.exchanger.accept_created(
-            state,
-            chunk,
-            self.driver_id as usize,
-            self.construction.as_deref(),
-        )?)
+        let tracker = self.queue_tracker.as_ref().ok_or_else(|| {
+            crate::runtime::fragment::ExecutionFailure::from_domain(LocalExchangeBindingFailure)
+        })?;
+        let factory = self
+            .construction
+            .as_deref()
+            .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
+        self.exchanger
+            .accept_created(tracker.as_ref(), chunk, factory, ctx)?;
+        Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(None)
+    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+        self.finish_producer();
+        Ok(SinkStep::new(NextStep::Finished, 0))
     }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
-        debug!(
-            "LocalExchangeSink set_finishing begin: exchange_id={} owner_node_id={} driver_id={} remaining_producers={}",
-            self.exchanger.exchange_id(),
-            self.owner_node_id,
-            self.driver_id,
-            self.exchanger.remaining_producers()
-        );
-        self.finished = true;
-        let remaining_before = self.exchanger.remaining_producers();
-        let finished_all = self.exchanger.finish_producer();
-        let remaining_after = self.exchanger.remaining_producers();
-        debug!(
-            "LocalExchangeSink producer finished: exchange_id={} owner_node_id={} driver_id={} remaining_before={} remaining_after={} finished_all={}",
-            self.exchanger.exchange_id(),
-            self.owner_node_id,
-            self.driver_id,
-            remaining_before,
-            remaining_after,
-            finished_all
-        );
-        if finished_all {
-            use tracing::info;
-            info!("LocalExchangeSink: all producers finished");
-            let stats = self.exchanger.stats_snapshot();
-            for part in stats.partitions {
-                debug!(
-                    "LocalExchange stats: exchange_id={} partition={} pushed_rows={} popped_rows={} pushed_chunks={} popped_chunks={} buffered_chunks={} remaining_producers={}",
-                    stats.exchange_id,
-                    part.partition,
-                    part.pushed_rows,
-                    part.popped_rows,
-                    part.pushed_chunks,
-                    part.popped_chunks,
-                    part.buffered_chunks,
-                    stats.remaining_producers
-                );
-            }
-        }
-        Ok(())
+}
+#[derive(Debug)]
+struct LocalExchangeBindingFailure;
+impl std::fmt::Display for LocalExchangeBindingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("local exchange sink has no installed queue ownership binding")
     }
-
-    fn sink_observable(&self) -> Option<Arc<Observable>> {
-        if self.is_finished() {
-            return None;
-        }
-        Some(self.exchanger.sink_observable())
-    }
-
-    fn early_finish_observable(&self) -> Option<Arc<Observable>> {
-        if self.is_finished() {
-            return None;
-        }
-        Some(self.exchanger.closed_observable())
+}
+impl std::error::Error for LocalExchangeBindingFailure {}
+impl novarocks_failure_contract::FailureProjection for LocalExchangeBindingFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        FailureFact::new(
+            FailureClass::Invariant,
+            ExecutionReason::LocalExchangeMissingBinding.reason(),
+        )
     }
 }
 
@@ -252,6 +247,7 @@ mod tests {
     use crate::exec::operators::{LocalExchangeSinkFactory, LocalExchangeSourceFactory};
     use crate::exec::pipeline::operator_factory::OperatorFactory;
     use crate::runtime::runtime_state::RuntimeState;
+    use novarocks_failure_contract::FailureProjection;
     use novarocks_types::SlotId;
 
     use crate::exec::operators::local_exchanger::LocalExchanger;
@@ -274,8 +270,7 @@ mod tests {
     fn local_exchange_forwards_chunks() {
         let rt = RuntimeState::default();
         let arena = Arc::new(ExprArena::default());
-        let exchanger =
-            LocalExchanger::new(1, 1, LocalExchangePartitionSpec::Single, Arc::clone(&arena));
+        let exchanger = LocalExchanger::new_handoff(1, 1, 2, Arc::clone(&arena));
         let sink_factory = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger));
         let source_factory = LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger));
 
@@ -286,54 +281,40 @@ mod tests {
         let c1 = chunk_of(&[1]);
         let c2 = chunk_of(&[2]);
 
-        sink.as_processor_mut()
-            .expect("sink op")
-            .push_chunk(&rt, c1)
-            .expect("push c1");
+        push_chunk(&mut sink, &rt, c1);
 
-        sink.as_processor_mut()
-            .expect("sink op")
-            .push_chunk(&rt, c2)
-            .expect("push c2");
+        push_chunk(&mut sink, &rt, c2);
 
-        sink.as_processor_mut()
-            .expect("sink op")
-            .set_finishing(&rt)
-            .expect("set_finishing should finish producer");
+        finish_sink(&mut sink, &rt);
 
-        let out1 = source
-            .as_processor_mut()
-            .expect("source op")
-            .pull_chunk(&rt)
-            .expect("pull c1")
-            .expect("chunk1");
+        let out1 = pull(&mut source, &rt).expect("chunk1");
         assert_eq!(out1.len(), 1);
 
-        let out2 = source
-            .as_processor_mut()
-            .expect("source op")
-            .pull_chunk(&rt)
-            .expect("pull c2")
-            .expect("chunk2");
+        let out2 = pull(&mut source, &rt).expect("chunk2");
         assert_eq!(out2.len(), 1);
 
-        let out3 = source
-            .as_processor_mut()
-            .expect("source op")
-            .pull_chunk(&rt)
-            .expect("pull done");
+        let out3 = pull(&mut source, &rt);
         assert!(out3.is_none());
+    }
+
+    fn source_step(
+        source: &mut Box<dyn crate::exec::pipeline::operator::Operator>,
+        rt: &RuntimeState,
+    ) -> crate::exec::pipeline::step::StepResult {
+        use crate::exec::pipeline::step_context::{DEFAULT_TURN_WORK_UNITS, StepContext, TurnWork};
+        let control = rt.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, DEFAULT_TURN_WORK_UNITS);
+        source
+            .as_mut()
+            .drive(&mut StepContext::new(&control, &mut work))
+            .expect("source work")
     }
 
     fn pull(
         source: &mut Box<dyn crate::exec::pipeline::operator::Operator>,
         rt: &RuntimeState,
     ) -> Option<Chunk> {
-        source
-            .as_processor_mut()
-            .expect("source op")
-            .pull_chunk(rt)
-            .expect("pull")
+        source_step(source, rt).output
     }
 
     fn push(
@@ -341,14 +322,85 @@ mod tests {
         rt: &RuntimeState,
         values: &[i32],
     ) {
-        sink.as_processor_mut()
-            .expect("sink op")
-            .push_chunk(rt, chunk_of(values))
-            .expect("push");
+        push_chunk(sink, rt, chunk_of(values));
     }
-
-    fn need_input(sink: &dyn crate::exec::pipeline::operator::Operator) -> bool {
-        sink.as_processor_ref().expect("sink op").need_input()
+    fn push_chunk(
+        sink: &mut Box<dyn crate::exec::pipeline::operator::Operator>,
+        rt: &RuntimeState,
+        chunk: Chunk,
+    ) {
+        use crate::exec::pipeline::{
+            input::RawInput,
+            step::InputResult,
+            step_context::{StepContext, TurnWork},
+        };
+        sink.bind_runtime_state(rt).expect("install queue binding");
+        let control = rt.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let mut ctx = StepContext::new(&control, &mut work);
+        assert!(matches!(
+            sink.as_mut().try_push(&mut ctx, RawInput::for_test(chunk)),
+            InputResult::Accepted(Ok(_))
+        ));
+        let step = sink
+            .as_mut()
+            .drive(&mut ctx)
+            .expect("enqueue accepted input");
+        assert!(step.output.is_none());
+    }
+    fn finish_sink(
+        sink: &mut Box<dyn crate::exec::pipeline::operator::Operator>,
+        rt: &RuntimeState,
+    ) {
+        use crate::exec::pipeline::{
+            step::NextStep,
+            step_context::{StepContext, TurnWork},
+        };
+        let control = rt.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let mut ctx = StepContext::new(&control, &mut work);
+        sink.as_mut().finish(&mut ctx).unwrap();
+        let step = sink.as_mut().drive(&mut ctx).unwrap();
+        assert!(step.output.is_none());
+        assert!(matches!(step.next, NextStep::Finished));
+    }
+    fn poll_control(
+        sink: &mut Box<dyn crate::exec::pipeline::operator::Operator>,
+        rt: &RuntimeState,
+    ) {
+        use crate::exec::pipeline::step_context::{StepContext, TurnWork};
+        let control = rt.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 0);
+        sink.as_mut()
+            .poll_control(&mut StepContext::new(&control, &mut work))
+            .unwrap();
+    }
+    fn reject_after_withdrawal(
+        sink: &mut Box<dyn crate::exec::pipeline::operator::Operator>,
+        rt: &RuntimeState,
+        chunk: Chunk,
+    ) {
+        use crate::exec::pipeline::{
+            input::RawInput,
+            step::InputResult,
+            step_context::{StepContext, TurnWork},
+        };
+        let original = chunk.columns()[0].clone();
+        let control = rt.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 0);
+        match sink.as_mut().try_push(
+            &mut StepContext::new(&control, &mut work),
+            RawInput::for_test(chunk),
+        ) {
+            InputResult::Rejected { input, failure } => {
+                assert!(Arc::ptr_eq(
+                    &original,
+                    &input.original_for_test().columns()[0]
+                ));
+                assert_eq!(failure.failure_fact().reason().code(), 27);
+            }
+            _ => panic!("finished receiver must reject the same raw input"),
+        }
     }
 
     fn first_value(chunk: &Chunk) -> i32 {
@@ -360,29 +412,100 @@ mod tests {
     }
 
     #[test]
+    fn full_queue_defers_the_same_raw_input_until_capacity_changes() {
+        use crate::exec::pipeline::{
+            input::RawInput,
+            step::{AdmissionNext, InputResult, NextStep},
+            step_context::{StepContext, TurnWork},
+        };
+        let rt = RuntimeState::default();
+        let exchanger = LocalExchanger::new_handoff(1, 1, 1, Arc::new(ExprArena::default()));
+        let mut sink = LocalExchangeSinkFactory::new(-1, exchanger.clone()).create(1, 0);
+        install_actual_creator(sink.as_mut(), &rt);
+        let mut source = LocalExchangeSourceFactory::new(-1, 1, exchanger.clone()).create(1, 0);
+        push(&mut sink, &rt, &[7]);
+        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("deferred raw input");
+        let mut chunk = chunk_of(&[8, 9]);
+        chunk.transfer_to(&tracker);
+        let original = chunk.columns()[0].clone();
+        let bytes = tracker.current();
+        let control = rt.error_state();
+        let mut work = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        let mut ctx = StepContext::new(&control, &mut work);
+        let mut raw = RawInput::for_test(chunk);
+        let mut observed = None;
+        for _ in 0..2 {
+            raw = match sink.as_mut().try_push(&mut ctx, raw) {
+                InputResult::Deferred {
+                    input,
+                    next: AdmissionNext::Wait(wait),
+                } => {
+                    assert!(Arc::ptr_eq(
+                        &original,
+                        &input.original_for_test().columns()[0]
+                    ));
+                    assert!(Arc::ptr_eq(&wait.observable, &exchanger.sink_observable()));
+                    if let Some(generation) = observed {
+                        assert_eq!(wait.observed_generation, generation);
+                    }
+                    observed = Some(wait.observed_generation);
+                    input
+                }
+                _ => panic!("full queue must refuse before preparation"),
+            };
+            assert_eq!(
+                tracker.current(),
+                bytes,
+                "refusal preserves edge responsibility"
+            );
+        }
+        assert_eq!(first_value(&pull(&mut source, &rt).unwrap()), 7);
+        assert!(matches!(
+            sink.as_mut().try_push(&mut ctx, raw),
+            InputResult::Accepted(Ok(_))
+        ));
+        let step = sink.as_mut().drive(&mut ctx).unwrap();
+        assert!(step.output.is_none());
+        assert!(matches!(step.next, NextStep::NeedInput));
+        assert_eq!(step.committed_rows, 2);
+        let output = pull(&mut source, &rt).unwrap();
+        assert!(Arc::ptr_eq(&original, &output.columns()[0]));
+        assert_eq!(output.len(), 2);
+        drop(original);
+        drop(output);
+        assert_eq!(tracker.current(), 0);
+        finish_sink(&mut sink, &rt);
+        assert!(matches!(
+            source_step(&mut source, &rt).next,
+            NextStep::Finished
+        ));
+    }
+
+    #[test]
     fn handoff_queue_backpressures_at_its_chunk_bound_and_wakes_on_pop() {
         let rt = RuntimeState::default();
         let exchanger = LocalExchanger::new_handoff(1, 3, 2, Arc::new(ExprArena::default()));
         let mut sink = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger)).create(1, 0);
+        install_actual_creator(sink.as_mut(), &rt);
         let mut source =
             LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger)).create(3, 0);
 
-        assert!(need_input(sink.as_ref()));
+        assert!(exchanger.need_input());
         push(&mut sink, &rt, &[1]);
         assert!(
-            need_input(sink.as_ref()),
+            exchanger.need_input(),
             "one queued chunk is below the bound of two"
         );
         push(&mut sink, &rt, &[2, 3]);
         assert!(
-            !need_input(sink.as_ref()),
+            !exchanger.need_input(),
             "the whole queue holds at most two chunks"
         );
 
         let capacity = exchanger.sink_observable();
         let before = capacity.generation();
         assert!(pull(&mut source, &rt).is_some());
-        assert!(need_input(sink.as_ref()));
+        assert!(exchanger.need_input());
         assert!(
             capacity.generation() > before,
             "a pop that frees the bound must wake a producer parked on the sink"
@@ -403,10 +526,7 @@ mod tests {
         for value in 0..6 {
             push(&mut sink, &rt, &[value]);
         }
-        sink.as_processor_mut()
-            .expect("sink op")
-            .set_finishing(&rt)
-            .expect("finish producer");
+        finish_sink(&mut sink, &rt);
 
         // Consumer 2 takes everything while the others are idle: no chunk is
         // reserved for a consumer that is not running.
@@ -418,7 +538,10 @@ mod tests {
         for consumer in &mut consumers {
             assert!(pull(consumer, &rt).is_none());
             assert!(
-                consumer.is_finished(),
+                matches!(
+                    source_step(consumer, &rt).next,
+                    crate::exec::pipeline::step::NextStep::Finished
+                ),
                 "an empty queue with no producer is end of stream"
             );
         }
@@ -445,27 +568,26 @@ mod tests {
                     scope.spawn(move || {
                         let mut values = Vec::new();
                         loop {
-                            if let Some(chunk) = pull(&mut consumer, rt) {
+                            let step = source_step(&mut consumer, rt);
+                            if let Some(chunk) = step.output {
                                 values.push(first_value(&chunk));
-                            } else if consumer.is_finished() {
-                                return values;
-                            } else {
-                                std::thread::yield_now();
                             }
+                            if matches!(step.next, crate::exec::pipeline::step::NextStep::Finished)
+                            {
+                                return values;
+                            }
+                            std::thread::yield_now();
                         }
                     })
                 })
                 .collect::<Vec<_>>();
             for value in 0..CHUNKS {
-                while !need_input(sink.as_ref()) {
+                while !exchanger.need_input() {
                     std::thread::yield_now();
                 }
                 push(&mut sink, rt, &[value]);
             }
-            sink.as_processor_mut()
-                .expect("sink op")
-                .set_finishing(rt)
-                .expect("finish producer");
+            finish_sink(&mut sink, rt);
             readers
                 .into_iter()
                 .flat_map(|reader| reader.join().expect("consumer thread"))
@@ -497,11 +619,16 @@ mod tests {
         let readable = exchanger.source_observable();
         let writable = exchanger.sink_observable();
         let before_push = readable.generation();
-        assert!(!source.as_processor_ref().expect("source").has_output());
+        let idle = source_step(&mut source, &rt);
+        assert!(idle.output.is_none());
+        assert!(matches!(
+            idle.next,
+            crate::exec::pipeline::step::NextStep::Wait(_)
+        ));
         push(&mut first, &rt, &[7]);
         assert!(readable.generation() > before_push);
-        assert!(!need_input(first.as_ref()));
-        assert!(!need_input(second.as_ref()));
+        assert!(!exchanger.need_input());
+        assert!(!exchanger.need_input());
 
         let before_pop = writable.generation();
         assert_eq!(
@@ -509,24 +636,28 @@ mod tests {
             7
         );
         assert!(writable.generation() > before_pop);
-        assert!(need_input(first.as_ref()));
-        assert!(need_input(second.as_ref()));
-        first
-            .as_processor_mut()
-            .expect("first")
-            .set_finishing(&rt)
-            .expect("finish first");
-        assert!(!source.as_processor_ref().expect("source").has_output());
+        assert!(exchanger.need_input());
+        assert!(exchanger.need_input());
+        finish_sink(&mut first, &rt);
+        let idle = source_step(&mut source, &rt);
+        assert!(idle.output.is_none());
+        assert!(matches!(
+            idle.next,
+            crate::exec::pipeline::step::NextStep::Wait(_)
+        ));
         let before_eos = readable.generation();
-        second
-            .as_processor_mut()
-            .expect("second")
-            .set_finishing(&rt)
-            .expect("finish second");
+        finish_sink(&mut second, &rt);
         assert!(readable.generation() > before_eos);
-        assert!(source.as_processor_ref().expect("source").has_output());
-        assert!(pull(&mut source, &rt).is_none());
-        assert!(source.is_finished());
+        let eos = source_step(&mut source, &rt);
+        assert!(eos.output.is_none());
+        assert!(matches!(
+            eos.next,
+            crate::exec::pipeline::step::NextStep::Finished
+        ));
+        assert!(matches!(
+            source_step(&mut source, &rt).next,
+            crate::exec::pipeline::step::NextStep::Finished
+        ));
     }
 
     #[test]
@@ -547,6 +678,7 @@ mod tests {
                 )
             };
             let mut sink = LocalExchangeSinkFactory::new(-1, Arc::clone(&exchanger)).create(1, 0);
+            install_actual_creator(sink.as_mut(), &rt);
             let mut source =
                 LocalExchangeSourceFactory::new(-1, 1, Arc::clone(&exchanger)).create(1, 0);
             let tracker = crate::runtime::mem_tracker::MemTracker::new_root("queued test input");
@@ -555,20 +687,24 @@ mod tests {
             chunk.transfer_to(&tracker);
             let input_bytes = tracker.current();
             assert!(input_bytes > 0);
-            sink.as_processor_mut()
-                .expect("sink")
-                .push_chunk(&rt, chunk)
-                .expect("push input");
+            push_chunk(&mut sink, &rt, chunk);
             assert!(array.upgrade().is_some());
             assert_eq!(tracker.current(), input_bytes);
-            assert!(!need_input(sink.as_ref()));
+            assert!(!exchanger.need_input());
             let writable = exchanger.sink_observable();
             let closed = exchanger.closed_observable();
             let before_writable = writable.generation();
             let before_closed = closed.generation();
             source.cancel();
-            assert!(source.is_finished());
-            assert!(sink.is_finished());
+            poll_control(&mut sink, &rt);
+            assert!(matches!(
+                source_step(&mut source, &rt).next,
+                crate::exec::pipeline::step::NextStep::Finished
+            ));
+            assert!(matches!(
+                source_step(&mut sink, &rt).next,
+                crate::exec::pipeline::step::NextStep::Finished
+            ));
             assert!(array.upgrade().is_none());
             assert_eq!(
                 tracker.current(),
@@ -583,10 +719,7 @@ mod tests {
             assert_eq!(closed.generation(), after_closed);
             let late = chunk_of(&[3]);
             let late_array = Arc::downgrade(&late.columns()[0]);
-            sink.as_processor_mut()
-                .expect("sink")
-                .push_chunk(&rt, late)
-                .expect("late push");
+            reject_after_withdrawal(&mut sink, &rt, late);
             assert!(late_array.upgrade().is_none());
             assert_eq!(
                 exchanger.partition_buffered_chunks(0).map(|(n, _)| n),
@@ -610,8 +743,11 @@ mod tests {
         first.close().expect("close first consumer");
         first.close().expect("a repeated close is a no-op");
         assert!(!exchanger.all_consumers_closed());
-        assert!(!sink.is_finished());
-        assert!(need_input(sink.as_ref()));
+        assert!(!matches!(
+            source_step(&mut sink, &rt).next,
+            crate::exec::pipeline::step::NextStep::Finished
+        ));
+        assert!(exchanger.need_input());
         let chunk = pull(&mut second, &rt).expect("the remaining consumer still reads");
         assert_eq!(first_value(&chunk), 7);
     }
@@ -630,9 +766,8 @@ mod tests {
         push(&mut sink, &rt, &[2]);
 
         let early_finish = sink
-            .as_processor_ref()
-            .expect("sink op")
-            .early_finish_observable()
+            .as_ref()
+            .control_observable()
             .expect("an open handoff sink exposes its early-finish observable");
         let before = early_finish.generation();
         first.close().expect("close first consumer");
@@ -642,6 +777,7 @@ mod tests {
             "one consumer is still reading"
         );
         second.close().expect("close second consumer");
+        poll_control(&mut sink, &rt);
 
         assert!(exchanger.all_consumers_closed());
         assert!(
@@ -649,18 +785,21 @@ mod tests {
             "producers must be woken"
         );
         assert!(
-            sink.is_finished(),
+            matches!(
+                source_step(&mut sink, &rt).next,
+                crate::exec::pipeline::step::NextStep::Finished
+            ),
             "nothing a producer pushes can be read any more"
         );
-        assert!(!need_input(sink.as_ref()));
+        assert!(!exchanger.need_input());
         assert_eq!(
             exchanger
                 .partition_buffered_chunks(0)
                 .map(|(chunks, _)| chunks),
             Some(0)
         );
-        // A late push after every consumer left is dropped, not queued.
-        push(&mut sink, &rt, &[3]);
+        // No new input is accepted after control withdrawal.
+        reject_after_withdrawal(&mut sink, &rt, chunk_of(&[3]));
         assert_eq!(
             exchanger
                 .partition_buffered_chunks(0)
@@ -722,13 +861,11 @@ mod tests {
                 receiver_port,
             },
         );
-        let mut source = remote.create(1, 0);
+        let (mut source, source_observable) = remote.create_source(0);
         source.prepare().expect("prepare remote source");
-        let source_observable = source
-            .as_processor_ref()
-            .unwrap()
-            .source_observable()
-            .unwrap();
+        source
+            .bind_runtime_state(&state)
+            .expect("bind remote source");
         let mut producer = PipelineDriver::new(
             0,
             vec![source, sink.create(1, 0)],
@@ -744,6 +881,8 @@ mod tests {
         let (wait, generation, deadline) =
             producer.blocked_observable_snapshot().expect("input wait");
         assert!(deadline.is_some(), "remote idle deadline is preserved");
+        let (control_wait, control_generation) =
+            producer.blocked_terminal_snapshot().expect("control wait");
         let source_observers = source_observable.num_observers();
         let sink_observers = exchanger.sink_observable().num_observers();
         producer.set_ready();
@@ -777,26 +916,41 @@ mod tests {
             "no remote chunk or EOS is needed"
         );
         assert!(
+            Arc::ptr_eq(&wait, &control_wait),
+            "data and control share the driver's stable endpoint"
+        );
+        assert!(
             wait.generation() > generation,
-            "consumer close must invalidate the input wait"
+            "consumer withdrawal invalidates the data wait too"
+        );
+        assert!(
+            control_wait.generation() > control_generation,
+            "consumer close invalidates the independently subscribed control wait"
         );
         producer.set_ready();
         assert_eq!(
-            producer.process(Duration::from_secs(1)),
+            producer.process(Duration::ZERO),
             DriverState::Finished,
             "sink-only notification permits actual driver completion"
         );
-        // The same target also receives source events, including an event
-        // overlapping downstream completion. Neither event replaces the other.
+        // Finished data work releases its old source subscription even while
+        // the driver object and its stable control endpoint still exist.
+        let retired_generation = wait.generation();
         source_observable.notify_observers();
-        assert!(wait.generation() > generation + 1);
+        assert_eq!(wait.generation(), retired_generation);
         assert!(exchanger.all_consumers_closed());
-        let weak_wait = Arc::downgrade(&wait);
+        let weak_control = Arc::downgrade(&control_wait);
+        drop(control_wait);
         drop(wait);
         drop(producer);
         assert!(
-            weak_wait.upgrade().is_none(),
-            "forwarding does not retain the driver wait"
+            weak_control.upgrade().is_none(),
+            "forwarding does not retain the driver control wait"
+        );
+        assert_eq!(
+            exchanger.closed_observable().num_observers(),
+            0,
+            "driver exit removes its scoped control subscription"
         );
     }
 
@@ -817,10 +971,7 @@ mod tests {
         install_actual_creator(sink.as_mut(), &state);
         let mut departed = source_factory.create(2, 0);
         let mut sibling = source_factory.create(2, 1);
-        sink.as_processor_mut()
-            .unwrap()
-            .push_chunk(&state, chunk_of(&(0..64).collect::<Vec<_>>()))
-            .unwrap();
+        push_chunk(&mut sink, &state, chunk_of(&(0..64).collect::<Vec<_>>()));
         let before = exchanger.stats_snapshot();
         assert!(before.partitions[0].buffered_chunks > 0);
         let sibling_rows = before.partitions[1].pushed_rows;
@@ -829,60 +980,46 @@ mod tests {
         let generation = wake.generation();
         departed.close().unwrap();
         departed.cancel();
-        departed
-            .as_processor_mut()
-            .unwrap()
-            .set_finishing(&state)
-            .unwrap();
+        departed.begin_exit().unwrap();
         assert!(
-            !sink.is_finished(),
+            !matches!(
+                source_step(&mut sink, &state).next,
+                crate::exec::pipeline::step::NextStep::Finished
+            ),
             "a necessary sibling keeps its producer live"
         );
         assert_eq!(
             wake.generation(),
             generation + 1,
-            "close/cancel/finishing settle only once"
+            "close/cancel/exit settle only once"
         );
         assert_eq!(exchanger.stats_snapshot().partitions[0].buffered_chunks, 0);
         let mut rows = 0;
-        while let Some(chunk) = sibling
-            .as_processor_mut()
-            .unwrap()
-            .pull_chunk(&state)
-            .unwrap()
-        {
+        while let Some(chunk) = pull(&mut sibling, &state) {
             rows += chunk.len() as u64;
         }
         assert_eq!(rows, sibling_rows);
         assert!(
-            sink.as_processor_ref().unwrap().need_input(),
+            exchanger.need_input(),
             "departed queue releases backpressure"
         );
-        sink.as_processor_mut()
-            .unwrap()
-            .push_chunk(&state, chunk_of(&(64..128).collect::<Vec<_>>()))
-            .unwrap();
+        push_chunk(&mut sink, &state, chunk_of(&(64..128).collect::<Vec<_>>()));
         assert_eq!(
             exchanger.stats_snapshot().partitions[0].buffered_chunks,
             0,
             "late partition output is discarded"
         );
         let expected = exchanger.stats_snapshot().partitions[1].pushed_rows;
-        sink.as_processor_mut()
-            .unwrap()
-            .set_finishing(&state)
-            .unwrap();
-        while let Some(chunk) = sibling
-            .as_processor_mut()
-            .unwrap()
-            .pull_chunk(&state)
-            .unwrap()
-        {
+        finish_sink(&mut sink, &state);
+        while let Some(chunk) = pull(&mut sibling, &state) {
             rows += chunk.len() as u64;
         }
         assert_eq!(rows, expected);
         assert!(
-            sibling.is_finished(),
+            matches!(
+                source_step(&mut sibling, &state).next,
+                crate::exec::pipeline::step::NextStep::Finished
+            ),
             "necessary sibling receives normal EOS"
         );
         sibling.close().unwrap();

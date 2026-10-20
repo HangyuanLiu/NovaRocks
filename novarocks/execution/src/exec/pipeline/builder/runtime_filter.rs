@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 fn runtime_filter_contract(
     contract: &lp::StaticFilterContract,
-) -> Result<execution::RuntimeFilterExecutionContract, String> {
+) -> Result<execution::RuntimeFilterExecutionContract, execution::RuntimeFilterFailure> {
     match contract {
         lp::StaticFilterContract::Membership {
             canonical,
@@ -32,8 +32,7 @@ fn runtime_filter_contract(
             let schema = execution::RuntimeFilterMembershipSchema::from_canonical_value_type(
                 canonical.clone(),
                 value_type.clone(),
-            )
-            .map_err(|error| error.to_string())?;
+            )?;
             Ok(execution::RuntimeFilterExecutionContract::Membership(
                 schema,
             ))
@@ -71,8 +70,7 @@ fn runtime_filter_contract(
                 keys,
                 *comparator_digest,
                 *contract_digest,
-            )
-            .map_err(|error| error.to_string())?;
+            )?;
             Ok(execution::RuntimeFilterExecutionContract::Ordered(
                 Arc::new(order).into(),
             ))
@@ -84,7 +82,7 @@ fn runtime_filter_contract(
 /// checked against the canonical schema of its key type.
 pub(super) fn runtime_filter_consumer_contract(
     static_consumer: &lp::StaticFilterConsumer,
-) -> Result<execution::RuntimeFilterConsumerContract, String> {
+) -> Result<execution::RuntimeFilterConsumerContract, execution::RuntimeFilterFailure> {
     let id = execution::RuntimeFilterBindingId::new(static_consumer.binding_id());
     let channel = execution::RuntimeFilterChannelId::new(static_consumer.channel_id());
     let contract = runtime_filter_contract(static_consumer.contract())?;
@@ -133,12 +131,13 @@ pub(super) fn runtime_filter_consumer_contract(
             }
         }
         _ => {
-            return Err(
-                "local program runtime filter consumer activation/reduction mismatch".to_string(),
-            );
+            return Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                "local program runtime filter consumer activation/reduction mismatch",
+            )
+            .into());
         }
-    }
-    .map_err(|error| error.to_string())?;
+    }?;
     Ok(runtime_contract)
 }
 
@@ -146,7 +145,7 @@ pub(super) fn runtime_filter_consumer_contract(
 /// checked against the canonical schema of its key type.
 pub(super) fn runtime_filter_producer(
     producer: &lp::StaticFilterProducer,
-) -> Result<execution::RuntimeFilterProducerContract, String> {
+) -> Result<execution::RuntimeFilterProducerContract, execution::RuntimeFilterFailure> {
     let id = execution::RuntimeFilterBindingId::new(producer.binding_id());
     let channel = execution::RuntimeFilterChannelId::new(producer.channel_id());
     let contract = runtime_filter_contract(producer.contract())?;
@@ -164,10 +163,12 @@ pub(super) fn runtime_filter_producer(
             execution::RuntimeFilterProducerContract::top_k_summary(id, channel, k.get(), contract)
         }
         _ => {
-            return Err(
-                "local program runtime filter producer kind/reduction mismatch".to_string(),
-            );
+            return Err(execution::RuntimeFilterContractViolation::new(
+                execution::RuntimeFilterContractViolationKind::ContractMismatch,
+                "local program runtime filter producer kind/reduction mismatch",
+            )
+            .into());
         }
     };
-    result.map_err(|error| error.to_string())
+    result.map_err(execution::RuntimeFilterFailure::from)
 }

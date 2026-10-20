@@ -177,26 +177,28 @@ impl ExprArena {
 
     pub(crate) fn runtime_error_binding(
         &self,
-    ) -> Result<Arc<crate::runtime::runtime_state::RuntimeErrorState>, String> {
-        self.runtime_error
-            .clone()
-            .ok_or_else(|| "expression arena has no exact fragment runtime binding".to_string())
+    ) -> crate::runtime::fragment::ExecutionResult<
+        Arc<crate::runtime::runtime_state::RuntimeErrorState>,
+    > {
+        self.runtime_error.clone().ok_or_else(|| {
+            crate::runtime::fragment::ExecutionFailure::from_domain(
+                crate::runtime::runtime_state::RuntimeBindingFailure::MissingExecutionRuntime,
+            )
+        })
     }
 
-    pub(crate) fn check_runtime_error(&self) -> Result<(), String> {
+    pub(crate) fn check_runtime_error(&self) -> crate::runtime::fragment::ExecutionResult<()> {
         match self.runtime_error.as_ref().and_then(|error| error.error()) {
-            Some(error) => Err(error.to_string()),
+            Some(error) => Err(error),
             None => Ok(()),
         }
     }
 
-    pub(crate) fn wait_interruptibly(&self, duration: std::time::Duration) -> Result<(), String> {
-        match &self.runtime_error {
-            Some(error) => error
-                .wait_interruptibly(duration)
-                .map_err(|error| error.to_string()),
-            None => Err("SLEEP requires an exact fragment runtime binding".to_string()),
-        }
+    pub(crate) fn wait_interruptibly(
+        &self,
+        duration: std::time::Duration,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
+        self.runtime_error_binding()?.wait_interruptibly(duration)
     }
 
     pub fn push(&mut self, node: ExprNode) -> ExprId {
@@ -232,24 +234,27 @@ impl ExprArena {
         &mut self,
         id: ExprId,
         value_type: novarocks_functions::FunctionValueType,
-    ) -> Result<(), String> {
-        self.set_value_type_observed::<String>(id, value_type, || Ok(()))
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
+        self.set_value_type_observed(id, value_type, || Ok(()))
     }
 
-    pub fn set_value_type_observed<E: From<String>>(
+    pub fn set_value_type_observed(
         &mut self,
         id: ExprId,
         value_type: novarocks_functions::FunctionValueType,
-        mut observe: impl FnMut() -> Result<(), E>,
-    ) -> Result<(), E> {
+        mut observe: impl FnMut() -> crate::runtime::fragment::ExecutionResult<()>,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let Some(data_type) = self.types.get(id.0) else {
-            return Err(format!("expression id {} is out of bounds", id.0).into());
+            return Err(expression_contract(format_args!(
+                "expression id {} is out of bounds",
+                id.0
+            )));
         };
-        enum MatchError<E> {
-            Observer(E),
+        enum MatchError {
+            Observer(crate::runtime::fragment::ExecutionFailure),
             Type(novarocks_type_contract::ValueTypeError),
         }
-        impl<E> From<novarocks_type_contract::ValueTypeError> for MatchError<E> {
+        impl From<novarocks_type_contract::ValueTypeError> for MatchError {
             fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
                 Self::Type(error)
             }
@@ -261,12 +266,14 @@ impl ExprArena {
         )
         .map_err(|error| match error {
             MatchError::Observer(error) => error,
-            MatchError::Type(error) => E::from(error.to_string()),
+            MatchError::Type(error) => {
+                crate::runtime::fragment::ExecutionFailure::from_domain(error)
+            }
         })?;
         if !same {
-            return Err(
-                String::from("expression carrier differs from its complete binding").into(),
-            );
+            return Err(expression_contract(
+                "expression carrier differs from its complete binding",
+            ));
         }
         observe()?;
         self.field_schemas[id.0] = Some(ChunkFieldSchema::from_value_type(
@@ -286,11 +293,13 @@ impl ExprArena {
         &mut self,
         id: ExprId,
         source: novarocks_type_contract::RegexpCountPatternSource,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         self.validate_regexp_count_pattern_source(id, source)?;
         let slot = &mut self.regexp_count_sources[id.0];
         if slot.is_some_and(|previous| previous != source) {
-            return Err("regexp_count pattern source is already bound".into());
+            return Err(expression_contract(
+                "regexp_count pattern source is already bound",
+            ));
         }
         *slot = Some(source);
         Ok(())
@@ -307,16 +316,20 @@ impl ExprArena {
         &self,
         id: ExprId,
         source: novarocks_type_contract::RegexpCountPatternSource,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let Some(ExprNode::FunctionCall {
             kind: function::FunctionKind::String("regexp_count"),
             args,
         }) = self.node(id)
         else {
-            return Err("regexp_count pattern source belongs to a different call".into());
+            return Err(expression_contract(
+                "regexp_count pattern source belongs to a different call",
+            ));
         };
         let [_, pattern] = args.as_slice() else {
-            return Err("regexp_count pattern source requires two arguments".into());
+            return Err(expression_contract(
+                "regexp_count pattern source requires two arguments",
+            ));
         };
         let exact_physical_utf8 = |ty: &novarocks_functions::FunctionValueType| {
             ty.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
@@ -333,7 +346,9 @@ impl ExprArena {
             })
             || matches!(self.node(*pattern), Some(ExprNode::Constant(value)) if !exact_physical_utf8(value.value_type()))
         {
-            return Err("regexp_count pattern source requires exact Physical Utf8".into());
+            return Err(expression_contract(
+                "regexp_count pattern source requires exact Physical Utf8",
+            ));
         }
         if source.invalid_pattern_is_error()
             && !matches!(
@@ -341,7 +356,9 @@ impl ExprArena {
                 Some(ExprNode::Constant(_)) | Some(ExprNode::Literal(LiteralValue::Utf8(_)))
             )
         {
-            return Err("regexp_count native literal fact has a dynamic pattern definition".into());
+            return Err(expression_contract(
+                "regexp_count native literal fact has a dynamic pattern definition",
+            ));
         }
         Ok(())
     }
@@ -350,13 +367,19 @@ impl ExprArena {
         self.nodes.get(id.0)
     }
 
-    pub fn replace_literal(&mut self, id: ExprId, value: LiteralValue) -> Result<(), String> {
-        let node = self
-            .nodes
-            .get_mut(id.0)
-            .ok_or_else(|| format!("expression id {} is out of bounds", id.0))?;
+    pub fn replace_literal(
+        &mut self,
+        id: ExprId,
+        value: LiteralValue,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
+        let node = self.nodes.get_mut(id.0).ok_or_else(|| {
+            expression_contract(format_args!("expression id {} is out of bounds", id.0))
+        })?;
         if !matches!(node, ExprNode::Literal(_)) {
-            return Err(format!("expression id {} is not a literal", id.0));
+            return Err(expression_contract(format_args!(
+                "expression id {} is not a literal",
+                id.0
+            )));
         }
         *node = ExprNode::Literal(value);
         Ok(())
@@ -402,7 +425,11 @@ impl ExprArena {
         self.session_time_zone.as_deref()
     }
 
-    pub fn eval(&self, id: ExprId, chunk: &Chunk) -> Result<ArrayRef, String> {
+    pub fn eval(
+        &self,
+        id: ExprId,
+        chunk: &Chunk,
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         evaluate(self, id, chunk)
     }
 }
@@ -411,216 +438,250 @@ fn evaluate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     id: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    let node = arena.node(id).ok_or_else(|| "invalid ExprId".to_string())?;
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
+    let node = arena
+        .node(id)
+        .ok_or_else(|| expression_contract("invalid ExprId"))?;
     match node {
-            ExprNode::Constant(value) => {
-                if !arena.data_type(id).is_some_and(|ty| novarocks_type_contract::arrow_data_types_exact(ty, &value.value_type().data_type())) {
-                    return Err("constant pool carrier differs from expression metadata".into());
-                }
-                Ok((constant_eval::broadcast(value, chunk.len()))?)
+        ExprNode::Constant(value) => {
+            if !arena.data_type(id).is_some_and(|ty| {
+                novarocks_type_contract::arrow_data_types_exact(ty, &value.value_type().data_type())
+            }) {
+                return Err(expression_contract(
+                    "constant pool carrier differs from expression metadata",
+                ));
             }
-            ExprNode::Literal(v) => {
-                if matches!(v, LiteralValue::Null) {
-                    let target_type = arena.data_type(id).cloned().unwrap_or(DataType::Null);
-                    if !matches!(target_type, DataType::Null) {
-                        // StarRocks plans may materialize `NULL` directly into typed slots (e.g. `slot: NULL`)
-                        // without an explicit `cast(NULL as <type>)`. We must preserve the declared slot/expr type
-                        // to avoid later `concat_batches` failures on `(Null, Utf8)` / `(Null, Decimal128(..))`.
-                        return Ok(new_null_array(&target_type, chunk.len()));
-                    }
-                }
-                let mut out = literal::eval(v, chunk.len())?;
+            Ok((constant_eval::broadcast(value, chunk.len()))?)
+        }
+        ExprNode::Literal(v) => {
+            if matches!(v, LiteralValue::Null) {
                 let target_type = arena.data_type(id).cloned().unwrap_or(DataType::Null);
-                if !matches!(target_type, DataType::Null) && out.data_type() != &target_type {
-                    out = cast::cast_with_special_rules(&out, &target_type).map_err(|e| {
-                        format!(
-                            "literal cast failed from {:?} to {:?}: {}",
-                            out.data_type(),
-                            target_type,
-                            e
-                        )
-                    })?;
-                }
-                Ok(out)
-            }
-            ExprNode::SlotId(slot_id) => Ok((slot::eval_slot_id(*slot_id, chunk))?),
-            ExprNode::ArrayExpr { elements } => Ok((array_expr::eval_array_expr(arena, id, elements, chunk))?),
-            ExprNode::StructExpr { fields } => {
-                Ok((struct_expr::eval_struct_expr(arena, id, fields, chunk))?)
-            }
-            ExprNode::LambdaFunction { .. } => Err(
-                ("lambda function expression can only be used as an argument to higher-order functions"
-                    .to_string()).into(),
-            ),
-            ExprNode::DictDecode { child, dict } => {
-                Ok((dict_decode::eval_dict_decode(arena, id, *child, dict, chunk))?)
-            }
-            ExprNode::Cast(child, policy) => Ok((cast::eval(arena, id, *child, *policy, chunk))?),
-            ExprNode::CastTime(child, _) => Ok((cast::eval_time(arena, id, *child, chunk))?),
-            ExprNode::CastTimeFromDatetime(child, _) => {
-                Ok((cast::eval_time_from_datetime(arena, id, *child, chunk))?)
-            }
-            ExprNode::Add(a, b, policy) => Ok((arithmetic::eval_add(arena, id, *a, *b, *policy, chunk))?),
-            ExprNode::Sub(a, b, policy) => Ok((arithmetic::eval_sub(arena, id, *a, *b, *policy, chunk))?),
-            ExprNode::Mul(a, b, policy) => Ok((arithmetic::eval_mul(arena, id, *a, *b, *policy, chunk))?),
-            ExprNode::Div(a, b, policy) => Ok((arithmetic::eval_div(arena, id, *a, *b, *policy, chunk))?),
-            ExprNode::Mod(a, b, policy) => Ok((arithmetic::eval_mod(arena, id, *a, *b, *policy, chunk))?),
-            ExprNode::Eq(a, b) => Ok((comparison::eval_eq(arena, *a, *b, chunk))?),
-            ExprNode::EqForNull(a, b) => Ok((comparison::eval_eq_for_null(arena, *a, *b, chunk))?),
-            ExprNode::Ne(a, b) => Ok((comparison::eval_ne(arena, *a, *b, chunk))?),
-            ExprNode::Lt(a, b) => Ok((comparison::eval_lt(arena, *a, *b, chunk))?),
-            ExprNode::Le(a, b) => Ok((comparison::eval_le(arena, *a, *b, chunk))?),
-            ExprNode::Gt(a, b) => Ok((comparison::eval_gt(arena, *a, *b, chunk))?),
-            ExprNode::Ge(a, b) => Ok((comparison::eval_ge(arena, *a, *b, chunk))?),
-            ExprNode::And(a, b) => Ok((comparison::eval_and(arena, *a, *b, chunk))?),
-            ExprNode::Or(a, b) => Ok((comparison::eval_or(arena, *a, *b, chunk))?),
-            ExprNode::Not(child) => Ok((comparison::eval_not(arena, *child, chunk))?),
-            ExprNode::IsNull(child) => Ok((function::eval_is_null(arena, *child, chunk))?),
-            ExprNode::IsNotNull(child) => Ok((function::eval_is_not_null(arena, *child, chunk))?),
-            ExprNode::In {
-                child,
-                values,
-                is_not_in,
-            } => Ok((in_pred::eval_in(arena, *child, values, *is_not_in, chunk))?),
-            ExprNode::Case {
-                has_case_expr,
-                has_else_expr,
-                children,
-            } => Ok((case::eval_case(arena, *has_case_expr, *has_else_expr, children, chunk))?),
-            ExprNode::FunctionCall { kind, args } => {
-                let metadata = function::function_metadata(*kind);
-                let arity = novarocks_functions::invocation_arity::InvocationArity {
-                    minimum: metadata.min_args,
-                    maximum: metadata.max_args,
-                };
-                if let Some(failure) = arity.failure(args.len()) {
-                    return Err((failure.with_original_message(metadata.name, std::fmt::format)).into());
-                }
-                match kind {
-                    FunctionKind::Abs => Ok((function::eval_abs(arena, id, args[0], chunk))?),
-                    FunctionKind::ArrayMap => Ok((function::eval_array_map(arena, id, args, chunk))?),
-                    FunctionKind::Year => Ok((function::eval_year(arena, id, chunk))?),
-                    FunctionKind::HourFromUnixtime => Ok((function::eval_hour_from_unixtime(arena, id, args, chunk))?),
-                    FunctionKind::AssertTrue => Ok((function::eval_assert_true(arena, args, chunk))?),
-                    FunctionKind::Substring => {
-                        let length_expr = if args.len() == 3 { Some(args[2]) } else { None };
-                        Ok((function::eval_substring(arena, args[0], args[1], length_expr, chunk))?)
-                    }
-                    FunctionKind::Like => Ok((function::eval_like(arena, args[0], args[1], chunk))?),
-                    FunctionKind::Upper => Ok((function::eval_upper(arena, args[0], chunk))?),
-                    FunctionKind::Split => Ok((function::eval_split(arena, args[0], args[1], chunk))?),
-                    FunctionKind::If => {
-                        Ok((function::eval_if(arena, id, args[0], args[1], args[2], chunk))?)
-                    }
-                    FunctionKind::IfNull => Ok((function::eval_ifnull(arena, args[0], args[1], chunk))?),
-                    FunctionKind::Coalesce => Ok((function::eval_coalesce(arena, id, args, chunk))?),
-                    FunctionKind::IsNull => Ok((function::eval_is_null(arena, args[0], chunk))?),
-                    FunctionKind::IsNotNull => Ok((function::eval_is_not_null(arena, args[0], chunk))?),
-                    FunctionKind::Round => {
-                        let decimals_expr = if args.len() == 2 { Some(args[1]) } else { None };
-                        Ok((function::eval_round(arena, id, args[0], decimals_expr, chunk))?)
-                    }
-                    FunctionKind::Array(name) => {
-                        Ok((function::eval_array_function(name, arena, id, args, chunk))?)
-                    }
-                    FunctionKind::Map(name) => {
-                        Ok((function::eval_map_function(name, arena, id, args, chunk))?)
-                    }
-                    FunctionKind::StructFn(name) => {
-                        Ok((function::eval_struct_function(name, arena, id, args, chunk))?)
-                    }
-                    FunctionKind::Date(name) => {
-                        Ok((function::eval_date_function(name, arena, id, args, chunk))?)
-                    }
-                    FunctionKind::Math(name) => {
-                        Ok((function::eval_math_function(name, arena, id, args, chunk))?)
-                    }
-                    FunctionKind::String(name) => {
-                        Ok((function::eval_string_function(name, arena, id, args, chunk))?)
-                    }
-                    FunctionKind::Bit(name) => {
-                        Ok((function::eval_bit_function(name, arena, id, args, chunk))?)
-                    }
-                    FunctionKind::Matching(name) => {
-                        Ok((function::eval_matching_function(name, arena, id, args, chunk))?)
-                    }
-                    FunctionKind::Encryption(name) => {
-                        Ok((function::eval_encryption_function(name, arena, id, args, chunk))?)
-                    }
-                    FunctionKind::Variant(name) => {
-                        Ok((function::eval_variant_function(name, arena, id, args, chunk))?)
-                    }
-                    FunctionKind::Object(name) => {
-                        Ok((function::eval_object_function(name, arena, id, args, chunk))?)
-                    }
-                    FunctionKind::MvState(name) => {
-                        Ok((function::eval_mv_state_function(name, arena, id, args, chunk))?)
-                    }
-                    FunctionKind::PercentileToBinary => {
-                        Ok((function::eval_percentile_to_binary(arena, id, args, chunk))?)
-                    }
-                    FunctionKind::JsonToText => {
-                        Ok((function::eval_json_to_text(arena, id, args, chunk))?)
-                    }
-                    FunctionKind::NullIf => {
-                        Ok((function::eval_nullif(arena, id, args[0], args[1], chunk))?)
-                    }
-                    FunctionKind::IcebergTransformIdentity => {
-                        Ok((function::eval_iceberg_identity(arena, args[0], chunk))?)
-                    }
-                    FunctionKind::IcebergTransformVoid => {
-                        Ok((function::eval_iceberg_void(arena, args[0], chunk))?)
-                    }
-                    FunctionKind::IcebergTransformYear => {
-                        Ok((function::eval_iceberg_year(arena, args[0], chunk))?)
-                    }
-                    FunctionKind::IcebergTransformMonth => {
-                        Ok((function::eval_iceberg_month(arena, args[0], chunk))?)
-                    }
-                    FunctionKind::IcebergTransformDay => {
-                        Ok((function::eval_iceberg_day(arena, args[0], chunk))?)
-                    }
-                    FunctionKind::IcebergTransformHour => {
-                        Ok((function::eval_iceberg_hour(arena, args[0], chunk))?)
-                    }
-                    FunctionKind::IcebergTransformBucket => {
-                        Ok((function::eval_iceberg_bucket(arena, args[0], args[1], chunk))?)
-                    }
-                    FunctionKind::IcebergTransformTruncate => {
-                        Ok((function::eval_iceberg_truncate(arena, args[0], args[1], chunk))?)
-                    }
+                if !matches!(target_type, DataType::Null) {
+                    // StarRocks plans may materialize `NULL` directly into typed slots (e.g. `slot: NULL`)
+                    // without an explicit `cast(NULL as <type>)`. We must preserve the declared slot/expr type
+                    // to avoid later `concat_batches` failures on `(Null, Utf8)` / `(Null, Decimal128(..))`.
+                    return Ok(new_null_array(&target_type, chunk.len()));
                 }
             }
-            ExprNode::Clone(child) => {
-                // Evaluate the child expression
-                let child_array = arena.eval(*child, chunk)?;
-
-                // Implement Copy-On-Write semantics:
-                // Arrow arrays are already Arc-wrapped, so cloning the ArrayRef
-                // gives us a new reference with independent ownership semantics.
-                // If the underlying array needs to be mutated, Arrow will perform
-                // a deep copy automatically when calling mutable operations.
-                //
-                // This aligns with StarRocks BE's Column::mutate() behavior:
-                // - If use_count == 1: zero-copy (direct return)
-                // - If use_count > 1: deep copy (via Arc::make_mut or clone)
-                //
-                // For our purposes, simply returning a clone of the ArrayRef
-                // provides the necessary COW protection.
-                Ok(child_array)
+            let mut out = literal::eval(v, chunk.len())?;
+            let target_type = arena.data_type(id).cloned().unwrap_or(DataType::Null);
+            if !matches!(target_type, DataType::Null) && out.data_type() != &target_type {
+                out = cast::cast_with_special_rules(&out, &target_type)?;
+            }
+            Ok(out)
+        }
+        ExprNode::SlotId(slot_id) => slot::eval_slot_id(*slot_id, chunk).map_err(Into::into),
+        ExprNode::ArrayExpr { elements } => array_expr::eval_array_expr(arena, id, elements, chunk),
+        ExprNode::StructExpr { fields } => {
+            Ok((struct_expr::eval_struct_expr(arena, id, fields, chunk))?)
+        }
+        ExprNode::LambdaFunction { .. } => Err(expression_contract(
+            "lambda function expression can only be used as an argument to higher-order functions",
+        )),
+        ExprNode::DictDecode { child, dict } => {
+            Ok((dict_decode::eval_dict_decode(arena, id, *child, dict, chunk))?)
+        }
+        ExprNode::Cast(child, policy) => Ok((cast::eval(arena, id, *child, *policy, chunk))?),
+        ExprNode::CastTime(child, _) => Ok((cast::eval_time(arena, id, *child, chunk))?),
+        ExprNode::CastTimeFromDatetime(child, _) => {
+            Ok((cast::eval_time_from_datetime(arena, id, *child, chunk))?)
+        }
+        ExprNode::Add(a, b, policy) => {
+            Ok((arithmetic::eval_add(arena, id, *a, *b, *policy, chunk))?)
+        }
+        ExprNode::Sub(a, b, policy) => {
+            Ok((arithmetic::eval_sub(arena, id, *a, *b, *policy, chunk))?)
+        }
+        ExprNode::Mul(a, b, policy) => {
+            Ok((arithmetic::eval_mul(arena, id, *a, *b, *policy, chunk))?)
+        }
+        ExprNode::Div(a, b, policy) => {
+            Ok((arithmetic::eval_div(arena, id, *a, *b, *policy, chunk))?)
+        }
+        ExprNode::Mod(a, b, policy) => {
+            Ok((arithmetic::eval_mod(arena, id, *a, *b, *policy, chunk))?)
+        }
+        ExprNode::Eq(a, b) => Ok((comparison::eval_eq(arena, *a, *b, chunk))?),
+        ExprNode::EqForNull(a, b) => Ok((comparison::eval_eq_for_null(arena, *a, *b, chunk))?),
+        ExprNode::Ne(a, b) => Ok((comparison::eval_ne(arena, *a, *b, chunk))?),
+        ExprNode::Lt(a, b) => Ok((comparison::eval_lt(arena, *a, *b, chunk))?),
+        ExprNode::Le(a, b) => Ok((comparison::eval_le(arena, *a, *b, chunk))?),
+        ExprNode::Gt(a, b) => Ok((comparison::eval_gt(arena, *a, *b, chunk))?),
+        ExprNode::Ge(a, b) => Ok((comparison::eval_ge(arena, *a, *b, chunk))?),
+        ExprNode::And(a, b) => Ok((comparison::eval_and(arena, *a, *b, chunk))?),
+        ExprNode::Or(a, b) => Ok((comparison::eval_or(arena, *a, *b, chunk))?),
+        ExprNode::Not(child) => Ok((comparison::eval_not(arena, *child, chunk))?),
+        ExprNode::IsNull(child) => Ok((function::eval_is_null(arena, *child, chunk))?),
+        ExprNode::IsNotNull(child) => Ok((function::eval_is_not_null(arena, *child, chunk))?),
+        ExprNode::In {
+            child,
+            values,
+            is_not_in,
+        } => Ok((in_pred::eval_in(arena, *child, values, *is_not_in, chunk))?),
+        ExprNode::Case {
+            has_case_expr,
+            has_else_expr,
+            children,
+        } => case::eval_case(arena, id, *has_case_expr, *has_else_expr, children, chunk),
+        ExprNode::FunctionCall { kind, args } => {
+            let metadata = function::function_metadata(*kind);
+            let arity = novarocks_functions::invocation_arity::InvocationArity {
+                minimum: metadata.min_args,
+                maximum: metadata.max_args,
+            };
+            if let Some(failure) = arity.failure(args.len()) {
+                return Err(failure
+                    .with_original_message(metadata.name, |detail| expression_contract(detail)));
+            }
+            match kind {
+                FunctionKind::Abs => function::eval_abs(arena, id, args[0], chunk),
+                FunctionKind::ArrayMap => function::eval_array_map(arena, id, args, chunk),
+                FunctionKind::Year => function::eval_year(arena, id, chunk),
+                FunctionKind::HourFromUnixtime => {
+                    function::eval_hour_from_unixtime(arena, id, args, chunk)
+                }
+                FunctionKind::AssertTrue => function::eval_assert_true(arena, args, chunk),
+                FunctionKind::Substring => {
+                    let length_expr = if args.len() == 3 { Some(args[2]) } else { None };
+                    Ok((function::eval_substring(arena, args[0], args[1], length_expr, chunk))?)
+                }
+                FunctionKind::Like => Ok((function::eval_like(arena, args[0], args[1], chunk))?),
+                FunctionKind::Upper => Ok((function::eval_upper(arena, args[0], chunk))?),
+                FunctionKind::Split => Ok((function::eval_split(arena, args[0], args[1], chunk))?),
+                FunctionKind::If => {
+                    Ok((function::eval_if(arena, id, args[0], args[1], args[2], chunk))?)
+                }
+                FunctionKind::IfNull => function::eval_ifnull(arena, id, args[0], args[1], chunk),
+                FunctionKind::Coalesce => function::eval_coalesce(arena, id, args, chunk),
+                FunctionKind::IsNull => function::eval_is_null(arena, args[0], chunk),
+                FunctionKind::IsNotNull => function::eval_is_not_null(arena, args[0], chunk),
+                FunctionKind::Round => {
+                    let decimals_expr = if args.len() == 2 { Some(args[1]) } else { None };
+                    Ok((function::eval_round(arena, id, args[0], decimals_expr, chunk))?)
+                }
+                FunctionKind::Array(name) => {
+                    Ok((function::eval_array_function(name, arena, id, args, chunk))?)
+                }
+                FunctionKind::Map(name) => {
+                    Ok((function::eval_map_function(name, arena, id, args, chunk))?)
+                }
+                FunctionKind::StructFn(name) => {
+                    Ok((function::eval_struct_function(name, arena, id, args, chunk))?)
+                }
+                FunctionKind::Date(name) => {
+                    Ok((function::eval_date_function(name, arena, id, args, chunk))?)
+                }
+                FunctionKind::Math(name) => {
+                    Ok((function::eval_math_function(name, arena, id, args, chunk))?)
+                }
+                FunctionKind::String(name) => {
+                    Ok((function::eval_string_function(name, arena, id, args, chunk))?)
+                }
+                FunctionKind::Bit(name) => {
+                    Ok((function::eval_bit_function(name, arena, id, args, chunk))?)
+                }
+                FunctionKind::Matching(name) => {
+                    Ok((function::eval_matching_function(name, arena, id, args, chunk))?)
+                }
+                FunctionKind::Encryption(name) => {
+                    Ok((function::eval_encryption_function(name, arena, id, args, chunk))?)
+                }
+                FunctionKind::Variant(name) => {
+                    Ok((function::eval_variant_function(name, arena, id, args, chunk))?)
+                }
+                FunctionKind::Object(name) => {
+                    Ok((function::eval_object_function(name, arena, id, args, chunk))?)
+                }
+                FunctionKind::MvState(name) => {
+                    Ok((function::eval_mv_state_function(name, arena, id, args, chunk))?)
+                }
+                FunctionKind::PercentileToBinary => {
+                    Ok((function::eval_percentile_to_binary(arena, id, args, chunk))?)
+                }
+                FunctionKind::JsonToText => function::eval_json_to_text(arena, id, args, chunk),
+                FunctionKind::NullIf => {
+                    Ok((function::eval_nullif(arena, id, args[0], args[1], chunk))?)
+                }
+                FunctionKind::IcebergTransformIdentity => {
+                    Ok((function::eval_iceberg_identity(arena, args[0], chunk))?)
+                }
+                FunctionKind::IcebergTransformVoid => {
+                    Ok((function::eval_iceberg_void(arena, args[0], chunk))?)
+                }
+                FunctionKind::IcebergTransformYear => {
+                    Ok((function::eval_iceberg_year(arena, args[0], chunk))?)
+                }
+                FunctionKind::IcebergTransformMonth => {
+                    Ok((function::eval_iceberg_month(arena, args[0], chunk))?)
+                }
+                FunctionKind::IcebergTransformDay => {
+                    Ok((function::eval_iceberg_day(arena, args[0], chunk))?)
+                }
+                FunctionKind::IcebergTransformHour => {
+                    Ok((function::eval_iceberg_hour(arena, args[0], chunk))?)
+                }
+                FunctionKind::IcebergTransformBucket => {
+                    Ok((function::eval_iceberg_bucket(arena, args[0], args[1], chunk))?)
+                }
+                FunctionKind::IcebergTransformTruncate => {
+                    Ok((function::eval_iceberg_truncate(arena, args[0], args[1], chunk))?)
+                }
             }
         }
+        ExprNode::Clone(child) => {
+            // Evaluate the child expression
+            let child_array = arena.eval(*child, chunk)?;
+
+            // Implement Copy-On-Write semantics:
+            // Arrow arrays are already Arc-wrapped, so cloning the ArrayRef
+            // gives us a new reference with independent ownership semantics.
+            // If the underlying array needs to be mutated, Arrow will perform
+            // a deep copy automatically when calling mutable operations.
+            //
+            // This aligns with StarRocks BE's Column::mutate() behavior:
+            // - If use_count == 1: zero-copy (direct return)
+            // - If use_count > 1: deep copy (via Arc::make_mut or clone)
+            //
+            // For our purposes, simply returning a clone of the ArrayRef
+            // provides the necessary COW protection.
+            Ok(child_array)
+        }
+    }
 }
 
 mod evaluation_context;
 #[cfg(test)]
 mod evaluation_context_tests;
 pub use evaluation_context::ExprEvaluation;
-pub(crate) use evaluation_context::ExprEvaluationFailure;
 pub(crate) use evaluation_context::{ExprEvaluationContext, ExprEvaluationControl};
 
-pub fn cast_array_to_target(array: &ArrayRef, target_type: &DataType) -> Result<ArrayRef, String> {
+#[derive(Debug)]
+struct ExpressionContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for ExpressionContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for ExpressionContract {}
+impl novarocks_failure_contract::FailureProjection for ExpressionContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::ExpressionContract.reason(),
+        )
+    }
+}
+fn expression_contract(
+    detail: impl std::fmt::Display,
+) -> crate::runtime::fragment::ExecutionFailure {
+    crate::runtime::fragment::ExecutionFailure::from_domain(ExpressionContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+pub fn cast_array_to_target(
+    array: &ArrayRef,
+    target_type: &DataType,
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     cast::cast_with_special_rules(array, target_type)
 }
 
@@ -631,6 +692,7 @@ mod tests {
     use arrow::array::{Array, Int32Array};
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_failure_contract::FailureProjection;
     use novarocks_types::SlotId;
     use std::sync::Arc;
 
@@ -706,6 +768,29 @@ mod tests {
         arena
             .eval(id, &constant_chunk(rows))
             .expect("exact constant evaluation")
+    }
+
+    #[test]
+    fn runtime_stop_and_wait_keep_the_originating_failure() {
+        let state = Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default());
+        let original = crate::runtime::fragment::ExecutionFailure::from(
+            novarocks_functions::KernelFailure::ResourceExhausted,
+        );
+        state.set_error(original.clone());
+        let mut arena = ExprArena::default();
+        arena.bind_runtime_error(state);
+        assert!(
+            arena
+                .check_runtime_error()
+                .unwrap_err()
+                .same_occurrence(&original)
+        );
+        assert!(
+            arena
+                .wait_interruptibly(std::time::Duration::ZERO)
+                .unwrap_err()
+                .same_occurrence(&original)
+        );
     }
 
     #[test]
@@ -1001,6 +1086,35 @@ mod tests {
         )
     }
 
+    fn assert_constant_copy_extent(
+        failure: crate::runtime::fragment::ExecutionFailure,
+        layout: u16,
+        required: u64,
+        limit: u64,
+    ) {
+        use novarocks_failure_contract::{FailureClass, RepresentationBoundary, domain};
+        use std::error::Error;
+        let fact = failure.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Representation);
+        assert_eq!(fact.reason().domain(), domain::KERNEL.get());
+        assert_eq!(fact.reason().code(), 259);
+        assert!(fact.resource().is_none());
+        let extent = fact.representation().unwrap();
+        assert_eq!(extent.layout.domain, domain::KERNEL);
+        assert_eq!(extent.layout.code.get(), layout);
+        assert_eq!(extent.boundary, RepresentationBoundary::SingleOutput);
+        assert_eq!(extent.required, Some(required));
+        assert_eq!(extent.extent_limit, Some(limit));
+        assert_eq!(extent.representable_prefix, None);
+        let mut source = failure.source();
+        let mut original_copy = false;
+        while let Some(actual) = source {
+            original_copy |= actual.is::<novarocks_functions::selected_copy::CopyError>();
+            source = actual.source();
+        }
+        assert!(original_copy);
+    }
+
     #[test]
     fn constant_broadcast_rejects_root_and_fixed_list_nested_run_end_overflow() {
         use arrow::array::FixedSizeListArray;
@@ -1011,10 +1125,12 @@ mod tests {
             1,
         );
         assert!(constant_eval::broadcast(&root, i16::MAX as usize).is_ok());
-        assert_eq!(
+        assert_constant_copy_extent(
             constant_eval::broadcast(&root, i16::MAX as usize + 1)
                 .expect_err("root run-end extent"),
-            "constant broadcast output extent exceeds its Arrow format"
+            52,
+            32768,
+            32767,
         );
         for null in [false, true] {
             let array = Arc::new(
@@ -1029,10 +1145,12 @@ mod tests {
             let ty =
                 novarocks_type_contract::FunctionValueType::new(array.data_type().clone(), null);
             let value = checked_constant(array, ty, 0);
-            assert_eq!(
+            assert_constant_copy_extent(
                 constant_eval::broadcast(&value, 16384)
                     .expect_err("fixed list copies children even under NULL"),
-                "constant broadcast output extent exceeds its Arrow format"
+                52,
+                32768,
+                32767,
             );
         }
     }
@@ -1078,10 +1196,12 @@ mod tests {
             novarocks_type_contract::FunctionValueType::new(outer.data_type().clone(), false),
             0,
         );
-        assert_eq!(
+        assert_constant_copy_extent(
             constant_eval::broadcast(&outer, 16384)
                 .expect_err("MutableArrayData copies nested NULL list payload"),
-            "constant broadcast output extent exceeds its Arrow format"
+            52,
+            32768,
+            32767,
         );
         let structure = Arc::new(
             StructArray::try_new(
@@ -1096,10 +1216,12 @@ mod tests {
             novarocks_type_contract::FunctionValueType::new(structure.data_type().clone(), true),
             0,
         );
-        assert_eq!(
+        assert_constant_copy_extent(
             constant_eval::broadcast(&value, 32768)
                 .expect_err("struct take copies children under NULL"),
-            "constant broadcast output extent exceeds its Arrow format"
+            52,
+            32768,
+            32767,
         );
     }
 
@@ -1141,9 +1263,11 @@ mod tests {
                     32768
                 );
             } else {
-                assert_eq!(
+                assert_constant_copy_extent(
                     output.expect_err("sparse union expands all children"),
-                    "constant broadcast output extent exceeds its Arrow format"
+                    52,
+                    32768,
+                    32767,
                 );
             }
         }
@@ -1187,10 +1311,12 @@ mod tests {
             novarocks_type_contract::FunctionValueType::new(list.data_type().clone(), false),
             0,
         );
-        assert_eq!(
+        assert_constant_copy_extent(
             constant_eval::broadcast(&value, (i32::MAX as usize / 4) + 1)
                 .expect_err("nested UTF8 offset overflow"),
-            "constant broadcast output extent exceeds its Arrow format"
+            44,
+            2147483648,
+            2147483647,
         );
     }
 
@@ -1238,9 +1364,11 @@ mod tests {
                     assert_eq!(output.len(), 3);
                     assert_eq!(output.null_count(), if null { 3 } else { 0 });
                 } else {
-                    assert_eq!(
+                    assert_constant_copy_extent(
                         output.expect_err("constructor precedes NULL list selection"),
-                        "constant broadcast output extent exceeds its Arrow format"
+                        51,
+                        128,
+                        127,
                     );
                 }
             }
@@ -1303,10 +1431,12 @@ mod tests {
             novarocks_type_contract::FunctionValueType::new(outer.data_type().clone(), false),
             0,
         );
-        assert_eq!(
+        assert_constant_copy_extent(
             constant_eval::broadcast(&value, 1)
                 .expect_err("mutable-copy recurses into zero-capacity constructor children"),
-            "constant broadcast output extent exceeds its Arrow format"
+            51,
+            128,
+            127,
         );
     }
 
@@ -1322,7 +1452,8 @@ mod tests {
         assert_eq!(
             arena
                 .eval(id, &constant_chunk(1))
-                .expect_err("no implicit constant cast"),
+                .expect_err("no implicit constant cast")
+                .detail(),
             "constant pool carrier differs from expression metadata"
         );
     }

@@ -543,7 +543,7 @@ fn float_cast_compile_three_primary_causes_preserve_success_and_ordinary_false_a
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let refusal = CompileCallbacks::new(cause, stop_at);
+                let refusal = CompileCallbacks::new(cause.clone(), stop_at);
                 assert!(
                     matches!(compile(&functions, package.clone(), &refusal), Err(FragmentCompileError::Control(actual)) if actual == cause)
                 );

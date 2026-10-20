@@ -410,16 +410,7 @@ fn value_resolution_scope_with_creation<T, H>(
 ) -> Result<T, ResolutionFailure<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
     let result = body(&mut work);
-    if matches!(
-        result,
-        Err(ResolutionFailure::Resolution(ResolveError::Control(_))
-            | ResolutionFailure::Creator(_)
-            | ResolutionFailure::Resource(_))
-    ) {
-        return result;
-    }
-    work.finish()?;
-    result
+    work.finish_result(result, ResolutionFailure::from)
 }
 
 fn value_carriers<'a>(

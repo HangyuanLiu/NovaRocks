@@ -28,7 +28,11 @@ use arrow::{
 use novarocks_types::SlotId;
 use std::sync::Arc;
 
-fn evaluate(ws: bool, arrays: Vec<ArrayRef>, rows: usize) -> Result<ArrayRef, String> {
+fn evaluate(
+    ws: bool,
+    arrays: Vec<ArrayRef>,
+    rows: usize,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let arguments = arrays.len();
     let arrays = if arrays.is_empty() {
         vec![Arc::new(Int64Array::from(vec![0; rows])) as ArrayRef]
@@ -171,20 +175,21 @@ fn legacy_concat_contract_tests_exact_byte_cap_used_separator_and_many_args() {
 fn legacy_concat_contract_tests_eager_exact_carrier_messages_are_not_null_masked() {
     let wrong = Arc::new(Int64Array::from(vec![1])) as ArrayRef;
     assert_eq!(
-        evaluate(false, vec![strings(vec![None]), wrong.clone()], 1).unwrap_err(),
+        (evaluate(false, vec![strings(vec![None]), wrong.clone()], 1).unwrap_err()).to_string(),
         "concat expects string"
     );
     assert_eq!(
-        evaluate(true, vec![wrong.clone(), strings(vec![None])], 1).unwrap_err(),
+        (evaluate(true, vec![wrong.clone(), strings(vec![None])], 1).unwrap_err()).to_string(),
         "concat_ws expects string separator"
     );
     assert_eq!(
-        evaluate(
+        (evaluate(
             true,
             vec![strings(vec![None]), strings(vec![None]), wrong],
             1
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "concat_ws expects string"
     );
 }

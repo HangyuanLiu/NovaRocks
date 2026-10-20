@@ -35,7 +35,7 @@ use std::{sync::Mutex, time::Duration};
 struct CompileControl(Option<CompileControlError>);
 impl PureCompileControl for CompileControl {
     fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-        self.0.map_or(Ok(()), Err)
+        self.0.clone().map_or(Ok(()), Err)
     }
 }
 struct RuntimeControl {
@@ -249,13 +249,13 @@ fn page<'call, 'a>(
 }
 fn invalid_input<T: std::fmt::Debug>(result: Result<T, KernelFailure>) {
     assert!(
-        matches!(result, Err(KernelFailure::InvalidProgram(_))),
+        matches!(result, Err(ref cause) if crate::kernel_control::test_contract::input(cause)),
         "{result:?}"
     );
 }
 fn internal_page<T: std::fmt::Debug>(result: Result<T, KernelFailure>) {
     assert!(
-        matches!(result, Err(KernelFailure::Internal(_))),
+        matches!(result, Err(ref cause) if crate::kernel_control::test_contract::output(cause)),
         "{result:?}"
     );
 }
@@ -649,9 +649,12 @@ fn outer_control_types_survive_preparation_input_and_output_validation() {
         ),
     ] {
         assert_eq!(
-            TableCallContract::try_new(call.clone(), &CompileControl(Some(compile_failure)))
-                .unwrap_err(),
-            failure
+            TableCallContract::try_new(
+                call.clone(),
+                &CompileControl(Some(compile_failure.clone()))
+            )
+            .unwrap_err(),
+            KernelFailure::CompileControl(compile_failure)
         );
         let control = RuntimeControl::fail(failure.clone(), false);
         assert_eq!(

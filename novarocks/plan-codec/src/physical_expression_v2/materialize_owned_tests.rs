@@ -217,7 +217,7 @@ fn caller_owned_receiving_success_and_source_floor_refusal_preserve_every_actual
         for at in 0..trace.len() {
             for cause in CAUSES {
                 assert!(
-                    matches!(invoke(&f,&defs,&c,source,limits(),Some((at,cause))),Err(Error::Control(actual)) if actual==cause),
+                    matches!(invoke(&f,&defs,&c,source,limits(),Some((at,cause.clone()))),Err(Error::Control(actual)) if actual==cause),
                     "source={source} callback={at}"
                 );
                 assert_eq!(c.trace(), trace[..=at]);
@@ -257,7 +257,7 @@ fn caller_owned_wide_lists_and_clones_have_actual_quantum_and_original_source_lo
     for at in [0, quantum, trace.len() - 1] {
         for cause in CAUSES {
             assert!(
-                matches!(invoke(&f,&defs,&c,SOURCE,limits(),Some((at,cause))),Err(Error::Control(actual)) if actual==cause)
+                matches!(invoke(&f,&defs,&c,SOURCE,limits(),Some((at,cause.clone()))),Err(Error::Control(actual)) if actual==cause)
             );
             assert_eq!(c.trace(), trace[..=at]);
         }
@@ -343,7 +343,7 @@ fn caller_owned_captured_value_literal_and_signature_pairs_preserve_facts_and_pr
         for at in 0..trace.len() {
             for cause in CAUSES {
                 assert!(
-                    matches!(run(Some((at,cause))), Err(Error::Control(actual)) if actual==cause)
+                    matches!(run(Some((at,cause.clone()))), Err(Error::Control(actual)) if actual==cause)
                 );
                 assert_eq!(c.trace(), trace[..=at]);
             }

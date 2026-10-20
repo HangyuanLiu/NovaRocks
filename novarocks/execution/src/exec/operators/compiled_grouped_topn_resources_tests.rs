@@ -23,8 +23,8 @@
 //! Execution maintains this short affected-change lane beside the consumer.
 
 use super::*;
-use crate::exec::operators::compiled_aggregate::expression_allocation_host;
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::tracked_state_allocator::expression_allocation_host;
 use arrow::array::{Int64Array, StringArray};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -54,10 +54,16 @@ fn public_work_refuses_overflow_and_real_host_limit_without_leaving_a_charge() {
     let tracker = MemTracker::new_root("grouped-key-work-refusal");
     tracker.install_limit_once(1).unwrap();
     let host = expression_allocation_host(Arc::clone(&tracker));
-    assert!(matches!(
-        ArrowWorkBudget::admit(host.clone(), shape()),
-        Err(KernelFailure::ResourceExhausted)
-    ));
+    let refusal = ArrowWorkBudget::admit(host.clone(), shape())
+        .err()
+        .expect("actual host limit refuses the operation");
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&refusal);
+    assert_eq!(
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Resource
+    );
+    assert_eq!(fact.resource().unwrap().limit, Some(1));
+    assert!(fact.resource().unwrap().requested.unwrap() > 1);
     assert_eq!(tracker.current(), 0);
     assert!(matches!(
         ArrowWorkBudget::admit(

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
 use novarocks_functions::builtin::calendar_extended_shared::{
@@ -28,16 +28,18 @@ pub use novarocks_functions::builtin::calendar_extended_shared::{
 
 pub fn eval_from_days<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &DataType::Date32)?;
     let value = arena.eval(args[0], chunk)?;
     let rows = value.len();
-    Ok((evaluate_legacy_calendar(
+    evaluate_legacy_calendar(
         CalendarOperation::FromDays,
         &[value],
         &DataType::Date32,
         rows,
-    ))?)
+    )
+    .map_err(Into::into)
 }

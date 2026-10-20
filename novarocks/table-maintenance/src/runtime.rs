@@ -649,7 +649,7 @@ mod tests {
             let job = runtime.submit(create("orders", 1), ()).await.unwrap();
             runtime.claim_next(2).await.unwrap().unwrap();
             let failure = TerminalError::known_uncommitted("cohort compile failed")
-                .with_compile_control(Some(control));
+                .with_compile_control(Some(control.clone()));
             runtime.finish(job.job_id, Err(failure), 3).await.unwrap();
             let terminal = runtime.wait_for_completion(job.job_id).await.unwrap();
             assert_eq!(terminal.compile_control, Some(control));

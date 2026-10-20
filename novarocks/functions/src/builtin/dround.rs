@@ -70,13 +70,7 @@ fn checked_numeric_view<'a>(
         }
         _ => return Err(invalid("dround input is not an installed numeric profile")),
     }
-    NumericArrayView::new(array).map_err(|_| {
-        if matches!(data_type, DataType::Decimal128(..)) {
-            internal("dround selected decimal cannot be downcast")
-        } else {
-            internal("dround selected carrier cannot be downcast")
-        }
-    })
+    NumericArrayView::new(array).map_err(KernelFailure::from_domain)
 }
 struct NumericValue<'a> {
     argument: EvaluatedArgument<'a>,
@@ -233,12 +227,7 @@ pub(super) fn evaluate_dround<'a>(
             Ok((x, digits))
         },
     )
-    .map_err(|error| match error {
-        crate::math_numeric::MathNumericError::Kernel(error) => error,
-        crate::math_numeric::MathNumericError::Legacy(error) => {
-            KernelFailure::Operational(crate::KernelDiagnostic::new(&error))
-        }
-    })?;
+    .map_err(crate::math_numeric::MathNumericError::into_kernel)?;
     SelectedValues::try_new(selection, target.data_type(), values, Box::default())
         .map_err(|_| internal("dround compact output violates its selected contract"))
 }

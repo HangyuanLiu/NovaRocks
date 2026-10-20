@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{
     Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, ListArray, make_array,
 };
@@ -26,7 +28,7 @@ use arrow_data::transform::MutableArrayData;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-fn insertion_sort_indices_desc(values: &ArrayRef, indices: &mut [usize]) -> Result<(), String> {
+fn insertion_sort_indices_desc(values: &ArrayRef, indices: &mut [usize]) -> ExecutionResult<()> {
     for i in 1..indices.len() {
         let mut j = i;
         while j > 0 {
@@ -44,38 +46,37 @@ fn insertion_sort_indices_desc(values: &ArrayRef, indices: &mut [usize]) -> Resu
     Ok(())
 }
 
-fn top_n_value_at(array: &ArrayRef, row: usize) -> Result<Option<i64>, String> {
+fn top_n_value_at(array: &ArrayRef, row: usize) -> ExecutionResult<Option<i64>> {
     let idx = super::common::row_index(row, array.len());
     match array.data_type() {
         DataType::Int8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "array_top_n failed to downcast n to Int8Array".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                expression_contract("array_top_n failed to downcast n to Int8Array")
+            })?;
             Ok((!arr.is_null(idx)).then_some(i64::from(arr.value(idx))))
         }
         DataType::Int16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "array_top_n failed to downcast n to Int16Array".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
+                expression_contract("array_top_n failed to downcast n to Int16Array")
+            })?;
             Ok((!arr.is_null(idx)).then_some(i64::from(arr.value(idx))))
         }
         DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "array_top_n failed to downcast n to Int32Array".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                expression_contract("array_top_n failed to downcast n to Int32Array")
+            })?;
             Ok((!arr.is_null(idx)).then_some(i64::from(arr.value(idx))))
         }
         DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "array_top_n failed to downcast n to Int64Array".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                expression_contract("array_top_n failed to downcast n to Int64Array")
+            })?;
             Ok((!arr.is_null(idx)).then_some(arr.value(idx)))
         }
-        other => Err(format!("array_top_n expects BIGINT n, got {:?}", other)),
+        other => Err(expression_contract(format_args!(
+            "array_top_n expects BIGINT n, got {:?}",
+            other
+        ))),
     }
 }
 
@@ -84,9 +85,15 @@ pub fn eval_array_top_n<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(expression_contract(
+            "array_top_n has an invalid prepared argument count",
+        ));
+    }
     let arr = arena.eval(args[0], chunk)?;
     let n_arr = arena.eval(args[1], chunk)?;
+    super::common::validate_rows(n_arr.len(), chunk.len(), "array_top_n count")?;
     // SQL NULL propagation: a literal `NULL` (DataType::Null) input means
     // the whole call collapses to NULL — produce an all-NULL array of the
     // expected output type so downstream consumers see one row of NULL per
@@ -95,19 +102,28 @@ pub fn eval_array_top_n<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         let out_type = arena.data_type(expr).cloned().unwrap_or(DataType::Null);
         return Ok(arrow::array::new_null_array(&out_type, chunk.len()));
     }
-    let list = arr
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| format!("array_top_n expects ListArray, got {:?}", arr.data_type()))?;
+    let list = arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+        expression_contract(format_args!(
+            "array_top_n expects ListArray, got {:?}",
+            arr.data_type()
+        ))
+    })?;
 
+    super::common::validate_rows(list.len(), chunk.len(), "array_top_n input")?;
     let output_field = match arena.data_type(expr) {
         Some(DataType::List(field)) => field.clone(),
-        _ => match list.data_type() {
+        Some(other) => {
+            return Err(expression_contract(format_args!(
+                "array_top_n output must be List, got {other:?}"
+            )));
+        }
+        None => match list.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(
-                    (format!("array_top_n output type must be List, got {:?}", other)).into(),
-                );
+                return Err(expression_contract(format_args!(
+                    "array_top_n output type must be List, got {:?}",
+                    other
+                )));
             }
         },
     };
@@ -127,14 +143,8 @@ pub fn eval_array_top_n<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     let mut values = list.values().clone();
     if values.data_type() != &target_item_type {
-        values = cast(&values, &target_item_type).map_err(|e| {
-            format!(
-                "array_top_n failed to cast element type {:?} -> {:?}: {}",
-                values.data_type(),
-                target_item_type,
-                e
-            )
-        })?;
+        values = cast(&values, &target_item_type)
+            .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
 
     let values_data = values.to_data();
@@ -142,7 +152,7 @@ pub fn eval_array_top_n<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let offsets = list.value_offsets();
     let mut out_offsets = Vec::with_capacity(chunk.len() + 1);
     out_offsets.push(0_i32);
-    let mut current: i64 = 0;
+    let mut current = 0i32;
     let mut null_builder = NullBufferBuilder::new(chunk.len());
 
     for row in 0..chunk.len() {
@@ -180,25 +190,30 @@ pub fn eval_array_top_n<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         for idx in non_null_indices
             .into_iter()
             .chain(null_indices.into_iter())
-            .take(n as usize)
+            .take(usize::try_from(n).unwrap_or(usize::MAX))
         {
+            let next =
+                novarocks_functions::aggregate_scalar::checked_list_output_offset(current, 1)?;
             mutable.extend(0, idx, idx + 1);
-            current += 1;
+            current = next;
         }
 
-        if current > i32::MAX as i64 {
-            return Err(("array_top_n offset overflow".to_string()).into());
-        }
         out_offsets.push(current as i32);
         null_builder.append_non_null();
     }
 
     let out_values = make_array(mutable.freeze());
-    let out = ListArray::new(
+    let out = ListArray::try_new(
         output_field,
         OffsetBuffer::new(out_offsets.into()),
         out_values,
         null_builder.finish(),
-    );
+    )
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "array_top_n constructor",
+            source,
+        )
+    })?;
     Ok(Arc::new(out) as ArrayRef)
 }

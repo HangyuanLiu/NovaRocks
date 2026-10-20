@@ -50,7 +50,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after primary");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -621,7 +621,7 @@ fn every_compile_callback_preserves_three_primary_causes_on_success_and_ordinary
                 ] {
                     let control = CompileControl {
                         trace: Mutex::default(),
-                        refusal: Some((at, cause)),
+                        refusal: Some((at, cause.clone())),
                     };
                     assert_eq!(
                         compile_cause(fixture.prepare(options, &control).unwrap_err()),
@@ -1028,7 +1028,7 @@ fn wide_full_field_binding_observation_crosses_actual_compile_quantum_without_ty
             ] {
                 let control = CompileControl {
                     trace: Mutex::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert_eq!(
                     compile_cause(fixture.prepare(options(true), &control).unwrap_err()),

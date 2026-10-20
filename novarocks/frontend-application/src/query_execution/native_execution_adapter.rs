@@ -28,15 +28,17 @@ use novarocks_execution_contract::{
     AcquireQueryContextAdmissionTicket, LeaseValidFor, OperationOutcome, QueryContextRef,
     TaskOperationId,
 };
+use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
 use novarocks_query_application::api::{
     ActivatedNativeAttempt, ActiveNativeAttemptOwner, CancellationView, DormantNativeAttemptOwner,
     LogicalExecutionNativePort, LogicalNativeOpenFuture, LogicalNativeOpenRequest,
-    NativeActiveAttemptConvergenceFuture, NativeAttemptActivationFailure,
-    NativeAttemptActivationFuture, NativeAttemptConvergenceFuture, NativeAttemptPreparationError,
-    NativeAttemptPreparationFailure, NativeAttemptPreparationFuture, NativeAttemptPreparationPort,
-    NativeAttemptPreparationRequest, NativeAttemptRunFuture, QueryExecutionClient,
-    QueryExecutionError, QueryExecutionErrorKind, QueryExecutionFuture, QueryExecutionRequest,
+    NativeActiveAttemptConvergenceFuture, NativeActiveConvergenceClosure,
+    NativeActiveConvergenceRequest, NativeAttemptActivationFailure, NativeAttemptActivationFuture,
+    NativeAttemptConvergenceFuture, NativeAttemptPreparationError, NativeAttemptPreparationFailure,
+    NativeAttemptPreparationFuture, NativeAttemptPreparationPort, NativeAttemptPreparationRequest,
+    NativeAttemptRunFuture, QueryExecutionClient, QueryExecutionError, QueryExecutionErrorKind,
+    QueryExecutionFuture, QueryExecutionRequest,
 };
 use novarocks_query_application::coordination::{
     AbortQueryContextEffectAdmission, AbortQueryContextEffectPort, AbortQueryContextIssueIdentity,
@@ -48,6 +50,9 @@ use novarocks_query_application::coordination::{
     ReplacementQualificationEffectSubmission, ReplacementQualificationFailure,
     ReplacementQualificationIdentity, ReplacementQualificationRequest, RootRelayBinding,
     RootRelayFrontier,
+};
+use novarocks_query_application::execution_error::{
+    ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
 };
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::NativeCompatibilityId;
@@ -139,8 +144,7 @@ impl LogicalAbortRouter {
         if routes.insert(execution, adapter).is_some() {
             return Err(NativeAttemptActivationFailure::new(
                 attempt_runtime_failure(
-                    AttemptFailureClass::ContractViolation,
-                    QueryExecutionErrorKind::InvalidRequest,
+                    QueryFailureReason::PreparationProtocol,
                     "logical execution installed the same Native Abort route twice",
                 ),
             ));
@@ -264,16 +268,11 @@ impl LogicalReplacementQualificationPort {
         let mut targets = BTreeMap::new();
         for target in snapshot.targets() {
             let process = target.process_id().map_err(|error| {
-                attempt_failure(
-                    AttemptFailureClass::ContractViolation,
-                    QueryExecutionErrorKind::InvalidRequest,
-                    error.to_string(),
-                )
+                attempt_failure(QueryFailureReason::PreparationProtocol, error.to_string())
             })?;
             if targets.insert(process, target.clone()).is_some() {
                 return Err(attempt_failure(
-                    AttemptFailureClass::ContractViolation,
-                    QueryExecutionErrorKind::InvalidRequest,
+                    QueryFailureReason::PreparationProtocol,
                     "replacement candidate topology repeats a Worker process",
                 ));
             }
@@ -305,10 +304,10 @@ impl LogicalReplacementQualificationPort {
                 Ok(reservation) => {
                     let _ = submission.qualified(reservation);
                 }
-                Err(_) => submission.rejected(),
+                Err(error) => submission.refused(error),
             },
-            Err(_) => {
-                submission.rejected();
+            Err(error) => {
+                submission.refused(error);
             }
         }
         self.inner.busy.store(false, Ordering::Release);
@@ -635,7 +634,7 @@ async fn acquire_replacement_admissions(
         acks.handle(),
         runtime.data_runtime.clone(),
     )
-    .map_err(|_| ReplacementQualificationFailure::EffectOwnerClosed)?;
+    .map_err(|error| ReplacementQualificationFailure::DomainRefused(error.failure_fact()))?;
     let valid_for =
         LeaseValidFor::new(crate::task_execution::context_owner::ADMISSION_TICKET_VALID_FOR)
             .map_err(|_| ReplacementQualificationFailure::InvalidReservation)?;
@@ -940,24 +939,36 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
             .is_some_and(|window| !window.is_for_scope(&owner.scope()))
         {
             return Box::pin(async {
-                Err(QueryExecutionError::new(
-                    QueryExecutionErrorKind::InvalidRequest,
-                    "logical read result window belongs to a foreign scope",
+                Err(QueryExecutionError::from_execution(
+                    ExecutionFailureInput::new(
+                        QueryFailureReason::PreparationProtocol.failure_fact(),
+                        SafeDetail::truncating(
+                            "logical read result window belongs to a foreign scope",
+                        ),
+                        ExecutionFailureSite::Coordinator,
+                    ),
                 ))
             });
         }
         if !description.matches_plan_seal(template.native_manifest_template().plan()) {
             return Box::pin(async {
-                Err(QueryExecutionError::new(
-                    QueryExecutionErrorKind::InvalidRequest,
-                    "prepared logical read Native template has a foreign plan seal",
+                Err(QueryExecutionError::from_execution(
+                    ExecutionFailureInput::new(
+                        QueryFailureReason::PreparationProtocol.failure_fact(),
+                        SafeDetail::truncating(
+                            "prepared logical read Native template has a foreign plan seal",
+                        ),
+                        ExecutionFailureSite::Coordinator,
+                    ),
                 ))
             });
         }
         let delivery = match description
             .row_carrier()
             .map_err(|error| {
-                QueryExecutionError::new(QueryExecutionErrorKind::InvalidRequest, error)
+                attempt_runtime_failure(QueryFailureReason::PreparationProtocol, error)
+                    .error()
+                    .clone()
             })
             .and_then(|carrier| ProductionRootDelivery::bind(carrier, result_window))
         {
@@ -1047,19 +1058,27 @@ impl ProductionRootDelivery {
             C::Relayed { kind, client_rows } => {
                 C::relayed(kind, client_rows)?;
                 let window = window.ok_or_else(|| {
-                    QueryExecutionError::new(
-                        QueryExecutionErrorKind::InvalidRequest,
-                        "relayed logical read requires its admitted result window",
-                    )
+                    QueryExecutionError::from_execution(ExecutionFailureInput::new(
+                        QueryFailureReason::PreparationProtocol.failure_fact(),
+                        SafeDetail::truncating(
+                            "relayed logical read requires its admitted result window",
+                        ),
+                        ExecutionFailureSite::Coordinator,
+                    ))
                 })?;
                 let expected = match kind {
                     K::ClientRows => W::Client,
                     _ => W::Internal,
                 };
                 if window.class() != expected {
-                    return Err(QueryExecutionError::new(
-                        QueryExecutionErrorKind::InvalidRequest,
-                        "relayed logical read window differs from its frozen output class",
+                    return Err(QueryExecutionError::from_execution(
+                        ExecutionFailureInput::new(
+                            QueryFailureReason::PreparationProtocol.failure_fact(),
+                            SafeDetail::truncating(
+                                "relayed logical read window differs from its frozen output class",
+                            ),
+                            ExecutionFailureSite::Coordinator,
+                        ),
                     ));
                 }
                 Ok(Self::Relayed {
@@ -1098,7 +1117,7 @@ pub(crate) trait FrontendActiveAttemptBehavior<M = ManifestBoundNativeAttemptInp
     fn converge<'a>(
         &'a mut self,
         inputs: &'a mut M,
-        cancellation: CancellationView,
+        request: NativeActiveConvergenceRequest,
     ) -> NativeActiveAttemptConvergenceFuture<'a>;
 }
 
@@ -1511,13 +1530,14 @@ impl ProductionManifestAttemptProjection {
 }
 
 fn projection_failure(error: DistributedQueryError) -> NativeAttemptActivationFailure {
-    projection_message(error.to_string())
+    NativeAttemptActivationFailure::new(NativeAttemptPreparationFailure::from_input(
+        error.into_execution_failure_input(),
+    ))
 }
 
 fn projection_message(message: impl Into<String>) -> NativeAttemptActivationFailure {
     NativeAttemptActivationFailure::new(attempt_runtime_failure(
-        AttemptFailureClass::ContractViolation,
-        QueryExecutionErrorKind::InvalidRequest,
+        QueryFailureReason::PreparationProtocol,
         message.into(),
     ))
 }
@@ -1583,8 +1603,7 @@ where
         Box::pin(async move {
             let activation = inputs.begin_activation().map_err(|error| {
                 NativeAttemptActivationFailure::new(attempt_runtime_failure(
-                    AttemptFailureClass::ContractViolation,
-                    QueryExecutionErrorKind::InvalidRequest,
+                    QueryFailureReason::PreparationProtocol,
                     error.to_string(),
                 ))
             })?;
@@ -1681,12 +1700,13 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
     fn converge<'a>(
         &'a mut self,
         inputs: &'a mut ManifestBoundNativeAttemptInputs,
-        cancellation: CancellationView,
+        request: NativeActiveConvergenceRequest,
     ) -> NativeActiveAttemptConvergenceFuture<'a> {
         let execution_id = inputs.execution_id();
         Box::pin(async move {
-            let convergence = self.attempt.converge(cancellation).await;
+            let convergence = self.attempt.converge(request).await?;
             if self.lifecycle_diagnostics.is_enabled() {
+                let observed_failure = self.attempt.observed_failure();
                 let contributions = self
                     .attempt
                     .round
@@ -1708,11 +1728,13 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
                     execution_id,
                     error_source: None,
                     primary_error: None,
+                failure: observed_failure,
+                worker_contexts_converged: matches!(&convergence, NativeActiveConvergenceClosure::Evidence(_)),
                     runtime_filter,
                 },
             );
             }
-            convergence
+            Ok(convergence)
         })
     }
 }
@@ -1741,8 +1763,7 @@ impl RetainedAttemptInputs for SnapshotBoundDormantAttemptInputs {
     ) -> Result<Self::Manifest, NativeAttemptActivationFailure> {
         self.bind_manifest(schedule).map_err(|error| {
             NativeAttemptActivationFailure::new(attempt_runtime_failure(
-                AttemptFailureClass::ContractViolation,
-                QueryExecutionErrorKind::InvalidRequest,
+                QueryFailureReason::PreparationProtocol,
                 error.to_string(),
             ))
         })
@@ -1946,9 +1967,9 @@ where
 
     fn converge<'a>(
         &'a mut self,
-        cancellation: CancellationView,
+        request: NativeActiveConvergenceRequest,
     ) -> NativeActiveAttemptConvergenceFuture<'a> {
-        self.behavior.converge(&mut self.inputs, cancellation)
+        self.behavior.converge(&mut self.inputs, request)
     }
 }
 
@@ -2076,8 +2097,7 @@ where
             let mut state = tokio::select! {
                 reason = cancellation.cancelled() => {
                     return Err(attempt_failure(
-                        AttemptFailureClass::ExecutionFailure,
-                        QueryExecutionErrorKind::Cancelled,
+                        query_cancellation_reason(&reason),
                         format!(
                             "Native attempt preparation was cancelled before acquiring its serialization: {reason:?}"
                         ),
@@ -2108,11 +2128,7 @@ where
             if let Some(nomination) = &nominated_execution {
                 for target in snapshot.targets() {
                     let process = target.process_id().map_err(|error| {
-                        attempt_failure(
-                            AttemptFailureClass::ContractViolation,
-                            QueryExecutionErrorKind::InvalidRequest,
-                            error.to_string(),
-                        )
+                        attempt_failure(QueryFailureReason::PreparationProtocol, error.to_string())
                     })?;
                     let binding = (|| -> Result<(), String> {
                         if let Some(controls) = &state.controls {
@@ -2144,32 +2160,21 @@ where
                         Ok(())
                     })();
                     binding.map_err(|error| {
-                        attempt_failure(
-                            AttemptFailureClass::ContractViolation,
-                            QueryExecutionErrorKind::InvalidRequest,
-                            error,
-                        )
+                        attempt_failure(QueryFailureReason::PreparationProtocol, error)
                     })?;
                 }
             }
             state
                 .dormant_factory
                 .register_candidate(request.execution(), &snapshot)?;
-            let scheduling = state.template.attempt_scheduling_facts().map_err(|error| {
-                attempt_failure(
-                    AttemptFailureClass::ContractViolation,
-                    QueryExecutionErrorKind::InvalidRequest,
-                    error,
-                )
-            })?;
+            let scheduling = state
+                .template
+                .attempt_scheduling_facts()
+                .map_err(|error| attempt_failure(QueryFailureReason::PreparationProtocol, error))?;
             let inputs =
                 SnapshotBoundDormantAttemptInputs::capture(&state.template, &request, snapshot)
                     .map_err(|error| {
-                        attempt_failure(
-                            AttemptFailureClass::ContractViolation,
-                            QueryExecutionErrorKind::InvalidRequest,
-                            error.to_string(),
-                        )
+                        attempt_failure(QueryFailureReason::PreparationProtocol, error.to_string())
                     })?;
             let behavior = state.dormant_factory.create()?;
             let owner = SnapshotBoundDormantAttemptOwner::new(inputs, behavior);
@@ -2200,23 +2205,16 @@ async fn wait_for_attempt_topology(
         }
         tokio::select! {
             reason = cancellation.cancelled() => {
-                let (class, kind) = match reason {
-                    novarocks_workload_control::CancellationReason::DeadlineExceeded
-                    | novarocks_workload_control::CancellationReason::FrontendDrainDeadlineExceeded => (
-                        AttemptFailureClass::DeadlineExceeded, QueryExecutionErrorKind::DeadlineExceeded,
-                    ),
-                    _ => (AttemptFailureClass::Cancelled, QueryExecutionErrorKind::Cancelled),
-                };
+                let reason_fact = query_cancellation_reason(&reason);
                 return Err(attempt_failure(
-                    class, kind,
+                    reason_fact,
                     format!("Native replacement topology wait was cancelled: {reason:?}"),
                 ));
             }
             changed = changes.changed() => {
                 if changed.is_err() {
                     return Err(attempt_failure(
-                        AttemptFailureClass::RecoverableInfrastructure,
-                        QueryExecutionErrorKind::Failed,
+                        QueryFailureReason::ObservationLost,
                         "Native replacement topology owner closed",
                     ));
                 }
@@ -2247,27 +2245,52 @@ fn capture_attempt_topology(
 {
     topology.snapshot().map_err(|error| {
         attempt_failure(
-            AttemptFailureClass::RecoverableInfrastructure,
-            QueryExecutionErrorKind::Failed,
+            QueryFailureReason::ObservationLost,
             format!("failed to capture Native attempt topology: {error}"),
         )
     })
 }
 
-fn attempt_failure(
-    class: AttemptFailureClass,
-    kind: QueryExecutionErrorKind,
-    message: impl Into<std::sync::Arc<str>>,
-) -> NativeAttemptPreparationError {
-    attempt_runtime_failure(class, kind, message).into()
+fn query_cancellation_reason(
+    reason: &novarocks_workload_control::CancellationReason,
+) -> QueryFailureReason {
+    match reason {
+        novarocks_workload_control::CancellationReason::DeadlineExceeded
+        | novarocks_workload_control::CancellationReason::FrontendDrainDeadlineExceeded => {
+            QueryFailureReason::DeadlineExceeded
+        }
+        _ => QueryFailureReason::Cancelled,
+    }
 }
-
+fn attempt_failure(
+    reason: QueryFailureReason,
+    diagnostic: impl std::fmt::Display,
+) -> NativeAttemptPreparationError {
+    attempt_runtime_failure(reason, diagnostic).into()
+}
 fn attempt_runtime_failure(
-    class: AttemptFailureClass,
-    kind: QueryExecutionErrorKind,
-    message: impl Into<std::sync::Arc<str>>,
+    reason: QueryFailureReason,
+    diagnostic: impl std::fmt::Display,
 ) -> NativeAttemptPreparationFailure {
-    NativeAttemptPreparationFailure::new(class, QueryExecutionError::new(kind, message))
+    tracing::debug!(reason = ?reason, error = %diagnostic, "Native attempt preparation failed");
+    // These are this owner's reasons. Foreign display strings remain private
+    // diagnostics and never supply machine facts or a client-safe promise.
+    let safe = match reason {
+        QueryFailureReason::Cancelled => "logical execution was cancelled during preparation",
+        QueryFailureReason::DeadlineExceeded => {
+            "logical execution deadline expired during preparation"
+        }
+        QueryFailureReason::PreparationProtocol => "native attempt preparation contract failed",
+        QueryFailureReason::ObservationLost => {
+            "native attempt topology observation became unavailable"
+        }
+        _ => "native attempt preparation failed",
+    };
+    NativeAttemptPreparationFailure::from_input(ExecutionFailureInput::new(
+        reason.failure_fact(),
+        SafeDetail::truncating(safe),
+        ExecutionFailureSite::Coordinator,
+    ))
 }
 
 #[cfg(test)]
@@ -2280,6 +2303,7 @@ mod tests {
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_query_application::api::{
         ActiveNativeAttemptOwner, CancellationView, NativeActiveAttemptConvergenceFuture,
+        NativeActiveConvergenceClosure, NativeActiveConvergenceRequest,
         NativeAttemptActivationFailure, NativeAttemptConvergence, NativeAttemptConvergenceFuture,
         NativeAttemptPreparationError, NativeAttemptRunFuture, NativeAttemptTerminal,
     };
@@ -2763,9 +2787,13 @@ mod tests {
         fn converge<'a>(
             &'a mut self,
             _inputs: &'a mut ManifestBoundNativeAttemptInputs,
-            _cancellation: CancellationView,
+            _request: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
-            Box::pin(async { NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced() })
+            Box::pin(async {
+                Ok(NativeActiveConvergenceClosure::Evidence(
+                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                ))
+            })
         }
     }
 
@@ -2882,7 +2910,7 @@ mod tests {
         fn converge<'a>(
             &'a mut self,
             inputs: &'a mut TestManifest,
-            _cancellation: CancellationView,
+            _request: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             assert_eq!(inputs.marker, 73);
             assert_eq!(
@@ -2892,7 +2920,9 @@ mod tests {
             let observed = Arc::clone(&self.convergence_observed);
             Box::pin(async move {
                 observed.store(true, Ordering::SeqCst);
-                NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced()
+                Ok(NativeActiveConvergenceClosure::Evidence(
+                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                ))
             })
         }
     }
@@ -2919,8 +2949,7 @@ mod tests {
                     ActivationMode::Pending => std::future::pending().await,
                     ActivationMode::Error => Err(NativeAttemptActivationFailure::new(
                         attempt_runtime_failure(
-                            super::AttemptFailureClass::RecoverableInfrastructure,
-                            super::QueryExecutionErrorKind::Failed,
+                            super::QueryFailureReason::PreparationFailed,
                             "activation failed",
                         ),
                     )),
@@ -3125,7 +3154,15 @@ mod tests {
         );
         active.behavior.observe_run_inputs(&mut active.inputs);
         assert!(active.behavior.run_observed.load(Ordering::SeqCst));
-        ActiveNativeAttemptOwner::converge(&mut active, cancellation).await;
+        ActiveNativeAttemptOwner::converge(
+            &mut active,
+            NativeActiveConvergenceRequest::new(
+                cancellation,
+                Instant::now() + Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("the original active fixture joins successfully");
         assert!(convergence_observed.load(Ordering::SeqCst));
     }
 }

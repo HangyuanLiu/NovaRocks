@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::ArrayRef;
 
 pub fn eval_nullif<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -24,12 +25,12 @@ pub fn eval_nullif<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
+    let target = arena
+        .data_type(expr)
+        .ok_or_else(|| crate::exec::expr::expression_contract("nullif: missing output type"))?;
     let left_arr = arena.eval(left, chunk)?;
     let right_arr = arena.eval(right, chunk)?;
-    Ok((novarocks_functions::builtin::nullif::evaluate_legacy(
-        left_arr,
-        right_arr,
-        arena.data_type(expr),
-    ))?)
+    novarocks_functions::builtin::nullif::evaluate_legacy(left_arr, right_arr, target)
+        .map_err(ExecutionFailure::from)
 }

@@ -17,12 +17,12 @@
 //! Whole N gather/builder scope and last-alias custody, using original authors.
 use super::aggregate_by::HostByBuffer;
 use super::aggregate_n_core::NState;
-use super::aggregate_n_largeint_operation::{NDataDomain, classify};
+use super::aggregate_n_largeint_operation::{NDataDomain, project_failure};
 use super::aggregate_n_largeint_resources::{
     BoundNCodecResources, NEmissionGeometry, operation_prefix_bytes,
 };
 use crate::aggregate_host_allocator::HostAggregateAllocator;
-use crate::aggregate_scalar::{self as scalar, ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::{self as scalar, ScalarWork};
 use crate::arrow_result_custody::retain_result_backing_direct;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
@@ -44,8 +44,8 @@ pub(super) trait NEmissionAccess {
     ) -> Result<(), KernelFailure>;
     fn with_core(
         &self,
-        operation: impl FnOnce(&NState<HostAggregateAllocator>) -> Result<(), ScalarStateError>,
-    ) -> Result<(), ScalarStateError>;
+        operation: impl FnOnce(&NState<HostAggregateAllocator>) -> Result<(), KernelFailure>,
+    ) -> Result<(), KernelFailure>;
 }
 pub(super) fn emit_n<'s, S, I>(
     contract: &Arc<AggregateCallContract>,
@@ -85,7 +85,7 @@ where
         let result =
             state.with_core(|core| geometry.add_state(core, &mut ScalarWork::new(Some(&mut work))));
         if let Err(error) = result {
-            return Err(classify(error, &domain, &allocator, &mut work));
+            return Err(project_failure(error, &domain, &allocator, &mut work));
         }
     }
     if geometry.rows != states.len() {
@@ -94,7 +94,7 @@ where
     let final_result = contract.phase().produces_final_result();
     let facts = geometry.facts(final_result)?;
     let mut operation = charge.reserve_operation(facts.operation)?;
-    let result = (|| -> Result<ArrayRef, ScalarStateError> {
+    let result = (|| -> Result<ArrayRef, KernelFailure> {
         let mut scalar_work = ScalarWork::new(Some(&mut work));
         if final_result {
             let mut values = Vec::new();
@@ -113,9 +113,10 @@ where
                 values,
                 &mut scalar_work,
             )
+            .map_err(Into::into)
         } else {
             scalar_work.flush()?;
-            let mut builder = BinaryBuilder::new();
+            let mut builder = crate::aggregate_scalar::BinaryResultBuilder::new();
             scalar_work.flush()?;
             for state in states {
                 scalar_work.step()?;
@@ -127,12 +128,12 @@ where
                     };
                     core.serialize_with_codec_resources(&mut bytes, &mut codec, &mut scalar_work)?;
                     scalar_work.flush()?;
-                    builder.append_value(&bytes.0);
-                    scalar_work.flush()
+                    builder.append_value(&bytes.0)?;
+                    scalar_work.flush().map_err(Into::into)
                 })?;
             }
             scalar_work.flush()?;
-            let values = Arc::new(builder.finish()) as ArrayRef;
+            let values = Arc::new(builder.finish()?) as ArrayRef;
             scalar_work.flush()?;
             // The original 16-byte reset buffer ends under the whole loan.
             drop(builder);
@@ -141,7 +142,7 @@ where
     })();
     let values = match result {
         Ok(values) => values,
-        Err(error) => return Err(classify(error, &domain, &allocator, &mut work)),
+        Err(error) => return Err(project_failure(error, &domain, &allocator, &mut work)),
     };
     let retained =
         retain_result_backing_direct(values, charge, &mut operation, allocator, &mut work)?;

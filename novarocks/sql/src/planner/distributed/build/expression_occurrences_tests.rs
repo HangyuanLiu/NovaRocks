@@ -54,7 +54,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after first refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -88,7 +88,7 @@ fn prefixes(
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(run(fragment,catalog,&control),Err(ExpressionOccurrenceError::Control(actual)) if actual==cause),
@@ -633,18 +633,24 @@ fn occurrence_typeof_missing_owner_is_not_an_installed_type_only_capability() {
         Err(FunctionBindingError::UnknownFunction)
     ));
     let trace = control.trace.lock().unwrap().clone();
-    assert_eq!(
-        trace,
-        [
-            (CompilePhase::FunctionSpecialization, 0),
-            (CompilePhase::FunctionSpecialization, 1)
-        ]
-    );
+    assert_eq!(trace, [(CompilePhase::FunctionSpecialization, 0)]);
+    // The missing original owner wins before an armed optional later check.
+    for cause in CAUSES {
+        let late = Control {
+            trace: Mutex::default(),
+            refusal: Some((trace.len(), cause)),
+        };
+        assert!(matches!(
+            SqlFunctionCatalog::resolve_scalar_binding(&catalog, "typeof", &[], &late),
+            Err(FunctionBindingError::UnknownFunction)
+        ));
+        assert_eq!(*late.trace.lock().unwrap(), trace);
+    }
     for at in 0..trace.len() {
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(SqlFunctionCatalog::resolve_scalar_binding(&catalog, "typeof", &[], &control),
@@ -760,17 +766,9 @@ fn occurrence_metadata_only_refusal_and_nested_typed_controls_never_fallback_or_
     prefixes(&fragment, &MetadataOnly, false, false);
     for cause in CAUSES {
         assert!(
-            matches!(ExpressionOccurrenceError::function(FunctionSpecializationFailure::Binding(FunctionBindingError::Control(cause))),ExpressionOccurrenceError::Control(actual) if actual==cause)
+            matches!(ExpressionOccurrenceError::function(FunctionSpecializationFailure::Binding(FunctionBindingError::Control(cause.clone()))),ExpressionOccurrenceError::Control(actual) if actual==cause)
         );
-        let kernel = match cause {
-            CompileControlError::Cancelled => novarocks_functions::KernelFailure::Cancelled,
-            CompileControlError::DeadlineExceeded => {
-                novarocks_functions::KernelFailure::DeadlineExceeded
-            }
-            CompileControlError::ResourceExhausted => {
-                novarocks_functions::KernelFailure::ResourceExhausted
-            }
-        };
+        let kernel = novarocks_functions::KernelFailure::CompileControl(cause.clone());
         assert!(
             matches!(ExpressionOccurrenceError::function(FunctionSpecializationFailure::Kernel(kernel)),ExpressionOccurrenceError::Control(actual) if actual==cause)
         );

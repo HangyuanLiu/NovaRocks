@@ -476,7 +476,10 @@ pub(super) fn program_for_arguments(
         Arc::new(providers),
         constants(),
     );
-    let owner = TestPreparationControl::new(Duration::from_millis(1));
+    let owner = TestPreparationControl::new(
+        preparation_identity(binding.execution()),
+        Duration::from_millis(1),
+    );
     let loan = owner.loan();
     let mut types = TypeMaterializationJournal::default();
     let mut projects = ProjectMetadataJournal::default();
@@ -680,4 +683,16 @@ pub(super) fn last_free(
         .authority()
         .maintain(binding.authority().maintenance_scan_bound().unwrap());
     assert!(binding.authority().root().committed_bytes() < retained);
+}
+
+fn preparation_identity(
+    execution: novarocks_types::identity::QueryExecutionId,
+) -> novarocks_execution_contract::TaskIdentity {
+    use novarocks_types::identity::{BackendProcessId, StageId, TaskId};
+    novarocks_execution_contract::TaskIdentity::new(
+        execution,
+        StageId::new(1).unwrap(),
+        TaskId::new(1).unwrap(),
+        BackendProcessId::new_v7(),
+    )
 }

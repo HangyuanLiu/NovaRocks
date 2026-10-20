@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
 use arrow::array::{Array, ArrayRef, BooleanArray, ListArray, MapArray, StructArray, make_array};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
@@ -28,23 +28,40 @@ pub fn eval_map_filter<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(expression_contract(
+            "map_filter requires exactly 2 arguments",
+        ));
+    }
     let map_arr = arena.eval(args[0], chunk)?;
     let filter_arr = arena.eval(args[1], chunk)?;
-    let map = map_arr
-        .as_any()
-        .downcast_ref::<MapArray>()
-        .ok_or_else(|| format!("map_filter expects MapArray, got {:?}", map_arr.data_type()))?;
+    let map = map_arr.as_any().downcast_ref::<MapArray>().ok_or_else(|| {
+        expression_contract(format_args!(
+            "map_filter expects MapArray, got {:?}",
+            map_arr.data_type()
+        ))
+    })?;
     let filter = filter_arr
         .as_any()
         .downcast_ref::<ListArray>()
         .ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "map_filter expects ListArray, got {:?}",
                 filter_arr.data_type()
-            )
+            ))
         })?;
 
+    crate::exec::expr::function::array::common::validate_rows(
+        map_arr.len(),
+        chunk.len(),
+        "map_filter input",
+    )?;
+    crate::exec::expr::function::array::common::validate_rows(
+        filter_arr.len(),
+        chunk.len(),
+        "map_filter input",
+    )?;
     let mut keys = map.keys().clone();
     let mut values = map.values().clone();
     let (map_field, ordered) = super::common::output_map_field(
@@ -54,44 +71,36 @@ pub fn eval_map_filter<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         "map_filter",
     )?;
     let DataType::Struct(fields) = map_field.data_type() else {
-        return Err(("map_filter map entries type must be Struct".to_string()).into());
+        return Err(expression_contract(
+            "map_filter map entries type must be Struct",
+        ));
     };
     if fields.len() != 2 {
-        return Err(("map_filter map entries type must have 2 fields".to_string()).into());
+        return Err(expression_contract(
+            "map_filter map entries type must have 2 fields",
+        ));
     }
     if keys.data_type() != fields[0].data_type() {
-        keys = cast(&keys, fields[0].data_type()).map_err(|e| {
-            format!(
-                "map_filter failed to cast keys to output type {:?}: {}",
-                fields[0].data_type(),
-                e
-            )
-        })?;
+        keys = cast(&keys, fields[0].data_type())
+            .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
     if values.data_type() != fields[1].data_type() {
-        values = cast(&values, fields[1].data_type()).map_err(|e| {
-            format!(
-                "map_filter failed to cast values to output type {:?}: {}",
-                fields[1].data_type(),
-                e
-            )
-        })?;
+        values = cast(&values, fields[1].data_type())
+            .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
 
     let mut filter_values = filter.values().clone();
     if filter_values.data_type() != &DataType::Boolean {
-        filter_values = cast(&filter_values, &DataType::Boolean).map_err(|e| {
-            format!(
-                "map_filter failed to cast filter array element to BOOLEAN: {}",
-                e
-            )
-        })?;
+        filter_values = cast(&filter_values, &DataType::Boolean)
+            .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
     let filter_values = filter_values
         .as_any()
         .downcast_ref::<BooleanArray>()
         .ok_or_else(|| {
-            "map_filter failed to downcast filter element array to BooleanArray".to_string()
+            expression_contract(
+                "map_filter failed to downcast filter element array to BooleanArray",
+            )
         })?;
 
     let keys_data = keys.to_data();
@@ -132,14 +141,14 @@ pub fn eval_map_filter<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 && !filter_values.is_null(filter_idx)
                 && filter_values.value(filter_idx)
             {
+                current = novarocks_functions::aggregate_scalar::checked_map_output_offset(
+                    current as i32,
+                    1,
+                )? as i64;
                 keys_mutable.extend(0, map_idx, map_idx + 1);
                 values_mutable.extend(0, map_idx, map_idx + 1);
-                current += 1;
             }
             filter_idx += 1;
-        }
-        if current > i32::MAX as i64 {
-            return Err(("map_filter offset overflow".to_string()).into());
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();
@@ -147,7 +156,13 @@ pub fn eval_map_filter<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     let out_keys = make_array(keys_mutable.freeze());
     let out_values = make_array(values_mutable.freeze());
-    let out_entries = StructArray::new(fields.clone(), vec![out_keys, out_values], None);
+    let out_entries = StructArray::try_new(fields.clone(), vec![out_keys, out_values], None)
+        .map_err(|source| {
+            crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+                "map_filter StructArray",
+                source,
+            )
+        })?;
     let out = MapArray::try_new(
         map_field,
         OffsetBuffer::new(out_offsets.into()),
@@ -155,6 +170,11 @@ pub fn eval_map_filter<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         null_builder.finish(),
         ordered,
     )
-    .map_err(|e| format!("map_filter: {}", e))?;
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "map_filter constructor",
+            source,
+        )
+    })?;
     Ok(Arc::new(out) as ArrayRef)
 }

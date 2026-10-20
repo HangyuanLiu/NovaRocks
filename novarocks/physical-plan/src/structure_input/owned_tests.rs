@@ -87,7 +87,7 @@ fn borrowed_structure_actual_success_and_original_rejections_preserve_every_cont
                 CompileControlError::ResourceExhausted,
             ] {
                 let caller = Control {
-                    stop: Some((stop, cause)),
+                    stop: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert!(

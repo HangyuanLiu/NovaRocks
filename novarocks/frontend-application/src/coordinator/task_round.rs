@@ -159,7 +159,7 @@ pub(crate) fn assemble_round(
         acks.handle(),
         transport.data_runtime.clone(),
     )
-    .map_err(TaskExecutionError::Schedule)?;
+    .map_err(TaskExecutionError::NativeTransport)?;
     let sink = split_delivery.sink(Arc::new(sink) as Arc<dyn TaskOperationSink>);
 
     let intake = StatusIntake::new(STATUS_INTAKE_CAPACITY, Arc::clone(&wake));
@@ -181,7 +181,7 @@ pub(crate) fn assemble_round(
             transport.data_runtime,
             transport.subscription_scope,
         )
-        .map_err(TaskExecutionError::Schedule)?,
+        .map_err(TaskExecutionError::NativeTransport)?,
     );
 
     let execution = QueryTaskExecution::new(

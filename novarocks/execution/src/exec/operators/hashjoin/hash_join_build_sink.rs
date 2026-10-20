@@ -27,6 +27,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
 use std::sync::Arc;
@@ -45,8 +46,14 @@ use super::native_runtime_filter::{
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::{JoinDistributionMode, JoinType};
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{SinkKernel, SinkStep, Transform},
+    step::NextStep,
+    step_context::StepContext,
+};
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::runtime_state::RuntimeState;
@@ -74,7 +81,7 @@ struct HashJoinBuildRuntimeFilterExecution {
 
 struct HashJoinBuildOperatorRuntimeFilterExecution {
     producers: Option<NativeRuntimeFilterProducerSet>,
-    bind_error: Option<String>,
+    bind_error: Option<crate::runtime::fragment::ExecutionFailure>,
     local_partition_count: Option<u32>,
 }
 
@@ -192,12 +199,12 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
                     let expected = factory.local_partition_count();
                     let dop_error = match u32::try_from(dop) {
                         Ok(actual) if actual == expected => None,
-                        Ok(actual) => Some(format!(
+                        Ok(actual) => Some(crate::runtime::fragment::ExecutionFailure::from(crate::runtime_filter::RuntimeFilterContractViolation::new(crate::runtime_filter::RuntimeFilterContractViolationKind::ContractMismatch, format!(
                             "native runtime-filter build DOP drifted between planning and operator creation: expected={expected} actual={actual}"
-                        )),
-                        Err(_) => Some(format!(
+                        )))),
+                        Err(_) => Some(crate::runtime::fragment::ExecutionFailure::from(crate::runtime_filter::RuntimeFilterContractViolation::new(crate::runtime_filter::RuntimeFilterContractViolationKind::InvalidPartitionCount, format!(
                             "native runtime-filter build DOP {dop} cannot be represented as a partition count"
-                        )),
+                        )))),
                     };
                     match factory.create_for_driver(dop, driver_id) {
                         Ok(producers) => (Some(producers), dop_error, Some(expected)),
@@ -212,7 +219,8 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
                 local_partition_count,
             }
         };
-        Box::new(HashJoinBuildSinkOperator {
+        Box::new(Transform::hydrating(HashJoinBuildSinkOperator {
+            construction: None,
             name: self.name.clone(),
             node_id: self.node_id,
             driver_id,
@@ -234,7 +242,7 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
             build_key_batches_accounting: None,
             build_key_batches_mem_tracker: None,
             build_table: None,
-            finished: false,
+            artifact_memory: None,
             build_row_count: 0,
             build_has_null_key: false,
             build_null_key_rows: match requirements.null_keys {
@@ -248,8 +256,7 @@ impl OperatorFactory for HashJoinBuildSinkFactory {
             input_chunks: 0,
             build_input_chunks_mem_tracker: None,
             build_table_mem_tracker: None,
-            construction: None,
-        })
+        }))
     }
 
     fn is_sink(&self) -> bool {
@@ -280,7 +287,7 @@ struct HashJoinBuildSinkOperator {
     build_key_batches_accounting: Option<TrackedBytes>,
     build_key_batches_mem_tracker: Option<Arc<MemTracker>>,
     build_table: Option<JoinHashMap>,
-    finished: bool,
+    artifact_memory: Option<BuildArtifactMemory>,
     build_row_count: usize,
     build_has_null_key: bool,
     build_null_key_rows: Option<Vec<u32>>,
@@ -293,16 +300,24 @@ struct HashJoinBuildSinkOperator {
     build_table_mem_tracker: Option<Arc<MemTracker>>,
 }
 
-impl Operator for HashJoinBuildSinkOperator {
+#[derive(Clone)]
+struct BuildArtifactMemory {
+    table: Option<Arc<MemTracker>>,
+    store: Option<Arc<MemTracker>>,
+}
+
+impl OperatorLifecycle for HashJoinBuildSinkOperator {
     fn creates_typed_storage(&self) -> bool {
         true
     }
+
     fn set_construction_factory(
         &mut self,
         factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) {
         self.construction = Some(factory);
     }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -329,7 +344,21 @@ impl Operator for HashJoinBuildSinkOperator {
         self.profiles = Some(profiles);
     }
 
-    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        let artifact = state.mem_tracker().map(|root| {
+            MemTracker::new_child(
+                format!("JoinBuildArtifact: {}", self.state.dep_name(self.partition)),
+                &root,
+            )
+        });
+        self.artifact_memory = Some(BuildArtifactMemory {
+            table: artifact
+                .as_ref()
+                .map(|tracker| MemTracker::new_child("BuildHashTable", tracker)),
+            store: artifact
+                .as_ref()
+                .map(|tracker| MemTracker::new_child("BuildStore", tracker)),
+        });
         Ok(self.bind_native_runtime_filters()?)
     }
 
@@ -340,33 +369,16 @@ impl Operator for HashJoinBuildSinkOperator {
     fn close(&mut self) -> ExecutionResult<()> {
         Ok(self.fail_native_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed)?)
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
 }
-
-impl ProcessorOperator for HashJoinBuildSinkOperator {
-    fn need_input(&self) -> bool {
-        !self.is_finished()
-    }
-
-    fn has_output(&self) -> bool {
-        false
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, mut chunk: Chunk) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
+impl InputEncodingPolicy for HashJoinBuildSinkOperator {}
+impl SinkKernel for HashJoinBuildSinkOperator {
+    fn consume(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        chunk: PreparedInput,
+    ) -> ExecutionResult<SinkStep> {
+        let mut chunk = chunk.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         let result: ExecutionResult<()> = (|| {
             self.init_profile_if_needed();
             if !matches!(
@@ -381,7 +393,9 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                     | JoinType::RightAnti
                     | JoinType::NullAwareLeftAnti
             ) {
-                return Err("unsupported join type for hash join build".into());
+                return Err(super::build_state::build_contract(
+                    "unsupported join type for hash join build",
+                ));
             }
             if chunk.is_empty() {
                 return Ok(());
@@ -400,7 +414,8 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             self.input_rows = self.input_rows.saturating_add(chunk.len() as u64);
             self.input_chunks = self.input_chunks.saturating_add(1);
             let base_row_id = self.build_row_count;
-            self.build_row_count = self.build_row_count.saturating_add(chunk.len());
+            self.build_row_count =
+                super::join_hash_table::checked_row_count(self.build_row_count, chunk.len())?;
             let requirements = required_build_components(
                 self.join_type,
                 self.has_residual_predicate,
@@ -426,25 +441,19 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                 .as_ref()
                 .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
             let owner = factory.begin_input_construction(&chunk)?;
-            let control =
-                super::super::compiled_expression::RuntimeKernelControl::new(_state.error_state());
-            let evaluation = crate::exec::expr::ExprEvaluationContext::new(
-                &self.arena,
-                owner.as_ref(),
-                &control,
-            );
+            let evaluation =
+                crate::exec::expr::ExprEvaluationContext::new(&self.arena, owner.as_ref(), ctx);
             let mut key_arrays = Vec::with_capacity(self.build_keys.len());
             for expr in &self.build_keys {
                 let array = evaluation.eval(*expr, &chunk)?;
                 key_arrays.push(array);
             }
             if self.eq_null_safe.len() != key_arrays.len() {
-                return Err(format!(
+                return Err(super::build_state::build_contract(format_args!(
                     "hash join build null-safe key count mismatch: flags={} keys={}",
                     self.eq_null_safe.len(),
                     key_arrays.len()
-                )
-                .into());
+                )));
             }
 
             if !self.build_has_null_key {
@@ -458,13 +467,8 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                                 && !key_array.is_valid(row)
                         });
                     if has_forbidden_null {
-                        let flat_row_id = base_row_id
-                            .checked_add(row)
-                            .ok_or_else(|| "join build null-key row id overflow".to_string())?;
-                        null_key_rows.push(
-                            u32::try_from(flat_row_id)
-                                .map_err(|_| "join build null-key row id overflow".to_string())?,
-                        );
+                        // The full build-row extent was checked before retention.
+                        null_key_rows.push((base_row_id + row) as u32);
                     }
                 }
             }
@@ -479,21 +483,28 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             self.submit_native_runtime_filters(&key_arrays)?;
             Ok(())
         })();
-        if result.is_err() {
+        if let Err(error) = result {
+            let failure = crate::runtime::fragment::ExecutionFailure::from(error);
+            ctx.report_failure(failure.clone());
             let _ = self.fail_native_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed);
+            return Err(failure);
         }
-        Ok(result?)
+        Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(None)
-    }
-
-    fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
-        let result = (|| {
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
+        let memory = self
+            .artifact_memory
+            .as_ref()
+            .ok_or_else(|| {
+                novarocks_functions::KernelFailure::InvalidProgram(
+                    novarocks_functions::KernelDiagnostic::new(
+                        "hash build runtime binding is missing",
+                    ),
+                )
+            })?
+            .clone();
+        let result: ExecutionResult<()> = (|| {
             self.init_profile_if_needed();
             debug!(
                 "HashJoinBuildSink set_finishing: dep_key={} driver_id={} partition={} node_id={} input_rows={} input_chunks={}",
@@ -504,8 +515,6 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                 self.input_rows,
                 self.input_chunks
             );
-            self.finished = true;
-
             let requirements = required_build_components(
                 self.join_type,
                 self.has_residual_predicate,
@@ -533,7 +542,9 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                     &self.build_key_batches,
                     JoinHashMapBuildOptions {
                         purpose: requirements.join_hash_map_purpose().ok_or_else(|| {
-                            "hash join lookup purpose missing for keyed build".to_string()
+                            super::build_state::build_contract(
+                                "hash join lookup purpose missing for keyed build",
+                            )
                         })?,
                         ..JoinHashMapBuildOptions::default()
                     },
@@ -556,17 +567,6 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                 self.build_table = Some(table);
             }
 
-            self.publish_runtime_filters(state)?;
-            debug!(
-                "HashJoinBuildSink mark_local_filters_ready: dep_key={} driver_id={} partition={} node_id={} input_rows={} input_chunks={}",
-                self.state.dep_name(self.partition),
-                self.driver_id,
-                self.partition,
-                self.node_id,
-                self.input_rows,
-                self.input_chunks
-            );
-
             let build_store_rows = if retain_build_rows {
                 self.build_store_builder.row_count()
             } else {
@@ -584,17 +584,11 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             };
             drop(input_chunks);
 
-            if let Some(root) = state.mem_tracker() {
-                let label = format!("JoinBuildArtifact: {}", self.state.dep_name(self.partition));
-                let artifact = MemTracker::new_child(label, &root);
-                let artifact_table = MemTracker::new_child("BuildHashTable", &artifact);
-                if let Some(table) = table.as_mut() {
-                    table.set_mem_tracker(artifact_table);
-                }
-                let artifact_build_store = MemTracker::new_child("BuildStore", &artifact);
-                if let Some(store) = build_store.as_mut() {
-                    store.transfer_to(&artifact_build_store);
-                }
+            if let (Some(table), Some(tracker)) = (table.as_mut(), memory.table.as_ref()) {
+                table.set_mem_tracker(Arc::clone(tracker));
+            }
+            if let (Some(store), Some(tracker)) = (build_store.as_mut(), memory.store.as_ref()) {
+                store.transfer_to(tracker);
             }
             self.clear_build_key_batches();
             let build_null_key_rows = self.build_null_key_rows.take().map(Arc::new);
@@ -611,9 +605,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
                 build_null_key_rows,
             ));
             artifact.validate_components(requirements)?;
-            self.state
-                .set_build(self.partition, artifact)
-                .map_err(|e| e.to_string())?;
+            self.state.set_build(self.partition, artifact)?;
             self.finish_native_runtime_filters()?;
             debug!(
                 "HashJoinBuildSink finished: dep_key={} driver_id={} partition={} node_id={} join_type={} input_rows={} input_chunks={} build_row_count={} build_has_null_key={} build_store_rows={} build_table={} build_keys={} join_map_method={}",
@@ -633,15 +625,18 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
             );
             Ok(())
         })();
-        if result.is_err() {
+        if let Err(error) = result {
+            let failure = crate::runtime::fragment::ExecutionFailure::from(error);
+            ctx.report_failure(failure.clone());
             let _ = self.fail_native_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed);
+            return Err(failure);
         }
-        result
+        Ok(SinkStep::new(NextStep::Finished, 0))
     }
 }
 
 impl HashJoinBuildSinkOperator {
-    fn bind_native_runtime_filters(&mut self) -> Result<(), String> {
+    fn bind_native_runtime_filters(&mut self) -> ExecutionResult<()> {
         let HashJoinBuildOperatorRuntimeFilterExecution {
             producers,
             bind_error,
@@ -653,19 +648,25 @@ impl HashJoinBuildSinkOperator {
         let Some(producers) = producers.as_mut() else {
             return Ok(());
         };
-        let local_partition_count = local_partition_count
-            .ok_or_else(|| "native runtime-filter build partition count is missing".to_string())?;
+        let local_partition_count = local_partition_count.ok_or_else(|| {
+            crate::runtime::fragment::ExecutionFailure::from(
+                crate::runtime_filter::RuntimeFilterContractViolation::new(
+                    crate::runtime_filter::RuntimeFilterContractViolationKind::ContractMismatch,
+                    "native runtime-filter build partition count is missing",
+                ),
+            )
+        })?;
         producers.bind(local_partition_count)
     }
 
-    fn submit_native_runtime_filters(&mut self, key_arrays: &[ArrayRef]) -> Result<(), String> {
+    fn submit_native_runtime_filters(&mut self, key_arrays: &[ArrayRef]) -> ExecutionResult<()> {
         match self.runtime_filter_execution.producers.as_mut() {
             Some(producers) => producers.submit(key_arrays),
             None => Ok(()),
         }
     }
 
-    fn finish_native_runtime_filters(&mut self) -> Result<(), String> {
+    fn finish_native_runtime_filters(&mut self) -> ExecutionResult<()> {
         match self.runtime_filter_execution.producers.as_mut() {
             Some(producers) => producers.finish(),
             None => Ok(()),
@@ -675,7 +676,7 @@ impl HashJoinBuildSinkOperator {
     fn fail_native_runtime_filters(
         &mut self,
         reason: RuntimeFilterProducerFailure,
-    ) -> Result<(), String> {
+    ) -> ExecutionResult<()> {
         match self.runtime_filter_execution.producers.as_mut() {
             Some(producers) => producers.fail(reason),
             None => Ok(()),
@@ -711,11 +712,6 @@ impl HashJoinBuildSinkOperator {
         self.build_key_batches.clear();
         self.build_key_batches_retained_bytes = 0;
         self.build_key_batches_accounting = None;
-    }
-
-    fn publish_runtime_filters(&mut self, _state: &RuntimeState) -> Result<(), String> {
-        // Native runtime filters are produced through the injected backend session, not here.
-        Ok(())
     }
 
     fn init_profile_if_needed(&mut self) {
@@ -836,7 +832,7 @@ mod tests {
             &self,
             partition: usize,
             artifact: Arc<JoinBuildArtifact>,
-        ) -> Result<(), String> {
+        ) -> ExecutionResult<()> {
             self.partitions
                 .lock()
                 .expect("partition lock")
@@ -861,8 +857,10 @@ mod tests {
             &self,
             _partition: usize,
             _artifact: Arc<JoinBuildArtifact>,
-        ) -> Result<(), String> {
-            Err("injected set_build failure".to_string())
+        ) -> ExecutionResult<()> {
+            Err(super::super::build_state::build_contract(
+                "injected set_build failure",
+            ))
         }
     }
 
@@ -1017,7 +1015,7 @@ mod tests {
     fn direct_int_build_operator(state: Arc<TestBuildState>) -> HashJoinBuildSinkOperator {
         let mut arena = ExprArena::default();
         let build_key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        HashJoinBuildSinkOperator {
+        let mut operator = HashJoinBuildSinkOperator {
             construction: Some(actual_evaluation_factory()),
             name: "HASH_JOIN (id=1)".to_string(),
             node_id: 1,
@@ -1044,7 +1042,7 @@ mod tests {
             build_key_batches_accounting: None,
             build_key_batches_mem_tracker: None,
             build_table: None,
-            finished: false,
+            artifact_memory: None,
             build_row_count: 0,
             build_has_null_key: false,
             build_null_key_rows: None,
@@ -1055,7 +1053,11 @@ mod tests {
             input_chunks: 0,
             build_input_chunks_mem_tracker: None,
             build_table_mem_tracker: None,
-        }
+        };
+        operator
+            .bind_runtime_state(&RuntimeState::default())
+            .unwrap();
+        operator
     }
 
     fn direct_set_build_operator(state: Arc<TestBuildState>) -> HashJoinBuildSinkOperator {
@@ -1085,7 +1087,9 @@ mod tests {
         );
         let mut operator = factory.create(1, 0);
         operator.set_construction_factory(actual_evaluation_factory());
-        operator.set_construction_factory(actual_evaluation_factory());
+        operator
+            .bind_runtime_state(&RuntimeState::default())
+            .unwrap();
         operator
     }
 
@@ -1121,7 +1125,7 @@ mod tests {
             .expect("bind native producer");
 
         let error = operator
-            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .consume_for_test(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
             .expect_err("null-safe key mismatch must fail");
         assert!(
             error.detail().contains("null-safe key count mismatch"),
@@ -1158,7 +1162,7 @@ mod tests {
             .expect("bind native producer");
 
         let error = operator
-            .set_finishing(&RuntimeState::default())
+            .finish_for_test(&RuntimeState::default())
             .expect_err("set_build failure must propagate");
         assert!(
             error.detail().contains("injected set_build failure"),
@@ -1205,11 +1209,14 @@ mod tests {
             .expect("bind sibling");
 
         first.cancel();
-        sibling
-            .as_processor_mut()
-            .expect("processor")
-            .set_finishing(&RuntimeState::default())
-            .expect("sibling finish after cancel");
+        {
+            let mut calls = crate::exec::pipeline::test_driver::TestDriver::new(
+                sibling.as_mut(),
+                &RuntimeState::default(),
+            );
+            calls.signal_eos().unwrap();
+            assert!(calls.collect_until_finished().unwrap().is_empty());
+        }
         drop(sibling);
         drop(first);
 
@@ -1283,11 +1290,14 @@ mod tests {
             operator
                 .bind_runtime_state(&RuntimeState::default())
                 .expect("bind producer");
-            operator
-                .as_processor_mut()
-                .expect("processor")
-                .set_finishing(&RuntimeState::default())
-                .expect("finish empty build");
+            {
+                let mut calls = crate::exec::pipeline::test_driver::TestDriver::new(
+                    operator.as_mut(),
+                    &RuntimeState::default(),
+                );
+                calls.signal_eos().unwrap();
+                assert!(calls.collect_until_finished().unwrap().is_empty());
+            }
         }
 
         assert_eq!(
@@ -1313,14 +1323,14 @@ mod tests {
         let mut operator = direct_int_build_operator(state.clone());
 
         operator
-            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .consume_for_test(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
             .expect("push chunk");
 
         assert!(operator.build_table.is_none());
         assert_eq!(operator.build_key_batches.len(), 1);
 
         operator
-            .set_finishing(&RuntimeState::default())
+            .finish_for_test(&RuntimeState::default())
             .expect("finish");
 
         let artifact = state
@@ -1345,10 +1355,10 @@ mod tests {
         operator.set_profiles(profiles.clone());
 
         operator
-            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .consume_for_test(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
             .expect("push chunk");
         operator
-            .set_finishing(&RuntimeState::default())
+            .finish_for_test(&RuntimeState::default())
             .expect("finish");
 
         assert_eq!(
@@ -1365,10 +1375,10 @@ mod tests {
         operator.set_profiles(profiles.clone());
 
         operator
-            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 1_000_000]))
+            .consume_for_test(&RuntimeState::default(), int32_chunk(vec![1, 1_000_000]))
             .expect("push chunk");
         operator
-            .set_finishing(&RuntimeState::default())
+            .finish_for_test(&RuntimeState::default())
             .expect("finish");
 
         assert_eq!(
@@ -1400,10 +1410,10 @@ mod tests {
         operator.set_profiles(profiles.clone());
 
         operator
-            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 1_000_000]))
+            .consume_for_test(&RuntimeState::default(), int32_chunk(vec![1, 1_000_000]))
             .expect("push chunk");
         operator
-            .set_finishing(&RuntimeState::default())
+            .finish_for_test(&RuntimeState::default())
             .expect("finish");
 
         assert_eq!(
@@ -1434,10 +1444,10 @@ mod tests {
         operator.set_profiles(profiles.clone());
 
         operator
-            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 1_000_000]))
+            .consume_for_test(&RuntimeState::default(), int32_chunk(vec![1, 1_000_000]))
             .expect("push chunk");
         operator
-            .set_finishing(&RuntimeState::default())
+            .finish_for_test(&RuntimeState::default())
             .expect("finish");
 
         assert_eq!(
@@ -1467,10 +1477,10 @@ mod tests {
         operator.set_profiles(profiles.clone());
 
         operator
-            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .consume_for_test(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
             .expect("push chunk");
         operator
-            .set_finishing(&RuntimeState::default())
+            .finish_for_test(&RuntimeState::default())
             .expect("finish");
 
         assert_eq!(profiles.common.get_info_string("JoinHashMapMethod"), None);
@@ -1494,16 +1504,15 @@ mod tests {
         let state = Arc::new(TestBuildState::default());
         let mut operator = null_aware_build_operator(Arc::clone(&state), false);
 
-        let processor = operator.as_processor_mut().expect("processor");
+        let mut processor = crate::exec::pipeline::test_driver::TestDriver::new(
+            operator.as_mut(),
+            &RuntimeState::default(),
+        );
         processor
-            .push_chunk(
-                &RuntimeState::default(),
-                nullable_int32_chunk(vec![Some(1), None, Some(2)]),
-            )
+            .input_without_output(nullable_int32_chunk(vec![Some(1), None, Some(2)]))
             .expect("push chunk");
-        processor
-            .set_finishing(&RuntimeState::default())
-            .expect("finish");
+        processor.signal_eos().unwrap();
+        assert!(processor.collect_until_finished().unwrap().is_empty());
 
         let artifact = state
             .artifact
@@ -1524,16 +1533,15 @@ mod tests {
         let state = Arc::new(TestBuildState::default());
         let mut operator = null_aware_build_operator(Arc::clone(&state), true);
 
-        let processor = operator.as_processor_mut().expect("processor");
+        let mut processor = crate::exec::pipeline::test_driver::TestDriver::new(
+            operator.as_mut(),
+            &RuntimeState::default(),
+        );
         processor
-            .push_chunk(
-                &RuntimeState::default(),
-                nullable_int32_chunk(vec![Some(1), None, Some(2)]),
-            )
+            .input_without_output(nullable_int32_chunk(vec![Some(1), None, Some(2)]))
             .expect("push chunk");
-        processor
-            .set_finishing(&RuntimeState::default())
-            .expect("finish");
+        processor.signal_eos().unwrap();
+        assert!(processor.collect_until_finished().unwrap().is_empty());
 
         let artifact = state
             .artifact
@@ -1558,7 +1566,7 @@ mod tests {
         let mut operator = direct_set_build_operator(Arc::clone(&state));
 
         operator
-            .set_finishing(&RuntimeState::default())
+            .finish_for_test(&RuntimeState::default())
             .expect("finish");
 
         let artifact = state
@@ -1619,7 +1627,7 @@ mod tests {
             build_key_batches_accounting: None,
             build_key_batches_mem_tracker: None,
             build_table: None,
-            finished: false,
+            artifact_memory: None,
             build_row_count: 0,
             build_has_null_key: false,
             build_null_key_rows: None,
@@ -1631,6 +1639,9 @@ mod tests {
             build_input_chunks_mem_tracker: None,
             build_table_mem_tracker: None,
         };
+        operator
+            .bind_runtime_state(&RuntimeState::default())
+            .unwrap();
 
         operator.set_mem_tracker(Arc::clone(&root));
         let key_batches_tracker = root
@@ -1640,13 +1651,13 @@ mod tests {
             .expect("BuildKeyBatches tracker");
 
         operator
-            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .consume_for_test(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
             .expect("push chunk");
 
         assert!(key_batches_tracker.current() > 0);
 
         operator
-            .set_finishing(&RuntimeState::default())
+            .finish_for_test(&RuntimeState::default())
             .expect("finish");
 
         assert_eq!(key_batches_tracker.current(), 0);
@@ -1678,7 +1689,7 @@ mod tests {
             .clone();
 
         operator
-            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .consume_for_test(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
             .expect("push chunk");
 
         assert_eq!(operator.build_store_builder.row_count(), 0);
@@ -1687,7 +1698,7 @@ mod tests {
         assert!(key_batches_tracker.current() > 0);
 
         operator
-            .set_finishing(&RuntimeState::default())
+            .finish_for_test(&RuntimeState::default())
             .expect("finish");
 
         assert_eq!(key_batches_tracker.current(), 0);
@@ -1736,7 +1747,7 @@ mod tests {
             build_key_batches_accounting: None,
             build_key_batches_mem_tracker: None,
             build_table: None,
-            finished: false,
+            artifact_memory: None,
             build_row_count: 0,
             build_has_null_key: false,
             build_null_key_rows: None,
@@ -1748,6 +1759,9 @@ mod tests {
             build_input_chunks_mem_tracker: None,
             build_table_mem_tracker: None,
         };
+        operator
+            .bind_runtime_state(&RuntimeState::default())
+            .unwrap();
 
         operator.set_mem_tracker(Arc::clone(&root));
         let key_batches_tracker = root
@@ -1757,13 +1771,13 @@ mod tests {
             .expect("BuildKeyBatches tracker");
 
         operator
-            .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
+            .consume_for_test(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
             .expect("first push");
         let after_first = key_batches_tracker.current();
         assert!(after_first > 0);
 
         operator
-            .push_chunk(&RuntimeState::default(), int32_chunk(vec![4, 5, 6]))
+            .consume_for_test(&RuntimeState::default(), int32_chunk(vec![4, 5, 6]))
             .expect("second push");
 
         assert_eq!(
@@ -1773,7 +1787,7 @@ mod tests {
         assert_eq!(key_batches_tracker.peak(), key_batches_tracker.current());
 
         operator
-            .set_finishing(&RuntimeState::default())
+            .finish_for_test(&RuntimeState::default())
             .expect("finish");
 
         assert_eq!(key_batches_tracker.current(), 0);

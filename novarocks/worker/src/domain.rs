@@ -527,6 +527,27 @@ impl DomainPolicyRejection {
     }
 }
 
+impl fmt::Display for DomainPolicyRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+impl std::error::Error for DomainPolicyRejection {}
+impl novarocks_execution_contract::failure::FailureProjection for DomainPolicyRejection {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use crate::failure_reason::WorkerFailureReason as R;
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+        let reason = match self.conflict {
+            DomainConflict::SameTokenDifferentContent => R::DomainTokenContentMismatch,
+            DomainConflict::Gap => R::DomainTokenGap,
+            DomainConflict::AfterSeal => R::DomainAfterSeal,
+            DomainConflict::UnknownMember => R::DomainUnknownMember,
+            DomainConflict::NotMonotonic => R::DomainNonMonotonic,
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+
 pub fn validate_task_domain_membership(
     descriptor: &TaskDescriptor,
     updates: &[TaskDomainUpdate],
@@ -787,6 +808,52 @@ fn commit_task_domain_update(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn domain_projection_policy_conflict_keeps_its_own_reason_and_source() {
+        use novarocks_execution_contract::TaskFailureCategory;
+        use novarocks_execution_contract::failure::{FailureClass, FailureProjection, domain};
+        use std::error::Error;
+        for (conflict, code) in [
+            (super::DomainConflict::SameTokenDifferentContent, 60),
+            (super::DomainConflict::Gap, 61),
+            (super::DomainConflict::AfterSeal, 62),
+            (super::DomainConflict::UnknownMember, 63),
+            (super::DomainConflict::NotMonotonic, 64),
+        ] {
+            let policy =
+                super::DomainPolicyRejection::new(conflict, "ResourceExhausted: cancelled S3 403");
+            assert_eq!(policy.failure_fact().class(), FailureClass::Invariant);
+            assert_eq!(
+                policy.failure_fact().reason().domain(),
+                domain::WORKER.get()
+            );
+            assert_eq!(policy.failure_fact().reason().code(), code);
+            let boundary = crate::task_domain_execution::DomainExecutionRejection::from(policy);
+            assert_eq!(
+                boundary
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<super::DomainPolicyRejection>()
+                    .unwrap()
+                    .conflict(),
+                conflict
+            );
+            let host = boundary.into_host();
+            assert_eq!(host.category(), TaskFailureCategory::Protocol);
+            let mut source = host.source();
+            let mut found = false;
+            while let Some(current) = source {
+                if let Some(actual) = current.downcast_ref::<super::DomainPolicyRejection>() {
+                    found = true;
+                    assert_eq!(actual.conflict(), conflict);
+                    assert_eq!(actual.failure_fact().reason().code(), code);
+                }
+                source = current.source();
+            }
+            assert!(found);
+        }
+    }
+
     use super::{
         AcceptedSplitWatermark, CredentialDomain, ExchangeDestinationClosureDomain,
         ExchangeEdgeDomain, ScalarDomain,

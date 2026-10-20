@@ -340,7 +340,7 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let error = preparation_error(RefreshError::from(
-                novarocks_sql::compiler::SqlCompileError::from(control),
+                novarocks_sql::compiler::SqlCompileError::from(control.clone()),
             ));
             assert_eq!(error.compile_control_error(), Some(control));
             assert_eq!(error.kind(), MvBackgroundEngineErrorKind::InvalidDefinition);

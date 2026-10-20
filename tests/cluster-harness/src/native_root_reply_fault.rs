@@ -22,7 +22,10 @@ use anyhow::{Context, Result, bail, ensure};
 use bytes::Bytes;
 use h2::{RecvStream, SendStream, client, server};
 use http::{HeaderMap, Request, Response};
-use novarocks_execution_contract::{identity::TaskIdentity, root_result::RootResultRead};
+use novarocks_execution_contract::{
+    identity::TaskIdentity,
+    root_result::{RootReadOutcome, RootReadResponse, RootResultRead},
+};
 use novarocks_native_trust::{NativeCallerSubject, NativeProcessIdentity, NativeServerAdmission};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{novarocks as wire, result as result_wire};
@@ -30,7 +33,7 @@ use novarocks_result_contract::{
     ClientRowProfile, ClientRowStreamCursor, RootOutputKind, RootProfileId, RootProfileV1,
 };
 use novarocks_task_codec::operation::decode_covered_subscribe_task_status;
-use novarocks_task_codec::root_result::{decode_read, decode_reply};
+use novarocks_task_codec::root_result::{decode_read, decode_response};
 use novarocks_types::FrontendProcessId;
 use prost::Message;
 use serde::Serialize;
@@ -2592,6 +2595,30 @@ fn append_prefix_only_suffix(core: Arc<Core>, original: &Bytes) -> Result<Bytes>
     Ok(body.into_bytes())
 }
 
+fn reply_data(response: &wire::FetchRootResultResponse) -> Result<&result_wire::RootData> {
+    let Some(wire::fetch_root_result_response::Result::Reply(receipt)) = response.result.as_ref()
+    else {
+        bail!("fault mutation requires an actual Reply receipt");
+    };
+    let Some(wire::root_read_receipt::Outcome::Data(data)) = receipt.outcome.as_ref() else {
+        bail!("verified Data1 outcome unexpectedly disappeared");
+    };
+    Ok(data)
+}
+
+fn reply_data_mut(
+    response: &mut wire::FetchRootResultResponse,
+) -> Result<&mut result_wire::RootData> {
+    let Some(wire::fetch_root_result_response::Result::Reply(receipt)) = response.result.as_mut()
+    else {
+        bail!("fault mutation requires an actual Reply receipt");
+    };
+    let Some(wire::root_read_receipt::Outcome::Data(data)) = receipt.outcome.as_mut() else {
+        bail!("closed mutation unexpectedly changed real Data outcome");
+    };
+    Ok(data)
+}
+
 async fn inject_reply(
     upstream: Response<RecvStream>,
     mut downstream: server::SendResponse<Bytes>,
@@ -2610,8 +2637,6 @@ async fn inject_reply(
     let original_message = single_message(&original)?;
     let mut wire = wire::FetchRootResultResponse::decode(original_message.clone())
         .context("real root reply protobuf")?;
-    require_canonical_reply(&wire, &original_message, core.clone())?;
-    drop(original_message);
     ensure!(
         parts
             .headers
@@ -2627,22 +2652,32 @@ async fn inject_reply(
             "real root content-length differs from body"
         );
     }
-    let reply = decode_reply(
+    let decoded = decode_response(
         wire.clone(),
         &expected,
         expected.consumed(),
         FieldPath::root("root_fault_original"),
     )?;
-    let is_not_ready = matches!(
-        wire.outcome,
-        Some(wire::fetch_root_result_response::Outcome::NotReady(true))
-    );
+    let reply = match decoded {
+        RootReadResponse::Reply(reply) => reply,
+        RootReadResponse::Deferred(_) | RootReadResponse::Refused(_) => {
+            // Neither branch acknowledges a watermark. Preserve the complete
+            // response and let the original FE owner decide the next action.
+            // SlotExit retains the same absolute capture deadline and mutation.
+            drop(wire);
+            drop(original_message);
+            drop(body);
+            let mut send = downstream.send_response(Response::from_parts(parts, ()), false)?;
+            send_bytes(&mut send, original).await?;
+            send.send_trailers(trailers.context("verified root trailers disappeared")?)?;
+            return Ok(());
+        }
+    };
+    require_canonical_reply(&wire, &original_message, core.clone())?;
+    drop(original_message);
+    let is_not_ready = matches!(&reply.outcome, RootReadOutcome::NotReady);
     ensure!(
-        is_not_ready
-            || matches!(
-                wire.outcome,
-                Some(wire::fetch_root_result_response::Outcome::Data(_))
-            ),
+        is_not_ready || matches!(&reply.outcome, RootReadOutcome::Data(_)),
         "one-shot root phase requires a legal NotReady or real Data1 reply"
     );
     if is_not_ready {
@@ -2654,7 +2689,7 @@ async fn inject_reply(
         state.not_ready_observed += 1;
         let evidence = serde_json::json!({"attempt":state.target_attempts,
             "task":reply.root_task.to_string(),"profile":wire.profile_id,
-            "kind":"ClientRows","accepted_consumed":wire.accepted_consumed_sequence,
+            "kind":"ClientRows","accepted_consumed":reply.accepted_consumed,
             "wire_bytes":original.len(),"wire_sha256":hash(&original)});
         state.not_ready_replies.push(evidence);
     }
@@ -2690,10 +2725,7 @@ async fn inject_reply(
         // No claim, mutation, deadline renewal or fabricated Data on NotReady.
         return Ok(());
     }
-    let original_data = match wire.outcome.as_ref() {
-        Some(wire::fetch_root_result_response::Outcome::Data(data)) => data.clone(),
-        _ => bail!("verified Data1 outcome unexpectedly disappeared"),
-    };
+    let original_data = reply_data(&wire)?.clone();
     // Validate the untouched first body with the same carrier-neutral grammar
     // used by the real FE relay; a preexisting malformed reply is never a fixture.
     let profile = ClientRowProfile::try_new(
@@ -2711,7 +2743,7 @@ async fn inject_reply(
         );
     }
     let before = serde_json::json!({"task":reply.root_task.to_string(),"profile":wire.profile_id,
-        "kind":"ClientRows","accepted_consumed":wire.accepted_consumed_sequence,
+        "kind":"ClientRows","accepted_consumed":reply.accepted_consumed,
         "sequence":original_data.sequence,"body_bytes":original_data.body.len(),
         "body_sha256":hash(&original_data.body),"wire_bytes":original.len(),"wire_sha256":hash(&original),
         "end_after_data":original_data.end_after_data.as_ref().map(|end|
@@ -2724,18 +2756,11 @@ async fn inject_reply(
             });
         }
         RootReplyMutation::FourBytePrefixOnly => {
-            if let Some(wire::fetch_root_result_response::Outcome::Data(data)) =
-                wire.outcome.as_mut()
-            {
-                data.body = Bytes::from_static(&[1, 0, 0, 0]);
-            }
+            reply_data_mut(&mut wire)?.body = Bytes::from_static(&[1, 0, 0, 0]);
         }
         RootReplyMutation::ValidRowPrefixOnlySuffix => {
-            if let Some(wire::fetch_root_result_response::Outcome::Data(data)) =
-                wire.outcome.as_mut()
-            {
-                data.body = append_prefix_only_suffix(core.clone(), &data.body)?;
-            }
+            let data = reply_data_mut(&mut wire)?;
+            data.body = append_prefix_only_suffix(core.clone(), &data.body)?;
         }
     }
     // The mutation list is closed. Identity, watermark, sequence and optional
@@ -2757,13 +2782,10 @@ async fn inject_reply(
         "mutated root protobuf length differs from preflight"
     );
     let frame = frame.into_bytes();
-    let changed_data = match wire.outcome.as_ref() {
-        Some(wire::fetch_root_result_response::Outcome::Data(data)) => data,
-        _ => bail!("closed mutation unexpectedly changed real Data outcome"),
-    };
+    let changed_data = reply_data(&wire)?;
     let altered = serde_json::json!({"mutation":mutation,"task":reply.root_task.to_string(),
         "profile":wire.profile_id,"output_kind":format!("{:?}",wire.output_kind),
-        "accepted_consumed":wire.accepted_consumed_sequence,
+        "accepted_consumed":reply.accepted_consumed,
         "sequence":changed_data.sequence,"body_bytes":changed_data.body.len(),
         "body_sha256":hash(&changed_data.body),
         "end_after_data":changed_data.end_after_data.as_ref().map(|end|
@@ -2929,8 +2951,9 @@ mod tests {
     #[test]
     fn same_length_reordered_protobuf_decodes_but_fails_canonical_bytes() {
         let core = core();
-        let canonical = Bytes::from_static(&[0x10, 1, 0x20, 1]);
-        let reordered = Bytes::from_static(&[0x20, 1, 0x10, 1]);
+        // Profile 1 and reply { ack_only: true }; only the outer field order differs.
+        let canonical = Bytes::from_static(&[0x10, 1, 0x22, 2, 0x10, 1]);
+        let reordered = Bytes::from_static(&[0x22, 2, 0x10, 1, 0x10, 1]);
         let expected = wire::FetchRootResultResponse::decode(canonical.clone()).unwrap();
         let actual = wire::FetchRootResultResponse::decode(reordered.clone()).unwrap();
         assert_eq!(actual, expected);
@@ -2970,8 +2993,9 @@ mod tests {
     #[test]
     fn canonical_validation_cannot_bypass_shared_credit() {
         let core = core();
-        let message = Bytes::from_static(&[0x10, 1, 0x20, 1]);
+        let message = Bytes::from_static(&[0x10, 1, 0x22, 2, 0x10, 1]);
         let wire = wire::FetchRootResultResponse::decode(message.clone()).unwrap();
+        assert_eq!(wire.encoded_len(), message.len());
         let credit =
             ByteCredit::new(core.clone(), core.bounds.maximum_owned_buffer_bytes - 3).unwrap();
         assert!(require_canonical_reply(&wire, &message, core.clone()).is_err());
@@ -3568,18 +3592,15 @@ mod tests {
         Ok(frame.into_bytes())
     }
 
-    #[tokio::test]
-    async fn actual_not_ready_forwarding_preserves_wire_and_does_not_claim() -> Result<()> {
+    async fn assert_actual_transparent_response(
+        make_wire: impl FnOnce(&RootResultRead) -> Result<wire::FetchRootResultResponse>,
+        is_not_ready: bool,
+        deadline_context: &'static str,
+    ) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(2), async {
             let core = core();
             let expected = expected();
-            let wire = encode_reply(&RootResultReply {
-                root_task: expected.root_task(),
-                profile: expected.profile(),
-                kind: expected.kind(),
-                accepted_consumed: 0,
-                outcome: RootReadOutcome::NotReady,
-            })?;
+            let wire = make_wire(&expected)?;
             let original = frame(core.clone(), &wire)?;
             let original_bytes = original.clone();
             let original_hash = hash(&original);
@@ -3588,7 +3609,7 @@ mod tests {
             {
                 let mut state = core.state.lock().unwrap();
                 state.deadline = Some(deadline);
-                state.armed_mutation = Some(RootReplyMutation::ProfileTwo);
+                state.armed_mutation = is_not_ready.then_some(RootReplyMutation::ProfileTwo);
                 state.target_attempts = 1;
             }
             let mut trailers = HeaderMap::new();
@@ -3663,8 +3684,8 @@ mod tests {
             let observation = RootReplyFaultControl { core: core.clone() }.observation();
             assert_eq!(observation.claimed, 0);
             assert_eq!(observation.emitted_messages, 0);
-            assert_eq!(observation.not_ready_observed, 1);
-            assert_eq!(observation.not_ready_forwarded, 1);
+            assert_eq!(observation.not_ready_observed, u64::from(is_not_ready));
+            assert_eq!(observation.not_ready_forwarded, u64::from(is_not_ready));
             assert!(observation.original.is_none() && observation.mutated.is_none());
             assert!(observation.failures.is_empty());
             assert_eq!(core.state.lock().unwrap().deadline, Some(deadline));
@@ -3687,8 +3708,76 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         })
         .await
-        .context("component NotReady deadline")?
+        .context(deadline_context)?
     }
+
+    #[tokio::test]
+    async fn actual_not_ready_forwarding_preserves_wire_and_does_not_claim() -> Result<()> {
+        assert_actual_transparent_response(
+            |expected| {
+                Ok(encode_reply(&RootResultReply {
+                    root_task: expected.root_task(),
+                    profile: expected.profile(),
+                    kind: expected.kind(),
+                    accepted_consumed: 0,
+                    outcome: RootReadOutcome::NotReady,
+                })?)
+            },
+            true,
+            "component NotReady deadline",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn actual_deferred_forwarding_keeps_wire_and_deadline_without_arming_or_ack() -> Result<()>
+    {
+        use novarocks_execution_contract::root_result::{RootReadDeferral, RootReadDeferred};
+        assert_actual_transparent_response(
+            |expected| {
+                Ok(novarocks_task_codec::root_result::encode_response(
+                    &RootReadResponse::Deferred(RootReadDeferred::for_request(
+                        expected,
+                        RootReadDeferral::Preparing,
+                    )),
+                )?)
+            },
+            false,
+            "component Deferred deadline",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn actual_refused_forwarding_keeps_wire_and_deadline_without_arming_or_ack() -> Result<()>
+    {
+        use novarocks_execution_contract::{
+            SafeDetail,
+            failure::{FailureClass, FailureFact, FailureReason},
+            root_result::RootReadRefusal,
+        };
+        assert_actual_transparent_response(
+            |expected| {
+                Ok(novarocks_task_codec::root_result::encode_response(
+                    &RootReadResponse::Refused(RootReadRefusal::for_request(
+                        expected,
+                        FailureFact::new(
+                            FailureClass::Data,
+                            FailureReason::new(
+                                std::num::NonZeroU16::MAX,
+                                std::num::NonZeroU16::new(1).unwrap(),
+                            ),
+                        ),
+                        SafeDetail::truncating("component root read domain refusal"),
+                    )),
+                )?)
+            },
+            false,
+            "component Refused deadline",
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn actor_stop_joins_pending_stream_owners_and_returns_credit() -> Result<()> {
         tokio::time::timeout(Duration::from_secs(3), async {

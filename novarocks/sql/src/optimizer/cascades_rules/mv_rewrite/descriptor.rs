@@ -2104,7 +2104,7 @@ mod tests {
                     0,
                     "callback after first cause"
                 );
-                Err(self.cause)
+                Err(self.cause.clone())
             }
         }
         let control = crate::optimizer::test_optimizer_control();
@@ -2184,7 +2184,7 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let refusal = Refuse {
-                cause,
+                cause: cause.clone(),
                 calls: AtomicUsize::new(0),
             };
             assert_eq!(

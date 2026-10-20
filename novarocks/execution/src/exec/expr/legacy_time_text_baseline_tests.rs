@@ -17,7 +17,7 @@
 //! Independent raw TIME baselines, recorded before core extraction.
 use super::{ExprArena, ExprId, ExprNode};
 use crate::exec::chunk::{Chunk, ChunkSchema};
-use crate::exec::expr::function::{FunctionKind, eval_date_function};
+use crate::exec::expr::function::FunctionKind;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Int64Array, StringArray, TimestampMicrosecondArray,
 };
@@ -49,9 +49,12 @@ fn setup(columns: Vec<ArrayRef>) -> (ExprArena, Vec<ExprId>, Chunk) {
 fn text(v: Vec<Option<&str>>) -> ArrayRef {
     Arc::new(StringArray::from(v))
 }
-fn raw(name: &str, columns: Vec<ArrayRef>) -> Result<ArrayRef, String> {
+fn raw(
+    name: &str,
+    columns: Vec<ArrayRef>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (arena, args, chunk) = setup(columns);
-    eval_date_function(name, &arena, ExprId(usize::MAX), &args, &chunk)
+    eval_frozen_time(name, &arena, &args, &chunk)
 }
 fn ints(a: &ArrayRef) -> Vec<Option<i64>> {
     a.as_any()
@@ -138,14 +141,8 @@ fn original_time_to_sec_roundtrip_bypasses_all_cast_kinds() {
         };
         // The transformed child is deliberately inadmissible if it were evaluated.
         let cast = arena.push_typed(cast, DataType::Int64);
-        let out = eval_date_function(
-            "time_to_sec",
-            &arena,
-            ExprId(usize::MAX),
-            &[cast, ExprId(usize::MAX)],
-            &chunk,
-        )
-        .unwrap();
+        let out =
+            eval_frozen_time("time_to_sec", &arena, &[cast, ExprId(usize::MAX)], &chunk).unwrap();
         assert_eq!(
             ints(&out),
             vec![Some(-1), Some(-3_023_999), Some(3_023_999), None]
@@ -167,7 +164,7 @@ fn original_time_to_sec_source_type_error_precedes_wrappers() {
         DataType::Timestamp(TimeUnit::Microsecond, None),
     );
     assert_eq!(
-        eval_date_function("time_to_sec", &arena, ExprId(usize::MAX), &[cast], &chunk).unwrap_err(),
+        (eval_frozen_time("time_to_sec", &arena, &[cast], &chunk).unwrap_err()).to_string(),
         "sec_to_time source for time_to_sec must be int"
     );
 }
@@ -175,11 +172,12 @@ fn original_time_to_sec_source_type_error_precedes_wrappers() {
 fn original_time_to_sec_wrong_carrier_and_empty_type_admission() {
     for rows in [0, 1] {
         assert_eq!(
-            raw(
+            (raw(
                 "time_to_sec",
                 vec![Arc::new(Int64Array::from(vec![None; rows]))]
             )
-            .unwrap_err(),
+            .unwrap_err())
+            .to_string(),
             "unsupported datetime input type: Int64"
         );
     }
@@ -188,10 +186,9 @@ fn original_time_to_sec_wrong_carrier_and_empty_type_admission() {
 fn original_time_to_sec_arity_panic_and_ignored_tail() {
     let (arena, args, chunk) = setup(vec![text(vec![Some("01:02:03")])]);
     assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| eval_date_function(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| eval_frozen_time(
             "time_to_sec",
             &arena,
-            ExprId(0),
             &[],
             &chunk
         )))
@@ -199,10 +196,9 @@ fn original_time_to_sec_arity_panic_and_ignored_tail() {
     );
     assert_eq!(
         ints(
-            &eval_date_function(
+            &eval_frozen_time(
                 "time_to_sec",
                 &arena,
-                ExprId(0),
                 &[args[0], ExprId(usize::MAX)],
                 &chunk
             )
@@ -290,10 +286,7 @@ fn original_time_format_cast_source_differs_from_identical_value() {
         DataType::Timestamp(TimeUnit::Microsecond, None),
     );
     assert_eq!(
-        strings(
-            &eval_date_function("time_format", &arena, ExprId(0), &[cast, args[1]], &chunk)
-                .unwrap()
-        ),
+        strings(&eval_frozen_time("time_format", &arena, &[cast, args[1]], &chunk).unwrap()),
         vec![None]
     );
     assert_eq!(
@@ -319,26 +312,29 @@ fn original_time_format_raw_override_error_precedes_format_admission() {
         DataType::Timestamp(TimeUnit::Microsecond, None),
     );
     assert_eq!(
-        eval_date_function("time_format", &arena, ExprId(0), &[cast, args[0]], &chunk).unwrap_err(),
+        (eval_frozen_time("time_format", &arena, &[cast, args[0]], &chunk).unwrap_err())
+            .to_string(),
         "invalid ExprId"
     );
     assert_eq!(
-        raw(
+        (raw(
             "time_format",
             vec![
                 Arc::new(Int64Array::from(vec![1])),
                 Arc::new(Int64Array::from(vec![1]))
             ]
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "time_format expects string format"
     );
     assert_eq!(
-        raw(
+        (raw(
             "time_format",
             vec![Arc::new(Int64Array::from(vec![1])), text(vec![Some("%f")])]
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "time_format expects time"
     );
 }
@@ -346,10 +342,9 @@ fn original_time_format_raw_override_error_precedes_format_admission() {
 fn original_time_format_arity_panic_and_ignored_tail() {
     let (arena, args, chunk) = setup(vec![text(vec![Some("01:02:03")]), text(vec![Some("%f")])]);
     assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| eval_date_function(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| eval_frozen_time(
             "time_format",
             &arena,
-            ExprId(0),
             &args[..1],
             &chunk
         )))
@@ -357,10 +352,9 @@ fn original_time_format_arity_panic_and_ignored_tail() {
     );
     assert_eq!(
         strings(
-            &eval_date_function(
+            &eval_frozen_time(
                 "time_format",
                 &arena,
-                ExprId(0),
                 &[args[0], args[1], ExprId(usize::MAX)],
                 &chunk
             )
@@ -403,4 +397,46 @@ fn original_time_to_sec_if_invocation_domain_and_standalone_batch() {
         ints(&arena.eval(guarded, &chunk).unwrap()),
         vec![Some(0), Some(-1)]
     );
+}
+
+/// Direct dispatcher tests still need the exact frozen result declaration.
+/// Clone only fixture facts so the original wrapper/source expression IDs are
+/// unchanged; no production fallback or alternate evaluator is installed.
+pub(super) fn eval_frozen_time(
+    name: &str,
+    source: &ExprArena,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    let (name, output) = match name {
+        "time_to_sec" => ("time_to_sec", DataType::Int64),
+        "time_format" => ("time_format", DataType::Utf8),
+        _ => panic!("unsupported time fixture call: {name}"),
+    };
+    let mut arena = source.clone();
+    let root = arena.push_typed(
+        ExprNode::FunctionCall {
+            kind: FunctionKind::Date(name),
+            args: args.to_vec(),
+        },
+        output,
+    );
+    crate::exec::expr::function::eval_date_function(name, &arena, root, args, chunk)
+}
+#[test]
+fn time_dispatch_requires_a_real_frozen_result_declaration() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let (arena, args, chunk) = setup(vec![text(vec![Some("12:34:56")]), text(vec![Some("%f")])]);
+    for (name, args) in [("time_to_sec", &args[..1]), ("time_format", &args[..])] {
+        let failure = crate::exec::expr::function::eval_date_function(
+            name,
+            &arena,
+            ExprId(usize::MAX),
+            args,
+            &chunk,
+        )
+        .unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(failure.failure_fact().reason().code(), 274);
+    }
 }

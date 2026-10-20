@@ -180,7 +180,7 @@ pub struct ProgramResolvedCalls {
     _storage: ValueTypeStorageLifetime,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProgramResolvedCallsError {
     Control(CompileControlError),
     TooManyItems,

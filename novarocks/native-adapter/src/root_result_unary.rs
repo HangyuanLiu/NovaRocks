@@ -33,11 +33,13 @@ use std::task::{Context, Poll};
 
 use bytes::{BufMut, Bytes};
 use hyper::body::{Body, Frame, SizeHint};
-use novarocks_execution_contract::root_result::{RootReadOutcome, RootResultReply};
+use novarocks_execution_contract::root_result::{
+    RootReadOutcome, RootReadResponse, RootResultReply,
+};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as wire;
 use novarocks_result_contract::RootProfileV1;
-use novarocks_task_codec::root_result::{decode_read, encode_reply};
+use novarocks_task_codec::root_result::{decode_read, encode_reply, encode_response};
 use prost::Message;
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBody, EncodeBuf, Encoder};
 use tonic::codegen::http;
@@ -45,7 +47,7 @@ use tonic::server::UnaryService;
 use tonic::{Code, Request, Response, Status};
 
 use crate::root_result_reader::{
-    NativeRootReadRefusal, NativeRootReadResponse, NativeRootResultReader, NativeRootSendOwnership,
+    NativeRootReadResponse, NativeRootResultReader, NativeRootSendOwnership,
 };
 
 const GRPC_PREFIX: usize = 5;
@@ -154,7 +156,16 @@ impl<'a> UnaryService<wire::FetchRootResultRequest> for RootService<'a> {
                     .map_err(|_| Status::new(Code::Internal, "invalid sealed root reply"))?;
                     (message, None)
                 }
-                NativeRootReadResponse::Refused(reason) => return Err(refusal_status(reason)),
+                NativeRootReadResponse::Deferred(reason) => {
+                    let message = encode_response(&RootReadResponse::Deferred(reason))
+                        .map_err(|_| Status::internal("invalid root deferral projection"))?;
+                    (message, None)
+                }
+                NativeRootReadResponse::Refused(reason) => {
+                    let message = encode_response(&RootReadResponse::Refused(reason))
+                        .map_err(|_| Status::internal("invalid root refusal projection"))?;
+                    (message, None)
+                }
             };
             // Projection follows the same metadata pregrant. Publish the
             // strong handoff before returning Ready to Tonic's map_response,
@@ -290,29 +301,5 @@ impl Body for NativeRootUnaryBody {
     }
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
-    }
-}
-
-fn refusal_status(reason: NativeRootReadRefusal) -> Status {
-    match reason {
-        NativeRootReadRefusal::UnknownRoot => Status::new(Code::NotFound, "unknown context root"),
-        NativeRootReadRefusal::Mismatch => {
-            Status::new(Code::FailedPrecondition, "frozen root read mismatch")
-        }
-        NativeRootReadRefusal::Preparing => {
-            Status::new(Code::Unavailable, "root installation in progress")
-        }
-        NativeRootReadRefusal::Busy => {
-            Status::new(Code::ResourceExhausted, "root read holder capacity")
-        }
-        NativeRootReadRefusal::BackingCapacity => {
-            Status::new(Code::ResourceExhausted, "root send backing capacity")
-        }
-        NativeRootReadRefusal::MetadataCapacity => {
-            Status::new(Code::ResourceExhausted, "root send metadata capacity")
-        }
-        NativeRootReadRefusal::Channel(_) => {
-            Status::new(Code::FailedPrecondition, "root channel read refused")
-        }
     }
 }

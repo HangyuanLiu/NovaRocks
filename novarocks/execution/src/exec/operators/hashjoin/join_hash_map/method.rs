@@ -39,6 +39,74 @@ use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::operators::hashjoin::join_hash_table::{JoinHashTable, row_has_forbidden_null};
 use crate::runtime::mem_tracker::MemTracker;
 
+#[derive(Debug)]
+struct JoinMapContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for JoinMapContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for JoinMapContract {}
+impl novarocks_failure_contract::FailureProjection for JoinMapContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::JoinMapContract.reason(),
+        )
+    }
+}
+fn map_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(JoinMapContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+#[derive(Debug)]
+struct JoinMapExtent {
+    required: u128,
+    limit: u64,
+    dimension: novarocks_failure_contract::ResourceDimension,
+}
+impl std::fmt::Display for JoinMapExtent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "join direct index {:?} extent {} exceeds {}",
+            self.dimension, self.required, self.limit
+        )
+    }
+}
+impl std::error::Error for JoinMapExtent {}
+impl novarocks_failure_contract::FailureProjection for JoinMapExtent {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, ResourceFacts, ResourceScope};
+        FailureFact::new(
+            FailureClass::Resource,
+            crate::runtime::fragment::ExecutionReason::JoinMapExtent.reason(),
+        )
+        .with_resource(ResourceFacts {
+            request_scope: Some(ResourceScope::Operator),
+            constraint_scope: Some(ResourceScope::Operator),
+            dimension: self.dimension,
+            requested: u64::try_from(self.required).ok(),
+            required_growth: None,
+            limit: Some(self.limit),
+            live: None,
+            committed: None,
+        })
+    }
+}
+fn map_extent(
+    required: u128,
+    limit: u64,
+    dimension: novarocks_failure_contract::ResourceDimension,
+) -> ExecutionFailure {
+    ExecutionFailure::from_domain(JoinMapExtent {
+        required,
+        limit,
+        dimension,
+    })
+}
+
 const DIRECT_RANGE_ROW_MULTIPLIER: u64 = 8;
 const DIRECT_RANGE_MAX_LEN: u64 = 16 * 1024 * 1024;
 const DIRECT_SET_MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -79,14 +147,43 @@ pub(crate) struct BuildKeyBatch {
     num_rows: usize,
 }
 
+#[derive(Debug)]
+struct BuildKeyBatchFailure {
+    ordinal: usize,
+    actual: usize,
+    expected: usize,
+}
+impl std::fmt::Display for BuildKeyBatchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "join build key batch column {} length mismatch: array={} rows={}",
+            self.ordinal, self.actual, self.expected
+        )
+    }
+}
+impl std::error::Error for BuildKeyBatchFailure {}
+impl novarocks_failure_contract::FailureProjection for BuildKeyBatchFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::JoinBuildKeyRows.reason(),
+        )
+    }
+}
 impl BuildKeyBatch {
-    pub(crate) fn new(arrays: Vec<ArrayRef>, num_rows: usize) -> Result<Self, String> {
-        for array in &arrays {
+    pub(crate) fn new(
+        arrays: Vec<ArrayRef>,
+        num_rows: usize,
+    ) -> crate::runtime::fragment::ExecutionResult<Self> {
+        for (ordinal, array) in arrays.iter().enumerate() {
             if array.len() != num_rows {
-                return Err(format!(
-                    "join build key batch length mismatch: array={} rows={}",
-                    array.len(),
-                    num_rows
+                return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+                    BuildKeyBatchFailure {
+                        ordinal,
+                        actual: array.len(),
+                        expected: num_rows,
+                    },
                 ));
             }
         }
@@ -201,7 +298,7 @@ impl JoinHashMap {
     pub(crate) fn new_chained(
         key_types: Vec<DataType>,
         null_safe_eq: Vec<bool>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ExecutionFailure> {
         let tracker = MemTracker::new_child(
             "JoinHashMapTest",
             &crate::runtime::mem_tracker::process_mem_tracker(),
@@ -213,7 +310,7 @@ impl JoinHashMap {
         key_types: Vec<DataType>,
         null_safe_eq: Vec<bool>,
         tracker: Arc<MemTracker>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ExecutionFailure> {
         Ok(Self::Chained(ChainedJoinHashMap {
             table: JoinHashTable::new_with_tracker(key_types, null_safe_eq, tracker)?,
         }))
@@ -225,7 +322,7 @@ impl JoinHashMap {
         null_safe_eq: Vec<bool>,
         batches: &[BuildKeyBatch],
         options: JoinHashMapBuildOptions,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ExecutionFailure> {
         Self::build_from_key_batches_with_tracker(key_types, null_safe_eq, batches, options, None)
     }
 
@@ -235,7 +332,7 @@ impl JoinHashMap {
         batches: &[BuildKeyBatch],
         options: JoinHashMapBuildOptions,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ExecutionFailure> {
         if let Some(direct_set) = DirectIntJoinHashSet::try_build(
             &key_types,
             &null_safe_eq,
@@ -263,9 +360,9 @@ impl JoinHashMap {
             ),
             #[cfg(not(test))]
             None => {
-                return Err(
-                    "join hash table memory tracker must be bound before construction".to_string(),
-                );
+                return Err(map_contract(
+                    "join hash table memory tracker must be bound before construction",
+                ));
             }
         };
         let mut chained = Self::new_chained_with_tracker(key_types, null_safe_eq, tracker)?;
@@ -320,28 +417,27 @@ impl JoinHashMap {
         &mut self,
         key_arrays: &[ArrayRef],
         num_rows: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExecutionFailure> {
         match self {
             Self::Chained(map) => map.table.add_build_rows(key_arrays, num_rows),
-            Self::DirectInt(_) => {
-                Err("direct integer join hash map does not support incremental build".to_string())
-            }
-            Self::DirectIntSet(_) => Err(
-                "presence-only direct integer join set does not support incremental build"
-                    .to_string(),
-            ),
+            Self::DirectInt(_) => Err(map_contract(
+                "direct integer join hash map does not support incremental build",
+            )),
+            Self::DirectIntSet(_) => Err(map_contract(
+                "presence-only direct integer join set does not support incremental build",
+            )),
         }
     }
 
-    pub(crate) fn finalize(&mut self) -> Result<(), String> {
+    pub(crate) fn finalize(&mut self) -> Result<(), ExecutionFailure> {
         match self {
             Self::Chained(map) => map.table.finalize_groups(),
-            Self::DirectInt(_) => {
-                Err("direct integer join hash map is finalized during build".to_string())
-            }
-            Self::DirectIntSet(_) => {
-                Err("presence-only direct integer join set is finalized during build".to_string())
-            }
+            Self::DirectInt(_) => Err(map_contract(
+                "direct integer join hash map is finalized during build",
+            )),
+            Self::DirectIntSet(_) => Err(map_contract(
+                "presence-only direct integer join set is finalized during build",
+            )),
         }
     }
 
@@ -358,10 +454,9 @@ impl JoinHashMap {
             Self::DirectInt(map) => {
                 Ok((map.lookup_selection_evaluated(probe_keys, probe, evaluate))?)
             }
-            Self::DirectIntSet(_) => Err(
-                ("presence-only direct integer join set cannot enumerate build rows".to_string())
-                    .into(),
-            ),
+            Self::DirectIntSet(_) => Err(map_contract(
+                "presence-only direct integer join set cannot enumerate build rows",
+            )),
         }
     }
 
@@ -409,10 +504,9 @@ impl JoinHashMap {
             Self::DirectInt(map) => {
                 Ok((map.lookup_group_ids_evaluated(probe_keys, probe, evaluate))?)
             }
-            Self::DirectIntSet(_) => Err(
-                ("presence-only direct integer join set cannot return group ids".to_string())
-                    .into(),
-            ),
+            Self::DirectIntSet(_) => Err(map_contract(
+                "presence-only direct integer join set cannot return group ids",
+            )),
         }
     }
 
@@ -425,10 +519,9 @@ impl JoinHashMap {
         match self {
             Self::Chained(map) => Ok((map.search_pairs_evaluated(probe_keys, probe, evaluate))?),
             Self::DirectInt(map) => Ok((map.search_pairs_evaluated(probe_keys, probe, evaluate))?),
-            Self::DirectIntSet(_) => Err(
-                ("presence-only direct integer join set cannot enumerate build rows".to_string())
-                    .into(),
-            ),
+            Self::DirectIntSet(_) => Err(map_contract(
+                "presence-only direct integer join set cannot enumerate build rows",
+            )),
         }
     }
 
@@ -438,14 +531,15 @@ impl JoinHashMap {
         arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
-    ) -> Result<(Vec<Option<usize>>, JoinSelection), String> {
+    ) -> Result<(Vec<Option<usize>>, JoinSelection), ExecutionFailure> {
         if probe.chunk_schema().is_typed() {
-            return Err("reference join-key evaluation requires an untyped input".into());
+            return Err(map_contract(
+                "reference join-key evaluation requires an untyped input",
+            ));
         }
         self.lookup_selection_evaluated(probe_keys, probe, &mut |id, input| {
             arena.eval(id, input).map_err(Into::into)
         })
-        .map_err(|error| error.to_string())
     }
 
     #[cfg(test)]
@@ -454,14 +548,15 @@ impl JoinHashMap {
         arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
-    ) -> Result<Vec<bool>, String> {
+    ) -> Result<Vec<bool>, ExecutionFailure> {
         if probe.chunk_schema().is_typed() {
-            return Err("reference join-key evaluation requires an untyped input".into());
+            return Err(map_contract(
+                "reference join-key evaluation requires an untyped input",
+            ));
         }
         self.lookup_membership_evaluated(probe_keys, probe, &mut |id, input| {
             arena.eval(id, input).map_err(Into::into)
         })
-        .map_err(|error| error.to_string())
     }
 
     #[cfg(test)]
@@ -470,14 +565,15 @@ impl JoinHashMap {
         arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
-    ) -> Result<(ProbeMask, SearchStats), String> {
+    ) -> Result<(ProbeMask, SearchStats), ExecutionFailure> {
         if probe.chunk_schema().is_typed() {
-            return Err("reference join-key evaluation requires an untyped input".into());
+            return Err(map_contract(
+                "reference join-key evaluation requires an untyped input",
+            ));
         }
         self.search_membership_evaluated(probe_keys, probe, &mut |id, input| {
             arena.eval(id, input).map_err(Into::into)
         })
-        .map_err(|error| error.to_string())
     }
 
     #[cfg(test)]
@@ -486,14 +582,15 @@ impl JoinHashMap {
         arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
-    ) -> Result<Vec<Option<usize>>, String> {
+    ) -> Result<Vec<Option<usize>>, ExecutionFailure> {
         if probe.chunk_schema().is_typed() {
-            return Err("reference join-key evaluation requires an untyped input".into());
+            return Err(map_contract(
+                "reference join-key evaluation requires an untyped input",
+            ));
         }
         self.lookup_group_ids_evaluated(probe_keys, probe, &mut |id, input| {
             arena.eval(id, input).map_err(Into::into)
         })
-        .map_err(|error| error.to_string())
     }
 
     #[cfg(test)]
@@ -502,14 +599,15 @@ impl JoinHashMap {
         arena: &ExprArena,
         probe_keys: &[ExprId],
         probe: &Chunk,
-    ) -> Result<(JoinSelection, SearchStats), String> {
+    ) -> Result<(JoinSelection, SearchStats), ExecutionFailure> {
         if probe.chunk_schema().is_typed() {
-            return Err("reference join-key evaluation requires an untyped input".into());
+            return Err(map_contract(
+                "reference join-key evaluation requires an untyped input",
+            ));
         }
         self.search_pairs_evaluated(probe_keys, probe, &mut |id, input| {
             arena.eval(id, input).map_err(Into::into)
         })
-        .map_err(|error| error.to_string())
     }
 
     /// Membership of `probe_len` probe rows whose key arrays are already
@@ -519,7 +617,7 @@ impl JoinHashMap {
         &self,
         probe_keys: &[ArrayRef],
         probe_len: usize,
-    ) -> Result<(ProbeMask, SearchStats), String> {
+    ) -> Result<(ProbeMask, SearchStats), ExecutionFailure> {
         check_probe_key_arrays(probe_keys, probe_len)?;
         match self {
             Self::Chained(map) => map.search_membership_arrays(probe_keys, probe_len),
@@ -534,14 +632,14 @@ impl JoinHashMap {
         &self,
         probe_keys: &[ArrayRef],
         probe_len: usize,
-    ) -> Result<Vec<Option<usize>>, String> {
+    ) -> Result<Vec<Option<usize>>, ExecutionFailure> {
         check_probe_key_arrays(probe_keys, probe_len)?;
         match self {
             Self::Chained(map) => map.lookup_group_ids_arrays(probe_keys, probe_len),
             Self::DirectInt(map) => map.lookup_group_ids_arrays(probe_keys, probe_len),
-            Self::DirectIntSet(_) => {
-                Err("presence-only direct integer join set cannot return group ids".to_string())
-            }
+            Self::DirectIntSet(_) => Err(map_contract(
+                "presence-only direct integer join set cannot return group ids",
+            )),
         }
     }
 
@@ -551,27 +649,164 @@ impl JoinHashMap {
         &self,
         probe_keys: &[ArrayRef],
         probe_len: usize,
-    ) -> Result<(JoinSelection, SearchStats), String> {
+    ) -> Result<(JoinSelection, SearchStats), ExecutionFailure> {
         check_probe_key_arrays(probe_keys, probe_len)?;
         match self {
             Self::Chained(map) => map.search_pairs_arrays(probe_keys, probe_len),
             Self::DirectInt(map) => map.search_pairs_arrays(probe_keys, probe_len),
-            Self::DirectIntSet(_) => {
-                Err("presence-only direct integer join set cannot enumerate build rows".to_string())
-            }
+            Self::DirectIntSet(_) => Err(map_contract(
+                "presence-only direct integer join set cannot enumerate build rows",
+            )),
         }
     }
 }
 
+/// Position in already looked-up groups. It retains O(probe rows) metadata,
+/// never the Cartesian output relation. Direct chains retain their next link
+/// so resuming a page does not rescan an earlier prefix.
+pub(crate) struct JoinPairCursor {
+    groups: Vec<Option<usize>>,
+    probe_row: usize,
+    offset: usize,
+    next_build: u32,
+}
+#[derive(Debug)]
+pub(crate) enum JoinCursorFailure {
+    GroupUnavailable { group: usize },
+    BuildRowUnavailable { row: u32 },
+    PresenceOnly,
+    RowIdExtent,
+}
+impl std::fmt::Display for JoinCursorFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GroupUnavailable { group } => {
+                write!(f, "join cursor group {group} is unavailable")
+            }
+            Self::BuildRowUnavailable { row } => {
+                write!(f, "join cursor build row {row} is unavailable")
+            }
+            Self::PresenceOnly => f.write_str("presence-only join storage cannot enumerate rows"),
+            Self::RowIdExtent => f.write_str("join row exceeds its row-id representation"),
+        }
+    }
+}
+impl std::error::Error for JoinCursorFailure {}
+impl novarocks_failure_contract::FailureProjection for JoinCursorFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let (class, reason) = match self {
+            Self::GroupUnavailable { .. } => (
+                FailureClass::Invariant,
+                ExecutionReason::JoinGroupUnavailable,
+            ),
+            Self::BuildRowUnavailable { .. } => (
+                FailureClass::Invariant,
+                ExecutionReason::JoinBuildRowUnavailable,
+            ),
+            Self::PresenceOnly => (FailureClass::Invariant, ExecutionReason::JoinPresenceOnly),
+            Self::RowIdExtent => (
+                FailureClass::Representation,
+                ExecutionReason::JoinRowIdExtent,
+            ),
+        };
+        FailureFact::new(class, reason.reason())
+    }
+}
+impl JoinPairCursor {
+    pub(crate) fn new(groups: Vec<Option<usize>>) -> Self {
+        Self {
+            groups,
+            probe_row: 0,
+            offset: 0,
+            next_build: ROW_NONE,
+        }
+    }
+    pub(crate) fn is_complete(&self) -> bool {
+        self.probe_row == self.groups.len()
+    }
+    pub(crate) fn next_page(
+        &mut self,
+        map: &JoinHashMap,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<JoinSelection, JoinCursorFailure> {
+        if matches!(map, JoinHashMap::DirectIntSet(_)) {
+            return Err(JoinCursorFailure::PresenceOnly);
+        }
+        let mut output = JoinSelection::new();
+        while !self.is_complete() && output.len() < limit.get() {
+            let Some(group) = self.groups[self.probe_row] else {
+                self.advance_probe();
+                continue;
+            };
+            let probe =
+                u32::try_from(self.probe_row).map_err(|_| JoinCursorFailure::RowIdExtent)?;
+            match map {
+                JoinHashMap::Chained(map) => {
+                    let rows = map
+                        .table
+                        .group_build_rows(group)
+                        .map_err(|_| JoinCursorFailure::GroupUnavailable { group })?;
+                    let end = self
+                        .offset
+                        .saturating_add(limit.get() - output.len())
+                        .min(rows.len());
+                    for &row in &rows[self.offset..end] {
+                        output.push(probe, row);
+                    }
+                    self.offset = end;
+                    if end == rows.len() {
+                        self.advance_probe();
+                    }
+                }
+                JoinHashMap::DirectInt(map) => {
+                    let mut row = if self.offset == 0 {
+                        *map.first
+                            .get(group)
+                            .ok_or(JoinCursorFailure::GroupUnavailable { group })?
+                    } else {
+                        self.next_build
+                    };
+                    while row != ROW_NONE && output.len() < limit.get() {
+                        output.push(probe, row);
+                        self.offset += 1;
+                        row = *map
+                            .next
+                            .get(row as usize)
+                            .ok_or(JoinCursorFailure::BuildRowUnavailable { row })?;
+                    }
+                    self.next_build = row;
+                    if row == ROW_NONE {
+                        self.advance_probe();
+                    }
+                }
+                JoinHashMap::DirectIntSet(_) => {
+                    unreachable!("presence storage rejected before enumeration")
+                }
+            }
+        }
+        Ok(output)
+    }
+    fn advance_probe(&mut self) {
+        self.probe_row += 1;
+        self.offset = 0;
+        self.next_build = ROW_NONE;
+    }
+}
+
 /// Every evaluated probe key array covers exactly the probe rows.
-fn check_probe_key_arrays(probe_keys: &[ArrayRef], probe_len: usize) -> Result<(), String> {
+fn check_probe_key_arrays(
+    probe_keys: &[ArrayRef],
+    probe_len: usize,
+) -> Result<(), ExecutionFailure> {
     for array in probe_keys {
         if array.len() != probe_len {
-            return Err(format!(
+            return Err(map_contract(format_args!(
                 "join probe key array length mismatch: array={} rows={}",
                 array.len(),
                 probe_len
-            ));
+            )));
         }
     }
     Ok(())
@@ -616,7 +851,7 @@ impl ChainedJoinHashMap {
         &self,
         probe_keys: &[ArrayRef],
         probe_len: usize,
-    ) -> Result<(JoinSelection, SearchStats), String> {
+    ) -> Result<(JoinSelection, SearchStats), ExecutionFailure> {
         let group_ids = self.lookup_group_ids_arrays(probe_keys, probe_len)?;
         self.pairs_from_group_ids(group_ids)
     }
@@ -624,7 +859,7 @@ impl ChainedJoinHashMap {
     fn pairs_from_group_ids(
         &self,
         group_ids: Vec<Option<usize>>,
-    ) -> Result<(JoinSelection, SearchStats), String> {
+    ) -> Result<(JoinSelection, SearchStats), ExecutionFailure> {
         let stats = SearchStats::from_group_ids(&group_ids);
         let mut selection = JoinSelection::new();
         for (probe_row, group_id_opt) in group_ids.iter().enumerate() {
@@ -653,14 +888,14 @@ impl ChainedJoinHashMap {
         &self,
         probe_keys: &[ArrayRef],
         probe_len: usize,
-    ) -> Result<(ProbeMask, SearchStats), String> {
+    ) -> Result<(ProbeMask, SearchStats), ExecutionFailure> {
         let group_ids = self.lookup_group_ids_arrays(probe_keys, probe_len)?;
         Self::membership_from_group_ids(group_ids)
     }
 
     fn membership_from_group_ids(
         group_ids: Vec<Option<usize>>,
-    ) -> Result<(ProbeMask, SearchStats), String> {
+    ) -> Result<(ProbeMask, SearchStats), ExecutionFailure> {
         let stats = SearchStats::from_group_ids(&group_ids);
         let mut mask = ProbeMask::new(group_ids.len(), false);
         for (row, group_id) in group_ids.iter().enumerate() {
@@ -682,7 +917,7 @@ impl ChainedJoinHashMap {
             return Ok(Vec::new());
         }
         if probe_keys.is_empty() {
-            return Err(("join hash table does not support empty keys".to_string()).into());
+            return Err(map_contract("join hash table does not support empty keys"));
         }
 
         let mut probe_key_arrays = Vec::with_capacity(probe_keys.len());
@@ -697,54 +932,44 @@ impl ChainedJoinHashMap {
         &self,
         probe_key_arrays: &[ArrayRef],
         probe_len: usize,
-    ) -> Result<Vec<Option<usize>>, String> {
+    ) -> Result<Vec<Option<usize>>, ExecutionFailure> {
         if probe_len == 0 {
             return Ok(Vec::new());
         }
         if probe_key_arrays.is_empty() {
-            return Err("join hash table does not support empty keys".to_string());
+            return Err(map_contract("join hash table does not support empty keys"));
         }
 
-        let key_views = build_group_key_views(probe_key_arrays).map_err(|e| e.to_string())?;
+        let key_views = build_group_key_views(probe_key_arrays)?;
         let nulls = build_nulls(&key_views, probe_len, self.table.null_safe_eq());
 
         match self.table.key_strategy() {
             GroupKeyStrategy::OneNumber => {
                 let view = key_views
                     .first()
-                    .ok_or_else(|| "join one number key view missing".to_string())?;
-                let hashes = build_one_number_hashes(view, probe_len, self.table.hash_seed())
-                    .map_err(|e| e.to_string())?;
-                self.table
-                    .lookup_one_number_batch(view, &hashes, &nulls)
-                    .map_err(|e| e.to_string())
+                    .ok_or_else(|| map_contract("join one number key view missing"))?;
+                let hashes = build_one_number_hashes(view, probe_len, self.table.hash_seed())?;
+                self.table.lookup_one_number_batch(view, &hashes, &nulls)
             }
             GroupKeyStrategy::OneString => {
                 let view = key_views
                     .first()
-                    .ok_or_else(|| "join one string key view missing".to_string())?;
-                let hashes = build_group_key_hashes(&key_views, probe_len, self.table.hash_seed())
-                    .map_err(|e| e.to_string())?;
-                self.table
-                    .lookup_one_string_batch(view, &hashes, &nulls)
-                    .map_err(|e| e.to_string())
+                    .ok_or_else(|| map_contract("join one string key view missing"))?;
+                let hashes = build_group_key_hashes(&key_views, probe_len, self.table.hash_seed())?;
+                self.table.lookup_one_string_batch(view, &hashes, &nulls)
             }
             GroupKeyStrategy::FixedSize => {
-                let hashes = build_group_key_hashes(&key_views, probe_len, self.table.hash_seed())
-                    .map_err(|e| e.to_string())?;
+                let hashes = build_group_key_hashes(&key_views, probe_len, self.table.hash_seed())?;
                 self.table
                     .lookup_fixed_size_batch(&key_views, &hashes, &nulls)
-                    .map_err(|e| e.to_string())
             }
             GroupKeyStrategy::CompressedFixed => {
                 let ctx = self
                     .table
                     .compressed_ctx()
-                    .ok_or_else(|| "join compressed key context missing".to_string())?;
-                let keys = build_compressed_flags(ctx, &key_views, probe_len)
-                    .map_err(|e| e.to_string())?;
-                let hashes = build_group_key_hashes(&key_views, probe_len, self.table.hash_seed())
-                    .map_err(|e| e.to_string())?;
+                    .ok_or_else(|| map_contract("join compressed key context missing"))?;
+                let keys = build_compressed_flags(ctx, &key_views, probe_len)?;
+                let hashes = build_group_key_hashes(&key_views, probe_len, self.table.hash_seed())?;
                 let need_rows = keys
                     .iter()
                     .zip(nulls.iter())
@@ -754,20 +979,21 @@ impl ChainedJoinHashMap {
                 } else {
                     None
                 };
-                self.table
-                    .lookup_compressed_batch(&key_views, &keys, rows.as_ref(), &hashes, &nulls)
-                    .map_err(|e| e.to_string())
+                self.table.lookup_compressed_batch(
+                    &key_views,
+                    &keys,
+                    rows.as_ref(),
+                    &hashes,
+                    &nulls,
+                )
             }
             GroupKeyStrategy::Serialized => {
                 let rows = self.table.build_rows_or_fallback(probe_key_arrays)?;
-                let hashes = build_group_key_hashes(&key_views, probe_len, self.table.hash_seed())
-                    .map_err(|e| e.to_string())?;
-                self.table
-                    .lookup_serialized_batch(&rows, &hashes, &nulls)
-                    .map_err(|e| e.to_string())
+                let hashes = build_group_key_hashes(&key_views, probe_len, self.table.hash_seed())?;
+                self.table.lookup_serialized_batch(&rows, &hashes, &nulls)
             }
             GroupKeyStrategy::Scalar => {
-                Err("join hash table does not support empty keys".to_string())
+                Err(map_contract("join hash table does not support empty keys"))
             }
         }
     }
@@ -784,7 +1010,7 @@ impl DirectIntJoinHashMap {
         batches: &[BuildKeyBatch],
         options: JoinHashMapBuildOptions,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<Option<Self>, String> {
+    ) -> Result<Option<Self>, ExecutionFailure> {
         if key_types.len() != 1 || null_safe_eq.len() != 1 || null_safe_eq[0] {
             return Ok(None);
         }
@@ -801,12 +1027,17 @@ impl DirectIntJoinHashMap {
         }
         let row_gate = (stats.indexed_rows as u64)
             .checked_mul(options.direct_range_row_multiplier)
-            .ok_or_else(|| "join direct range gate overflow".to_string())?;
+            .ok_or_else(|| map_contract("join direct range gate overflow"))?;
         if range > row_gate {
             return Ok(None);
         }
-        let len = usize::try_from(range)
-            .map_err(|_| "direct integer join range length overflow".to_string())?;
+        let len = usize::try_from(range).map_err(|_| {
+            map_extent(
+                range as u128,
+                usize::MAX as u64,
+                novarocks_failure_contract::ResourceDimension::Positions,
+            )
+        })?;
         let mut map = Self {
             data_type: key_types[0].clone(),
             min: stats.min,
@@ -828,37 +1059,39 @@ impl DirectIntJoinHashMap {
         Ok(Some(map))
     }
 
-    fn fill_from_batches(&mut self, batches: &[BuildKeyBatch]) -> Result<(), String> {
+    fn fill_from_batches(&mut self, batches: &[BuildKeyBatch]) -> Result<(), ExecutionFailure> {
         let mut base_row = 0usize;
         for batch in batches {
             let array = batch
                 .arrays()
                 .first()
-                .ok_or_else(|| "direct integer join build key missing".to_string())?;
+                .ok_or_else(|| map_contract("direct integer join build key missing"))?;
             if array.data_type() != &self.data_type {
-                return Err("direct integer join key type mismatch".to_string());
+                return Err(map_contract("direct integer join key type mismatch"));
             }
-            let view = IntArrayView::new(array)?;
+            let view = IntArrayView::new(array).map_err(ExecutionFailure::from_domain)?;
             for row in 0..batch.num_rows() {
                 let global_row = base_row
                     .checked_add(row)
-                    .ok_or_else(|| "direct integer join row count overflow".to_string())?;
+                    .ok_or_else(|| map_contract("direct integer join row count overflow"))?;
                 let Some(value) = view.value_at(row) else {
                     continue;
                 };
-                let bucket = direct_bucket(value, self.min, self.max, self.len)
-                    .ok_or_else(|| "direct integer join key outside collected range".to_string())?;
+                let bucket =
+                    direct_bucket(value, self.min, self.max, self.len).ok_or_else(|| {
+                        map_contract("direct integer join key outside collected range")
+                    })?;
                 let row_id = u32::try_from(global_row)
-                    .map_err(|_| "direct integer join row id overflow".to_string())?;
+                    .map_err(|_| map_contract("direct integer join row id overflow"))?;
                 self.next[global_row] = self.first[bucket];
                 self.first[bucket] = row_id;
             }
             base_row = base_row
                 .checked_add(batch.num_rows())
-                .ok_or_else(|| "direct integer join row count overflow".to_string())?;
+                .ok_or_else(|| map_contract("direct integer join row count overflow"))?;
         }
         if base_row != self.row_count {
-            return Err("direct integer join row count mismatch".to_string());
+            return Err(map_contract("direct integer join row count mismatch"));
         }
         Ok(())
     }
@@ -882,7 +1115,7 @@ impl DirectIntJoinHashMap {
         &self,
         probe_keys: &[ArrayRef],
         probe_len: usize,
-    ) -> Result<Vec<Option<usize>>, String> {
+    ) -> Result<Vec<Option<usize>>, ExecutionFailure> {
         if probe_len == 0 {
             return Ok(Vec::new());
         }
@@ -894,8 +1127,8 @@ impl DirectIntJoinHashMap {
         &self,
         probe_array: &ArrayRef,
         probe_len: usize,
-    ) -> Result<Vec<Option<usize>>, String> {
-        let probe_view = IntArrayView::new(probe_array)?;
+    ) -> Result<Vec<Option<usize>>, ExecutionFailure> {
+        let probe_view = IntArrayView::new(probe_array).map_err(ExecutionFailure::from_domain)?;
         let mut group_ids = Vec::with_capacity(probe_len);
         for row in 0..probe_len {
             let group_id = match probe_view.value_at(row) {
@@ -960,7 +1193,7 @@ impl DirectIntJoinHashMap {
         &self,
         probe_keys: &[ArrayRef],
         probe_len: usize,
-    ) -> Result<(JoinSelection, SearchStats), String> {
+    ) -> Result<(JoinSelection, SearchStats), ExecutionFailure> {
         if probe_len == 0 {
             return Ok(empty_pairs());
         }
@@ -972,8 +1205,8 @@ impl DirectIntJoinHashMap {
         &self,
         probe_array: &ArrayRef,
         probe_len: usize,
-    ) -> Result<(JoinSelection, SearchStats), String> {
-        let probe_view = IntArrayView::new(probe_array)?;
+    ) -> Result<(JoinSelection, SearchStats), ExecutionFailure> {
+        let probe_view = IntArrayView::new(probe_array).map_err(ExecutionFailure::from_domain)?;
         let mut cursor = Vec::with_capacity(probe_len);
         let mut hit_rows = 0u64;
         for probe_row in 0..probe_len {
@@ -1024,7 +1257,7 @@ impl DirectIntJoinHashMap {
         &self,
         probe_keys: &[ArrayRef],
         probe_len: usize,
-    ) -> Result<(ProbeMask, SearchStats), String> {
+    ) -> Result<(ProbeMask, SearchStats), ExecutionFailure> {
         if probe_len == 0 {
             return Ok(empty_membership());
         }
@@ -1036,8 +1269,8 @@ impl DirectIntJoinHashMap {
         &self,
         probe_array: &ArrayRef,
         probe_len: usize,
-    ) -> Result<(ProbeMask, SearchStats), String> {
-        let probe_view = IntArrayView::new(probe_array)?;
+    ) -> Result<(ProbeMask, SearchStats), ExecutionFailure> {
+        let probe_view = IntArrayView::new(probe_array).map_err(ExecutionFailure::from_domain)?;
         let mut mask = ProbeMask::new(probe_len, false);
         let mut hit_rows = 0u64;
         for row in 0..probe_len {
@@ -1067,11 +1300,11 @@ impl DirectIntJoinHashMap {
         (row != ROW_NONE).then_some(bucket)
     }
 
-    fn next_row(&self, row_id: u32) -> Result<u32, String> {
+    fn next_row(&self, row_id: u32) -> Result<u32, ExecutionFailure> {
         self.next
             .get(row_id as usize)
             .copied()
-            .ok_or_else(|| "direct integer join row id out of bounds".to_string())
+            .ok_or_else(|| map_contract("direct integer join row id out of bounds"))
     }
 
     fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
@@ -1115,7 +1348,7 @@ impl DirectIntJoinHashSet {
         batches: &[BuildKeyBatch],
         options: JoinHashMapBuildOptions,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<Option<Self>, String> {
+    ) -> Result<Option<Self>, ExecutionFailure> {
         // DirectIntSet stores one bit per integer key in the observed
         // [min, max] range. It is only useful for presence-only joins: once
         // callers need group ids or build rows, the bitset no longer carries
@@ -1148,10 +1381,20 @@ impl DirectIntJoinHashSet {
         if bitset_bytes > options.direct_set_max_bytes && bitset_bytes > bucket_gate {
             return Ok(None);
         }
-        let len = usize::try_from(range)
-            .map_err(|_| "direct integer join set range length overflow".to_string())?;
-        let bitset_len = usize::try_from(bitset_bytes)
-            .map_err(|_| "direct integer join set byte size overflow".to_string())?;
+        let len = usize::try_from(range).map_err(|_| {
+            map_extent(
+                range as u128,
+                usize::MAX as u64,
+                novarocks_failure_contract::ResourceDimension::Positions,
+            )
+        })?;
+        let bitset_len = usize::try_from(bitset_bytes).map_err(|_| {
+            map_extent(
+                bitset_bytes as u128,
+                usize::MAX as u64,
+                novarocks_failure_contract::ResourceDimension::Bytes,
+            )
+        })?;
         let mut set = Self {
             data_type: key_types[0].clone(),
             min: stats.min,
@@ -1172,33 +1415,33 @@ impl DirectIntJoinHashSet {
         Ok(Some(set))
     }
 
-    fn fill_from_batches(&mut self, batches: &[BuildKeyBatch]) -> Result<(), String> {
+    fn fill_from_batches(&mut self, batches: &[BuildKeyBatch]) -> Result<(), ExecutionFailure> {
         let mut base_row = 0usize;
         for batch in batches {
             let array = batch
                 .arrays()
                 .first()
-                .ok_or_else(|| "direct integer join set build key missing".to_string())?;
+                .ok_or_else(|| map_contract("direct integer join set build key missing"))?;
             if array.data_type() != &self.data_type {
-                return Err("direct integer join set key type mismatch".to_string());
+                return Err(map_contract("direct integer join set key type mismatch"));
             }
-            let view = IntArrayView::new(array)?;
+            let view = IntArrayView::new(array).map_err(ExecutionFailure::from_domain)?;
             for row in 0..batch.num_rows() {
                 let Some(value) = view.value_at(row) else {
                     continue;
                 };
                 let bucket =
                     direct_bucket(value, self.min, self.max, self.len).ok_or_else(|| {
-                        "direct integer join set key outside collected range".to_string()
+                        map_contract("direct integer join set key outside collected range")
                     })?;
                 self.set_bucket(bucket)?;
             }
             base_row = base_row
                 .checked_add(batch.num_rows())
-                .ok_or_else(|| "direct integer join set row count overflow".to_string())?;
+                .ok_or_else(|| map_contract("direct integer join set row count overflow"))?;
         }
         if base_row != self.row_count {
-            return Err("direct integer join set row count mismatch".to_string());
+            return Err(map_contract("direct integer join set row count mismatch"));
         }
         self.refresh_accounting();
         Ok(())
@@ -1223,7 +1466,7 @@ impl DirectIntJoinHashSet {
         &self,
         probe_keys: &[ArrayRef],
         probe_len: usize,
-    ) -> Result<(ProbeMask, SearchStats), String> {
+    ) -> Result<(ProbeMask, SearchStats), ExecutionFailure> {
         if probe_len == 0 {
             return Ok(empty_membership());
         }
@@ -1235,8 +1478,8 @@ impl DirectIntJoinHashSet {
         &self,
         probe_array: &ArrayRef,
         probe_len: usize,
-    ) -> Result<(ProbeMask, SearchStats), String> {
-        let probe_view = IntArrayView::new(probe_array)?;
+    ) -> Result<(ProbeMask, SearchStats), ExecutionFailure> {
+        let probe_view = IntArrayView::new(probe_array).map_err(ExecutionFailure::from_domain)?;
         let mut mask = ProbeMask::new(probe_len, false);
         let mut hit_rows = 0u64;
         for row in 0..probe_len {
@@ -1258,11 +1501,11 @@ impl DirectIntJoinHashSet {
         ))
     }
 
-    fn set_bucket(&mut self, bucket: usize) -> Result<(), String> {
+    fn set_bucket(&mut self, bucket: usize) -> Result<(), ExecutionFailure> {
         let byte = bucket / 8;
         let bit = (bucket % 8) as u8;
         let Some(slot) = self.bits.get_mut(byte) else {
-            return Err("direct integer join set bucket out of bounds".to_string());
+            return Err(map_contract("direct integer join set bucket out of bounds"));
         };
         *slot |= 1u8 << bit;
         Ok(())
@@ -1326,7 +1569,7 @@ impl Drop for DirectIntJoinHashSet {
 fn collect_direct_int_stats(
     data_type: &DataType,
     batches: &[BuildKeyBatch],
-) -> Result<DirectIntStats, String> {
+) -> Result<DirectIntStats, ExecutionFailure> {
     let mut min = i64::MAX;
     let mut max = i64::MIN;
     let mut row_count = 0usize;
@@ -1334,21 +1577,21 @@ fn collect_direct_int_stats(
     let mut not_null = true;
     for batch in batches {
         if batch.arrays().len() != 1 {
-            return Err("direct integer join requires one build key".to_string());
+            return Err(map_contract("direct integer join requires one build key"));
         }
         let array = batch
             .arrays()
             .first()
-            .ok_or_else(|| "direct integer join build key missing".to_string())?;
+            .ok_or_else(|| map_contract("direct integer join build key missing"))?;
         if array.len() != batch.num_rows() {
-            return Err(format!(
+            return Err(map_contract(format_args!(
                 "join build key batch length mismatch: array={} rows={}",
                 array.len(),
                 batch.num_rows()
-            ));
+            )));
         }
         if array.data_type() != data_type {
-            return Err("direct integer join key type mismatch".to_string());
+            return Err(map_contract("direct integer join key type mismatch"));
         }
         // Use observed Arrow nulls for the M2 fast path. This is stricter than
         // trusting planner metadata and keeps the fast path correct for computed
@@ -1356,14 +1599,11 @@ fn collect_direct_int_stats(
         if array.null_count() > 0 {
             not_null = false;
         }
-        let next_row_count = row_count
-            .checked_add(batch.num_rows())
-            .ok_or_else(|| "direct integer join row count overflow".to_string())?;
-        if next_row_count > u32::MAX as usize {
-            return Err("direct integer join row count overflow".to_string());
-        }
-        row_count = next_row_count;
-        let view = IntArrayView::new(array)?;
+        row_count = crate::exec::operators::hashjoin::join_hash_table::checked_row_count(
+            row_count,
+            batch.num_rows(),
+        )?;
+        let view = IntArrayView::new(array).map_err(ExecutionFailure::from_domain)?;
         for row in 0..batch.num_rows() {
             let Some(value) = view.value_at(row) else {
                 continue;
@@ -1372,7 +1612,7 @@ fn collect_direct_int_stats(
             max = max.max(value);
             indexed_rows = indexed_rows
                 .checked_add(1)
-                .ok_or_else(|| "direct integer join indexed row count overflow".to_string())?;
+                .ok_or_else(|| map_contract("direct integer join indexed row count overflow"))?;
         }
     }
     Ok(DirectIntStats {
@@ -1384,19 +1624,28 @@ fn collect_direct_int_stats(
     })
 }
 
-fn checked_direct_range(min: i64, max: i64) -> Result<u64, String> {
+fn checked_direct_range(min: i64, max: i64) -> Result<u64, ExecutionFailure> {
     if max < min {
-        return Err("direct integer join range is empty".to_string());
+        return Err(map_contract("direct integer join range is empty"));
     }
     let range = (max as i128) - (min as i128) + 1;
-    u64::try_from(range).map_err(|_| "direct integer join range overflow".to_string())
+    u64::try_from(range).map_err(|_| {
+        map_extent(
+            range as u128,
+            u64::MAX,
+            novarocks_failure_contract::ResourceDimension::Positions,
+        )
+    })
 }
 
-fn direct_set_bytes(range: u64) -> Result<u64, String> {
-    range
-        .checked_add(7)
-        .map(|bits| bits / 8)
-        .ok_or_else(|| "direct integer join set byte size overflow".to_string())
+fn direct_set_bytes(range: u64) -> Result<u64, ExecutionFailure> {
+    range.checked_add(7).map(|bits| bits / 8).ok_or_else(|| {
+        map_extent(
+            range as u128 + 7,
+            u64::MAX,
+            novarocks_failure_contract::ResourceDimension::Bytes,
+        )
+    })
 }
 
 fn direct_set_bucket_gate(indexed_rows: usize) -> u64 {
@@ -1412,13 +1661,18 @@ fn direct_bucket(value: i64, min: i64, max: i64, len: usize) -> Option<usize> {
     if value < min || value > max {
         return None;
     }
-    let bucket = usize::try_from(value - min).ok()?;
+    let bucket = usize::try_from(value as i128 - min as i128).ok()?;
     (bucket < len).then_some(bucket)
 }
 
-fn fallback_hash_seed(key_types: &[DataType], null_safe_eq: &[bool]) -> Result<u64, String> {
+fn fallback_hash_seed(
+    key_types: &[DataType],
+    null_safe_eq: &[bool],
+) -> Result<u64, ExecutionFailure> {
     if key_types.is_empty() || key_types.len() != null_safe_eq.len() {
-        return Err("join hash seed requires matching non-empty key metadata".to_string());
+        return Err(map_contract(
+            "join hash seed requires matching non-empty key metadata",
+        ));
     }
     Ok(crate::exec::hash_table::hash::seed_from_hasher(
         &hashbrown::hash_map::DefaultHashBuilder::default(),
@@ -1432,7 +1686,7 @@ fn eval_single_probe_int_key_evaluated(
     evaluate: &mut ExprEvaluationCallback<'_>,
 ) -> Result<ArrayRef, ExecutionFailure> {
     if probe_keys.len() != 1 {
-        return Err(("direct integer join requires one probe key".to_string()).into());
+        return Err(map_contract("direct integer join requires one probe key"));
     }
     let array = evaluate(probe_keys[0], probe)?;
     single_probe_int_key(std::slice::from_ref(&array), data_type)?;
@@ -1444,14 +1698,14 @@ fn eval_single_probe_int_key_evaluated(
 fn single_probe_int_key<'a>(
     probe_keys: &'a [ArrayRef],
     data_type: &DataType,
-) -> Result<&'a ArrayRef, String> {
+) -> Result<&'a ArrayRef, ExecutionFailure> {
     let [array] = probe_keys else {
-        return Err("direct integer join requires one probe key".to_string());
+        return Err(map_contract("direct integer join requires one probe key"));
     };
     if array.data_type() != data_type {
-        return Err("direct integer join probe key type mismatch".to_string());
+        return Err(map_contract("direct integer join probe key type mismatch"));
     }
-    IntArrayView::new(array)?;
+    IntArrayView::new(array).map_err(ExecutionFailure::from_domain)?;
     Ok(array)
 }
 
@@ -1501,11 +1755,11 @@ mod tests {
 
     use super::{
         BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions, JoinHashMapBuildPurpose,
-        JoinHashMapMethodKind,
+        JoinHashMapMethodKind, JoinPairCursor,
     };
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
-    use crate::exec::operators::hashjoin::join_hash_map::search::SearchStats;
+    use crate::exec::operators::hashjoin::join_hash_map::search::{JoinSelection, SearchStats};
     use crate::runtime::mem_tracker::MemTracker;
     use novarocks_types::SlotId;
 
@@ -1964,6 +2218,7 @@ mod tests {
             assert!(
                 map.search_pairs_arrays(&keys, probe.len() + 1)
                     .expect_err("short key array")
+                    .detail()
                     .contains("length mismatch")
             );
         }
@@ -1994,9 +2249,56 @@ mod tests {
             .expect_err("set cannot enumerate rows");
 
         assert_eq!(
-            err,
+            err.detail(),
             "presence-only direct integer join set cannot enumerate build rows"
         );
+    }
+
+    #[test]
+    fn pair_cursor_pages_preserve_actual_group_order_without_replaying_pairs() {
+        let build = int32_chunk(vec![Some(1), Some(2), Some(1), None]);
+        let probe = int32_chunk(vec![Some(1), Some(3), None, Some(2), Some(1)]);
+        let mut chained = JoinHashMap::new_chained(vec![DataType::Int32], vec![false]).unwrap();
+        chained
+            .add_build_rows(build.columns(), build.len())
+            .unwrap();
+        chained.finalize().unwrap();
+        let direct = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[BuildKeyBatch::new(build.columns().to_vec(), build.len()).unwrap()],
+            JoinHashMapBuildOptions::default(),
+        )
+        .unwrap();
+        assert!(matches!(direct, JoinHashMap::DirectInt(_)));
+        for (map, rows) in [
+            (&chained, vec![2, 0, 1, 2, 0]),
+            (&direct, vec![2, 0, 1, 2, 0]),
+        ] {
+            for limit in [1, 2, 3, 7] {
+                let groups = map
+                    .lookup_group_ids_arrays(probe.columns(), probe.len())
+                    .unwrap();
+                let mut cursor = JoinPairCursor::new(groups);
+                let mut pairs = JoinSelection::new();
+                while !cursor.is_complete() {
+                    let page = cursor
+                        .next_page(map, std::num::NonZeroUsize::new(limit).unwrap())
+                        .unwrap();
+                    assert!(page.len() <= limit);
+                    pairs.probe.extend(page.probe);
+                    pairs.build.extend(page.build);
+                }
+                assert_eq!(pairs.probe, vec![0, 0, 3, 4, 4]);
+                assert_eq!(pairs.build, rows);
+                assert!(
+                    cursor
+                        .next_page(map, std::num::NonZeroUsize::new(1).unwrap())
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
     }
 
     #[test]
@@ -2187,7 +2489,7 @@ mod tests {
             .expect_err("set cannot enumerate rows");
 
         assert_eq!(
-            err,
+            err.detail(),
             "presence-only direct integer join set cannot enumerate build rows"
         );
     }
@@ -2239,7 +2541,14 @@ mod tests {
         );
 
         match result {
-            Err(err) => assert_eq!(err, "join direct range gate overflow"),
+            Err(err) => {
+                use novarocks_failure_contract::FailureProjection;
+                assert_eq!(
+                    err.failure_fact().class(),
+                    novarocks_failure_contract::FailureClass::Invariant
+                );
+                assert_eq!(err.detail(), "join direct range gate overflow");
+            }
             Ok(_) => panic!("expected direct range gate overflow"),
         }
     }
@@ -2524,7 +2833,12 @@ mod tests {
         .into_iter()
         .map(Into::into)
         .collect();
-        failures.push(ExecutionFailure::from("cancelled").at_operator(41, PipelineOperation::Push));
+        failures.push(
+            ExecutionFailure::from(KernelFailure::Operational(KernelDiagnostic::new(
+                "cancelled",
+            )))
+            .at_operator(41, PipelineOperation::Push),
+        );
         for map in [&chained, &direct, &set] {
             let mut calls = Vec::new();
             let actual = map

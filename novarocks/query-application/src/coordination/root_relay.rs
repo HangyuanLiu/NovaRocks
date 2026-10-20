@@ -38,7 +38,10 @@
 use std::num::NonZeroU64;
 
 use novarocks_execution_contract::TaskIdentity;
-use novarocks_execution_contract::root_result::{RootReadOutcome, RootResultEnd, RootResultReply};
+use novarocks_execution_contract::root_result::{
+    RootReadDeferral, RootReadOutcome, RootReadRefusal, RootReadResponse, RootResultEnd,
+    RootResultReply,
+};
 use novarocks_result_contract::{
     ClientBodyError, ClientRowProfile, ClientRowStreamCursor, RootOutputKind, RootProfileId,
 };
@@ -86,6 +89,42 @@ impl std::fmt::Display for RootRelayError {
 }
 impl std::error::Error for RootRelayError {}
 
+impl RootRelayError {
+    pub fn safe_detail(&self) -> novarocks_execution_contract::SafeDetail {
+        // These diagnostics contain only this owner's fixed protocol wording.
+        // Body validation retains its producer's safe detail without row bytes.
+        let detail = match self {
+            Self::Identity => "root reply identity differs from its read",
+            Self::ConsumedMismatch => "root reply acknowledged a frontier this read did not send",
+            Self::Sequence => "root item arrived out of sequence",
+            Self::UnexpectedOutcome => "root reply outcome does not answer its read",
+            Self::Retired => "wanted root item was retired before it was read",
+            Self::EndMismatch => "root End differs from the rows delivered before it",
+            Self::ReceiptOrder => "root delivery receipt is out of order",
+            Self::Body(error) => error.safe_detail(),
+        };
+        novarocks_execution_contract::SafeDetail::truncating(detail)
+    }
+}
+
+impl novarocks_execution_contract::failure::FailureProjection for RootRelayError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::FailureProjection;
+        match self {
+            Self::Body(error) => error.failure_fact(),
+            Self::Identity
+            | Self::ConsumedMismatch
+            | Self::Sequence
+            | Self::UnexpectedOutcome
+            | Self::Retired
+            | Self::EndMismatch
+            | Self::ReceiptOrder => {
+                crate::execution_error::QueryFailureReason::ResultProtocol.failure_fact()
+            }
+        }
+    }
+}
+
 /// What the next read asks for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RootRelayRead {
@@ -95,8 +134,10 @@ pub struct RootRelayRead {
 }
 
 /// What to do with an accepted reply.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RootRelayStep {
+    Deferred(RootReadDeferral),
+    Refused(RootReadRefusal),
     /// Hand this item's validated body to delivery, in order. `rows` is the
     /// number of rows it completes.
     Deliver {
@@ -124,7 +165,7 @@ pub struct RootRelayFrontier {
     cursor: ClientRowStreamCursor,
     next_wanted: NonZeroU64,
     consumed_through: u64,
-    delivered_through: u64,
+    validated_through: u64,
     end: Option<RootResultEnd>,
     acknowledged_end: bool,
     last_read: Option<RootRelayRead>,
@@ -150,7 +191,7 @@ impl RootRelayFrontier {
             cursor: ClientRowStreamCursor::new(),
             next_wanted: NonZeroU64::MIN,
             consumed_through: 0,
-            delivered_through: 0,
+            validated_through: 0,
             end: None,
             acknowledged_end: false,
             last_read: None,
@@ -178,7 +219,7 @@ impl RootRelayFrontier {
     }
     /// Validated items whose delivery receipt has not completed.
     pub fn in_flight(&self) -> usize {
-        (self.delivered_through - self.consumed_through) as usize
+        (self.validated_through - self.consumed_through) as usize
     }
 
     /// The next read, or `None` when the stream needs nothing more: either
@@ -213,13 +254,35 @@ impl RootRelayFrontier {
     /// body when it has one. Failure changes no frontier.
     pub fn accept(
         &mut self,
-        reply: &RootResultReply,
+        response: &RootReadResponse,
         body: Option<&[u8]>,
     ) -> Result<RootRelayStep, RootRelayError> {
         let read = self.last_read.ok_or(RootRelayError::UnexpectedOutcome)?;
-        if reply.root_task != self.root || reply.profile != self.profile || reply.kind != self.kind
+        if response.root_task() != self.root
+            || response.profile() != self.profile
+            || response.kind() != self.kind
         {
             return Err(RootRelayError::Identity);
+        }
+        let reply = match response {
+            RootReadResponse::Deferred(deferred) => {
+                self.last_read = None;
+                return Ok(RootRelayStep::Deferred(deferred.reason()));
+            }
+            RootReadResponse::Refused(refused) => {
+                self.last_read = None;
+                return Ok(RootRelayStep::Refused(refused.clone()));
+            }
+            RootReadResponse::Reply(reply) => reply,
+        };
+        if matches!(reply.outcome, RootReadOutcome::AwaitTerminalControl) {
+            // Sealing may precede applying this request's cumulative ACK.
+            // Only actual completed delivery receipts bound the real watermark.
+            if reply.accepted_consumed > self.consumed_through {
+                return Err(RootRelayError::ConsumedMismatch);
+            }
+            self.last_read = None;
+            return Ok(RootRelayStep::AwaitTerminalControl);
         }
         if reply.accepted_consumed != read.consumed {
             return Err(RootRelayError::ConsumedMismatch);
@@ -259,7 +322,7 @@ impl RootRelayFrontier {
                         let end = data
                             .end_after_data()
                             .ok_or(RootRelayError::UnexpectedOutcome)?;
-                        if self.delivered_through != 0 || end.output_rows > 1 {
+                        if self.validated_through != 0 || end.output_rows > 1 {
                             return Err(RootRelayError::EndMismatch);
                         }
                         (self.cursor, end.output_rows)
@@ -270,7 +333,7 @@ impl RootRelayFrontier {
                     self.check_end(end, cursor, wanted.get() + 1)?;
                 }
                 self.cursor = cursor;
-                self.delivered_through = wanted.get();
+                self.validated_through = wanted.get();
                 self.next_wanted = wanted.checked_add(1).ok_or(RootRelayError::Sequence)?;
                 self.end = data.end_after_data();
                 RootRelayStep::Deliver {
@@ -310,10 +373,11 @@ impl RootRelayFrontier {
         if end.sequence.get() != expected_sequence {
             return Err(RootRelayError::Sequence);
         }
-        if self.client_rows.is_some()
-            && (cursor.validate_end().is_err() || cursor.completed_rows() != end.output_rows)
-        {
-            return Err(RootRelayError::EndMismatch);
+        if self.client_rows.is_some() {
+            cursor.validate_end().map_err(RootRelayError::Body)?;
+            if cursor.completed_rows() != end.output_rows {
+                return Err(RootRelayError::EndMismatch);
+            }
         }
         Ok(())
     }
@@ -321,7 +385,7 @@ impl RootRelayFrontier {
     /// Delivery of `sequence` completed. Receipts complete strictly in the
     /// order items were delivered.
     pub fn receipt(&mut self, sequence: NonZeroU64) -> Result<(), RootRelayError> {
-        if sequence.get() != self.consumed_through + 1 || sequence.get() > self.delivered_through {
+        if sequence.get() != self.consumed_through + 1 || sequence.get() > self.validated_through {
             return Err(RootRelayError::ReceiptOrder);
         }
         self.consumed_through = sequence.get();
@@ -407,7 +471,7 @@ mod tests {
             _ => None,
         };
         let reply = reply(frontier.root(), read.consumed, outcome);
-        frontier.accept(&reply, body.as_deref())
+        frontier.accept(&RootReadResponse::Reply(reply), body.as_deref())
     }
 
     #[test]
@@ -455,8 +519,14 @@ mod tests {
         // End inside the unfinished row is refused and changes nothing.
         assert_eq!(
             exchange(&mut frontier, end(2, 1)),
-            Err(RootRelayError::EndMismatch)
+            Err(RootRelayError::Body(ClientBodyError::EndInsideRow))
         );
+        assert_body_projection(
+            RootRelayError::Body(ClientBodyError::EndInsideRow),
+            ClientBodyError::EndInsideRow,
+        );
+        assert_eq!(frontier.consumed_through(), 1);
+        assert_eq!(frontier.in_flight(), 0);
         assert!(matches!(
             exchange(&mut frontier, data(2, b"cdef", Some((3, 1)))),
             Ok(RootRelayStep::Deliver {
@@ -487,10 +557,21 @@ mod tests {
     fn end_row_count_and_sequence_must_match_what_was_delivered() {
         let mut frontier = frontier(root());
         exchange(&mut frontier, data(1, &[1, 0, 0, 0, b'a'], None)).unwrap();
-        assert_eq!(
-            exchange(&mut frontier, end(2, 2)),
-            Err(RootRelayError::EndMismatch)
-        );
+        let error = exchange(&mut frontier, end(2, 2)).unwrap_err();
+        assert_eq!(error, RootRelayError::EndMismatch);
+        {
+            use novarocks_execution_contract::failure::FailureProjection;
+            assert_eq!(
+                error.failure_fact(),
+                crate::execution_error::QueryFailureReason::ResultProtocol.failure_fact(),
+            );
+            assert_eq!(
+                error.safe_detail(),
+                novarocks_execution_contract::SafeDetail::truncating(
+                    "root End differs from the rows delivered before it",
+                ),
+            );
+        }
         assert_eq!(
             exchange(&mut frontier, end(3, 1)),
             Err(RootRelayError::Sequence)
@@ -522,14 +603,42 @@ mod tests {
         assert_eq!(frontier.end_consumed().map(|end| end.output_rows), Some(0));
     }
 
+    fn assert_body_projection(error: RootRelayError, source: ClientBodyError) {
+        use novarocks_execution_contract::{
+            SafeDetail,
+            failure::{FailureClass, FailureEvidence, FailureProjection},
+        };
+        assert_eq!(error.failure_fact(), source.failure_fact());
+        assert_eq!(error.failure_fact().class(), FailureClass::Data);
+        assert_eq!(
+            error.failure_fact().evidence(),
+            FailureEvidence::Originating
+        );
+        assert_eq!(error.failure_fact().resource(), None);
+        assert_eq!(error.failure_fact().representation(), None);
+        assert_eq!(
+            error.safe_detail(),
+            SafeDetail::truncating(source.safe_detail())
+        );
+        assert_ne!(
+            error.failure_fact().reason(),
+            crate::execution_error::QueryFailureReason::BackendLost
+                .failure_fact()
+                .reason(),
+        );
+    }
+
     #[test]
     fn malformed_bodies_change_no_frontier() {
         let mut frontier = frontier(root());
         // A new prefix with no payload, a zero-length row and an oversize row.
-        for body in [
-            &[1, 0, 0, 0, b'a', 1, 0][..],
-            &[0, 0, 0, 0, b'a'][..],
-            &[65, 0, 0, 0, b'a'][..],
+        for (body, expected) in [
+            (
+                &[1, 0, 0, 0, b'a', 1, 0][..],
+                ClientBodyError::PrefixWithoutPayload,
+            ),
+            (&[0, 0, 0, 0, b'a'][..], ClientBodyError::InvalidRowLength),
+            (&[65, 0, 0, 0, b'a'][..], ClientBodyError::InvalidRowLength),
         ] {
             let read = frontier.next_read().unwrap();
             frontier.sent(read);
@@ -543,10 +652,11 @@ mod tests {
                 .unwrap(),
             );
             let reply = reply(frontier.root(), 0, outcome);
-            assert!(matches!(
-                frontier.accept(&reply, Some(body)),
-                Err(RootRelayError::Body(_))
-            ));
+            let error = frontier
+                .accept(&RootReadResponse::Reply(reply), Some(body))
+                .unwrap_err();
+            assert_eq!(error, RootRelayError::Body(expected));
+            assert_body_projection(error, expected);
             assert_eq!(frontier.in_flight(), 0);
             assert_eq!(
                 frontier.next_read(),
@@ -567,35 +677,50 @@ mod tests {
         let mut foreign = reply(root, 0, RootReadOutcome::NotReady);
         foreign.kind = RootOutputKind::CountOnly;
         assert_eq!(
-            frontier.accept(&foreign, None),
+            frontier.accept(&RootReadResponse::Reply(foreign), None),
             Err(RootRelayError::Identity)
         );
         assert_eq!(
-            frontier.accept(&reply(root, 3, RootReadOutcome::NotReady), None),
+            frontier.accept(
+                &RootReadResponse::Reply(reply(root, 3, RootReadOutcome::NotReady)),
+                None
+            ),
             Err(RootRelayError::ConsumedMismatch)
         );
         assert_eq!(
-            frontier.accept(&reply(root, 0, RootReadOutcome::AckOnly), None),
+            frontier.accept(
+                &RootReadResponse::Reply(reply(root, 0, RootReadOutcome::AckOnly)),
+                None
+            ),
             Err(RootRelayError::UnexpectedOutcome)
         );
         assert_eq!(
-            frontier.accept(&reply(root, 0, RootReadOutcome::Retired), None),
+            frontier.accept(
+                &RootReadResponse::Reply(reply(root, 0, RootReadOutcome::Retired)),
+                None
+            ),
             Err(RootRelayError::Retired)
         );
         assert_eq!(
             frontier.accept(
-                &reply(root, 0, data(2, &[1, 0, 0, 0, b'a'], None)),
+                &RootReadResponse::Reply(reply(root, 0, data(2, &[1, 0, 0, 0, b'a'], None))),
                 Some(&[1, 0, 0, 0, b'a'])
             ),
             Err(RootRelayError::Sequence)
         );
         assert_eq!(
-            frontier.accept(&reply(root, 0, RootReadOutcome::NotReady), None),
+            frontier.accept(
+                &RootReadResponse::Reply(reply(root, 0, RootReadOutcome::NotReady)),
+                None
+            ),
             Ok(RootRelayStep::NotReady)
         );
         // A reply with no matching sent read is refused.
         assert_eq!(
-            frontier.accept(&reply(root, 0, RootReadOutcome::NotReady), None),
+            frontier.accept(
+                &RootReadResponse::Reply(reply(root, 0, RootReadOutcome::NotReady)),
+                None
+            ),
             Err(RootRelayError::UnexpectedOutcome)
         );
     }
@@ -628,7 +753,10 @@ mod tests {
                 accepted_consumed: 0,
                 outcome,
             };
-            let accepted = frontier.accept(&reply, Some(b"domain consumer validates the record"));
+            let accepted = frontier.accept(
+                &RootReadResponse::Reply(reply),
+                Some(b"domain consumer validates the record"),
+            );
             if rows <= 1 {
                 assert!(
                     matches!(accepted, Ok(RootRelayStep::Deliver { rows: actual, .. }) if actual == rows)
@@ -664,10 +792,10 @@ mod tests {
                 outcome: outcome.clone(),
             };
             assert_eq!(
-                frontier.accept(&reply, body),
+                frontier.accept(&RootReadResponse::Reply(reply), body),
                 Err(RootRelayError::UnexpectedOutcome)
             );
-            assert_eq!(frontier.delivered_through, 0);
+            assert_eq!(frontier.validated_through, 0);
         }
     }
 
@@ -695,12 +823,74 @@ mod tests {
             outcome: end(1, 42),
         };
         assert_eq!(
-            count.accept(&reply, None),
+            count.accept(&RootReadResponse::Reply(reply), None),
             Ok(RootRelayStep::EndKnown(RootResultEnd {
                 sequence: seq(1),
                 output_rows: 42
             }))
         );
         assert_eq!(count.end_consumed().map(|end| end.output_rows), Some(42));
+    }
+    #[test]
+    fn sealed_reply_uses_actual_watermark_without_rewinding_delivery_or_ack() {
+        let stream_root = root();
+        let mut original = frontier(stream_root);
+        exchange(&mut original, data(1, &[1, 0, 0, 0, b'a'], None)).unwrap();
+        original.receipt(seq(1)).unwrap();
+        let read = original.next_read().unwrap();
+        assert_eq!(read.consumed, 1);
+        original.sent(read);
+        let sealed =
+            RootReadResponse::Reply(reply(stream_root, 0, RootReadOutcome::AwaitTerminalControl));
+        assert_eq!(
+            original.accept(&sealed, None),
+            Ok(RootRelayStep::AwaitTerminalControl)
+        );
+        assert_eq!(original.next_read(), Some(read));
+        assert_eq!(original.end_consumed(), None);
+
+        let mut original = frontier(stream_root);
+        exchange(&mut original, data(1, &[1, 0, 0, 0, b'a'], None)).unwrap();
+        // Validating bytes does not prove their socket delivery.
+        let read = original.next_read().unwrap();
+        original.sent(read);
+        let unproven =
+            RootReadResponse::Reply(reply(stream_root, 1, RootReadOutcome::AwaitTerminalControl));
+        assert_eq!(
+            original.accept(&unproven, None),
+            Err(RootRelayError::ConsumedMismatch)
+        );
+    }
+    #[test]
+    fn deferred_response_keeps_the_exact_original_cumulative_read_replayable() {
+        use novarocks_execution_contract::root_result::{RootReadDeferred, RootResultRead};
+        let mut frontier = frontier(root());
+        exchange(&mut frontier, data(1, &[1, 0, 0, 0, b'a'], None)).unwrap();
+        frontier.receipt(seq(1)).unwrap();
+        let read = frontier.next_read().unwrap();
+        let request = RootResultRead::try_new(
+            frontier.root(),
+            frontier.profile(),
+            frontier.kind(),
+            read.wanted,
+            read.consumed,
+            std::time::Duration::from_millis(10),
+        )
+        .unwrap();
+        frontier.sent(read);
+        let deferred = RootReadResponse::Deferred(RootReadDeferred::for_request(
+            &request,
+            RootReadDeferral::Preparing,
+        ));
+        assert_eq!(
+            frontier.accept(&deferred, None),
+            Ok(RootRelayStep::Deferred(RootReadDeferral::Preparing))
+        );
+        assert_eq!(frontier.next_read(), Some(read));
+        assert_eq!(frontier.end_consumed(), None);
+        assert_eq!(
+            frontier.accept(&deferred, None),
+            Err(RootRelayError::UnexpectedOutcome)
+        );
     }
 }

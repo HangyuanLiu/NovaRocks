@@ -157,7 +157,7 @@ fn selected_relation_every_actual_control_prefix_and_ordinary_tail_keep_first_ca
             assert!(baseline.last().unwrap().1 > 0);
             for at in 0..baseline.len() {
                 for cause in CAUSES {
-                    c.arm(Some((at, cause)));
+                    c.arm(Some((at, cause.clone())));
                     assert!(matches!(materialize_relation(d, id, OWNED_SOURCE, limits()), Err(Error::Control(actual)) if actual == cause));
                     assert_eq!(trace(&c), baseline[..=at]);
                 }
@@ -171,7 +171,7 @@ fn selected_relation_every_actual_control_prefix_and_ordinary_tail_keep_first_ca
             for cause in CAUSES {
                 c.arm(None);
                 let token = prepare_relation_materialization(d, 0, OWNED_SOURCE, limits())?;
-                c.arm(Some((at, cause)));
+                c.arm(Some((at, cause.clone())));
                 assert!(matches!(token.emit(), Err(Error::Control(actual)) if actual == cause));
                 assert_eq!(trace(&c), baseline[..=at]);
             }
@@ -191,7 +191,7 @@ fn selected_relation_real_retained_namespace_scan_is_admitted_before_lookup_and_
         assert_eq!(baseline[quantum].0, CompilePhase::Decode);
         for at in [0, quantum, baseline.len()-1] {
             for cause in CAUSES {
-                c.arm(Some((at, cause)));
+                c.arm(Some((at, cause.clone())));
                 assert!(matches!(materialize_relation(d, 319, OWNED_SOURCE, limits()), Err(Error::Control(actual)) if actual == cause));
                 assert_eq!(trace(&c), baseline[..=at]);
             }

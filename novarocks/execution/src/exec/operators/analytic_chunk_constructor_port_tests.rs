@@ -13,7 +13,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Observe the actual constructor inputs and lifetime, never a memory grant.
-use super::stages::{AnalyticChunkConstruction, LegacyWork};
+use super::stages::{AnalyticChunkConstruction, UnscopedWork};
 use super::*;
 use arrow::array::{RecordBatch, RecordBatchOptions, StructArray, UInt32Array};
 use arrow::buffer::NullBuffer;
@@ -108,7 +108,7 @@ impl AnalyticInputWork for Constructors<'_> {
         ordinal: usize,
         indices: &Arc<UInt32Array>,
     ) -> Result<ArrayRef, stages::AnalyticCopyFailure<Self::Failure>> {
-        match LegacyWork.take_column(&mut (), source, ordinal, indices) {
+        match UnscopedWork.take_column(&mut (), source, ordinal, indices) {
             Ok(column) => {
                 self.taken.push(Arc::clone(&column));
                 Ok(column)
@@ -116,8 +116,8 @@ impl AnalyticInputWork for Constructors<'_> {
             Err(stages::AnalyticCopyFailure::OriginalArrow(error)) => {
                 Err(stages::AnalyticCopyFailure::OriginalArrow(error))
             }
-            Err(stages::AnalyticCopyFailure::OriginalText(message)) => {
-                Err(stages::AnalyticCopyFailure::OriginalText(message))
+            Err(stages::AnalyticCopyFailure::Source(message)) => {
+                Err(stages::AnalyticCopyFailure::Source(message))
             }
             Err(stages::AnalyticCopyFailure::Control(never)) => match never {},
         }
@@ -129,7 +129,7 @@ impl AnalyticInputWork for Constructors<'_> {
         offset: usize,
         len: usize,
     ) -> Result<ArrayRef, Self::Failure> {
-        let column = match LegacyWork.slice_column(&mut (), source, offset, len) {
+        let column = match UnscopedWork.slice_column(&mut (), source, offset, len) {
             Ok(column) => column,
             Err(never) => match never {},
         };
@@ -150,7 +150,7 @@ impl AnalyticInputWork for Constructors<'_> {
             batch.num_rows(),
         )
         .map_err(Err)?;
-        project(LegacyWork.construct_batch_chunk(&mut (), batch, schema))
+        project(UnscopedWork.construct_batch_chunk(&mut (), batch, schema))
     }
     fn construct_columns_chunk(
         &mut self,
@@ -166,7 +166,7 @@ impl AnalyticInputWork for Constructors<'_> {
             columns.first().map_or(0, |c| c.len()),
         )
         .map_err(Err)?;
-        project(LegacyWork.construct_columns_chunk(&mut (), schema, columns))
+        project(UnscopedWork.construct_columns_chunk(&mut (), schema, columns))
     }
 }
 
@@ -426,9 +426,16 @@ fn c02_p2_constructor_original_split_data_full_text_scope_and_no_footer() {
     )
     .unwrap_err();
     match &error {
-        AnalyticStageFailure::OriginalData { stage, message, .. } => {
+        AnalyticStageFailure::Operation {
+            stage,
+            cause: message,
+            ..
+        } => {
             assert_eq!(*stage, AnalyticInputStage::OutputSplit);
-            assert_eq!(message, &expected);
+            assert_eq!(message.to_string(), expected);
+            use novarocks_failure_contract::{FailureClass, FailureProjection};
+            assert_eq!(message.failure_fact().class(), FailureClass::Invariant);
+            assert!(std::error::Error::source(message).is_some());
         }
         other => panic!("wrong constructor channel {other:?}"),
     }
@@ -442,7 +449,7 @@ fn c02_p2_constructor_original_split_data_full_text_scope_and_no_footer() {
     let mut work = Constructors::new(&control);
     assert!(
         matches!(stages::split(output, source.columns(), std::slice::from_ref(&source), &mut work),
-        Err(AnalyticStageFailure::OriginalData { message, .. }) if message == expected)
+        Err(AnalyticStageFailure::Operation { cause: message, .. }) if message.to_string() == expected)
     );
     assert_eq!(control.trace().len(), work.births[0].callbacks);
 }

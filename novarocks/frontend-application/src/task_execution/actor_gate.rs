@@ -674,16 +674,11 @@ impl ActorGateOwner {
     }
 }
 
-fn actor_error(error: impl std::fmt::Display) -> TaskExecutionError {
-    TaskExecutionError::Schedule(format!(
-        "logical execution actor refused Task protocol work: {error}"
-    ))
+fn actor_error(error: LogicalExecutionActorError) -> TaskExecutionError {
+    TaskExecutionError::Actor(error)
 }
-
-fn actor_establish_error(error: impl std::fmt::Display) -> TaskExecutionError {
-    TaskExecutionError::Schedule(format!(
-        "logical execution actor Establish gate failed: {error}"
-    ))
+fn actor_establish_error(error: EstablishIssueError) -> TaskExecutionError {
+    TaskExecutionError::Establish(error)
 }
 
 #[derive(Debug, Default)]
@@ -1126,9 +1121,12 @@ mod tests {
         assert!(matches!(
             harness.context_owner.on_context_ack(&acknowledgement),
             Err(TaskExecutionError::PreReadyEstablishRejected {
-                backend,
-                outcome: OperationOutcome::IdentityMismatch,
-            }) if backend == harness.request.context().backend_process_id()
+                context,
+                operation_id,
+                rejection,
+            }) if context == harness.request.context()
+                && operation_id == harness.request.envelope().operation_id()
+                && rejection.outcome() == OperationOutcome::IdentityMismatch
         ));
         assert_eq!(harness.owner.drive(&harness.drive).await.unwrap(), 2);
         assert!(harness.owner.prepare_convergence());

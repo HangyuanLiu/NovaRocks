@@ -16,6 +16,7 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{Array, ArrayRef, Int64Array};
 #[cfg(test)]
 use arrow::array::{Decimal128Array, FixedSizeBinaryArray, UInt64Array};
@@ -30,25 +31,58 @@ use novarocks_types::largeint;
 #[cfg(test)]
 use std::sync::Arc;
 
-fn to_i64_array(array: &ArrayRef, fn_name: &str, arg_idx: usize) -> Result<Int64Array, String> {
+#[derive(Debug)]
+struct BitCallFailure {
+    label: novarocks_failure_contract::BoundedDetail,
+    source: novarocks_functions::bit_array::BitArrayError,
+}
+impl std::fmt::Display for BitCallFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.label.as_str(), self.source)
+    }
+}
+impl std::error::Error for BitCallFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for BitCallFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        self.source.failure_fact()
+    }
+}
+fn bit_failure(
+    label: &str,
+    source: novarocks_functions::bit_array::BitArrayError,
+) -> ExecutionFailure {
+    ExecutionFailure::from_domain(BitCallFailure {
+        label: novarocks_failure_contract::BoundedDetail::truncating(label),
+        source,
+    })
+}
+fn to_i64_array(
+    array: &ArrayRef,
+    fn_name: &str,
+    arg_idx: usize,
+) -> Result<Int64Array, ExecutionFailure> {
     novarocks_functions::bit_array::to_i64_array(array, arg_idx)
-        .map_err(|error| error.legacy_message(fn_name))
+        .map_err(|source| bit_failure(fn_name, source))
 }
 fn to_i128_values(
     array: &ArrayRef,
     fn_name: &str,
     arg_idx: usize,
-) -> Result<Vec<Option<i128>>, String> {
+) -> Result<Vec<Option<i128>>, ExecutionFailure> {
     novarocks_functions::bit_array::to_i128_values(array, arg_idx)
-        .map_err(|error| error.legacy_message(fn_name))
+        .map_err(|source| bit_failure(fn_name, source))
 }
 fn cast_largeint_output(
     values: &[Option<i128>],
     output_type: Option<&DataType>,
     fn_name: &str,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, ExecutionFailure> {
     novarocks_functions::bit_array::cast_largeint_output(values, output_type)
-        .map_err(|error| error.legacy_message(fn_name))
+        .map_err(|source| bit_failure(fn_name, source))
 }
 
 fn use_largeint_path<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -78,7 +112,7 @@ fn eval_unary_i64<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     func: F,
-) -> Result<ArrayRef, __Eval::Error>
+) -> Result<ArrayRef, ExecutionFailure>
 where
     F: Fn(i64) -> i64,
 {
@@ -87,16 +121,14 @@ where
 
     let out = novarocks_functions::bit_array::map_values_observed(
         Selection::all(values.len()),
-        |_, row| Ok::<_, String>((!values.is_null(row)).then(|| values.value(row))),
+        |_, row| Ok::<_, ExecutionFailure>((!values.is_null(row)).then(|| values.value(row))),
         func,
         &mut |_| Ok(()),
     )?;
-    Ok((novarocks_functions::bit_array::finish_i64_observed(
-        out,
-        arena.data_type(expr),
-        &mut |_| Ok::<(), String>(()),
-    )?
-    .map_err(|error| error.legacy_message(fn_name)))?)
+    novarocks_functions::bit_array::finish_i64_observed(out, arena.data_type(expr), &mut |_| {
+        Ok::<(), ExecutionFailure>(())
+    })?
+    .map_err(|source| bit_failure(fn_name, source))
 }
 
 fn eval_unary_i128<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -106,7 +138,7 @@ fn eval_unary_i128<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     func: F,
-) -> Result<ArrayRef, __Eval::Error>
+) -> Result<ArrayRef, ExecutionFailure>
 where
     F: Fn(i128) -> i128,
 {
@@ -114,11 +146,11 @@ where
     let values = to_i128_values(&array, fn_name, 0)?;
     let out = novarocks_functions::bit_array::map_values_observed(
         Selection::all(values.len()),
-        |_, row| Ok::<_, String>(values[row]),
+        |_, row| Ok::<_, ExecutionFailure>(values[row]),
         func,
         &mut |_| Ok(()),
     )?;
-    Ok((cast_largeint_output(&out, arena.data_type(expr), fn_name))?)
+    cast_largeint_output(&out, arena.data_type(expr), fn_name)
 }
 
 fn eval_binary_i64<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -128,7 +160,7 @@ fn eval_binary_i64<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     func: F,
-) -> Result<ArrayRef, __Eval::Error>
+) -> Result<ArrayRef, ExecutionFailure>
 where
     F: Fn(i64, i64) -> i64,
 {
@@ -140,7 +172,7 @@ where
     let out = novarocks_functions::bit_array::map_values_observed(
         Selection::all(chunk.len()),
         |_, row| {
-            Ok::<_, String>(if left.is_null(row) || right.is_null(row) {
+            Ok::<_, ExecutionFailure>(if left.is_null(row) || right.is_null(row) {
                 None
             } else {
                 Some((left.value(row), right.value(row)))
@@ -149,12 +181,10 @@ where
         |(left, right)| func(left, right),
         &mut |_| Ok(()),
     )?;
-    Ok((novarocks_functions::bit_array::finish_i64_observed(
-        out,
-        arena.data_type(expr),
-        &mut |_| Ok::<(), String>(()),
-    )?
-    .map_err(|error| error.legacy_message(fn_name)))?)
+    novarocks_functions::bit_array::finish_i64_observed(out, arena.data_type(expr), &mut |_| {
+        Ok::<(), ExecutionFailure>(())
+    })?
+    .map_err(|source| bit_failure(fn_name, source))
 }
 
 fn eval_binary_i128<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -164,7 +194,7 @@ fn eval_binary_i128<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     func: F,
-) -> Result<ArrayRef, __Eval::Error>
+) -> Result<ArrayRef, ExecutionFailure>
 where
     F: Fn(i128, i128) -> i128,
 {
@@ -176,7 +206,7 @@ where
     let out = novarocks_functions::bit_array::map_values_observed(
         Selection::all(chunk.len()),
         |_, row| {
-            Ok::<_, String>(match (left[row], right[row]) {
+            Ok::<_, ExecutionFailure>(match (left[row], right[row]) {
                 (Some(left), Some(right)) => Some((left, right)),
                 _ => None,
             })
@@ -184,7 +214,7 @@ where
         |(left, right)| func(left, right),
         &mut |_| Ok(()),
     )?;
-    Ok((cast_largeint_output(&out, arena.data_type(expr), fn_name))?)
+    cast_largeint_output(&out, arena.data_type(expr), fn_name)
 }
 
 fn eval_shift_i64<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -194,7 +224,7 @@ fn eval_shift_i64<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     func: F,
-) -> Result<ArrayRef, __Eval::Error>
+) -> Result<ArrayRef, ExecutionFailure>
 where
     F: Fn(i64, u32) -> i64,
 {
@@ -216,13 +246,11 @@ where
         &mut |_| Ok::<_, std::convert::Infallible>(()),
     )
     .unwrap_or_else(|never| match never {});
-    Ok((novarocks_functions::bit_array::finish_i64_observed(
-        out,
-        arena.data_type(expr),
-        &mut |_| Ok::<_, std::convert::Infallible>(()),
-    )
+    novarocks_functions::bit_array::finish_i64_observed(out, arena.data_type(expr), &mut |_| {
+        Ok::<_, std::convert::Infallible>(())
+    })
     .unwrap_or_else(|never| match never {})
-    .map_err(|error| error.legacy_message(fn_name)))?)
+    .map_err(|source| bit_failure(fn_name, source))
 }
 
 fn eval_shift_i128<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -232,7 +260,7 @@ fn eval_shift_i128<F, __Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     func: F,
-) -> Result<ArrayRef, __Eval::Error>
+) -> Result<ArrayRef, ExecutionFailure>
 where
     F: Fn(i128, u32) -> i128,
 {
@@ -253,7 +281,7 @@ where
         &mut |_| Ok::<_, std::convert::Infallible>(()),
     )
     .unwrap_or_else(|never| match never {});
-    Ok((cast_largeint_output(&out, arena.data_type(expr), fn_name))?)
+    cast_largeint_output(&out, arena.data_type(expr), fn_name)
 }
 
 pub fn eval_bit_shift_left<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -261,19 +289,15 @@ pub fn eval_bit_shift_left<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     if use_largeint_path(arena, expr, args) {
-        return Ok(
-            (eval_shift_i128("bit_shift_left", arena, expr, args, chunk, |a, b| {
-                ShiftOp::Left.apply_i128(a, i64::from(b))
-            }))?,
-        );
+        return eval_shift_i128("bit_shift_left", arena, expr, args, chunk, |a, b| {
+            ShiftOp::Left.apply_i128(a, i64::from(b))
+        });
     }
-    Ok(
-        (eval_shift_i64("bit_shift_left", arena, expr, args, chunk, |a, b| {
-            ShiftOp::Left.apply_i64(a, i64::from(b))
-        }))?,
-    )
+    eval_shift_i64("bit_shift_left", arena, expr, args, chunk, |a, b| {
+        ShiftOp::Left.apply_i64(a, i64::from(b))
+    })
 }
 
 pub fn eval_bit_shift_right<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -281,19 +305,15 @@ pub fn eval_bit_shift_right<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     if use_largeint_path(arena, expr, args) {
-        return Ok(
-            (eval_shift_i128("bit_shift_right", arena, expr, args, chunk, |a, b| {
-                ShiftOp::Right.apply_i128(a, i64::from(b))
-            }))?,
-        );
+        return eval_shift_i128("bit_shift_right", arena, expr, args, chunk, |a, b| {
+            ShiftOp::Right.apply_i128(a, i64::from(b))
+        });
     }
-    Ok(
-        (eval_shift_i64("bit_shift_right", arena, expr, args, chunk, |a, b| {
-            ShiftOp::Right.apply_i64(a, i64::from(b))
-        }))?,
-    )
+    eval_shift_i64("bit_shift_right", arena, expr, args, chunk, |a, b| {
+        ShiftOp::Right.apply_i64(a, i64::from(b))
+    })
 }
 
 pub fn eval_bit_shift_right_logical<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -301,25 +321,25 @@ pub fn eval_bit_shift_right_logical<__Eval: crate::exec::expr::ExprEvaluation + 
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     if use_largeint_path(arena, expr, args) {
-        return Ok((eval_shift_i128(
+        return eval_shift_i128(
             "bit_shift_right_logical",
             arena,
             expr,
             args,
             chunk,
             |a, b| ShiftOp::RightLogical.apply_i128(a, i64::from(b)),
-        ))?);
+        );
     }
-    Ok((eval_shift_i64(
+    eval_shift_i64(
         "bit_shift_right_logical",
         arena,
         expr,
         args,
         chunk,
         |a, b| ShiftOp::RightLogical.apply_i64(a, i64::from(b)),
-    ))?)
+    )
 }
 
 pub fn eval_bitand<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -327,19 +347,15 @@ pub fn eval_bitand<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     if use_largeint_path(arena, expr, args) {
-        return Ok(
-            (eval_binary_i128("bitand", arena, expr, args, chunk, |a, b| {
-                BitwiseOp::And.apply_i128(a, b)
-            }))?,
-        );
+        return eval_binary_i128("bitand", arena, expr, args, chunk, |a, b| {
+            BitwiseOp::And.apply_i128(a, b)
+        });
     }
-    Ok(
-        (eval_binary_i64("bitand", arena, expr, args, chunk, |a, b| {
-            BitwiseOp::And.apply_i64(a, b)
-        }))?,
-    )
+    eval_binary_i64("bitand", arena, expr, args, chunk, |a, b| {
+        BitwiseOp::And.apply_i64(a, b)
+    })
 }
 
 pub fn eval_bitnot<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -347,15 +363,15 @@ pub fn eval_bitnot<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     if use_largeint_path(arena, expr, args) {
-        return Ok((eval_unary_i128("bitnot", arena, expr, args, chunk, |a| {
+        return eval_unary_i128("bitnot", arena, expr, args, chunk, |a| {
             BitwiseOp::Not.apply_i128(a, 0)
-        }))?);
+        });
     }
-    Ok((eval_unary_i64("bitnot", arena, expr, args, chunk, |a| {
+    eval_unary_i64("bitnot", arena, expr, args, chunk, |a| {
         BitwiseOp::Not.apply_i64(a, 0)
-    }))?)
+    })
 }
 
 pub fn eval_bitor<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -363,17 +379,15 @@ pub fn eval_bitor<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     if use_largeint_path(arena, expr, args) {
-        return Ok(
-            (eval_binary_i128("bitor", arena, expr, args, chunk, |a, b| {
-                BitwiseOp::Or.apply_i128(a, b)
-            }))?,
-        );
+        return eval_binary_i128("bitor", arena, expr, args, chunk, |a, b| {
+            BitwiseOp::Or.apply_i128(a, b)
+        });
     }
-    Ok((eval_binary_i64("bitor", arena, expr, args, chunk, |a, b| {
+    eval_binary_i64("bitor", arena, expr, args, chunk, |a, b| {
         BitwiseOp::Or.apply_i64(a, b)
-    }))?)
+    })
 }
 
 pub fn eval_bitxor<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -381,19 +395,15 @@ pub fn eval_bitxor<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     if use_largeint_path(arena, expr, args) {
-        return Ok(
-            (eval_binary_i128("bitxor", arena, expr, args, chunk, |a, b| {
-                BitwiseOp::Xor.apply_i128(a, b)
-            }))?,
-        );
+        return eval_binary_i128("bitxor", arena, expr, args, chunk, |a, b| {
+            BitwiseOp::Xor.apply_i128(a, b)
+        });
     }
-    Ok(
-        (eval_binary_i64("bitxor", arena, expr, args, chunk, |a, b| {
-            BitwiseOp::Xor.apply_i64(a, b)
-        }))?,
-    )
+    eval_binary_i64("bitxor", arena, expr, args, chunk, |a, b| {
+        BitwiseOp::Xor.apply_i64(a, b)
+    })
 }
 
 #[cfg(test)]
@@ -702,7 +712,10 @@ mod legacy_bitwise_contract_tests {
     use arrow::record_batch::RecordBatch;
     use novarocks_types::SlotId;
 
-    fn evaluate_result(name: &'static str, arrays: Vec<ArrayRef>) -> Result<ArrayRef, String> {
+    fn evaluate_result(
+        name: &'static str,
+        arrays: Vec<ArrayRef>,
+    ) -> Result<ArrayRef, ExecutionFailure> {
         let output_type = arrays[0].data_type().clone();
         let fields = arrays
             .iter()
@@ -989,7 +1002,11 @@ mod legacy_bitwise_contract_tests {
                 vec![signed(&ty, &[Some(1)]), signed(&ty, &[Some(2)])],
             )
             .unwrap_err();
-            assert_eq!(error, "bitnot expects 1 to 1 arguments, got 2");
+            assert!(
+                error
+                    .to_string()
+                    .contains("bitnot expects 1 to 1 arguments, got 2")
+            );
         }
         let error = evaluate_result(
             "bitnot",
@@ -999,7 +1016,11 @@ mod legacy_bitwise_contract_tests {
             ],
         )
         .unwrap_err();
-        assert_eq!(error, "bitnot expects 1 to 1 arguments, got 2");
+        assert!(
+            error
+                .to_string()
+                .contains("bitnot expects 1 to 1 arguments, got 2")
+        );
         // A genuine unary call remains accepted; a false blanket rejection
         // of bitnot cannot make this negative-arity oracle pass.
         assert_signed(

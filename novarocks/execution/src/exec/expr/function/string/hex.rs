@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{Array, ArrayRef, BinaryArray, LargeBinaryArray, StringArray};
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ pub fn eval_hex<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let _ = expr;
     let input = arena.eval(args[0], chunk)?;
     let len = input.len();
@@ -63,7 +64,7 @@ pub fn eval_hex<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             }
         }
     } else {
-        return Err(("hex expects string/binary or integer".to_string()).into());
+        return Err(expression_contract("hex expects string/binary or integer"));
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }

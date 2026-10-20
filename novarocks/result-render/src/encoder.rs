@@ -44,10 +44,21 @@ fn error(kind: E) -> RenderError {
     RenderError {
         kind,
         output_ordinal: None,
+        required: None,
     }
 }
 fn invalid() -> RenderError {
-    error(E::UnsupportedPresentation)
+    error(E::CursorInvariant)
+}
+fn invalid_value() -> RenderError {
+    error(E::InvalidValue)
+}
+fn extent_error(kind: E, required: usize) -> RenderError {
+    RenderError {
+        kind,
+        output_ordinal: None,
+        required: u64::try_from(required).ok(),
+    }
 }
 fn down<T: 'static>(a: &ArrayRef) -> Result<&T, RenderError> {
     a.as_any()
@@ -79,8 +90,11 @@ impl Path {
         }
     }
     fn child(mut self, index: usize) -> Result<Self, RenderError> {
-        if self.depth as usize >= 64 || index > u16::MAX as usize {
-            return Err(error(E::DepthLimit));
+        if self.depth as usize >= 64 {
+            return Err(extent_error(E::DepthLimit, usize::from(self.depth) + 1));
+        }
+        if index > u16::MAX as usize {
+            return Err(error(E::SchemaMismatch));
         }
         self.children[self.depth as usize] = index as u16;
         self.depth += 1;
@@ -238,7 +252,7 @@ impl std::fmt::Write for Atom {
         Ok(())
     }
 }
-macro_rules! atom {($($arg:tt)*)=>{{let mut a=Atom::new();write!(&mut a,$($arg)*).map_err(|_|error(E::ArithmeticOverflow))?;a}}}
+macro_rules! atom {($($arg:tt)*)=>{{let mut a=Atom::new();write!(&mut a,$($arg)*).map_err(|_|error(E::CursorInvariant))?;a}}}
 #[derive(Clone)]
 struct Variant {
     source: Source,
@@ -388,13 +402,13 @@ fn stream_next(
                     // Cell capacity was reserved before feed. Never rewind a
                     // byte after the parser has accepted its state transition.
                     if !b.cell() {
-                        return Err(error(E::ArithmeticOverflow));
+                        return Err(error(E::CursorInvariant));
                     }
                     *elements = elements
                         .checked_add(1)
                         .ok_or_else(|| error(E::ArithmeticOverflow))?;
                     if *elements > V::MAX_ELEMENTS_PER_ROW {
-                        return Err(error(E::ElementLimit));
+                        return Err(extent_error(E::ElementLimit, *elements));
                     }
                 }
                 if let Some(u) = &mut stream.utf8 {
@@ -512,7 +526,7 @@ impl CellCursor {
     }
     fn push(&mut self, t: Task) -> Result<(), RenderError> {
         if self.stack.len() >= 196 {
-            return Err(error(E::DepthLimit));
+            return Err(extent_error(E::WorkStackLimit, self.stack.len() + 1));
         }
         self.stack.push(t);
         Ok(())
@@ -526,7 +540,7 @@ impl CellCursor {
             .checked_add(1)
             .ok_or_else(|| error(E::ArithmeticOverflow))?;
         if self.elements > V::MAX_ELEMENTS_PER_ROW {
-            return Err(error(E::ElementLimit));
+            return Err(extent_error(E::ElementLimit, self.elements));
         }
         Ok(())
     }
@@ -1023,8 +1037,10 @@ impl CellCursor {
         b: &mut Budget,
     ) -> Result<(), RenderError> {
         let data = v.source.data(s)?;
-        let bytes = data.get(v.range.clone()).ok_or_else(invalid)?;
-        let head = *bytes.first().ok_or_else(invalid)?;
+        let bytes = data
+            .get(v.range.clone())
+            .ok_or_else(|| error(E::InvalidVariant))?;
+        let head = *bytes.first().ok_or_else(|| error(E::InvalidVariant))?;
         match head & 3 {
             2 | 3 => {
                 if v.depth >= V::MAX_DEPTH {
@@ -1033,7 +1049,7 @@ impl CellCursor {
                 let object = head & 3 == 2;
                 let info = Collection::parse(data, v.range.clone(), object)?;
                 if info.count > V::MAX_ELEMENTS_PER_ROW {
-                    return Err(error(E::ElementLimit));
+                    return Err(extent_error(E::ElementLimit, self.elements));
                 }
                 self.literal(if object { b"}" } else { b"]" })?;
                 self.push(Task::VariantCollection {
@@ -1048,7 +1064,7 @@ impl CellCursor {
             1 => {
                 let len = (head >> 2) as usize;
                 if len + 1 != bytes.len() {
-                    return Err(invalid());
+                    return Err(error(E::InvalidVariant));
                 }
                 self.quoted(
                     v.source.slice(v.range.start + 1..v.range.end)?,
@@ -1063,38 +1079,48 @@ impl CellCursor {
                 let a = match tag {
                     0 => {
                         if !payload.is_empty() {
-                            return Err(invalid());
+                            return Err(error(E::InvalidVariant));
                         }
                         Some(Atom::literal(b"null"))
                     }
                     1 | 2 => {
                         if !payload.is_empty() {
-                            return Err(invalid());
+                            return Err(error(E::InvalidVariant));
                         }
                         Some(Atom::literal(if tag == 1 { b"true" } else { b"false" }))
                     }
                     3 => Some(atom!(
                         "{}",
-                        i8::from_le_bytes(payload.try_into().map_err(|_| invalid())?)
+                        i8::from_le_bytes(
+                            payload.try_into().map_err(|_| error(E::InvalidVariant))?
+                        )
                     )),
                     4 => Some(atom!(
                         "{}",
-                        i16::from_le_bytes(payload.try_into().map_err(|_| invalid())?)
+                        i16::from_le_bytes(
+                            payload.try_into().map_err(|_| error(E::InvalidVariant))?
+                        )
                     )),
                     5 => Some(atom!(
                         "{}",
-                        i32::from_le_bytes(payload.try_into().map_err(|_| invalid())?)
+                        i32::from_le_bytes(
+                            payload.try_into().map_err(|_| error(E::InvalidVariant))?
+                        )
                     )),
                     6 => Some(atom!(
                         "{}",
-                        i64::from_le_bytes(payload.try_into().map_err(|_| invalid())?)
+                        i64::from_le_bytes(
+                            payload.try_into().map_err(|_| error(E::InvalidVariant))?
+                        )
                     )),
                     7 | 14 => {
                         let n = if tag == 7 {
-                            f64::from_le_bytes(payload.try_into().map_err(|_| invalid())?)
+                            f64::from_le_bytes(
+                                payload.try_into().map_err(|_| error(E::InvalidVariant))?,
+                            )
                         } else {
                             f64::from(f32::from_le_bytes(
-                                payload.try_into().map_err(|_| invalid())?,
+                                payload.try_into().map_err(|_| error(E::InvalidVariant))?,
                             ))
                         };
                         let mut a = if n.is_finite() {
@@ -1118,7 +1144,7 @@ impl CellCursor {
                             _ => 16,
                         };
                         if payload.len() != width + 1 || payload[0] > 38 {
-                            return Err(invalid());
+                            return Err(error(E::InvalidVariant));
                         }
                         let mut raw = [0; 16];
                         let sign = payload[width] & 0x80 != 0;
@@ -1139,20 +1165,24 @@ impl CellCursor {
                         Some(a)
                     }
                     11 => {
-                        let days = i32::from_le_bytes(payload.try_into().map_err(|_| invalid())?);
+                        let days = i32::from_le_bytes(
+                            payload.try_into().map_err(|_| error(E::InvalidVariant))?,
+                        );
                         Some(atom!("\"{}\"", date_atom(days, true, false)?))
                     }
                     12 | 13 => {
-                        let raw = i64::from_le_bytes(payload.try_into().map_err(|_| invalid())?);
+                        let raw = i64::from_le_bytes(
+                            payload.try_into().map_err(|_| error(E::InvalidVariant))?,
+                        );
                         let secs = raw.div_euclid(1_000_000);
                         let micro = raw.rem_euclid(1_000_000) as u32;
                         let dt =
                             chrono::DateTime::<chrono::Utc>::from_timestamp(secs, micro * 1000)
-                                .ok_or_else(invalid)?;
+                                .ok_or_else(|| error(E::InvalidVariant))?;
                         let mut a = Atom::literal(b"\"");
                         if tag == 12 {
-                            let offset =
-                                chrono::FixedOffset::east_opt(v.offset).ok_or_else(invalid)?;
+                            let offset = chrono::FixedOffset::east_opt(v.offset)
+                                .ok_or_else(|| error(E::InvalidVariant))?;
                             let dt = dt.with_timezone(&offset);
                             write!(
                                 &mut a,
@@ -1204,7 +1234,7 @@ impl CellCursor {
                     15 | 16 => {
                         let len = variant_cursor::read(payload, 0, 4)? as usize;
                         if len.checked_add(4) != Some(payload.len()) {
-                            return Err(invalid());
+                            return Err(error(E::InvalidVariant));
                         }
                         self.quoted(
                             v.source.slice(v.range.start + 5..v.range.end)?,
@@ -1219,7 +1249,7 @@ impl CellCursor {
                     }
                     20 => {
                         if payload.len() != 16 {
-                            return Err(invalid());
+                            return Err(error(E::InvalidVariant));
                         }
                         let mut a = Atom::literal(b"\"");
                         for (i, byte) in payload.iter().enumerate() {
@@ -1231,14 +1261,14 @@ impl CellCursor {
                         a.write_str("\"").map_err(|_| invalid())?;
                         Some(a)
                     }
-                    _ => return Err(invalid()),
+                    _ => return Err(error(E::InvalidVariant)),
                 };
                 if let Some(a) = a {
                     b.scan(a.len * 2 + 512);
                     self.push(Task::Atom(a))?;
                 }
             }
-            _ => return Err(invalid()),
+            _ => return Err(error(E::InvalidVariant)),
         }
         Ok(())
     }
@@ -1294,10 +1324,13 @@ fn year_atom(year: i32, chrono_style: bool) -> Result<Atom, RenderError> {
     })
 }
 fn date_atom(days: i32, chrono_style: bool, sentinel: bool) -> Result<Atom, RenderError> {
-    let ce = 719163i64.checked_add(i64::from(days)).ok_or_else(invalid)?;
-    let date =
-        chrono::NaiveDate::from_num_days_from_ce_opt(i32::try_from(ce).map_err(|_| invalid())?)
-            .ok_or_else(invalid)?;
+    let ce = 719163i64
+        .checked_add(i64::from(days))
+        .ok_or_else(invalid_value)?;
+    let date = chrono::NaiveDate::from_num_days_from_ce_opt(
+        i32::try_from(ce).map_err(|_| invalid_value())?,
+    )
+    .ok_or_else(invalid_value)?;
     if sentinel && date.year() == -1 && date.month() == 11 && date.day() == 30 {
         return Ok(Atom::literal(b"0000-00-00"));
     }
@@ -1313,38 +1346,42 @@ fn decimal128(value: i128, scale: usize, precision: Option<u8>) -> Result<Atom, 
     let abs = value.unsigned_abs();
     let digits = atom!("{abs}");
     if precision.is_some_and(|p| digits.len > p as usize) {
-        return Err(invalid());
+        return Err(invalid_value());
     }
     decimal_digits(&digits.data[..digits.len], negative, scale)
 }
 fn decimal_digits(digits: &[u8], negative: bool, scale: usize) -> Result<Atom, RenderError> {
     let mut a = Atom::new();
     if negative {
-        a.write_str("-").map_err(|_| invalid())?;
+        a.write_str("-").map_err(|_| invalid_value())?;
     }
     if scale == 0 {
-        a.write_str(std::str::from_utf8(digits).map_err(|_| invalid())?)
-            .map_err(|_| invalid())?;
+        a.write_str(std::str::from_utf8(digits).map_err(|_| invalid_value())?)
+            .map_err(|_| invalid_value())?;
     } else if digits.len() > scale {
-        a.write_str(std::str::from_utf8(&digits[..digits.len() - scale]).map_err(|_| invalid())?)
-            .map_err(|_| invalid())?;
-        a.write_str(".").map_err(|_| invalid())?;
-        a.write_str(std::str::from_utf8(&digits[digits.len() - scale..]).map_err(|_| invalid())?)
-            .map_err(|_| invalid())?;
+        a.write_str(
+            std::str::from_utf8(&digits[..digits.len() - scale]).map_err(|_| invalid_value())?,
+        )
+        .map_err(|_| invalid_value())?;
+        a.write_str(".").map_err(|_| invalid_value())?;
+        a.write_str(
+            std::str::from_utf8(&digits[digits.len() - scale..]).map_err(|_| invalid_value())?,
+        )
+        .map_err(|_| invalid_value())?;
     } else {
-        a.write_str("0.").map_err(|_| invalid())?;
+        a.write_str("0.").map_err(|_| invalid_value())?;
         for _ in 0..scale - digits.len() {
-            a.write_str("0").map_err(|_| invalid())?;
+            a.write_str("0").map_err(|_| invalid_value())?;
         }
-        a.write_str(std::str::from_utf8(digits).map_err(|_| invalid())?)
-            .map_err(|_| invalid())?;
+        a.write_str(std::str::from_utf8(digits).map_err(|_| invalid_value())?)
+            .map_err(|_| invalid_value())?;
     }
     Ok(a)
 }
 fn decimal256(raw: [u8; 32], scale: usize, precision: u8) -> Result<Atom, RenderError> {
     let digits = novarocks_functions::decimal256_digits::original_digits(raw);
     if digits.digits().len() > precision as usize {
-        return Err(invalid());
+        return Err(invalid_value());
     }
     decimal_digits(digits.digits(), digits.negative(), scale)
 }
@@ -1418,7 +1455,7 @@ fn scalar_atom(
         }
         N::LargeInt => atom!(
             "{}",
-            i128::from_be_bytes(bytes(array, row)?.try_into().map_err(|_| invalid())?)
+            i128::from_be_bytes(bytes(array, row)?.try_into().map_err(|_| invalid_value())?)
         ),
         N::Decimal {
             bits: 128,
@@ -1438,7 +1475,7 @@ fn scalar_atom(
         N::Time { unit } => {
             let n = micros(time_raw(array, row)?, unit);
             if !nested && n < 0 {
-                return Err(invalid());
+                return Err(invalid_value());
             }
             let abs = n.unsigned_abs();
             let mut a = atom!(
@@ -1450,7 +1487,7 @@ fn scalar_atom(
             );
             let frac = abs % 1_000_000;
             if frac != 0 {
-                write!(&mut a, ".{frac:06}").map_err(|_| invalid())?;
+                write!(&mut a, ".{frac:06}").map_err(|_| invalid_value())?;
             }
             a
         }
@@ -1489,10 +1526,10 @@ fn scalar_atom(
                     )
                 };
             let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(
-                i64::try_from(secs).map_err(|_| invalid())?,
+                i64::try_from(secs).map_err(|_| invalid_value())?,
                 nanos,
             )
-            .ok_or_else(invalid)?;
+            .ok_or_else(invalid_value)?;
             let mut a = atom!(
                 "{}-{:02}-{:02} {:02}:{:02}:{:02}",
                 year_atom(
@@ -1507,7 +1544,8 @@ fn scalar_atom(
             );
             if width != 0 && (!optional || nanos != 0) {
                 let frac = nanos / 10u32.pow(9 - width);
-                write!(&mut a, ".{frac:0width$}", width = width as usize).map_err(|_| invalid())?;
+                write!(&mut a, ".{frac:0width$}", width = width as usize)
+                    .map_err(|_| invalid_value())?;
             }
             a
         }
@@ -1796,6 +1834,7 @@ impl ArrowMysqlTextEncoder {
                     return Err(RenderError {
                         kind: E::SchemaMismatch,
                         output_ordinal: Some(ordinal as u32),
+                        required: None,
                     });
                 }
                 validate_field(&column.field, field.data_type(), false).map_err(|mut e| {
@@ -1860,7 +1899,7 @@ impl ArrowMysqlTextEncoder {
             }
             self.elements += 1;
             if self.elements > V::MAX_ELEMENTS_PER_ROW {
-                return Err(error(E::ElementLimit));
+                return Err(extent_error(E::ElementLimit, self.elements));
             }
             self.cell_atom = Atom::literal(&[0xfb]);
         } else {
@@ -1890,7 +1929,7 @@ impl ArrowMysqlTextEncoder {
             .checked_add(n)
             .ok_or_else(|| error(E::ArithmeticOverflow))?;
         if self.row_length > V::ROW_PAYLOAD_BYTES as usize {
-            return Err(error(E::RowTooLarge));
+            return Err(extent_error(E::RowTooLarge, self.row_length));
         }
         Ok(())
     }
@@ -2136,7 +2175,7 @@ impl ArrowMysqlTextEncoder {
                     .checked_add(n)
                     .ok_or_else(|| error(E::ArithmeticOverflow))?;
                 if self.cell_length > V::ROW_PAYLOAD_BYTES as usize {
-                    return Err(error(E::RowTooLarge));
+                    return Err(extent_error(E::RowTooLarge, self.cell_length));
                 }
                 match self.phase {
                     Phase::Small => {
@@ -2160,7 +2199,7 @@ impl ArrowMysqlTextEncoder {
                         .checked_add(1)
                         .ok_or_else(|| error(E::ArithmeticOverflow))?;
                     if self.cell_length > V::ROW_PAYLOAD_BYTES as usize {
-                        return Err(error(E::RowTooLarge));
+                        return Err(extent_error(E::RowTooLarge, self.cell_length));
                     }
                     match self.phase {
                         Phase::Small => {

@@ -82,7 +82,7 @@ fn prepare(
     bindings: ScanBindings,
     output: &ResultSinkHandle,
 ) -> ExecutionResult<PreparedPipelineExecution> {
-    let state = Arc::new(RuntimeState::new(
+    let state = Arc::new(RuntimeState::for_local_execution(
         None,
         None,
         None,
@@ -180,13 +180,17 @@ fn an_aborted_compiled_scan_reaches_its_parked_reader() {
     let running = prepare(&program, bound(&op), &output)
         .expect("compiled scan prepares")
         .start();
-    assert!(running.cancel("aborted by the test"));
     assert!(
-        op.terminations() >= 1,
-        "the abort starts the scan's terminal cleanup"
+        running.cancel(crate::runtime::fragment::FragmentCancelReason::new(
+            "aborted by the test"
+        ))
     );
     let error = running
         .join()
         .expect_err("an aborted scan fails its fragment");
+    assert!(
+        op.terminations() >= 1,
+        "actual join observes the scan's terminal cleanup, independently of cancel acceptance"
+    );
     assert!(error.to_string().contains("aborted by the test"), "{error}");
 }

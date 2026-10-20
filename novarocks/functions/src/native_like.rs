@@ -25,7 +25,7 @@ pub enum LikeObservation {
 }
 #[derive(Debug)]
 pub enum LikeError<E> {
-    Data(&'static str),
+    Operation(crate::KernelFailure),
     Host(E),
 }
 fn event<E>(
@@ -34,19 +34,19 @@ fn event<E>(
 ) -> Result<(), LikeError<E>> {
     observe(e).map_err(LikeError::Host)
 }
-fn legacy<T>(
+fn required<T>(
     run: impl FnOnce(
         &mut dyn FnMut(LikeObservation) -> Result<(), Infallible>,
     ) -> Result<T, LikeError<Infallible>>,
-) -> Result<T, String> {
+) -> Result<T, crate::KernelFailure> {
     match run(&mut |_| Ok(())) {
         Ok(v) => Ok(v),
-        Err(LikeError::Data(s)) => Err(s.into()),
+        Err(LikeError::Operation(cause)) => Err(cause),
         Err(LikeError::Host(never)) => match never {},
     }
 }
 pub fn like_match(text: &str, pattern: &str) -> bool {
-    legacy(|observe| like_match_observed(text, pattern, observe)).unwrap()
+    required(|observe| like_match_observed(text, pattern, observe)).unwrap()
 }
 pub fn like_match_observed<E>(
     text: &str,
@@ -142,8 +142,11 @@ fn row_observed<E>(
         observe,
     )?))
 }
-pub fn evaluate_legacy(text: &ArrayRef, pattern: &ArrayRef) -> Result<ArrayRef, String> {
-    legacy(|observe| evaluate_observed(text, pattern, observe))
+pub fn evaluate_required(
+    text: &ArrayRef,
+    pattern: &ArrayRef,
+) -> Result<ArrayRef, crate::KernelFailure> {
+    required(|observe| evaluate_observed(text, pattern, observe))
 }
 pub fn evaluate_observed<E>(
     text: &ArrayRef,
@@ -151,18 +154,23 @@ pub fn evaluate_observed<E>(
     observe: &mut dyn FnMut(LikeObservation) -> Result<(), E>,
 ) -> Result<ArrayRef, LikeError<E>> {
     let len = text.len();
+    if pattern.len() != len {
+        return Err(LikeError::Operation(contract(
+            "like: pattern length differs from its input",
+        )));
+    }
     let text = text
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or(LikeError::Data(
+        .ok_or(LikeError::Operation(contract(
             "like: first argument must be a string array",
-        ))?;
+        )))?;
     let pattern = pattern
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or(LikeError::Data(
+        .ok_or(LikeError::Operation(contract(
             "like: second argument must be a string array",
-        ))?;
+        )))?;
     event(observe, LikeObservation::OpaqueBoundary)?;
     let result_values: Vec<Option<bool>> = (0..len)
         .map(|i| row_observed(text, i, pattern, i, observe))
@@ -377,7 +385,7 @@ impl PreparedNativeLikeRecipe {
                 )
                 .map_err(|error| match error {
                     LikeError::Host(cause) => cause,
-                    LikeError::Data(message) => internal(message),
+                    LikeError::Operation(cause) => cause,
                 })?;
                 values.push(value);
                 work.step()?;
@@ -388,8 +396,7 @@ impl PreparedNativeLikeRecipe {
             // The original native negated expansion invokes this same Arrow
             // Boolean NOT author after the complete positive LIKE result.
             let output = if self.negated {
-                let out =
-                    arrow_arith::boolean::not(&output).map_err(|e| internal(&e.to_string()))?;
+                let out = arrow_arith::boolean::not(&output).map_err(arrow_failure)?;
                 work.flush()?;
                 out
             } else {
@@ -433,3 +440,46 @@ impl PreparedNativeLikeRecipe {
 #[cfg(test)]
 #[path = "native_like_tests.rs"]
 mod tests;
+
+#[derive(Debug)]
+enum LikeOperationFailure {
+    Contract(&'static str),
+    Arrow(arrow_schema::ArrowError),
+}
+impl std::fmt::Display for LikeOperationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Contract(message) => f.write_str(message),
+            Self::Arrow(source) => source.fmt(f),
+        }
+    }
+}
+impl std::error::Error for LikeOperationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Arrow(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for LikeOperationFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        let (class, code) = match self {
+            Self::Contract(_) => (FailureClass::Invariant, 384),
+            Self::Arrow(arrow_schema::ArrowError::MemoryError(_)) => (FailureClass::Resource, 386),
+            Self::Arrow(_) => (FailureClass::Invariant, 385),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for LikeOperationFailure {}
+fn contract(message: &'static str) -> crate::KernelFailure {
+    crate::KernelFailure::from_domain(LikeOperationFailure::Contract(message))
+}
+fn arrow_failure(source: arrow_schema::ArrowError) -> crate::KernelFailure {
+    crate::KernelFailure::from_domain(LikeOperationFailure::Arrow(source))
+}

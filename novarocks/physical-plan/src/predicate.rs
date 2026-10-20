@@ -52,7 +52,7 @@ pub struct ExactPredicateResponsibility {
     definition: ExprId,
     context: ExpressionEffectContext,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PredicateSourceError {
     Control(CompileControlError),
     InvalidFragment,
@@ -73,7 +73,14 @@ impl fmt::Display for PredicateSourceError {
         write!(f, "invalid predicate responsibility source: {self:?}")
     }
 }
-impl std::error::Error for PredicateSourceError {}
+impl std::error::Error for PredicateSourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<CompileControlError> for PredicateSourceError {
     fn from(error: CompileControlError) -> Self {
         Self::Control(error)

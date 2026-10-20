@@ -3351,7 +3351,7 @@ mod tests {
                 &mut ConnectorDecodeContext::new(&header, &mut ledger),
             )
             .unwrap_err();
-        assert_eq!(error.kind(), ConnectorCodecErrorKind::InconsistentFields);
+        assert_eq!(error.kind(), &ConnectorCodecErrorKind::InconsistentFields);
     }
 
     #[test]
@@ -3574,11 +3574,11 @@ mod tests {
     fn strict_scanner_rejects_unknown_duplicate_wrong_wire_and_nested_corruption() {
         assert_eq!(
             decode_view_bytes(&[0x10, 1], limits()).kind(),
-            ConnectorCodecErrorKind::UnknownField
+            &ConnectorCodecErrorKind::UnknownField
         );
         assert_eq!(
             decode_view_bytes(&[0x08, 1], limits()).kind(),
-            ConnectorCodecErrorKind::InvalidValue
+            &ConnectorCodecErrorKind::InvalidValue
         );
 
         let transaction = dto::HiveTransactionHandle {
@@ -3594,7 +3594,7 @@ mod tests {
         }
         assert_eq!(
             decode_view_bytes(&duplicated, limits()).kind(),
-            ConnectorCodecErrorKind::DuplicateField
+            &ConnectorCodecErrorKind::DuplicateField
         );
 
         let mut nested_unknown = transaction.clone();
@@ -3603,7 +3603,7 @@ mod tests {
         payload.extend_from_slice(&nested_unknown);
         assert_eq!(
             decode_view_bytes(&payload, limits()).kind(),
-            ConnectorCodecErrorKind::UnknownField
+            &ConnectorCodecErrorKind::UnknownField
         );
 
         let nested_wrong_wire = [0x08, 1, 0x10, 1];
@@ -3611,7 +3611,7 @@ mod tests {
         payload.extend_from_slice(&nested_wrong_wire);
         assert_eq!(
             decode_view_bytes(&payload, limits()).kind(),
-            ConnectorCodecErrorKind::InvalidValue
+            &ConnectorCodecErrorKind::InvalidValue
         );
     }
 
@@ -3647,7 +3647,7 @@ mod tests {
             let error = <IcebergReadWireCodec as ConnectorPrivateDecoder<IcebergColumnHandle>>::decode_private(
                 &IcebergReadWireCodec, &raw, &mut ConnectorDecodeContext::new(&header, &mut ledger),
             ).unwrap_err();
-            assert_eq!(error.kind(), ConnectorCodecErrorKind::Capacity);
+            assert_eq!(error.kind(), &ConnectorCodecErrorKind::Capacity);
         }
     }
 
@@ -3760,12 +3760,12 @@ mod change_window_wire_tests {
             let error =
                 scan::<dto::IcebergChangeSplit>(&[(retired << 3) | 2, 0], Schema::ChangeSplit)
                     .unwrap_err();
-            assert_eq!(error.kind(), ConnectorCodecErrorKind::UnknownField);
+            assert_eq!(error.kind(), &ConnectorCodecErrorKind::UnknownField);
         }
         let error =
             scan::<dto::IcebergDeletedDataFileRows>(&[0x12, 0], Schema::DeletedDataFileRows)
                 .unwrap_err();
-        assert_eq!(error.kind(), ConnectorCodecErrorKind::UnknownField);
+        assert_eq!(error.kind(), &ConnectorCodecErrorKind::UnknownField);
     }
 
     #[test]
@@ -3789,7 +3789,7 @@ mod change_window_wire_tests {
             scan::<dto::IcebergChangeSplit>(&duplicated, Schema::ChangeSplit)
                 .unwrap_err()
                 .kind(),
-            ConnectorCodecErrorKind::DuplicateField
+            &ConnectorCodecErrorKind::DuplicateField
         );
         // Both complete endpoint lists recurse through the strict delete schema.
         for field in [2_u8, 3_u8] {
@@ -3826,7 +3826,7 @@ mod compile_control_tests {
         fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             let mut trace = self.trace.lock().unwrap();
             trace.push((phase, units));
-            if let Some((index, cause)) = self.refuse
+            if let Some((index, cause)) = self.refuse.clone()
                 && trace.len() == index
             {
                 return Err(cause);
@@ -4060,11 +4060,14 @@ mod compile_control_tests {
             for &index in &checkpoints {
                 let control = Control {
                     trace: Default::default(),
-                    refuse: Some((index, cause)),
+                    refuse: Some((index, cause.clone())),
                 };
                 let error = run_column(&payload, &control).unwrap_err();
-                assert_eq!(error.compile_control_error(), Some(cause));
-                assert_eq!(error.kind(), ConnectorCodecErrorKind::CompileControl(cause));
+                assert_eq!(error.compile_control_error(), Some(&cause));
+                assert_eq!(
+                    error.kind(),
+                    &ConnectorCodecErrorKind::CompileControl(cause.clone())
+                );
                 assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
             }
         }
@@ -4096,7 +4099,7 @@ mod compile_control_tests {
         for cause in causes() {
             let control = Control {
                 trace: Default::default(),
-                refuse: Some((index, cause)),
+                refuse: Some((index, cause.clone())),
             };
             let mut budget = ledger();
             let mut context =
@@ -4111,7 +4114,7 @@ mod compile_control_tests {
                 )
                 .unwrap_err()
                 .compile_control_error(),
-                Some(cause)
+                Some(&cause)
             );
             assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
         }
@@ -4167,7 +4170,7 @@ mod compile_control_tests {
             for use_domain in [false, true] {
                 let control = Control {
                     trace: Default::default(),
-                    refuse: Some((700, cause)),
+                    refuse: Some((700, cause.clone())),
                 };
                 let mut budget = ledger();
                 let mut context =
@@ -4178,7 +4181,7 @@ mod compile_control_tests {
                 } else {
                     decode_identity(&identity, &mut context).unwrap_err()
                 };
-                assert_eq!(error.compile_control_error(), Some(cause));
+                assert_eq!(error.compile_control_error(), Some(&cause));
                 let calls = control.trace.lock().unwrap().len();
                 assert_eq!(calls, 700);
                 assert_eq!(
@@ -4186,7 +4189,7 @@ mod compile_control_tests {
                         .flush_compile_control()
                         .unwrap_err()
                         .compile_control_error(),
-                    Some(cause)
+                    Some(&cause)
                 );
                 assert_eq!(control.trace.lock().unwrap().len(), calls);
             }
@@ -4227,7 +4230,7 @@ mod compile_control_tests {
             for cause in causes() {
                 let control = Control {
                     trace: Default::default(),
-                    refuse: Some((3, cause)),
+                    refuse: Some((3, cause.clone())),
                 };
                 let mut budget = ledger();
                 let mut context =
@@ -4237,7 +4240,7 @@ mod compile_control_tests {
                     decode_value(&raw, ty, &mut context)
                         .unwrap_err()
                         .compile_control_error(),
-                    Some(cause)
+                    Some(&cause)
                 );
                 assert_eq!(control.trace.lock().unwrap()[2].1, 256);
                 assert_eq!(
@@ -4245,7 +4248,7 @@ mod compile_control_tests {
                         .flush_compile_control()
                         .unwrap_err()
                         .compile_control_error(),
-                    Some(cause)
+                    Some(&cause)
                 );
                 assert_eq!(control.trace.lock().unwrap().len(), 3);
             }
@@ -4272,7 +4275,7 @@ mod compile_control_tests {
         for cause in causes() {
             let control = Control {
                 trace: Default::default(),
-                refuse: Some((trace.len(), cause)),
+                refuse: Some((trace.len(), cause.clone())),
             };
             let mut budget = ledger();
             let mut context =
@@ -4282,7 +4285,7 @@ mod compile_control_tests {
                 decode_identity(&raw, &mut context)
                     .unwrap_err()
                     .compile_control_error(),
-                Some(cause)
+                Some(&cause)
             );
         }
         let ordinary_text = codec_error(
@@ -4309,13 +4312,13 @@ mod compile_control_tests {
         for cause in causes() {
             let control = Control {
                 trace: Default::default(),
-                refuse: Some((trace.len(), cause)),
+                refuse: Some((trace.len(), cause.clone())),
             };
             assert_eq!(
                 run_column(&payload, &control)
                     .unwrap_err()
                     .compile_control_error(),
-                Some(cause)
+                Some(&cause)
             );
         }
         let mut budget = ledger();
@@ -4332,7 +4335,7 @@ mod compile_control_tests {
         for cause in causes() {
             let control = Control {
                 trace: Default::default(),
-                refuse: Some((2, cause)),
+                refuse: Some((2, cause.clone())),
             };
             let mut budget = ledger();
             let mut context =
@@ -4348,7 +4351,7 @@ mod compile_control_tests {
                 )
                 .unwrap_err()
                 .compile_control_error(),
-                Some(cause)
+                Some(&cause)
             );
             assert!(input.is_empty());
             assert_eq!(control.trace.lock().unwrap()[1].1, 256);
@@ -4415,7 +4418,7 @@ mod compile_control_tests {
             for index in [trace.len() - 100, trace.len()] {
                 let control = Control {
                     trace: Default::default(),
-                    refuse: Some((index, cause)),
+                    refuse: Some((index, cause.clone())),
                 };
                 let mut budget = ledger();
                 let mut context =
@@ -4425,7 +4428,7 @@ mod compile_control_tests {
                     decode_table(&raw, &mut context)
                         .unwrap_err()
                         .compile_control_error(),
-                    Some(cause)
+                    Some(&cause)
                 );
                 assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
             }

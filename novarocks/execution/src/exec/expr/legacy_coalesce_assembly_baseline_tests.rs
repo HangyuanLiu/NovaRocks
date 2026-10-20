@@ -29,7 +29,11 @@ use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_types::SlotId;
 use std::sync::Arc;
-fn eval(name: &str, columns: Vec<ArrayRef>, output: DataType) -> Result<ArrayRef, String> {
+fn eval(
+    name: &str,
+    columns: Vec<ArrayRef>,
+    output: DataType,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut arena = ExprArena::default();
     let mut args = Vec::new();
     let mut fields = Vec::new();
@@ -61,7 +65,7 @@ fn eval(name: &str, columns: Vec<ArrayRef>, output: DataType) -> Result<ArrayRef
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     let input = Chunk::new_with_chunk_schema(batch, schema);
     if name == "ifnull" {
-        function::eval_ifnull(&arena, args[0], args[1], &input)
+        function::eval_ifnull(&arena, root, args[0], args[1], &input)
     } else {
         function::eval_coalesce(&arena, root, &args, &input)
     }
@@ -173,7 +177,7 @@ fn legacy_coalesce_assembly_baseline_timestamp_timezone_is_retained() {
     }
 }
 #[test]
-fn legacy_coalesce_assembly_baseline_decimal_targets_preserve_distinct_rules() {
+fn legacy_coalesce_assembly_decimal_results_preserve_declared_precision_and_scale() {
     let left: ArrayRef = Arc::new(
         Decimal128Array::from(vec![Some(100), None, None])
             .with_precision_and_scale(9, 2)
@@ -191,8 +195,8 @@ fn legacy_coalesce_assembly_baseline_decimal_targets_preserve_distinct_rules() {
         declared.clone(),
     )
     .unwrap();
-    let expected = Decimal128Array::from(vec![Some(100), Some(333), None])
-        .with_precision_and_scale(9, 2)
+    let expected = Decimal128Array::from(vec![Some(1000), Some(3333), None])
+        .with_precision_and_scale(18, 3)
         .unwrap();
     assert_eq!(output.to_data(), expected.to_data());
     let output = eval("coalesce", vec![left, right], declared).unwrap();

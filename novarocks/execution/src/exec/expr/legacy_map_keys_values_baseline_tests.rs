@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Original MAP_KEYS/MAP_VALUES raw authors: sorting, data failures and field projection.
+use super::legacy_array_append_baseline_tests::{
+    assert_frozen_target as assert_expression_contract, assert_original_arrow,
+};
 use super::{ExprArena, ExprId, ExprNode};
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use arrow::array::{
@@ -24,6 +27,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_buffer::{NullBuffer, OffsetBuffer};
+use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_types::SlotId;
 use std::sync::Arc;
 #[derive(Clone, Copy)]
@@ -60,13 +64,17 @@ fn call(
     id: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     match p {
         Part::Keys => super::function::map::eval_map_keys(arena, id, args, chunk),
         Part::Values => super::function::map::eval_map_values(arena, id, args, chunk),
     }
 }
-fn raw(p: Part, a: ArrayRef, output: Option<DataType>) -> Result<ArrayRef, String> {
+fn raw(
+    p: Part,
+    a: ArrayRef,
+    output: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (mut arena, args, chunk) = setup(a);
     let id = output
         .map(|t| arena.push_typed(ExprNode::SlotId(SlotId::new(999)), t))
@@ -179,7 +187,7 @@ fn original_map_parts_unsupported_key_compare_fails_only_when_comparison_needed(
             false,
         );
         assert_eq!(
-            raw(p, a.clone(), None).unwrap_err(),
+            (raw(p, a.clone(), None).unwrap_err()).to_string(),
             "map key ordered compare unsupported type: UInt32"
         );
         let singles = map(
@@ -257,7 +265,7 @@ fn original_map_parts_nan_and_signed_zero_keep_insertion_sort_original_ties() {
 fn original_map_parts_wrong_carrier_output_error_precedence_and_unused_arguments() {
     for p in [Part::Keys, Part::Values] {
         assert_eq!(
-            raw(p, Arc::new(Int32Array::from(vec![1])), None).unwrap_err(),
+            (raw(p, Arc::new(Int32Array::from(vec![1])), None).unwrap_err()).to_string(),
             format!("{} expects MapArray, got Int32", name(p))
         );
         let a = map(
@@ -268,7 +276,7 @@ fn original_map_parts_wrong_carrier_output_error_precedence_and_unused_arguments
             false,
         );
         assert_eq!(
-            raw(p, a, Some(DataType::Int32)).unwrap_err(),
+            (raw(p, a, Some(DataType::Int32)).unwrap_err()).to_string(),
             format!("{} output type must be List, got Int32", name(p))
         );
         let a = map(
@@ -282,10 +290,10 @@ fn original_map_parts_wrong_carrier_output_error_precedence_and_unused_arguments
         let bad = arena.push_typed(ExprNode::SlotId(SlotId::new(987)), DataType::Int32);
         args.push(bad);
         assert!(call(p, &arena, ExprId(usize::MAX), &args, &chunk).is_ok());
-        assert_eq!(
-            call(p, &arena, ExprId(usize::MAX), &[bad], &chunk).unwrap_err(),
-            arena.eval(bad, &chunk).unwrap_err()
-        );
+        let actual = call(p, &arena, ExprId(usize::MAX), &[bad], &chunk).unwrap_err();
+        let expected = arena.eval(bad, &chunk).unwrap_err();
+        assert_eq!(actual.failure_fact(), expected.failure_fact());
+        assert_eq!(actual.detail(), expected.detail());
     }
 }
 #[test]

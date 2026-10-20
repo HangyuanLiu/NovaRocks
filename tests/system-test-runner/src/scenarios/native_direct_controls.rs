@@ -99,7 +99,10 @@ impl DirectIntentOwner {
         ensure!(
             matches!(
                 action,
-                "ingress-hold" | "registry-hold" | "preparation-hold"
+                "ingress-hold"
+                    | "registry-hold"
+                    | "preparation-hold"
+                    | "prepared-failure-exit-hold"
             ),
             "unsupported Native direct action"
         );
@@ -135,7 +138,8 @@ impl DirectIntentOwner {
                 .get(query_index)
                 .context("Native direct target query outside frozen set")?;
             ensure!(
-                task_id.is_some() == (action == "preparation-hold"),
+                task_id.is_some()
+                    == matches!(action, "preparation-hold" | "prepared-failure-exit-hold"),
                 "Native direct target has wrong Task specificity"
             );
             let token = if shared_backend_token {

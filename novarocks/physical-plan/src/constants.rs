@@ -361,7 +361,6 @@ impl From<ConstantError> for ConstantReferenceError {
     fn from(error: ConstantError) -> Self {
         match error {
             ConstantError::Control(error) => Self::Control(error),
-            ConstantError::Limit(_) => Self::Control(CompileControlError::ResourceExhausted),
             error => Self::Constant(error),
         }
     }
@@ -387,7 +386,20 @@ impl fmt::Display for ConstantReferenceError {
         }
     }
 }
-impl std::error::Error for ConstantReferenceError {}
+impl std::error::Error for ConstantReferenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Constant(source) => Some(source),
+            Self::Structure(source) => Some(source),
+            Self::MissingPool(_)
+            | Self::DuplicatePool(_)
+            | Self::SourceTypeMismatch(_)
+            | Self::UnusedPools
+            | Self::InvalidConsumer(_) => None,
+        }
+    }
+}
 
 pub(crate) fn collection_reference(constant: &crate::UnpivotConstant) -> Option<ConstantReference> {
     match constant {

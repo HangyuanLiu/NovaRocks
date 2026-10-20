@@ -128,6 +128,7 @@ fn native_negate_original_int64_error_retains_current_ordinal_and_full_message()
         panic!("original i64 overflow must remain required data error")
     };
     assert_eq!(error.selected_ordinal(), 5);
+    assert_eq!(error.reason(), crate::DataFailureReason::NumericOutOfRange);
     assert_eq!(
         error.message(),
         "Arithmetic overflow: Overflow happened on: 0 - -9223372036854775808"
@@ -398,7 +399,7 @@ fn native_negate_computed_specialization_keeps_actual_compile_primary_without_fo
             let at = trace.len();
             trace.push((p, n));
             if at == self.at {
-                Err(self.cause)
+                Err(self.cause.clone())
             } else {
                 Ok(())
             }
@@ -429,7 +430,7 @@ fn native_negate_computed_specialization_keeps_actual_compile_primary_without_fo
             let control = Fail {
                 trace: Mutex::new(Vec::new()),
                 at,
-                cause,
+                cause: cause.clone(),
             };
             assert_eq!(
                 native_negate_computed_result_type(&source, &control)
@@ -439,5 +440,71 @@ fn native_negate_computed_specialization_keeps_actual_compile_primary_without_fo
             );
             assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
         }
+    }
+}
+
+#[test]
+fn native_negate_real_address_rejection_precedes_every_armed_footer_refusal() {
+    let input: ArrayRef = Arc::new(Int64Array::from(vec![Some(7)]));
+    let recipe = recipe(DataType::Int64);
+    for late in [
+        KernelFailure::Cancelled,
+        KernelFailure::DeadlineExceeded,
+        KernelFailure::ResourceExhausted,
+        invalid("late validation"),
+        KernelFailure::Internal(KernelDiagnostic::new("late internal failure")),
+        KernelFailure::Operational(KernelDiagnostic::new("late operation failure")),
+        KernelFailure::InstanceFailed,
+    ] {
+        let control = Control {
+            trace: Mutex::default(),
+            refusal: Some((1, late)),
+        };
+        let actual = recipe
+            .evaluate_row(EvaluatedArgument::Column(&input), 0, 1, &control)
+            .unwrap_err();
+        assert!(matches!(actual, KernelFailure::InvalidProgram(_)));
+        assert_eq!(*control.trace.lock().unwrap(), [0]);
+    }
+}
+
+#[test]
+fn native_negate_real_row_data_keeps_its_successful_cooperative_completion() {
+    let input: ArrayRef = Arc::new(Int64Array::from(vec![Some(i64::MIN)]));
+    let recipe = recipe(DataType::Int64);
+    let success = Control::default();
+    let NativeNegateRowResult::RowError(data) = recipe
+        .evaluate_row(EvaluatedArgument::Column(&input), 5, 0, &success)
+        .unwrap()
+    else {
+        panic!("original overflow stays in the normal row-data channel");
+    };
+    assert_eq!(data.selected_ordinal(), 5);
+    assert_eq!(data.reason(), crate::DataFailureReason::NumericOutOfRange);
+    assert_eq!(
+        data.message(),
+        "Arithmetic overflow: Overflow happened on: 0 - -9223372036854775808"
+    );
+    let trace = success.trace.lock().unwrap().clone();
+    assert!(trace.contains(&256));
+    // The actual final pending-work checkpoint follows the arithmetic row
+    // result. Unlike an outer Err, that normal result must still observe it.
+    let tail = trace.len().checked_sub(1).unwrap();
+    for late in [
+        KernelFailure::Cancelled,
+        KernelFailure::DeadlineExceeded,
+        KernelFailure::ResourceExhausted,
+    ] {
+        let control = Control {
+            trace: Mutex::default(),
+            refusal: Some((tail, late.clone())),
+        };
+        assert_eq!(
+            recipe
+                .evaluate_row(EvaluatedArgument::Column(&input), 5, 0, &control)
+                .unwrap_err(),
+            late
+        );
+        assert_eq!(*control.trace.lock().unwrap(), trace);
     }
 }

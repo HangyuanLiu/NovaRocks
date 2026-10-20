@@ -75,6 +75,8 @@ impl ExecutionRuntimeConfig {
 /// boundary explicit before those implementations move into this crate.
 #[derive(Clone)]
 pub struct ExecutionRuntime {
+    // One health owner follows this application runtime and all of its clones.
+    execution_health: Arc<crate::runtime::execution_health::ExecutionHealth>,
     config: ExecutionRuntimeConfig,
     function_set: Arc<SealedExecutionFunctionSet>,
     /// The one memory capacity authority this OS process was given.
@@ -125,6 +127,7 @@ impl ExecutionRuntime {
             exchange_io_executor,
         ));
         Ok(Self {
+            execution_health: Arc::new(crate::runtime::execution_health::ExecutionHealth::default()),
             config,
             function_set,
             memory_authority,
@@ -137,6 +140,10 @@ impl ExecutionRuntime {
             driver_executor,
             exchange_send_queue,
         })
+    }
+
+    pub fn execution_health(&self) -> Arc<crate::runtime::execution_health::ExecutionHealth> {
+        Arc::clone(&self.execution_health)
     }
 
     pub const fn config(&self) -> &ExecutionRuntimeConfig {
@@ -175,7 +182,7 @@ impl ExecutionRuntime {
     /// Stop accepting driver work and wait a bounded time for driver scheduling
     /// threads to join. A reaper retains join ownership after a timeout.
     /// Application shutdown invokes this before releasing the runtime owner.
-    pub fn shutdown_driver_execution(&self) -> Result<(), String> {
+    pub fn shutdown_driver_execution(&self) -> crate::runtime::fragment::ExecutionResult<()> {
         self.driver_executor.shutdown()
     }
 

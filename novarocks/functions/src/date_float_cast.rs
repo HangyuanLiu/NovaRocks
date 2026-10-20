@@ -15,20 +15,66 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Original DATE-to-float scalar computation, with the v1 raw arithmetic intact.
+//! DATE-to-float scalar computation with checked calendar-range conversion.
 //! Callers own NULL/address validation and original full/bounded error projection.
 use chrono::{Datelike, NaiveDate};
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
 
-pub fn date32_to_date_literal(days: i32) -> Result<i32, String> {
-    let date = NaiveDate::from_num_days_from_ce_opt(UNIX_EPOCH_DAY_OFFSET + days)
-        .ok_or_else(|| format!("invalid Date32 value {days}"))?;
-    Ok(date.year() * 10000 + date.month() as i32 * 100 + date.day() as i32)
+pub fn date32_to_date_literal(days: i32) -> Result<i64, DateFloatFailure> {
+    let date = UNIX_EPOCH_DAY_OFFSET
+        .checked_add(days)
+        .and_then(NaiveDate::from_num_days_from_ce_opt)
+        .ok_or(DateFloatFailure { days })?;
+    Ok(i64::from(date.year()) * 10000 + i64::from(date.month()) * 100 + i64::from(date.day()))
 }
 
-pub fn value_f32(days: i32) -> Result<f32, String> {
+pub fn value_f32(days: i32) -> Result<f32, DateFloatFailure> {
     Ok(date32_to_date_literal(days)? as f32)
 }
-pub fn value_f64(days: i32) -> Result<f64, String> {
+pub fn value_f64(days: i32) -> Result<f64, DateFloatFailure> {
     Ok(date32_to_date_literal(days)? as f64)
+}
+
+/// A genuine value failure must use a row or invocation Data channel.
+/// ```compile_fail
+/// let value = novarocks_functions::date_float_cast::value_f64(i32::MAX).unwrap_err();
+/// let _ = novarocks_functions::KernelFailure::from_domain(value);
+/// ```
+#[derive(Debug)]
+pub struct DateFloatFailure {
+    days: i32,
+}
+impl std::fmt::Display for DateFloatFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid Date32 value {}", self.days)
+    }
+}
+impl std::error::Error for DateFloatFailure {}
+impl novarocks_failure_contract::FailureProjection for DateFloatFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        crate::DataFailureReason::NumericOutOfRange.failure_fact()
+    }
+}
+// This value-only failure has no outer-kernel marker.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+    #[test]
+    fn date_float_calendar_range_is_checked_without_signed_add_panic() {
+        assert_eq!(date32_to_date_literal(0).unwrap(), 19700101);
+        let max_date = NaiveDate::MAX;
+        let max_literal =
+            date32_to_date_literal(max_date.num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET).unwrap();
+        assert_eq!(max_literal, 2_621_421_231);
+        assert!(max_literal > i64::from(i32::MAX));
+        for days in [i32::MIN, i32::MAX] {
+            let error = date32_to_date_literal(days).unwrap_err();
+            assert_eq!(error.days, days);
+            assert_eq!(
+                error.failure_fact(),
+                crate::DataFailureReason::NumericOutOfRange.failure_fact()
+            );
+        }
+    }
 }

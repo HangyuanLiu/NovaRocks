@@ -76,6 +76,7 @@ impl CatalogAdmission {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogApplicationErrorKind {
+    Interrupted,
     InvalidRequest,
     NotFound,
     AlreadyExists,
@@ -90,13 +91,34 @@ pub enum CatalogApplicationErrorKind {
 pub struct CatalogApplicationError {
     kind: CatalogApplicationErrorKind,
     message: String,
+    source: Option<novarocks_failure_contract::SharedFailureCause>,
 }
 
 impl CatalogApplicationError {
+    pub fn from_domain<E>(kind: CatalogApplicationErrorKind, cause: E) -> Self
+    where
+        E: std::error::Error
+            + novarocks_failure_contract::FailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        let source = novarocks_failure_contract::SharedFailureCause::new(cause);
+        Self {
+            kind,
+            message: source.detail().into(),
+            source: Some(source),
+        }
+    }
+    pub fn source_failure(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
+        self.source.as_ref()
+    }
+
     pub fn new(kind: CatalogApplicationErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
+            source: None,
         }
     }
 
@@ -111,7 +133,36 @@ impl fmt::Display for CatalogApplicationError {
     }
 }
 
-impl std::error::Error for CatalogApplicationError {}
+impl std::error::Error for CatalogApplicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|cause| cause as &dyn std::error::Error)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for CatalogApplicationError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass as C, FailureFact, FailureReason, domain};
+        if let Some(source) = &self.source {
+            return source.failure_fact();
+        }
+        let (class, reason) = match self.kind {
+            CatalogApplicationErrorKind::InvalidRequest => (C::Data, 900),
+            CatalogApplicationErrorKind::NotFound => (C::Dependency, 901),
+            CatalogApplicationErrorKind::AlreadyExists => (C::Data, 902),
+            CatalogApplicationErrorKind::Conflict => (C::Dependency, 903),
+            CatalogApplicationErrorKind::Unavailable => (C::Dependency, 904),
+            CatalogApplicationErrorKind::Internal => (C::Unexpected, 905),
+            CatalogApplicationErrorKind::UnsupportedSourceMode => (C::Data, 906),
+            CatalogApplicationErrorKind::DesiredStateEnumerationIncomplete => (C::Dependency, 907),
+            CatalogApplicationErrorKind::Interrupted => (C::Invariant, 908),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::METADATA, std::num::NonZeroU16::new(reason).unwrap()),
+        )
+    }
+}
 
 /// The Catalog application's command and admission dependency.
 pub trait CatalogApplicationPort: Send + Sync {

@@ -451,7 +451,7 @@ impl PureCompileControl for Trace {
         events.push((phase, units));
         if self.at == Some(at) {
             self.refused.store(true, Ordering::SeqCst);
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -572,7 +572,7 @@ fn small_success_and_ordinary_refusal_keep_every_original_compile_callback_prefi
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let control = Trace::new(Some(at), cause);
+                let control = Trace::new(Some(at), cause.clone());
                 assert!(
                     matches!(invoke(&control), Err(FragmentCompileError::Control(actual)) if actual == cause)
                 );
@@ -598,7 +598,7 @@ fn wide_actual_change_event_list_crosses_quantum_without_partial_program() {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = Trace::new(Some(at), cause);
+            let control = Trace::new(Some(at), cause.clone());
             assert!(
                 matches!(compile(&source, &control), Err(FragmentCompileError::Control(actual)) if actual == cause)
             );

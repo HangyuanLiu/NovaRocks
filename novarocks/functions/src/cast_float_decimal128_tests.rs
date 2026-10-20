@@ -337,7 +337,7 @@ fn float_decimal128_compile_callbacks_preserve_three_causes_no_tail() {
                 assert!(at <= stop, "callback after primary compile refusal");
             }
             calls.push((phase, items));
-            if let Some((stop, cause)) = self.refusal {
+            if let Some((stop, cause)) = self.refusal.clone() {
                 if at == stop {
                     return Err(cause);
                 }
@@ -396,7 +396,7 @@ fn float_decimal128_compile_callbacks_preserve_three_causes_no_tail() {
             ] {
                 let control = CompileControl {
                     calls: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let failure = PreparedCastRecipe::try_new(
                     op,

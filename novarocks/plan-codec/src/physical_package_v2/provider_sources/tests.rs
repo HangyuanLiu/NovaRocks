@@ -80,7 +80,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         trace.push(units);
-        if let Some((stop, cause)) = *self.stop.lock().unwrap()
+        if let Some((stop, cause)) = self.stop.lock().unwrap().clone()
             && stop == at
         {
             return Err(cause);
@@ -1273,7 +1273,7 @@ fn actual_small_success_consumer_callbacks_keep_three_primary_causes_without_foo
         for at in 0..trace.len() {
             for cause in CAUSES {
                 let c = Control {
-                    stop: Mutex::new(Some((at, cause))),
+                    stop: Mutex::new(Some((at, cause.clone()))),
                     ..Default::default()
                 };
                 assert!(
@@ -1448,7 +1448,7 @@ fn original_field_arc_fvt_package_and_cumulative_budget_loans_reject_foreign_wit
         for at in 0..trace.len() {
             for cause in CAUSES {
                 let c = Control {
-                    stop: Mutex::new(Some((at, cause))),
+                    stop: Mutex::new(Some((at, cause.clone()))),
                     ..Default::default()
                 };
                 assert!(

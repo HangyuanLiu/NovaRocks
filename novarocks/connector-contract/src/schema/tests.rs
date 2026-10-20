@@ -48,7 +48,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         trace.push(units);
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -452,7 +452,7 @@ fn owned_schema_actual_small_success_and_union_error_prefixes_keep_three_origina
         for at in 0..positive.len() {
             for cause in CAUSES {
                 let c = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 let (result, _) = observed(&source, SOURCE, &c);
@@ -491,7 +491,7 @@ fn owned_schema_wide_frequent_flushing_and_long_name_actual_quantum_keep_sampled
         for at in [0, interior, positive.len() - 1] {
             for cause in CAUSES {
                 let c = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 let result = observed(&source, SOURCE, &c).0;

@@ -94,7 +94,15 @@ fn by_window_source_custody_actual_metadata_refusal_drops_original_chunk_owner()
         Ok(_) => panic!("actual metadata allocation must be refused"),
         Err(cause) => cause,
     };
-    assert_eq!(cause, novarocks_functions::KernelFailure::ResourceExhausted);
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&cause);
+    assert_eq!(
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Resource
+    );
+    let resource = fact.resource().expect("the actual tracker capacity source");
+    assert_eq!(resource.limit, Some(1));
+    assert!(resource.requested.unwrap() > 1);
+    assert!(resource.committed.unwrap() > 1);
     assert_eq!(input_tracker.current(), 0);
     assert_eq!(wrap_tracker.current(), 0);
     assert_eq!(query.current(), 0);

@@ -74,7 +74,7 @@ impl PureCompileControl for Control {
             assert!(at <= refusal, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((refusal, cause)) if refusal == at => Err(cause),
             _ => Ok(()),
         }
@@ -281,7 +281,7 @@ fn assert_materialize_prefixes(
 ) {
     for at in positions {
         for cause in CAUSES {
-            let control = Control::refusing(at, cause);
+            let control = Control::refusing(at, cause.clone());
             assert!(
                 matches!(materialize(stream,field,ty,retention,limits,&control),
             Err(FlatReaderError::Projection(FlatPoolResourceError::Control(actual))) if actual == cause)
@@ -468,7 +468,7 @@ fn actual_reader_explicit_request_coexistence_and_work_envelopes_have_exact_boun
     let trace = control.trace();
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let refusal = Control::refusing(at, cause);
+            let refusal = Control::refusing(at, cause.clone());
             assert!(
                 matches!(stream.preflight_reader_resources(&ty,retention,policy(),reader_limits(),&refusal),Err(FlatPoolResourceError::Control(actual)) if actual==cause)
             );
@@ -600,14 +600,35 @@ fn actual_reader_checked_geometry_does_not_hide_payload_validation_failures() {
         let error = ordinary_materialize(&stream, &field, &ty, retention, reader_limits());
         if owner_error {
             assert!(matches!(
-                error,
-                FlatReaderError::Projection(FlatPoolResourceError::Constant(ConstantError::Arrow(
-                    _
-                )))
+                &error,
+                FlatReaderError::Projection(FlatPoolResourceError::Constant(
+                    ConstantError::Source(_)
+                ))
             ));
         } else {
-            assert!(matches!(error, FlatReaderError::Arrow(_)));
+            assert!(matches!(&error, FlatReaderError::Arrow(_)));
         }
+        let mut source: &(dyn std::error::Error + 'static) = &error;
+        let mut saw_constant = false;
+        loop {
+            if let Some(constant) = source.downcast_ref::<ConstantError>() {
+                use novarocks_failure_contract::{FailureClass, FailureProjection};
+                assert_eq!(constant.failure_fact().class(), FailureClass::Data);
+                assert_eq!(
+                    constant.failure_fact().reason().domain(),
+                    novarocks_failure_contract::domain::CONSTANT.get()
+                );
+                assert_eq!(constant.failure_fact().reason().code(), 5);
+                saw_constant = true;
+            }
+            if source.is::<arrow::error::ArrowError>() {
+                break;
+            }
+            source = source
+                .source()
+                .expect("actual reader/constant SDK refusal must remain reachable");
+        }
+        assert_eq!(saw_constant, owner_error);
     }
 }
 
@@ -826,7 +847,7 @@ fn actual_reader_sparse_source_metadata_capacity_is_admitted_before_pool_delegat
     );
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let refusal = Control::refusing(at, cause);
+            let refusal = Control::refusing(at, cause.clone());
             assert!(matches!(
                 sparse_stream.preflight_reader_resources(
                     &ty, sparse_retention, policy(), low, &refusal,
@@ -932,7 +953,7 @@ fn actual_reader_deleted_metadata_keeps_original_backing_invoice_work_authority(
     );
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let refusal = Control::refusing(at, cause);
+            let refusal = Control::refusing(at, cause.clone());
             assert!(matches!(
                 stream.preflight_reader_resources(&ty, enlarged_invoice, policy(), low, &refusal),
                 Err(FlatPoolResourceError::Control(actual)) if actual == cause

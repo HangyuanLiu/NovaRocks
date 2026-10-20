@@ -3531,7 +3531,7 @@ fn writer_grouped_unpivot_source_gate_preserves_each_original_control_and_ordina
                 assert!(at <= stop, "callback after original refusal");
             }
             trace.push((phase, units));
-            match self.refusal {
+            match self.refusal.clone() {
                 Some((stop, cause)) if stop == at => Err(cause),
                 _ => Ok(()),
             }
@@ -3581,7 +3581,7 @@ fn writer_grouped_unpivot_source_gate_preserves_each_original_control_and_ordina
             ] {
                 let refusal = Control {
                     trace: Mutex::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert_eq!(
                     crate::constants::validate_fragment_constants_observed(
@@ -4008,7 +4008,7 @@ fn runtime_filter_grouped_parent_observed_control_retains_every_first_refusal() 
             let mut trace = self.trace.lock().unwrap();
             let at = trace.len();
             trace.push(units);
-            if let Some((refuse_at, cause)) = self.refusal {
+            if let Some((refuse_at, cause)) = self.refusal.clone() {
                 if at == refuse_at {
                     return Err(cause);
                 }
@@ -4046,7 +4046,7 @@ fn runtime_filter_grouped_parent_observed_control_retains_every_first_refusal() 
         ] {
             let control = Control {
                 trace: Mutex::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert_eq!(evaluate(&control), Err(cause));
             assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);

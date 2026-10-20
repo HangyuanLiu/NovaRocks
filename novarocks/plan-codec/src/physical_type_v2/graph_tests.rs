@@ -41,7 +41,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         events.push(units);
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -491,7 +491,7 @@ fn graph_small_success_and_ordinary_actual_callback_prefixes_preserve_three_caus
         for at in 0..expected.len() {
             for cause in CAUSES {
                 let control = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 assert!(
@@ -532,7 +532,7 @@ fn graph_duplicate_insertions_charge_the_completed_mutation_before_the_ordinary_
         let mutation_tail = expected.iter().rposition(|&n| n == 1).unwrap();
         for cause in CAUSES {
             let control = Control {
-                stop: Some((mutation_tail, cause)),
+                stop: Some((mutation_tail, cause.clone())),
                 ..Control::default()
             };
             assert!(matches!(
@@ -574,7 +574,7 @@ fn graph_wide_320_real_sparse_insertions_have_finer_opaque_observation_and_sampl
     ] {
         for cause in CAUSES {
             let control = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(

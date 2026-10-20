@@ -47,7 +47,7 @@ impl AggregateFunction for BoolStateAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         build_bool_state_spec(func, input_type, input_is_intermediate, AggKind::BoolState)
     }
 
@@ -59,14 +59,15 @@ impl AggregateFunction for BoolStateAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "bool_state input missing".to_string())?;
-        let bool_arr = arr
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| "bool_state input must be BooleanArray".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("bool_state input missing")
+        })?;
+        let bool_arr = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "bool_state input must be BooleanArray",
+            )
+        })?;
         Ok(AggInputView::Bool(bool_arr))
     }
 
@@ -74,7 +75,7 @@ impl AggregateFunction for BoolStateAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_bool_state_merge_view(array)
     }
 
@@ -98,7 +99,7 @@ impl AggregateFunction for BoolStateAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         update_bool_state(offset, state_ptrs, input)
     }
 
@@ -108,7 +109,7 @@ impl AggregateFunction for BoolStateAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         merge_bool_state(offset, state_ptrs, input)
     }
 
@@ -118,7 +119,7 @@ impl AggregateFunction for BoolStateAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         _output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         build_bool_state_array(offset, group_states)
     }
 }
@@ -129,7 +130,7 @@ impl AggregateFunction for BoolStateSignedAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         build_bool_state_spec(
             func,
             input_type,
@@ -146,10 +147,12 @@ impl AggregateFunction for BoolStateSignedAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "bool_state_signed input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "bool_state_signed input missing",
+            )
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -157,7 +160,7 @@ impl AggregateFunction for BoolStateSignedAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_bool_state_merge_view(array)
     }
 
@@ -181,7 +184,7 @@ impl AggregateFunction for BoolStateSignedAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         update_bool_state_signed(offset, state_ptrs, input)
     }
 
@@ -191,7 +194,7 @@ impl AggregateFunction for BoolStateSignedAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         merge_bool_state(offset, state_ptrs, input)
     }
 
@@ -201,7 +204,7 @@ impl AggregateFunction for BoolStateSignedAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         _output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         build_bool_state_array(offset, group_states)
     }
 }
@@ -211,19 +214,29 @@ fn build_bool_state_spec(
     input_type: Option<&DataType>,
     input_is_intermediate: bool,
     kind: AggKind,
-) -> Result<AggSpec, String> {
+) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
     if !input_is_intermediate {
         let input_type = input_type.ok_or_else(|| match &kind {
-            AggKind::BoolState => "bool_state input type missing".to_string(),
-            AggKind::BoolStateSigned => "bool_state_signed input type missing".to_string(),
-            other => format!("unexpected bool_state kind: {other:?}"),
+            AggKind::BoolState => crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "bool_state input type missing",
+            ),
+            AggKind::BoolStateSigned => {
+                crate::exec::expr::agg::functions::aggregate_binding_contract(
+                    "bool_state_signed input type missing",
+                )
+            }
+            other => crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "unexpected bool_state kind: {other:?}"
+            )),
         })?;
         match kind {
             AggKind::BoolState => {
                 if input_type != &DataType::Boolean {
-                    return Err(format!(
-                        "bool_state expects Boolean input, got {input_type:?}"
-                    ));
+                    return Err(
+                        crate::exec::expr::agg::functions::aggregate_binding_contract(
+                            format_args!("bool_state expects Boolean input, got {input_type:?}"),
+                        ),
+                    );
                 }
             }
             AggKind::BoolStateSigned => validate_signed_input_type(input_type)?,
@@ -248,30 +261,40 @@ fn build_bool_state_spec(
     })
 }
 
-fn validate_signed_input_type(input_type: &DataType) -> Result<(), String> {
+fn validate_signed_input_type(
+    input_type: &DataType,
+) -> crate::runtime::fragment::ExecutionResult<()> {
     let DataType::Struct(fields) = input_type else {
-        return Err(format!(
-            "bool_state_signed expects struct input (value, change_op), got {:?}",
-            input_type
-        ));
+        return Err(
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "bool_state_signed expects struct input (value, change_op), got {:?}",
+                input_type
+            )),
+        );
     };
     if fields.len() != 2 {
-        return Err(format!(
-            "bool_state_signed expects 2 arguments, got struct with {} fields",
-            fields.len()
-        ));
+        return Err(
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "bool_state_signed expects 2 arguments, got struct with {} fields",
+                fields.len()
+            )),
+        );
     }
     if fields[0].data_type() != &DataType::Boolean {
-        return Err(format!(
-            "bool_state_signed value must be Boolean, got {:?}",
-            fields[0].data_type()
-        ));
+        return Err(
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "bool_state_signed value must be Boolean, got {:?}",
+                fields[0].data_type()
+            )),
+        );
     }
     if fields[1].data_type() != &DataType::Int8 {
-        return Err(format!(
-            "bool_state_signed change_op must be Int8, got {:?}",
-            fields[1].data_type()
-        ));
+        return Err(
+            crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                "bool_state_signed change_op must be Int8, got {:?}",
+                fields[1].data_type()
+            )),
+        );
     }
     Ok(())
 }
@@ -288,14 +311,15 @@ fn bool_state_layout_for(kind: &AggKind) -> (usize, usize) {
 
 fn build_bool_state_merge_view<'a>(
     array: &'a Option<ArrayRef>,
-) -> Result<AggInputView<'a>, String> {
-    let arr = array
-        .as_ref()
-        .ok_or_else(|| "bool_state merge input missing".to_string())?;
-    let binary = arr
-        .as_any()
-        .downcast_ref::<BinaryArray>()
-        .ok_or_else(|| "bool_state merge input must be BinaryArray".to_string())?;
+) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+    let arr = array.as_ref().ok_or_else(|| {
+        crate::exec::expr::agg::views::aggregate_input_contract("bool_state merge input missing")
+    })?;
+    let binary = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+        crate::exec::expr::agg::views::aggregate_input_contract(
+            "bool_state merge input must be BinaryArray",
+        )
+    })?;
     Ok(AggInputView::Binary(binary))
 }
 
@@ -309,12 +333,14 @@ fn state_slot(base: AggStatePtr, offset: usize) -> *mut BoolStateCounts {
     unsafe { (base as *mut u8).add(offset) as *mut BoolStateCounts }
 }
 
-fn add_delta(slot: *mut i64, delta: i64, context: &str) -> Result<(), String> {
+fn add_delta(
+    slot: *mut i64,
+    delta: i64,
+    context: &str,
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     unsafe {
         let current = *slot;
-        let next = current
-            .checked_add(delta)
-            .ok_or_else(|| format!("{context} overflow while adding count delta"))?;
+        let next = super::failure::add_count(current, delta, context)?;
         *slot = next;
     }
     Ok(())
@@ -325,7 +351,7 @@ fn add_bool_delta(
     value: bool,
     delta: i64,
     context: &str,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     unsafe {
         if value {
             add_delta(std::ptr::addr_of_mut!((*state).count_true), delta, context)
@@ -339,9 +365,11 @@ fn update_bool_state(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let AggInputView::Bool(array) = input else {
-        return Err("bool_state batch input type mismatch".to_string());
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "bool_state batch input type mismatch",
+        ));
     };
     for (row, &base) in state_ptrs.iter().enumerate() {
         if array.is_null(row) {
@@ -356,18 +384,26 @@ fn update_bool_state_signed(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let AggInputView::Any(array) = input else {
-        return Err("bool_state_signed batch input type mismatch".to_string());
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "bool_state_signed batch input type mismatch",
+        ));
     };
     let struct_arr = array
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| "bool_state_signed expects struct input".to_string())?;
+        .ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "bool_state_signed expects struct input",
+            )
+        })?;
     if struct_arr.num_columns() != 2 {
-        return Err(format!(
-            "bool_state_signed expects 2 arguments, got {}",
-            struct_arr.num_columns()
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!(
+                "bool_state_signed expects 2 arguments, got {}",
+                struct_arr.num_columns()
+            ),
         ));
     }
     let value_arr_ref = struct_arr.column(0);
@@ -375,20 +411,20 @@ fn update_bool_state_signed(
         .as_any()
         .downcast_ref::<BooleanArray>()
         .ok_or_else(|| {
-            format!(
+            crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
                 "bool_state_signed value must be Boolean, got {:?}",
                 value_arr_ref.data_type()
-            )
+            ))
         })?;
     let op_arr_ref = struct_arr.column(1);
     let op_arr = op_arr_ref
         .as_any()
         .downcast_ref::<Int8Array>()
         .ok_or_else(|| {
-            format!(
+            crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
                 "bool_state_signed change_op must be Int8, got {:?}",
                 op_arr_ref.data_type()
-            )
+            ))
         })?;
 
     for (row, &base) in state_ptrs.iter().enumerate() {
@@ -401,7 +437,11 @@ fn update_bool_state_signed(
             match op_arr.value(row) {
                 CHANGE_OP_INSERT => 1,
                 CHANGE_OP_DELETE => -1,
-                other => return Err(format!("unknown bool_state_signed change_op: {other}")),
+                other => {
+                    return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                        format_args!("unknown bool_state_signed change_op: {other}"),
+                    ));
+                }
             }
         };
         add_bool_delta(
@@ -418,9 +458,11 @@ fn merge_bool_state(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let AggInputView::Binary(array) = input else {
-        return Err("bool_state merge input type mismatch".to_string());
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "bool_state merge input type mismatch",
+        ));
     };
     for (row, &base) in state_ptrs.iter().enumerate() {
         if array.is_null(row) {
@@ -434,14 +476,20 @@ fn merge_bool_state(
     Ok(())
 }
 
-fn build_bool_state_array(offset: usize, group_states: &[AggStatePtr]) -> Result<ArrayRef, String> {
+fn build_bool_state_array(
+    offset: usize,
+    group_states: &[AggStatePtr],
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut builder = BinaryBuilder::new();
+    let mut extent = super::failure::BinaryOutput::default();
     for &base in group_states {
         let state = unsafe { &*state_slot(base, offset) };
         if state.count_true == 0 && state.count_false == 0 {
             builder.append_value([]);
         } else {
-            builder.append_value(encode_bool_state(state.count_true, state.count_false));
+            let bytes = encode_bool_state(state.count_true, state.count_false);
+            extent.append(bytes.len())?;
+            builder.append_value(bytes);
         }
     }
     Ok(Arc::new(builder.finish()))
@@ -520,7 +568,11 @@ mod tests {
             super::super::super::update_batch(&self.spec, 0, &state_ptrs, &input).unwrap();
         }
 
-        fn try_update(&mut self, input: AggInputView<'_>, rows: usize) -> Result<(), String> {
+        fn try_update(
+            &mut self,
+            input: AggInputView<'_>,
+            rows: usize,
+        ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
             let ptr = self.ptr();
             let state_ptrs = vec![ptr; rows];
             super::super::super::update_batch(&self.spec, 0, &state_ptrs, &input)
@@ -751,7 +803,10 @@ mod tests {
 
         let err = cell.try_update(view, 1).unwrap_err();
 
-        assert!(err.contains("unknown bool_state_signed change_op"));
+        assert!(
+            err.to_string()
+                .contains("unknown bool_state_signed change_op")
+        );
     }
 
     #[test]

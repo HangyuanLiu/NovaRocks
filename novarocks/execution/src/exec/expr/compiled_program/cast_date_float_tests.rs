@@ -241,7 +241,7 @@ fn date_float_actual_compiler_every_compile_control_refusal_keeps_typed_cause() 
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let control = CompileCallbacks::new(cause, at);
+                let control = CompileCallbacks::new(cause.clone(), at);
                 assert!(
                     matches!(compile(&functions,package.clone(),&control),Err(FragmentCompileError::Control(error)) if error==cause)
                 );

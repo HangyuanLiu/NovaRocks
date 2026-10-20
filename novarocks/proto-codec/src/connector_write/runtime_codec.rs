@@ -254,7 +254,9 @@ fn wire_error(owner: &str, error: ConnectorCodecError) -> ConnectorWriteCodecErr
         ConnectorCodecErrorKind::Unsupported => ProtocolErrorKind::Unsupported,
         ConnectorCodecErrorKind::Capacity => ProtocolErrorKind::Capacity,
         ConnectorCodecErrorKind::VersionMismatch => ProtocolErrorKind::VersionMismatch,
-        ConnectorCodecErrorKind::CompileControl(cause) => ProtocolErrorKind::CompileControl(cause),
+        ConnectorCodecErrorKind::CompileControl(cause) => {
+            ProtocolErrorKind::CompileControl(cause.clone())
+        }
     };
     ConnectorWriteCodecError::new(
         owner,
@@ -278,7 +280,7 @@ mod compile_control_tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let error = wire_error("paimon", ConnectorCodecError::from(cause));
+            let error = wire_error("paimon", ConnectorCodecError::from(cause.clone()));
             let outer_source = std::error::Error::source(&error).unwrap();
             assert_eq!(
                 outer_source.downcast_ref::<ProtocolError>(),
@@ -286,7 +288,7 @@ mod compile_control_tests {
             );
             assert_eq!(
                 error.protocol().kind(),
-                ProtocolErrorKind::CompileControl(cause)
+                &ProtocolErrorKind::CompileControl(cause.clone())
             );
             assert_eq!(
                 std::error::Error::source(error.protocol())
@@ -303,7 +305,7 @@ mod compile_control_tests {
                 "pure compilation was cancelled",
             ),
         );
-        assert_eq!(diagnostic.protocol().kind(), ProtocolErrorKind::Capacity);
+        assert_eq!(diagnostic.protocol().kind(), &ProtocolErrorKind::Capacity);
         assert!(std::error::Error::source(diagnostic.protocol()).is_none());
     }
 }

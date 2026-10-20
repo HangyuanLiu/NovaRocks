@@ -56,7 +56,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut calls = self.calls.lock().unwrap();
         calls.push(units);
-        if let Some((at, cause)) = self.refuse
+        if let Some((at, cause)) = self.refuse.clone()
             && calls.len() == at
         {
             return Err(cause);
@@ -356,7 +356,7 @@ fn sql_dependency_type_host_abort_all_original_control_checkpoints_preserve_firs
     ] {
         // The parent's original entry is checked before the encoder can borrow work.
         for at in 2..=checkpoints {
-            let control = Control::new(Some((at, cause)));
+            let control = Control::new(Some((at, cause.clone())));
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
             let error = encode_borrowed_type_table_writer_sources_with_host_in(
                 &values,

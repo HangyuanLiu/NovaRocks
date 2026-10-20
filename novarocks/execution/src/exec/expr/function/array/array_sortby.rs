@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::ArrayRef;
 
 pub fn eval_array_sortby<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -23,7 +24,12 @@ pub fn eval_array_sortby<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() < 2 {
+        return Err(expression_contract(
+            "array_sortby has an invalid prepared argument count",
+        ));
+    }
     let source = arena.eval(args[0], chunk)?;
     Ok(
         (novarocks_functions::builtin::array_sortby_core::evaluate_fallible(

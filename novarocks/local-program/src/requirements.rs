@@ -127,7 +127,7 @@ impl std::error::Error for BindingRequirementsError {}
 
 /// Compilation preserves the caller's control cause separately from structural
 /// requirement errors. It does not authorize task capabilities or memory.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BindingRequirementsCompileError {
     Requirement(BindingRequirementsError),
     Control(CompileControlError),
@@ -229,7 +229,7 @@ mod tests {
             assert_eq!(phase, CompilePhase::LowerProgram);
             let mut calls = self.calls.lock().unwrap();
             calls.push(units);
-            if let Some((call, error)) = self.refusal
+            if let Some((call, error)) = self.refusal.clone()
                 && calls.len() == call
             {
                 return Err(error);
@@ -292,7 +292,7 @@ mod tests {
             for call in 1..=6 {
                 let control = Control {
                     calls: Mutex::default(),
-                    refusal: Some((call, error)),
+                    refusal: Some((call, error.clone())),
                 };
                 let result = BindingRequirements::try_new_for_compile(filters(513), &control);
                 assert!(

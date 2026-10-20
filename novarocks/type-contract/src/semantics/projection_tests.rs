@@ -31,10 +31,10 @@ impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, work_units: u32) -> Result<(), CompileControlError> {
         let mut checkpoints = self.checkpoints.lock().unwrap();
         checkpoints.push((phase, work_units));
-        if let Some(error) = self.entry_failure {
+        if let Some(error) = self.entry_failure.clone() {
             return Err(error);
         }
-        if let Some((limit, error)) = self.positive_failure
+        if let Some((limit, error)) = self.positive_failure.clone()
             && checkpoints.iter().map(|(_, units)| units).sum::<u32>() >= limit
         {
             return Err(error);
@@ -218,7 +218,7 @@ fn typed_control_failures_precede_input_iteration_and_stop_at_the_quantum() {
         let input = table();
         let before = input.clone();
         let control = Control {
-            entry_failure: Some(failure),
+            entry_failure: Some(failure.clone()),
             ..Default::default()
         };
         let refs = std::iter::from_fn(|| -> Option<SemanticParameterRef> {
@@ -226,26 +226,26 @@ fn typed_control_failures_precede_input_iteration_and_stop_at_the_quantum() {
         });
         assert_eq!(
             input.project_observed(refs, CompilePhase::Validate, &control),
-            Err(SemanticParameterProjectionError::Control(failure))
+            Err(SemanticParameterProjectionError::Control(failure.clone()))
         );
         assert_eq!(
             control.checkpoints.into_inner().unwrap(),
             vec![(CompilePhase::Validate, 0)]
         );
         let control = Control {
-            entry_failure: Some(failure),
+            entry_failure: Some(failure.clone()),
             ..Default::default()
         };
         assert_eq!(
             input.project_observed([], CompilePhase::Validate, &control),
-            Err(SemanticParameterProjectionError::Control(failure))
+            Err(SemanticParameterProjectionError::Control(failure.clone()))
         );
         assert_eq!(
             control.checkpoints.into_inner().unwrap(),
             vec![(CompilePhase::Validate, 0)]
         );
         let control = Control {
-            positive_failure: Some((256, failure)),
+            positive_failure: Some((256, failure.clone())),
             ..Default::default()
         };
         let consumed = AtomicUsize::new(0);

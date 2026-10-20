@@ -44,7 +44,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         events.push(units);
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -750,7 +750,7 @@ fn receiver_numeric_envelopes_and_actual_callback_prefixes_keep_original_three_c
         for at in 0..expected.len() {
             for cause in CAUSES {
                 let c = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 assert!(
@@ -983,7 +983,7 @@ fn receiver_materialization_host_preserves_every_actual_control_refusal() {
     for stop in 0..trace(&complete).len() {
         for cause in CAUSES {
             let c = Control {
-                stop: Some((stop, cause)),
+                stop: Some((stop, cause.clone())),
                 events: Mutex::new(Vec::new()),
             };
             let mut host = scope(false);

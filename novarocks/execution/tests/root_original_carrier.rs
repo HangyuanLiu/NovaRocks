@@ -23,64 +23,73 @@ use arrow::array::{Array, ArrayRef, DictionaryArray, ListArray, StringArray, Str
 use arrow::datatypes::{DataType, Field, Fields, Int32Type};
 use arrow::record_batch::RecordBatch;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use novarocks_execution::exec::operators::RootResultSinkFactory;
 use novarocks_execution::exec::pipeline::driver::{DriverState, PipelineDriver};
-use novarocks_execution::exec::pipeline::operator::{Operator, ProcessorOperator};
+use novarocks_execution::exec::pipeline::input::PreparedInput;
+use novarocks_execution::exec::pipeline::operator::{
+    InputEncodingPolicy, Operator, OperatorLifecycle,
+};
+use novarocks_execution::exec::pipeline::operator_factory::OperatorFactory;
+use novarocks_execution::exec::pipeline::shape::{
+    SinkKernel, SinkStep, Source, SourceKernel, SourceStart, Transform,
+};
+use novarocks_execution::exec::pipeline::step::{NextStep, StepResult};
+use novarocks_execution::exec::pipeline::step_context::StepContext;
 use novarocks_execution::runtime::fragment::ExecutionResult;
+use novarocks_execution::runtime::fragment::io::{
+    FragmentIoError, ResultAbort, ResultWriteCredit, RootInputAdmission, RootInputAuthority,
+    RootProducerState, RootResultInput, RootResultSession, RootResultWriteSpec,
+    RootWorkExitProgress,
+};
 use novarocks_execution::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::observable::Observable;
 use novarocks_execution::runtime::profile::{OperatorProfiles, Profiler};
 use novarocks_execution::runtime::runtime_state::RuntimeState;
+use novarocks_execution_contract::TaskIdentity;
+use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};
 use novarocks_types::SlotId;
 use novarocks_types::logical::{LogicalType, field_with_logical_type};
+use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 type Received = Arc<Mutex<Option<Chunk>>>;
 
 struct OneChunkSource {
     chunk: Option<Chunk>,
+    root_authority: Option<Arc<RootInputAuthority>>,
 }
 
-impl Operator for OneChunkSource {
+impl OperatorLifecycle for OneChunkSource {
     fn name(&self) -> &str {
         "OriginalCarrierSource"
     }
-
-    fn is_finished(&self) -> bool {
-        self.chunk.is_none()
+}
+impl SourceKernel for OneChunkSource {
+    fn start(&self) -> SourceStart {
+        if self.chunk.is_some() {
+            SourceStart::Ready
+        } else {
+            SourceStart::Finished
+        }
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if let Some(authority) = &self.root_authority {
+            assert!(
+                !authority.is_available(),
+                "root admission must precede production"
+            );
+        }
+        Ok(StepResult::new(self.chunk.take(), NextStep::Finished, 0))
     }
 }
 
-impl ProcessorOperator for OneChunkSource {
-    fn need_input(&self) -> bool {
-        false
-    }
-
-    fn has_output(&self) -> bool {
-        self.chunk.is_some()
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
-        Err("the source does not accept input".to_string().into())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(self.chunk.take())
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        Ok(())
-    }
-}
-
-struct OriginalReceiver {
+struct OriginalSession {
     received: Received,
-    finished: bool,
+    spec: RootResultWriteSpec,
+    authority: Arc<RootInputAuthority>,
+    finished: AtomicBool,
+    exit_observable: Arc<Observable>,
+    exit_waker: Mutex<Option<std::task::Waker>>,
     arrays: Vec<ArrayRef>,
     schema: ChunkSchemaRef,
     source_tracker: Arc<MemTracker>,
@@ -89,67 +98,67 @@ struct OriginalReceiver {
 
 struct OrdinaryReceiver {
     received: Received,
-    finished: bool,
 }
-
-macro_rules! receiver_operator {
-    ($receiver:ty, $name:literal) => {
-        impl Operator for $receiver {
-            fn name(&self) -> &str {
-                $name
-            }
-
-            fn is_finished(&self) -> bool {
-                self.finished
-            }
-
-            fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-                Some(self)
-            }
-
-            fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-                Some(self)
-            }
-        }
-    };
-}
-
-receiver_operator!(OriginalReceiver, "OriginalReceiver");
-receiver_operator!(OrdinaryReceiver, "OrdinaryReceiver");
-
-macro_rules! receiver_processor_readiness {
-    () => {
-        fn need_input(&self) -> bool {
-            !self.finished && self.received.lock().unwrap().is_none()
-        }
-
-        fn has_output(&self) -> bool {
-            false
-        }
-
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-            Ok(None)
-        }
-
-        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-            self.finished = true;
-            Ok(())
-        }
-    };
-}
-
-impl ProcessorOperator for OriginalReceiver {
-    receiver_processor_readiness!();
-
-    fn takes_original_input(&self) -> bool {
-        true
+impl OperatorLifecycle for OrdinaryReceiver {
+    fn name(&self) -> &str {
+        "OrdinaryReceiver"
     }
-
-    fn accepts_encoded_column(&self, _slot: SlotId, _data_type: &DataType) -> bool {
-        panic!("original input must bypass dictionary hydration and profiler inspection")
+}
+impl InputEncodingPolicy for OrdinaryReceiver {}
+impl SinkKernel for OrdinaryReceiver {
+    fn consume(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<SinkStep> {
+        let chunk = input.into_uncovered_chunk()?;
+        assert_eq!(chunk.columns()[0].data_type(), &DataType::Utf8);
+        let mut slot = self.received.lock().unwrap();
+        assert!(
+            slot.is_none(),
+            "the finite source delivers exactly one input"
+        );
+        let rows = chunk.len() as u64;
+        *slot = Some(chunk);
+        Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
+}
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+impl RootResultSession for OriginalSession {
+    fn spec(&self) -> &RootResultWriteSpec {
+        &self.spec
+    }
+    fn try_acquire_input(&self) -> Result<RootInputAdmission, FragmentIoError> {
+        let novarocks_execution::runtime::fragment::io::RootInputReservationAdmission::Granted(
+            mut reservation,
+        ) = self.authority.try_reserve()?
+        else {
+            return Ok(RootInputAdmission::Blocked);
+        };
+        let mut credit = Some(ResultWriteCredit::new(reservation.required_bytes(), |_| {}));
+        let admission = reservation.try_bind(&mut credit);
+        if !matches!(admission, Ok(RootInputAdmission::Granted(_))) {
+            reservation.retire_credit(&mut credit);
+        }
+        admission
+    }
+    fn writable_observable(&self) -> Arc<Observable> {
+        self.authority.observable()
+    }
+    fn submit_input(&self, offered: &mut Option<RootResultInput>) -> Result<(), FragmentIoError> {
+        let submitted = offered
+            .as_ref()
+            .expect("root submission owns its offered slot");
+        assert!(self.authority.owns_original(submitted.permit()));
+        if self.finished.load(Ordering::Acquire) {
+            return Err(FragmentIoError::new(
+                novarocks_execution::runtime::fragment::io::FragmentIoOperation::ResultWrite,
+                novarocks_execution::runtime::fragment::io::FragmentIoErrorKind::Cancelled,
+                "fixture original input is closed",
+            ));
+        }
+        assert_eq!(submitted.permit().task(), self.spec.task);
+        let chunk = submitted.chunk();
         assert!(Arc::ptr_eq(&self.schema, &chunk.chunk_schema_ref()));
         assert_eq!(chunk.columns().len(), self.arrays.len());
         for (actual, original) in chunk.columns().iter().zip(&self.arrays) {
@@ -168,19 +177,64 @@ impl ProcessorOperator for OriginalReceiver {
             self.original_charge,
             "the original input accounting owner must survive the final edge"
         );
-        *self.received.lock().unwrap() = Some(chunk);
+        // Build the Context-owned alias and acquire its empty slot before
+        // admission; a failed check/panic still leaves the offered input owned
+        // by its caller. No input job remains when submission returns.
+        let context_payload = chunk.clone();
+        let mut received = self.received.lock().unwrap();
+        assert!(received.is_none());
+        let submitted = offered
+            .take()
+            .expect("validated original input remains present");
+        *received = Some(context_payload);
+        drop(received);
+        let (chunk, mut permit) = submitted.into_cleanup_parts();
+        drop(chunk);
+        assert_eq!(permit.retire(), RootWorkExitProgress::Exited);
         Ok(())
     }
-}
-
-impl ProcessorOperator for OrdinaryReceiver {
-    receiver_processor_readiness!();
-
-    // Keep the default takes_original_input/accepts_encoded_column behavior.
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        assert_eq!(chunk.columns()[0].data_type(), &DataType::Utf8);
-        *self.received.lock().unwrap() = Some(chunk);
+    fn finish_input(&self) -> Result<(), FragmentIoError> {
+        assert!(self.authority.is_available());
+        assert!(!self.finished.swap(true, Ordering::AcqRel));
+        // Submission is synchronous; retained output is Context-owned, not a job.
+        let exit_waker = self.exit_waker.lock().unwrap().clone();
+        self.exit_observable.notify_observers();
+        if let Some(waker) = exit_waker {
+            waker.wake();
+        }
+        self.authority.observable().notify_observers();
         Ok(())
+    }
+    fn producer_state(&self) -> RootProducerState {
+        if self.finished.load(Ordering::Acquire) {
+            RootProducerState::ContextHeld
+        } else {
+            RootProducerState::Accepting
+        }
+    }
+    fn producer_exit_observable(&self) -> Arc<Observable> {
+        self.exit_observable.clone()
+    }
+    fn poll_producer_exit(&self, waker: &std::task::Waker) -> RootWorkExitProgress {
+        let mut registered = self.exit_waker.lock().unwrap();
+        if let Some(previous) = registered.as_ref() {
+            if !previous.will_wake(waker) {
+                return RootWorkExitProgress::Unresolved;
+            }
+        } else {
+            *registered = Some(waker.clone());
+        }
+        let issuer = self.authority.input_exit_progress();
+        if issuer == RootWorkExitProgress::Unresolved {
+            RootWorkExitProgress::Unresolved
+        } else if self.finished.load(Ordering::Acquire) && issuer == RootWorkExitProgress::Exited {
+            RootWorkExitProgress::Exited
+        } else {
+            RootWorkExitProgress::Pending
+        }
+    }
+    fn abort(&self, reason: ResultAbort) {
+        panic!("unexpected root abort: {reason:?}")
     }
 }
 
@@ -249,14 +303,18 @@ fn source_chunk() -> Chunk {
     Chunk::try_new_with_chunk_schema(batch, schema).unwrap()
 }
 
-fn run_driver(chunk: Chunk, sink: Box<dyn Operator>) -> OperatorProfiles {
+fn run_driver(
+    chunk: Chunk,
+    sink: Box<dyn Operator>,
+    root_authority: Option<Arc<RootInputAuthority>>,
+) -> OperatorProfiles {
     let profiler = Profiler::new("root-original-carrier");
     let profiles = vec![
         OperatorProfiles::new(profiler.child("Source")),
         OperatorProfiles::new(profiler.child("Receiver")),
     ];
     let sink_profile = profiles[1].clone();
-    let runtime = Arc::new(RuntimeState::new(
+    let runtime = Arc::new(RuntimeState::for_local_execution(
         None,
         None,
         None,
@@ -267,7 +325,13 @@ fn run_driver(chunk: Chunk, sink: Box<dyn Operator>) -> OperatorProfiles {
     ));
     let mut driver = PipelineDriver::new(
         0,
-        vec![Box::new(OneChunkSource { chunk: Some(chunk) }), sink],
+        vec![
+            Box::new(Source::new(OneChunkSource {
+                chunk: Some(chunk),
+                root_authority,
+            })),
+            sink,
+        ],
         Some(profiler),
         profiles,
         runtime,
@@ -294,15 +358,37 @@ fn original_receiver_preserves_carrier_schema_and_accounting_with_profiler() {
     let original_charge = source_tracker.current();
     assert!(original_charge > 0);
     let received = Arc::new(Mutex::new(None));
-    let sink = OriginalReceiver {
+    let spec = RootResultWriteSpec {
+        task: TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(51, 52), AttemptId::new(1).unwrap()).unwrap(),
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            BackendProcessId::new_v7(),
+        ),
+        contract: Arc::new(RootOutputContract::new(
+            RootProfileId::V1,
+            FrozenRootOutput::CountOnly,
+        )),
+    };
+    let authority = Arc::new(RootInputAuthority::new(
+        &spec,
+        Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::new()),
+    ));
+    let session = Arc::new(OriginalSession {
         received: Arc::clone(&received),
-        finished: false,
+        spec,
+        authority: Arc::clone(&authority),
+        finished: AtomicBool::new(false),
+        exit_observable: Arc::new(Observable::new()),
+        exit_waker: Mutex::new(None),
         arrays,
         schema: Arc::clone(&schema),
         source_tracker: Arc::clone(&source_tracker),
         original_charge,
-    };
-    let profiles = run_driver(chunk, Box::new(sink));
+    });
+    let factory = RootResultSinkFactory::try_new(session, 1).unwrap();
+    factory.bind_pipeline_dop(1).unwrap();
+    let profiles = run_driver(chunk, factory.create(1, 0), Some(authority));
     let chunk = received.lock().unwrap().take().unwrap();
     assert!(Arc::ptr_eq(&schema, &chunk.chunk_schema_ref()));
     assert_eq!(profiles.unique.counter_value("DictInputColumns"), Some(0));
@@ -327,10 +413,8 @@ fn ordinary_receiver_still_hydrates_dictionary_and_records_profile() {
     let received = Arc::new(Mutex::new(None));
     let sink = OrdinaryReceiver {
         received: Arc::clone(&received),
-        finished: false,
     };
-    assert!(!sink.takes_original_input());
-    let profiles = run_driver(chunk, Box::new(sink));
+    let profiles = run_driver(chunk, Box::new(Transform::hydrating(sink)), None);
     let chunk = received.lock().unwrap().take().unwrap();
     assert!(!Arc::ptr_eq(&original_array, &chunk.columns()[0]));
     assert_eq!(chunk.schema().metadata(), &metadata);

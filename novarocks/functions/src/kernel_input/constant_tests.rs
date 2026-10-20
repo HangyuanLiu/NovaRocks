@@ -544,7 +544,7 @@ fn entry_256_and_final_failures_keep_all_three_outer_control_categories() {
 }
 
 #[test]
-fn ordinary_argument_type_mismatch_observes_completed_tail_before_error() {
+fn ordinary_argument_type_mismatch_is_primary_without_an_optional_tail() {
     let value = pool(
         Arc::new(Int64Array::from(vec![3, 7])),
         false,
@@ -559,9 +559,7 @@ fn ordinary_argument_type_mismatch_observes_completed_tail_before_error() {
         Err(KernelFailure::InvalidProgram(_))
     ));
     let checks = baseline.checks();
-    assert_eq!(checks[0], 0);
-    assert_eq!(checks.len(), 2);
-    assert!(*checks.last().unwrap() > 0);
+    assert_eq!(checks, [0]);
     for error in [
         KernelFailure::Cancelled,
         KernelFailure::DeadlineExceeded,
@@ -571,17 +569,19 @@ fn ordinary_argument_type_mismatch_observes_completed_tail_before_error() {
         KernelFailure::Internal(crate::KernelDiagnostic::new("original type refusal")),
         KernelFailure::Operational(crate::KernelDiagnostic::new("original type refusal")),
     ] {
+        // Every hypothetical later callback remains armed, but the actual
+        // type author has already refused before any completion observation.
         let control = Control::fail_at(1, error.clone());
-        assert_eq!(
+        assert!(matches!(
             validate(&value, Selection::all(3), &wrong, &control),
-            Err(error)
-        );
+            Err(KernelFailure::InvalidProgram(_))
+        ));
         assert_eq!(control.checks(), checks);
     }
 }
 
 #[test]
-fn selected_nonnull_argument_null_rejection_observes_completed_tail() {
+fn selected_nonnull_argument_null_rejection_is_primary_without_an_optional_tail() {
     let column: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(4), None]));
     let nonnull = FunctionValueType::new(DataType::Int64, false);
     // The unselected first NULL is not input. The later selected NULL must be
@@ -598,9 +598,7 @@ fn selected_nonnull_argument_null_rejection_observes_completed_tail() {
         Err(KernelFailure::InvalidProgram(_))
     ));
     let checks = baseline.checks();
-    assert_eq!(checks[0], 0);
-    assert_eq!(checks.len(), 2);
-    assert!(*checks.last().unwrap() >= 2);
+    assert_eq!(checks, [0]);
     for error in [
         KernelFailure::Cancelled,
         KernelFailure::DeadlineExceeded,
@@ -611,15 +609,15 @@ fn selected_nonnull_argument_null_rejection_observes_completed_tail() {
         KernelFailure::Operational(crate::KernelDiagnostic::new("original NULL refusal")),
     ] {
         let control = Control::fail_at(1, error.clone());
-        assert_eq!(
+        assert!(matches!(
             validate_argument_observed(
                 EvaluatedArgument::Column(&column),
                 selection,
                 &nonnull,
                 &control
             ),
-            Err(error)
-        );
+            Err(KernelFailure::InvalidProgram(_))
+        ));
         assert_eq!(control.checks(), checks);
     }
 }

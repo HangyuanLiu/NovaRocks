@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, ListArray, make_array};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
@@ -24,7 +26,7 @@ use arrow_data::transform::MutableArrayData;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-fn insertion_sort_indices(values: &ArrayRef, indices: &mut [usize]) -> Result<(), String> {
+fn insertion_sort_indices(values: &ArrayRef, indices: &mut [usize]) -> ExecutionResult<()> {
     for i in 1..indices.len() {
         let mut j = i;
         while j > 0 {
@@ -47,21 +49,35 @@ pub fn eval_array_sort<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "array_sort has an invalid prepared argument count",
+        ));
+    }
     let arr = arena.eval(args[0], chunk)?;
-    let list = arr
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| format!("array_sort expects ListArray, got {:?}", arr.data_type()))?;
+    let list = arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+        expression_contract(format_args!(
+            "array_sort expects ListArray, got {:?}",
+            arr.data_type()
+        ))
+    })?;
 
+    super::common::validate_rows(list.len(), chunk.len(), "array_sort input")?;
     let output_field = match arena.data_type(expr) {
         Some(DataType::List(field)) => field.clone(),
-        _ => match list.data_type() {
+        Some(other) => {
+            return Err(expression_contract(format_args!(
+                "array_sort output must be List, got {other:?}"
+            )));
+        }
+        None => match list.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(
-                    (format!("array_sort output type must be List, got {:?}", other)).into(),
-                );
+                return Err(expression_contract(format_args!(
+                    "array_sort output type must be List, got {:?}",
+                    other
+                )));
             }
         },
     };
@@ -69,14 +85,8 @@ pub fn eval_array_sort<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     let mut values = list.values().clone();
     if values.data_type() != &target_item_type {
-        values = cast(&values, &target_item_type).map_err(|e| {
-            format!(
-                "array_sort failed to cast element type {:?} -> {:?}: {}",
-                values.data_type(),
-                target_item_type,
-                e
-            )
-        })?;
+        values = cast(&values, &target_item_type)
+            .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
 
     let values_data = values.to_data();
@@ -85,7 +95,7 @@ pub fn eval_array_sort<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let offsets = list.value_offsets();
     let mut out_offsets = Vec::with_capacity(chunk.len() + 1);
     out_offsets.push(0_i32);
-    let mut current: i64 = 0;
+    let mut current = 0i32;
     let mut null_builder = NullBufferBuilder::new(chunk.len());
 
     for row in 0..chunk.len() {
@@ -110,22 +120,27 @@ pub fn eval_array_sort<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         insertion_sort_indices(&values, &mut non_null_indices)?;
 
         for idx in null_indices.into_iter().chain(non_null_indices.into_iter()) {
+            let next =
+                novarocks_functions::aggregate_scalar::checked_list_output_offset(current, 1)?;
             mutable.extend(0, idx, idx + 1);
-            current += 1;
-        }
-        if current > i32::MAX as i64 {
-            return Err(("array_sort offset overflow".to_string()).into());
+            current = next;
         }
         out_offsets.push(current as i32);
         null_builder.append_non_null();
     }
 
     let out_values = make_array(mutable.freeze());
-    let out = ListArray::new(
+    let out = ListArray::try_new(
         output_field,
         OffsetBuffer::new(out_offsets.into()),
         out_values,
         null_builder.finish(),
-    );
+    )
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "array_sort constructor",
+            source,
+        )
+    })?;
     Ok(Arc::new(out) as ArrayRef)
 }

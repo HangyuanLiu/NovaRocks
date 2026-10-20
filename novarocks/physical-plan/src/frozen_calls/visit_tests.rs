@@ -24,7 +24,7 @@ use novarocks_connector_contract::{
 };
 use novarocks_type_contract::OrderedComparisonAlgorithm;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum OwnerError {
     Frozen(FrozenCallError),
     Attachment(u32),
@@ -48,7 +48,7 @@ impl PureCompileControl for TraceControl {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         let mut trace = self.trace.lock().unwrap();
         trace.push((phase, units));
-        if let Some((position, cause)) = self.refusal
+        if let Some((position, cause)) = self.refusal.clone()
             && trace.len() == position
         {
             return Err(cause);
@@ -267,7 +267,7 @@ fn check_prefixes(fragment: &Fragment, uses: &PhysicalRootUses, failure: Option<
             CompileControlError::ResourceExhausted,
         ] {
             let control = TraceControl {
-                refusal: Some((position, cause)),
+                refusal: Some((position, cause.clone())),
                 ..Default::default()
             };
             assert_eq!(
@@ -565,7 +565,7 @@ fn observed_visitor_rejects_changed_roots_before_exposing_bindings_and_finishes_
             CompileControlError::ResourceExhausted,
         ] {
             let refused = TraceControl {
-                refusal: Some((position, cause)),
+                refusal: Some((position, cause.clone())),
                 ..Default::default()
             };
             assert_eq!(
@@ -603,7 +603,7 @@ fn observed_visitor_wide_actual_occurrences_observe_quantum_without_definition_d
             CompileControlError::ResourceExhausted,
         ] {
             let refused = TraceControl {
-                refusal: Some((position, cause)),
+                refusal: Some((position, cause.clone())),
                 ..Default::default()
             };
             assert_eq!(

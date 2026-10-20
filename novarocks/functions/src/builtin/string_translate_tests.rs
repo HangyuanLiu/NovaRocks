@@ -70,7 +70,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -389,7 +389,7 @@ fn string_translate_compile_success_and_ordinary_tail_preserve_all_callback_caus
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let actual = prepared_for_test_with_control(
                     "translate",
@@ -711,7 +711,7 @@ fn string_translate_empty_and_required_child_errors_do_not_bypass_eager_argument
     let mut kernel = instance("translate");
     assert!(matches!(
         kernel.evaluate(Selection::all(1), &bad_addresses, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let failed = SelectedValues::try_new(
         Selection::all(1),
@@ -731,7 +731,7 @@ fn string_translate_empty_and_required_child_errors_do_not_bypass_eager_argument
         let mut kernel = instance("translate");
         assert!(matches!(
             kernel.evaluate(Selection::all(1), &arguments, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
         let after = Control::default();
         assert_eq!(

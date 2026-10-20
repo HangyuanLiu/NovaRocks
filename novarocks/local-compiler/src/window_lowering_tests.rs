@@ -1176,13 +1176,34 @@ fn sum_min_max_over_prepare_through_their_installed_window_kernels() {
     }
 }
 
+#[derive(Debug)]
+struct WindowFundingRefusal;
+impl std::fmt::Display for WindowFundingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("original Window output funding refusal")
+    }
+}
+impl std::error::Error for WindowFundingRefusal {}
+
+impl novarocks_failure_contract::FailureProjection for WindowFundingRefusal {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::*;
+        FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(
+                domain::LOCAL_COMPILER,
+                std::num::NonZeroU16::new(1001).unwrap(),
+            ),
+        )
+    }
+}
 struct WindowOutputHost {
     reject: bool,
     calls: Vec<crate::ProjectOutputRequestFacts>,
     completed: usize,
 }
 impl crate::ProjectMetadataScope for WindowOutputHost {
-    type HostError = std::io::Error;
+    type HostError = WindowFundingRefusal;
     fn materialize<C, B>(
         &mut self,
         facts: &crate::ProjectOutputRequestFacts,
@@ -1194,9 +1215,7 @@ impl crate::ProjectMetadataScope for WindowOutputHost {
     {
         self.calls.push(*facts);
         if self.reject {
-            return Err(crate::ProjectMetadataFailure::Host(std::io::Error::other(
-                "original Window output funding refusal",
-            )));
+            return Err(crate::ProjectMetadataFailure::Host(WindowFundingRefusal));
         }
         let output = body().map_err(crate::ProjectMetadataFailure::Body)?;
         assert!(output.exprs.is_empty());

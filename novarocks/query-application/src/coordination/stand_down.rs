@@ -293,6 +293,85 @@ impl fmt::Display for ContextStandDownError {
 
 impl std::error::Error for ContextStandDownError {}
 
+impl novarocks_execution_contract::failure::FailureProjection for ContextStandDownError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, domain,
+        };
+        let (class, code, observed_stop) = match self {
+            Self::DuplicateContext => (FailureClass::Invariant, 84, false),
+            Self::ActivationExecutionMismatch => (FailureClass::Invariant, 84, false),
+            Self::UnknownContext => (FailureClass::Invariant, 84, false),
+            Self::IdentityMismatch => (FailureClass::Invariant, 84, false),
+            Self::StandDownNotStarted => (FailureClass::Control, 85, false),
+            Self::EstablishIssueStillUnsettled => (FailureClass::Control, 85, false),
+            Self::WrongState => (FailureClass::Control, 85, false),
+            Self::StandDownAlreadyStarted => (FailureClass::Control, 86, true),
+            Self::FutureAuthorization => (FailureClass::Invariant, 87, false),
+            Self::ConflictingWorkerSettlement => (FailureClass::Invariant, 88, false),
+            Self::InvalidWorkerSettlement => (FailureClass::Invariant, 88, false),
+            Self::ClosureRegression => (FailureClass::Invariant, 88, false),
+            Self::AuthorizationGenerationExhausted => (FailureClass::Invariant, 89, false),
+            Self::EventCapacityOverflow => (FailureClass::Resource, 90, false),
+            Self::EventBackpressureInvariant => (FailureClass::Invariant, 91, false),
+            Self::EventChannelClosed => (FailureClass::Control, 92, true),
+            Self::EffectCapacityClosed => (FailureClass::Control, 92, true),
+            Self::ResponsibilitySettlementFailed => (FailureClass::Unexpected, 93, false),
+        };
+        let reason = FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap());
+        if observed_stop {
+            FailureFact::stop_observation(reason)
+        } else {
+            FailureFact::new(class, reason)
+        }
+    }
+}
+
+impl ContextStandDownError {
+    /// Bounded diagnostic authored here; no foreign Display becomes safe detail.
+    pub fn safe_detail(&self) -> novarocks_execution_contract::SafeDetail {
+        let message = match self {
+            Self::DuplicateContext => "stand-down context set contains a duplicate identity",
+            Self::ActivationExecutionMismatch => {
+                "stand-down activation and query context name different executions"
+            }
+            Self::UnknownContext => "stand-down event names an unknown query context",
+            Self::IdentityMismatch => "stand-down event does not match its exact Abort issue",
+            Self::StandDownNotStarted => "query-context stand-down has not started",
+            Self::EstablishIssueStillUnsettled => {
+                "Establish issue has not settled before stand-down"
+            }
+            Self::WrongState => {
+                "query-context stand-down action is not allowed in the current state"
+            }
+            Self::StandDownAlreadyStarted => "query-context stand-down already started",
+            Self::FutureAuthorization => {
+                "Abort event names an authorization generation not yet issued"
+            }
+            Self::ConflictingWorkerSettlement => {
+                "Abort issue received conflicting Worker settlements"
+            }
+            Self::InvalidWorkerSettlement => {
+                "Abort Worker receipt does not prove a closing context state"
+            }
+            Self::ClosureRegression => "query-context closure observation regressed",
+            Self::AuthorizationGenerationExhausted => {
+                "bounded Abort authorization generation could not advance"
+            }
+            Self::EventCapacityOverflow => "Abort event capacity arithmetic overflowed",
+            Self::EventBackpressureInvariant => {
+                "bounded Abort event capacity exhausted before its issue budget"
+            }
+            Self::EventChannelClosed => "Abort issue actor event channel is closed",
+            Self::EffectCapacityClosed => "Abort effect-port capacity observation is closed",
+            Self::ResponsibilitySettlementFailed => {
+                "stand-down residual responsibility could not be settled"
+            }
+        };
+        novarocks_execution_contract::SafeDetail::truncating(message)
+    }
+}
+
 #[derive(Debug)]
 struct ContextStandDownRecord {
     activation: AttemptActivationIdentity,
@@ -1633,10 +1712,16 @@ mod tests {
             )
             .unwrap();
         let permit = ledger.authorize_next().unwrap().unwrap();
+        let error = permit.try_submit(&ClosedPort::default()).unwrap_err();
+        assert_eq!(error, ContextStandDownError::EffectCapacityClosed);
+        use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
         assert_eq!(
-            permit.try_submit(&ClosedPort::default()).unwrap_err(),
-            ContextStandDownError::EffectCapacityClosed
+            error.failure_fact().evidence(),
+            FailureEvidence::StopObservation
         );
+        let actor_error = crate::coordination::LogicalExecutionActorError::StandDown(error);
+        assert_eq!(actor_error.failure_fact(), error.failure_fact());
+        assert_eq!(actor_error.safe_detail(), error.safe_detail());
     }
 
     #[test]

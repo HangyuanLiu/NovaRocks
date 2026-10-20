@@ -47,7 +47,7 @@ impl PureCompileControl for Control {
             );
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -61,11 +61,14 @@ fn prefixes(call: impl Fn(&Control) -> Result<(), FunctionSpecializationFailure>
         trace.first(),
         Some(&(CompilePhase::FunctionSpecialization, 0))
     );
+    if success {
+        assert!(trace.iter().any(|(_, units)| *units > 0));
+    }
     for at in 0..trace.len() {
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(call(&control), Err(FunctionSpecializationFailure::Control(actual)) if actual == cause)
@@ -288,26 +291,32 @@ fn sql_overload_declaration_exact_ids_and_kind_never_reresolve_a_name_or_overloa
             &direct_control,
         )
         .unwrap_err();
-        match case {
+        let assert_refusal = |error: &FunctionSpecializationFailure| match case {
             0 => assert!(matches!(
-                &direct,
+                error,
                 FunctionSpecializationFailure::Binding(FunctionBindingError::UnknownFunction)
             )),
             1 => assert!(matches!(
-                &direct,
+                error,
                 FunctionSpecializationFailure::InvalidInput(
                     "pure preparation has a different exact kind or selected owner"
                 )
             )),
             2 => assert!(matches!(
-                &direct,
+                error,
                 FunctionSpecializationFailure::Binding(FunctionBindingError::UnknownOverload(actual))
                     if actual == &missing_overload
             )),
             _ => unreachable!(),
-        }
-        // Each completed lookup has a real pending positive ordinary exit.
-        assert!(direct_control.trace.lock().unwrap().last().unwrap().1 > 0);
+        };
+        assert_refusal(&direct);
+        // The source refusal is already authored; no optional footer may
+        // observe a later control cause and replace it.
+        let trace = direct_control.trace.lock().unwrap().clone();
+        assert_eq!(
+            trace.first(),
+            Some(&(CompilePhase::FunctionSpecialization, 0))
+        );
         let adapter_control = Control::default();
         let adapter = snapshot
             .pure_overload_declaration_observed(function, kind, overload, &adapter_control)
@@ -321,6 +330,28 @@ fn sql_overload_declaration_exact_ids_and_kind_never_reresolve_a_name_or_overloa
             *adapter_control.trace.lock().unwrap(),
             *direct_control.trace.lock().unwrap()
         );
+        assert_refusal(&adapter);
+        for cause in CAUSES {
+            let late = Control {
+                trace: Mutex::default(),
+                refusal: Some((trace.len(), cause.clone())),
+            };
+            let original = EngineFunctionCatalog::pure_overload_declaration_observed(
+                &catalog, function, kind, overload, &late,
+            )
+            .unwrap_err();
+            assert_refusal(&original);
+            assert_eq!(*late.trace.lock().unwrap(), trace);
+            let late = Control {
+                trace: Mutex::default(),
+                refusal: Some((trace.len(), cause)),
+            };
+            let original = snapshot
+                .pure_overload_declaration_observed(function, kind, overload, &late)
+                .unwrap_err();
+            assert_refusal(&original);
+            assert_eq!(*late.trace.lock().unwrap(), trace);
+        }
         prefixes(
             |control| {
                 snapshot

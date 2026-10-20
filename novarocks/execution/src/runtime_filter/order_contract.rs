@@ -230,10 +230,7 @@ mod tests {
             let host = OrderedTopNAllocationHost::new(tracker.clone());
             let control = Control::pass();
             let error = host.shared_order_contract(&frozen, &control).unwrap_err();
-            assert_eq!(
-                error.cause(),
-                &ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted)
-            );
+            crate::runtime_filter::assert_real_tracker_capacity(&error, limit as i64);
             assert_eq!(tracker.current(), 0);
             if limit == 1 {
                 assert_eq!(control.calls.load(Ordering::SeqCst), 0);
@@ -254,7 +251,10 @@ mod tests {
             .retain_shared(inner, &control)
             .err()
             .expect("the outer holder cannot fit beside its admitted prefix");
-        assert_eq!(error, KernelFailure::ResourceExhausted);
+        crate::runtime_filter::assert_real_tracker_capacity(
+            &error,
+            inner_stock + i64::try_from(prefix).unwrap(),
+        );
         assert!(control.calls.load(Ordering::SeqCst) > 0);
         assert_eq!(
             tracker.current(),

@@ -230,7 +230,12 @@ fn original_hll_generic_all_null_and_empty_states_keep_full_error_domain() {
     );
     assert!(expected.len() > crate::MAX_ROW_ERROR_MESSAGE_BYTES);
     assert!(
-        matches!(hash_array_value_for_hll_observed(&actual,0,&mut work),Err(HllError::Legacy(text)) if text==expected)
+        matches!(hash_array_value_for_hll_observed(&actual,0,&mut work),Err(error) if {
+            use novarocks_failure_contract::FailureProjection;
+            error.failure_fact().class() == novarocks_failure_contract::FailureClass::Invariant
+                && error.failure_fact().reason().code() == 327
+                && error.to_string().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES
+        })
     );
     let empty = HllRawState::default();
     assert_eq!(estimate_cardinality(&empty, &mut work).unwrap(), 0);
@@ -248,7 +253,7 @@ fn original_hll_real_host_metadata_and_register_allocation_preserve_every_cause(
         assert_metadata_only(&host);
         arm_refusal(&host, 0, cause.clone());
         assert!(
-            matches!(update_state_register_from_hash(&mut state,1,&mut HllWork::new(None)),Err(HllError::Kernel(error)) if error==cause)
+            matches!(update_state_register_from_hash(&mut state,1,&mut HllWork::new(None)),Err(error) if error==cause)
         );
         assert!(state.registers.is_none());
         assert_metadata_only(&host);
@@ -317,4 +322,42 @@ fn original_hll_shared_hash_codec_estimate_serialization_every_callback_has_no_t
             }
         }
     }
+}
+
+#[test]
+fn hll_raw_bad_payload_and_borrowed_metadata_have_distinct_facts_and_lifetimes() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let payload = Arc::new(vec![HLL_DATA_EXPLICIT]);
+    let weak = Arc::downgrade(&payload);
+    let error = merge_hll_bytes(
+        &mut HllRawState::default(),
+        &payload,
+        &mut HllWork::new(None),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.failure_fact(),
+        crate::DataFailureReason::InvalidEncoding.failure_fact()
+    );
+    assert!(matches!(
+        error,
+        HllError::Payload(HllMergeFailure::ExplicitMalformed)
+    ));
+    drop(payload);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(error.failure_fact().class(), FailureClass::Data);
+    let field = Arc::new(arrow_schema::Field::new(
+        "field".repeat(512),
+        DataType::Int64,
+        true,
+    ));
+    let weak = Arc::downgrade(&field);
+    let ty = DataType::Struct(vec![field.clone()].into());
+    let error = HllInputFailure::Unsupported(&ty).into_kernel();
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(error.failure_fact().reason().code(), 327);
+    assert!(error.to_string().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
+    drop(ty);
+    drop(field);
+    assert!(weak.upgrade().is_none());
 }

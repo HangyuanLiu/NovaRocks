@@ -42,7 +42,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -125,7 +125,7 @@ fn prefixes(
         ] {
             let control = Control {
                 trace: Default::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(invoke(&control), Err(PhysicalAggregateRequestError::Control(actual)) if actual == cause)
@@ -409,7 +409,7 @@ fn journal_update_foreign_equal_owner_is_refused_before_a_checked_loan_is_publis
         ] {
             let control = Control {
                 trace: Default::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(invoke(&control), Err(SqlSourceJournalError::Control(actual)) if actual == cause)

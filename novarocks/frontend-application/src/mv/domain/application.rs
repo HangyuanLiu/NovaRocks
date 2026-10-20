@@ -331,7 +331,7 @@ impl MvApplicationError {
         self
     }
     pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
-        self.compile_control
+        self.compile_control.clone()
     }
 
     pub fn kind(&self) -> MvApplicationErrorKind {
@@ -388,10 +388,8 @@ impl MvCreateProviderError {
         result.compile_control = failure.compile_control_error();
         result
     }
-    pub const fn compile_control_error(
-        &self,
-    ) -> Option<novarocks_type_contract::CompileControlError> {
-        self.compile_control
+    pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control.clone()
     }
 
     pub fn kind(&self) -> MvCreateProviderErrorKind {

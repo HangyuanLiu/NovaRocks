@@ -746,6 +746,12 @@ fn build_frontend_query_session_factory_from_role_products(
             .as_ref()
             .and_then(|session| session.statement.clone()),
     );
+    #[cfg(novarocks_dev_controls)]
+    let query_service = query_service.with_result_handoff(
+        host.test_session
+            .as_ref()
+            .and_then(|session| session.result_handoff.clone()),
+    );
     let query_service = Arc::new(query_service);
     host.mark_ready()?;
     Ok(query_service)

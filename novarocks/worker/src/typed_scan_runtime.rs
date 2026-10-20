@@ -38,18 +38,75 @@ use novarocks_types::QueryExecutionId;
 use crate::read_attempt::{ReceivedReadSplit, TypedReadAttemptContext};
 
 /// Looks up an attempt's runtime-filter session at the moment a scan binds it.
-pub type RuntimeFilterSessionResolver =
-    Arc<dyn Fn() -> Result<Option<RuntimeFilterSessionRef>, String> + Send + Sync>;
+pub type RuntimeFilterSessionResolver = Arc<
+    dyn Fn() -> Result<Option<RuntimeFilterSessionRef>, crate::RuntimeFilterContractError>
+        + Send
+        + Sync,
+>;
+
+/// Absence at the query-leased execution lookup, not proof of cancellation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CatalogExecutionAccessError {
+    LeaseUnavailable { catalog: CatalogHandle },
+    ReadUnavailable { catalog: CatalogHandle },
+    WriteUnavailable { catalog: CatalogHandle },
+}
+impl std::fmt::Display for CatalogExecutionAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LeaseUnavailable { catalog } => write!(
+                f,
+                "no query-leased catalog runtime exists for {}@{}",
+                catalog.catalog_name().as_str(),
+                catalog.version().short_hex()
+            ),
+            Self::ReadUnavailable { catalog } => write!(
+                f,
+                "catalog runtime for {}@{} has no typed read capability",
+                catalog.catalog_name().as_str(),
+                catalog.version().short_hex()
+            ),
+            Self::WriteUnavailable { catalog } => write!(
+                f,
+                "catalog runtime for {}@{} has no typed write capability",
+                catalog.catalog_name().as_str(),
+                catalog.version().short_hex()
+            ),
+        }
+    }
+}
+impl std::error::Error for CatalogExecutionAccessError {}
+impl novarocks_execution_contract::failure::FailureProjection for CatalogExecutionAccessError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use crate::failure_reason::WorkerFailureReason as R;
+        use novarocks_execution_contract::failure::*;
+        FailureFact::new(
+            FailureClass::Dependency,
+            match self {
+                Self::LeaseUnavailable { .. } => R::CatalogExecutionLeaseUnavailable,
+                Self::ReadUnavailable { .. } => R::CatalogExecutionReadUnavailable,
+                Self::WriteUnavailable { .. } => R::CatalogExecutionWriteUnavailable,
+            }
+            .reason(),
+        )
+    }
+}
 
 /// Resolves one reader only through an attempt's query-leased immutable catalog
 /// runtime. It intentionally cannot reinstall a provider runtime.
-pub type CatalogReadExecutionResolver =
-    Arc<dyn Fn(&CatalogHandle) -> Result<ConnectorExecutionReadBinding, String> + Send + Sync>;
+pub type CatalogReadExecutionResolver = Arc<
+    dyn Fn(&CatalogHandle) -> Result<ConnectorExecutionReadBinding, CatalogExecutionAccessError>
+        + Send
+        + Sync,
+>;
 
 /// Resolves one writer only through an attempt's query-leased immutable catalog
 /// runtime.
-pub type CatalogWriteExecutionResolver =
-    Arc<dyn Fn(&CatalogHandle) -> Result<ConnectorExecutionWriteBinding, String> + Send + Sync>;
+pub type CatalogWriteExecutionResolver = Arc<
+    dyn Fn(&CatalogHandle) -> Result<ConnectorExecutionWriteBinding, CatalogExecutionAccessError>
+        + Send
+        + Sync,
+>;
 
 /// The SPI-only facts a typed reader retains after native carrier decoding.
 ///
@@ -106,29 +163,29 @@ impl WorkerConnectorResourceLedger {
         }
     }
 
-    fn install(&self, tracker: Arc<MemTracker>) -> Result<(), String> {
+    fn install(&self, tracker: Arc<MemTracker>) -> Result<(), ConnectorResourceBindingError> {
         if let Some(existing) = self.tracker.get() {
             return if Arc::ptr_eq(existing, &tracker) {
                 Ok(())
             } else {
-                Err("connector resource ledger was rebound to another fragment tracker".to_string())
+                Err(ConnectorResourceBindingError::TrackerRebound)
             };
         }
         self.tracker
             .set(tracker)
-            .map_err(|_| "connector resource ledger installation raced".to_string())
+            .map_err(|_| ConnectorResourceBindingError::InstallationRaced)
     }
 
     fn admitted_resources(
         self: &Arc<Self>,
         tracker: &Arc<MemTracker>,
-    ) -> Result<ConnectorExecutionResources, String> {
+    ) -> Result<ConnectorExecutionResources, ConnectorResourceBindingError> {
         let installed = self
             .tracker
             .get()
-            .ok_or_else(|| "connector resources requested before task admission".to_string())?;
+            .ok_or(ConnectorResourceBindingError::BeforeAdmission)?;
         if !Arc::ptr_eq(installed, tracker) {
-            return Err("connector resource request has the wrong fragment tracker".to_string());
+            return Err(ConnectorResourceBindingError::WrongTracker);
         }
         Ok(ConnectorExecutionResources::from_admitted_ledger(
             Arc::clone(self) as Arc<dyn ConnectorResourceLedger>,
@@ -377,14 +434,14 @@ impl TypedScanRuntime {
     pub fn catalog_read_execution(
         &self,
         handle: &CatalogHandle,
-    ) -> Result<ConnectorExecutionReadBinding, String> {
+    ) -> Result<ConnectorExecutionReadBinding, CatalogExecutionAccessError> {
         (self.catalog_read_execution)(handle)
     }
 
     pub fn catalog_write_execution(
         &self,
         handle: &CatalogHandle,
-    ) -> Result<ConnectorExecutionWriteBinding, String> {
+    ) -> Result<ConnectorExecutionWriteBinding, CatalogExecutionAccessError> {
         (self.catalog_write_execution)(handle)
     }
 
@@ -411,9 +468,9 @@ impl TypedScanRuntime {
         &self,
         execution_id: QueryExecutionId,
         tracker: &Arc<MemTracker>,
-    ) -> Result<ConnectorExecutionResources, String> {
+    ) -> Result<ConnectorExecutionResources, ConnectorResourceBindingError> {
         if execution_id != self.execution_id {
-            return Err("connector resource request belongs to another execution".to_string());
+            return Err(ConnectorResourceBindingError::WrongExecution);
         }
         self.connector_resource_ledger.admitted_resources(tracker)
     }
@@ -424,19 +481,19 @@ impl TypedScanRuntime {
     pub fn admitted_connector_resources_for_bound_task(
         &self,
         execution_id: QueryExecutionId,
-    ) -> Result<ConnectorExecutionResources, String> {
+    ) -> Result<ConnectorExecutionResources, ConnectorResourceBindingError> {
         let tracker = self
             .connector_resource_ledger
             .tracker
             .get()
-            .ok_or_else(|| "connector resources requested before fragment admission".to_string())?;
+            .ok_or(ConnectorResourceBindingError::BeforeAdmission)?;
         self.admitted_connector_resources(execution_id, tracker)
     }
 
     pub fn install_connector_resource_tracker(
         &self,
         tracker: Arc<MemTracker>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ConnectorResourceBindingError> {
         self.connector_resource_ledger.install(tracker)
     }
 
@@ -444,7 +501,7 @@ impl TypedScanRuntime {
         &self,
         plan_node_id: i32,
         execution: ConnectorExecutionReadBinding,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::read_attempt::ReadExecutionRegistrationError> {
         self.read_context.register(plan_node_id, execution)
     }
 }
@@ -525,7 +582,7 @@ mod tests {
         let error = ledger
             .install(other_fragment)
             .expect_err("rebinding to another fragment must fail closed");
-        assert!(error.contains("rebound to another fragment tracker"));
+        assert_eq!(error, super::ConnectorResourceBindingError::TrackerRebound);
     }
 
     #[test]
@@ -556,5 +613,49 @@ mod tests {
             .expect("reservation above the real tracker limit must fail");
         assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
         assert_eq!(admitted.current(), 0);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorResourceBindingError {
+    TrackerRebound,
+    InstallationRaced,
+    BeforeAdmission,
+    WrongTracker,
+    WrongExecution,
+}
+impl std::fmt::Display for ConnectorResourceBindingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::TrackerRebound => {
+                "connector resource ledger was rebound to another fragment tracker"
+            }
+            Self::InstallationRaced => "connector resource ledger installation raced",
+            Self::BeforeAdmission => "connector resources requested before task admission",
+            Self::WrongTracker => "connector resource request has the wrong fragment tracker",
+            Self::WrongExecution => "connector resource request belongs to another execution",
+        })
+    }
+}
+impl std::error::Error for ConnectorResourceBindingError {}
+impl novarocks_execution_contract::failure::FailureProjection for ConnectorResourceBindingError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use crate::failure_reason::WorkerFailureReason as R;
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact};
+        let reason = match self {
+            Self::TrackerRebound => R::ConnectorTrackerRebound,
+            Self::InstallationRaced => R::ConnectorTrackerInstallRaced,
+            Self::BeforeAdmission => R::ConnectorBeforeAdmission,
+            Self::WrongTracker => R::ConnectorWrongTracker,
+            Self::WrongExecution => R::ConnectorWrongExecution,
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+impl From<ConnectorResourceBindingError>
+    for novarocks_execution::runtime::fragment::ExecutionFailure
+{
+    fn from(cause: ConnectorResourceBindingError) -> Self {
+        Self::from_domain(cause)
     }
 }

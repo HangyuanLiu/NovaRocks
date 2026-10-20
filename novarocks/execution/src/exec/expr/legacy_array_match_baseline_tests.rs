@@ -37,7 +37,11 @@ pub(super) fn list(values: ArrayRef, offsets: Vec<i32>, valid: Option<Vec<bool>>
         valid.map(NullBuffer::from),
     ))
 }
-pub(super) fn raw(name: &'static str, a: ArrayRef, arity: usize) -> Result<ArrayRef, String> {
+pub(super) fn raw(
+    name: &'static str,
+    a: ArrayRef,
+    arity: usize,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let slot = SlotId::new(19);
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
@@ -181,25 +185,21 @@ fn legacy_array_match_original_full_type_error_and_arity_before_children() {
     for name in ["all_match", "any_match"] {
         let a: ArrayRef = Arc::new(NullArray::new(1));
         assert_eq!(
-            raw(name, a.clone(), 1).unwrap_err(),
+            (raw(name, a.clone(), 1).unwrap_err()).to_string(),
             format!("{name} expects ListArray, got Null")
         );
         assert_eq!(
-            raw(name, a.clone(), 0).unwrap_err(),
+            (raw(name, a.clone(), 0).unwrap_err()).to_string(),
             format!("{name} expects 1 to 1 arguments, got 0")
         );
         assert_eq!(
-            raw(name, a, 2).unwrap_err(),
+            (raw(name, a, 2).unwrap_err()).to_string(),
             format!("{name} expects 1 to 1 arguments, got 2")
         );
         let values: ArrayRef = Arc::new(Date32Array::from(vec![None]));
-        let expected = arrow::compute::cast(&values, &DataType::Boolean)
-            .unwrap_err()
-            .to_string();
+        let expected = arrow::compute::cast(&values, &DataType::Boolean).unwrap_err();
         let a = list(values, vec![0, 1], Some(vec![false]));
-        assert_eq!(
-            raw(name, a, 1).unwrap_err(),
-            format!("{name} failed to cast element to BOOLEAN: {expected}")
-        );
+        let refusal = raw(name, a, 1).unwrap_err();
+        super::legacy_array_append_baseline_tests::assert_original_arrow(&refusal, &expected);
     }
 }

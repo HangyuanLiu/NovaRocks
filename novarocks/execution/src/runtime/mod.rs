@@ -5,6 +5,7 @@ pub mod dispatch_metrics;
 pub mod endpoint;
 pub mod exchange;
 pub mod exec_env;
+pub mod execution_health;
 pub mod execution_runtime;
 pub mod execution_services;
 pub mod fragment;
@@ -22,6 +23,8 @@ pub mod runtime_state;
 pub mod scalar_memory;
 pub mod scan_stream_metrics;
 pub mod table_writer_metrics;
+pub mod task_control;
+pub(crate) mod tracked_state_allocator;
 
 pub use execution_runtime::{
     ExecutionRuntime, ExecutionRuntimeConfig, ExecutionRuntimeConfigError,

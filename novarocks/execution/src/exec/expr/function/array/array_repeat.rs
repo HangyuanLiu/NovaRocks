@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, Field};
 use novarocks_functions::builtin::array_repeat_core::{cast_repeat_count, repeat_values};
@@ -26,17 +28,27 @@ pub fn eval_array_repeat<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(expression_contract(
+            "array_repeat requires exactly two prepared arguments",
+        ));
+    }
     let source = arena.eval(args[0], chunk)?;
     let count_array = cast_repeat_count(arena.eval(args[1], chunk)?)?;
     let counts = count_array
         .as_any()
         .downcast_ref::<Int64Array>()
-        .ok_or_else(|| "array_repeat internal count downcast failure".to_string())?;
+        .ok_or_else(|| expression_contract("array_repeat internal count downcast failure"))?;
 
     let output_field = match arena.data_type(expr) {
         Some(DataType::List(field)) => field.clone(),
-        _ => Arc::new(Field::new("item", source.data_type().clone(), true)),
+        Some(other) => {
+            return Err(expression_contract(format_args!(
+                "array_repeat output must be List, got {other:?}"
+            )));
+        }
+        None => Arc::new(Field::new("item", source.data_type().clone(), true)),
     };
-    Ok((repeat_values(source, counts, chunk.len(), output_field))?)
+    repeat_values(source, counts, chunk.len(), output_field).map_err(ExecutionFailure::from)
 }

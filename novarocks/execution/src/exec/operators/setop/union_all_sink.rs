@@ -27,11 +27,19 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
-use crate::exec::chunk::Chunk;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{SinkKernel, SinkStep, Transform},
+    step::NextStep,
+    step_context::StepContext,
+};
+use crate::runtime::mem_tracker::MemTracker;
+use std::sync::Arc;
 
 use super::union_all_shared::UnionAllSharedState;
 use crate::runtime::runtime_state::RuntimeState;
@@ -59,11 +67,11 @@ impl OperatorFactory for UnionAllSinkFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(UnionAllSinkOperator {
+        Box::new(Transform::hydrating(UnionAllSinkOperator {
             name: self.name.clone(),
             state: self.state.clone(),
-            finished: false,
-        })
+            memory: None,
+        }))
     }
 
     fn is_sink(&self) -> bool {
@@ -74,57 +82,46 @@ impl OperatorFactory for UnionAllSinkFactory {
 struct UnionAllSinkOperator {
     name: String,
     state: UnionAllSharedState,
-    finished: bool,
+    memory: Option<QueueInputMemory>,
+}
+struct QueueInputMemory {
+    tracker: Option<Arc<MemTracker>>,
 }
 
-impl Operator for UnionAllSinkOperator {
+impl OperatorLifecycle for UnionAllSinkOperator {
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        self.memory = Some(QueueInputMemory {
+            tracker: self.state.queue_mem_tracker(state),
+        });
+        Ok(())
     }
 }
-
-impl ProcessorOperator for UnionAllSinkOperator {
-    fn need_input(&self) -> bool {
-        !self.is_finished()
-    }
-
-    fn has_output(&self) -> bool {
-        false
-    }
-
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
+impl InputEncodingPolicy for UnionAllSinkOperator {}
+impl SinkKernel for UnionAllSinkOperator {
+    fn consume(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<SinkStep> {
+        let memory = self.memory.as_ref().ok_or_else(|| {
+            novarocks_functions::KernelFailure::InvalidProgram(
+                novarocks_functions::KernelDiagnostic::new(
+                    "union input runtime binding is missing",
+                ),
+            )
+        })?;
+        let chunk = input.into_uncovered_chunk()?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        if !chunk.is_empty() {
+            self.state.push_chunk(memory.tracker.as_ref(), chunk);
         }
-        if chunk.is_empty() {
-            return Ok(());
-        }
-        self.state.push_chunk(state, chunk);
-        Ok(())
+        Ok(SinkStep::new(NextStep::NeedInput, rows))
     }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        Ok(None)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        if self.finished {
-            return Ok(());
-        }
-        self.finished = true;
+    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<SinkStep> {
         self.state.producer_finished();
-        Ok(())
+        Ok(SinkStep::new(NextStep::Finished, 0))
     }
 }

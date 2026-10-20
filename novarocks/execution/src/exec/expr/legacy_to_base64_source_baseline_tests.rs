@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Actual original source/data/arity/carrier oracles; no guessed provenance from values.
+use super::legacy_array_append_baseline_tests::{
+    assert_frozen_target as assert_expression_contract, assert_original_arrow,
+};
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::function::{FunctionKind, encryption::eval_encryption_function};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
@@ -26,6 +29,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
+use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_type_contract::DecimalOverflowPolicy;
 use novarocks_types::SlotId;
 use std::{
@@ -114,7 +118,11 @@ fn setup(input: ArrayRef, source: Source) -> (ExprArena, ExprId, Chunk) {
     };
     (arena, child, chunk)
 }
-pub(crate) fn raw(input: ArrayRef, source: Source, target: DataType) -> Result<ArrayRef, String> {
+pub(crate) fn raw(
+    input: ArrayRef,
+    source: Source,
+    target: DataType,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (mut arena, child, chunk) = setup(input, source);
     let args = vec![child];
     let expr = arena.push_typed(
@@ -246,36 +254,39 @@ fn legacy_to_base64_original_byte_carriers_and_full_static_error_before_null() {
         vec![None, None]
     );
     assert_eq!(
-        raw(
+        (raw(
             Arc::new(Int64Array::from(vec![None])),
             Source::Slot,
             DataType::Utf8
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "to_base64: arg0 must be VARCHAR or VARBINARY"
     );
 }
 #[test]
-fn legacy_to_base64_original_extra_arguments_are_not_evaluated_and_empty_args_panic() {
+fn to_base64_prepared_arity_precedes_children_and_valid_source_is_preserved() {
     let (arena, child, chunk) = setup(strings(vec![Some("ÿ")]), Source::Slot);
-    let args = [child, ExprId(usize::MAX)];
+    for args in [
+        vec![],
+        vec![child, ExprId(usize::MAX)],
+        vec![ExprId(usize::MAX), child],
+    ] {
+        let error =
+            eval_encryption_function("to_base64", &arena, ExprId(0), &args, &chunk).unwrap_err();
+        assert_expression_contract(&error);
+    }
     assert_eq!(
-        values(eval_encryption_function("to_base64", &arena, ExprId(0), &args, &chunk).unwrap()),
+        values(eval_encryption_function("to_base64", &arena, ExprId(0), &[child], &chunk).unwrap()),
         vec![Some("w78=".into())]
     );
-    assert!(
-        catch_unwind(AssertUnwindSafe(|| eval_encryption_function(
-            "to_base64",
-            &arena,
-            ExprId(0),
-            &[],
-            &chunk
-        )))
-        .is_err()
-    );
-    let bad = [ExprId(usize::MAX), child];
-    assert_eq!(
-        eval_encryption_function("to_base64", &arena, ExprId(0), &bad, &chunk).unwrap_err(),
-        "invalid ExprId"
-    );
+    let error = eval_encryption_function(
+        "to_base64",
+        &arena,
+        ExprId(0),
+        &[ExprId(usize::MAX)],
+        &chunk,
+    )
+    .unwrap_err();
+    assert_eq!(error.detail(), "invalid ExprId");
 }

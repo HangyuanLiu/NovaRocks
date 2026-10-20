@@ -237,7 +237,7 @@ fn bool_cast_type_author_preserves_original_control_on_success_and_ordinary_fail
                 ] {
                     let control = Trace {
                         at: Some(at),
-                        cause,
+                        cause: cause.clone(),
                         seen: Mutex::new(vec![]),
                         refused: Mutex::new(false),
                     };

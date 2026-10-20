@@ -38,7 +38,7 @@ impl PureCompileControl for CompileControl {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push(units);
-        if let Some((at, cause)) = self.refusal
+        if let Some((at, cause)) = self.refusal.clone()
             && trace.len() == at + 1
         {
             Err(cause)
@@ -565,7 +565,7 @@ fn conversion_actual_compile_metadata_quantum_and_runtime_rows_preserve_every_or
             CompileControlError::ResourceExhausted,
         ] {
             let control = CompileControl {
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 ..Default::default()
             };
             let error = ConversionRecipe::try_new(prepared.contract(), &control).unwrap_err();
@@ -668,7 +668,7 @@ fn conversion_concrete_classes_and_required_error_journal_are_checked_before_suc
             &[EvaluatedArgument::Column(&foreign)],
             &Control::default()
         ),
-        Err(KernelFailure::Internal(_))
+        Err(ref cause) if crate::kernel_control::test_contract::output(cause)
     ));
     let child_values: ArrayRef = Arc::new(Int64Array::from(vec![None]));
     let child = SelectedValues::try_new(
@@ -685,7 +685,7 @@ fn conversion_concrete_classes_and_required_error_journal_are_checked_before_suc
             &[EvaluatedArgument::SelectedColumn(&child)],
             &Control::default()
         ),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
 }
 

@@ -32,6 +32,7 @@ use super::native_compatibility::raw_apply_task_operations_until;
 use super::native_creation::{
     RawBackendSession, RawCreate, await_installed, ensure_accepted,
     observe_all_canceled_and_stopped, outcome, quiesce_session, raw_create_identity,
+    receipt_verdict,
 };
 use super::native_direct_controls::{
     DirectIntent, DirectIntentOwner, close_hold, read_marker, release_hold,
@@ -253,10 +254,12 @@ fn establish_declared(
 fn assert_still_preparing(session: &RawBackendSession, create: &RawCreate) -> Result<()> {
     let receipt = session.apply(create.operation(), "replay held preparation identity")?;
     ensure!(
-        outcome(&receipt) == proto::TaskOperationOutcome::Idempotent,
+        outcome(&receipt)? == proto::TaskOperationOutcome::Idempotent,
         "held entity was not replayed by identity: {receipt:?}"
     );
-    let Some(proto::task_operation_receipt::Ack::CreateTask(ack)) = receipt.ack else {
+    let Some(proto::task_operation_verdict::Ack::CreateTask(ack)) =
+        receipt_verdict(&receipt)?.ack.clone()
+    else {
         bail!("held replay omitted Create acknowledgement");
     };
     let status = ack.current_status.context("held replay omitted status")?;
@@ -356,10 +359,12 @@ fn same_batch(
     {
         ensure!(
             receipt.operation_id == operation_id
-                && outcome(receipt) == proto::TaskOperationOutcome::Accepted,
+                && outcome(receipt)? == proto::TaskOperationOutcome::Accepted,
             "same ApplyBatch did not promptly accept the exact ordered item: {receipt:?}"
         );
-        let Some(proto::task_operation_receipt::Ack::CreateTask(ack)) = &receipt.ack else {
+        let Some(proto::task_operation_verdict::Ack::CreateTask(ack)) =
+            &receipt_verdict(&receipt)?.ack
+        else {
             bail!("same ApplyBatch omitted the Create acknowledgement");
         };
         ensure!(
@@ -452,13 +457,13 @@ fn fifo_capacity(
     gate.await_entered(context, &a, &a1)?;
     ensure_accepted(&a, &a2)?;
     ensure!(
-        outcome(&a.apply(receiver(&a, 3).operation(), "full Context P")?)
+        outcome(&a.apply(receiver(&a, 3).operation(), "full Context P")?)?
             == proto::TaskOperationOutcome::PreparationBusy,
         "full Context preparation positions did not reject"
     );
     ensure_accepted(&b, &b1)?;
     ensure!(
-        outcome(&b.apply(receiver(&b, 2).operation(), "full global preparation count")?)
+        outcome(&b.apply(receiver(&b, 2).operation(), "full global preparation count")?)?
             == proto::TaskOperationOutcome::PreparationBusy,
         "full global preparation count did not reject"
     );
@@ -523,7 +528,7 @@ fn fifo_capacity(
         outcome(&canceled.apply(
             receiver(&canceled, 3).operation(),
             "Create after held Quiesce"
-        )?) == proto::TaskOperationOutcome::ContextTerminalReceipt,
+        )?)? == proto::TaskOperationOutcome::ContextTerminalReceipt,
         "Quiesce reopened preparation admission"
     );
     gate.release()?;
@@ -547,7 +552,7 @@ fn byte_capacity(
     let mut accepted = vec![first];
     loop {
         let next = receiver(&session, accepted.len() as u32 + 1);
-        match outcome(&session.apply(next.operation(), "fill temporary preparation bytes")?) {
+        match outcome(&session.apply(next.operation(), "fill temporary preparation bytes")?)? {
             proto::TaskOperationOutcome::Accepted => accepted.push(next),
             proto::TaskOperationOutcome::PreparationBusy => break,
             verdict => bail!("byte capacity returned {verdict:?}"),
@@ -577,7 +582,7 @@ fn byte_capacity(
         )),
     }];
     ensure!(
-        outcome(&session.apply(oversized.operation(), "single oversized preparation")?)
+        outcome(&session.apply(oversized.operation(), "single oversized preparation")?)?
             == proto::TaskOperationOutcome::ResourceExhausted,
         "single oversized preparation was reported as temporary Busy"
     );
@@ -618,16 +623,16 @@ fn finish(
 }
 
 #[derive(Debug)]
-struct Snapshot {
-    positions: usize,
-    position_limit: usize,
-    context_positions: usize,
-    context_limit: usize,
-    queued: usize,
-    workers: usize,
-    worker_limit: usize,
-    bytes: usize,
-    byte_limit: usize,
+pub(super) struct Snapshot {
+    pub(super) positions: usize,
+    pub(super) position_limit: usize,
+    pub(super) context_positions: usize,
+    pub(super) context_limit: usize,
+    pub(super) queued: usize,
+    pub(super) workers: usize,
+    pub(super) worker_limit: usize,
+    pub(super) bytes: usize,
+    pub(super) byte_limit: usize,
 }
 
 fn scrape(context: &mut ScenarioContext, index: usize) -> Result<Option<Snapshot>> {
@@ -697,7 +702,7 @@ fn await_snapshot(
     await_snapshot_at(context, 0, positions, queued, workers)
 }
 
-fn await_snapshot_at(
+pub(super) fn await_snapshot_at(
     context: &mut ScenarioContext,
     index: usize,
     positions: usize,

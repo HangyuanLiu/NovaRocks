@@ -716,7 +716,7 @@ mod tests {
                 let mut trace = self.units.lock().unwrap();
                 trace.push(units);
                 if self.refuse_tail && trace.len() == 3 {
-                    Err(self.cause)
+                    Err(self.cause.clone())
                 } else {
                     Ok(())
                 }
@@ -731,7 +731,7 @@ mod tests {
                 _: &dyn PureCompileControl,
             ) -> Result<ConnectorWriteRecipeDraft, PureProviderCompileError<Self::Error>>
             {
-                match self.0 {
+                match self.0.clone() {
                     Some(cause) => Err(PureProviderCompileError::Control(cause)),
                     None => Err(PureProviderCompileError::Provider(invalid(
                         "private refusal",
@@ -749,7 +749,7 @@ mod tests {
         ] {
             let control = Trace {
                 units: Mutex::default(),
-                cause,
+                cause: cause.clone(),
                 refuse_tail: true,
             };
             let error = ConnectorWriteRecipe::try_compile_with_provider(
@@ -759,7 +759,7 @@ mod tests {
             )
             .unwrap_err();
             assert!(
-                matches!(error, ConnectorWriteRecipeCompileError::Control(actual) if actual == cause)
+                matches!(&error, ConnectorWriteRecipeCompileError::Control(actual) if actual == &cause)
             );
             assert_eq!(
                 error
@@ -772,17 +772,17 @@ mod tests {
 
             let control = Trace {
                 units: Mutex::default(),
-                cause,
+                cause: cause.clone(),
                 refuse_tail: true,
             };
             let error = ConnectorWriteRecipe::try_compile_with_provider(
                 &original,
-                &Refusal(Some(cause)),
+                &Refusal(Some(cause.clone())),
                 &control,
             )
             .unwrap_err();
             assert!(
-                matches!(error, ConnectorWriteRecipeCompileError::Control(actual) if actual == cause)
+                matches!(&error, ConnectorWriteRecipeCompileError::Control(actual) if actual == &cause)
             );
             assert_eq!(control.units.lock().unwrap().as_slice(), &[0, 0]);
         }

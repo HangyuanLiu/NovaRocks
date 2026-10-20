@@ -132,3 +132,19 @@ mod tests {
         );
     }
 }
+
+impl novarocks_failure_contract::FailureProjection for ConnectorIdentityError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        let code = match self {
+            Self::InvalidProviderId => 30,
+            Self::InvalidInstanceId => 31,
+            Self::InvalidCanonicalInstanceId => 32,
+            Self::InvalidWriteTargetOrdinal => 33,
+        };
+        FailureFact::new(
+            FailureClass::Data,
+            FailureReason::new(domain::CONNECTOR, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}

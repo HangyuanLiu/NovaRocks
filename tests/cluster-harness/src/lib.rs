@@ -209,6 +209,14 @@ struct LifecycleConvergenceWireSnapshot {
     query_local_sequence: u64,
     query_attempt_id: u64,
     error_source: Option<String>,
+    #[serde(default)]
+    failure_fact: Option<Vec<u8>>,
+    #[serde(default)]
+    failure_detail: Option<String>,
+    #[serde(default)]
+    failure_site: Option<serde_json::Value>,
+    #[serde(default)]
+    worker_contexts_converged: bool,
     runtime_filter: RuntimeFilterTerminalRollupWire,
 }
 
@@ -426,12 +434,28 @@ fn decode_query_lifecycle_structured_snapshot(
         Some("no-outcome") => Some(QueryLifecycleErrorSource::NoOutcome),
         Some(source) => bail!("unknown FE lifecycle snapshot error source {source:?}"),
     };
+    ensure!(
+        wire.failure_fact.is_some() == wire.failure_detail.is_some()
+            && wire.failure_fact.is_some() == wire.failure_site.is_some(),
+        "observed failure input is incomplete"
+    );
+    ensure!(
+        wire.failure_detail.as_ref().is_none_or(|s| s.len() <= 512),
+        "observed safe detail exceeds its original bound"
+    );
     Ok(Some(QueryLifecycleStructuredSnapshot {
         execution_id: Some(wire.execution_id),
         process_namespace,
         local_sequence: wire.query_local_sequence,
         attempt_id: wire.query_attempt_id,
         error_source,
+        failure_fact: decode_observed_failure_fact(wire.failure_fact.as_deref())?,
+        failure_detail: wire.failure_detail,
+        failure_site: wire
+            .failure_site
+            .map(decode_observed_failure_site)
+            .transpose()?,
+        worker_contexts_converged: wire.worker_contexts_converged,
         runtime_filter: decode_runtime_filter_terminal_rollup(wire.runtime_filter)?,
     }))
 }
@@ -1076,10 +1100,155 @@ pub struct QueryLifecycleStructuredSnapshot {
     pub local_sequence: u64,
     pub attempt_id: u64,
     pub error_source: Option<QueryLifecycleErrorSource>,
+    /// The original physical attempt's typed terminal; no logical acceptance authority.
+    pub failure_fact: Option<novarocks_execution_contract::failure::FailureFact>,
+    pub failure_detail: Option<String>,
+    pub failure_site: Option<QueryLifecycleFailureSite>,
+    pub worker_contexts_converged: bool,
     /// The FE-normalized Runtime Filter terminal read model. This is a
     /// query-scoped immutable projection, never a process counter or log
     /// rendering.
     pub runtime_filter: RuntimeFilterTerminalRollup,
+}
+
+/// Read model of an original attempt's failure location. Identity decoding uses
+/// the production codec; a missing location never becomes an invented Task.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryLifecycleFailureSite {
+    Task {
+        identity: novarocks_execution_contract::TaskIdentity,
+        phase: novarocks_execution_contract::TaskFailurePhase,
+    },
+    TaskControl {
+        identity: novarocks_execution_contract::TaskIdentity,
+    },
+    Operation {
+        context: novarocks_execution_contract::QueryContextRef,
+        operation_id: novarocks_execution_contract::TaskOperationId,
+        kind: String,
+    },
+    RootRead {
+        root: novarocks_execution_contract::TaskIdentity,
+    },
+    Backend {
+        process: novarocks_types::BackendProcessId,
+    },
+    Coordinator,
+}
+fn decode_observed_failure_fact(
+    bytes: Option<&[u8]>,
+) -> Result<Option<novarocks_execution_contract::failure::FailureFact>> {
+    use prost::Message;
+    bytes
+        .map(|bytes| {
+            ensure!(
+                bytes.len() <= 512,
+                "observed failure fact exceeds its finite vocabulary bound"
+            );
+            let fact = novarocks_proto_models::novarocks::FailureFact::decode(bytes)?;
+            novarocks_task_codec::status::decode_failure_fact(
+                &fact,
+                novarocks_proto_codec::FieldPath::root("observed_failure_fact"),
+            )
+            .map_err(Into::into)
+        })
+        .transpose()
+}
+fn decode_observed_failure_site(value: serde_json::Value) -> Result<QueryLifecycleFailureSite> {
+    use novarocks_execution_contract::TaskFailurePhase;
+    use novarocks_proto_codec::FieldPath;
+    use novarocks_proto_models::novarocks as pb;
+    use novarocks_task_codec::identity::{decode_query_context_ref, decode_task_identity};
+    use prost::Message;
+    let path = FieldPath::root("observed_failure_site");
+    let bytes = |field: &str| -> Result<Vec<u8>> {
+        let b: Vec<u8> = serde_json::from_value(
+            value
+                .get(field)
+                .context("missing failure identity")?
+                .clone(),
+        )?;
+        ensure!(
+            b.len() <= 128,
+            "observed failure identity exceeds finite bound"
+        );
+        Ok(b)
+    };
+    let task = |field: &str| -> Result<novarocks_execution_contract::TaskIdentity> {
+        Ok(decode_task_identity(
+            &pb::TaskIdentity::decode(bytes(field)?.as_slice())?,
+            path.clone(),
+        )?)
+    };
+    Ok(
+        match value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .context("missing failure site kind")?
+        {
+            "task" => QueryLifecycleFailureSite::Task {
+                identity: task("identity")?,
+                phase: match value.get("phase").and_then(serde_json::Value::as_str) {
+                    Some("preparation") => TaskFailurePhase::Preparation,
+                    Some("execution") => TaskFailurePhase::Execution,
+                    _ => bail!("unknown observed Task failure phase"),
+                },
+            },
+            "task-control" => QueryLifecycleFailureSite::TaskControl {
+                identity: task("identity")?,
+            },
+            "operation" => {
+                let context = decode_query_context_ref(
+                    &pb::QueryContextRef::decode(bytes("context")?.as_slice())?,
+                    path,
+                )?;
+                let operation_id = novarocks_execution_contract::TaskOperationId::try_from_bytes(
+                    bytes("operation_id")?
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("observed operation id must be 16 bytes"))?,
+                )?;
+                let kind = value
+                    .get("operation_kind")
+                    .and_then(serde_json::Value::as_str)
+                    .context("missing observed operation kind")?;
+                use novarocks_execution_contract::operation::OperationKind as K;
+                ensure!(
+                    [
+                        K::AcquireQueryContextAdmissionTicket,
+                        K::CreateTask,
+                        K::UpdateTask,
+                        K::UpdateQueryContext,
+                        K::CancelTask,
+                        K::AbortQueryContext,
+                        K::QuiesceQueryContext,
+                        K::ReleaseQueryContext,
+                        K::FetchTaskDynamicFilters,
+                        K::GetFinalTaskInfo
+                    ]
+                    .iter()
+                    .any(|k| k.as_str() == kind),
+                    "unknown observed operation kind"
+                );
+                QueryLifecycleFailureSite::Operation {
+                    context,
+                    operation_id,
+                    kind: kind.to_owned(),
+                }
+            }
+            "root-read" => QueryLifecycleFailureSite::RootRead {
+                root: task("root")?,
+            },
+            "backend" => QueryLifecycleFailureSite::Backend {
+                process: value
+                    .get("process")
+                    .and_then(serde_json::Value::as_str)
+                    .context("missing observed backend")?
+                    .parse()?,
+            },
+            "coordinator" => QueryLifecycleFailureSite::Coordinator,
+            _ => bail!("unknown observed failure site"),
+        },
+    )
 }
 
 /// Exact statement attempt selected by a synchronized scenario fault binding.
@@ -2618,6 +2787,14 @@ pub trait ServerHandle: Send {
     ) -> Result<()> {
         bail!("selected Native fault is unsupported by this server mode")
     }
+    fn activate_selected_deferred_query_lifecycle_fault(
+        &mut self,
+        _index: usize,
+        _kind: &'static str,
+        _run_token: &str,
+    ) -> Result<()> {
+        bail!("this harness has no deferred Native fault activation")
+    }
     fn selected_query_lifecycle_fault_hit(
         &self,
         _index: usize,
@@ -2781,6 +2958,11 @@ pub trait ServerHandle: Send {
     #[allow(dead_code)]
     fn be_log_contents(&self, index: usize) -> Result<String> {
         bail!("BE log reading is unsupported by this server mode (index={index})")
+    }
+    /// Read only the current backend's original stdout under a finite bound.
+    /// The result excludes restart history and human diagnostic envelopes.
+    fn be_stdout_contents(&self, index: usize, _max_bytes: usize) -> Result<String> {
+        bail!("bounded BE stdout reading is unsupported by this server mode (index={index})")
     }
     fn be_current_log_contents(&self, index: usize) -> Result<String> {
         self.be_log_contents(index)
@@ -4951,6 +5133,18 @@ impl ServerHandle for CrossProcessServerHandle {
             .insert((index, kind), run_token.to_owned());
         Ok(())
     }
+    fn activate_selected_deferred_query_lifecycle_fault(
+        &mut self,
+        index: usize,
+        kind: &'static str,
+        run_token: &str,
+    ) -> Result<()> {
+        self.ensure_be_index(index)?;
+        self.test_sessions
+            .as_ref()
+            .context("deferred action has no original role session")?
+            .activate_deferred_native_fault(index, kind, run_token)
+    }
     fn selected_query_lifecycle_fault_hit(
         &self,
         index: usize,
@@ -5010,7 +5204,9 @@ impl ServerHandle for CrossProcessServerHandle {
                 observation.connection_id,
                 wire,
             )? {
-                if !require_success || snapshot.error_source.is_none() {
+                if !require_success
+                    || (snapshot.error_source.is_none() && snapshot.failure_fact.is_none())
+                {
                     return Ok(snapshot);
                 }
                 latest = Some(snapshot);
@@ -5313,6 +5509,17 @@ impl ServerHandle for CrossProcessServerHandle {
         self.ensure_be_index(index)?;
         let current = self.be_processes[index].log_contents()?;
         Ok(format!("{}{}", self.be_log_history[index], current))
+    }
+
+    fn be_stdout_contents(&self, index: usize, max_bytes: usize) -> Result<String> {
+        self.ensure_be_index(index)?;
+        self.be_processes[index]
+            .stdout_log_source()
+            .with_bounded_snapshot_reader(max_bytes as u64, |reader, _| {
+                let mut text = String::new();
+                reader.read_to_string(&mut text)?;
+                Ok(text)
+            })
     }
 
     fn be_current_log_contents(&self, index: usize) -> Result<String> {
@@ -6744,6 +6951,69 @@ mod tests {
         decode_query_lifecycle_structured_snapshot(wire)
             .expect("decode lifecycle debug snapshot")
             .expect("debug endpoint returns a snapshot")
+    }
+
+    #[test]
+    fn statement_terminal_observation_preserves_complete_fact_and_refuses_partial_inputs() {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, ResourceDimension, ResourceFacts, domain,
+        };
+        use prost::Message;
+        use std::num::NonZeroU16;
+        let fact = FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(domain::MEMORY, NonZeroU16::new(8).unwrap()),
+        )
+        .with_resource(ResourceFacts {
+            request_scope: None,
+            constraint_scope: None,
+            dimension: ResourceDimension::Bytes,
+            requested: Some(64),
+            required_growth: None,
+            limit: Some(1),
+            live: Some(0),
+            committed: Some(64),
+        });
+        let mut value = lifecycle_debug_json("11:12:13");
+        value["failure_fact"] = serde_json::json!(
+            novarocks_task_codec::status::encode_failure_fact(fact).encode_to_vec()
+        );
+        value["failure_detail"] = serde_json::json!("original bounded author detail");
+        value["failure_site"] = serde_json::json!({"kind":"coordinator"});
+        value["worker_contexts_converged"] = serde_json::json!(true);
+        let observed = decode_lifecycle_debug_json(value.clone());
+        assert_eq!(observed.failure_fact, Some(fact));
+        assert_eq!(
+            observed.failure_site,
+            Some(QueryLifecycleFailureSite::Coordinator)
+        );
+        assert_eq!(
+            observed.failure_detail.as_deref(),
+            Some("original bounded author detail")
+        );
+        assert!(observed.worker_contexts_converged);
+        for field in ["failure_fact", "failure_detail", "failure_site"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                decode_query_lifecycle_structured_snapshot(
+                    serde_json::from_value(missing).unwrap()
+                )
+                .is_err()
+            );
+        }
+        let mut bad = value.clone();
+        bad["failure_site"] = serde_json::json!({"kind":"task","identity":[],"phase":"execution"});
+        assert!(
+            decode_query_lifecycle_structured_snapshot(serde_json::from_value(bad).unwrap())
+                .is_err()
+        );
+        let mut bad = value;
+        bad["failure_fact"] = serde_json::json!(vec![0u8; 513]);
+        assert!(
+            decode_query_lifecycle_structured_snapshot(serde_json::from_value(bad).unwrap())
+                .is_err()
+        );
     }
 
     fn statement_observation_json() -> serde_json::Value {

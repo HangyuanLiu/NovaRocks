@@ -824,7 +824,10 @@ fn test_tera_datetime_parser_am_pm() {
 fn test_tera_datetime_format_validation() {
     use novarocks_execution::exec::expr::function::date::compile_tera_format;
     let err = compile_tera_format(";YYYYmm:dd").expect_err("format should be invalid");
-    assert_eq!(err, "The format parameter ;YYYYmm:dd is invalid format");
+    assert_eq!(
+        err.to_string(),
+        "The format parameter ;YYYYmm:dd is invalid format"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2263,7 +2266,11 @@ fn test_last_day_makedate_next_previous() {
     let invalid = common::literal_string(&mut arena, "mon");
     let next_err =
         eval_date_function("next_day", &arena, expr_date, &[base, invalid], &chunk).unwrap_err();
-    assert!(next_err.contains("mon not supported in next_day dow_string backend"));
+    assert!(
+        next_err
+            .to_string()
+            .contains("mon not supported in next_day dow_string backend")
+    );
     let prev = common::literal_string(&mut arena, "2020-01-02");
     let friday2 = common::literal_string(&mut arena, "Fr");
     assert_eq!(
@@ -2273,7 +2280,11 @@ fn test_last_day_makedate_next_previous() {
     let monday2 = common::literal_string(&mut arena, "mon");
     let prev_err = eval_date_function("previous_day", &arena, expr_date, &[prev, monday2], &chunk)
         .unwrap_err();
-    assert!(prev_err.contains("mon not supported in previous_day dow_string backend"));
+    assert!(
+        prev_err
+            .to_string()
+            .contains("mon not supported in previous_day dow_string backend")
+    );
 }
 
 #[test]
@@ -2338,7 +2349,10 @@ fn test_next_previous_day_invalid_dow_string() {
     let invalid = common::literal_string(&mut arena, "mon");
     let err = eval_date_function("next_day", &arena, expr_date, &[base, invalid], &chunk)
         .expect_err("next_day should reject lowercase dow string");
-    assert!(err.contains("mon not supported in next_day dow_string backend"));
+    assert!(
+        err.to_string()
+            .contains("mon not supported in next_day dow_string backend")
+    );
 
     let base_prev = common::literal_string(&mut arena, "2020-01-02");
     let invalid_prev = common::literal_string(&mut arena, "monday");
@@ -2350,7 +2364,11 @@ fn test_next_previous_day_invalid_dow_string() {
         &chunk,
     )
     .expect_err("previous_day should reject lowercase dow string");
-    assert!(err_prev.contains("monday not supported in previous_day dow_string backend"));
+    assert!(
+        err_prev
+            .to_string()
+            .contains("monday not supported in previous_day dow_string backend")
+    );
 }
 
 #[test]
@@ -2437,7 +2455,7 @@ fn test_trunc_and_slice_and_alignment() {
         &chunk,
     )
     .expect_err("invalid date_trunc unit should return error");
-    assert!(err.contains("format value must in"));
+    assert!(err.to_string().contains("format value must in"));
     assert_eq!(
         date_eval_ts("date_floor", &arena, expr_ts, &[unit_month, dt], &chunk),
         dt_micros("2020-01-01 00:00:00")
@@ -3237,7 +3255,7 @@ fn slice_typed_arena_rejects_contract_and_control_errors_without_null_masking() 
             result_type,
         );
         let error = arena.eval(call, &chunk).unwrap_err();
-        assert!(error.contains(fragment), "{name}: {error}");
+        assert!(error.to_string().contains(fragment), "{name}: {error}");
     }
 }
 
@@ -3312,6 +3330,7 @@ fn slice_typed_arena_distinguishes_input_null_cast_failure_and_pre_epoch_error()
                 arena
                     .eval(call, &chunk)
                     .unwrap_err()
+                    .to_string()
                     .contains("can't before 0001-01-01")
             );
         } else {
@@ -3347,7 +3366,7 @@ fn slice_typed_arena_rejects_null_controls_even_with_null_input() {
             let call = slice_call(&mut arena, name, args, domain);
             let error = arena.eval(call, &chunk).unwrap_err();
             assert!(
-                error.contains(fragment),
+                error.to_string().contains(fragment),
                 "{name} control {null_index}: {error}"
             );
         }

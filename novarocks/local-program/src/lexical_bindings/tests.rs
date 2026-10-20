@@ -50,7 +50,7 @@ impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
         *self.units.lock().unwrap() += units as usize;
-        if let Some((at, failure)) = self.fail
+        if let Some((at, failure)) = self.fail.clone()
             && at == units
         {
             Err(failure)
@@ -938,7 +938,7 @@ fn new_closure_records_share_one_bound_and_observe_typed_outer_control() {
                 (0..100).map(|id| slot(id, input())).collect(),
             );
             let control = Control {
-                fail: Some((units, error)),
+                fail: Some((units, error.clone())),
                 ..Control::default()
             };
             assert_eq!(

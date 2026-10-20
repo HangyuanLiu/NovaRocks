@@ -136,7 +136,7 @@ impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         let mut trace = self.trace.lock().unwrap();
         trace.push((phase, units));
-        if let Some((at, cause)) = self.refusal
+        if let Some((at, cause)) = self.refusal.clone()
             && trace.len() == at
         {
             return Err(cause);
@@ -207,7 +207,7 @@ fn cow_source_receipt_codec_three_compile_causes_preserve_actual_prefix() {
     ] {
         for at in 1..=trace.len() {
             let control = Control {
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 ..Default::default()
             };
             let mut ledger = ConnectorDecodeLedger::new(limits(1 << 20));
@@ -218,7 +218,7 @@ fn cow_source_receipt_codec_three_compile_causes_preserve_actual_prefix() {
                         IcebergReadTypes::wire_codecs().decode_table(&payload, &mut context)
                     }
                 };
-            assert_eq!(result.unwrap_err().compile_control_error(), Some(cause));
+            assert_eq!(result.unwrap_err().compile_control_error(), Some(&cause));
             assert_eq!(*control.trace.lock().unwrap(), trace[..at]);
         }
     }
@@ -233,5 +233,5 @@ fn cow_source_receipt_codec_real_ledger_refusal_is_capacity() {
     let error = IcebergReadTypes::wire_codecs()
         .decode_table(&payload, &mut ConnectorDecodeContext::new(&h, &mut ledger))
         .unwrap_err();
-    assert_eq!(error.kind(), ConnectorCodecErrorKind::Capacity);
+    assert_eq!(error.kind(), &ConnectorCodecErrorKind::Capacity);
 }

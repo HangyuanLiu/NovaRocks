@@ -487,7 +487,10 @@ fn analytic_original_schema_independent_aliases_keep_query_origin_to_last_free()
         let binding = binding(64 << 20);
         let tracker = construction_tracker();
         let bytes = source(input_type, 512);
-        let owner = TestPreparationControl::new(Duration::from_millis(1));
+        let owner = TestPreparationControl::new(
+            preparation_identity(binding.execution()),
+            Duration::from_millis(1),
+        );
         let loan = owner.loan();
         let mut compile_journal = ProjectMetadataJournal::default();
         let compiled = compile(&bytes, &binding, &tracker, &loan, &mut compile_journal);
@@ -628,7 +631,10 @@ fn analytic_actual_private_host_and_original_builder_capture_separate_occurrence
         let binding = binding(64 << 20);
         let tracker = construction_tracker();
         let bytes = source(bigint(), label_bytes);
-        let owner = TestPreparationControl::new(Duration::from_millis(1));
+        let owner = TestPreparationControl::new(
+            preparation_identity(binding.execution()),
+            Duration::from_millis(1),
+        );
         let loan = owner.loan();
         let mut journal = ProjectMetadataJournal::default();
         let compiled = compile(&bytes, &binding, &tracker, &loan, &mut journal);
@@ -744,12 +750,15 @@ fn analytic_original_schema_actual_capacity_and_worker_stop_remain_nominal() {
         preparation_memory::{PreparationMemoryRefusal, PreparationMemoryStop},
         preparation_metadata::PreparationMetadataFailure,
     };
-    use novarocks_worker::PreparationStop;
+    use novarocks_worker::TestPreparationIntent;
     let _ = novarocks_server_application::memory_observation::snapshot();
     let binding = binding(64 << 20);
     let tracker = construction_tracker();
     let bytes = source(bigint(), 512);
-    let owner = TestPreparationControl::new(Duration::from_millis(1));
+    let owner = TestPreparationControl::new(
+        preparation_identity(binding.execution()),
+        Duration::from_millis(1),
+    );
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
     let first = compile(&bytes, &binding, &tracker, &loan, &mut journal);
@@ -774,7 +783,7 @@ fn analytic_original_schema_actual_capacity_and_worker_stop_remain_nominal() {
             PreparationMemoryRefusal::Capacity(_)
         ))
     ));
-    assert!(owner.stop(PreparationStop::Abort(
+    assert!(owner.stop(TestPreparationIntent::Abort(
         novarocks_execution_contract::AbortCause::QueryFailed
     )));
     let error = prepare_window_metadata_for_test(
@@ -810,7 +819,10 @@ fn analytic_original_schema_actual_occupied_capacity_retains_qualified_shortage(
     let binding = binding(TOTAL);
     let tracker = construction_tracker();
     let bytes = source(bigint(), 512);
-    let owner = TestPreparationControl::new(Duration::from_millis(1));
+    let owner = TestPreparationControl::new(
+        preparation_identity(binding.execution()),
+        Duration::from_millis(1),
+    );
     let loan = owner.loan();
     let mut journal = ProjectMetadataJournal::default();
     let compiled = compile(&bytes, &binding, &tracker, &loan, &mut journal);
@@ -871,4 +883,16 @@ fn analytic_original_schema_actual_occupied_capacity_retains_qualified_shortage(
     // The helper consumed the real producer. Its genuine frees after this
     // verdict may invalidate freshness; the nominal cause remains unchanged.
     drop(filler);
+}
+
+fn preparation_identity(
+    execution: novarocks_types::identity::QueryExecutionId,
+) -> novarocks_execution_contract::TaskIdentity {
+    use novarocks_types::identity::{BackendProcessId, StageId, TaskId};
+    novarocks_execution_contract::TaskIdentity::new(
+        execution,
+        StageId::new(1).unwrap(),
+        TaskId::new(1).unwrap(),
+        BackendProcessId::new_v7(),
+    )
 }

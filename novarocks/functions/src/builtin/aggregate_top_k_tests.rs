@@ -355,7 +355,7 @@ fn approx_top_k_owner_same_original_core_final_and_binary_roundtrip_real_custody
     }
 }
 #[test]
-fn approx_top_k_owner_whole_original_data_actual_sparse_domain_and_failed_reentry() {
+fn approx_top_k_owner_contract_actual_sparse_domain_and_failed_reentry() {
     let host = Arc::new(Host::default());
     let mut c = column(
         kernel(&[DataType::UInt32], AggregateKernelPhase::Single),
@@ -377,19 +377,18 @@ fn approx_top_k_owner_whole_original_data_actual_sparse_domain_and_failed_reentr
         &Control::default(),
     )
     .unwrap_err();
-    let EvaluationFailure::InvocationData(data) = err else {
-        panic!("original whole invocation Data")
+    let EvaluationFailure::Kernel(cause) = err else {
+        panic!("unsupported frozen carrier is outer")
     };
-    assert_eq!(
-        data.message(),
-        "update aggregate state: unsupported tracked scalar type: UInt32"
-    );
-    assert_eq!(data.state_indices(), &[1]);
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(cause.failure_fact().reason().code(), 313);
+    assert_eq!(cause.to_string(), "unsupported tracked scalar type: UInt32");
     assert!(matches!(
         c.emit_evaluation(&[1], 2, &Control::default()),
         Err(EvaluationFailure::Kernel(KernelFailure::InstanceFailed))
     ));
-    drop(data);
+    drop(cause);
     drop(c);
     empty(&host);
 }
@@ -509,7 +508,7 @@ struct CompileRefusal(CompileControlError);
 impl PureCompileControl for CompileRefusal {
     fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert_eq!(units, 0);
-        Err(self.0)
+        Err(self.0.clone())
     }
 }
 #[test]
@@ -521,7 +520,7 @@ fn approx_top_k_owner_three_original_compile_causes() {
         CompileControlError::ResourceExhausted,
     ] {
         assert!(
-            matches!(k.clone_for_local_phase(k.contract.clone(),&CompileRefusal(cause)),Err(actual)if actual==compile_failure(cause))
+            matches!(k.clone_for_local_phase(k.contract.clone(),&CompileRefusal(cause.clone())),Err(actual)if actual==compile_failure(cause))
         );
     }
 }
@@ -596,6 +595,13 @@ fn approx_top_k_owner_intermediate_final_codec_and_full_merge_data_domain() {
         data.message(),
         "merge aggregate state: approx_top_k merge payload too short"
     );
+    assert_eq!(
+        data.projected_fact(),
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &DataFailureReason::InvalidEncoding
+        )
+    );
+    assert!(data.original_source().is_some());
     assert_eq!(data.input_rows(), &rows);
     assert_eq!(data.state_indices(), &[1]);
     assert_eq!(data.aggregate_phase(), AggregateInvocationPhase::Merge);
@@ -624,10 +630,189 @@ fn approx_top_k_owner_empty_struct_setup_is_original_whole_data_before_rows() {
         data.message(),
         "update aggregate state: approx_top_k struct input must have at least 1 field"
     );
+    assert_eq!(
+        data.projected_fact(),
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &DataFailureReason::InvalidValue
+        )
+    );
+    assert!(data.original_source().is_some());
     assert_eq!(data.batch_rows(), 0);
     assert!(data.input_rows().is_empty());
     assert!(data.state_indices().is_empty());
     drop(data);
     drop(c);
     empty(&host);
+}
+
+#[test]
+fn topk_real_codec_sources_do_not_retain_payload_or_host() {
+    use novarocks_failure_contract::FailureProjection;
+    use std::error::Error;
+    let host = Arc::new(Host::default());
+    let host_owner = Arc::downgrade(&host);
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    for (bytes, utf8) in [
+        (vec![1, 4, 1, 0, 0, 0, 0xff], true),
+        (vec![1, 11, 1, 0, 0, 0, b'x'], false),
+    ] {
+        let source = core::decode_optional_scalar_tracked_observed(
+            &bytes,
+            &allocator,
+            &mut ScalarWork::new(None),
+        )
+        .unwrap_err();
+        assert_eq!(
+            source.failure_fact(),
+            DataFailureReason::InvalidEncoding.failure_fact()
+        );
+        let KernelFailure::Source(source) = source else {
+            panic!("actual codec source required")
+        };
+        let actual = source.source().unwrap().source().unwrap();
+        if utf8 {
+            assert!(actual.is::<std::str::Utf8Error>());
+        } else {
+            assert!(actual.is::<<arrow_buffer::i256 as std::str::FromStr>::Err>());
+        }
+    }
+    drop(allocator);
+    empty(&host);
+    drop(host);
+    assert!(host_owner.upgrade().is_none());
+}
+
+#[test]
+fn topk_bad_child_counts_refuse_before_original_scratch_allocation() {
+    use novarocks_failure_contract::FailureProjection;
+    let host = Arc::new(Host::default());
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let before = host.ledger.lock().unwrap().attempts;
+    for tag in [8, 9, 10] {
+        let mut bytes = vec![1, tag];
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        let error = core::decode_optional_scalar_tracked_observed(
+            &bytes,
+            &allocator,
+            &mut ScalarWork::new(None),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.failure_fact(),
+            DataFailureReason::InvalidEncoding.failure_fact()
+        );
+        assert_eq!(host.ledger.lock().unwrap().attempts, before);
+    }
+    let mut header = vec![];
+    header.extend_from_slice(&5_u32.to_le_bytes());
+    header.extend_from_slice(&100_u32.to_le_bytes());
+    header.extend_from_slice(&100_u32.to_le_bytes());
+    let error =
+        core::deserialize_state_tracked_observed(&header, &allocator, &mut ScalarWork::new(None))
+            .err()
+            .expect("missing entries must fail");
+    assert_eq!(
+        error.failure_fact(),
+        DataFailureReason::InvalidEncoding.failure_fact()
+    );
+    assert_eq!(host.ledger.lock().unwrap().attempts, before);
+    drop(allocator);
+    empty(&host);
+}
+
+#[test]
+fn topk_value_decoder_checks_the_original_value_type_depth_boundary() {
+    use novarocks_failure_contract::FailureProjection;
+    fn nested(levels: usize) -> Vec<u8> {
+        let mut bytes = vec![1, 2];
+        bytes.extend_from_slice(&0_i64.to_le_bytes());
+        for _ in 0..levels {
+            let mut parent = vec![1, 10, 1, 0, 0, 0];
+            parent.extend(bytes);
+            bytes = parent;
+        }
+        bytes
+    }
+    let host = Arc::new(Host::default());
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let maximum = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH;
+    let value = core::decode_optional_scalar_tracked_observed(
+        &nested(maximum),
+        &allocator,
+        &mut ScalarWork::new(None),
+    )
+    .unwrap();
+    drop(value);
+    let error = core::decode_optional_scalar_tracked_observed(
+        &nested(maximum + 1),
+        &allocator,
+        &mut ScalarWork::new(None),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.failure_fact(),
+        DataFailureReason::InvalidEncoding.failure_fact()
+    );
+    drop(allocator);
+    empty(&host);
+}
+
+#[test]
+fn topk_known_codec_origin_survives_real_diagnostic_refusal_and_host_exit() {
+    use novarocks_failure_contract::FailureProjection;
+    use std::error::Error;
+    let kernel = kernel(&[DataType::Int64], AggregateKernelPhase::Final);
+    let host = Arc::new(Host::default());
+    let host_owner = Arc::downgrade(&host);
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let input: ArrayRef = Arc::new(BinaryArray::from(vec![b"bad".as_slice()]));
+    let input_owner = Arc::downgrade(&input);
+    let bytes = input
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap()
+        .value(0);
+    let origin =
+        core::deserialize_state_tracked_observed(bytes, &allocator, &mut ScalarWork::new(None))
+            .err()
+            .expect("actual bad payload must fail");
+    let expected = origin.clone();
+    let control = Control {
+        refusal: Some((0, KernelFailure::DeadlineExceeded)),
+        ..Default::default()
+    };
+    let mut sink = FailureSink {
+        allocator: &allocator,
+        domain: FailureDomain::Mutation {
+            contract: &kernel.contract,
+            phase: AggregateInvocationPhase::Merge,
+            selection: Selection::all(1),
+            mapping: &[0],
+        },
+        control: &control,
+    };
+    let EvaluationFailure::Kernel(error) = topk_error(origin, &mut sink) else {
+        panic!("diagnostic cannot complete")
+    };
+    assert_eq!(error.failure_fact(), expected.failure_fact());
+    let KernelFailure::Source(source) = &error else {
+        panic!("actual diagnostic refusal required")
+    };
+    let source = source
+        .source()
+        .unwrap()
+        .downcast_ref::<TopKDiagnosticFailure>()
+        .unwrap();
+    assert_eq!(source.origin, expected);
+    assert_eq!(source.diagnostic, KernelFailure::DeadlineExceeded);
+    assert_eq!(source.phase, AggregateInvocationPhase::Merge);
+    assert_eq!(control.trace.lock().unwrap().len(), 1);
+    drop(sink);
+    drop(input);
+    assert!(input_owner.upgrade().is_none());
+    drop(allocator);
+    empty(&host);
+    drop(host);
+    assert!(host_owner.upgrade().is_none());
+    assert_eq!(error.failure_fact(), expected.failure_fact());
 }

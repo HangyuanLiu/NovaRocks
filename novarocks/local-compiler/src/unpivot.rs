@@ -658,7 +658,7 @@ mod tests {
             let mut observations = self.observations.lock().unwrap();
             let index = observations.len();
             observations.push((phase, units));
-            match self.refuse {
+            match self.refuse.clone() {
                 Some((at, cause)) if index == at => Err(cause),
                 _ => Ok(()),
             }
@@ -722,7 +722,7 @@ mod tests {
         ] {
             for at in 1..trace.len() {
                 let refused = Control {
-                    refuse: Some((at, cause)),
+                    refuse: Some((at, cause.clone())),
                     ..Default::default()
                 };
                 let mut work =

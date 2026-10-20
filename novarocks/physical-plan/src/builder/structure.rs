@@ -46,7 +46,14 @@ impl fmt::Display for FragmentStructureError {
         }
     }
 }
-impl std::error::Error for FragmentStructureError {}
+impl std::error::Error for FragmentStructureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Structure(source) => Some(source),
+        }
+    }
+}
 
 impl FragmentBuilder {
     /// Finish an unpublished definition's resource and structural stage.

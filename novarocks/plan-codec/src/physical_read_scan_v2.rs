@@ -85,7 +85,27 @@ impl fmt::Display for E {
         }
     }
 }
-impl std::error::Error for E {}
+impl std::error::Error for ReadScanCodecError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Provider(source) => Some(source),
+            Self::Scan(source) => Some(source),
+            Self::Recipe(source) => Some(source),
+            Self::Protocol(source) => Some(source),
+            Self::Domain(source) => Some(source),
+            Self::Binding(source) => Some(source),
+            Self::Payload(source) => Some(source),
+            Self::Schema(source) => Some(source),
+            Self::Type(source) => Some(source),
+            Self::Index(source) => Some(source),
+            Self::Node(source) => Some(source),
+            Self::ConstructionResource(source) => Some(source),
+            Self::InvalidSourceSchema(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 impl From<crate::physical_public_source_schema_v2::PublicSourceSchemaCodecError> for E {
     fn from(error: crate::physical_public_source_schema_v2::PublicSourceSchemaCodecError) -> Self {
         match error {
@@ -124,7 +144,7 @@ impl From<c::ConnectorReadRelationRecipeError> for E {
 impl From<ProtocolError> for E {
     fn from(e: ProtocolError) -> Self {
         match e.kind() {
-            novarocks_proto_codec::ProtocolErrorKind::CompileControl(c) => Self::Control(c),
+            novarocks_proto_codec::ProtocolErrorKind::CompileControl(c) => Self::Control(c.clone()),
             _ => Self::Protocol(e),
         }
     }
@@ -778,7 +798,7 @@ fn count_tuple(
                 &mut |f| {
                     if let Err(error) = m.domain_prefix(*f, &mut previous) {
                         let cause = match &error {
-                            E::Control(c) => *c,
+                            E::Control(c) => c.clone(),
                             _ => CompileControlError::ResourceExhausted,
                         };
                         failure = Some(error);
@@ -844,7 +864,7 @@ fn count_raw_tuple(
                     &mut |f| {
                         if let Err(error) = m.domain_prefix(*f, &mut previous) {
                             let cause = match &error {
-                                E::Control(c) => *c,
+                                E::Control(c) => c.clone(),
                                 _ => CompileControlError::ResourceExhausted,
                             };
                             failure = Some(error);

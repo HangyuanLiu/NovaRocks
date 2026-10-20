@@ -48,7 +48,7 @@ fn original_scalar_invocation_metadata_arity_precedes_every_undefined_child() {
             DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
         );
         assert_eq!(
-            arena.eval(root, &chunk).unwrap_err(),
+            (arena.eval(root, &chunk).unwrap_err()).to_string(),
             format!("array_struct_subfield expects 2 to 2 arguments, got {count}")
         );
     }
@@ -72,7 +72,7 @@ fn original_scalar_invocation_case_diagnostic_is_whole_call_and_not_root_null_ma
         DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
     );
     assert_eq!(
-        arena.eval(root, &chunk).unwrap_err(),
+        (arena.eval(root, &chunk).unwrap_err()).to_string(),
         "__array_struct_subfield field 'chosen' does not exist"
     );
 }
@@ -97,7 +97,7 @@ fn original_scalar_invocation_empty_if_else_is_called_but_unused_then_is_not() {
         DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
     );
     assert_eq!(
-        arena.eval(root, &chunk).unwrap_err(),
+        (arena.eval(root, &chunk).unwrap_err()).to_string(),
         "__array_struct_subfield field-name argument is empty"
     );
     let unused = arena.push_typed(

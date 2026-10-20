@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 //! ONE original bitmap aggregate state/update/merge math, independent of Execution pointers/tracker.
-use crate::aggregate_scalar::{ScalarStateAllocator, ScalarStateError};
-use crate::bitmap_value::{BitmapDecodePort, LegacyBitmapPort};
+use crate::aggregate_scalar::ScalarStateAllocator;
+use crate::bitmap_value::BitmapDecodePort;
+#[cfg(test)]
+use crate::bitmap_value::{BitmapValueFailure, TypedBitmapPort};
 use arrow_array::*;
 use arrow_schema::DataType;
 use hashbrown::hash_map::DefaultHashBuilder;
@@ -52,13 +54,13 @@ impl<A: ScalarStateAllocator> BitmapState<A> {
 }
 
 impl<A: ScalarStateAllocator> BitmapState<A> {
-    pub fn insert(&mut self, value: u64) -> Result<(), ScalarStateError> {
+    pub fn insert(&mut self, value: u64) -> Result<(), crate::KernelFailure> {
         if self.values.contains(&value) {
             return Ok(());
         }
-        self.values.try_reserve(1).map_err(|_| {
+        self.values.try_reserve(1).map_err(|source| {
             self.allocator
-                .scalar_allocation_error("reserve bitmap hash set")
+                .scalar_allocation_error("reserve bitmap hash set", source)
         })?;
         self.values.insert(value);
         Ok(())
@@ -66,6 +68,12 @@ impl<A: ScalarStateAllocator> BitmapState<A> {
 
     pub(crate) fn value_count(&self) -> usize {
         self.values.len()
+    }
+    pub fn aggregate_encoded_size(&self) -> Result<usize, crate::bitmap_value::BitmapValueFailure> {
+        crate::bitmap_value::aggregate_bitmap_byte_len(
+            self.values.len(),
+            self.values.iter().next().copied(),
+        )
     }
     pub fn encoded_values(&self) -> BitmapValues {
         self.values.iter().copied().collect()
@@ -82,14 +90,31 @@ impl<A: ScalarStateAllocator> BitmapState<A> {
         }
         i64::try_from(self.values.len())
             .map(Some)
-            .map_err(|_| CardinalityFailure(self.values.len()))
+            .map_err(|source| CardinalityFailure {
+                entries: self.values.len(),
+                source,
+            })
     }
 }
 #[derive(Clone, Copy, Debug)]
-pub struct CardinalityFailure(pub usize);
+pub struct CardinalityFailure {
+    pub entries: usize,
+    source: std::num::TryFromIntError,
+}
 impl std::fmt::Display for CardinalityFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "bitmap_union_int cardinality overflow: {}", self.0)
+        write!(f, "bitmap_union_int cardinality overflow: {}", self.entries)
+    }
+}
+
+impl std::error::Error for CardinalityFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for CardinalityFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        crate::DataFailureReason::NumericOutOfRange.failure_fact()
     }
 }
 
@@ -110,6 +135,39 @@ impl std::fmt::Display for InputFailure<'_> {
         }
     }
 }
+
+#[derive(Debug)]
+pub struct BitmapInputFailure {
+    downcast: bool,
+    detail: novarocks_failure_contract::BoundedDetail,
+}
+impl InputFailure<'_> {
+    pub fn into_failure(self) -> BitmapInputFailure {
+        BitmapInputFailure {
+            downcast: matches!(self, Self::Downcast(_)),
+            detail: novarocks_failure_contract::BoundedDetail::truncating_display(self),
+        }
+    }
+}
+impl std::fmt::Display for BitmapInputFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.detail.as_str())
+    }
+}
+impl std::error::Error for BitmapInputFailure {}
+impl novarocks_failure_contract::FailureProjection for BitmapInputFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(
+                domain::KERNEL,
+                std::num::NonZeroU16::new(if self.downcast { 193 } else { 194 }).unwrap(),
+            ),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for BitmapInputFailure {}
 /// Typed original state mutation seam, not a decoder or evaluator callback.
 pub trait BitmapAggregatePort: BitmapDecodePort {
     fn input_failure(&mut self, failure: InputFailure<'_>) -> Self::Error;
@@ -432,56 +490,83 @@ pub enum StateMutation {
     Observe,
     Insert(u64),
 }
-pub struct LegacyRows<W> {
-    writer: W,
-    decoder: LegacyBitmapPort,
+#[cfg(test)]
+#[derive(Debug)]
+enum TestFailure {
+    Bitmap(BitmapValueFailure),
+    Input(BitmapInputFailure),
 }
-impl<W: FnMut(usize, StateMutation) -> Result<(), String>> LegacyRows<W> {
-    pub fn new(writer: W) -> Self {
-        Self {
-            writer,
-            decoder: LegacyBitmapPort,
+#[cfg(test)]
+impl std::fmt::Display for TestFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bitmap(source) => source.fmt(f),
+            Self::Input(source) => source.fmt(f),
         }
     }
 }
-impl<W: FnMut(usize, StateMutation) -> Result<(), String>> BitmapDecodePort for LegacyRows<W> {
-    type Error = String;
-    fn data(&mut self, m: std::fmt::Arguments<'_>) -> String {
-        self.decoder.data(m)
-    }
-    fn is_data(error: &String) -> bool {
-        LegacyBitmapPort::is_data(error)
-    }
-    fn step(&mut self) -> Result<(), String> {
-        self.decoder.step()
-    }
-    fn boundary(&mut self) -> Result<(), String> {
-        self.decoder.boundary()
-    }
-    fn before_render(&mut self, n: usize) -> Result<(), String> {
-        self.decoder.before_render(n)
-    }
-    fn before_tree_insert(&mut self, n: usize) -> Result<(), String> {
-        self.decoder.before_tree_insert(n)
-    }
-    fn before_tree_collection(&mut self, n: usize) -> Result<(), String> {
-        self.decoder.before_tree_collection(n)
-    }
-    fn before_roaring(&mut self, n: usize) -> Result<(), String> {
-        self.decoder.before_roaring(n)
-    }
-    fn before_u32_collection(&mut self, n: u64) -> Result<(), String> {
-        self.decoder.before_u32_collection(n)
+#[cfg(test)]
+struct TestRows<W> {
+    writer: W,
+    decoder: TypedBitmapPort,
+}
+#[cfg(test)]
+impl<W: FnMut(usize, StateMutation) -> Result<(), TestFailure>> TestRows<W> {
+    pub fn new(writer: W) -> Self {
+        Self {
+            writer,
+            decoder: TypedBitmapPort,
+        }
     }
 }
-impl<W: FnMut(usize, StateMutation) -> Result<(), String>> BitmapAggregatePort for LegacyRows<W> {
-    fn input_failure(&mut self, f: InputFailure<'_>) -> String {
-        f.to_string()
+#[cfg(test)]
+impl<W: FnMut(usize, StateMutation) -> Result<(), TestFailure>> BitmapDecodePort for TestRows<W> {
+    type Error = TestFailure;
+    fn failure(&mut self, source: BitmapValueFailure) -> TestFailure {
+        TestFailure::Bitmap(source)
     }
-    fn observe(&mut self, n: usize) -> Result<(), String> {
+    fn is_data(error: &TestFailure) -> bool {
+        matches!(error, TestFailure::Bitmap(source) if source.is_data())
+    }
+    fn step(&mut self) -> Result<(), TestFailure> {
+        self.decoder.step().map_err(TestFailure::Bitmap)
+    }
+    fn boundary(&mut self) -> Result<(), TestFailure> {
+        self.decoder.boundary().map_err(TestFailure::Bitmap)
+    }
+    fn before_render(&mut self, n: usize) -> Result<(), TestFailure> {
+        self.decoder.before_render(n).map_err(TestFailure::Bitmap)
+    }
+    fn before_tree_insert(&mut self, n: usize) -> Result<(), TestFailure> {
+        self.decoder
+            .before_tree_insert(n)
+            .map_err(TestFailure::Bitmap)
+    }
+    fn before_tree_collection(&mut self, n: usize) -> Result<(), TestFailure> {
+        self.decoder
+            .before_tree_collection(n)
+            .map_err(TestFailure::Bitmap)
+    }
+    fn before_roaring(&mut self, n: usize) -> Result<(), TestFailure> {
+        self.decoder.before_roaring(n).map_err(TestFailure::Bitmap)
+    }
+    fn before_u32_collection(&mut self, n: u64) -> Result<(), TestFailure> {
+        self.decoder
+            .before_u32_collection(n)
+            .map_err(TestFailure::Bitmap)
+    }
+}
+#[cfg(test)]
+impl<W: FnMut(usize, StateMutation) -> Result<(), TestFailure>> BitmapAggregatePort
+    for TestRows<W>
+{
+    fn input_failure(&mut self, f: InputFailure<'_>) -> TestFailure {
+        TestFailure::Input(f.into_failure())
+    }
+    fn observe(&mut self, n: usize) -> Result<(), TestFailure> {
         (self.writer)(n, StateMutation::Observe)
     }
-    fn insert(&mut self, n: usize, v: u64) -> Result<(), String> {
+    fn insert(&mut self, n: usize, v: u64) -> Result<(), TestFailure> {
         (self.writer)(n, StateMutation::Insert(v))
     }
 }
@@ -495,7 +580,7 @@ mod tests {
         let a = Arc::new(Int32Array::from(vec![Some(-1), Some(7), None])) as ArrayRef;
         for operation in [BitmapOperation::Count, BitmapOperation::BitmapProjection] {
             let mut mutations = Vec::new();
-            let mut port = LegacyRows::new(|ordinal, mutation| {
+            let mut port = TestRows::new(|ordinal, mutation| {
                 mutations.push((
                     ordinal,
                     match mutation {
@@ -522,7 +607,7 @@ mod tests {
             Some(b"-1".as_slice()),
         ])) as ArrayRef;
         let mut mutations = Vec::new();
-        let mut port = LegacyRows::new(|ordinal, mutation| {
+        let mut port = TestRows::new(|ordinal, mutation| {
             mutations.push((
                 ordinal,
                 match mutation {
@@ -536,15 +621,20 @@ mod tests {
         assert_eq!(mutations, vec![(1, None), (2, None), (2, Some(u64::MAX))]);
         let a = a.as_any().downcast_ref::<BinaryArray>().unwrap();
         let expected = crate::bitmap_value::decode_bitmap(b"bad").unwrap_err();
-        let mut port = LegacyRows::new(|_, _| Ok(()));
-        assert_eq!(merge(a, 0..3, &mut port).unwrap_err(), expected);
+        let mut port = TestRows::new(|_, _| Ok(()));
+        assert_eq!(
+            merge(a, 0..3, &mut port).unwrap_err().to_string(),
+            expected.to_string()
+        );
     }
     #[test]
     fn bitmap_aggregate_original_core_unsupported_empty_type_is_not_null_success() {
         let a = Arc::new(NullArray::new(0)) as ArrayRef;
-        let mut port = LegacyRows::new(|_, _| panic!("unsupported carrier cannot mutate state"));
+        let mut port = TestRows::new(|_, _| panic!("unsupported carrier cannot mutate state"));
         assert_eq!(
-            update(BitmapOperation::Count, &a, 0..0, &mut port).unwrap_err(),
+            update(BitmapOperation::Count, &a, 0..0, &mut port)
+                .unwrap_err()
+                .to_string(),
             "bitmap aggregate expects BOOLEAN/INTEGER/VARCHAR/BINARY input, got Null"
         );
     }

@@ -373,7 +373,7 @@ mod tests {
             let mut recorded = self.units.lock().unwrap();
             recorded.push(units);
             let total: u32 = recorded.iter().sum();
-            if let Some((stop, error)) = self.stop {
+            if let Some((stop, error)) = self.stop.clone() {
                 let hit = match stop {
                     Stop::Entry => units == 0,
                     Stop::Positive(limit) => units > 0 && total >= limit,
@@ -507,9 +507,11 @@ mod tests {
             ] {
                 let tree = wide_scan_union(320);
                 let pattern = wide_scan_pattern(320);
-                let control = Control::new(Some((stop, error)));
+                let control = Control::new(Some((stop, error.clone())));
                 let result = super::bind_tree(&pattern, &tree, &control);
-                assert!(matches!(result, Err(failure) if failure == SqlCompileError::from(error)));
+                assert!(
+                    matches!(result, Err(failure) if failure == SqlCompileError::from(error.clone()))
+                );
                 let before = control.units.lock().unwrap().clone();
                 assert_eq!(before[0], 0);
                 match stop {
@@ -530,10 +532,10 @@ mod tests {
                 children: vec![],
             };
             for pattern in [&Pattern::Leaf, &mismatch] {
-                let control = Control::new(Some((Stop::Entry, error)));
+                let control = Control::new(Some((Stop::Entry, error.clone())));
                 assert!(matches!(
                     super::bind_tree(pattern, &tree, &control),
-                    Err(failure) if failure == SqlCompileError::from(error)
+                    Err(failure) if failure == SqlCompileError::from(error.clone())
                 ));
                 assert_eq!(*control.units.lock().unwrap(), vec![0]);
             }
@@ -555,10 +557,10 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             for pattern in [&Pattern::Leaf, &mismatch] {
-                let control = Control::new(Some((Stop::Finish, error)));
+                let control = Control::new(Some((Stop::Finish, error.clone())));
                 assert!(matches!(
                     super::bind_tree(pattern, &tree, &control),
-                    Err(failure) if failure == SqlCompileError::from(error)
+                    Err(failure) if failure == SqlCompileError::from(error.clone())
                 ));
                 assert_eq!(*control.units.lock().unwrap(), vec![0, 1]);
             }

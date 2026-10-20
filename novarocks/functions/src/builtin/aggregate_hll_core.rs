@@ -26,15 +26,15 @@ pub const HLL_DATA_FULL: u8 = 3;
 const HLL_COLUMN_PRECISION: usize = 14;
 pub const HLL_REGISTERS_COUNT: usize = 16 * 1024;
 const HLL_SPARSE_THRESHOLD: usize = 4096;
+/// Decode can author a value failure; it cannot enter the outer-only kernel port.
+/// ```compile_fail
+/// use novarocks_functions::{KernelFailure, builtin::aggregate_hll_core::{HllError, HllMergeFailure}};
+/// let _ = KernelFailure::from_domain(HllError::Payload(HllMergeFailure::Empty));
+/// ```
 #[derive(Debug)]
 pub enum HllError {
-    Legacy(String),
+    Payload(HllMergeFailure),
     Kernel(KernelFailure),
-}
-impl From<String> for HllError {
-    fn from(message: String) -> Self {
-        Self::Legacy(message)
-    }
 }
 impl From<KernelFailure> for HllError {
     fn from(cause: KernelFailure) -> Self {
@@ -44,12 +44,27 @@ impl From<KernelFailure> for HllError {
 impl std::fmt::Display for HllError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Legacy(message) => f.write_str(message),
+            Self::Payload(source) => source.fmt(f),
             Self::Kernel(cause) => cause.fmt(f),
         }
     }
 }
-impl std::error::Error for HllError {}
+impl std::error::Error for HllError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Payload(source) => Some(source),
+            Self::Kernel(source) => Some(source),
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for HllError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        match self {
+            Self::Payload(source) => source.failure_fact(),
+            Self::Kernel(source) => source.failure_fact(),
+        }
+    }
+}
 
 pub struct HllWork<'control, 'scope> {
     work: Option<&'scope mut EvaluationCheckpoints<'control>>,
@@ -58,13 +73,13 @@ impl<'control, 'scope> HllWork<'control, 'scope> {
     pub fn new(work: Option<&'scope mut EvaluationCheckpoints<'control>>) -> Self {
         Self { work }
     }
-    pub fn step(&mut self) -> Result<(), HllError> {
+    pub fn step(&mut self) -> Result<(), KernelFailure> {
         if let Some(work) = &mut self.work {
             work.step()?;
         }
         Ok(())
     }
-    pub fn flush(&mut self) -> Result<(), HllError> {
+    pub fn flush(&mut self) -> Result<(), KernelFailure> {
         if let Some(work) = &mut self.work {
             work.flush()?;
         }
@@ -74,21 +89,21 @@ impl<'control, 'scope> HllWork<'control, 'scope> {
 /// Storage only: the original fixed register math is implemented once below.
 pub trait HllRegisterAllocator: Clone {
     type Registers: Deref<Target = [u8; HLL_REGISTERS_COUNT]> + DerefMut;
-    fn allocate_registers(&self) -> Result<Self::Registers, HllError>;
+    fn allocate_registers(&self) -> Result<Self::Registers, KernelFailure>;
 }
 #[derive(Clone, Copy, Default)]
 pub struct LegacyHllRegisterAllocator;
 impl HllRegisterAllocator for LegacyHllRegisterAllocator {
     type Registers = Box<[u8; HLL_REGISTERS_COUNT]>;
-    fn allocate_registers(&self) -> Result<Self::Registers, HllError> {
+    fn allocate_registers(&self) -> Result<Self::Registers, KernelFailure> {
         Ok(Box::new([0u8; HLL_REGISTERS_COUNT]))
     }
 }
 impl HllRegisterAllocator for crate::aggregate_host_allocator::HostAggregateAllocator {
     type Registers = allocator_api2::boxed::Box<[u8; HLL_REGISTERS_COUNT], Self>;
-    fn allocate_registers(&self) -> Result<Self::Registers, HllError> {
+    fn allocate_registers(&self) -> Result<Self::Registers, KernelFailure> {
         allocator_api2::boxed::Box::try_new_in([0u8; HLL_REGISTERS_COUNT], self.clone())
-            .map_err(|_| HllError::Kernel(self.take_failure()))
+            .map_err(|_| self.take_failure())
     }
 }
 pub struct HllRawState<A: HllRegisterAllocator = LegacyHllRegisterAllocator> {
@@ -117,7 +132,7 @@ impl Default for HllRawState {
 pub fn ensure_registers<'a, A: HllRegisterAllocator>(
     state: &'a mut HllRawState<A>,
     work: &mut HllWork<'_, '_>,
-) -> Result<&'a mut [u8; HLL_REGISTERS_COUNT], HllError> {
+) -> Result<&'a mut [u8; HLL_REGISTERS_COUNT], KernelFailure> {
     if state.registers.is_none() {
         work.flush()?;
         state.registers = Some(state.allocator.allocate_registers()?);
@@ -129,7 +144,7 @@ pub fn update_state_register_from_hash<A: HllRegisterAllocator>(
     state: &mut HllRawState<A>,
     hash_value: u64,
     work: &mut HllWork<'_, '_>,
-) -> Result<(), HllError> {
+) -> Result<(), KernelFailure> {
     if hash_value == 0 {
         return Ok(());
     }
@@ -142,13 +157,13 @@ pub fn update_state_register_from_hash<A: HllRegisterAllocator>(
 pub fn hash_bytes_for_hll_observed(
     bytes: &[u8],
     work: &mut HllWork<'_, '_>,
-) -> Result<u64, HllError> {
+) -> Result<u64, KernelFailure> {
     crate::hll::murmur_hash64a_observed(bytes, MURMUR_SEED, &mut || work.step())
 }
 pub fn estimate_cardinality<A: HllRegisterAllocator>(
     state: &HllRawState<A>,
     work: &mut HllWork<'_, '_>,
-) -> Result<i64, HllError> {
+) -> Result<i64, KernelFailure> {
     if !state.has_value {
         return Ok(0);
     }
@@ -166,7 +181,7 @@ pub fn cardinality_from_serialized_hll(
         ..HllRawState::default()
     };
     merge_hll_bytes(&mut state, bytes, work)?;
-    estimate_cardinality(&state, work)
+    Ok(estimate_cardinality(&state, work)?)
 }
 
 pub fn update_register_from_hash(registers: &mut [u8; HLL_REGISTERS_COUNT], hash_value: u64) {
@@ -186,7 +201,7 @@ fn merge_as_opaque_payload<A: HllRegisterAllocator>(
     state: &mut HllRawState<A>,
     bytes: &[u8],
     work: &mut HllWork<'_, '_>,
-) -> Result<(), HllError> {
+) -> Result<(), KernelFailure> {
     let hash = hash_bytes_for_hll_observed(bytes, work)?;
     update_state_register_from_hash(state, hash, work)?;
     Ok(())
@@ -210,6 +225,29 @@ impl HllMergeFailure {
             Self::DecodeExplicitHash => "hll_raw decode EXPLICIT hash failed",
             Self::DecodeSparseCount => "hll_raw decode SPARSE count failed",
             Self::DecodeSparseIndex => "hll_raw decode SPARSE index failed",
+        }
+    }
+}
+
+impl std::fmt::Display for HllMergeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+impl std::error::Error for HllMergeFailure {}
+impl novarocks_failure_contract::FailureProjection for HllMergeFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        match self {
+            Self::Empty | Self::ExplicitMalformed | Self::SparseMalformed => {
+                crate::DataFailureReason::InvalidEncoding.failure_fact()
+            }
+            Self::DecodeExplicitHash | Self::DecodeSparseCount | Self::DecodeSparseIndex => {
+                FailureFact::new(
+                    FailureClass::Invariant,
+                    FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(329).unwrap()),
+                )
+            }
         }
     }
 }
@@ -270,20 +308,14 @@ pub fn merge_hll_bytes<A: HllRegisterAllocator>(
     bytes: &[u8],
     work: &mut HllWork<'_, '_>,
 ) -> Result<(), HllError> {
-    merge_hll_bytes_with_failure(
-        state,
-        bytes,
-        work,
-        |failure| HllError::Legacy(failure.message().to_string()),
-        |failure| failure,
-    )
+    merge_hll_bytes_with_failure(state, bytes, work, HllError::Payload, HllError::Kernel)
 }
 pub fn merge_hll_bytes_with_failure<A: HllRegisterAllocator, E>(
     state: &mut HllRawState<A>,
     bytes: &[u8],
     work: &mut HllWork<'_, '_>,
     mut payload_failure: impl FnMut(HllMergeFailure) -> E,
-    mut kernel_failure: impl FnMut(HllError) -> E,
+    mut kernel_failure: impl FnMut(KernelFailure) -> E,
 ) -> Result<(), E> {
     match hll_payload_recipe(bytes).map_err(&mut payload_failure)? {
         HllPayloadRecipe::Empty => Ok(()),
@@ -357,7 +389,7 @@ pub fn merge_hll_bytes_with_failure<A: HllRegisterAllocator, E>(
 pub fn serialize_hll_state<A: HllRegisterAllocator>(
     state: &HllRawState<A>,
     work: &mut HllWork<'_, '_>,
-) -> Result<Option<Vec<u8>>, HllError> {
+) -> Result<Option<Vec<u8>>, KernelFailure> {
     if !state.has_value {
         return Ok(None);
     }
@@ -405,7 +437,7 @@ pub fn serialize_hll_state<A: HllRegisterAllocator>(
 pub fn estimate_cardinality_from_registers_observed(
     registers: &[u8; HLL_REGISTERS_COUNT],
     work: &mut HllWork<'_, '_>,
-) -> Result<i64, HllError> {
+) -> Result<i64, KernelFailure> {
     let num_streams = HLL_REGISTERS_COUNT as f64;
     let alpha = match HLL_REGISTERS_COUNT {
         16 => 0.673,
@@ -517,12 +549,12 @@ pub fn hash_array_value_for_hll_observed(
     array: &ArrayRef,
     row: usize,
     work: &mut HllWork<'_, '_>,
-) -> Result<Option<u64>, HllError> {
+) -> Result<Option<u64>, KernelFailure> {
     hash_array_value_for_hll_with_failure(
         array,
         row,
         work,
-        |failure| HllError::Legacy(failure.to_string()),
+        |failure| failure.into_kernel(),
         |failure| failure,
     )
 }
@@ -532,7 +564,7 @@ pub fn hash_array_value_for_hll_with_failure<E>(
     row: usize,
     work: &mut HllWork<'_, '_>,
     mut input_failure: impl FnMut(HllInputFailure<'_>) -> E,
-    mut hash_failure: impl FnMut(HllError) -> E,
+    mut hash_failure: impl FnMut(KernelFailure) -> E,
 ) -> Result<Option<u64>, E> {
     let mut hash =
         |bytes: &[u8]| hash_bytes_for_hll_observed(bytes, work).map_err(&mut hash_failure);
@@ -749,9 +781,51 @@ pub fn merge_payload_rows<E>(
 pub fn nullable_payload_cardinality<A: HllRegisterAllocator>(
     state: Option<&HllRawState<A>>,
     work: &mut HllWork<'_, '_>,
-) -> Result<Option<i64>, HllError> {
+) -> Result<Option<i64>, KernelFailure> {
     match state {
         Some(state) if state.has_value => estimate_cardinality(state, work).map(Some),
         _ => Ok(None),
+    }
+}
+
+/// The owned error drops borrowed metadata at the actual failing reader boundary.
+#[derive(Debug)]
+struct HllCarrierContract {
+    payload: bool,
+    detail: novarocks_failure_contract::BoundedDetail,
+}
+impl std::fmt::Display for HllCarrierContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.detail.fmt(f)
+    }
+}
+impl std::error::Error for HllCarrierContract {}
+impl novarocks_failure_contract::FailureProjection for HllCarrierContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(
+                domain::KERNEL,
+                std::num::NonZeroU16::new(if self.payload { 328 } else { 327 }).unwrap(),
+            ),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for HllCarrierContract {}
+impl HllInputFailure<'_> {
+    pub fn into_kernel(self) -> KernelFailure {
+        KernelFailure::from_domain(HllCarrierContract {
+            payload: false,
+            detail: novarocks_failure_contract::BoundedDetail::truncating_display(self),
+        })
+    }
+}
+impl HllPayloadInputFailure<'_> {
+    pub fn into_kernel(self) -> KernelFailure {
+        KernelFailure::from_domain(HllCarrierContract {
+            payload: true,
+            detail: novarocks_failure_contract::BoundedDetail::truncating_display(self),
+        })
     }
 }

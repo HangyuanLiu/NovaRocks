@@ -60,6 +60,8 @@ struct Ledger {
     bytes: usize,
     live: Vec<(usize, Layout)>,
     metadata: Option<(usize, Layout)>,
+    registers_allocated: usize,
+    registers_released: usize,
 }
 #[derive(Default)]
 struct Host {
@@ -85,6 +87,9 @@ impl AggregateStateAllocator for Host {
             ledger.metadata = Some(block);
         }
         ledger.live.push(block);
+        if layout.size() == core::HLL_REGISTERS_COUNT {
+            ledger.registers_allocated += 1;
+        }
         Ok(pointer)
     }
     unsafe fn release(&self, pointer: NonNull<u8>, layout: Layout) {
@@ -96,6 +101,9 @@ impl AggregateStateAllocator for Host {
             .expect("exact block released once");
         ledger.live.swap_remove(at);
         ledger.bytes -= layout.size();
+        if layout.size() == core::HLL_REGISTERS_COUNT {
+            ledger.registers_released += 1;
+        }
         unsafe { std::alloc::dealloc(pointer.as_ptr(), layout) };
     }
 }
@@ -256,7 +264,7 @@ fn ndv_actual_column_all_null_and_supported_inputs_allocate_no_diagnostic() {
     }
 }
 #[test]
-fn ndv_actual_column_long_actual_metadata_diagnostic_keeps_full_bytes_and_last_loan() {
+fn ndv_actual_column_metadata_contract_is_bounded_and_releases_the_actual_input() {
     use arrow_schema::{Field, Fields};
     let fields: Fields = (0..96)
         .map(|i| {
@@ -316,26 +324,26 @@ fn ndv_actual_column_long_actual_metadata_diagnostic_keeps_full_bytes_and_last_l
         frame.run(&Control::default()),
         Err(KernelFailure::InstanceFailed.into())
     );
-    let EvaluationFailure::InvocationData(data) = error else {
-        panic!("whole invocation Data");
-    };
-    assert!(std::ptr::eq(data.aggregate_contract(), contract.as_ref()));
-    assert_eq!(data.message(), original);
-    assert_eq!(data.to_string(), original);
-    assert_eq!(data.input_rows(), &[0, 1, 2]);
-    assert_eq!(data.state_indices(), &[0, 0, 0]);
-    assert_eq!(data.aggregate_phase(), AggregateInvocationPhase::Update);
-    let clone = data.clone();
+    assert_hll_input_contract(&error);
+    assert!(error.to_string().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
+    assert!(
+        error
+            .to_string()
+            .starts_with("hll_raw does not support input type")
+    );
+    let weak = Arc::downgrade(&values);
     let attempts = host.ledger.lock().unwrap().attempts;
-    assert!(data.same_backing(&clone));
+    let clone = error.clone();
+    assert_eq!(error, clone);
     assert_eq!(host.ledger.lock().unwrap().attempts, attempts);
+    assert_eq!(frame.retained_preparation_bytes(), 0);
     drop(frame);
     drop(column);
-    assert_eq!(host.ledger.lock().unwrap().bytes, data.retained_bytes());
-    drop(data);
-    assert_ne!(host.ledger.lock().unwrap().bytes, 0);
-    drop(clone);
+    drop(contract);
+    drop(values);
+    assert!(weak.upgrade().is_none());
     assert_released(&host);
+    assert_hll_input_contract(&clone);
 }
 #[test]
 fn ndv_selected_null_excludes_unsupported_non_null_without_preparing_a_diagnostic() {
@@ -361,48 +369,31 @@ fn ndv_selected_null_excludes_unsupported_non_null_without_preparing_a_diagnosti
     assert_released(&host);
 }
 #[test]
-fn ndv_actual_column_every_diagnostic_allocation_refusal_retains_the_seven_causes() {
+fn ndv_actual_column_carrier_contract_precedes_every_armed_host_refusal() {
     let values: ArrayRef = Arc::new(arrow_array::UInt32Array::from(vec![Some(7)]));
-    let successful = Arc::new(Host::default());
-    let mut probe = column(
-        kernel(
-            "ndv",
-            FunctionValueType::new(DataType::UInt32, false),
-            AggregateKernelPhase::Single,
-        ),
-        successful.clone(),
-    );
-    let before = successful.ledger.lock().unwrap().attempts;
-    assert!(matches!(
-        run_column(&mut probe, &values, Selection::all(1), &Control::default()),
-        Err(EvaluationFailure::InvocationData(_))
-    ));
-    let attempts = successful.ledger.lock().unwrap().attempts - before;
-    drop(probe);
-    assert_released(&successful);
     for cause in causes() {
-        for offset in 0..attempts {
-            let host = Arc::new(Host::default());
-            let mut column = column(
-                kernel(
-                    "ndv",
-                    FunctionValueType::new(DataType::UInt32, false),
-                    AggregateKernelPhase::Single,
-                ),
-                host.clone(),
-            );
-            let baseline = host.ledger.lock().unwrap().bytes;
-            arm_refusal(&host, offset, cause.clone());
-            assert_eq!(
-                run_column(&mut column, &values, Selection::all(1), &Control::default()),
-                Err(cause.clone().into())
-            );
-            assert_eq!(host.ledger.lock().unwrap().bytes, baseline);
-            drop(column);
-            assert_released(&host);
-        }
+        let host = Arc::new(Host::default());
+        let mut column = column(
+            kernel(
+                "ndv",
+                FunctionValueType::new(DataType::UInt32, false),
+                AggregateKernelPhase::Single,
+            ),
+            host.clone(),
+        );
+        let before = host.ledger.lock().unwrap().attempts;
+        let baseline = host.ledger.lock().unwrap().bytes;
+        arm_refusal(&host, 0, cause);
+        let error =
+            run_column(&mut column, &values, Selection::all(1), &Control::default()).unwrap_err();
+        assert_hll_input_contract(&error);
+        assert_eq!(host.ledger.lock().unwrap().attempts, before);
+        assert_eq!(host.ledger.lock().unwrap().bytes, baseline);
+        drop(column);
+        assert_released(&host);
     }
 }
+
 #[test]
 fn ndv_actual_column_every_preparation_and_run_control_refusal_stops_without_tail() {
     let values: ArrayRef = Arc::new(arrow_array::UInt32Array::from(vec![None, Some(7), Some(8)]));
@@ -416,10 +407,9 @@ fn ndv_actual_column_every_preparation_and_run_control_refusal_stops_without_tai
         successful.clone(),
     );
     let trace = Control::default();
-    assert!(matches!(
-        run_column(&mut probe, &values, Selection::all(3), &trace),
-        Err(EvaluationFailure::InvocationData(_))
-    ));
+    assert_hll_input_contract(
+        &run_column(&mut probe, &values, Selection::all(3), &trace).unwrap_err(),
+    );
     let callbacks = trace.trace.lock().unwrap().len();
     drop(probe);
     assert_released(&successful);
@@ -450,7 +440,7 @@ fn ndv_actual_column_every_preparation_and_run_control_refusal_stops_without_tai
 }
 
 #[test]
-fn ndv_data_publication_does_not_run_success_footer_or_mask_first_data() {
+fn ndv_contract_skips_work_completion_and_real_payload_data_skips_optional_footer() {
     let values: ArrayRef = Arc::new(arrow_array::UInt32Array::from(vec![None, Some(7), Some(8)]));
     let host = Arc::new(Host::default());
     let mut column = column(
@@ -475,17 +465,56 @@ fn ndv_data_publication_does_not_run_success_footer_or_mask_first_data() {
     let mut frame = column
         .prepare_update_batch_evaluation(&[0, 0, 0], input, &setup)
         .unwrap();
-    assert!(frame.retained_preparation_bytes() > 0);
+    assert_eq!(frame.retained_preparation_bytes(), 0);
     let run = Control::default();
     let error = frame.run(&run).unwrap_err();
+    assert_hll_input_contract(&error);
+    // The successful first NULL row retains its work tail. The following
+    // originating carrier refusal starts no new cooperative checkpoint.
     assert_eq!(run.trace.lock().unwrap().as_slice(), &[0, 0, 0, 1, 0, 0]);
+    let footers = std::cell::Cell::new(0);
     let finished: Result<(), EvaluationFailure> =
         crate::evaluation_failure::finish_evaluation_lifecycle(Err(error.clone()), || {
-            panic!("Data cannot run an optional footer")
+            footers.set(footers.get() + 1);
+            Ok(())
         });
+    // Accepted first-cause semantics also protect ordinary outer Kernel
+    // failures; this is not resource cleanup or state destruction.
+    assert_eq!(footers.get(), 0);
     assert_eq!(finished, Err(error));
     drop(finished);
     drop(frame);
+    drop(column);
+    assert_released(&host);
+
+    // Exercise the no-footer property with a real value failure, retaining
+    // the same host-backed invocation capsule and its exact merge domain.
+    let host = Arc::new(Host::default());
+    let mut column = self::column(
+        kernel(
+            "ndv",
+            FunctionValueType::new(DataType::Int64, false),
+            AggregateKernelPhase::Final,
+        ),
+        host.clone(),
+    );
+    let values = malformed_merge_values(&[1]);
+    let data = run_merge_column(&mut column, &values, &Control::default()).unwrap_err();
+    let EvaluationFailure::InvocationData(capsule) = &data else {
+        panic!("malformed HLL bytes are value Data")
+    };
+    assert_eq!(
+        novarocks_failure_contract::FailureProjection::failure_fact(capsule),
+        novarocks_failure_contract::FailureProjection::failure_fact(
+            &crate::DataFailureReason::InvalidEncoding
+        )
+    );
+    let finished: Result<(), EvaluationFailure> =
+        crate::evaluation_failure::finish_evaluation_lifecycle(Err(data.clone()), || {
+            panic!("value Data cannot run an optional footer")
+        });
+    assert_eq!(finished, Err(data));
+    drop(finished);
     drop(column);
     assert_released(&host);
 }
@@ -599,10 +628,23 @@ fn ndv_actual_merge_all_original_reachable_data_branches_preserve_full_message_a
         assert!(frame.retained_preparation_bytes() > 0);
         let cause = frame.run(&Control::default()).unwrap_err();
         assert_eq!(frame.rows_processed(), 2);
+        // A real valid prefix allocated registers; the original production
+        // latch_failure -> core.clear released them while the state is alive.
+        {
+            let ledger = host.ledger.lock().unwrap();
+            assert_eq!(ledger.registers_allocated, 1);
+            assert_eq!(ledger.registers_released, 1);
+        }
         let EvaluationFailure::InvocationData(data) = cause else {
             panic!("whole Data");
         };
         assert!(std::ptr::eq(data.aggregate_contract(), contract.as_ref()));
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&data),
+            novarocks_failure_contract::FailureProjection::failure_fact(
+                &crate::DataFailureReason::InvalidEncoding
+            )
+        );
         assert_eq!(
             data.message(),
             crate::aggregate_format::AggregateFailureStage::Merge
@@ -625,7 +667,13 @@ fn ndv_actual_merge_all_original_reachable_data_branches_preserve_full_message_a
         drop(frame);
         drop(column);
         assert_eq!(host.ledger.lock().unwrap().bytes, data.retained_bytes());
+        let alias = data.clone();
+        assert!(alias.same_backing(&data));
         drop(data);
+        // The real shared capsule still owns its actual HostAggregateAllocator
+        // reference. Only its final owner drop returns the remaining blocks.
+        assert_eq!(host.ledger.lock().unwrap().bytes, alias.retained_bytes());
+        drop(alias);
         assert_released(&host);
     }
 }
@@ -745,3 +793,13 @@ fn ndv_actual_merge_each_control_refusal_and_data_first_prefix_has_no_tail() {
 
 #[path = "aggregate_emission_context_tests.rs"]
 mod emission_context_tests;
+
+fn assert_hll_input_contract(error: &EvaluationFailure) {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let EvaluationFailure::Kernel(error) = error else {
+        panic!("HLL carrier metadata must be an outer failure")
+    };
+    let fact = error.failure_fact();
+    assert_eq!(fact.class(), FailureClass::Invariant);
+    assert_eq!(fact.reason().code(), 327);
+}

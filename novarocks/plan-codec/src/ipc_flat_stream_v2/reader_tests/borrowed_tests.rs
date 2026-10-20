@@ -116,7 +116,7 @@ fn check_both_traces(
     for at in 0..trace.len() {
         for cause in CAUSES {
             for borrowed in [false, true] {
-                let control = Control::refusing(at, cause);
+                let control = Control::refusing(at, cause.clone());
                 assert!(matches!(
                     invoke(borrowed, stream, field, ty, invoice, &control),
                     Err(FlatReaderError::Projection(FlatPoolResourceError::Control(actual)))

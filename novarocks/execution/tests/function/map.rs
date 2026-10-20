@@ -458,7 +458,7 @@ fn test_map_apply_lambda_output_must_be_map() {
 
     let err = eval_map_function("map_apply", &arena, expr, &[lambda, map_arg], &chunk)
         .expect_err("must fail");
-    assert!(err.contains("must return MAP"));
+    assert!(err.to_string().contains("must return MAP"));
 }
 
 #[test]
@@ -561,7 +561,7 @@ fn test_element_at_not_found_with_check_errors() {
     );
     let expr = typed_null(&mut arena, DataType::Int64);
     let err = eval_element_at(&arena, expr, &[map_arg, key, check_true], &chunk).unwrap_err();
-    assert!(err.contains("Key not present in map"));
+    assert!(err.to_string().contains("Key not present in map"));
 }
 
 // ---------------------------------------------------------------------------
@@ -824,7 +824,7 @@ fn test_map_from_arrays_length_mismatch() {
     let expr = typed_null(&mut arena, map_type);
 
     let err = eval_map_from_arrays(&arena, expr, &[keys, values], &chunk).expect_err("must fail");
-    assert!(err.contains("same length"));
+    assert!(err.to_string().contains("same length"));
 }
 
 #[test]
@@ -865,7 +865,16 @@ fn test_map_from_arrays_rejects_null_key_entries() {
 
     let err = eval_map_function("map_from_arrays", &arena, expr, &[keys, values], &chunk)
         .expect_err("NULL keys must reject the whole Map construction");
-    assert_eq!(err, "map key must not be NULL");
+    use novarocks_failure_contract::{
+        FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+    };
+    assert_eq!(
+        err.failure_fact(),
+        FailureFact::new(
+            FailureClass::Data,
+            FailureReason::new(domain::EXECUTION, std::num::NonZeroU16::new(577).unwrap())
+        ),
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -1765,19 +1765,7 @@ fn cleanup_failed(message: impl Into<Arc<str>>) -> ExternalMutationFinalization 
 }
 
 fn failure_from_connector(error: ConnectorError) -> ConnectorMutationFailure {
-    let kind = match error.kind() {
-        ConnectorErrorKind::InvalidRequest => ConnectorMutationFailureKind::InvalidRequest,
-        ConnectorErrorKind::NotFound => ConnectorMutationFailureKind::NotFound,
-        ConnectorErrorKind::PermissionDenied => ConnectorMutationFailureKind::PermissionDenied,
-        ConnectorErrorKind::Unsupported => ConnectorMutationFailureKind::Unsupported,
-        ConnectorErrorKind::Cancelled => ConnectorMutationFailureKind::Cancelled,
-        ConnectorErrorKind::DeadlineExceeded => ConnectorMutationFailureKind::DeadlineExceeded,
-        ConnectorErrorKind::ResourceExhausted => ConnectorMutationFailureKind::ResourceExhausted,
-        ConnectorErrorKind::Unavailable => ConnectorMutationFailureKind::Unavailable,
-        ConnectorErrorKind::CorruptData => ConnectorMutationFailureKind::CorruptData,
-        ConnectorErrorKind::Internal => ConnectorMutationFailureKind::Internal,
-    };
-    ConnectorMutationFailure::new(kind, error.to_string())
+    ConnectorMutationFailure::from_connector(error)
 }
 
 fn operation_marker(operation_id: ConnectorStagedCreateOperationId) -> String {

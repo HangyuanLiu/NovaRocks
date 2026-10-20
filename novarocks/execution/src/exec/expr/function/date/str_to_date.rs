@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 use novarocks_functions::builtin::calendar_extended_shared::{
@@ -27,24 +27,32 @@ fn eval_str_to_date_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    let output_type = super::common::frozen_type(arena.arena(), expr)?.clone();
     let text = arena.eval(args[0], chunk)?;
     let format = arena.eval(args[1], chunk)?;
-    text.as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "str_to_date expects string".to_string())?;
+    text.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        novarocks_functions::builtin::calendar_parts_shared::part_contract(
+            "str_to_date expects string",
+        )
+    })?;
     format
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "str_to_date expects string".to_string())?;
+        .ok_or_else(|| {
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "str_to_date expects string",
+            )
+        })?;
     let rows = text.len();
-    let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Date32);
-    Ok((evaluate_legacy_calendar(
+
+    evaluate_legacy_calendar(
         CalendarOperation::StrToDate,
         &[text, format],
         &output_type,
         rows,
-    ))?)
+    )
+    .map_err(Into::into)
 }
 
 pub fn eval_str_to_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -52,8 +60,8 @@ pub fn eval_str_to_date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_str_to_date_inner(arena, expr, args, chunk))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_str_to_date_inner(arena, expr, args, chunk)
 }
 
 pub fn eval_str2date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -61,6 +69,6 @@ pub fn eval_str2date<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_str_to_date_inner(arena, expr, args, chunk))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_str_to_date_inner(arena, expr, args, chunk)
 }

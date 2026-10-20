@@ -71,7 +71,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -638,7 +638,7 @@ fn calendar_diff_strict_null_hidden_inactive_empty_child_and_bad_address_never_b
         let mut kernel = instance("days_diff", &text_type(true));
         assert!(matches!(
             kernel.evaluate(Selection::all(2), &args, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
         let after = Control::default();
         assert_eq!(
@@ -668,7 +668,7 @@ fn calendar_diff_strict_null_hidden_inactive_empty_child_and_bad_address_never_b
             ],
             &Control::default()
         ),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let types = [text_type(false), text_type(true)];
     let ordinary_scalar = ordinary.slice(0, 1);
@@ -686,7 +686,7 @@ fn calendar_diff_strict_null_hidden_inactive_empty_child_and_bad_address_never_b
             ],
             &Control::default()
         ),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
 }
 
@@ -773,7 +773,7 @@ fn calendar_diff_every_actual_compile_callback_preserves_three_causes_success_an
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let error = prepared_for_test_with_control(
                     "datediff",

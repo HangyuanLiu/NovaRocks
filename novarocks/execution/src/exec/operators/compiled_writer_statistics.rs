@@ -37,10 +37,14 @@
 //! consulted. Coverage, completeness and channel-mapping checks stay with the
 //! finish operator, identical for every statistics owner.
 
+use super::compiled_writer_failure::{self as failure, IndexKind};
+use crate::exec::fragment::error::{
+    FragmentBindingError, FragmentBindingErrorKind, FragmentBindingTarget,
+};
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use std::alloc::Layout;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::ptr::NonNull;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Int8Array, Int32Array, new_null_array};
@@ -65,7 +69,7 @@ use super::compiled_unpivot::{
     LiteralSource, Producer, UnpivotExpansion, list_item_field, map_entries_field,
 };
 use super::table_finish::{
-    FinishStatisticsCoverage, FinishStatisticsFactory, GroupedUnpivotSource,
+    FinishStatisticsCoverage, FinishStatisticsFactory, GroupedUnpivotKernel, GroupedUnpivotSource,
     root_artifact_chunk_with_construction,
 };
 use crate::exec::chunk::{
@@ -73,11 +77,16 @@ use crate::exec::chunk::{
 };
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{
-    ConstructionFailure, InputConstructionFactory, InputConstructionOwner, Operator,
-    ProcessorOperator,
+    ConstructionFailure, InputConstructionFactory, InputConstructionOwner, InputEncodingPolicy,
+    Operator,
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::exec::pipeline::schedule::observer::Observable;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{HydrateInput, Source, SourceKernel, Transform, TransformKernel},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
@@ -87,68 +96,7 @@ use novarocks_type_contract::ValueTypeStorageLifetime;
 const STATE_BLOCK_BYTES: usize = 64 * 1024;
 const MAX_STATES_PER_BLOCK: usize = 4096;
 
-/// State backing charged to the operator's memory tracker before it is
-/// allocated and released after it is returned.
-struct TrackedStateAllocator {
-    tracker: Arc<MemTracker>,
-}
-
-impl novarocks_functions::opaque_memory::OpaqueAllocationHost for TrackedStateAllocator {
-    fn reserve_opaque(&self, bytes: usize) -> Result<(), KernelFailure> {
-        if bytes == 0 {
-            return Ok(());
-        }
-        let bytes = i64::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
-        if self.tracker.consume_and_check_limit(bytes).is_err() {
-            self.tracker.release(bytes);
-            return Err(KernelFailure::ResourceExhausted);
-        }
-        Ok(())
-    }
-    fn release_opaque(&self, bytes: usize) {
-        if bytes != 0 {
-            // Successful reservation was represented exactly as i64.
-            self.tracker
-                .release(i64::try_from(bytes).expect("successful opaque reservation size"));
-        }
-    }
-}
-impl AggregateStateAllocator for TrackedStateAllocator {
-    fn opaque_allocation_host(
-        &self,
-    ) -> Option<&dyn novarocks_functions::opaque_memory::OpaqueAllocationHost> {
-        Some(self)
-    }
-
-    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, KernelFailure> {
-        if layout.size() == 0 {
-            return Err(KernelFailure::Internal(KernelDiagnostic::new(
-                "writer aggregate state block has no size",
-            )));
-        }
-        let bytes = i64::try_from(layout.size()).map_err(|_| KernelFailure::ResourceExhausted)?;
-        if self.tracker.consume_and_check_limit(bytes).is_err() {
-            self.tracker.release(bytes);
-            return Err(KernelFailure::ResourceExhausted);
-        }
-        // SAFETY: the layout has a nonzero size.
-        match NonNull::new(unsafe { std::alloc::alloc(layout) }) {
-            Some(block) => Ok(block),
-            None => {
-                self.tracker.release(bytes);
-                Err(KernelFailure::ResourceExhausted)
-            }
-        }
-    }
-
-    unsafe fn release(&self, block: NonNull<u8>, layout: Layout) {
-        // SAFETY: the column returns a block this allocator produced with
-        // exactly this layout, after destroying every state inside it.
-        unsafe { std::alloc::dealloc(block.as_ptr(), layout) };
-        self.tracker
-            .release(i64::try_from(layout.size()).unwrap_or(i64::MAX));
-    }
-}
+use crate::runtime::tracked_state_allocator::TrackedStateAllocator;
 
 /// The operator's bound memory tracker. A unit test may drive an operator
 /// without a pipeline; it charges a child of the process tracker.
@@ -168,9 +116,12 @@ fn bound_tracker(
     }
     #[cfg(not(test))]
     {
-        Err(ExecutionFailure::from(format!(
-            "{label} memory tracker must be bound before its first state"
-        )))
+        Err(
+            crate::runtime::runtime_state::RuntimeBindingFailure::MissingOperatorMemoryTracker {
+                operator: novarocks_failure_contract::BoundedDetail::truncating(label),
+            }
+            .into(),
+        )
     }
 }
 
@@ -188,11 +139,11 @@ fn writer_call(
     site: ProgramCallSite,
     phase: AggregateKernelPhase,
     input: SlotId,
-) -> Result<WriterCall, String> {
+) -> ExecutionResult<WriterCall> {
     let Some(ProgramStateTemplate::Aggregate { kernel, .. }) = program.state_template(site) else {
-        return Err(format!(
+        return Err(failure::contract(format_args!(
             "compiled writer call {site:?} has no prepared aggregate"
-        ));
+        )));
     };
     let handle = kernel.clone();
     let contract = Arc::clone(handle.contract());
@@ -201,9 +152,9 @@ fn writer_call(
         || contract.distinct()
         || !contract.order_keys().is_empty()
     {
-        return Err(format!(
+        return Err(failure::contract(format_args!(
             "compiled writer call {site:?} is not a single-channel {phase:?} aggregate"
-        ));
+        )));
     }
     Ok(WriterCall {
         handle,
@@ -250,7 +201,10 @@ fn writer_binding_matches(
         })
         .map_err(|failure| match failure {
             Failure::Creator(cause) => ExecutionFailure::from(cause),
-            Failure::Source(cause) => ConstructionFailure::InvalidSource(cause.to_string()).into(),
+            Failure::Source(cause) => ConstructionFailure::Source(
+                crate::runtime::fragment::SharedDomainFailure::new(cause),
+            )
+            .into(),
         })
 }
 
@@ -326,17 +280,7 @@ fn statistics_copy_failure(
     match failure {
         CopyConstructionError::Creator(cause) => cause.into(),
         CopyConstructionError::Resource(cause) => ConstructionFailure::Resource(cause).into(),
-        CopyConstructionError::Copy(CopyError::Control(cause)) => cause.into(),
-        CopyConstructionError::Copy(CopyError::Extent) => KernelFailure::ResourceExhausted.into(),
-        CopyConstructionError::Copy(CopyError::Invalid(message)) => {
-            ConstructionFailure::InvalidSource(message.to_owned()).into()
-        }
-        CopyConstructionError::Copy(CopyError::Unsupported(ty)) => {
-            ConstructionFailure::InvalidSource(format!(
-                "writer statistics carrier {ty:?} is unsupported"
-            ))
-            .into()
-        }
+        CopyConstructionError::Copy(cause) => cause.into_kernel().into(),
     }
 }
 
@@ -596,22 +540,23 @@ impl CompiledWriterPartialFactory {
             )
         })?)?;
         let name = NAME.to_owned();
-        owner.request(Layout::new::<CompiledWriterPartialProcessor>())?;
-        Ok(Box::new(CompiledWriterPartialProcessor {
-            name,
-            calls: PartialCallSource::Prepared(calls),
-            output_layout,
-            input_layout: Some(input_layout),
-            _creation: Some(owner.storage_lifetime()),
-            output: None,
-            construction: None,
-            control: RuntimeKernelControl::new(error),
-            tracker: None,
-            states: None,
-            pending: VecDeque::new(),
-            finishing: false,
-            finished: false,
-        }))
+        owner.request(Layout::new::<WriterPartialStep>())?;
+        Ok(Box::new(Transform::hydrating(
+            CompiledWriterPartialProcessor {
+                name,
+                calls: PartialCallSource::Prepared(calls),
+                output_layout,
+                input_layout: Some(input_layout),
+                _creation: Some(owner.storage_lifetime()),
+                output: None,
+                construction: None,
+                control: RuntimeKernelControl::new(error),
+                tracker: None,
+                states: None,
+                input: None,
+                finishing: false,
+            },
+        )))
     }
 
     /// The partial statistics of local writer `node`, or `None` when it
@@ -620,13 +565,11 @@ impl CompiledWriterPartialFactory {
         program: &LocalProgram,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Option<Self>, String> {
+    ) -> ExecutionResult<Option<Self>> {
         let at = node.index();
-        let graph_node = program
-            .graph()
-            .nodes()
-            .get(at)
-            .ok_or_else(|| format!("missing compiled table writer node {at}"))?;
+        let graph_node = program.graph().nodes().get(at).ok_or_else(|| {
+            failure::missing(format_args!("missing compiled table writer node {at}"))
+        })?;
         let ProgramNodeKind::TableWriter {
             projection,
             writer_multiplex_layout,
@@ -634,7 +577,9 @@ impl CompiledWriterPartialFactory {
             ..
         } = graph_node.kind()
         else {
-            return Err(format!("compiled node {at} is not a TableWriter"));
+            return Err(failure::contract(format_args!(
+                "compiled node {at} is not a TableWriter"
+            )));
         };
         if partial_aggregates.is_empty() {
             return Ok(None);
@@ -644,22 +589,21 @@ impl CompiledWriterPartialFactory {
         for (ordinal_in_node, call) in partial_aggregates.iter().enumerate() {
             let site = ProgramCallSite::WriterPartial {
                 node,
-                call: u32::try_from(ordinal_in_node)
-                    .map_err(|_| format!("compiled writer {at} has too many partial calls"))?,
+                call: failure::index(IndexKind::PartialCall, ordinal_in_node)?,
             };
             if ordinal(&projection.layout, call.input_slot_id).is_none() {
-                return Err(format!(
+                return Err(failure::contract(format_args!(
                     "compiled writer partial call {site:?} reads slot {} outside its projection",
                     call.input_slot_id
-                ));
+                )));
             }
             let output = ordinal(writer_multiplex_layout, call.intermediate_slot_id)
                 .filter(|ordinal| *ordinal > 3)
                 .ok_or_else(|| {
-                    format!(
+                    failure::contract(format_args!(
                         "compiled writer partial call {site:?} writes slot {} outside its auxiliary channels",
                         call.intermediate_slot_id
-                    )
+                    ))
                 })?;
             let prepared = writer_call(
                 program,
@@ -670,22 +614,22 @@ impl CompiledWriterPartialFactory {
             let binding = writer_multiplex_layout
                 .value_binding_at(output)
                 .ok_or_else(|| {
-                    format!(
+                    failure::contract(format_args!(
                         "compiled writer partial call {site:?} channel lacks a typed declaration"
-                    )
+                    ))
                 })?;
             let declared =
                 novarocks_type_contract::FunctionValueType::try_from_typed_binding(binding.clone())
-                    .map_err(|error| error.to_string())?;
+                    .map_err(ExecutionFailure::from_domain)?;
             let intermediate = prepared.contract.intermediate_type();
             if !intermediate.same_physical_binding_ignoring_root_nullability_observed::<novarocks_type_contract::ValueTypeError>(
                 &declared, || Ok(()),
-            ).map_err(|error| error.to_string())?
+            ).map_err(ExecutionFailure::from_domain)?
                 || (intermediate.nullable() && !declared.nullable())
             {
-                return Err(format!(
+                return Err(failure::contract(format_args!(
                     "compiled writer partial call {site:?} state differs from its channel"
-                ));
+                )));
             }
             output_positions.push(output);
             calls.push(prepared);
@@ -708,7 +652,7 @@ impl OperatorFactory for CompiledWriterPartialFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(CompiledWriterPartialProcessor {
+        Box::new(Transform::hydrating(CompiledWriterPartialProcessor {
             name: self.name.clone(),
             calls: self.calls.clone(),
             output_layout: self.output_layout.clone(),
@@ -719,12 +663,13 @@ impl OperatorFactory for CompiledWriterPartialFactory {
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             tracker: None,
             states: None,
-            pending: VecDeque::new(),
+            input: None,
             finishing: false,
-            finished: false,
-        })
+        }))
     }
 }
+
+type WriterPartialStep = Transform<CompiledWriterPartialProcessor, HydrateInput>;
 
 /// One driver's partial statistics: one state per call, all in one group.
 struct CompiledWriterPartialProcessor {
@@ -739,9 +684,8 @@ struct CompiledWriterPartialProcessor {
     tracker: Option<Arc<MemTracker>>,
     /// One column per call, each holding exactly its driver's one state.
     states: Option<Vec<AggregateStateColumn>>,
-    pending: VecDeque<Chunk>,
+    input: Option<Chunk>,
     finishing: bool,
-    finished: bool,
 }
 
 impl CompiledWriterPartialProcessor {
@@ -753,9 +697,9 @@ impl CompiledWriterPartialProcessor {
             return Ok(());
         }
         let tracker = bound_tracker(self.tracker.as_ref(), "CompiledWriterPartialAggregate")?;
-        let allocator: Arc<dyn AggregateStateAllocator> = Arc::new(TrackedStateAllocator {
-            tracker: MemTracker::new_child("CompiledWriterPartialStates", &tracker),
-        });
+        let allocator: Arc<dyn AggregateStateAllocator> = Arc::new(TrackedStateAllocator::new(
+            MemTracker::new_child("CompiledWriterPartialStates", &tracker),
+        ));
         let mut states = Vec::with_capacity(self.calls.len());
         for call in self.calls.iter() {
             let mut column = AggregateStateColumn::try_new(
@@ -772,27 +716,8 @@ impl CompiledWriterPartialProcessor {
 
     fn consume(&mut self, chunk: &Chunk) -> ExecutionResult<()> {
         self.ensure_states()?;
-        // Writer and statistics have distinct actual demands. Keep the writer's
-        // original Chunk; only this processor adapts its own typed view.
-        for (call, column) in self
-            .calls
-            .iter()
-            .zip(self.states.as_ref().expect("states were created"))
-        {
-            if !call.handle.same_installed_owner(column.handle()) {
-                return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
-                    "writer state and input have different installed owners",
-                ))
-                .into());
-            }
-            call.handle.argument_encoding(0)?;
-        }
-        let adapted = crate::exec::pipeline::operator::hydrate_for_downstream_with_factory(
-            chunk,
-            self,
-            self.construction.as_deref(),
-        )?;
-        let chunk = &adapted;
+        // Preparation has already adapted this receiver's declared demands.
+        // The writer keeps its independently prepared provider view.
         let rows = chunk.len();
         let mapping = vec![0usize; rows];
         let states = self.states.as_mut().expect("states were created");
@@ -811,7 +736,11 @@ impl CompiledWriterPartialProcessor {
                     .typed_binding()
                     .clone(),
             )
-            .map_err(|cause| ConstructionFailure::InvalidSource(cause.to_string()))?;
+            .map_err(|cause| {
+                ConstructionFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(
+                    cause,
+                ))
+            })?;
             let encoding = call.handle.argument_encoding(0)?;
             let input = SelectedAggregateUpdateInput::try_new_with_typed_sources(
                 call.contract.as_ref(),
@@ -832,7 +761,7 @@ impl CompiledWriterPartialProcessor {
 
     /// The driver's one intermediate row; the empty input's is each call's
     /// initial state.
-    fn emit(&mut self) -> ExecutionResult<()> {
+    fn emit(&mut self) -> ExecutionResult<Chunk> {
         self.ensure_states()?;
         let states = self.states.as_ref().expect("states were created");
         let output = self
@@ -854,22 +783,18 @@ impl CompiledWriterPartialProcessor {
         for column in states {
             columns.push(column.emit_evaluation(&[0], 1, &self.control)?);
         }
-        self.pending
-            .push_back(Chunk::try_new_typed_with_columns_owned_observed::<
-                ConstructionFailure,
-                _,
-            >(
-                Arc::clone(output),
-                columns,
-                1,
-                owner.storage_lifetime(),
-                |step| owner.observe(0, &[], step),
-            )?);
-        Ok(())
+        Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            Arc::clone(output),
+            columns,
+            1,
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
+        )
+        .map_err(Into::into)
     }
 }
 
-impl Operator for CompiledWriterPartialProcessor {
+impl OperatorLifecycle for CompiledWriterPartialProcessor {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -907,7 +832,11 @@ impl Operator for CompiledWriterPartialProcessor {
                     novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                         actual_input.clone(),
                     )
-                    .map_err(|cause| ConstructionFailure::InvalidSource(cause.to_string()))?;
+                    .map_err(|cause| {
+                        ConstructionFailure::Source(
+                            crate::runtime::fragment::SharedDomainFailure::new(cause),
+                        )
+                    })?;
                 if !writer_binding_matches(expected_input, &actual_input, owner.as_ref())?
                     || actual_input.nullable() && !expected_input.nullable()
                 {
@@ -934,7 +863,11 @@ impl Operator for CompiledWriterPartialProcessor {
                 let output = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                     output.clone(),
                 )
-                .map_err(|cause| ConstructionFailure::InvalidSource(cause.to_string()))?;
+                .map_err(|cause| {
+                    ConstructionFailure::Source(crate::runtime::fragment::SharedDomainFailure::new(
+                        cause,
+                    ))
+                })?;
                 let expected = call.handle().contract().intermediate_type();
                 if !writer_binding_matches(expected, &output, owner.as_ref())?
                     || expected.nullable() && !output.nullable()
@@ -965,73 +898,66 @@ impl Operator for CompiledWriterPartialProcessor {
         self.control.bind_mem_tracker(Arc::clone(&tracker));
         self.tracker = Some(tracker);
     }
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.input = None;
+        self.states = None;
+        Ok(())
     }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
     }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn cancel(&mut self) {
+        self.input = None;
+        self.states = None;
     }
 }
 
-impl ProcessorOperator for CompiledWriterPartialProcessor {
-    fn input_construction_factory(&self) -> Option<&dyn InputConstructionFactory> {
-        self.construction.as_deref()
-    }
-    fn accepts_encoded_path(
+impl InputEncodingPolicy for CompiledWriterPartialProcessor {
+    fn retains_encoded_path(
         &self,
         occurrence: crate::exec::pipeline::operator::EncodedValueOccurrence<'_>,
     ) -> bool {
-        let Some(states) = self.states.as_ref() else {
-            return false;
-        };
         self.calls
             .iter()
-            .zip(states.iter())
-            .filter(|(call, _)| call.input == occurrence.slot)
-            .all(|(_, state)| {
+            .filter(|call| call.input == occurrence.slot)
+            .all(|call| {
                 occurrence.path.is_empty()
                     && matches!(occurrence.carrier, DataType::Dictionary(key, values) if key.as_ref() == &DataType::Int32 && matches!(values.as_ref(), DataType::Utf8 | DataType::LargeUtf8))
-                    && state
-                        .argument_encoding(0)
+                    && call.handle.argument_encoding(0)
                         .is_ok_and(|token| token.accepts_root_int32_string_dictionary())
             })
     }
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished
+}
+impl TransformKernel for CompiledWriterPartialProcessor {
+    fn apply(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        self.input = Some(input.into_uncovered_chunk()?);
+        self.drive(ctx)
     }
-    fn has_output(&self) -> bool {
-        !self.pending.is_empty()
+    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if !ctx.work().try_consume(1) {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
+        }
+        if let Some(chunk) = self.input.take() {
+            let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+            if !chunk.is_empty() {
+                self.consume(&chunk)?;
+            }
+            return Ok(StepResult::new(None, NextStep::NeedInput, rows));
+        }
+        if self.finishing {
+            let output = self.emit()?;
+            self.states = None;
+            return Ok(StepResult::new(Some(output), NextStep::Finished, 0));
+        }
+        Ok(StepResult::new(None, NextStep::NeedInput, 0))
     }
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.finishing || self.finished {
-            return Err("compiled writer partial aggregate received input after finishing".into());
-        }
-        if chunk.is_empty() {
-            return Ok(());
-        }
-        self.consume(&chunk)
-    }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        let output = self.pending.pop_front();
-        if self.finishing && self.pending.is_empty() {
-            self.finished = true;
-        }
-        Ok(output)
-    }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        if self.finishing || self.finished {
-            return Ok(());
-        }
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         self.finishing = true;
-        self.emit()?;
-        self.states = None;
-        if self.pending.is_empty() {
-            self.finished = true;
-        }
-        Ok(())
+        self.drive(ctx)
     }
 }
 
@@ -1070,13 +996,11 @@ impl CompiledFinishStatistics {
         program: &Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Option<(FinishStatisticsCoverage, Arc<Self>)>, String> {
+    ) -> ExecutionResult<Option<(FinishStatisticsCoverage, Arc<Self>)>> {
         let at = node.index();
-        let graph_node = program
-            .graph()
-            .nodes()
-            .get(at)
-            .ok_or_else(|| format!("missing compiled table finish node {at}"))?;
+        let graph_node = program.graph().nodes().get(at).ok_or_else(|| {
+            failure::missing(format_args!("missing compiled table finish node {at}"))
+        })?;
         let ProgramNodeKind::TableFinish {
             writer_multiplex_layout,
             root_result_layout,
@@ -1084,36 +1008,40 @@ impl CompiledFinishStatistics {
             ..
         } = graph_node.kind()
         else {
-            return Err(format!("compiled node {at} is not a TableFinish"));
+            return Err(failure::contract(format_args!(
+                "compiled node {at} is not a TableFinish"
+            )));
         };
-        let invalid = |what: String| format!("compiled table finish at local node {at} {what}");
+        let invalid = |what: std::fmt::Arguments<'_>| {
+            failure::contract(format_args!(
+                "compiled table finish at local node {at} {what}"
+            ))
+        };
         let unpivot = match (&final_aggregates.unpivot, final_aggregates.calls.is_empty()) {
             (None, true) => return Ok(None),
             (Some(unpivot), false) => unpivot,
             _ => {
-                return Err(invalid(
+                return Err(invalid(format_args!(
                     "has final aggregates and a grouped Unpivot that are not both present"
-                        .to_string(),
-                ));
+                )));
             }
         };
         let grouping = ordinal(writer_multiplex_layout, unpivot.grouping_input_slot_id)
-            .ok_or_else(|| invalid("groups by a slot outside its writer relation".to_string()))?;
+            .ok_or_else(|| invalid(format_args!("groups by a slot outside its writer relation")))?;
         if writer_multiplex_layout.schema().field(grouping).data_type() != &DataType::Int32 {
-            return Err(invalid("groups by a non-Int32 channel".to_string()));
+            return Err(invalid(format_args!("groups by a non-Int32 channel")));
         }
         let mut calls = Vec::with_capacity(final_aggregates.calls.len());
         let mut slots = vec![unpivot.grouping_output_slot_id];
         for (call_ordinal, call) in final_aggregates.calls.iter().enumerate() {
             let site = ProgramCallSite::WriterFinal {
                 node,
-                call: u32::try_from(call_ordinal)
-                    .map_err(|_| invalid("has too many final calls".to_string()))?,
+                call: failure::index(IndexKind::FinalCall, call_ordinal)?,
             };
             let input = ordinal(writer_multiplex_layout, call.intermediate_input_slot_id)
                 .filter(|ordinal| *ordinal > 3)
                 .ok_or_else(|| {
-                    invalid(format!(
+                    invalid(format_args!(
                         "final call {call_ordinal} reads slot {} outside its auxiliary channels",
                         call.intermediate_input_slot_id
                     ))
@@ -1127,7 +1055,7 @@ impl CompiledFinishStatistics {
             if writer_multiplex_layout.schema().field(input).data_type()
                 != prepared.contract.intermediate_type().data_type()
             {
-                return Err(invalid(format!(
+                return Err(invalid(format_args!(
                     "final call {call_ordinal} reads a channel of another state type"
                 )));
             }
@@ -1144,12 +1072,12 @@ impl CompiledFinishStatistics {
                         .data_type()
                         .clone()
                 })
-                .ok_or_else(|| invalid(format!("expands into slot {slot} outside its Root")))
+                .ok_or_else(|| invalid(format_args!("expands into slot {slot} outside its Root")))
         };
         if root_field(unpivot.passthrough_output_slot_id)? != DataType::Int32 {
-            return Err(invalid(
-                "passes its target through a non-Int32 channel".to_string(),
-            ));
+            return Err(invalid(format_args!(
+                "passes its target through a non-Int32 channel"
+            )));
         }
         let value_type = root_field(unpivot.value_output_slot_id)?;
         let literal_types = unpivot
@@ -1165,17 +1093,17 @@ impl CompiledFinishStatistics {
                 .iter()
                 .position(|call| call.final_output_slot_id == mapping.input_value_slot_id)
                 .ok_or_else(|| {
-                    invalid(format!(
+                    invalid(format_args!(
                         "mapping {mapping_ordinal} reads a slot outside its final aggregates"
                     ))
                 })?;
             if *calls[value].contract.final_type().data_type() != value_type {
-                return Err(invalid(format!(
+                return Err(invalid(format_args!(
                     "mapping {mapping_ordinal} final value differs from its Root value channel"
                 )));
             }
             if mapping.constants.len() != literal_types.len() {
-                return Err(invalid(format!(
+                return Err(invalid(format_args!(
                     "mapping {mapping_ordinal} has another literal width"
                 )));
             }
@@ -1188,17 +1116,15 @@ impl CompiledFinishStatistics {
                         constant_sites.push(ProgramExpressionRootSite::Node {
                             node,
                             role: ProgramNodeExpressionRole::FinishUnpivotConstant {
-                                mapping: u32::try_from(mapping_ordinal)
-                                    .map_err(|_| invalid("has too many mappings".to_string()))?,
-                                constant: u32::try_from(constant_ordinal)
-                                    .map_err(|_| invalid("has too many literals".to_string()))?,
+                                mapping: failure::index(IndexKind::Mapping, mapping_ordinal)?,
+                                constant: failure::index(IndexKind::Literal, constant_ordinal)?,
                             },
                         });
                         LiteralSource::Root(constant_sites.len() - 1)
                     }
                     UnpivotConstant::Int32List(values) => {
                         if list_item_field(literal_type).is_none() {
-                            return Err(invalid(format!(
+                            return Err(invalid(format_args!(
                                 "expands an Int32List constant into {literal_type:?}"
                             )));
                         }
@@ -1206,7 +1132,7 @@ impl CompiledFinishStatistics {
                     }
                     UnpivotConstant::Utf8Map(entries) => {
                         if map_entries_field(literal_type).is_none() {
-                            return Err(invalid(format!(
+                            return Err(invalid(format_args!(
                                 "expands a Utf8Map constant into {literal_type:?}"
                             )));
                         }
@@ -1256,7 +1182,7 @@ impl CompiledFinishStatistics {
     /// constant reads no channel, so the row only gives it its one row.
     fn evaluate_constants(
         &self,
-        state: &RuntimeState,
+        receiver: &RuntimeKernelControl,
         root_schema: &ChunkSchemaRef,
         factory: &Arc<dyn InputConstructionFactory>,
         tracker: Option<&Arc<MemTracker>>,
@@ -1275,12 +1201,18 @@ impl CompiledFinishStatistics {
                 .root_port
                 .value_binding(slot.slot_id())
                 .ok_or_else(|| {
-                    ExecutionFailure::from("compiled grouped Unpivot Root binding is absent")
+                    ExecutionFailure::from(FragmentBindingError::new(
+                        FragmentBindingTarget::Program,
+                        FragmentBindingErrorKind::MissingAssignment,
+                        "compiled grouped Unpivot Root binding is absent",
+                    ))
                 })?;
             if original != slot.typed_binding() {
-                return Err(
-                    "compiled grouped Unpivot Root binding differs from its declared layout".into(),
-                );
+                return Err(ExecutionFailure::from(FragmentBindingError::new(
+                    FragmentBindingTarget::Program,
+                    FragmentBindingErrorKind::LayoutMismatch,
+                    "compiled grouped Unpivot Root binding differs from its declared layout",
+                )));
             }
         }
         let temporary = factory.begin_typed_construction(root_schema)?;
@@ -1288,8 +1220,7 @@ impl CompiledFinishStatistics {
             root_schema.slots().len(),
             temporary.as_ref(),
         )?;
-        let mut control = RuntimeKernelControl::new(Arc::clone(&self.error));
-        control.bind_runtime_memory(state);
+        let mut control = receiver.for_receiver();
         if let Some(tracker) = tracker {
             control.bind_mem_tracker(Arc::clone(tracker));
         }
@@ -1310,12 +1241,15 @@ impl CompiledFinishStatistics {
                     &control,
                 )?);
             } else {
-                return Err(format!(
-                    "compiled grouped Unpivot at local node {} has a NOT NULL Root field {}",
-                    self.node.index(),
-                    slot.field().name()
-                )
-                .into());
+                return Err(ExecutionFailure::from(FragmentBindingError::new(
+                    FragmentBindingTarget::Program,
+                    FragmentBindingErrorKind::SchemaMismatch,
+                    format!(
+                        "compiled grouped Unpivot at local node {} has a NOT NULL Root field {}",
+                        self.node.index(),
+                        slot.field().name()
+                    ),
+                )));
             }
         }
         let row = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
@@ -1376,30 +1310,29 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
             self.node.index()
         )
         .expect("String formatting cannot fail");
-        owner.request(Layout::new::<CompiledWriterFinalAggregate>())?;
-        Ok(Box::new(CompiledWriterFinalAggregate {
-            name,
-            calls: FinalCallSource::Compiled(Arc::clone(&self.calls)),
-            grouping: self.plan.grouping_input_slot_id,
-            output_layout: Some(self.final_layout.clone()),
-            input_schema: None,
-            _creation: Some(owner.storage_lifetime()),
-            output_slots: FinalOutputSlots::Compiled(Arc::clone(&self.final_slots)),
-            output: None,
-            construction: None,
-            control: RuntimeKernelControl::new(Arc::clone(&self.error)),
-            tracker: None,
-            states: None,
-            groups: BTreeMap::new(),
-            pending: VecDeque::new(),
-            finishing: false,
-            finished: false,
-        }))
+        owner.request(Layout::new::<WriterFinalStep>())?;
+        Ok(Box::new(Transform::hydrating(
+            CompiledWriterFinalAggregate {
+                name,
+                calls: FinalCallSource::Compiled(Arc::clone(&self.calls)),
+                grouping: self.plan.grouping_input_slot_id,
+                output_layout: Some(self.final_layout.clone()),
+                input_schema: None,
+                _creation: Some(owner.storage_lifetime()),
+                output_slots: FinalOutputSlots::Compiled(Arc::clone(&self.final_slots)),
+                output: None,
+                construction: None,
+                control: RuntimeKernelControl::new(Arc::clone(&self.error)),
+                tracker: None,
+                states: None,
+                groups: BTreeMap::new(),
+            },
+        )))
     }
 
     fn grouped_unpivot(
         &self,
-        state: &RuntimeState,
+        receiver: &RuntimeKernelControl,
         mut final_chunk: Chunk,
         root_schema: ChunkSchemaRef,
         tracker: Option<Arc<MemTracker>>,
@@ -1410,12 +1343,12 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
         }
         if let Some(tracker) = tracker.as_ref() {
             final_chunk
-                .try_transfer_to_typed(tracker)
+                .try_transfer_to(tracker)
                 .map_err(ConstructionFailure::Memory)?;
         }
         let owner = factory.begin_typed_construction(&root_schema)?;
         let temporary = factory.begin_typed_construction(&root_schema)?;
-        let mut control = RuntimeKernelControl::new(Arc::clone(&self.error));
+        let mut control = receiver.for_receiver();
         control.bind_construction_factory(Arc::clone(&factory));
         // Group/row traversal borrows the actual final array; it constructs
         // neither an Int32Array clone nor a second source Chunk.
@@ -1424,7 +1357,11 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
             .as_any()
             .downcast_ref::<Int32Array>()
             .ok_or_else(|| {
-                ExecutionFailure::from("table finish final aggregate grouping output is not Int32")
+                ExecutionFailure::from(FragmentBindingError::new(
+                    FragmentBindingTarget::Program,
+                    FragmentBindingErrorKind::SchemaMismatch,
+                    "table finish final aggregate grouping output is not Int32",
+                ))
             })?;
         let mut rows = super::unpivot_processor::unpivot_vec::<(u32, usize)>(
             groups.len(),
@@ -1441,23 +1378,37 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
         for row in 0..groups.len() {
             control.checkpoint(1)?;
             if groups.is_null(row) {
-                return Err("table finish final aggregate produced a null grouping key".into());
+                return Err(ExecutionFailure::from(FragmentBindingError::new(
+                    FragmentBindingTarget::Program,
+                    FragmentBindingErrorKind::SchemaMismatch,
+                    "table finish final aggregate produced a null grouping key",
+                )));
             }
             let target = target_ordinal_from_wire(groups.value(row))
-                .map_err(|error| format!("table finish final aggregate grouping key: {error}"))?;
+                .map_err(|cause| crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(crate::runtime::fragment::connector_failure::ConnectorOperation::DecodeWriteTarget, cause))?;
             if !seen.insert(target.get()) {
-                return Err(format!(
-                    "table finish final aggregate produced duplicate target {}",
-                    target.get()
-                )
-                .into());
+                return Err(ExecutionFailure::from(FragmentBindingError::new(
+                    FragmentBindingTarget::Program,
+                    FragmentBindingErrorKind::InvalidAssignment,
+                    format!(
+                        "table finish final aggregate produced duplicate target {}",
+                        target.get()
+                    ),
+                )));
             }
             if !self
                 .mappings
                 .iter()
                 .any(|mapping| mapping.target == target.get())
             {
-                return Err(format!("table finish final aggregate produced target {} with no grouped Unpivot mapping", target.get()).into());
+                return Err(ExecutionFailure::from(FragmentBindingError::new(
+                    FragmentBindingTarget::Program,
+                    FragmentBindingErrorKind::MissingAssignment,
+                    format!(
+                        "table finish final aggregate produced target {} with no grouped Unpivot mapping",
+                        target.get()
+                    ),
+                )));
             }
             rows.push((target.get(), row));
         }
@@ -1469,7 +1420,11 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
                 let expected = root_schema
                     .slot(self.plan.literal_output_slot_ids[ordinal])
                     .ok_or_else(|| {
-                        ExecutionFailure::from("grouped Unpivot literal declaration is absent")
+                        ExecutionFailure::from(FragmentBindingError::new(
+                            FragmentBindingTarget::Program,
+                            FragmentBindingErrorKind::MissingAssignment,
+                            "grouped Unpivot literal declaration is absent",
+                        ))
                     })?;
                 match literal {
                     LiteralSource::Root(root) => {
@@ -1481,15 +1436,15 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
                             novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                                 expected.typed_binding().clone(),
                             )
-                            .map_err(|_| {
-                                ExecutionFailure::from(
-                                    "grouped Unpivot literal declaration is invalid",
-                                )
-                            })?;
+                            .map_err(ExecutionFailure::from_domain)?;
                         if !source
                             .fits_physical_binding_observed(&expected, || control.checkpoint(1))?
                         {
-                            return Err("grouped Unpivot scalar differs from the complete Root literal declaration".into());
+                            return Err(ExecutionFailure::from(FragmentBindingError::new(
+                                FragmentBindingTarget::Program,
+                                FragmentBindingErrorKind::SchemaMismatch,
+                                "grouped Unpivot scalar differs from the complete Root literal declaration",
+                            )));
                         }
                     }
                     LiteralSource::Int32List(_) => {
@@ -1497,10 +1452,11 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
                             novarocks_type_contract::ValueKind::List(item)
                                 if item.kind() == &novarocks_type_contract::ValueKind::Scalar(DataType::Int32))
                         {
-                            return Err(
-                                "grouped Unpivot Int32List differs from its Root value domain"
-                                    .into(),
-                            );
+                            return Err(ExecutionFailure::from(FragmentBindingError::new(
+                                FragmentBindingTarget::Program,
+                                FragmentBindingErrorKind::SchemaMismatch,
+                                "grouped Unpivot Int32List differs from its Root value domain",
+                            )));
                         }
                     }
                     LiteralSource::Utf8Map(_) => {
@@ -1509,16 +1465,18 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
                                 if key.kind() == &novarocks_type_contract::ValueKind::String
                                     && value.kind() == &novarocks_type_contract::ValueKind::String)
                         {
-                            return Err(
-                                "grouped Unpivot Utf8Map differs from its Root value domains"
-                                    .into(),
-                            );
+                            return Err(ExecutionFailure::from(FragmentBindingError::new(
+                                FragmentBindingTarget::Program,
+                                FragmentBindingErrorKind::SchemaMismatch,
+                                "grouped Unpivot Utf8Map differs from its Root value domains",
+                            )));
                         }
                     }
                 }
             }
         }
-        let constants = self.evaluate_constants(state, &root_schema, &factory, tracker.as_ref())?;
+        let constants =
+            self.evaluate_constants(receiver, &root_schema, &factory, tracker.as_ref())?;
         let count = self
             .plan
             .literal_output_slot_ids
@@ -1534,12 +1492,13 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
         .into_iter()
         .chain(self.plan.literal_output_slot_ids.iter().copied())
         {
-            output_fields.push(
-                root_schema
-                    .slot(slot)
-                    .cloned()
-                    .ok_or_else(|| format!("table finish Root schema is missing slot {slot}"))?,
-            );
+            output_fields.push(root_schema.slot(slot).cloned().ok_or_else(|| {
+                FragmentBindingError::new(
+                    FragmentBindingTarget::Program,
+                    FragmentBindingErrorKind::MissingAssignment,
+                    format!("table finish Root schema is missing slot {slot}"),
+                )
+            })?);
         }
         let output = ChunkSchema::try_new_typed_observed::<ConstructionFailure>(
             output_fields,
@@ -1556,36 +1515,49 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
         grouped_arc::<ChunkSchema>(owner.as_ref())?;
         let output = Arc::new(output);
         let final_ordinal = |slot| {
-            final_chunk
-                .chunk_schema()
-                .index_of(slot)
-                .ok_or_else(|| format!("table finish final aggregate is missing value slot {slot}"))
+            final_chunk.chunk_schema().index_of(slot).ok_or_else(|| {
+                FragmentBindingError::new(
+                    FragmentBindingTarget::Program,
+                    FragmentBindingErrorKind::MissingAssignment,
+                    format!("table finish final aggregate is missing value slot {slot}"),
+                )
+            })
         };
         let grouping_ordinal = final_ordinal(self.plan.grouping_output_slot_id)?;
         let expected_value = root_schema
             .slot(self.plan.value_output_slot_id)
             .ok_or_else(|| {
-                ExecutionFailure::from("grouped Unpivot Root value declaration is absent")
+                ExecutionFailure::from(FragmentBindingError::new(
+                    FragmentBindingTarget::Program,
+                    FragmentBindingErrorKind::MissingAssignment,
+                    "grouped Unpivot Root value declaration is absent",
+                ))
             })?;
         for mapping in &self.mappings {
             let source = final_chunk
                 .chunk_schema()
                 .slot(mapping.value)
                 .ok_or_else(|| {
-                    ExecutionFailure::from("grouped Unpivot final value declaration is absent")
+                    ExecutionFailure::from(FragmentBindingError::new(
+                        FragmentBindingTarget::Program,
+                        FragmentBindingErrorKind::MissingAssignment,
+                        "grouped Unpivot final value declaration is absent",
+                    ))
                 })?;
             let source = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                 source.typed_binding().clone(),
             )
-            .map_err(|_| ExecutionFailure::from("grouped Unpivot final declaration is invalid"))?;
+            .map_err(ExecutionFailure::from_domain)?;
             let expected = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                 expected_value.typed_binding().clone(),
             )
-            .map_err(|_| ExecutionFailure::from("grouped Unpivot Root declaration is invalid"))?;
+            .map_err(ExecutionFailure::from_domain)?;
             if !source.fits_physical_binding_observed(&expected, || control.checkpoint(1))? {
-                return Err(
-                    "grouped Unpivot final value differs from the complete Root declaration".into(),
-                );
+                return Err(ExecutionFailure::from(FragmentBindingError::new(
+                    FragmentBindingTarget::Program,
+                    FragmentBindingErrorKind::SchemaMismatch,
+                    "grouped Unpivot final value differs from the complete Root declaration",
+                )));
             }
         }
 
@@ -1652,10 +1624,8 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
                 ),
             });
         }
-        grouped_arc::<Observable>(owner.as_ref())?;
-        let source_observable = Arc::new(Observable::new());
-        owner.request(Layout::new::<CompiledGroupedUnpivot>())?;
-        Ok(Box::new(CompiledGroupedUnpivot {
+        owner.request(Layout::new::<CompiledGroupedStep>())?;
+        Ok(Box::new(Source::new(CompiledGroupedUnpivot {
             final_chunk,
             constants,
             root_schema,
@@ -1665,9 +1635,8 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
             tracker,
             factory,
             control,
-            source_observable,
             _storage: owner.storage_lifetime(),
-        }))
+        })))
     }
 }
 
@@ -1768,7 +1737,7 @@ fn prepared_final_in(
     input_schema: ChunkSchemaRef,
     error: Arc<RuntimeErrorState>,
     owner: &dyn InputConstructionOwner,
-) -> ExecutionResult<Box<CompiledWriterFinalAggregate>> {
+) -> ExecutionResult<Box<WriterFinalStep>> {
     if calls.phase() != AggregateKernelPhase::Final || !input_schema.is_typed() {
         return Err(ConstructionFailure::InvalidSource(
             "writer final preparation is not complete".into(),
@@ -1782,29 +1751,30 @@ fn prepared_final_in(
     name.try_reserve_exact(NAME.len())
         .map_err(|_| KernelFailure::ResourceExhausted)?;
     name.push_str(NAME);
-    owner.request(Layout::new::<CompiledWriterFinalAggregate>())?;
-    Ok(Box::new(CompiledWriterFinalAggregate {
-        name,
-        output_slots: FinalOutputSlots::Prepared {
-            grouping: grouping_output,
-            calls: calls.clone(),
+    owner.request(Layout::new::<WriterFinalStep>())?;
+    Ok(Box::new(Transform::hydrating(
+        CompiledWriterFinalAggregate {
+            name,
+            output_slots: FinalOutputSlots::Prepared {
+                grouping: grouping_output,
+                calls: calls.clone(),
+            },
+            calls: FinalCallSource::Prepared(calls),
+            grouping: grouping_input,
+            output_layout: None,
+            input_schema: Some(input_schema),
+            _creation: Some(owner.storage_lifetime()),
+            output: None,
+            construction: None,
+            control: RuntimeKernelControl::new(error),
+            tracker: None,
+            states: None,
+            groups: BTreeMap::new(),
         },
-        calls: FinalCallSource::Prepared(calls),
-        grouping: grouping_input,
-        output_layout: None,
-        input_schema: Some(input_schema),
-        _creation: Some(owner.storage_lifetime()),
-        output: None,
-        construction: None,
-        control: RuntimeKernelControl::new(error),
-        tracker: None,
-        states: None,
-        groups: BTreeMap::new(),
-        pending: VecDeque::new(),
-        finishing: false,
-        finished: false,
-    }))
+    )))
 }
+
+type WriterFinalStep = Transform<CompiledWriterFinalAggregate, HydrateInput>;
 
 /// The finish's final aggregate: one state per call of each target group.
 struct CompiledWriterFinalAggregate {
@@ -1823,9 +1793,6 @@ struct CompiledWriterFinalAggregate {
     states: Option<Vec<AggregateStateColumn>>,
     /// Each target's group index, in ascending target order.
     groups: BTreeMap<u32, usize>,
-    pending: VecDeque<Chunk>,
-    finishing: bool,
-    finished: bool,
 }
 
 impl CompiledWriterFinalAggregate {
@@ -1837,9 +1804,9 @@ impl CompiledWriterFinalAggregate {
             return Ok(());
         }
         let tracker = bound_tracker(self.tracker.as_ref(), "CompiledWriterFinalAggregate")?;
-        let allocator: Arc<dyn AggregateStateAllocator> = Arc::new(TrackedStateAllocator {
-            tracker: MemTracker::new_child("CompiledWriterFinalStates", &tracker),
-        });
+        let allocator: Arc<dyn AggregateStateAllocator> = Arc::new(TrackedStateAllocator::new(
+            MemTracker::new_child("CompiledWriterFinalStates", &tracker),
+        ));
         let mut states = Vec::with_capacity(self.calls.len());
         for call in self.calls.iter() {
             let stride = call.handle.state_layout().pad_to_align().size().max(1);
@@ -1861,16 +1828,24 @@ impl CompiledWriterFinalAggregate {
         let targets = targets
             .as_any()
             .downcast_ref::<Int32Array>()
-            .ok_or_else(|| ExecutionFailure::from("table finish target ordinal is not Int32"))?;
+            .ok_or_else(|| {
+                ExecutionFailure::from(FragmentBindingError::new(
+                    FragmentBindingTarget::Program,
+                    FragmentBindingErrorKind::SchemaMismatch,
+                    "table finish target ordinal is not Int32",
+                ))
+            })?;
         let mut mapping = Vec::with_capacity(targets.len());
         for row in 0..targets.len() {
             if targets.is_null(row) {
-                return Err(ExecutionFailure::from(
+                return Err(ExecutionFailure::from(FragmentBindingError::new(
+                    FragmentBindingTarget::Program,
+                    FragmentBindingErrorKind::SchemaMismatch,
                     "table finish received an aggregate partial with a null target ordinal",
-                ));
+                )));
             }
             let target = target_ordinal_from_wire(targets.value(row))
-                .map_err(|error| format!("table finish aggregate partial target: {error}"))?
+                .map_err(|cause| crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(crate::runtime::fragment::connector_failure::ConnectorOperation::DecodeWriteTarget, cause))?
                 .get();
             let next = self.groups.len();
             let group = *self.groups.entry(target).or_insert(next);
@@ -1948,9 +1923,8 @@ impl CompiledWriterFinalAggregate {
                 continue;
             }
             let groups = selected.iter().map(|row| mapping[*row]).collect::<Vec<_>>();
-            let selection = Selection::try_sparse(rows, &selected).map_err(|_| {
-                ExecutionFailure::from("table finish aggregate partial selection is not ordered")
-            })?;
+            let selection =
+                Selection::try_sparse(rows, &selected).map_err(ExecutionFailure::from_domain)?;
             let input = SelectedAggregateMergeInput::try_new(
                 call.contract.as_ref(),
                 selection,
@@ -1964,10 +1938,10 @@ impl CompiledWriterFinalAggregate {
     }
 
     /// Every target group's final values, in ascending target order.
-    fn emit(&mut self) -> ExecutionResult<()> {
+    fn build_output(&mut self) -> ExecutionResult<Option<Chunk>> {
         let count = self.groups.len();
         if count == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let output = self
             .output
@@ -1996,11 +1970,8 @@ impl CompiledWriterFinalAggregate {
         for (target, group) in &self.groups {
             let target =
                 novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(*target)
-                    .map_err(|error| format!("table finish final target: {error}"))?;
-            targets.push(
-                target_ordinal_to_wire(target)
-                    .map_err(|error| format!("table finish final target: {error}"))?,
-            );
+                    .map_err(ExecutionFailure::from_domain)?;
+            targets.push(target_ordinal_to_wire(target));
             indices.push(*group);
             statistics_work(owner.as_ref(), 1)?;
         }
@@ -2042,22 +2013,18 @@ impl CompiledWriterFinalAggregate {
         for column in states {
             columns.push(column.emit_evaluation(&indices, count, &self.control)?);
         }
-        self.pending
-            .push_back(Chunk::try_new_typed_with_columns_owned_observed::<
-                ConstructionFailure,
-                _,
-            >(
-                Arc::clone(output),
-                columns,
-                count,
-                owner.storage_lifetime(),
-                |step| owner.observe(0, &[], step),
-            )?);
-        Ok(())
+        let output = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            Arc::clone(output),
+            columns,
+            count,
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
+        )?;
+        Ok(Some(output))
     }
 }
 
-impl Operator for CompiledWriterFinalAggregate {
+impl OperatorLifecycle for CompiledWriterFinalAggregate {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -2148,52 +2115,45 @@ impl Operator for CompiledWriterFinalAggregate {
         self.control.bind_mem_tracker(Arc::clone(&tracker));
         self.tracker = Some(tracker);
     }
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.states = None;
+        self.groups.clear();
+        Ok(())
     }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
     }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn cancel(&mut self) {
+        self.states = None;
+        self.groups.clear();
     }
 }
 
-impl ProcessorOperator for CompiledWriterFinalAggregate {
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished
-    }
-    fn has_output(&self) -> bool {
-        !self.pending.is_empty()
-    }
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.finishing || self.finished {
-            return Err("compiled writer final aggregate received input after finishing".into());
+impl InputEncodingPolicy for CompiledWriterFinalAggregate {}
+impl TransformKernel for CompiledWriterFinalAggregate {
+    fn apply(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
+        self.output
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        if !chunk.is_empty() {
+            self.consume(&chunk)?;
         }
-        if chunk.is_empty() {
-            return Ok(());
-        }
-        self.consume(&chunk)
+        Ok(StepResult::new(None, NextStep::NeedInput, rows))
     }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        let output = self.pending.pop_front();
-        if self.finishing && self.pending.is_empty() {
-            self.finished = true;
-        }
-        Ok(output)
-    }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        if self.finishing || self.finished {
-            return Ok(());
-        }
-        self.finishing = true;
-        self.emit()?;
+    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        self.output
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let output = self.build_output()?;
         self.states = None;
         self.groups.clear();
-        if self.pending.is_empty() {
-            self.finished = true;
-        }
-        Ok(())
+        Ok(StepResult::new(output, NextStep::Finished, 0))
     }
 }
 
@@ -2271,6 +2231,8 @@ struct GroupedTarget {
 
 /// The Root artifact rows of one final batch, target by target in the
 /// batch's row order.
+type CompiledGroupedStep = Source<CompiledGroupedUnpivot>;
+
 struct CompiledGroupedUnpivot {
     final_chunk: Chunk,
     constants: GroupedConstants,
@@ -2279,13 +2241,12 @@ struct CompiledGroupedUnpivot {
     next: usize,
     started: bool,
     tracker: Option<Arc<MemTracker>>,
-    source_observable: Arc<Observable>,
     factory: Arc<dyn InputConstructionFactory>,
     control: RuntimeKernelControl,
     _storage: ValueTypeStorageLifetime,
 }
 
-impl GroupedUnpivotSource for CompiledGroupedUnpivot {
+impl GroupedUnpivotKernel for CompiledGroupedUnpivot {
     fn visit_targets(
         &self,
         visit: &mut dyn FnMut(u32) -> ExecutionResult<()>,
@@ -2295,82 +2256,89 @@ impl GroupedUnpivotSource for CompiledGroupedUnpivot {
         }
         Ok(())
     }
-
-    fn targets(&self) -> Vec<u32> {
-        self.targets.iter().map(|target| target.target).collect()
-    }
-
-    fn pull(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        loop {
-            let Some(target) = self.targets.get_mut(self.next) else {
-                return Ok(None);
-            };
-            if !self.started {
-                let owner = self.factory.begin_input_construction(&self.final_chunk)?;
-                let row = self
-                    .final_chunk
-                    .slice_typed_observed::<ConstructionFailure, _>(
-                        target.row,
-                        1,
-                        owner.storage_lifetime(),
-                        |step| owner.observe(0, &[], step),
-                    )?;
-                let mut constants = super::unpivot_processor::unpivot_vec::<ArrayRef>(
-                    self.constants.arrays.len(),
-                    owner.as_ref(),
+}
+impl SourceKernel for CompiledGroupedUnpivot {
+    fn poll_output(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if self.next == self.targets.len() {
+            return Ok(StepResult::new(None, NextStep::Finished, 0));
+        }
+        if !ctx.work().try_consume(1) {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
+        }
+        let Some(target) = self.targets.get_mut(self.next) else {
+            return Ok(StepResult::new(None, NextStep::Finished, 0));
+        };
+        if !self.started {
+            let owner = self.factory.begin_input_construction(&self.final_chunk)?;
+            let row = self
+                .final_chunk
+                .slice_typed_observed::<ConstructionFailure, _>(
+                    target.row,
+                    1,
+                    owner.storage_lifetime(),
+                    |step| owner.observe(0, &[], step),
                 )?;
-                for constant in &self.constants.arrays {
-                    owner.observe(
-                        0,
-                        &[],
-                        ArrayNormalizationStep::SliceArray {
-                            source: constant,
-                            offset: 0,
-                            length: 1,
-                        },
-                    )?;
-                    constants.push(constant.slice(0, 1));
-                    owner.observe(0, &[], ArrayNormalizationStep::OpaqueOperationFinished)?;
-                }
-                let storage = row
-                    .source_storage_lifetime_observed::<ConstructionFailure>(
-                        owner.storage_lifetime(),
-                        |layout| owner.request(layout),
-                    )?
-                    .retaining_observed(&self.constants.storage, |layout| owner.request(layout))?;
-                target
-                    .expansion
-                    .start_typed(row.into_batch_projection(), constants, storage)?;
-                self.started = true;
+            let mut constants = super::unpivot_processor::unpivot_vec::<ArrayRef>(
+                self.constants.arrays.len(),
+                owner.as_ref(),
+            )?;
+            for constant in &self.constants.arrays {
+                owner.observe(
+                    0,
+                    &[],
+                    ArrayNormalizationStep::SliceArray {
+                        source: constant,
+                        offset: 0,
+                        length: 1,
+                    },
+                )?;
+                constants.push(constant.slice(0, 1));
+                owner.observe(0, &[], ArrayNormalizationStep::OpaqueOperationFinished)?;
             }
-            if let Some(chunk) = target.expansion.next_typed(
-                self.tracker.as_ref(),
-                self.factory.as_ref(),
-                &self.control,
-            )? {
-                if let Some(output) = root_artifact_chunk_with_construction(
-                    chunk,
-                    &self.root_schema,
-                    self.tracker.as_ref(),
-                    self.factory.as_ref(),
-                    &self.control,
-                )? {
-                    return Ok(Some(output));
-                }
-                continue;
-            }
-            // The target's expansion is exhausted.
+            let storage = row
+                .source_storage_lifetime_observed::<ConstructionFailure>(
+                    owner.storage_lifetime(),
+                    |layout| owner.request(layout),
+                )?
+                .retaining_observed(&self.constants.storage, |layout| owner.request(layout))?;
+            target
+                .expansion
+                .start_typed(row.into_batch_projection(), constants, storage)?;
+            self.started = true;
+        }
+        let step = target.expansion.step_typed(
+            self.tracker.as_ref(),
+            self.factory.as_ref(),
+            &self.control,
+        )?;
+        let complete = matches!(step.next, NextStep::NeedInput);
+        if complete {
             self.next += 1;
             self.started = false;
         }
+        let output = match step.output {
+            Some(chunk) => root_artifact_chunk_with_construction(
+                chunk,
+                &self.root_schema,
+                self.tracker.as_ref(),
+                self.factory.as_ref(),
+                &self.control,
+            )?,
+            None => None,
+        };
+        let next = if self.next == self.targets.len() {
+            NextStep::Finished
+        } else if complete {
+            NextStep::Runnable
+        } else {
+            step.next
+        };
+        Ok(StepResult::new(output, next, 0))
     }
-
-    fn is_finished(&self) -> bool {
-        self.next == self.targets.len()
-    }
-
-    fn source_observable(&self) -> Arc<Observable> {
-        Arc::clone(&self.source_observable)
+}
+impl OperatorLifecycle for CompiledGroupedUnpivot {
+    fn name(&self) -> &str {
+        "COMPILED_GROUPED_WRITER_UNPIVOT"
     }
 }
 

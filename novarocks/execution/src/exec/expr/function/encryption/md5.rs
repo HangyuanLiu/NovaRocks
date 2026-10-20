@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::exec::expr::expression_contract;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 use novarocks_functions::builtin::md5_shared::{self, Operation};
 
@@ -24,9 +26,15 @@ pub fn eval_md5<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "md5 requires exactly 1 prepared argument(s)",
+        ));
+    }
     let _ = expr;
     let input = super::common::to_owned_bytes_array(arena.eval(args[0], chunk)?, "md5", 0)?;
     let rows = input.len();
-    Ok((md5_shared::evaluate_legacy(Operation::Md5, &[input], rows, None))?)
+    md5_shared::evaluate_required(Operation::Md5, &[input], rows, None)
+        .map_err(ExecutionFailure::from)
 }

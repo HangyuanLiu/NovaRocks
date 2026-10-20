@@ -46,8 +46,8 @@ impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         self.events.lock().unwrap().push((phase, units));
         match self.refusal {
-            Refusal::Entry if units == 0 => Err(self.error),
-            Refusal::Positive if units > 0 => Err(self.error),
+            Refusal::Entry if units == 0 => Err(self.error.clone()),
+            Refusal::Positive if units > 0 => Err(self.error.clone()),
             _ => Ok(()),
         }
     }
@@ -522,14 +522,14 @@ fn entry_and_tail_refusal_publish_no_node_or_index_for_all_control_categories() 
                 )
                 .unwrap();
             let before = publication(&arena);
-            let control = Control::new(refusal, error);
+            let control = Control::new(refusal, error.clone());
             assert_eq!(
                 arena.intern_observed(
                     ScalarNode::ColumnRef(crate::column_id::ColumnId(1)),
                     ty(),
                     &control
                 ),
-                Err(error.into())
+                Err(error.clone().into())
             );
             assert_eq!(publication(&arena), before);
             let events = control.events.lock().unwrap();
@@ -559,10 +559,10 @@ fn actual_long_bytes_and_child_fanout_observe_256_and_keep_primary_control() {
         ] {
             let mut arena = ScalarArena::new();
             let before = publication(&arena);
-            let control = Control::new(Refusal::Positive, error);
+            let control = Control::new(Refusal::Positive, error.clone());
             assert_eq!(
                 arena.intern_observed(node, ty(), &control),
-                Err(error.into())
+                Err(error.clone().into())
             );
             assert_eq!(publication(&arena), before);
             assert_eq!(

@@ -338,7 +338,7 @@ mod tests {
                 assert!(at <= stop, "callback after primary refusal");
             }
             trace.push(units);
-            match self.refusal {
+            match self.refusal.clone() {
                 Some((stop, cause)) if stop == at => Err(cause),
                 _ => Ok(()),
             }
@@ -461,7 +461,7 @@ mod tests {
             for stop in 0..expected.len() {
                 for cause in CAUSES {
                     let refusing = Control {
-                        refusal: Some((stop, cause)),
+                        refusal: Some((stop, cause.clone())),
                         ..Control::default()
                     };
                     assert!(matches!(

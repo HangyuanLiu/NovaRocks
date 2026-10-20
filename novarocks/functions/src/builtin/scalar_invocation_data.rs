@@ -86,7 +86,7 @@ struct ScalarDataInner {
     contract: Arc<ScalarCallContract>,
     domain: SourceDomain,
     allocator_metadata_bytes: usize,
-    original: OnceLock<String>,
+    original: OnceLock<(crate::DataFailureReason, String)>,
     // Destroy the moved String before releasing its actual host reservation.
     diagnostic_scope: OpaqueReservation,
 }
@@ -101,6 +101,15 @@ impl ScalarInvocationData {
             .original
             .get()
             .expect("published original scalar Data")
+            .1
+            .as_str()
+    }
+    pub fn reason(&self) -> crate::DataFailureReason {
+        self.0
+            .original
+            .get()
+            .expect("published original scalar Data")
+            .0
     }
     pub fn batch_rows(&self) -> usize {
         self.0.domain.batch_rows()
@@ -119,7 +128,7 @@ impl ScalarInvocationData {
         self.0.allocator_metadata_bytes
             + self.0.block_bytes()
             + self.0.domain.bytes()
-            + self.0.original.get().expect("published Data").capacity()
+            + self.0.original.get().expect("published Data").1.capacity()
     }
     pub fn retained_admission_bytes(&self) -> usize {
         self.0.diagnostic_scope.remaining_bytes() + self.0.domain.opaque_admission_bytes()
@@ -172,10 +181,14 @@ pub(crate) fn direct_slot_request_layouts(
     Ok((HostShared::<ScalarDataInner>::allocation_layout(), rows))
 }
 impl DirectScalarDataSlot {
-    pub(super) fn publish_original(self, message: String) -> ScalarInvocationData {
+    pub(super) fn publish_original(
+        self,
+        reason: crate::DataFailureReason,
+        message: String,
+    ) -> ScalarInvocationData {
         // No handle or reference to the cell escaped construction. This is the
         // only set on this cell, so the pinned OnceLock author cannot wait.
-        let _ = self.0.original.set(message);
+        let _ = self.0.original.set((reason, message));
         ScalarInvocationData(self.0)
     }
 }
@@ -295,8 +308,12 @@ impl ScalarDataSlot {
     /// proven source bound. This transport neither grants nor checks that bound
     /// after the original Data error. It performs no copy/formatter/allocation,
     /// callback or fallible footer. A producer with no such proof cannot use it.
-    pub(super) fn publish_original(&self, message: String) -> ScalarInvocationData {
-        let _ = self.0.original.set(message);
+    pub(super) fn publish_original(
+        &self,
+        reason: crate::DataFailureReason,
+        message: String,
+    ) -> ScalarInvocationData {
+        let _ = self.0.original.set((reason, message));
         ScalarInvocationData(self.0.clone())
     }
 }

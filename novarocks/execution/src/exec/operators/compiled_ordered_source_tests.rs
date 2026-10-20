@@ -21,13 +21,17 @@
 use super::*;
 use crate::exec::node::scan::{ScanChunkStream, ScanOp, ScanOutputStream, ScanStreamSource};
 use crate::exec::operators::scan::StreamScanSourceFactory;
+use crate::exec::pipeline::OperatorInstance;
 use crate::exec::pipeline::operator::FinishWatch;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::shape::StepOperator;
+use crate::exec::pipeline::step_context::{DEFAULT_TURN_WORK_UNITS, StepContext, TurnWork};
 use crate::runtime::fragment::ExecutionResult;
 use futures::{Stream, future::BoxFuture};
 use novarocks_spi::connector::read_stack::{
     BudgetConsume, ConnectorPollBudget, ConnectorSourceOperations,
 };
+use std::future::Future;
 use std::{
     pin::Pin,
     sync::atomic::AtomicBool,
@@ -103,11 +107,34 @@ impl Stream for PageStream {
     }
 }
 impl ScanChunkStream for PageStream {
-    fn close(self: Pin<Box<Self>>) -> BoxFuture<'static, Result<(), String>> {
+    fn take_exit_observation(
+        self: Pin<&mut Self>,
+        failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+    ) -> ExecutionResult<crate::exec::node::scan::ScanExitObservation> {
+        Ok(crate::exec::node::scan::ScanExitObservation {
+            // Pages retains the real queue of chunks; its body must also drop.
+            body_proof: crate::exec::node::scan::ScanExitBodyProof::CloseBodyRequired,
+            actual_exit: Box::pin(observe_fixture_source(
+                self.pages.operations.clone(),
+                failures,
+            )),
+        })
+    }
+    fn close(
+        self: Pin<Box<Self>>,
+        _failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+    ) -> BoxFuture<'static, ExecutionResult<()>> {
         self.pages.closes.fetch_add(1, Ordering::SeqCst);
         self.pages.operations.seal();
         let exit = self.pages.operations.exited();
-        Box::pin(async move { exit.await.map_err(|cause| cause.to_string()) })
+        Box::pin(async move {
+            match exit.await {
+                novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited => Ok(()),
+                novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Unresolved => {
+                    futures::future::pending().await
+                }
+            }
+        })
     }
 }
 struct Source {
@@ -143,7 +170,7 @@ impl ScanOp for BoundOp {
     fn stream_source(&self) -> Arc<dyn ScanStreamSource> {
         self.0.clone()
     }
-    fn terminate(&self) -> Result<(), String> {
+    fn terminate(&self) -> ExecutionResult<()> {
         self.0.pages.stops.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -158,7 +185,8 @@ struct SourceCase {
     consumer: Consumer,
     source: Arc<Source>,
     _factory: StreamScanSourceFactory,
-    operator: Box<dyn Operator>,
+    operator: OperatorInstance,
+    turn: TurnWork,
 }
 impl SourceCase {
     fn new(consumer: Consumer, limit: Option<usize>) -> Self {
@@ -209,15 +237,20 @@ impl SourceCase {
             consumer._control.clone(),
         );
         let mut operator = factory.create(1, 0);
+        let turn = TurnWork::new(std::num::NonZeroU64::MIN, DEFAULT_TURN_WORK_UNITS);
+        operator.bind_poll_budget(turn.poll_budget());
         operator.set_mem_tracker(consumer.tracker.clone());
         operator.set_construction_factory(consumer._creation.clone());
         operator.set_fragment_event_sink(consumer.effects.clone());
         operator.prepare().unwrap();
+        let tracker = consumer.tracker.clone();
+        let runtime_error = consumer.state.error_state();
         Self {
             consumer,
             source,
             _factory: factory,
-            operator,
+            operator: OperatorInstance::new(0, operator, Some(tracker), runtime_error),
+            turn,
         }
     }
     fn bind(&mut self) {
@@ -229,12 +262,29 @@ impl SourceCase {
     fn push_original(&self) {
         self.source.pages.push(self.consumer.fixture.input.clone());
     }
-    fn pull(&mut self) -> ExecutionResult<Option<Chunk>> {
-        let processor = self.operator.as_processor_mut().unwrap();
-        processor.begin_turn();
-        processor.pull_chunk(&self.consumer.state)
+    fn poll_exit(&mut self) {
+        use crate::exec::pipeline::operator::ExitProgress;
+        let observation = self.operator.observe_exit();
+        assert!(observation.failure.is_none());
+        assert!(observation.unresolved_exit.is_none());
+        assert!(
+            !matches!(observation.progress, ExitProgress::Unresolved(_)),
+            "the scripted connector has no unresolved exit"
+        );
     }
-    fn finish(self) {
+    fn pull(&mut self) -> ExecutionResult<Option<Chunk>> {
+        self.turn.begin_turn(DEFAULT_TURN_WORK_UNITS)?;
+        let control = self.consumer.state.error_state();
+        let step = self
+            .operator
+            .drive(&mut StepContext::new(&control, &mut self.turn))?;
+        if self.operator.is_finished() {
+            self.poll_exit();
+        }
+        Ok(step.output)
+    }
+    fn finish(mut self) {
+        self.poll_exit();
         assert_eq!(self.source.claims.load(Ordering::SeqCst), 1);
         assert_eq!(self.source.pages.closes.load(Ordering::SeqCst), 1);
         assert!(self.source.pages.operations.is_exited());
@@ -294,7 +344,8 @@ fn compiled_ordered_source_updated_rows_effect_and_original_stream_exit_are_real
     ));
     assert!(stop_observed.load(Ordering::SeqCst));
     assert!(!source.source.pages.operations.is_exited());
-    ticket.end(Ok(()));
+    ticket.end(novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited);
+    source.poll_exit();
     assert!(source.operator.pending_finish().is_none());
     source.finish();
 }
@@ -534,7 +585,8 @@ fn compiled_ordered_source_query_failure_keeps_the_first_cause_and_closes_real_o
             source.operator.pending_finish(),
             Some(FinishWatch::Notify(_))
         ));
-        ticket.end(Ok(()));
+        ticket.end(novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited);
+        source.poll_exit();
         assert!(source.operator.pending_finish().is_none());
         source.finish();
     }
@@ -594,7 +646,8 @@ fn compiled_ordered_source_bind_refusal_never_claims_a_stream_and_refunds_its_pr
         assert_eq!(source.source.claims.load(Ordering::SeqCst), 0);
         assert_eq!(source.source.pages.polls.load(Ordering::SeqCst), 0);
         assert!(source.consumer.effects.0.lock().unwrap().is_empty());
-        source.operator.close().unwrap();
+        source.operator.retire_data().unwrap();
+        source.poll_exit();
         assert!(source.operator.is_finished());
         assert!(source.operator.pending_finish().is_none());
         assert_eq!(
@@ -868,12 +921,14 @@ fn compiled_ordered_source_required_residual_row_error_precedes_invalid_live_sna
         "the invalid live snapshot was never polled"
     );
     assert!(source.consumer.effects.0.lock().unwrap().is_empty());
-    source.operator.close().unwrap();
+    source.operator.retire_data().unwrap();
+    source.poll_exit();
     assert!(matches!(
         source.operator.pending_finish(),
         Some(FinishWatch::Notify(_))
     ));
-    ticket.end(Ok(()));
+    ticket.end(novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited);
+    source.poll_exit();
     assert!(source.operator.pending_finish().is_none());
     source.finish();
 }
@@ -886,3 +941,37 @@ mod membership_tests;
 
 #[path = "compiled_ordered_page_source_tests.rs"]
 mod page_source_tests;
+
+async fn observe_fixture_source(
+    operations: novarocks_spi::connector::read_stack::ConnectorSourceOperations,
+    failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
+) -> crate::exec::node::scan::ScanExitProof {
+    use novarocks_spi::connector::read_stack::{
+        ConnectorSourceExitProof, ConnectorSourceFailureEvent,
+    };
+    let mut events = operations
+        .claim_failure_receiver()
+        .expect("one fixture source receiver");
+    let mut exit = Box::pin(operations.exited());
+    let mut events_ended = false;
+    futures::future::poll_fn(move |cx| {
+        if !events_ended { loop { match events.poll_event(cx) {
+            Poll::Ready(Some(ConnectorSourceFailureEvent::Required(cause))) => failures.report_failure(
+                crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(
+                    crate::runtime::fragment::connector_failure::ConnectorOperation::SourceExit,cause).into()),
+            Poll::Ready(Some(ConnectorSourceFailureEvent::CleanupUnresolved(cause))) => {
+                let cause = crate::runtime::fragment::connector_failure::ConnectorCallFailure::new(
+                    crate::runtime::fragment::connector_failure::ConnectorOperation::SourceExit,cause).into();
+                failures.report_cleanup(&cause); failures.report_unresolved_exit(&cause);
+            }
+            Poll::Ready(None) => {events_ended=true;break;}, Poll::Pending=>break,
+        }}}
+        match exit.as_mut().poll(cx) {
+            Poll::Ready(proof) if events_ended => Poll::Ready(match proof {
+                ConnectorSourceExitProof::Exited=>crate::exec::node::scan::ScanExitProof::Exited,
+                ConnectorSourceExitProof::Unresolved=>crate::exec::node::scan::ScanExitProof::Unresolved,
+            }),
+            _=>Poll::Pending,
+        }
+    }).await
+}

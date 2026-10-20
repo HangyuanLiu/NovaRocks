@@ -372,13 +372,13 @@ impl PureCompileControl for Control {
         assert_eq!(phase, CompilePhase::ProviderValidation);
         let mut calls = self.calls.lock().unwrap();
         calls.push(units);
-        if let Some((at, error)) = self.failure
+        if let Some((at, error)) = self.failure.clone()
             && calls.len() == at
         {
             return Err(error);
         }
         if units == 256
-            && let Some(error) = self.quantum
+            && let Some(error) = self.quantum.clone()
         {
             return Err(error);
         }
@@ -409,7 +409,7 @@ fn assert_provider(frozen: &FrozenConnectorRead, kind: ConnectorCodecErrorKind) 
     )
     .unwrap_err();
     assert!(
-        matches!(error, ConnectorReadProgramCompileError::Provider(ref error) if error.kind() == kind),
+        matches!(error, ConnectorReadProgramCompileError::Provider(ref error) if error.kind() == &kind),
         "unexpected error: {error:?}"
     );
 }
@@ -971,7 +971,7 @@ fn assert_control(frozen: &FrozenConnectorRead, control: &Control, expected: Com
         control,
     );
     assert!(
-        matches!(result, Err(ConnectorReadProgramCompileError::Control(actual)) if actual == expected),
+        matches!(&result, Err(ConnectorReadProgramCompileError::Control(actual)) if actual == &expected),
         "unexpected result: {result:?}"
     );
 }
@@ -1014,7 +1014,7 @@ fn complete_read_three_control_causes_refuse_entry_before_private_decode() {
     let frozen = Fixture::table().build_modified(None, Some(bytes::Bytes::new()), None);
     for error in causes() {
         let control = Control {
-            failure: Some((1, error)),
+            failure: Some((1, error.clone())),
             ..Control::accept()
         };
         assert_control(&frozen, &control, error);
@@ -1027,7 +1027,7 @@ fn complete_read_actual_wide_source_or_wire_work_refuses_first_256_without_reche
     let frozen = wide_fixture().build();
     for error in causes() {
         let control = Control {
-            quantum: Some(error),
+            quantum: Some(error.clone()),
             ..Control::accept()
         };
         assert_control(&frozen, &control, error);
@@ -1063,7 +1063,7 @@ fn complete_read_success_publication_tail_and_ordinary_error_tail_preserve_three
         assert!(calls.len() > 2);
         for error in causes() {
             let control = Control {
-                failure: Some((calls.len(), error)),
+                failure: Some((calls.len(), error.clone())),
                 ..Control::accept()
             };
             assert_control(frozen, &control, error);
@@ -1616,7 +1616,7 @@ fn complete_nominal_table_and_window_use_exact_declarations_and_refuse_old_revis
         let ConnectorReadProgramCompileError::Provider(error) = error else {
             panic!("expected exact provider ABI rejection");
         };
-        assert_eq!(error.kind(), ConnectorCodecErrorKind::VersionMismatch);
+        assert_eq!(error.kind(), &ConnectorCodecErrorKind::VersionMismatch);
         assert_eq!(error.path().to_string(), "header.codec_revision");
     }
     let invalid_current = fixture.build_modified(
@@ -1632,7 +1632,7 @@ fn complete_nominal_table_and_window_use_exact_declarations_and_refuse_old_revis
     .unwrap_err();
     assert!(
         matches!(error, ConnectorReadProgramCompileError::Provider(ref error)
-        if error.kind() != ConnectorCodecErrorKind::VersionMismatch)
+        if error.kind() != &ConnectorCodecErrorKind::VersionMismatch)
     );
     let mut wrong = fixture.clone();
     let mut wrong_declarations = domains.clone();

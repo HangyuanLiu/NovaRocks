@@ -257,7 +257,7 @@ mod tests {
             let error = arrow_data_type_fingerprint_observed::<Failure>(&ty, &mut || {
                 count += 1;
                 if count == 256 {
-                    Err(Failure::Control(cause))
+                    Err(Failure::Control(cause.clone()))
                 } else {
                     Ok(())
                 }

@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::engine_error_codes::EngineErrorCode;
-use crate::sql_error_codes::is_sql_error_code_token;
+use crate::sql_error_codes::{SqlErrorDescriptor, is_sql_error_identity};
 use crate::types::{ConnectionConfig, SqlErrorLocation};
 use anyhow::{Result, bail};
 use regex::Regex;
@@ -45,11 +45,18 @@ pub fn extract_engine_error_code(actual: &str) -> Option<String> {
 }
 
 pub fn extract_sql_error_code(actual: &str) -> Option<String> {
+    extract_sql_error_code_with_descriptors(actual, crate::production_sql_error_descriptors())
+}
+
+fn extract_sql_error_code_with_descriptors(
+    actual: &str,
+    descriptors: &[SqlErrorDescriptor],
+) -> Option<String> {
     let message = engine_error_message_body(actual);
     let candidate_start = message.strip_prefix('[')?;
     let close_idx = candidate_start.find(']')?;
     let candidate = &candidate_start[..close_idx];
-    is_sql_error_code_token(candidate).then(|| candidate.to_string())
+    is_sql_error_identity(candidate, descriptors).then(|| candidate.to_string())
 }
 
 /// Extract a line/column pair only from an explicitly rendered SQL error
@@ -241,6 +248,36 @@ mod tests {
     fn extract_engine_error_code_rejects_malformed_statement_failure_context() {
         let actual = "FAIL (0.00s): statement 1/1 (sha256=not-a-digest): MySqlError { ERROR 1235 (42000): [UnsupportedDistributedDmlShape] forced failure }";
         assert_eq!(extract_engine_error_code(actual), None);
+    }
+
+    #[test]
+    fn extract_compiled_identity_uses_exact_registered_descriptor_without_text_classification() {
+        let registered = [SqlErrorDescriptor {
+            code: "UnsupportedCompiledShape",
+            phase: crate::sql_error_codes::SqlErrorPhase::Execution,
+        }];
+        let actual = "ERROR 1105 (HY000): [UnsupportedCompiledShape] FULL OUTER hash join";
+        assert_eq!(
+            extract_sql_error_code_with_descriptors(actual, &registered).as_deref(),
+            Some("UnsupportedCompiledShape"),
+        );
+        assert_eq!(extract_sql_error_code_with_descriptors(actual, &[]), None);
+        assert_eq!(
+            extract_engine_error_code(actual).as_deref(),
+            Some("UnsupportedCompiledShape")
+        );
+        for invalid in [
+            "ERROR 1105 (HY000): [CommitUnknown] FULL OUTER hash join",
+            "ERROR 1105 (HY000): [UnsupportedcompiledShape] FULL OUTER hash join",
+            "ERROR 1105 (HY000): [UnsupportedCompiledShapeX] FULL OUTER hash join",
+            "ERROR 1105 (HY000): [NotARealCode] FULL OUTER hash join",
+            "ERROR 1105 (HY000): ordinary diagnostic near [UnsupportedCompiledShape]",
+        ] {
+            assert_eq!(
+                extract_sql_error_code_with_descriptors(invalid, &registered),
+                None
+            );
+        }
     }
 
     #[test]

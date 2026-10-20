@@ -18,6 +18,8 @@
 //! Extract paths from the Connector-owned, normalized engine Variant carrier.
 //! Parquet source structs belong to the Connector's sole conversion kernel.
 
+use crate::exec::variant_failure::{self, SdkStage};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -192,24 +194,24 @@ fn kernel_path<'a>(
     Ok(parquet::variant::VariantPath::from(elems))
 }
 
-fn large_binary_to_variant_array(arr: &LargeBinaryArray) -> Result<VariantArray, String> {
-    let mut metadata_builder = BinaryBuilder::new();
-    let mut value_builder = BinaryBuilder::new();
+fn large_binary_to_variant_array(arr: &LargeBinaryArray) -> ExecutionResult<VariantArray> {
+    let mut metadata_builder = novarocks_functions::aggregate_scalar::BinaryResultBuilder::new();
+    let mut value_builder = novarocks_functions::aggregate_scalar::BinaryResultBuilder::new();
     let mut validity = BooleanBufferBuilder::new(arr.len());
     let empty_meta = VariantMetadata::empty();
     let empty_meta_raw = empty_meta.raw();
 
     for row in 0..arr.len() {
         if arr.is_null(row) {
-            metadata_builder.append_value(empty_meta_raw);
-            value_builder.append_value([]);
+            metadata_builder.append_value(empty_meta_raw)?;
+            value_builder.append_value([])?;
             validity.append(false);
             continue;
         }
         let (metadata, value) = split_serialized(arr.value(row))
-            .map_err(|e| format!("variant path source row {row}: {e}"))?;
-        metadata_builder.append_value(metadata);
-        value_builder.append_value(value);
+            .map_err(|source| variant_failure::input_row("variant path source", row, source))?;
+        metadata_builder.append_value(metadata)?;
+        value_builder.append_value(value)?;
         validity.append(true);
     }
 
@@ -217,30 +219,34 @@ fn large_binary_to_variant_array(arr: &LargeBinaryArray) -> Result<VariantArray,
         Field::new("metadata", DataType::Binary, false),
         Field::new("value", DataType::Binary, true),
     ]);
-    let struct_arr = StructArray::new(
+    let struct_arr = StructArray::try_new(
         fields,
         vec![
-            Arc::new(metadata_builder.finish()) as ArrayRef,
-            Arc::new(value_builder.finish()) as ArrayRef,
+            Arc::new(metadata_builder.finish()?) as ArrayRef,
+            Arc::new(value_builder.finish()?) as ArrayRef,
         ],
         Some(NullBuffer::new(validity.finish())),
-    );
-    VariantArray::try_new(&struct_arr)
-        .map_err(|e| format!("variant path source: failed to assemble variant input: {e}"))
+    )
+    .map_err(|source| {
+        variant_failure::sdk_at("variant path source", SdkStage::AssembleInput, source)
+    })?;
+    VariantArray::try_new(&struct_arr).map_err(|source| {
+        variant_failure::sdk_at("variant path source", SdkStage::AssembleInput, source)
+    })
 }
 
 fn source_to_engine_variant_array(
     source_array: &ArrayRef,
     column_name: &str,
-) -> Result<VariantArray, String> {
+) -> ExecutionResult<VariantArray> {
     let source = source_array
         .as_any()
         .downcast_ref::<LargeBinaryArray>()
         .ok_or_else(|| {
-            format!(
+            materialization_contract(format_args!(
                 "variant path source column `{column_name}` has unsupported type: {:?}",
                 source_array.data_type()
-            )
+            ))
         })?;
     large_binary_to_variant_array(source)
 }
@@ -314,8 +320,13 @@ fn materialize_single_variant_path(
         )?;
     }
     let input_ref: ArrayRef = Arc::new(variant_array.into_inner());
-    let result = kernel_variant_get(&input_ref, opts)
-        .map_err(|e| VariantMaterializationFailure::Kernel(format!("{fn_name}: {e}")));
+    let result = kernel_variant_get(&input_ref, opts).map_err(|source| {
+        VariantMaterializationFailure::Evaluation(variant_failure::sdk_at(
+            fn_name,
+            SdkStage::Extract,
+            source,
+        ))
+    });
     if let Some(owner) = path_owner {
         owner.observe(
             0,
@@ -337,11 +348,16 @@ fn materialize_single_variant_path(
 #[derive(Debug)]
 pub enum VariantMaterializationFailure {
     Construction(crate::exec::pipeline::operator::ConstructionFailure),
-    Kernel(String),
+    Evaluation(ExecutionFailure),
 }
-impl From<String> for VariantMaterializationFailure {
-    fn from(error: String) -> Self {
-        Self::Kernel(error)
+impl From<ExecutionFailure> for VariantMaterializationFailure {
+    fn from(source: ExecutionFailure) -> Self {
+        Self::Evaluation(source)
+    }
+}
+impl From<novarocks_types::value::variant::VariantFailure> for VariantMaterializationFailure {
+    fn from(source: novarocks_types::value::variant::VariantFailure) -> Self {
+        Self::Evaluation(source.into())
     }
 }
 impl From<crate::exec::pipeline::operator::ConstructionFailure> for VariantMaterializationFailure {
@@ -363,7 +379,7 @@ fn materialize_variant_path_columns(
     read_slot_ids: &[SlotId],
     output_slot_ids: &[SlotId],
     specs: &[VariantPathSpec],
-) -> Result<RecordBatch, String> {
+) -> ExecutionResult<RecordBatch> {
     materialize_variant_path_columns_core(
         &batch,
         read_slot_ids,
@@ -374,8 +390,8 @@ fn materialize_variant_path_columns(
         None,
     )
     .map_err(|error| match error {
-        VariantMaterializationFailure::Kernel(error) => error,
-        VariantMaterializationFailure::Construction(error) => error.to_string(),
+        VariantMaterializationFailure::Evaluation(error) => error,
+        VariantMaterializationFailure::Construction(error) => error.into(),
     })
 }
 /// Strong runtime borrows the frozen output field author. New temporary indices
@@ -438,11 +454,13 @@ fn materialize_variant_path_columns_core(
         return Ok(batch.clone());
     }
     if batch.num_columns() != read_slot_ids.len() {
-        return Err(VariantMaterializationFailure::Kernel(format!(
-            "variant path read slot mismatch: columns={} read_slot_ids={}",
-            batch.num_columns(),
-            read_slot_ids.len()
-        )));
+        return Err(VariantMaterializationFailure::Evaluation(
+            materialization_contract(format_args!(
+                "variant path read slot mismatch: columns={} read_slot_ids={}",
+                batch.num_columns(),
+                read_slot_ids.len()
+            )),
+        ));
     }
 
     let batch_schema = batch.schema();
@@ -473,7 +491,7 @@ fn materialize_variant_path_columns_core(
                 break;
             }
         }
-        let source_idx=source_idx.ok_or_else(||format!("variant path source_read_slot_id={} for output_slot_id={} is missing from read slots {:?}",spec.source_read_slot_id(),spec.output_slot_id(),read_slot_ids))?;
+        let source_idx=source_idx.ok_or_else(||materialization_contract(format_args!("variant path source_read_slot_id={} for output_slot_id={} is missing from read slots {:?}",spec.source_read_slot_id(),spec.output_slot_id(),read_slot_ids)))?;
         let array = materialize_single_variant_path(batch.column(source_idx), spec, path_owner)?;
         work(owner, 1)?;
         let field = if final_schema.is_none() {
@@ -489,10 +507,12 @@ fn materialize_variant_path_columns_core(
             .insert(spec.output_slot_id(), (field, array))
             .is_some()
         {
-            return Err(VariantMaterializationFailure::Kernel(format!(
-                "duplicate variant path output_slot_id={}",
-                spec.output_slot_id()
-            )));
+            return Err(VariantMaterializationFailure::Evaluation(
+                materialization_contract(format_args!(
+                    "duplicate variant path output_slot_id={}",
+                    spec.output_slot_id()
+                )),
+            ));
         }
     }
 
@@ -525,18 +545,20 @@ fn materialize_variant_path_columns_core(
             columns.push(array.clone());
             continue;
         }
-        return Err(VariantMaterializationFailure::Kernel(format!(
-            "variant path output slot_id={} is neither a read column nor a synthetic column",
-            slot_id
-        )));
+        return Err(VariantMaterializationFailure::Evaluation(
+            materialization_contract(format_args!(
+                "variant path output slot_id={} is neither a read column nor a synthetic column",
+                slot_id
+            )),
+        ));
     }
 
     work(owner, 1)?;
     let schema = final_schema.unwrap_or_else(|| Arc::new(arrow::datatypes::Schema::new(fields)));
     RecordBatch::try_new(schema, columns).map_err(|error| {
-        VariantMaterializationFailure::Kernel(format!(
-            "build variant path materialized batch failed: {error}"
-        ))
+        VariantMaterializationFailure::Evaluation(
+            crate::exec::chunk::ChunkConstructionFailure::record_batch(error).into(),
+        )
     })
 }
 
@@ -742,7 +764,7 @@ mod tests {
     fn expression_variant_get_result_for_source(
         source: ArrayRef,
         strict: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> ExecutionResult<ArrayRef> {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "v",
             DataType::LargeBinary,
@@ -772,11 +794,11 @@ mod tests {
         }
     }
 
-    fn expression_variant_get_result(strict: bool) -> Result<ArrayRef, String> {
+    fn expression_variant_get_result(strict: bool) -> ExecutionResult<ArrayRef> {
         expression_variant_get_result_for_source(test_engine_variant(), strict)
     }
 
-    fn materialized_variant_path(strict: bool) -> Result<RecordBatch, String> {
+    fn materialized_variant_path(strict: bool) -> ExecutionResult<RecordBatch> {
         materialize_variant_path_columns(
             engine_variant_batch(),
             &[SlotId::new(90)],
@@ -868,7 +890,7 @@ mod tests {
     fn variant_path_strict_errors_but_try_returns_null_on_cast_failure() {
         let error = materialized_variant_path(true).expect_err("strict cast must fail");
         assert!(
-            error.contains("variant_get"),
+            error.to_string().contains("variant_get"),
             "error names strict function: {error}"
         );
 
@@ -909,4 +931,26 @@ mod tests {
         let expected = expression_variant_get_result(false).expect("expr normalized engine source");
         assert_int64_array_eq(batch.column(0), &expected);
     }
+}
+
+#[derive(Debug)]
+struct MaterializationContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for MaterializationContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for MaterializationContract {}
+impl novarocks_failure_contract::FailureProjection for MaterializationContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::VariantMaterializationContract.reason(),
+        )
+    }
+}
+fn materialization_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(MaterializationContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
 }

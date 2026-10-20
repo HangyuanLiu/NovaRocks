@@ -39,7 +39,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -117,7 +117,7 @@ fn all_prefixes(
     for at in 0..positive.len() {
         for cause in CAUSES {
             let c = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(matches!(invoke(&c),Err(Error::Control(actual)) if actual==cause));
@@ -485,7 +485,7 @@ fn joint_provider_real_mixed_320_source_loops_observe_quantum_and_keep_ordered_v
         for at in [0, quantum, positive.len() - 1] {
             for cause in CAUSES {
                 let c = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 let result = if direction == 0 {
@@ -566,7 +566,7 @@ fn joint_provider_sealed_lookup_and_retained_floor_use_original_controller() {
             for at in before..positive.len() {
                 for cause in CAUSES {
                     let c = Control {
-                        stop: Some((at, cause)),
+                        stop: Some((at, cause.clone())),
                         ..Control::default()
                     };
                     assert!(matches!(invoke(&c),Err(Error::Control(actual)) if actual==cause));

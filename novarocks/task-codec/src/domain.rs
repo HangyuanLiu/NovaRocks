@@ -834,6 +834,22 @@ impl fmt::Display for DynamicFilterProjectionError {
 
 impl std::error::Error for DynamicFilterProjectionError {}
 
+impl novarocks_execution_contract::failure::FailureProjection for DynamicFilterProjectionError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        // Both variants violate this codec's retained-content contract. The
+        // oversized value is an undeliverable stored payload, not admission.
+        let code = match self {
+            Self::NotAFilterEnvelope => 820,
+            Self::PayloadTooLarge { .. } => 821,
+        };
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+
 /// Projects one task's retained dynamic filter domain back onto the wire.
 ///
 /// This is the read side of [`decode_task_domain`]'s filter branch: the owner

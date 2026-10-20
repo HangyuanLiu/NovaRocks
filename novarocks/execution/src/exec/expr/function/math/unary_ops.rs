@@ -16,6 +16,7 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{ArrayRef, Float64Array};
 use novarocks_functions::builtin::numeric_unary::{self, NumericUnaryOp};
 use std::sync::Arc;
@@ -28,15 +29,10 @@ pub(super) fn eval_unary_f64<
     args: &[ExprId],
     chunk: &Chunk,
     func: F,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let array = arena.eval(args[0], chunk)?;
-    Ok((numeric_unary::evaluate_legacy_unary_f64(
-        &array,
-        chunk.len(),
-        arena.data_type(expr),
-        func,
-    )
-    .map_err(|error| error.to_string()))?)
+    numeric_unary::evaluate_legacy_unary_f64(&array, chunk.len(), arena.data_type(expr), func)
+        .map_err(ExecutionFailure::from)
 }
 fn eval_unary<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
@@ -44,175 +40,170 @@ fn eval_unary<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     op: NumericUnaryOp,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let array = arena.eval(args[0], chunk)?;
-    Ok((numeric_unary::evaluate_legacy_numeric_unary(
-        op,
-        &array,
-        chunk.len(),
-        arena.data_type(expr),
-    )
-    .map_err(|error| error.to_string()))?)
+    numeric_unary::evaluate_legacy_numeric_unary(op, &array, chunk.len(), arena.data_type(expr))
+        .map_err(ExecutionFailure::from)
 }
 pub fn eval_acos<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Acos))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Acos)
 }
 pub fn eval_asin<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Asin))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Asin)
 }
 pub fn eval_atan<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Atan))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Atan)
 }
 pub fn eval_ceil<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Ceil))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Ceil)
 }
 pub fn eval_cos<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Cos))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Cos)
 }
 pub fn eval_cbrt<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Cbrt))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Cbrt)
 }
 pub fn eval_cot<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Cot))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Cot)
 }
 pub fn eval_degress<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Degrees))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Degrees)
 }
 pub fn eval_dlog1<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Dlog1))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Dlog1)
 }
 pub fn eval_exp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Exp))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Exp)
 }
 pub fn eval_floor<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Floor))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Floor)
 }
 pub fn eval_ln<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Ln))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Ln)
 }
 pub fn eval_log10<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Log10))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Log10)
 }
 pub fn eval_log2<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Log2))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Log2)
 }
 pub fn eval_radians<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Radians))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Radians)
 }
 pub fn eval_positive<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Positive))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Positive)
 }
 pub fn eval_sin<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Sin))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Sin)
 }
 pub fn eval_sqrt<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Sqrt))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Sqrt)
 }
 pub fn eval_square<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Square))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Square)
 }
 pub fn eval_tan<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_unary(arena, expr, args, chunk, NumericUnaryOp::Tan))?)
+) -> Result<ArrayRef, ExecutionFailure> {
+    eval_unary(arena, expr, args, chunk, NumericUnaryOp::Tan)
 }
 #[cfg(test)]
 mod legacy_contract_tests {

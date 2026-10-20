@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{ArrayRef, Int64Array, StringArray};
-use arrow::compute::cast;
 use arrow::datatypes::DataType;
 use std::sync::Arc;
 
@@ -35,22 +34,17 @@ fn eval_part_int<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     part: DatePart,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    let expected_type = arena.data_type(expr).ok_or_else(|| {
+        novarocks_functions::builtin::calendar_parts_shared::part_contract(
+            "date part requires a frozen result type",
+        )
+    })?;
     let arr = arena.eval(args[0], chunk)?;
     let out = legacy_calendar_parts(part, &arr, Selection::all(arr.len()))?;
     let out = Arc::new(Int64Array::from(out)) as ArrayRef;
-    let expected_type = arena.data_type(expr).cloned().unwrap_or(DataType::Int64);
-    if out.data_type() == &expected_type {
-        return Ok(out);
-    }
-    Ok((cast(&out, &expected_type).map_err(|e| {
-        format!(
-            "date part output cast failed from {:?} to {:?}: {}",
-            out.data_type(),
-            expected_type,
-            e
-        )
-    }))?)
+    novarocks_functions::builtin::calendar_parts_shared::cast_calendar_array(out, expected_type)
+        .map_err(Into::into)
 }
 
 #[inline]
@@ -59,7 +53,7 @@ fn eval_part_string<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     part: DatePart,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     let arr = arena.eval(args[0], chunk)?;
     let out = legacy_calendar_names(part, &arr, Selection::all(arr.len()))?;
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
@@ -70,8 +64,8 @@ pub fn eval_day<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_int(arena, expr, args, chunk, DatePart::Day))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_int(arena, expr, args, chunk, DatePart::Day)
 }
 
 pub fn eval_dayofmonth<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -79,8 +73,8 @@ pub fn eval_dayofmonth<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_int(arena, expr, args, chunk, DatePart::Day))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_int(arena, expr, args, chunk, DatePart::Day)
 }
 
 pub fn eval_dayofweek<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -88,8 +82,8 @@ pub fn eval_dayofweek<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_int(arena, expr, args, chunk, DatePart::DayOfWeek))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_int(arena, expr, args, chunk, DatePart::DayOfWeek)
 }
 
 pub fn eval_dayofyear<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -97,8 +91,8 @@ pub fn eval_dayofyear<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_int(arena, expr, args, chunk, DatePart::DayOfYear))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_int(arena, expr, args, chunk, DatePart::DayOfYear)
 }
 
 pub fn eval_dayofweek_iso<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -106,8 +100,8 @@ pub fn eval_dayofweek_iso<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_int(arena, expr, args, chunk, DatePart::DayOfWeekIso))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_int(arena, expr, args, chunk, DatePart::DayOfWeekIso)
 }
 
 pub fn eval_weekday<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -115,8 +109,8 @@ pub fn eval_weekday<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_int(arena, expr, args, chunk, DatePart::WeekDay))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_int(arena, expr, args, chunk, DatePart::WeekDay)
 }
 
 pub fn eval_dayname<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -124,8 +118,8 @@ pub fn eval_dayname<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_string(arena, args, chunk, DatePart::DayName))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_string(arena, args, chunk, DatePart::DayName)
 }
 
 pub fn eval_hour<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -133,8 +127,8 @@ pub fn eval_hour<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_int(arena, expr, args, chunk, DatePart::Hour))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_int(arena, expr, args, chunk, DatePart::Hour)
 }
 
 pub fn eval_minute<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -142,8 +136,8 @@ pub fn eval_minute<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_int(arena, expr, args, chunk, DatePart::Minute))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_int(arena, expr, args, chunk, DatePart::Minute)
 }
 
 pub fn eval_month<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -151,8 +145,8 @@ pub fn eval_month<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_int(arena, expr, args, chunk, DatePart::Month))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_int(arena, expr, args, chunk, DatePart::Month)
 }
 
 pub fn eval_monthname<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -160,8 +154,8 @@ pub fn eval_monthname<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_string(arena, args, chunk, DatePart::MonthName))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_string(arena, args, chunk, DatePart::MonthName)
 }
 
 pub fn eval_quarter<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -169,8 +163,8 @@ pub fn eval_quarter<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_int(arena, expr, args, chunk, DatePart::Quarter))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_int(arena, expr, args, chunk, DatePart::Quarter)
 }
 
 pub fn eval_second<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -178,8 +172,8 @@ pub fn eval_second<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_int(arena, expr, args, chunk, DatePart::Second))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_int(arena, expr, args, chunk, DatePart::Second)
 }
 
 pub fn eval_week<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -187,8 +181,8 @@ pub fn eval_week<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_int(arena, expr, args, chunk, DatePart::WeekOfYear))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_int(arena, expr, args, chunk, DatePart::WeekOfYear)
 }
 
 pub fn eval_weekofyear<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -196,8 +190,8 @@ pub fn eval_weekofyear<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_int(arena, expr, args, chunk, DatePart::WeekOfYear))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_int(arena, expr, args, chunk, DatePart::WeekOfYear)
 }
 
 pub fn eval_year<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -205,8 +199,8 @@ pub fn eval_year<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_int(arena, expr, args, chunk, DatePart::Year))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_int(arena, expr, args, chunk, DatePart::Year)
 }
 
 pub fn eval_yearweek<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -214,6 +208,6 @@ pub fn eval_yearweek<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_part_int(arena, expr, args, chunk, DatePart::YearWeek))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_part_int(arena, expr, args, chunk, DatePart::YearWeek)
 }

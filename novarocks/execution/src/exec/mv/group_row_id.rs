@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use std::sync::Arc;
+#[path = "group_row_id_failure.rs"]
+mod failure;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int8Array, Int16Array, Int32Array,
@@ -24,43 +27,52 @@ use arrow::array::{
 use arrow::datatypes::{DataType, TimeUnit};
 
 /// Builds the stable aggregate-MV group-row identifier from its group-key columns.
-pub fn aggregate_group_row_id_array(columns: &[ArrayRef]) -> Result<ArrayRef, String> {
+pub fn aggregate_group_row_id_array(columns: &[ArrayRef]) -> Result<ArrayRef, ExecutionFailure> {
     let rows = columns.first().map(|column| column.len()).unwrap_or(0);
     for (idx, column) in columns.iter().enumerate() {
         if column.len() != rows {
-            return Err(format!(
+            return Err(failure::contract(format_args!(
                 "aggregate MV row id group key column {idx} length mismatch: {} vs {rows}",
                 column.len()
-            ));
+            )));
         }
     }
     let mut row_ids = Vec::with_capacity(rows);
+    let mut total_bytes = 0u128;
     for row in 0..rows {
         let mut cells = Vec::with_capacity(columns.len());
         for array in columns {
-            cells.push(hex_encode(&encoded_cell(array, row)?));
+            cells.push(hex_encode(&encoded_cell(array, row)?)?);
         }
-        row_ids.push(cells.join("|"));
+        let row_id = cells.join("|");
+        total_bytes = total_bytes
+            .checked_add(row_id.len() as u128)
+            .ok_or_else(failure::layout)?;
+        failure::check_utf8_extent(total_bytes, row_id.len() as u128, row_ids.len())?;
+        row_ids.push(row_id);
     }
     Ok(Arc::new(StringArray::from(row_ids)))
 }
 
 /// Returns the stable aggregate-MV group-row identifier for a single row.
-pub fn aggregate_group_row_id_at(columns: &[ArrayRef], row: usize) -> Result<String, String> {
+pub fn aggregate_group_row_id_at(
+    columns: &[ArrayRef],
+    row: usize,
+) -> Result<String, ExecutionFailure> {
     let mut cells = Vec::with_capacity(columns.len());
     for (idx, array) in columns.iter().enumerate() {
         if row >= array.len() {
-            return Err(format!(
+            return Err(failure::contract(format_args!(
                 "aggregate MV row id group key column {idx} row {row} is out of bounds for len {}",
                 array.len()
-            ));
+            )));
         }
-        cells.push(hex_encode(&encoded_cell(array, row)?));
+        cells.push(hex_encode(&encoded_cell(array, row)?)?);
     }
     Ok(cells.join("|"))
 }
 
-fn encoded_cell(array: &ArrayRef, row: usize) -> Result<Vec<u8>, String> {
+fn encoded_cell(array: &ArrayRef, row: usize) -> Result<Vec<u8>, ExecutionFailure> {
     match array.data_type() {
         DataType::Boolean => encode_typed_cell::<BooleanArray, _>(array, row, "boolean", |arr| {
             vec![u8::from(arr.value(row))]
@@ -97,9 +109,9 @@ fn encoded_cell(array: &ArrayRef, row: usize) -> Result<Vec<u8>, String> {
                 arr.value(row).to_le_bytes().to_vec()
             })
         }
-        other => Err(format!(
+        other => Err(failure::contract(format_args!(
             "aggregate MV row id does not support group key type {other:?}"
-        )),
+        ))),
     }
 }
 
@@ -108,15 +120,16 @@ fn encode_typed_cell<A, F>(
     row: usize,
     type_name: &str,
     value_bytes: F,
-) -> Result<Vec<u8>, String>
+) -> Result<Vec<u8>, ExecutionFailure>
 where
     A: Array + 'static,
     F: FnOnce(&A) -> Vec<u8>,
 {
-    let typed = array
-        .as_any()
-        .downcast_ref::<A>()
-        .ok_or_else(|| format!("aggregate MV row id downcast failed for {type_name}"))?;
+    let typed = array.as_any().downcast_ref::<A>().ok_or_else(|| {
+        failure::contract(format_args!(
+            "aggregate MV row id downcast failed for {type_name}"
+        ))
+    })?;
     let mut out = Vec::new();
     out.extend_from_slice(type_name.as_bytes());
     out.push(b':');
@@ -129,12 +142,17 @@ where
     Ok(out)
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+fn hex_encode(bytes: &[u8]) -> ExecutionResult<String> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
+    let encoded_len = bytes
+        .len()
+        .checked_mul(2)
+        .filter(|len| *len <= isize::MAX as usize)
+        .ok_or_else(failure::layout)?;
+    let mut out = String::with_capacity(encoded_len);
     for byte in bytes {
         out.push(HEX[(byte >> 4) as usize] as char);
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    out
+    Ok(out)
 }

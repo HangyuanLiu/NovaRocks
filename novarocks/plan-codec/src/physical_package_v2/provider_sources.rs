@@ -70,7 +70,15 @@ impl fmt::Display for ProviderSourceError {
         }
     }
 }
-impl std::error::Error for ProviderSourceError {}
+impl std::error::Error for ProviderSourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Source(source) => Some(source),
+            Self::Connector(source) => Some(source),
+        }
+    }
+}
 type Error = ProviderSourceError;
 fn invalid(message: &'static str) -> Error {
     TypeViewError::InvalidSource(message).into()

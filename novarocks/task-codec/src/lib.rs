@@ -104,8 +104,8 @@ mod tests {
         QueryContextAdmissionTicketReceipt, ReleaseOutcome, ResultByteLimit, ResultPacketSequence,
     };
     use novarocks_execution_contract::task_execution::status::{
-        AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
-        TaskState, TaskStatus, TaskStatusVersion, TerminationDetail,
+        AbortCause, CancelReason, SafeDetail, TaskFailure, TaskOutputFacts, TaskState, TaskStatus,
+        TaskStatusVersion, TerminationDetail,
     };
     use novarocks_execution_contract::task_execution::transition::QueryContextState;
     use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
@@ -441,7 +441,7 @@ mod tests {
                 .err()
                 .expect("an assignment is required")
                 .kind(),
-            ProtocolErrorKind::MissingField
+            &ProtocolErrorKind::MissingField
         );
     }
 
@@ -463,7 +463,7 @@ mod tests {
             decode_task_identity(&missing_execution, FieldPath::root("identity"))
                 .expect_err("execution id is required")
                 .kind(),
-            ProtocolErrorKind::MissingField
+            &ProtocolErrorKind::MissingField
         );
 
         let zero_stage = novarocks::TaskIdentity {
@@ -472,7 +472,7 @@ mod tests {
         };
         let error = decode_task_identity(&zero_stage, FieldPath::root("identity"))
             .expect_err("stage id must be nonzero");
-        assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(error.kind(), &ProtocolErrorKind::InvalidValue);
         assert_eq!(error.path().to_string(), "identity.stage_id");
 
         let zero_task = novarocks::TaskIdentity {
@@ -639,7 +639,7 @@ mod tests {
             decode_topology(&outside, FieldPath::root("topology"))
                 .expect_err("an ordinal outside the producer union fails closed")
                 .kind(),
-            ProtocolErrorKind::OutOfRange
+            &ProtocolErrorKind::OutOfRange
         );
         let mut no_senders = wire.clone();
         no_senders.outbound[0].sender_count = 0;
@@ -647,7 +647,7 @@ mod tests {
             decode_topology(&no_senders, FieldPath::root("topology"))
                 .expect_err("an edge counts at least its own producer")
                 .kind(),
-            ProtocolErrorKind::InvalidValue
+            &ProtocolErrorKind::InvalidValue
         );
 
         let mut duplicate = wire.clone();
@@ -662,7 +662,7 @@ mod tests {
             decode_topology(&duplicate, FieldPath::root("topology"))
                 .expect_err("a repeated source inflates the sender count")
                 .kind(),
-            ProtocolErrorKind::DuplicateField
+            &ProtocolErrorKind::DuplicateField
         );
 
         let mut wrong_ordinal = wire.clone();
@@ -671,7 +671,7 @@ mod tests {
             decode_topology(&wrong_ordinal, FieldPath::root("topology"))
                 .expect_err("each source owns exactly one ordinal")
                 .kind(),
-            ProtocolErrorKind::InconsistentFields
+            &ProtocolErrorKind::InconsistentFields
         );
 
         let mut unspecified = wire;
@@ -680,7 +680,7 @@ mod tests {
             decode_topology(&unspecified, FieldPath::root("topology"))
                 .expect_err("the default enum value is not a partitioning")
                 .kind(),
-            ProtocolErrorKind::InvalidEnum
+            &ProtocolErrorKind::InvalidEnum
         );
     }
 
@@ -706,7 +706,7 @@ mod tests {
             decode_task_descriptor(&zero_dop, FieldPath::root("descriptor"))
                 .expect_err("parallelism is nonzero")
                 .kind(),
-            ProtocolErrorKind::InvalidValue
+            &ProtocolErrorKind::InvalidValue
         );
 
         let mut duplicate_node = wire.clone();
@@ -722,7 +722,7 @@ mod tests {
             decode_task_descriptor(&negative_node, FieldPath::root("descriptor"))
                 .expect_err("a plan node id is nonnegative")
                 .kind(),
-            ProtocolErrorKind::OutOfRange
+            &ProtocolErrorKind::OutOfRange
         );
 
         let mut no_kernel_key = wire;
@@ -731,7 +731,7 @@ mod tests {
             decode_task_descriptor(&no_kernel_key, FieldPath::root("descriptor"))
                 .expect_err("the kernel key is required")
                 .kind(),
-            ProtocolErrorKind::MissingField
+            &ProtocolErrorKind::MissingField
         );
     }
 
@@ -792,14 +792,14 @@ mod tests {
                 .err()
                 .expect("a sink edge absent from topology must fail closed")
                 .kind(),
-            ProtocolErrorKind::InconsistentFields
+            &ProtocolErrorKind::InconsistentFields
         );
         assert_eq!(
             decode_create(create(descriptor.clone(), Vec::new()))
                 .err()
                 .expect("an outbound edge nothing binds must fail closed")
                 .kind(),
-            ProtocolErrorKind::InconsistentFields
+            &ProtocolErrorKind::InconsistentFields
         );
 
         let mut missing_endpoint = descriptor.clone();
@@ -815,7 +815,7 @@ mod tests {
                 .err()
                 .expect("a topology destination without an endpoint must fail closed")
                 .kind(),
-            ProtocolErrorKind::MissingField
+            &ProtocolErrorKind::MissingField
         );
 
         let mut invalid_ordinal = descriptor;
@@ -830,7 +830,7 @@ mod tests {
                 .err()
                 .expect("a topology sender ordinal outside its sender count must fail closed")
                 .kind(),
-            ProtocolErrorKind::OutOfRange
+            &ProtocolErrorKind::OutOfRange
         );
     }
 
@@ -857,7 +857,13 @@ mod tests {
             TerminationDetail::Canceled(CancelReason::UpstreamNoLongerNeeded),
             TerminationDetail::Aborted(AbortCause::LeaseExpired),
             TerminationDetail::Failed(TaskFailure::new(
-                TaskFailureCategory::Exchange,
+                novarocks_execution_contract::failure::FailureFact::new(
+                    novarocks_execution_contract::failure::FailureClass::Dependency,
+                    novarocks_execution_contract::failure::FailureReason::new(
+                        std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                        std::num::NonZeroU16::new(2).unwrap(),
+                    ),
+                ),
                 SafeDetail::new("destination failed").expect("fits"),
             )),
         ] {
@@ -889,7 +895,7 @@ mod tests {
             decode_task_status(&no_cause, FieldPath::root("status"))
                 .expect_err("FAILED requires a cause")
                 .kind(),
-            ProtocolErrorKind::InconsistentFields
+            &ProtocolErrorKind::InconsistentFields
         );
 
         let mut zero_version = encode_task_status(&finished);
@@ -905,7 +911,7 @@ mod tests {
             decode_task_status(&unspecified_state, FieldPath::root("status"))
                 .expect_err("the default enum value is not a state")
                 .kind(),
-            ProtocolErrorKind::InvalidEnum
+            &ProtocolErrorKind::InvalidEnum
         );
     }
 
@@ -932,7 +938,7 @@ mod tests {
             decode_task_status(&half, FieldPath::root("status"))
                 .expect_err("a half-reported pair loses a metric silently otherwise")
                 .kind(),
-            ProtocolErrorKind::InconsistentFields
+            &ProtocolErrorKind::InconsistentFields
         );
 
         let mut both = encode_task_status(&finished);
@@ -960,7 +966,7 @@ mod tests {
             decode_task_status(&half_output, FieldPath::root("status"))
                 .expect_err("the output pair is equally all-or-nothing")
                 .kind(),
-            ProtocolErrorKind::InconsistentFields
+            &ProtocolErrorKind::InconsistentFields
         );
     }
 
@@ -991,7 +997,7 @@ mod tests {
             decode_final_task_info(asked_about, &wire, FieldPath::root("info"))
                 .expect_err("final info must answer the task that was asked about")
                 .kind(),
-            ProtocolErrorKind::InconsistentFields
+            &ProtocolErrorKind::InconsistentFields
         );
         let matched = decode_final_task_info(answered_about, &wire, FieldPath::root("info"))
             .expect("the matching task is legal");
@@ -1126,7 +1132,7 @@ mod tests {
             decode_fetch_task_result(&anonymous, FieldPath::root("fetch"))
                 .expect_err("no identity")
                 .kind(),
-            ProtocolErrorKind::MissingField
+            &ProtocolErrorKind::MissingField
         );
         // Zero is not "wait as little as possible": it is a duration this
         // contract does not represent.
@@ -1148,7 +1154,7 @@ mod tests {
             decode_fetch_task_result(&zero_bytes, FieldPath::root("fetch"))
                 .expect_err("zero is not a payload credit")
                 .kind(),
-            ProtocolErrorKind::InvalidValue
+            &ProtocolErrorKind::InvalidValue
         );
 
         let oversized = novarocks::FetchTaskResultRequest {
@@ -1161,7 +1167,7 @@ mod tests {
             decode_fetch_task_result(&oversized, FieldPath::root("fetch"))
                 .expect_err("the request must fit the Native response envelope")
                 .kind(),
-            ProtocolErrorKind::OutOfRange
+            &ProtocolErrorKind::OutOfRange
         );
 
         let read = encode_get_final_task_info(root);
@@ -1244,7 +1250,7 @@ mod tests {
             )
             .expect_err("admission epoch is required before worker admission")
             .kind(),
-            ProtocolErrorKind::MissingField
+            &ProtocolErrorKind::MissingField
         );
 
         let mut zero_epoch = wire.clone();
@@ -1265,7 +1271,7 @@ mod tests {
             )
             .expect_err("an all-zero admission epoch must fail")
             .kind(),
-            ProtocolErrorKind::InvalidValue
+            &ProtocolErrorKind::InvalidValue
         );
 
         let mut missing_compatibility = wire.clone();
@@ -1285,7 +1291,7 @@ mod tests {
             )
             .expect_err("compatibility is required before worker admission")
             .kind(),
-            ProtocolErrorKind::MissingField
+            &ProtocolErrorKind::MissingField
         );
 
         let mut malformed_compatibility = wire.clone();
@@ -1307,7 +1313,7 @@ mod tests {
             )
             .expect_err("compatibility must be exactly 32 bytes")
             .kind(),
-            ProtocolErrorKind::InvalidValue
+            &ProtocolErrorKind::InvalidValue
         );
 
         let ticket_id = AdmissionTicketId::try_from_bytes([0x54; 16]).expect("nonzero ticket");
@@ -1331,7 +1337,7 @@ mod tests {
             )
             .expect_err("an all-zero ticket nonce must fail")
             .kind(),
-            ProtocolErrorKind::InvalidValue
+            &ProtocolErrorKind::InvalidValue
         );
 
         let other_valid_for = LeaseValidFor::new(Duration::from_secs(13)).expect("representable");
@@ -1350,7 +1356,7 @@ mod tests {
             )
             .expect_err("a receipt for different requested validity must fail")
             .kind(),
-            ProtocolErrorKind::InvalidValue
+            &ProtocolErrorKind::InvalidValue
         );
 
         let other_context = context(BackendProcessId::new_v7());
@@ -1369,7 +1375,7 @@ mod tests {
             )
             .expect_err("a receipt for another context must fail")
             .kind(),
-            ProtocolErrorKind::InvalidValue
+            &ProtocolErrorKind::InvalidValue
         );
     }
 
@@ -1451,7 +1457,7 @@ mod tests {
             )
             .expect_err("over the item budget")
             .kind(),
-            ProtocolErrorKind::OutOfRange
+            &ProtocolErrorKind::OutOfRange
         );
 
         let empty = novarocks::ApplyTaskOperationsRequest {
@@ -1471,10 +1477,14 @@ mod tests {
         let receipt = |id: TaskOperationId, outcome: novarocks::TaskOperationOutcome| {
             novarocks::TaskOperationReceipt {
                 operation_id: Some(super::identity::encode_task_operation_id(id)),
-                outcome: outcome as i32,
-                safe_detail: String::new(),
-                safe_field_path: None,
-                ack: None,
+                result: Some(novarocks::task_operation_receipt::Result::Verdict(
+                    novarocks::TaskOperationVerdict {
+                        outcome: outcome as i32,
+                        safe_detail: String::new(),
+                        safe_field_path: None,
+                        ack: None,
+                    },
+                )),
             }
         };
 
@@ -1603,7 +1613,7 @@ mod tests {
             FieldPath::root("batch"),
         )
         .expect_err("an establish must carry its admission ticket id");
-        assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(error.kind(), &ProtocolErrorKind::MissingField);
         assert_eq!(
             error.path().to_string(),
             "batch.operations[0].update_query_context.establish.admission_ticket_id"
@@ -1627,7 +1637,7 @@ mod tests {
             FieldPath::root("batch"),
         )
         .expect_err("an establish must carry its native compatibility identity");
-        assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(error.kind(), &ProtocolErrorKind::MissingField);
         assert_eq!(
             error.path().to_string(),
             "batch.operations[0].update_query_context.establish.native_compatibility_id"
@@ -1655,7 +1665,7 @@ mod tests {
                 FieldPath::root("batch"),
             )
             .expect_err("a native compatibility identity has an exact wire width");
-            assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+            assert_eq!(error.kind(), &ProtocolErrorKind::InvalidValue);
             assert_eq!(
                 error.path().to_string(),
                 "batch.operations[0].update_query_context.establish.native_compatibility_id.value"
@@ -2011,7 +2021,7 @@ mod tests {
             )
             .expect_err("over the representable range")
             .kind(),
-            ProtocolErrorKind::OutOfRange
+            &ProtocolErrorKind::OutOfRange
         );
     }
 
@@ -2338,7 +2348,7 @@ mod tests {
             encode_operation_batch(over, TransportBudget::DEFAULT)
                 .expect_err("over the item budget")
                 .kind(),
-            ProtocolErrorKind::OutOfRange,
+            &ProtocolErrorKind::OutOfRange,
             "the sender refuses its own oversized batch rather than shipping it"
         );
         assert!(
@@ -2612,7 +2622,7 @@ mod tests {
             decode_create_task_ack(&create, mine, FieldPath::root("ack"))
                 .expect_err("a create acknowledgement for another task is refused")
                 .kind(),
-            ProtocolErrorKind::InvalidValue
+            &ProtocolErrorKind::InvalidValue
         );
         // The same body against its own task decodes, so the fence above is the
         // identity check and not a broken decoder.
@@ -2627,7 +2637,7 @@ mod tests {
             decode_update_task_ack(&update, mine, FieldPath::root("ack"))
                 .expect_err("an update acknowledgement for another task is refused")
                 .kind(),
-            ProtocolErrorKind::InvalidValue
+            &ProtocolErrorKind::InvalidValue
         );
 
         let my_context = context(process);
@@ -2641,7 +2651,7 @@ mod tests {
             decode_query_context_ack(&ack, my_context, FieldPath::root("ack"))
                 .expect_err("a context acknowledgement for another context is refused")
                 .kind(),
-            ProtocolErrorKind::InvalidValue
+            &ProtocolErrorKind::InvalidValue
         );
         let (receipt, cause) =
             decode_query_context_ack(&ack, their_context, FieldPath::root("ack"))
@@ -2699,7 +2709,13 @@ mod tests {
                 TaskStatusVersion::new(2).unwrap(),
                 TaskState::Failed,
                 Some(TerminationDetail::Failed(TaskFailure::new_in_phase(
-                    TaskFailureCategory::Unsupported,
+                    novarocks_execution_contract::failure::FailureFact::new(
+                        novarocks_execution_contract::failure::FailureClass::Unsupported,
+                        novarocks_execution_contract::failure::FailureReason::new(
+                            std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                            std::num::NonZeroU16::new(1).unwrap(),
+                        ),
+                    ),
                     SafeDetail::truncating("FULL OUTER hash join"),
                     phase,
                 ))),
@@ -2716,6 +2732,514 @@ mod tests {
     }
 
     #[test]
+    fn operation_domain_failure_round_trips_its_original_facts_without_an_ack() {
+        use novarocks_execution_contract::operation::{
+            DomainFailureOutcome, OperationDomainFailure, OperationResult,
+        };
+        let fact = complete_canonical_fact();
+        let operation = TaskOperationId::new_v7();
+        for outcome in [
+            DomainFailureOutcome::InvalidStateOrRequest,
+            DomainFailureOutcome::ResourceExhausted,
+            DomainFailureOutcome::DomainConflict,
+        ] {
+            let failure = OperationDomainFailure::new(
+                fact,
+                SafeDetail::new("producer-safe refusal").unwrap(),
+            );
+            let wire = super::operation::encode_receipt(
+                operation,
+                OperationResult::DomainFailure {
+                    outcome,
+                    failure: failure.clone(),
+                },
+            );
+            let bytes = wire.encode_to_vec();
+            let wire = novarocks::TaskOperationReceipt::decode(bytes.as_slice()).unwrap();
+            let header =
+                super::operation::decode_receipt_header(&wire, FieldPath::root("receipt")).unwrap();
+            assert_eq!(header.operation_id(), operation);
+            let OperationResult::DomainFailure {
+                outcome: decoded,
+                failure: carried,
+            } = header.result()
+            else {
+                panic!("the original domain branch must survive")
+            };
+            assert_eq!(*decoded, outcome);
+            assert_eq!(carried, &failure);
+            assert_eq!(carried.fact(), fact);
+        }
+    }
+    #[test]
+    fn operation_domain_failure_requires_facts_and_a_domain_refusal_outcome() {
+        use novarocks_execution_contract::operation::{
+            DomainFailureOutcome, OperationDomainFailure, OperationResult,
+        };
+        let operation = TaskOperationId::new_v7();
+        let valid = super::operation::encode_receipt(
+            operation,
+            OperationResult::DomainFailure {
+                outcome: DomainFailureOutcome::InvalidStateOrRequest,
+                failure: OperationDomainFailure::new(
+                    complete_canonical_fact(),
+                    SafeDetail::new("safe").unwrap(),
+                ),
+            },
+        );
+        for case in 0..7 {
+            let mut wire = valid.clone();
+            if case == 0 {
+                wire.result = None;
+            } else {
+                let Some(novarocks::task_operation_receipt::Result::DomainFailure(domain)) =
+                    wire.result.as_mut()
+                else {
+                    panic!("domain")
+                };
+                match case {
+                    1 => domain.failure = None,
+                    2 => domain.failure.as_mut().unwrap().fact = None,
+                    3 => domain.outcome = novarocks::TaskOperationOutcome::Accepted as i32,
+                    4 => domain.outcome = novarocks::TaskOperationOutcome::PreparationBusy as i32,
+                    5 => {
+                        domain
+                            .failure
+                            .as_mut()
+                            .unwrap()
+                            .fact
+                            .as_mut()
+                            .unwrap()
+                            .reason
+                            .as_mut()
+                            .unwrap()
+                            .domain = 0
+                    }
+                    6 => domain.failure.as_mut().unwrap().safe_detail = "é".repeat(257),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                super::operation::decode_receipt_header(&wire, FieldPath::root("receipt")).is_err(),
+                "case {case}"
+            );
+        }
+        // Normal protocol deferral has no failure and remains in its own branch.
+        let wire = super::operation::encode_receipt(
+            operation,
+            OperationResult::Verdict {
+                outcome: OperationOutcome::PreparationBusy,
+                detail: None,
+                acknowledgement: None,
+            },
+        );
+        let header =
+            super::operation::decode_receipt_header(&wire, FieldPath::root("receipt")).unwrap();
+        assert!(matches!(
+            header.result(),
+            OperationResult::Verdict {
+                outcome: OperationOutcome::PreparationBusy,
+                ..
+            }
+        ));
+    }
+
+    fn canonical_status(fact: novarocks_execution_contract::failure::FailureFact) -> TaskStatus {
+        TaskStatus::try_new_with_installed(
+            identity(2, 3, backend()),
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Failed,
+            Some(TerminationDetail::Failed(TaskFailure::new_in_phase(
+                fact,
+                SafeDetail::new("producer redacted detail").unwrap(),
+                novarocks_execution_contract::TaskFailurePhase::Preparation,
+            ))),
+            TaskOutputFacts::default(),
+            false,
+        )
+        .unwrap()
+    }
+    fn canonical_wire_failure(wire: &mut novarocks::TaskStatus) -> &mut novarocks::TaskFailure {
+        let Some(novarocks::task_termination::Cause::Failed(failure)) =
+            wire.termination.as_mut().unwrap().cause.as_mut()
+        else {
+            panic!("expected the authored failure");
+        };
+        failure
+    }
+    fn complete_canonical_fact() -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        let nonzero = |n| std::num::NonZeroU16::new(n).unwrap();
+        FailureFact::new(
+            FailureClass::Representation,
+            FailureReason::new(nonzero(65534), nonzero(65535)),
+        )
+        .with_row_position(FailureRowPosition {
+            selected_ordinal: 0,
+            batch_row: u64::MAX,
+        })
+        .with_resource(ResourceFacts {
+            request_scope: Some(ResourceScope::Driver),
+            constraint_scope: Some(ResourceScope::Query),
+            dimension: ResourceDimension::Bytes,
+            requested: Some(0),
+            required_growth: None,
+            limit: Some(u64::MAX),
+            live: Some(0),
+            committed: None,
+        })
+        .with_representation(RepresentationFacts {
+            boundary: RepresentationBoundary::SingleOutput,
+            layout: RepresentationLayout {
+                domain: nonzero(65535),
+                code: nonzero(65534),
+            },
+            required: Some(0),
+            extent_limit: Some(u64::MAX),
+            representable_prefix: None,
+        })
+    }
+    #[test]
+    fn canonical_failure_facts_survive_status_and_final_info_protobuf_bytes() {
+        use super::status::{decode_final_task_info, encode_final_task_info};
+        use novarocks_execution_contract::failure::*;
+        let full = complete_canonical_fact();
+        let reason = full.reason();
+        for fact in [
+            full,
+            FailureFact::new(FailureClass::Data, reason),
+            FailureFact::new(FailureClass::Dependency, reason),
+            FailureFact::new(FailureClass::Resource, reason),
+            FailureFact::new(FailureClass::Invariant, reason),
+            FailureFact::new(FailureClass::Unexpected, reason),
+            FailureFact::new(FailureClass::Control, reason),
+            FailureFact::new(FailureClass::Unsupported, reason),
+            FailureFact::stop_observation(reason),
+        ] {
+            let status = canonical_status(fact);
+            let wire = encode_task_status(&status);
+            let bytes = wire.encode_to_vec();
+            let decoded_wire = novarocks::TaskStatus::decode(bytes.as_slice()).unwrap();
+            assert_eq!(
+                decode_task_status(&decoded_wire, FieldPath::root("status")).unwrap(),
+                status
+            );
+            let info = novarocks_execution_contract::FinalTaskInfo::try_new(
+                status.identity(),
+                status,
+                Vec::new(),
+                false,
+            )
+            .unwrap();
+            let bytes = encode_final_task_info(&info).encode_to_vec();
+            let decoded_wire = novarocks::FinalTaskInfo::decode(bytes.as_slice()).unwrap();
+            assert_eq!(
+                decode_final_task_info(
+                    info.final_status().identity(),
+                    &decoded_wire,
+                    FieldPath::root("final_info")
+                )
+                .unwrap(),
+                info
+            );
+        }
+        // Absent facts are distinct from actual zero, through the wire DTO too.
+        let mut wire = encode_task_status(&canonical_status(full));
+        let fact = canonical_wire_failure(&mut wire).fact.as_ref().unwrap();
+        assert_eq!(fact.row_position.as_ref().unwrap().selected_ordinal, 0);
+        let resource = fact.resource.as_ref().unwrap();
+        assert_eq!(resource.requested, Some(0));
+        assert_eq!(resource.required_growth, None);
+        assert_eq!(resource.live, Some(0));
+        assert_eq!(resource.committed, None);
+        let representation = fact.representation.as_ref().unwrap();
+        assert_eq!(representation.required, Some(0));
+        assert_eq!(representation.representable_prefix, None);
+    }
+    #[test]
+    fn canonical_failure_wire_rejects_missing_unknown_and_out_of_range_facts() {
+        let status = canonical_status(complete_canonical_fact());
+        // Each corruption goes through the real status ingress, independently.
+        let mutations: &[(fn(&mut novarocks::TaskFailure), ProtocolErrorKind, &str)] = &[
+            (
+                |f| f.fact = None,
+                ProtocolErrorKind::MissingField,
+                "status.termination.failed.fact",
+            ),
+            (
+                |f| f.fact.as_mut().unwrap().class = 0,
+                ProtocolErrorKind::InvalidEnum,
+                "status.termination.failed.fact.class",
+            ),
+            (
+                |f| f.fact.as_mut().unwrap().class = 999,
+                ProtocolErrorKind::InvalidEnum,
+                "status.termination.failed.fact.class",
+            ),
+            (
+                |f| f.fact.as_mut().unwrap().evidence = 0,
+                ProtocolErrorKind::InvalidEnum,
+                "status.termination.failed.fact.evidence",
+            ),
+            (
+                |f| f.fact.as_mut().unwrap().evidence = 999,
+                ProtocolErrorKind::InvalidEnum,
+                "status.termination.failed.fact.evidence",
+            ),
+            (
+                |f| {
+                    f.fact.as_mut().unwrap().evidence =
+                        novarocks::FailureEvidence::StopObservation as i32
+                },
+                ProtocolErrorKind::InconsistentFields,
+                "status.termination.failed.fact.class",
+            ),
+            (
+                |f| f.fact.as_mut().unwrap().reason = None,
+                ProtocolErrorKind::MissingField,
+                "status.termination.failed.fact.reason",
+            ),
+            (
+                |f| f.fact.as_mut().unwrap().reason.as_mut().unwrap().domain = 0,
+                ProtocolErrorKind::OutOfRange,
+                "status.termination.failed.fact.reason.domain",
+            ),
+            (
+                |f| f.fact.as_mut().unwrap().reason.as_mut().unwrap().code = 0,
+                ProtocolErrorKind::OutOfRange,
+                "status.termination.failed.fact.reason.code",
+            ),
+            (
+                |f| f.fact.as_mut().unwrap().reason.as_mut().unwrap().domain = 65536,
+                ProtocolErrorKind::OutOfRange,
+                "status.termination.failed.fact.reason.domain",
+            ),
+            (
+                |f| f.fact.as_mut().unwrap().reason.as_mut().unwrap().code = u32::MAX,
+                ProtocolErrorKind::OutOfRange,
+                "status.termination.failed.fact.reason.code",
+            ),
+            (
+                |f| {
+                    f.fact
+                        .as_mut()
+                        .unwrap()
+                        .resource
+                        .as_mut()
+                        .unwrap()
+                        .request_scope = Some(0)
+                },
+                ProtocolErrorKind::InvalidEnum,
+                "status.termination.failed.fact.resource.request_scope",
+            ),
+            (
+                |f| {
+                    f.fact
+                        .as_mut()
+                        .unwrap()
+                        .resource
+                        .as_mut()
+                        .unwrap()
+                        .constraint_scope = Some(999)
+                },
+                ProtocolErrorKind::InvalidEnum,
+                "status.termination.failed.fact.resource.constraint_scope",
+            ),
+            (
+                |f| {
+                    f.fact
+                        .as_mut()
+                        .unwrap()
+                        .resource
+                        .as_mut()
+                        .unwrap()
+                        .dimension = 0
+                },
+                ProtocolErrorKind::InvalidEnum,
+                "status.termination.failed.fact.resource.dimension",
+            ),
+            (
+                |f| {
+                    f.fact
+                        .as_mut()
+                        .unwrap()
+                        .resource
+                        .as_mut()
+                        .unwrap()
+                        .dimension = 999
+                },
+                ProtocolErrorKind::InvalidEnum,
+                "status.termination.failed.fact.resource.dimension",
+            ),
+            (
+                |f| {
+                    f.fact
+                        .as_mut()
+                        .unwrap()
+                        .representation
+                        .as_mut()
+                        .unwrap()
+                        .boundary = 0
+                },
+                ProtocolErrorKind::InvalidEnum,
+                "status.termination.failed.fact.representation.boundary",
+            ),
+            (
+                |f| {
+                    f.fact
+                        .as_mut()
+                        .unwrap()
+                        .representation
+                        .as_mut()
+                        .unwrap()
+                        .boundary = 999
+                },
+                ProtocolErrorKind::InvalidEnum,
+                "status.termination.failed.fact.representation.boundary",
+            ),
+            (
+                |f| {
+                    f.fact
+                        .as_mut()
+                        .unwrap()
+                        .representation
+                        .as_mut()
+                        .unwrap()
+                        .layout = None
+                },
+                ProtocolErrorKind::MissingField,
+                "status.termination.failed.fact.representation.layout",
+            ),
+            (
+                |f| {
+                    f.fact
+                        .as_mut()
+                        .unwrap()
+                        .representation
+                        .as_mut()
+                        .unwrap()
+                        .layout
+                        .as_mut()
+                        .unwrap()
+                        .domain = 0
+                },
+                ProtocolErrorKind::OutOfRange,
+                "status.termination.failed.fact.representation.layout.domain",
+            ),
+            (
+                |f| {
+                    f.fact
+                        .as_mut()
+                        .unwrap()
+                        .representation
+                        .as_mut()
+                        .unwrap()
+                        .layout
+                        .as_mut()
+                        .unwrap()
+                        .code = 0
+                },
+                ProtocolErrorKind::OutOfRange,
+                "status.termination.failed.fact.representation.layout.code",
+            ),
+            (
+                |f| {
+                    f.fact
+                        .as_mut()
+                        .unwrap()
+                        .representation
+                        .as_mut()
+                        .unwrap()
+                        .layout
+                        .as_mut()
+                        .unwrap()
+                        .domain = 65536
+                },
+                ProtocolErrorKind::OutOfRange,
+                "status.termination.failed.fact.representation.layout.domain",
+            ),
+            (
+                |f| {
+                    f.fact
+                        .as_mut()
+                        .unwrap()
+                        .representation
+                        .as_mut()
+                        .unwrap()
+                        .layout
+                        .as_mut()
+                        .unwrap()
+                        .code = u32::MAX
+                },
+                ProtocolErrorKind::OutOfRange,
+                "status.termination.failed.fact.representation.layout.code",
+            ),
+            (
+                |f| f.safe_detail = "é".repeat(257),
+                ProtocolErrorKind::OutOfRange,
+                "status.termination.failed.safe_detail",
+            ),
+        ];
+        for (case, (mutate, kind, path)) in mutations.iter().enumerate() {
+            let mut wire = encode_task_status(&status);
+            mutate(canonical_wire_failure(&mut wire));
+            let error = decode_task_status(&wire, FieldPath::root("status")).unwrap_err();
+            assert_eq!(error.kind(), kind, "corruption {case}");
+            assert_eq!(error.path().to_string(), *path, "corruption {case}");
+        }
+        // The exact UTF-8 limit is accepted; truncation is never delegated to ingress.
+        let mut wire = encode_task_status(&status);
+        canonical_wire_failure(&mut wire).safe_detail = "é".repeat(256);
+        let decoded = decode_task_status(&wire, FieldPath::root("status")).unwrap();
+        let Some(TerminationDetail::Failed(failure)) = decoded.termination() else {
+            panic!("failure")
+        };
+        assert_eq!(failure.detail().as_str(), "é".repeat(256));
+    }
+
+    #[test]
+    fn canonical_failure_wire_preserves_all_scopes_dimensions_and_boundaries() {
+        use novarocks_execution_contract::failure::*;
+        for scope in [
+            None,
+            Some(ResourceScope::Request),
+            Some(ResourceScope::Operator),
+            Some(ResourceScope::Driver),
+            Some(ResourceScope::Task),
+            Some(ResourceScope::Query),
+            Some(ResourceScope::Process),
+        ] {
+            for dimension in [
+                ResourceDimension::Bytes,
+                ResourceDimension::Items,
+                ResourceDimension::Positions,
+            ] {
+                for boundary in [
+                    RepresentationBoundary::MinimumUnit,
+                    RepresentationBoundary::SingleOutput,
+                ] {
+                    let mut resource = complete_canonical_fact().resource().unwrap();
+                    resource.request_scope = scope;
+                    resource.constraint_scope = scope;
+                    resource.dimension = dimension;
+                    let mut representation = complete_canonical_fact().representation().unwrap();
+                    representation.boundary = boundary;
+                    representation.representable_prefix = Some(0);
+                    let fact = complete_canonical_fact()
+                        .with_resource(resource)
+                        .with_representation(representation);
+                    let status = canonical_status(fact);
+                    assert_eq!(
+                        decode_task_status(&encode_task_status(&status), FieldPath::root("status"))
+                            .unwrap(),
+                        status
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn installed_history_and_preparation_failure_phase_are_required_wire_facts() {
         let task = identity(2, 3, backend());
         let accepted = TaskStatus::created(task);
@@ -2727,7 +3251,13 @@ mod tests {
             TaskStatusVersion::new(2).unwrap(),
             TaskState::Failed,
             Some(TerminationDetail::Failed(TaskFailure::new_in_phase(
-                TaskFailureCategory::Protocol,
+                novarocks_execution_contract::failure::FailureFact::new(
+                    novarocks_execution_contract::failure::FailureClass::Invariant,
+                    novarocks_execution_contract::failure::FailureReason::new(
+                        std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                        std::num::NonZeroU16::new(3).unwrap(),
+                    ),
+                ),
                 SafeDetail::truncating("invalid preparation"),
                 novarocks_execution_contract::TaskFailurePhase::Preparation,
             ))),

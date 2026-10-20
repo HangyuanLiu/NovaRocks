@@ -34,12 +34,7 @@ pub(super) struct CountKernel {
 }
 
 fn primary(error: &KernelFailure) -> bool {
-    matches!(
-        error,
-        KernelFailure::Cancelled
-            | KernelFailure::DeadlineExceeded
-            | KernelFailure::ResourceExhausted
-    )
+    error.is_interruption()
 }
 fn observed<T>(
     control: &dyn KernelEvaluationControl,

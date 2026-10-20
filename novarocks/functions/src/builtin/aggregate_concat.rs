@@ -18,7 +18,7 @@
 //! GROUP_CONCAT over its original tracked row state and exact frozen parameters.
 use super::aggregate_concat_core::{self as core, GroupConcatLayout, GroupConcatState};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
-use crate::aggregate_scalar::{ScalarStateError, ScalarWork};
+use crate::aggregate_scalar::ScalarWork;
 use crate::kernel_control::{KernelControlObservation, compile_failure, internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::*;
@@ -149,10 +149,8 @@ impl PreparedAggregateKernel for ConcatKernel {
                 addresses.push((argument.array(), address));
             }
             let layout = GroupConcatLayout::infer(addresses.len(), self.ascending.len())
-                .map_err(|error| invalid(&error))?;
-            state
-                .update_row(&addresses, layout, &mut ScalarWork::new(Some(work)))
-                .map_err(ScalarStateError::into_kernel_failure)
+                .map_err(KernelFailure::from_domain)?;
+            state.update_row(&addresses, layout, &mut ScalarWork::new(Some(work)))
         });
         if result.is_err() {
             state.latch_failure();
@@ -177,8 +175,7 @@ impl PreparedAggregateKernel for ConcatKernel {
                 input.state().array(),
                 self.ascending.len(),
                 &mut ScalarWork::new(Some(work)),
-            )
-            .map_err(ScalarStateError::into_kernel_failure)?;
+            )?;
             Ok(input)
         })
     }
@@ -208,16 +205,13 @@ impl PreparedAggregateKernel for ConcatKernel {
                 argument.array(),
                 self.ascending.len(),
                 &mut scalar_work,
+            )?;
+            merge.merge_row(
+                state,
+                address,
+                self.contract.intermediate_type().data_type(),
+                &mut scalar_work,
             )
-            .map_err(ScalarStateError::into_kernel_failure)?;
-            merge
-                .merge_row(
-                    state,
-                    address,
-                    self.contract.intermediate_type().data_type(),
-                    &mut scalar_work,
-                )
-                .map_err(ScalarStateError::into_kernel_failure)
         });
         if result.is_err() {
             state.latch_failure();
@@ -239,7 +233,6 @@ impl PreparedAggregateKernel for ConcatKernel {
                 states.iter().copied(),
                 &mut ScalarWork::new(Some(work)),
             )
-            .map_err(ScalarStateError::into_kernel_failure)
         })
     }
     fn build_final<'s, I>(
@@ -264,7 +257,6 @@ impl PreparedAggregateKernel for ConcatKernel {
                 self.max_len,
                 &mut ScalarWork::new(Some(work)),
             )
-            .map_err(ScalarStateError::into_kernel_failure)
         })
     }
 }
@@ -324,10 +316,10 @@ pub(super) fn validate_contract(
     }
     // Exact selected field metadata is retained; only original codec shape is validated.
     let fields = core::validate_intermediate_type(contract.intermediate_type().data_type())
-        .map_err(|error| invalid(&error))?;
+        .map_err(KernelFailure::from_domain)?;
     let mut actual_types =
         core::intermediate_arg_types_borrowed(contract.intermediate_type().data_type())
-            .map_err(|error| invalid(&error))?;
+            .map_err(KernelFailure::from_domain)?;
     let exact_channels = if fields.len() != arguments.len() {
         false
     } else {

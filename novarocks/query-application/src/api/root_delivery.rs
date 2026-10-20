@@ -22,7 +22,10 @@ use super::QueryExecutionError;
 use novarocks_execution_contract::{
     TaskIdentity,
     root_lifetime::RootReadSealed,
-    root_result::{RootReadOutcome, RootResultEnd, RootResultRead, RootResultReply},
+    root_result::{
+        RootReadDeferral, RootReadOutcome, RootReadRefusal, RootReadResponse, RootResultEnd,
+        RootResultRead, RootResultReply,
+    },
 };
 use novarocks_workload_control::{ResultWindowAlias, ResultWindowClass, WorkError};
 use std::{future::Future, num::NonZeroU64, pin::Pin};
@@ -54,16 +57,16 @@ pub trait BoundedRootReadPort: Send + Sync + 'static {
 /// Native decoding transfers the response and its actual physical guard here;
 /// protocol adapters receive only borrowed payload slices with exact sequence.
 pub struct RetainedRootReply {
-    reply: RootResultReply,
+    response: RootReadResponse,
     physical_guard: ResultWindowAlias,
 }
 impl RetainedRootReply {
     pub fn try_new(
-        reply: RootResultReply,
+        response: RootReadResponse,
         physical_guard: ResultWindowAlias,
         simultaneously_live_backing_bytes: u64,
     ) -> Result<Self, WorkError> {
-        let valid_class = match reply.kind {
+        let valid_class = match response.kind() {
             novarocks_result_contract::RootOutputKind::ClientRows => matches!(
                 physical_guard.class(),
                 ResultWindowClass::Client | ResultWindowClass::Local
@@ -75,57 +78,60 @@ impl RetainedRootReply {
                 physical_guard.class() != ResultWindowClass::Closing
             }
         };
-        let covers_visible_body = match &reply.outcome {
-            RootReadOutcome::Data(data) => {
-                simultaneously_live_backing_bytes >= data.body().len() as u64
-            }
+        let covers_visible_body = match &response {
+            RootReadResponse::Reply(RootResultReply {
+                outcome: RootReadOutcome::Data(data),
+                ..
+            }) => simultaneously_live_backing_bytes >= data.body().len() as u64,
             _ => true,
         };
-        let checked = if !valid_class || reply.validate().is_err() || !covers_visible_body {
+        let checked = if !valid_class || response.validate().is_err() || !covers_visible_body {
             Err(WorkError::Conflict)
         } else {
             physical_guard.check_backing_total(simultaneously_live_backing_bytes)
         };
         if let Err(error) = checked {
-            drop(reply);
+            drop(response);
             drop(physical_guard);
             return Err(error);
         }
         Ok(Self {
-            reply,
+            response,
             physical_guard,
         })
     }
     pub fn root_task(&self) -> TaskIdentity {
-        self.reply.root_task
+        self.response.root_task()
     }
-    /// The decoded reply, for frontier validation.
-    pub fn reply(&self) -> &RootResultReply {
-        &self.reply
-    }
-    pub fn accepted_consumed(&self) -> u64 {
-        self.reply.accepted_consumed
+    /// Every response retains its original admitted physical window.
+    pub fn response(&self) -> &RootReadResponse {
+        &self.response
     }
     pub fn profile(&self) -> novarocks_result_contract::RootProfileId {
-        self.reply.profile
+        self.response.profile()
     }
     pub fn kind(&self) -> novarocks_result_contract::RootOutputKind {
-        self.reply.kind
+        self.response.kind()
     }
     pub fn outcome(&self) -> RootReplyView<'_> {
-        match &self.reply.outcome {
-            RootReadOutcome::AckOnly => RootReplyView::AckOnly,
-            RootReadOutcome::NotReady => RootReplyView::NotReady,
-            RootReadOutcome::Retired => RootReplyView::Retired,
-            RootReadOutcome::AwaitTerminalControl => RootReplyView::AwaitTerminalControl,
-            RootReadOutcome::End(end) => RootReplyView::End(*end),
-            RootReadOutcome::Data(data) => RootReplyView::Data {
-                sequence: data.sequence(),
-                body: data.body().as_ref(),
-                end_after_data: data.end_after_data(),
+        match &self.response {
+            RootReadResponse::Deferred(deferred) => RootReplyView::Deferred(deferred.reason()),
+            RootReadResponse::Refused(refused) => RootReplyView::Refused(refused),
+            RootReadResponse::Reply(reply) => match &reply.outcome {
+                RootReadOutcome::AckOnly => RootReplyView::AckOnly,
+                RootReadOutcome::NotReady => RootReplyView::NotReady,
+                RootReadOutcome::Retired => RootReplyView::Retired,
+                RootReadOutcome::AwaitTerminalControl => RootReplyView::AwaitTerminalControl,
+                RootReadOutcome::End(end) => RootReplyView::End(*end),
+                RootReadOutcome::Data(data) => RootReplyView::Data {
+                    sequence: data.sequence(),
+                    body: data.body().as_ref(),
+                    end_after_data: data.end_after_data(),
+                },
             },
         }
     }
+
     pub fn retain_physical_guard(&self) -> ResultWindowAlias {
         self.physical_guard.clone()
     }
@@ -158,7 +164,10 @@ impl RetainedRootReply {
             root_task: self.root_task(),
             profile: self.profile(),
             kind: self.kind(),
-            accepted_consumed: self.accepted_consumed(),
+            accepted_consumed: match &self.response {
+                RootReadResponse::Reply(reply) => reply.accepted_consumed,
+                _ => unreachable!("Data is always an actual receipt"),
+            },
             native_sequence: sequence,
             body_bytes: body.len() as u64,
             end_after_data,
@@ -176,6 +185,8 @@ pub struct ResidentSegmentScalars {
 
 #[derive(Clone, Copy, Debug)]
 pub enum RootReplyView<'a> {
+    Deferred(RootReadDeferral),
+    Refused(&'a RootReadRefusal),
     AckOnly,
     NotReady,
     Retired,
@@ -346,21 +357,23 @@ mod scalar_projection_tests {
             client_rows: Some((profile, before)),
             reply: Arc::new(
                 RetainedRootReply::try_new(
-                    RootResultReply {
-                        root_task: task,
-                        profile: RootProfileId::V1,
-                        kind: RootOutputKind::ClientRows,
-                        accepted_consumed: 0,
-                        outcome: RootReadOutcome::Data(
-                            RootResultData::try_new(
-                                RootOutputKind::ClientRows,
-                                NonZeroU64::new(sequence).unwrap(),
-                                bytes::Bytes::from_static(bytes),
-                                None,
-                            )
-                            .unwrap(),
-                        ),
-                    },
+                    novarocks_execution_contract::root_result::RootReadResponse::Reply(
+                        RootResultReply {
+                            root_task: task,
+                            profile: RootProfileId::V1,
+                            kind: RootOutputKind::ClientRows,
+                            accepted_consumed: 0,
+                            outcome: RootReadOutcome::Data(
+                                RootResultData::try_new(
+                                    RootOutputKind::ClientRows,
+                                    NonZeroU64::new(sequence).unwrap(),
+                                    bytes::Bytes::from_static(bytes),
+                                    None,
+                                )
+                                .unwrap(),
+                            ),
+                        },
+                    ),
                     grant.retain_alias(),
                     4096 + bytes.len() as u64,
                 )

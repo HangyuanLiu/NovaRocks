@@ -50,10 +50,10 @@ impl Coordinator {
     }
 }
 
-/// Keep the original cause separate from its legacy operation formatter.
-/// Pure callers return that nominal cause; their operator adds its own context.
+/// Both allocation adapters retain the original domain source. Operator
+/// context is added only at the execution boundary.
 enum SessionFailure {
-    Message(String),
+    Definition(execution::RuntimeFilterContractViolation),
     Contract {
         binding: u32,
         operation: &'static str,
@@ -67,29 +67,18 @@ enum SessionFailure {
     Execution(ExecutionFailure),
 }
 impl SessionFailure {
-    fn legacy(self) -> String {
-        match self {
-            Self::Message(message) => message,
-            Self::Contract {
-                binding,
-                operation,
-                cause,
-            } => {
-                format!("native aggregate TopN producer binding_id={binding} {operation}: {cause}")
-            }
-            Self::Codec { binding, cause } => format!(
-                "native aggregate TopN producer binding_id={binding} contribution encoding failed: {cause}"
-            ),
-            Self::Boundary(cause) => cause.to_string(),
-            Self::Execution(cause) => cause.to_string(),
-        }
+    fn contract(detail: String) -> Self {
+        Self::Definition(execution::RuntimeFilterContractViolation::new(
+            execution::RuntimeFilterContractViolationKind::ContractMismatch,
+            detail,
+        ))
     }
     fn execution(self) -> ExecutionFailure {
         match self {
-            Self::Message(message) => message.into(),
+            Self::Definition(cause) => cause.into(),
             Self::Contract { cause, .. } => cause.into(),
             Self::Codec { cause, .. } => cause.into(),
-            Self::Boundary(cause) => cause.into(),
+            Self::Boundary(cause) => ExecutionFailure::from_domain(cause),
             Self::Execution(cause) => cause,
         }
     }
@@ -124,12 +113,12 @@ impl AggregateTopNProducerBinding {
             execution_contract.contract(),
             RuntimeFilterExecutionContract::Ordered(_)
         ) {
-            return Err(SessionFailure::Message(format!(
+            return Err(SessionFailure::contract(format!(
                 "native aggregate TopN producer binding_id={binding_id} requires an ordered contract"
             )));
         }
         if execution_contract.kind() != execution::RuntimeFilterProducerKind::OrderedBound {
-            return Err(SessionFailure::Message(format!(
+            return Err(SessionFailure::contract(format!(
                 "native aggregate TopN producer binding_id={binding_id} requires an ordered-bound producer contract"
             )));
         }
@@ -143,13 +132,13 @@ impl AggregateTopNProducerBinding {
     fn from_plan(
         spec: &AggregateTopNRuntimeFilterProducerBinding,
         session: execution::RuntimeFilterSessionRef,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         Self::from_parts(spec.binding_id(), spec.contract().clone(), session, || {
             Ok(Coordinator::Legacy(Arc::new(
                 AggregateTopNProducerInstanceCoordinator::default(),
             )))
         })
-        .map_err(SessionFailure::legacy)
+        .map_err(SessionFailure::execution)
     }
 }
 
@@ -189,7 +178,7 @@ impl AggregateTopNProducerSessionFactory {
         specs: &[AggregateTopNRuntimeFilterProducerBinding],
         session: execution::RuntimeFilterSessionRef,
         local_partition_count: i32,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let local_partition_count = validate_partition_count(local_partition_count)?;
         let bindings = specs
             .iter()
@@ -276,12 +265,13 @@ impl AggregateTopNProducerSessionFactory {
         &self,
         actual_dop: i32,
         local_index: i32,
-    ) -> Result<AggregateTopNProducerSession, String> {
+    ) -> ExecutionResult<AggregateTopNProducerSession> {
         let partition = self.driver_partition(actual_dop, local_index)?;
         if self.host.is_some() {
-            return Err(
+            return Err(SessionFailure::contract(
                 "compiled aggregate TopN producer requires controlled driver creation".into(),
-            );
+            )
+            .execution());
         }
         Ok(AggregateTopNProducerSession {
             streams: StreamStorage::Legacy(
@@ -311,7 +301,8 @@ impl AggregateTopNProducerSessionFactory {
             .driver_partition(actual_dop, local_index)
             .map_err(ExecutionFailure::from)?;
         let host = self.host.as_ref().ok_or_else(|| {
-            ExecutionFailure::from("compiled aggregate TopN producer has no creating host")
+            SessionFailure::contract("compiled aggregate TopN producer has no creating host".into())
+                .execution()
         })?;
         control.checkpoint(0)?;
         let mut streams = AggregateVec::new_in(host.vector_allocator());
@@ -338,32 +329,43 @@ impl AggregateTopNProducerSessionFactory {
         &self,
         actual_dop: i32,
         local_index: i32,
-    ) -> Result<execution::PartitionId, String> {
+    ) -> ExecutionResult<execution::PartitionId> {
         let actual_dop = validate_partition_count(actual_dop)?;
         if actual_dop != self.local_partition_count {
-            return Err(format!(
+            return Err(topn_producer_partition(format!(
                 "native aggregate TopN producer DOP drifted between factory build and operator creation: expected={} actual={actual_dop}",
                 self.local_partition_count
-            ));
+            )));
         }
-        let local_index = u32::try_from(local_index).map_err(|_| format!(
+        let local_index = u32::try_from(local_index).map_err(|_| topn_producer_partition(format!(
             "native aggregate TopN producer local index {local_index} cannot be represented as a partition id"
-        ))?;
+        )))?;
         if local_index >= self.local_partition_count {
-            return Err(format!(
+            return Err(topn_producer_partition(format!(
                 "native aggregate TopN producer local index {local_index} is outside DOP {}",
                 self.local_partition_count
-            ));
+            )));
         }
         Ok(execution::PartitionId::new(local_index))
     }
 }
-fn validate_partition_count(local_partition_count: i32) -> Result<u32, String> {
-    let local_partition_count = u32::try_from(local_partition_count).map_err(|_| format!(
-        "native aggregate TopN producer DOP {local_partition_count} cannot be represented as a partition count"
-    ))?;
+fn topn_producer_partition(detail: String) -> ExecutionFailure {
+    execution::RuntimeFilterContractViolation::new(
+        execution::RuntimeFilterContractViolationKind::InvalidPartitionCount,
+        detail,
+    )
+    .into()
+}
+fn validate_partition_count(local_partition_count: i32) -> ExecutionResult<u32> {
+    let local_partition_count = u32::try_from(local_partition_count).map_err(|_| {
+        topn_producer_partition(format!(
+            "native aggregate TopN producer DOP {local_partition_count} cannot be represented as a partition count"
+        ))
+    })?;
     if local_partition_count == 0 {
-        return Err("native aggregate TopN producer DOP must be positive".to_string());
+        return Err(topn_producer_partition(
+            "native aggregate TopN producer DOP must be positive".to_string(),
+        ));
     }
     Ok(local_partition_count)
 }
@@ -395,8 +397,8 @@ pub(crate) struct AggregateTopNProducerSession {
     host: Option<OrderedTopNAllocationHost>,
 }
 impl AggregateTopNProducerSession {
-    pub(crate) fn bind(&mut self) -> Result<(), String> {
-        self.bind_core(None).map_err(SessionFailure::legacy)
+    pub(crate) fn bind(&mut self) -> ExecutionResult<()> {
+        self.bind_core(None).map_err(SessionFailure::execution)
     }
     pub(crate) fn bind_owned(
         &mut self,
@@ -422,7 +424,7 @@ impl AggregateTopNProducerSession {
     pub(crate) fn submit_pending(
         &mut self,
         boundaries: &mut [AggregateTopNBoundaryBinding],
-    ) -> Result<(), String> {
+    ) -> ExecutionResult<()> {
         self.update(
             boundaries,
             false,
@@ -437,12 +439,12 @@ impl AggregateTopNProducerSession {
             },
             |contract, bound, cap| encode_execution_ordered_bound(contract, &bound, cap),
         )
-        .map_err(SessionFailure::legacy)
+        .map_err(SessionFailure::execution)
     }
     pub(crate) fn finish(
         &mut self,
         boundaries: &mut [AggregateTopNBoundaryBinding],
-    ) -> Result<(), String> {
+    ) -> ExecutionResult<()> {
         self.update(
             boundaries,
             true,
@@ -457,7 +459,7 @@ impl AggregateTopNProducerSession {
             },
             |contract, bound, cap| encode_execution_ordered_bound(contract, &bound, cap),
         )
-        .map_err(SessionFailure::legacy)
+        .map_err(SessionFailure::execution)
     }
     pub(crate) fn submit_pending_owned(
         &mut self,
@@ -480,7 +482,8 @@ impl AggregateTopNProducerSession {
         control: &dyn KernelEvaluationControl,
     ) -> ExecutionResult<()> {
         let host = self.host.clone().ok_or_else(|| {
-            ExecutionFailure::from("compiled aggregate TopN session has no creating host")
+            SessionFailure::contract("compiled aggregate TopN session has no creating host".into())
+                .execution()
         })?;
         let result = self.update(
             boundaries,
@@ -567,8 +570,8 @@ impl AggregateTopNProducerSession {
     pub(crate) fn fail(
         &mut self,
         reason: execution::RuntimeFilterProducerFailure,
-    ) -> Result<(), String> {
-        self.fail_core(reason).map_err(SessionFailure::legacy)
+    ) -> ExecutionResult<()> {
+        self.fail_core(reason).map_err(SessionFailure::execution)
     }
     pub(crate) fn fail_owned(
         &mut self,
@@ -591,7 +594,7 @@ impl AggregateTopNProducerSession {
         if self.streams.len() == boundaries {
             return Ok(());
         }
-        let cause = SessionFailure::Message(format!(
+        let cause = SessionFailure::contract(format!(
             "native aggregate TopN producer session/boundary count mismatch: sessions={} boundaries={boundaries}",
             self.streams.len()
         ));
@@ -694,7 +697,7 @@ impl AggregateTopNProducerStream {
             return Ok(());
         }
         let producer = self.producer.as_ref().ok_or_else(|| {
-            SessionFailure::Message(format!(
+            SessionFailure::contract(format!(
                 "native aggregate TopN producer binding_id={} was not bound before input",
                 self.binding.binding_id
             ))
@@ -726,10 +729,10 @@ impl AggregateTopNProducerStream {
             Err(cause) => return Err(self.error("contribution failed", cause)),
         }
         self.next_sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
-            SessionFailure::Message(format!(
-                "native aggregate TopN producer binding_id={} producer sequence overflow",
-                self.binding.binding_id
-            ))
+            SessionFailure::Execution(
+                execution::producer_sequence_extent(self.binding.binding_id, self.next_sequence)
+                    .into(),
+            )
         })?;
         Ok(())
     }
@@ -739,7 +742,7 @@ impl AggregateTopNProducerStream {
             return Ok(());
         }
         let producer = self.producer.as_ref().ok_or_else(|| {
-            SessionFailure::Message(format!(
+            SessionFailure::contract(format!(
                 "native aggregate TopN producer binding_id={} was not bound before finish",
                 self.binding.binding_id
             ))

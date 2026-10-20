@@ -38,7 +38,7 @@ impl Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         self.units.lock().unwrap().push(units);
-        if let Some(e) = self.failure
+        if let Some(e) = self.failure.clone()
             && (!self.at_positive || units > 0)
         {
             return Err(e);
@@ -313,7 +313,7 @@ fn controls_are_typed_at_entry_and_every_observed_interval() {
         CompileControlError::ResourceExhausted,
     ] {
         let control = Control {
-            failure: Some(error),
+            failure: Some(error.clone()),
             at_positive: false,
             units: Mutex::new(vec![]),
         };
@@ -444,17 +444,36 @@ fn scalar_factories_do_not_guess_json_or_decimal_precision() {
     assert_eq!(json.try_utf8().unwrap(), Some("{}"));
     let ty = FunctionValueType::new(DataType::Decimal128(2, 0), false);
     let field = Arc::new(Field::new("literal", ty.data_type().clone(), false));
-    assert!(matches!(
-        ConstantValue::from_decimal128(
-            field,
-            ty,
-            123,
-            policy(),
-            CompilePhase::Validate,
-            &Control::good()
-        ),
-        Err(ConstantError::Arrow(_))
-    ));
+    let error = ConstantValue::from_decimal128(
+        field,
+        ty,
+        123,
+        policy(),
+        CompilePhase::Validate,
+        &Control::good(),
+    )
+    .unwrap_err();
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(error.failure_fact().class(), FailureClass::Data);
+    assert_eq!(
+        error.failure_fact().reason().domain(),
+        novarocks_failure_contract::domain::CONSTANT.get()
+    );
+    assert_eq!(error.failure_fact().reason().code(), 5);
+    let mut source: &(dyn std::error::Error + 'static) = &error;
+    loop {
+        if let Some(original) = source.downcast_ref::<arrow_schema::ArrowError>() {
+            assert!(matches!(
+                original,
+                arrow_schema::ArrowError::InvalidArgumentError(_)
+            ));
+            assert!(original.to_string().contains("123"));
+            break;
+        }
+        source = source
+            .source()
+            .expect("original decimal coefficient SDK refusal");
+    }
 }
 
 #[test]
@@ -1138,7 +1157,7 @@ fn selected_payload_controls_are_typed_at_entry_and_actual_256_work() {
     ] {
         for at_positive in [false, true] {
             let control = Control {
-                failure: Some(error),
+                failure: Some(error.clone()),
                 at_positive,
                 units: Mutex::new(vec![]),
             };
@@ -1146,7 +1165,7 @@ fn selected_payload_controls_are_typed_at_entry_and_actual_256_work() {
                 p.value(0)
                     .unwrap()
                     .selected_payload_bytes_observed(CompilePhase::Validate, &control),
-                Err(ConstantError::Control(error))
+                Err(ConstantError::Control(error.clone()))
             );
             assert_eq!(
                 *control.units.lock().unwrap(),
@@ -1219,7 +1238,7 @@ fn raw_decimal_values_exceeding_exact_precision_are_rejected() {
                 CompilePhase::Validate,
                 &Control::good()
             ),
-            Err(ConstantError::Arrow(_))
+            Err(ConstantError::Source(_))
         ));
     }
 }

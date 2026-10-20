@@ -29,7 +29,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
         trace.push((phase, units));
-        if let Some((target, cause)) = self.fail
+        if let Some((target, cause)) = self.fail.clone()
             && at == target
         {
             return Err(cause);
@@ -178,7 +178,7 @@ fn caller_owns_entry_and_tail_and_every_real_small_callback_preserves_first_caus
         for at in 0..trace.len() {
             for cause in causes() {
                 let control = Control {
-                    fail: Some((at, cause)),
+                    fail: Some((at, cause.clone())),
                     ..Default::default()
                 };
                 assert_eq!(
@@ -206,7 +206,7 @@ fn caller_owns_entry_and_tail_and_every_real_small_callback_preserves_first_caus
     for at in 0..2 {
         for cause in causes() {
             let refused = Control {
-                fail: Some((at, cause)),
+                fail: Some((at, cause.clone())),
                 ..Default::default()
             };
             assert_eq!(
@@ -265,7 +265,7 @@ fn all_original_numeric_axes_are_primary_before_late_control_and_parent_refusal(
                 limits(),
                 &mut |_| {
                     calls += 1;
-                    Err(cause)
+                    Err(cause.clone())
                 },
                 &mut work
             ),
@@ -344,7 +344,7 @@ fn real_320_message_occurrences_keep_monotonic_snapshots_and_actual_quantum() {
     for at in [0, 1, trace.len() - 1] {
         for cause in causes() {
             let control = Control {
-                fail: Some((at, cause)),
+                fail: Some((at, cause.clone())),
                 ..Default::default()
             };
             assert_eq!(
@@ -377,7 +377,7 @@ fn captured_unknown_group_depth_is_numeric_before_parent_snapshot_and_progress()
                 &mut |facts| {
                     observed.push(*facts);
                     if facts.field_occurrences > 0 {
-                        Err(cause)
+                        Err(cause.clone())
                     } else {
                         Ok(())
                     }

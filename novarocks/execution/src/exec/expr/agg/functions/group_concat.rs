@@ -37,7 +37,9 @@ use core::{
 };
 type GroupConcatKind<'a> = (bool, &'a [bool], &'a [bool], i64);
 
-fn group_concat_kind(spec: &AggSpec) -> Result<GroupConcatKind<'_>, String> {
+fn group_concat_kind(
+    spec: &AggSpec,
+) -> crate::runtime::fragment::ExecutionResult<GroupConcatKind<'_>> {
     match &spec.kind {
         AggKind::GroupConcat {
             is_distinct,
@@ -50,7 +52,9 @@ fn group_concat_kind(spec: &AggSpec) -> Result<GroupConcatKind<'_>, String> {
             nulls_first.as_slice(),
             *max_len,
         )),
-        _ => Err("group_concat spec kind mismatch".to_string()),
+        _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "group_concat spec kind mismatch",
+        )),
     }
 }
 
@@ -60,8 +64,12 @@ impl AggregateFunction for GroupConcatAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let input_type = input_type.ok_or_else(|| "group_concat input type missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let input_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "group_concat input type missing",
+            )
+        })?;
         let is_distinct = func.order.is_distinct;
         let is_asc_order = func.order.is_asc_order.clone();
         let nulls_first = func.order.nulls_first.clone();
@@ -96,11 +104,13 @@ impl AggregateFunction for GroupConcatAgg {
             .unwrap_or_else(|| build_default_intermediate_type(&arg_types));
         let fields = validate_intermediate_type(&intermediate_type)?;
         if fields.len() != arg_types.len() {
-            return Err(format!(
-                "group_concat intermediate field count mismatch: expected {}, got {}",
-                arg_types.len(),
-                fields.len()
-            ));
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "group_concat intermediate field count mismatch: expected {}, got {}",
+                    arg_types.len(),
+                    fields.len()
+                )),
+            );
         }
 
         Ok(AggSpec {
@@ -126,10 +136,10 @@ impl AggregateFunction for GroupConcatAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "group_concat input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("group_concat input missing")
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -137,14 +147,17 @@ impl AggregateFunction for GroupConcatAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "group_concat merge input missing".to_string())?;
-        let _ = arr
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .ok_or_else(|| "group_concat merge input must be StructArray".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "group_concat merge input missing",
+            )
+        })?;
+        let _ = arr.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "group_concat merge input must be StructArray",
+            )
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -158,9 +171,11 @@ impl AggregateFunction for GroupConcatAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let tracker = tracker.ok_or_else(|| {
-            "allocation-tracked group_concat requires an aggregate memory tracker".to_string()
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "allocation-tracked group_concat requires an aggregate memory tracker",
+            )
         })?;
         unsafe {
             std::ptr::write(
@@ -192,26 +207,32 @@ impl AggregateFunction for GroupConcatAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("group_concat batch input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "group_concat batch input type mismatch",
+            ));
         };
         let (_, is_asc_order, _, _) = group_concat_kind(spec)?;
         let columns = extract_input_columns(array)?;
         let layout = GroupConcatLayout::infer(columns.len(), is_asc_order.len())?;
         let arg_types = core::intermediate_arg_types_borrowed(&spec.intermediate_type)?;
         if columns.len() != arg_types.len() {
-            return Err(format!(
-                "group_concat argument count mismatch: expected {}, got {}",
-                arg_types.len(),
-                columns.len()
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                format_args!(
+                    "group_concat argument count mismatch: expected {}, got {}",
+                    arg_types.len(),
+                    columns.len()
+                ),
             ));
         }
         for (index, (column, expected)) in columns.iter().zip(arg_types).enumerate() {
             if column.data_type() != expected {
-                return Err(format!(
-                    "group_concat argument type mismatch at {index}: expected {expected:?}, got {:?}",
-                    column.data_type()
+                return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                    format_args!(
+                        "group_concat argument type mismatch at {index}: expected {expected:?}, got {:?}",
+                        column.data_type()
+                    ),
                 ));
             }
         }
@@ -220,9 +241,7 @@ impl AggregateFunction for GroupConcatAgg {
         for (row, &base) in state_ptrs.iter().enumerate() {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut GroupConcatState) };
             let addresses: Vec<_> = columns.iter().map(|column| (column, row)).collect();
-            state
-                .update_row(&addresses, layout, &mut work)
-                .map_err(|error| error.to_string())?;
+            state.update_row(&addresses, layout, &mut work)?;
         }
         Ok(())
     }
@@ -233,22 +252,21 @@ impl AggregateFunction for GroupConcatAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("group_concat merge input type mismatch".to_string());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "group_concat merge input type mismatch",
+            ));
         };
         let (_, is_asc_order, _, _) = group_concat_kind(spec)?;
         let mut work = ScalarWork::new(None);
-        let merge = core::GroupConcatMerge::new(array, is_asc_order.len(), &mut work)
-            .map_err(|error| error.to_string())?;
+        let merge = core::GroupConcatMerge::new(array, is_asc_order.len(), &mut work)?;
         for (row, &base) in state_ptrs.iter().enumerate() {
             if merge.is_null(row) {
                 continue;
             }
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut GroupConcatState) };
-            merge
-                .merge_row(state, row, &spec.intermediate_type, &mut work)
-                .map_err(|error| error.to_string())?;
+            merge.merge_row(state, row, &spec.intermediate_type, &mut work)?;
         }
         Ok(())
     }
@@ -259,14 +277,14 @@ impl AggregateFunction for GroupConcatAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         let states = group_states
             .iter()
             .map(|&base| unsafe { &*((base as *mut u8).add(offset) as *const GroupConcatState) });
         let mut work = ScalarWork::new(None);
         if output_intermediate {
             return core::build_intermediate_array(&spec.intermediate_type, states, &mut work)
-                .map_err(|error| error.to_string());
+                .map_err(Into::into);
         }
         let (distinct, ascending, nulls_first, max_len) = group_concat_kind(spec)?;
         core::build_final_array(
@@ -278,7 +296,7 @@ impl AggregateFunction for GroupConcatAgg {
             max_len,
             &mut work,
         )
-        .map_err(|error| error.to_string())
+        .map_err(crate::runtime::fragment::ExecutionFailure::from)
     }
 }
 
@@ -755,5 +773,11 @@ mod tests {
         GroupConcatAgg.drop_state(&merge_spec, right_state.as_mut_ptr() as *mut u8);
         let out = out.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(out.value(0), "b,a");
+    }
+}
+
+impl From<core::GroupConcatShapeError> for crate::runtime::fragment::ExecutionFailure {
+    fn from(source: core::GroupConcatShapeError) -> Self {
+        Self::from_domain(source)
     }
 }

@@ -16,6 +16,7 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{Array, ArrayRef, Int32Array, Int64Array};
 use std::sync::Arc;
 
@@ -47,27 +48,35 @@ impl IntArgArray<'_> {
     }
 }
 
-fn downcast_int_arg_array<'a>(arr: &'a ArrayRef) -> Result<IntArgArray<'a>, String> {
+fn downcast_int_arg_array<'a>(arr: &'a ArrayRef) -> Result<IntArgArray<'a>, ExecutionFailure> {
     if let Some(v) = arr.as_any().downcast_ref::<Int32Array>() {
         return Ok(IntArgArray::Int32(v));
     }
     if let Some(v) = arr.as_any().downcast_ref::<Int64Array>() {
         return Ok(IntArgArray::Int64(v));
     }
-    Err("equiwidth_bucket expects BIGINT arguments".to_string())
+    Err(crate::exec::expr::expression_contract(
+        "equiwidth_bucket expects BIGINT arguments",
+    ))
 }
 
-fn const_i64_arg(arr: IntArgArray<'_>, name: &str) -> Result<i64, String> {
+fn const_i64_arg(arr: IntArgArray<'_>, name: &str) -> Result<i64, ExecutionFailure> {
     if arr.len() == 0 {
-        return Err(format!("equiwidth_bucket: {name} must be constant"));
+        return Err(crate::exec::expr::expression_contract(format_args!(
+            "equiwidth_bucket: {name} must be constant"
+        )));
     }
     if arr.is_null(0) {
-        return Err(format!("equiwidth_bucket: {name} must be constant"));
+        return Err(crate::exec::expr::expression_contract(format_args!(
+            "equiwidth_bucket: {name} must be constant"
+        )));
     }
     let first = arr.value(0);
     for row in 1..arr.len() {
         if arr.is_null(row) || arr.value(row) != first {
-            return Err(format!("equiwidth_bucket: {name} must be constant"));
+            return Err(crate::exec::expr::expression_contract(format_args!(
+                "equiwidth_bucket: {name} must be constant"
+            )));
         }
     }
     Ok(first)
@@ -78,7 +87,7 @@ pub fn eval_equiwidth_bucket<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let size_eval = arena.eval(args[0], chunk)?;
     let min_eval = arena.eval(args[1], chunk)?;
     let max_eval = arena.eval(args[2], chunk)?;
@@ -94,13 +103,19 @@ pub fn eval_equiwidth_bucket<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
     let buckets = const_i64_arg(buckets_arr, "argument[buckets]")?;
 
     if min >= max {
-        return Err(("equiwidth_bucket requirement: min < max".to_string()).into());
+        return Err(super::common::invalid_value(
+            "equiwidth_bucket requirement: min < max",
+        ));
     }
     if buckets <= 0 {
-        return Err(("equiwidth_bucket requirement: buckets > 0".to_string()).into());
+        return Err(super::common::invalid_value(
+            "equiwidth_bucket requirement: buckets > 0",
+        ));
     }
 
-    let width = ((max - min) / buckets).max(1);
+    // The valid BIGINT interval can span more than i64::MAX. Widen
+    // before subtraction; a final result outside BIGINT is numeric row data.
+    let width = ((i128::from(max) - i128::from(min)) / i128::from(buckets)).max(1);
     let mut out = Vec::with_capacity(chunk.len());
     for row in 0..chunk.len() {
         if size_arr.is_null(row) {
@@ -109,15 +124,21 @@ pub fn eval_equiwidth_bucket<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>
         }
         let size = size_arr.value(row);
         if size < min {
-            return Err(("equiwidth_bucket requirement: size >= min".to_string()).into());
+            return Err(super::common::invalid_value(
+                "equiwidth_bucket requirement: size >= min",
+            ));
         }
         if size > max {
-            return Err(("equiwidth_bucket requirement: size <= max".to_string()).into());
+            return Err(super::common::invalid_value(
+                "equiwidth_bucket requirement: size <= max",
+            ));
         }
-        out.push(Some((size - min) / width));
+        let bucket = (i128::from(size) - i128::from(min)) / width;
+        let bucket = i64::try_from(bucket).map_err(|_| super::common::numeric_range())?;
+        out.push(Some(bucket));
     }
     let out = Arc::new(Int64Array::from(out)) as ArrayRef;
-    Ok((super::common::cast_output(out, arena.data_type(expr)))?)
+    super::common::cast_output(out, arena.data_type(expr))
 }
 
 #[cfg(test)]
@@ -135,7 +156,7 @@ mod legacy_equiwidth_contract_tests {
         Arc::new(Int64Array::from(values))
     }
 
-    fn evaluate(inputs: [ArrayRef; 4]) -> Result<Vec<Option<i64>>, String> {
+    fn evaluate(inputs: [ArrayRef; 4]) -> Result<Vec<Option<i64>>, ExecutionFailure> {
         let slots = [
             SlotId::new(1),
             SlotId::new(2),
@@ -232,17 +253,19 @@ mod legacy_equiwidth_contract_tests {
             let mut values = [None, Some(0), Some(10), Some(2)];
             values[index] = None;
             let error = evaluate(values.map(|value| integers(vec![value]))).unwrap_err();
-            assert!(error.contains(name));
-            assert!(error.contains("must be constant"));
+            assert!(error.detail().contains(name));
+            assert!(error.detail().contains("must be constant"));
         }
         assert!(
             evaluate(row(None, Some(10), Some(0), Some(2)))
                 .unwrap_err()
+                .detail()
                 .contains("min < max")
         );
         assert!(
             evaluate(row(None, Some(0), Some(10), Some(0)))
                 .unwrap_err()
+                .detail()
                 .contains("buckets > 0")
         );
     }
@@ -253,6 +276,7 @@ mod legacy_equiwidth_contract_tests {
             assert!(
                 evaluate(row(Some(1), Some(min), Some(max), Some(2)))
                     .unwrap_err()
+                    .detail()
                     .contains("min < max")
             );
         }
@@ -260,17 +284,20 @@ mod legacy_equiwidth_contract_tests {
             assert!(
                 evaluate(row(Some(1), Some(0), Some(10), Some(buckets)))
                     .unwrap_err()
+                    .detail()
                     .contains("buckets > 0")
             );
         }
         assert!(
             evaluate(row(Some(-1), Some(0), Some(10), Some(2)))
                 .unwrap_err()
+                .detail()
                 .contains("size >= min")
         );
         assert!(
             evaluate(row(Some(11), Some(0), Some(10), Some(2)))
                 .unwrap_err()
+                .detail()
                 .contains("size <= max")
         );
     }
@@ -284,6 +311,7 @@ mod legacy_equiwidth_contract_tests {
                 assert!(
                     evaluate(inputs)
                         .unwrap_err()
+                        .detail()
                         .contains("expects BIGINT arguments")
                 );
             }
@@ -299,7 +327,7 @@ mod legacy_equiwidth_contract_tests {
             integers(vec![Some(2), Some(2)]),
         ])
         .unwrap_err();
-        assert!(together.contains("argument[min] must be constant"));
+        assert!(together.detail().contains("argument[min] must be constant"));
         assert_eq!(
             evaluate(row(Some(5), Some(0), Some(10), Some(2))).unwrap(),
             vec![Some(1)]
@@ -320,15 +348,18 @@ mod legacy_equiwidth_contract_tests {
                 2 => vec![Some(10), Some(11)],
                 _ => vec![Some(2), Some(3)],
             });
-            assert!(evaluate(inputs).unwrap_err().contains("must be constant"));
+            assert!(
+                evaluate(inputs)
+                    .unwrap_err()
+                    .detail()
+                    .contains("must be constant")
+            );
         }
     }
 
     #[test]
     fn extreme_signed_inputs_with_representable_differences_preserve_exact_integer_results() {
-        // Keep both differences in i64. The production subtractions outside
-        // this range remain unchecked; this oracle does not invent a policy
-        // for debug panics or unchecked-build wrapping.
+        // These differences fit BIGINT; their ordinary integer results stay exact.
         assert_eq!(
             evaluate(row(
                 Some(i64::MIN),
@@ -346,6 +377,35 @@ mod legacy_equiwidth_contract_tests {
         assert_eq!(
             evaluate(row(Some(i64::MAX), Some(0), Some(i64::MAX), Some(i64::MAX))).unwrap(),
             vec![Some(i64::MAX)]
+        );
+    }
+    #[test]
+    fn full_bigint_span_uses_wide_subtraction_and_checks_final_output() {
+        use novarocks_failure_contract::FailureProjection;
+        assert_eq!(
+            evaluate(row(
+                Some(i64::MAX),
+                Some(i64::MIN),
+                Some(i64::MAX),
+                Some(i64::MAX)
+            ))
+            .unwrap(),
+            vec![Some(i64::MAX)]
+        );
+        assert_eq!(
+            evaluate(row(Some(i64::MIN), Some(i64::MIN), Some(i64::MAX), Some(1))).unwrap(),
+            vec![Some(0)]
+        );
+        assert_eq!(
+            evaluate(row(Some(i64::MAX), Some(i64::MIN), Some(i64::MAX), Some(1))).unwrap(),
+            vec![Some(1)]
+        );
+        // Floor width is one for this interval/count, so the inclusive maximum
+        // produces 2^63, outside the frozen BIGINT result carrier.
+        let failure = evaluate(row(Some(0), Some(i64::MIN), Some(0), Some(i64::MAX))).unwrap_err();
+        assert_eq!(
+            failure.failure_fact(),
+            novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
         );
     }
 }

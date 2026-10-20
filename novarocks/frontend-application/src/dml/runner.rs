@@ -53,15 +53,11 @@ pub struct WriteTransactionOutcome {
     pub committed_receipt: Option<ConnectorWriteReceipt>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum CoordinatedWriteReport<H, A = Infallible> {
     NoOp,
     CommitRequired(H),
-    AbortRequired {
-        reason: String,
-        engine_error_code: Option<novarocks_types::EngineErrorCode>,
-        handle: A,
-    },
+    AbortRequired { reason: DmlError, handle: A },
 }
 
 pub trait WriteExecutor {
@@ -158,44 +154,56 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
                     }
                 }
             }
-            CoordinatedWriteReport::AbortRequired {
-                reason,
-                engine_error_code,
-                handle,
-            } => match self.executor.abort(&spec, &handle) {
-                Ok(ConnectorWriteAbortOutcome::KnownUncommitted { cleanup, .. }) => {
-                    attempt
-                        .terminal_known_uncommitted()
-                        .map_err(attempt_error)?;
-                    let mut error = DmlError::executor(
-                        crate::connector::mutation::known_uncommitted_message(reason, &cleanup),
-                    );
-                    if let Some(code) = engine_error_code {
-                        error = error.with_engine_error_code(code);
+            CoordinatedWriteReport::AbortRequired { reason, handle } => {
+                match self.executor.abort(&spec, &handle) {
+                    Ok(ConnectorWriteAbortOutcome::KnownUncommitted { cleanup, .. }) => {
+                        attempt
+                            .terminal_known_uncommitted()
+                            .map_err(attempt_error)?;
+                        Err(with_terminal(
+                            reason.with_uncommitted_cleanup(&cleanup),
+                            &attempt,
+                        ))
                     }
-                    Err(with_terminal(error, &attempt))
+                    Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+                        receipt,
+                        finalization,
+                        ..
+                    }) => {
+                        attempt.mark_dispatch_possible().map_err(attempt_error)?;
+                        let settled =
+                            self.finish_committed(&spec, &mut attempt, Some(receipt), finalization);
+                        if reason.execution_failure().is_some() {
+                            if let Err(error) = &settled {
+                                tracing::warn!(%error, "publication finalization failed after the selected execution failure");
+                            }
+                            // Actual publication is committed; the earlier Task
+                            // failure remains the selected SQL failure.
+                            Err(with_terminal(reason, &attempt))
+                        } else {
+                            settled
+                        }
+                    }
+                    Ok(ConnectorWriteAbortOutcome::CommitUnknown { failure, .. }) => {
+                        attempt.mark_dispatch_possible().map_err(attempt_error)?;
+                        attempt.terminal_commit_unknown().map_err(attempt_error)?;
+                        Err(with_terminal(
+                            reason.prefer_selected_execution(DmlError::commit(failure.message())),
+                            &attempt,
+                        ))
+                    }
+                    Err(message) => {
+                        attempt.mark_dispatch_possible().map_err(attempt_error)?;
+                        attempt
+                            .terminal_after_outer_failure()
+                            .map_err(attempt_error)?;
+                        Err(with_terminal(
+                            reason.prefer_selected_execution(DmlError::commit(message)),
+                            &attempt,
+                        ))
+                    }
                 }
-                Ok(ConnectorWriteAbortOutcome::KnownCommitted {
-                    receipt,
-                    finalization,
-                    ..
-                }) => {
-                    attempt.mark_dispatch_possible().map_err(attempt_error)?;
-                    self.finish_committed(&spec, &mut attempt, Some(receipt), finalization)
-                }
-                Ok(ConnectorWriteAbortOutcome::CommitUnknown { failure, .. }) => {
-                    attempt.mark_dispatch_possible().map_err(attempt_error)?;
-                    attempt.terminal_commit_unknown().map_err(attempt_error)?;
-                    Err(with_terminal(DmlError::commit(failure.message()), &attempt))
-                }
-                Err(message) => {
-                    attempt.mark_dispatch_possible().map_err(attempt_error)?;
-                    attempt
-                        .terminal_after_outer_failure()
-                        .map_err(attempt_error)?;
-                    Err(with_terminal(DmlError::commit(message), &attempt))
-                }
-            },
+            }
         }
     }
 
@@ -366,7 +374,7 @@ mod tests {
     use super::*;
 
     struct AbortRequiredExecutor {
-        code: Option<novarocks_types::EngineErrorCode>,
+        fact: novarocks_failure_contract::FailureFact,
         outcome: ConnectorWriteAbortOutcome,
         aborts: AtomicUsize,
     }
@@ -379,8 +387,9 @@ mod tests {
             _: &WriteTransactionSpec,
         ) -> Result<CoordinatedWriteReport<(), ()>, DmlError> {
             Ok(CoordinatedWriteReport::AbortRequired {
-                reason: "unsupported diagnostic".into(),
-                engine_error_code: self.code,
+                reason: DmlError::from_execution(novarocks_query_application::execution_error::ExecutionFailureInput::new(
+                    self.fact, novarocks_execution_contract::SafeDetail::truncating("unsupported diagnostic"),
+                    novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator)),
                 handle: (),
             })
         }
@@ -406,10 +415,16 @@ mod tests {
 
     #[test]
     fn staging_refusal_identity_is_restored_only_after_the_required_abort() {
-        use novarocks_types::EngineErrorCode;
-        for code in [None, Some(EngineErrorCode::UnsupportedCompiledShape)] {
+        use novarocks_failure_contract::FailureProjection;
+        for original in [
+            novarocks_plan_codec::PhysicalEncodeError::Invalid("unsupported diagnostic".into()),
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                "unsupported diagnostic".into(),
+            ),
+        ] {
+            let fact = original.failure_fact();
             let executor = AbortRequiredExecutor {
-                code,
+                fact,
                 outcome: ConnectorWriteAbortOutcome::KnownUncommitted {
                     cleanup: ExternalMutationFinalization::Complete,
                 },
@@ -420,14 +435,18 @@ mod tests {
                     .run(spec())
                     .unwrap_err();
             assert_eq!(executor.aborts.load(Ordering::SeqCst), 1);
-            assert_eq!(error.engine_error_code(), code);
+            assert_eq!(error.execution_failure().unwrap().fact(), fact);
             assert_eq!(
                 error.publication_terminal().unwrap().disposition(),
                 LakePublicationDisposition::KnownUncommitted
             );
         }
+        let fact = novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+            "unsupported diagnostic".into(),
+        )
+        .failure_fact();
         let executor = AbortRequiredExecutor {
-            code: Some(EngineErrorCode::UnsupportedCompiledShape),
+            fact,
             outcome: ConnectorWriteAbortOutcome::CommitUnknown {
                 failure: ConnectorMutationFailure::new(
                     ConnectorMutationFailureKind::Unavailable,
@@ -445,9 +464,10 @@ mod tests {
             error.publication_terminal().unwrap().disposition(),
             LakePublicationDisposition::CommitUnknown
         );
-        assert_ne!(
-            error.engine_error_code(),
-            Some(EngineErrorCode::UnsupportedCompiledShape)
+        assert_eq!(
+            error.execution_failure().unwrap().fact(),
+            fact,
+            "publication uncertainty cannot replace the original selected execution failure"
         );
     }
 
@@ -570,6 +590,180 @@ mod tests {
                 reference: None,
             },
         }
+    }
+
+    struct SelectedStageFailureExecutor {
+        input: novarocks_query_application::execution_error::ExecutionFailureInput,
+        outcome: Result<ConnectorWriteAbortOutcome, String>,
+        legacy: bool,
+        fail_finalize: bool,
+        stages: AtomicUsize,
+        aborts: AtomicUsize,
+        commits: AtomicUsize,
+        finalizations: AtomicUsize,
+    }
+    impl WriteExecutor for SelectedStageFailureExecutor {
+        type CommitHandle = ();
+        type AbortHandle = ();
+        fn run_coordinated_write(
+            &self,
+            _: &WriteTransactionSpec,
+        ) -> Result<CoordinatedWriteReport<(), ()>, DmlError> {
+            self.stages.fetch_add(1, Ordering::SeqCst);
+            Ok(CoordinatedWriteReport::AbortRequired {
+                reason: if self.legacy {
+                    DmlError::executor("legacy staging rejection")
+                } else {
+                    DmlError::from_execution(self.input.clone())
+                },
+                handle: (),
+            })
+        }
+        fn abort(
+            &self,
+            _: &WriteTransactionSpec,
+            _: &(),
+        ) -> Result<ConnectorWriteAbortOutcome, String> {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+            self.outcome.clone()
+        }
+        fn commit(
+            &self,
+            _: &WriteTransactionSpec,
+            _: &(),
+        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+            self.commits.fetch_add(1, Ordering::SeqCst);
+            Err("commit must not follow AbortRequired".into())
+        }
+        fn finalize(&self, _: &WriteTransactionSpec) -> Result<(), String> {
+            self.finalizations.fetch_add(1, Ordering::SeqCst);
+            if self.fail_finalize {
+                Err("local finalization failed".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    fn selected_stage_input() -> novarocks_query_application::execution_error::ExecutionFailureInput
+    {
+        use novarocks_execution_contract::{SafeDetail, TaskFailurePhase, identity::TaskIdentity};
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite,
+        };
+        use novarocks_types::{
+            AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+        };
+        let source = novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Internal,
+            "private stage source",
+        );
+        let identity = TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(81, 7), AttemptId::new(1).unwrap()).unwrap(),
+            StageId::new(1).unwrap(),
+            TaskId::new(2).unwrap(),
+            BackendProcessId::new_v7(),
+        );
+        ExecutionFailureInput::new(
+            source.failure_fact(),
+            SafeDetail::new("Unexpected failure (reason 4:10)").unwrap(),
+            ExecutionFailureSite::Task {
+                identity,
+                phase: TaskFailurePhase::Execution,
+            },
+        )
+    }
+    fn selected_executor(
+        outcome: Result<ConnectorWriteAbortOutcome, String>,
+    ) -> SelectedStageFailureExecutor {
+        SelectedStageFailureExecutor {
+            input: selected_stage_input(),
+            outcome,
+            legacy: false,
+            fail_finalize: false,
+            stages: AtomicUsize::new(0),
+            aborts: AtomicUsize::new(0),
+            commits: AtomicUsize::new(0),
+            finalizations: AtomicUsize::new(0),
+        }
+    }
+    #[test]
+    fn selected_task_failure_survives_abort_known_committed_and_finalization() {
+        for fail_finalize in [false, true] {
+            let mut executor = selected_executor(Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+                receipt: UnknownCommitExecutor::receipt(),
+                finalization: ExternalMutationFinalization::Complete,
+            }));
+            executor.fail_finalize = fail_finalize;
+            let error =
+                StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
+                    .run(spec())
+                    .unwrap_err();
+            assert_eq!(error.execution_failure(), Some(&executor.input));
+            let terminal = error
+                .publication_terminal()
+                .expect("actual committed publication");
+            assert_eq!(
+                terminal.disposition(),
+                LakePublicationDisposition::KnownCommitted
+            );
+            assert!(terminal.do_not_retry());
+            assert_eq!(executor.stages.load(Ordering::SeqCst), 1);
+            assert_eq!(executor.aborts.load(Ordering::SeqCst), 1);
+            assert_eq!(executor.commits.load(Ordering::SeqCst), 0);
+            assert_eq!(executor.finalizations.load(Ordering::SeqCst), 1);
+        }
+    }
+    #[test]
+    fn selected_task_failure_survives_unknown_abort_and_outer_failure() {
+        for outcome in [
+            Ok(ConnectorWriteAbortOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "abort publication unknown",
+                ),
+                evidence: UnknownCommitExecutor::evidence(),
+            }),
+            Err("abort response lost".to_owned()),
+        ] {
+            let executor = selected_executor(outcome);
+            let error =
+                StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
+                    .run(spec())
+                    .unwrap_err();
+            assert_eq!(error.execution_failure(), Some(&executor.input));
+            let terminal = error
+                .publication_terminal()
+                .expect("actual unknown publication");
+            assert_eq!(
+                terminal.disposition(),
+                LakePublicationDisposition::CommitUnknown
+            );
+            assert!(terminal.do_not_retry());
+            assert_eq!(executor.stages.load(Ordering::SeqCst), 1);
+            assert_eq!(executor.aborts.load(Ordering::SeqCst), 1);
+            assert_eq!(executor.commits.load(Ordering::SeqCst), 0);
+            assert_eq!(executor.finalizations.load(Ordering::SeqCst), 0);
+        }
+    }
+    #[test]
+    fn legacy_abort_known_committed_keeps_its_original_success_verdict() {
+        let mut executor = selected_executor(Ok(ConnectorWriteAbortOutcome::KnownCommitted {
+            receipt: UnknownCommitExecutor::receipt(),
+            finalization: ExternalMutationFinalization::Complete,
+        }));
+        executor.legacy = true;
+        let result = StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
+            .run(spec())
+            .unwrap();
+        assert_eq!(
+            result.committed_receipt,
+            Some(UnknownCommitExecutor::receipt())
+        );
+        assert_eq!(executor.stages.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.commits.load(Ordering::SeqCst), 0);
+        assert_eq!(executor.finalizations.load(Ordering::SeqCst), 1);
     }
 
     #[test]

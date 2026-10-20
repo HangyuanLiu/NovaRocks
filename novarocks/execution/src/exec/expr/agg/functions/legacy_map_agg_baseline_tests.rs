@@ -58,11 +58,19 @@ fn spec(input: &ArrayRef, output: DataType) -> AggSpec {
         )
         .unwrap()
 }
-fn update(state: &mut MapAggState, spec: &AggSpec, input: &ArrayRef) -> Result<(), String> {
+fn update(
+    state: &mut MapAggState,
+    spec: &AggSpec,
+    input: &ArrayRef,
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let ptr = state as *mut MapAggState as AggStatePtr;
     MapAggAgg.update_batch(spec, 0, &vec![ptr; input.len()], &AggInputView::Any(input))
 }
-fn emit(state: &MapAggState, spec: &AggSpec, partial: bool) -> Result<ArrayRef, String> {
+fn emit(
+    state: &MapAggState,
+    spec: &AggSpec,
+    partial: bool,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let ptr = state as *const MapAggState as AggStatePtr;
     MapAggAgg.build_array(spec, 0, &[ptr], partial)
 }
@@ -129,14 +137,14 @@ fn legacy_map_agg_baseline_key_null_skips_value_but_duplicate_value_is_read_befo
     let tracker = MemTracker::new_root("map-prefix-original");
     let mut state = MapAggState::new(tracker.clone());
     assert_eq!(
-        update(&mut state, &s, &input).unwrap_err(),
+        (update(&mut state, &s, &input).unwrap_err()).to_string(),
         "unsupported tracked scalar type: UInt32"
     );
     assert_eq!(state.entries.len(), 1);
     assert_eq!(state.seen_keys.len(), 1);
     assert!(state.entries[0].1.is_none());
     assert_eq!(
-        emit(&state, &s, false).unwrap_err(),
+        (emit(&state, &s, false).unwrap_err()).to_string(),
         "unsupported scalar output type: UInt32"
     );
     drop(state);
@@ -255,54 +263,55 @@ fn legacy_map_agg_baseline_target_full_fields_nested_metadata_and_sorted_flag() 
 #[test]
 fn legacy_map_agg_baseline_original_view_and_spec_errors_are_exact() {
     let raw: ArrayRef = Arc::new(Int64Array::from(vec![1]));
-    assert_eq!(
-        MapAggAgg
+    crate::exec::expr::agg::functions::common::assert_plan_contract(
+        &(MapAggAgg
             .build_spec_from_type(
                 &AggFunction {
                     name: "map_agg".into(),
                     ..Default::default()
                 },
                 None,
-                false
+                false,
             )
-            .unwrap_err(),
-        "map_agg input type missing"
+            .unwrap_err()),
+        &"map_agg input type missing",
     );
-    assert_eq!(
-        MapAggAgg
+    crate::exec::expr::agg::functions::common::assert_plan_contract(
+        &(MapAggAgg
             .build_spec_from_type(
                 &AggFunction {
                     name: "map_agg".into(),
                     ..Default::default()
                 },
                 Some(raw.data_type()),
-                false
+                false,
             )
-            .unwrap_err(),
-        "map_agg expects struct input, got Int64"
+            .unwrap_err()),
+        &"map_agg expects struct input, got Int64",
     );
     let input = packed(raw.clone(), raw.clone(), None);
     let mut s = spec(&input, target(DataType::Int64, DataType::Int64));
     assert_eq!(
-        MapAggAgg.build_input_view(&s, &None).err().unwrap(),
+        (MapAggAgg.build_input_view(&s, &None).err().unwrap()).to_string(),
         "map_agg input missing"
     );
     assert_eq!(
-        MapAggAgg
+        (MapAggAgg
             .build_merge_view(&s, &Some(raw.clone()))
             .err()
-            .unwrap(),
+            .unwrap())
+        .to_string(),
         "map_agg merge input must be MapArray"
     );
     let tracker = MemTracker::new_root("map-error-original");
     let mut state = MapAggState::new(tracker);
     assert_eq!(
-        update(&mut state, &s, &raw).unwrap_err(),
+        (update(&mut state, &s, &raw).unwrap_err()).to_string(),
         "map_agg expects struct input"
     );
     s.output_type = DataType::Int64;
     assert_eq!(
-        emit(&state, &s, false).unwrap_err(),
+        (emit(&state, &s, false).unwrap_err()).to_string(),
         "map_agg output type must be MAP, got Int64"
     );
 }
@@ -315,17 +324,19 @@ fn legacy_map_agg_baseline_real_allocator_refusal_rolls_back_and_tracker_is_requ
     );
     let s = spec(&input, target(DataType::Utf8, DataType::Utf8));
     let mut slot = std::mem::MaybeUninit::<MapAggState>::uninit();
-    assert_eq!(
-        MapAggAgg
+    crate::exec::expr::agg::functions::common::assert_plan_contract(
+        &(MapAggAgg
             .init_state_with_tracker(&s, slot.as_mut_ptr() as *mut u8, None)
-            .unwrap_err(),
-        "allocation-tracked map_agg requires a memory tracker"
+            .unwrap_err()),
+        &"allocation-tracked map_agg requires a memory tracker",
     );
     let tracker = MemTracker::new_root("map-refusal-original");
     tracker.install_limit_once(1).unwrap();
     let mut state = MapAggState::new(tracker.clone());
     let error = update(&mut state, &s, &input).unwrap_err();
-    assert!(error.starts_with("ResourceExhausted:"), "{error}");
+    crate::exec::expr::agg::functions::common::assert_collection_refusal::<
+        allocator_api2::collections::TryReserveError,
+    >(&error, "reserve aggregate byte value");
     assert!(state.entries.is_empty());
     assert!(state.seen_keys.is_empty());
     drop(state);
@@ -351,11 +362,9 @@ fn legacy_map_agg_baseline_lazy_full_diagnostic_uses_actual_carrier_debug() {
     let tracker = MemTracker::new_root("map-long-original");
     let mut state = MapAggState::new(tracker.clone());
     let error = update(&mut state, &s, &input).unwrap_err();
-    assert_eq!(
-        error,
-        format!("unsupported tracked scalar type: {actual_type:?}")
-    );
-    assert!(error.len() > 512);
+    let expected = format!("unsupported tracked scalar type: {actual_type:?}");
+    assert!(expected.len() > 512);
+    crate::exec::expr::agg::functions::common::assert_bounded_outer_contract(&error, &expected);
     assert!(state.entries.is_empty());
     drop(state);
     assert_eq!(tracker.current(), 0);

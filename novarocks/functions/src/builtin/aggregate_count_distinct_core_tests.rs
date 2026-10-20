@@ -30,8 +30,15 @@ unsafe impl Allocator for TestAllocator {
     }
 }
 impl ScalarStateAllocator for TestAllocator {
-    fn scalar_allocation_error(&self, operation: &str) -> ScalarStateError {
-        ScalarStateError::Legacy(operation.to_string())
+    fn scalar_allocation_error<E: crate::allocation_failure::AllocationRefusalSource>(
+        &self,
+        operation: &str,
+        source: E,
+    ) -> crate::KernelFailure {
+        crate::KernelFailure::from_domain(crate::allocation_failure::AllocationRefusal::new(
+            operation, source,
+        ))
+        .into()
     }
 }
 
@@ -149,7 +156,7 @@ fn count_distinct_core_float_bits_and_tolerant_variable_key_wire() {
         let key = encode_row(
             &input,
             row,
-            &LegacyCountReader,
+            &OwnedCountReader,
             Vec::new(),
             &mut ScalarWork::new(None),
         )
@@ -157,13 +164,13 @@ fn count_distinct_core_float_bits_and_tolerant_variable_key_wire() {
         .unwrap();
         state.insert(key).unwrap();
     }
-    assert_eq!(finalize_count(&state), 4);
+    assert_eq!(finalize_count(&state).unwrap(), 4);
     let mut bytes = serialize_set(&state, Vec::new(), &mut ScalarWork::new(None)).unwrap();
     bytes.extend_from_slice(b"trailing");
     let keys = deserialize_set(&bytes, Vec::<Vec<u8>>::new(), &mut ScalarWork::new(None)).unwrap();
     let mut merged = CountDistinctState::<TestAllocator>::new(TestAllocator);
     merge_decoded(&mut merged, keys, &mut ScalarWork::new(None)).unwrap();
-    assert_eq!(finalize_count(&merged), 4);
+    assert_eq!(finalize_count(&merged).unwrap(), 4);
 }
 #[test]
 fn count_distinct_core_one_recursive_encoder_matches_legacy_and_tracked_values() {
@@ -178,7 +185,7 @@ fn count_distinct_core_one_recursive_encoder_matches_legacy_and_tracked_values()
         let legacy = encode_row(
             &input,
             row,
-            &LegacyCountReader,
+            &OwnedCountReader,
             Vec::new(),
             &mut ScalarWork::new(None),
         )
@@ -241,7 +248,7 @@ fn count_distinct_core_variadic_tuple_is_the_original_packed_struct_key() {
         let legacy = encode_row(
             &packed,
             row,
-            &LegacyCountReader,
+            &OwnedCountReader,
             Vec::new(),
             &mut ScalarWork::new(None),
         )

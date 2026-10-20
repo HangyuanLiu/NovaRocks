@@ -23,6 +23,7 @@ novarocks-physical-plan.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-functions.workspace = true
 novarocks-memory.workspace = true
+novarocks-memory-failure.workspace = true
 novarocks-failpoint = { workspace = true, features = ["typed"] }
 novarocks-plan-codec.workspace = true
 novarocks-proto-codec.workspace = true

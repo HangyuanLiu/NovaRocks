@@ -15,36 +15,44 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+#[cfg(test)]
+use crate::exec::expr::ExprArena;
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 #[cfg(test)]
 use arrow::array::{Array, StringArray};
-use novarocks_functions::builtin::string_case::{StringCaseOp, evaluate_legacy_case};
+use novarocks_functions::builtin::string_case::{StringCaseOp, evaluate_required_case};
 #[cfg(test)]
 use std::sync::Arc;
 fn eval_lower_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    let input = arena.eval(args[0], chunk)?;
-    Ok((evaluate_legacy_case(StringCaseOp::Lower, &input))?)
+) -> ExecutionResult<ArrayRef> {
+    let [argument] = args else {
+        return Err(expression_contract(
+            "lower/lcase requires exactly one prepared argument",
+        ));
+    };
+    let input = arena.eval(*argument, chunk)?;
+    evaluate_required_case(StringCaseOp::Lower, &input).map_err(ExecutionFailure::from)
 }
 pub fn eval_lower<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_lower_impl(arena, args, chunk))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_lower_impl(arena, args, chunk)
 }
 pub fn eval_lcase<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_lower_impl(arena, args, chunk))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_lower_impl(arena, args, chunk)
 }
 #[cfg(test)]
 #[path = "legacy_string_case_baseline_tests.rs"]

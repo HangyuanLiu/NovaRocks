@@ -16,7 +16,7 @@
 // under the License.
 use super::common::{extract_date_array, extract_datetime_array};
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
 use chrono::{Datelike, NaiveDateTime, Timelike};
 use novarocks_functions::builtin::calendar_extended_shared::{
@@ -39,18 +39,22 @@ enum DiffUnit {
 }
 
 fn parse_diff_unit(unit: &str) -> Option<DiffUnit> {
-    match unit {
-        "year" => Some(DiffUnit::Years),
-        "quarter" => Some(DiffUnit::Quarters),
-        "month" => Some(DiffUnit::Months),
-        "week" => Some(DiffUnit::Weeks),
-        "day" => Some(DiffUnit::Days),
-        "hour" => Some(DiffUnit::Hours),
-        "minute" => Some(DiffUnit::Minutes),
-        "second" => Some(DiffUnit::Seconds),
-        "millisecond" => Some(DiffUnit::Milliseconds),
-        _ => None,
+    for (name, value) in [
+        ("year", DiffUnit::Years),
+        ("quarter", DiffUnit::Quarters),
+        ("month", DiffUnit::Months),
+        ("week", DiffUnit::Weeks),
+        ("day", DiffUnit::Days),
+        ("hour", DiffUnit::Hours),
+        ("minute", DiffUnit::Minutes),
+        ("second", DiffUnit::Seconds),
+        ("millisecond", DiffUnit::Milliseconds),
+    ] {
+        if unit.eq_ignore_ascii_case(name) {
+            return Some(value);
+        }
     }
+    None
 }
 
 #[inline]
@@ -176,9 +180,17 @@ fn eval_diff_unit<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     unit: DiffUnit,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     let a = extract_datetime_array(&arena.eval(args[0], chunk)?)?;
     let b = extract_datetime_array(&arena.eval(args[1], chunk)?)?;
+    if a.len() != b.len() {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "calendar difference argument lengths differ",
+            )
+            .into(),
+        );
+    }
     let mut out = Vec::with_capacity(a.len());
     for i in 0..a.len() {
         let v = match (a[i], b[i]) {
@@ -195,26 +207,44 @@ fn eval_shared_duration<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     operation: CalendarOperation,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     let left = arena.eval(args[0], chunk)?;
     let right = arena.eval(args[1], chunk)?;
     let rows = left.len();
-    Ok((evaluate_legacy_calendar(
+    evaluate_legacy_calendar(
         operation,
         &[left, right],
         &arrow::datatypes::DataType::Int64,
         rows,
-    ))?)
+    )
+    .map_err(Into::into)
 }
 
 pub fn eval_datediff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Int64)?;
+    if args.len() != 2 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "eval_datediff has an incompatible argument count",
+            )
+            .into(),
+        );
+    }
     let a = extract_date_array(&arena.eval(args[0], chunk)?)?;
     let b = extract_date_array(&arena.eval(args[1], chunk)?)?;
+    if a.len() != b.len() {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "calendar difference argument lengths differ",
+            )
+            .into(),
+        );
+    }
     let mut out = Vec::with_capacity(a.len());
     for i in 0..a.len() {
         let v = novarocks_functions::calendar_period_numeric::date_difference_days(a[i], b[i]);
@@ -225,18 +255,39 @@ pub fn eval_datediff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
 pub fn eval_date_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Int64)?;
+    if args.len() != 3 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "eval_date_diff has an incompatible argument count",
+            )
+            .into(),
+        );
+    }
     let unit_arr = arena.eval(args[0], chunk)?;
     let unit_arr = unit_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "date_diff expects unit string".to_string())?;
+        .ok_or_else(|| {
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "date_diff expects unit string",
+            )
+        })?;
     let lhs = extract_datetime_array(&arena.eval(args[1], chunk)?)?;
     let rhs = extract_datetime_array(&arena.eval(args[2], chunk)?)?;
 
+    if unit_arr.len() != lhs.len() || lhs.len() != rhs.len() {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "date_diff argument lengths differ",
+            )
+            .into(),
+        );
+    }
     let mut out = Vec::with_capacity(lhs.len());
     for i in 0..lhs.len() {
         if unit_arr.is_null(i) {
@@ -244,11 +295,13 @@ pub fn eval_date_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             continue;
         }
 
-        let Some(unit) = parse_diff_unit(&unit_arr.value(i).to_lowercase()) else {
-            return Err(
-                ("type column should be one of day/hour/minute/second/millisecond".to_string())
-                    .into(),
-            );
+        let Some(unit) = parse_diff_unit(unit_arr.value(i)) else {
+            return Err(crate::runtime::fragment::ExecutionFailure::from_domain(
+                novarocks_functions::RowDataError::new(
+                    i,
+                    "type column should be one of day/hour/minute/second/millisecond",
+                ),
+            ));
         };
 
         let v = match (lhs[i], rhs[i]) {
@@ -274,78 +327,159 @@ pub fn eval_days_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_datediff(arena, expr, args, chunk))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Int64)?;
+    if args.len() != 2 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "eval_days_diff has an incompatible argument count",
+            )
+            .into(),
+        );
+    }
+    eval_datediff(arena, expr, args, chunk)
 }
 
 pub fn eval_seconds_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_shared_duration(arena, args, chunk, CalendarOperation::SecondsDiff))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Int64)?;
+    if args.len() != 2 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "eval_seconds_diff has an incompatible argument count",
+            )
+            .into(),
+        );
+    }
+    eval_shared_duration(arena, args, chunk, CalendarOperation::SecondsDiff)
 }
 
 pub fn eval_milliseconds_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_diff_unit(arena, args, chunk, DiffUnit::Milliseconds))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Int64)?;
+    if args.len() != 2 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "eval_milliseconds_diff has an incompatible argument count",
+            )
+            .into(),
+        );
+    }
+    eval_diff_unit(arena, args, chunk, DiffUnit::Milliseconds)
 }
 
 pub fn eval_minutes_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_shared_duration(arena, args, chunk, CalendarOperation::MinutesDiff))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Int64)?;
+    if args.len() != 2 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "eval_minutes_diff has an incompatible argument count",
+            )
+            .into(),
+        );
+    }
+    eval_shared_duration(arena, args, chunk, CalendarOperation::MinutesDiff)
 }
 
 pub fn eval_hours_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_shared_duration(arena, args, chunk, CalendarOperation::HoursDiff))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Int64)?;
+    if args.len() != 2 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "eval_hours_diff has an incompatible argument count",
+            )
+            .into(),
+        );
+    }
+    eval_shared_duration(arena, args, chunk, CalendarOperation::HoursDiff)
 }
 
 pub fn eval_weeks_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_shared_duration(arena, args, chunk, CalendarOperation::WeeksDiff))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Int64)?;
+    if args.len() != 2 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "eval_weeks_diff has an incompatible argument count",
+            )
+            .into(),
+        );
+    }
+    eval_shared_duration(arena, args, chunk, CalendarOperation::WeeksDiff)
 }
 
 pub fn eval_months_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_diff_unit(arena, args, chunk, DiffUnit::Months))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Int64)?;
+    if args.len() != 2 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "eval_months_diff has an incompatible argument count",
+            )
+            .into(),
+        );
+    }
+    eval_diff_unit(arena, args, chunk, DiffUnit::Months)
 }
 
 pub fn eval_quarters_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_diff_unit(arena, args, chunk, DiffUnit::Quarters))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Int64)?;
+    if args.len() != 2 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "eval_quarters_diff has an incompatible argument count",
+            )
+            .into(),
+        );
+    }
+    eval_diff_unit(arena, args, chunk, DiffUnit::Quarters)
 }
 
 pub fn eval_years_diff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_diff_unit(arena, args, chunk, DiffUnit::Years))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Int64)?;
+    if args.len() != 2 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "eval_years_diff has an incompatible argument count",
+            )
+            .into(),
+        );
+    }
+    eval_diff_unit(arena, args, chunk, DiffUnit::Years)
 }

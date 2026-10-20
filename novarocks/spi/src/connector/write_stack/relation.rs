@@ -770,34 +770,27 @@ fn relation_schema(target_nullable: bool) -> SchemaRef {
 /// loudly rather than wrap: the value becomes the statement's user-visible
 /// affected row count.
 pub fn row_count_to_wire(rows: u64) -> Result<i64, ConnectorError> {
-    i64::try_from(rows).map_err(|_| {
-        ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "connector write row count exceeds the relation's signed carrier",
-        )
-    })
+    i64::try_from(rows)
+        .map_err(|_| super::failure::WriteCountFailure::SignedCarrier { required: rows }.into())
 }
 
-/// Widen a row count read back off the relation, rejecting a negative one.
+/// Reject a negative count from the trusted writer relation as a protocol
+/// contract violation; it is not an overflow of a user's SQL numeric value.
 pub fn row_count_from_wire(rows: i64) -> Result<u64, ConnectorError> {
-    u64::try_from(rows).map_err(|_| {
-        ConnectorError::new(
-            ConnectorErrorKind::CorruptData,
-            "connector write row count is negative",
-        )
-    })
+    u64::try_from(rows)
+        .map_err(|_| super::failure::WriteCountFailure::Negative { value: rows }.into())
 }
 
-/// Narrow a validated target ordinal into the relation's signed carrier.
+/// The sealed target profile fits the signed relation carrier. This is a
+/// build-time invariant, never a runtime memory refusal or a truncating cast.
+const _: () = assert!(
+    novarocks_connector_contract::MAX_CONNECTOR_WRITE_TARGETS > 0
+        && novarocks_connector_contract::MAX_CONNECTOR_WRITE_TARGETS - 1 <= i32::MAX as usize
+);
 pub fn target_ordinal_to_wire(
     target: crate::connector::write_stack::target::WriteTargetOrdinal,
-) -> Result<i32, ConnectorError> {
-    i32::try_from(target.get()).map_err(|_| {
-        ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "connector write target ordinal exceeds the relation's signed carrier",
-        )
-    })
+) -> i32 {
+    target.get() as i32
 }
 
 /// Read a target ordinal back off the relation, rejecting a negative or
@@ -1273,7 +1266,7 @@ mod tests {
 
         let target = crate::connector::write_stack::target::WriteTargetOrdinal::try_new(3)
             .expect("bounded ordinal");
-        assert_eq!(target_ordinal_to_wire(target).expect("narrow"), 3);
+        assert_eq!(target_ordinal_to_wire(target), 3);
         assert_eq!(
             target_ordinal_from_wire(3).expect("widen").get(),
             target.get()
@@ -1966,6 +1959,28 @@ mod borrowed_root_descriptor_tests {
         assert!(
             validate_root_write_result_schema(
                 &Schema::new(original.fields().clone()).with_metadata(attrs)
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod target_wire_boundary_tests {
+    use super::*;
+    #[test]
+    fn every_sealed_target_round_trips_through_the_signed_wire_carrier() {
+        for ordinal in 0..novarocks_connector_contract::MAX_CONNECTOR_WRITE_TARGETS {
+            let target =
+                novarocks_connector_contract::WriteTargetOrdinal::try_new(ordinal as u32).unwrap();
+            let wire = target_ordinal_to_wire(target);
+            assert_eq!(wire, ordinal as i32);
+            assert_eq!(target_ordinal_from_wire(wire).unwrap(), target);
+        }
+        assert!(target_ordinal_from_wire(-1).is_err());
+        assert!(
+            target_ordinal_from_wire(
+                novarocks_connector_contract::MAX_CONNECTOR_WRITE_TARGETS as i32
             )
             .is_err()
         );

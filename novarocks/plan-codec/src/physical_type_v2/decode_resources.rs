@@ -1012,7 +1012,11 @@ mod tests {
             assert!(events.len() < 2, "callback after first refusal");
             let at = events.len();
             events.push(units);
-            if at == 1 { Err(self.cause) } else { Ok(()) }
+            if at == 1 {
+                Err(self.cause.clone())
+            } else {
+                Ok(())
+            }
         }
     }
     #[test]

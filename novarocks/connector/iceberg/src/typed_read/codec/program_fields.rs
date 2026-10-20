@@ -722,7 +722,7 @@ mod tests {
             let mut trace = self.trace.lock().unwrap();
             let index = trace.len();
             trace.push(units);
-            if let Some((stop, cause)) = self.stop
+            if let Some((stop, cause)) = self.stop.clone()
                 && stop == index
             {
                 return Err(cause);
@@ -1291,7 +1291,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(error, Failure::Provider(error) if error.kind() == ConnectorCodecErrorKind::Unsupported)
+            matches!(error, Failure::Provider(error) if error.kind() == &ConnectorCodecErrorKind::Unsupported)
         );
     }
 
@@ -1453,7 +1453,7 @@ mod tests {
             for at in [0, quantum, tail] {
                 let control = Control {
                     trace: Mutex::default(),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 assert!(
                     matches!(run(&relation, columns, &public, &control), Err(Failure::Control(actual)) if actual == cause)
@@ -1481,7 +1481,7 @@ mod tests {
         let public = physical_public(vec![Arc::new(Field::new("bucket", DataType::Int32, true))]);
         assert!(
             matches!(run(&system(), &[column], &public, &Control::default()),
-            Err(Failure::Provider(error)) if error.kind() == ConnectorCodecErrorKind::Unsupported)
+            Err(Failure::Provider(error)) if error.kind() == &ConnectorCodecErrorKind::Unsupported)
         );
     }
 
@@ -1614,7 +1614,7 @@ mod tests {
             for at in [0, quantum, tail] {
                 let control = Control {
                     trace: Mutex::default(),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 assert!(
                     matches!(run(&relation,&columns,&public,&control),Err(Failure::Control(actual)) if actual==cause)
@@ -1652,7 +1652,7 @@ mod tests {
             let at = trace.len() - 1;
             let control = Control {
                 trace: Mutex::default(),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(run(&relation,&[],&public,&control),Err(Failure::Control(actual)) if actual==cause)

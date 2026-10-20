@@ -89,8 +89,12 @@ impl Chunk {
             )
             })?,
         )?;
-        let batch = arrow::compute::filter_record_batch(self.record_batch(), mask)
-            .map_err(|error| format!("filter expression input: {error}"))?;
+        let batch =
+            arrow::compute::filter_record_batch(self.record_batch(), mask).map_err(|source| {
+                crate::runtime::fragment::ExecutionFailure::from_domain(EvaluationFilterFailure(
+                    source,
+                ))
+            })?;
         owner.observe(0, &[], ArrayNormalizationStep::OpaqueOperationFinished)?;
         let source_storage = self.source_storage_lifetime_observed::<ConstructionFailure>(
             owner.storage_lifetime(),
@@ -114,5 +118,26 @@ impl Chunk {
         };
         output.retain_source_buffer_funding(self);
         Ok(output)
+    }
+}
+
+#[derive(Debug)]
+struct EvaluationFilterFailure(arrow::error::ArrowError);
+impl std::fmt::Display for EvaluationFilterFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "filter expression input: {}", self.0)
+    }
+}
+impl std::error::Error for EvaluationFilterFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for EvaluationFilterFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::FilterArrow.reason(),
+        )
     }
 }

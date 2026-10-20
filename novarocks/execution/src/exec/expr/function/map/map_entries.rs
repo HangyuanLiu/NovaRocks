@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 
 pub fn eval_map_entries<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -23,7 +24,13 @@ pub fn eval_map_entries<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    let map_arr = arena.eval(args[0], chunk)?;
-    Ok((novarocks_functions::builtin::map_entries_core::project(&map_arr, arena.data_type(expr)))?)
+) -> ExecutionResult<ArrayRef> {
+    let [argument] = args else {
+        return Err(expression_contract(
+            "map_entries requires exactly one prepared argument",
+        ));
+    };
+    let map_arr = arena.eval(*argument, chunk)?;
+    novarocks_functions::builtin::map_entries_core::project(&map_arr, arena.data_type(expr))
+        .map_err(ExecutionFailure::from)
 }

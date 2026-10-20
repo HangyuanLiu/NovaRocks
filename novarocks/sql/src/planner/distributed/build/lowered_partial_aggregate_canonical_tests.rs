@@ -200,7 +200,7 @@ fn verify_update_and_final(owner: &SqlAuthoredPhysicalPlan) {
         ] {
             let control = Control {
                 trace: Default::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             let invoke = || {
                 let mut work =
@@ -576,7 +576,7 @@ fn partial_success_layout_source_and_late_nullable_state_compatibility_keep_orig
             ] {
                 let control = Control {
                     trace: Default::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert!(
                     matches!(authored(source, &control), Err(ContractLoweringError::Control(actual)) if actual == cause)

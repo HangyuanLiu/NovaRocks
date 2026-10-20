@@ -189,7 +189,7 @@ mod tests {
         fn request_layout(&mut self, layout: Layout) -> Result<(), Refusal> {
             let ordinal = self.calls;
             self.calls += 1;
-            if let Some((stop, cause)) = self.stop {
+            if let Some((stop, cause)) = self.stop.clone() {
                 if stop == ordinal {
                     return Err(Refusal::Control(cause));
                 }
@@ -280,7 +280,7 @@ mod tests {
                     exits.clone(),
                     held.clone(),
                 );
-                scope.stop = cause.map(|reason| (stop, reason));
+                scope.stop = cause.clone().map(|reason| (stop, reason));
                 let result = FilterOrderKeys::try_single_observed(
                     key(exits.clone()),
                     scope.storage_lifetime(),

@@ -251,6 +251,7 @@ fn date_float_selected_row_error_preserves_full_original_message_and_excludes_in
         {
             CastRowResult::RowError(e) => {
                 assert_eq!(e.selected_ordinal(), 23);
+                assert_eq!(e.reason(), crate::DataFailureReason::NumericOutOfRange);
                 assert_eq!(
                     e.message(),
                     format!(

@@ -426,7 +426,7 @@ fn evaluate(
 }
 fn compare_executed_invocation_error(
     selected: &[usize],
-    batch_error: &str,
+    batch_error: &ReferenceFailure,
     pure: &PureSelection,
     probes: &[host::TemporalInvocationDataProbe],
     found: &mut Vec<String>,
@@ -436,7 +436,19 @@ fn compare_executed_invocation_error(
         ..Default::default()
     };
     // This entry is legal only after the actual phase produced InvocationData.
+    let Some((reference_fact, _)) = batch_error.original() else {
+        found.push(format!(
+            "temporal reference has no runtime domain fact: {batch_error}"
+        ));
+        return outcome;
+    };
     for probe in probes {
+        if reference_fact != probe.fact {
+            found.push(format!(
+                "temporal invocation Data reasons differ: reference {reference_fact:?}, pure {:?}",
+                probe.fact
+            ));
+        }
         if probe.invocation_rows != selected {
             found.push(
                 "this root-call differential encountered a different current invocation domain"
@@ -445,7 +457,7 @@ fn compare_executed_invocation_error(
         }
         if probe.stage != 2
             || probe.shape != novarocks_type_contract::TemporalSourceShape::SecondsCastOther
-            || probe.message != batch_error
+            || probe.message != batch_error.to_string()
         {
             found.push(format!("executed InvocationData differs from full legacy batch error: {probe:?}; {batch_error}"));
         }

@@ -712,7 +712,7 @@ impl PureCompileControl for Trace {
         events.push((phase, units));
         if self.at == Some(at) {
             self.refused.store(true, Ordering::SeqCst);
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -738,7 +738,7 @@ fn repeat_full_compiler_preserves_every_original_control_prefix_and_ordinary_tai
             CompileControlError::ResourceExhausted,
         ] {
             for at in 0..expected.len() {
-                let control = Trace::new(Some(at), cause);
+                let control = Trace::new(Some(at), cause.clone());
                 assert!(
                     matches!(compile(&fixture, &functions, &control), Err(FragmentCompileError::Control(actual)) if actual == cause)
                 );
@@ -774,7 +774,7 @@ fn repeat_wide_actual_grouping_work_has_entry_quantum_tail_refusal_without_repla
         CompileControlError::ResourceExhausted,
     ] {
         for at in [0, quantum, expected.len() - 1] {
-            let control = Trace::new(Some(at), cause);
+            let control = Trace::new(Some(at), cause.clone());
             assert!(
                 matches!(compile(&fixture, &functions, &control), Err(FragmentCompileError::Control(actual)) if actual == cause)
             );

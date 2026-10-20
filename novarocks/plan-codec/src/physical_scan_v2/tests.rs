@@ -66,7 +66,7 @@ struct Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
-        let (active, stop) = *self.state.lock().unwrap();
+        let (active, stop) = self.state.lock().unwrap().clone();
         if !active {
             return Ok(());
         }
@@ -1067,7 +1067,7 @@ fn scan_every_small_original_control_prefix_and_real_wide_quantum_are_primary() 
                     assert!(trace.last().is_some_and(|(_, u)| *u > 0));
                     for at in 0..trace.len() {
                         for cause in CAUSES {
-                            c.arm(Some((at, cause)));
+                            c.arm(Some((at, cause.clone())));
                             assert!(matches!(invoke(),Err(Error::Control(actual))if actual==cause));
                             assert_eq!(c.trace(), trace[..=at]);
                         }
@@ -1092,7 +1092,7 @@ fn scan_every_small_original_control_prefix_and_real_wide_quantum_are_primary() 
             let trace = c.trace();
             let at = trace.iter().position(|(_, u)| *u == 256).unwrap();
             for cause in CAUSES {
-                c.arm(Some((at, cause)));
+                c.arm(Some((at, cause.clone())));
                 assert!(
                     matches!(encode_scan_node(&node,relations,values,expressions,SOURCE,limits()),Err(Error::Control(actual))if actual==cause)
                 );
@@ -1108,7 +1108,7 @@ fn scan_every_small_original_control_prefix_and_real_wide_quantum_are_primary() 
             let trace = c.trace();
             let at = trace.iter().position(|(_, u)| *u == 256).unwrap();
             for cause in CAUSES {
-                c.arm(Some((at, cause)));
+                c.arm(Some((at, cause.clone())));
                 assert!(
                     matches!(decode_scan_node(&raw,rdrelations,rdexpr,SOURCE,limits()),Err(Error::Control(actual))if actual==cause)
                 );
@@ -1208,7 +1208,7 @@ fn scan_parent_actual_loans_exact_axes_and_all_small_control_prefixes() {
                 }
                 for at in 0..trace.len() {
                     for cause in CAUSES {
-                        c.arm(Some((at, cause)));
+                        c.arm(Some((at, cause.clone())));
                         assert!(
                             matches!(run(limits(), &mut vec![]), Err(Error::Control(actual)) if actual == cause)
                         );
@@ -1392,7 +1392,7 @@ fn scan_parent_ordinary_tail_and_real_320_residual_occurrences() {
             let trace = c.trace();
             for at in 0..trace.len() {
                 for cause in CAUSES {
-                    c.arm(Some((at, cause)));
+                    c.arm(Some((at, cause.clone())));
                     assert!(matches!(run(), Err(Error::Control(actual)) if actual == cause));
                     assert_eq!(c.trace(), trace[..=at]);
                 }

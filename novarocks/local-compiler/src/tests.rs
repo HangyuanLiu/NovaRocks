@@ -50,7 +50,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push(units);
-        if let Some((error, refusal)) = self.refusal {
+        if let Some((error, refusal)) = self.refusal.clone() {
             let refuse = match refusal {
                 Refuse::Entry => trace.len() == 1,
                 Refuse::Call(index) => trace.len() == index,
@@ -910,7 +910,7 @@ fn entry_private_quantum_and_final_publication_keep_all_three_control_categories
         let c = catalogue(&p, true, true);
         let control = Control {
             trace: Mutex::default(),
-            refusal: Some((cause, Refuse::Entry)),
+            refusal: Some((cause.clone(), Refuse::Entry)),
         };
         assert!(
             matches!(validate_fragment_providers(Arc::clone(&package),&c,&control),Err(ProviderPreparationError::Control(error)) if error==cause)
@@ -919,7 +919,7 @@ fn entry_private_quantum_and_final_publication_keep_all_three_control_categories
         assert_eq!(p.writes.load(Ordering::Relaxed), 0);
         let control = Control {
             trace: Mutex::default(),
-            refusal: Some((cause, Refuse::Call(successful_trace.len()))),
+            refusal: Some((cause.clone(), Refuse::Call(successful_trace.len()))),
         };
         assert!(
             matches!(validate_fragment_providers(Arc::clone(&package),&c,&control),Err(ProviderPreparationError::Control(error)) if error==cause)
@@ -930,7 +930,7 @@ fn entry_private_quantum_and_final_publication_keep_all_three_control_categories
         let wide = checked_package(Some("alpha"), 1, 320, None, false);
         let control = Control {
             trace: Mutex::default(),
-            refusal: Some((cause, Refuse::Quantum)),
+            refusal: Some((cause.clone(), Refuse::Quantum)),
         };
         assert!(
             matches!(validate_fragment_providers(wide,&c,&control),Err(ProviderPreparationError::Control(error)) if error==cause)
@@ -946,7 +946,7 @@ fn private_primary_control_is_not_rechecked_or_replaced_and_writer_is_not_called
         let port = Port::new("alpha", Behavior::ObservePrivate);
         let control = Control {
             trace: Mutex::default(),
-            refusal: Some((cause, Refuse::Private)),
+            refusal: Some((cause.clone(), Refuse::Private)),
         };
         assert!(
             matches!(validate_fragment_providers(Arc::clone(&package),&catalogue(&port,true,true),&control),Err(ProviderPreparationError::Control(error)) if error==cause)
@@ -964,7 +964,7 @@ fn writer_private_primary_control_keeps_the_cause_after_compiled_read_work() {
         let port = Port::new("alpha", Behavior::ObserveWritePrivate);
         let control = Control {
             trace: Mutex::default(),
-            refusal: Some((cause, Refuse::Private)),
+            refusal: Some((cause.clone(), Refuse::Private)),
         };
         assert!(
             matches!(validate_fragment_providers(Arc::clone(&package), &catalogue(&port,true,true), &control),
@@ -990,7 +990,7 @@ fn ordinary_node_error_observes_stage_tail_and_tail_control_stays_fatal() {
     for cause in causes() {
         let control = Control {
             trace: Mutex::default(),
-            refusal: Some((cause, Refuse::Call(trace.len()))),
+            refusal: Some((cause.clone(), Refuse::Call(trace.len()))),
         };
         assert!(
             matches!(validate_fragment_providers(Arc::clone(&package),&catalog,&control),Err(ProviderPreparationError::Control(error)) if error==cause)

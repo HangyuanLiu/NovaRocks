@@ -26,7 +26,7 @@ impl ScanRangeParams {
                 FieldPath::root("scan_range_params")
                     .field("range")
                     .append_segments(error.path().segments().iter().skip(1).cloned()),
-                error.kind(),
+                error.kind().clone(),
                 error.detail(),
             )
         })?;
@@ -195,7 +195,7 @@ mod tests {
     fn rejects_missing_range_and_file_format_at_their_wire_paths() {
         let missing_range = ScanRangeParams::parse(novarocks::ScanRangeParams::default())
             .expect_err("range is required");
-        assert_eq!(missing_range.kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(missing_range.kind(), &ProtocolErrorKind::InvalidValue);
         assert_eq!(missing_range.path().to_string(), "scan_range_params.range");
 
         let missing_kind =

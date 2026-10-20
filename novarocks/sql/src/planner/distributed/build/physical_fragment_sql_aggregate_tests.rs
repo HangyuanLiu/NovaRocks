@@ -36,7 +36,7 @@ impl PureCompileControl for Control {
             assert!(index <= stop, "callback after originating control refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == index => Err(cause),
             _ => Ok(()),
         }
@@ -123,7 +123,59 @@ fn prefixes(
     let result = invoke(&control);
     assert_eq!(result.is_ok(), success, "{result:?}");
     let expected = control.trace.into_inner().unwrap();
-    assert!(expected.len() >= 2);
+    assert_eq!(
+        expected.first(),
+        Some(&(CompilePhase::FunctionSpecialization, 0))
+    );
+    if success {
+        assert!(expected.len() >= 2);
+        assert!(expected.iter().any(|(_, units)| *units > 0));
+    } else {
+        let original = result.unwrap_err();
+        if matches!(
+            &original,
+            PhysicalFragmentEffectsError::InvalidSource(
+                "SQL aggregate composition loans a foreign plan, pool or parameter source"
+            )
+        ) {
+            // Identity is rejected before the first bounded flush. These two
+            // pending source checks do not authorize a later error footer.
+            assert_eq!(expected, [(CompilePhase::FunctionSpecialization, 0)]);
+        }
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = Control {
+                trace: Default::default(),
+                refusal: Some((expected.len(), cause)),
+            };
+            let actual = invoke(&control).unwrap_err();
+            match (&actual, &original) {
+                (
+                    PhysicalFragmentEffectsError::InvalidSource(actual),
+                    PhysicalFragmentEffectsError::InvalidSource(original),
+                ) => assert_eq!(actual, original),
+                (
+                    PhysicalFragmentEffectsError::MissingScope(actual),
+                    PhysicalFragmentEffectsError::MissingScope(original),
+                ) => assert_eq!(actual, original),
+                (
+                    PhysicalFragmentEffectsError::Aggregate(
+                        PhysicalAggregateOccurrenceError::InvalidSource(actual),
+                    ),
+                    PhysicalFragmentEffectsError::Aggregate(
+                        PhysicalAggregateOccurrenceError::InvalidSource(original),
+                    ),
+                ) => assert_eq!(actual, original),
+                _ => panic!(
+                    "different original SQL composition refusal: {actual:?}; expected {original:?}"
+                ),
+            }
+            assert_eq!(*control.trace.lock().unwrap(), expected);
+        }
+    }
     for index in 0..expected.len() {
         for cause in [
             CompileControlError::Cancelled,
@@ -132,7 +184,7 @@ fn prefixes(
         ] {
             let control = Control {
                 trace: Default::default(),
-                refusal: Some((index, cause)),
+                refusal: Some((index, cause.clone())),
             };
             assert!(
                 matches!(invoke(&control), Err(PhysicalFragmentEffectsError::Control(actual)) if actual == cause)

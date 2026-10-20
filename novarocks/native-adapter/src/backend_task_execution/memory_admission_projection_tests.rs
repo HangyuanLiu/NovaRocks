@@ -59,11 +59,16 @@ fn mem_a1_v2_actual_none_metadata_refusal_uses_existing_task_resource_category()
             CapacityError::MetadataExhausted { .. }
         ))
     ));
-    let full = format!("task {identity} could not be admitted: {error}");
-    let projected = memory_admission_failure_to_host(identity, &error);
+
+    let expected = novarocks_execution_contract::failure::FailureProjection::failure_fact(&error);
+    let projected = memory_admission_failure_to_host(identity, error);
+    assert_eq!(
+        novarocks_execution_contract::failure::FailureProjection::failure_fact(&projected),
+        expected
+    );
     assert_eq!(projected.category(), TaskFailureCategory::ResourceExhausted);
-    // The real metadata diagnostic fits the existing bounded task vocabulary.
-    assert_eq!(projected.detail().as_str(), full);
+    assert!(projected.detail().as_str().len() <= 512);
+    assert!(std::error::Error::source(&projected).is_some());
 }
 
 #[test]
@@ -108,10 +113,15 @@ fn read_schema_construction_failure_keeps_resource_and_local_model_categories() 
         ),
     ] {
         let cause = CompiledPackageError::Decode(PackageDecodeError::Scan(scan));
-        let detail = format!("task {identity} package could not be compiled: {cause}");
+        use novarocks_execution_contract::failure::FailureProjection;
+        let expected = cause.failure_fact();
         let projected = compiled_package_rejection(identity, cause);
         assert_eq!(projected.category(), category);
-        assert_eq!(projected.detail().as_str(), detail);
+        assert_eq!(projected.failure_fact(), expected);
+        let original = crate::backend_test_support::find_source::<ReadScanCodecError>(&projected)
+            .expect("actual scan codec source, not a reconstructed summary");
+        assert_eq!(original.failure_fact(), expected);
+        assert!(projected.detail().as_str().len() <= 512);
     }
 }
 
@@ -133,7 +143,7 @@ fn actual_schema_tracker_refusal_is_projected_as_resource_without_text_inference
     let failure = ExecutionFailure::from(cause);
     assert_eq!(failure.to_string(), original);
     assert_eq!(
-        super::failure_cause_category(failure.cause(), TaskFailureCategory::Execution),
+        super::failure_category(failure.cause()),
         TaskFailureCategory::ResourceExhausted
     );
 }

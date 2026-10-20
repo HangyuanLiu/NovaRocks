@@ -1439,3 +1439,20 @@ impl TypedSchemaMaterializations {
         SchemaMetadataMaterializations::from_materialized_owners(schema, loans.into())
     }
 }
+
+impl std::fmt::Display for MetadataMaterializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ValueType(source) => source.fmt(f),
+            source => write!(f, "metadata materialization refused: {source:?}"),
+        }
+    }
+}
+impl std::error::Error for MetadataMaterializationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ValueType(source) => Some(source),
+            _ => None,
+        }
+    }
+}

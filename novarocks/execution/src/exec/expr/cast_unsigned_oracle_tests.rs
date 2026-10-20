@@ -32,7 +32,7 @@ fn legacy(
     target: DataType,
     allow: bool,
     policy: DecimalOverflowPolicy,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let ty = FunctionValueType::new(source.data_type().clone(), true);
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![ty.try_to_field("source").unwrap()])),
@@ -274,8 +274,16 @@ fn legacy_unsigned_cast_float_exclusive_bounds_keep_negative_fraction_and_throw_
             for value in [-1.0, max_p1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
                 let source: ArrayRef = Arc::new(Float64Array::from(vec![Some(value), None]));
                 let error = legacy(source, target.clone(), true, policy).unwrap_err();
-                assert!(error.starts_with("Expr evaluate meet error: CAST failed:"));
-                assert!(error.contains(&format!("conflict with range of {name}")));
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with("Expr evaluate meet error: CAST failed:")
+                );
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("conflict with range of {name}"))
+                );
             }
             let source: ArrayRef = Arc::new(Float64Array::from(vec![
                 Some(-0.5),

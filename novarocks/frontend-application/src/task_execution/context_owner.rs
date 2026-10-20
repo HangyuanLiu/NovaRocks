@@ -603,9 +603,12 @@ impl QueryContextOwner {
         }
         if let Some(outcome) = ack.worker_outcome() {
             return Err(TaskExecutionError::OperationFailed {
+                context: self.context,
+                operation_id: ack.operation_id(),
                 kind: OperationKind::QuiesceQueryContext,
-                outcome,
-                detail: ack.detail().map(|detail| detail.as_str().to_owned()),
+                rejection: ack
+                    .worker_header()
+                    .expect("a checked Worker verdict has its original branch"),
             });
         }
         Err(TaskExecutionError::DispatchRejected {
@@ -823,9 +826,12 @@ impl QueryContextOwner {
                 });
             };
             return Err(TaskExecutionError::OperationFailed {
+                context: self.context,
+                operation_id: ack.operation_id(),
                 kind: OperationKind::AcquireQueryContextAdmissionTicket,
-                outcome,
-                detail: ack.detail().map(|detail| detail.as_str().to_owned()),
+                rejection: ack
+                    .worker_header()
+                    .expect("a checked Worker verdict has its original branch"),
             });
         }
         let AckPayload::AdmissionTicket(receipt) = ack.payload() else {
@@ -838,11 +844,16 @@ impl QueryContextOwner {
         if receipt.valid_for() != released.request.valid_for() {
             self.fail_admission();
             return Err(TaskExecutionError::OperationFailed {
+                context: self.context,
+                operation_id: ack.operation_id(),
                 kind: OperationKind::AcquireQueryContextAdmissionTicket,
-                outcome: OperationOutcome::DomainConflict,
-                detail: Some(
-                    "the admission ticket validity differs from the exact request".to_owned(),
-                ),
+                rejection: novarocks_execution_contract::operation::OperationResult::Verdict {
+                    outcome: OperationOutcome::DomainConflict,
+                    detail: Some(novarocks_execution_contract::SafeDetail::truncating(
+                        "the admission ticket validity differs from the exact request",
+                    )),
+                    acknowledgement: None,
+                },
             });
         }
         let conservative_expiry = released
@@ -915,9 +926,14 @@ impl QueryContextOwner {
             ))?;
             if lease.sequence() != released_sequence {
                 return Err(TaskExecutionError::OperationFailed {
+                    context: self.context,
+                    operation_id: ack.operation_id(),
                     kind: OperationKind::UpdateQueryContext,
-                    outcome: OperationOutcome::DomainConflict,
-                    detail: ack.detail().map(|d| d.as_str().to_owned()),
+                    rejection: novarocks_execution_contract::operation::OperationResult::Verdict {
+                        outcome: OperationOutcome::DomainConflict,
+                        detail: ack.detail().cloned(),
+                        acknowledgement: None,
+                    },
                 });
             }
             // The schedule comes from the frontend-local send time plus the
@@ -943,11 +959,7 @@ impl QueryContextOwner {
                         ContextTransition::Apply(state) => self.state = state,
                         ContextTransition::Idempotent => {}
                         _ => {
-                            return Err(TaskExecutionError::OperationFailed {
-                                kind: OperationKind::UpdateQueryContext,
-                                outcome: OperationOutcome::InvalidStateOrRequest,
-                                detail: ack.detail().map(|d| d.as_str().to_owned()),
-                            });
+                            return Err(TaskExecutionError::OperationFailed{context:self.context,operation_id:ack.operation_id(),kind:OperationKind::UpdateQueryContext,rejection:novarocks_execution_contract::operation::OperationResult::Verdict{outcome:OperationOutcome::InvalidStateOrRequest,detail:ack.detail().cloned(),acknowledgement:None}});
                         }
                     }
                 }
@@ -992,14 +1004,20 @@ impl QueryContextOwner {
         self.released = true;
         if is_establish {
             return Err(TaskExecutionError::PreReadyEstablishRejected {
-                backend: self.context.backend_process_id(),
-                outcome,
+                context: self.context,
+                operation_id: ack.operation_id(),
+                rejection: ack
+                    .worker_header()
+                    .expect("the original Worker verdict was checked"),
             });
         }
         Err(TaskExecutionError::OperationFailed {
+            context: self.context,
+            operation_id: ack.operation_id(),
             kind: OperationKind::UpdateQueryContext,
-            outcome,
-            detail: ack.detail().map(|d| d.as_str().to_owned()),
+            rejection: ack
+                .worker_header()
+                .expect("a checked Worker verdict has its original branch"),
         })
     }
 

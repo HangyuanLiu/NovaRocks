@@ -106,15 +106,27 @@ fn original_zero(partial: bool, direct: bool, inputs: &[Chunk]) -> (Chunk, Arc<M
         state.error_state(),
     ));
     operator.prepare().expect("prepare original aggregate");
-    let processor = operator.as_processor_mut().unwrap();
+    let mut processor =
+        crate::exec::pipeline::test_driver::TestDriver::new(operator.as_mut(), &state);
     for input in inputs {
-        processor.push_chunk(&state, input.clone()).unwrap();
+        processor.input_without_output(input.clone()).unwrap();
     }
-    processor.set_finishing(&state).unwrap();
-    let result = processor.pull_chunk(&state).unwrap().unwrap();
+    processor.signal_eos().unwrap();
+    let result = processor
+        .advance_to_boundary()
+        .map(|step| step.output)
+        .unwrap()
+        .unwrap();
     assert_eq!(result.len(), 1);
     assert!(result.record_batch().columns().is_empty());
-    assert!(processor.pull_chunk(&state).unwrap().is_none());
+    assert!(
+        processor
+            .advance_to_boundary()
+            .map(|step| step.output)
+            .unwrap()
+            .is_none()
+    );
+    drop(processor);
     drop(operator);
     assert!(
         tracker.current() > 0,

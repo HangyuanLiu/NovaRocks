@@ -42,7 +42,7 @@ impl PureCompileControl for Control {
             );
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((at, cause)) if trace.len() == at => Err(cause),
             _ => Ok(()),
         }
@@ -345,7 +345,7 @@ fn long_literal_type_sharing_preserves_each_actual_handle_copy_control_prefix() 
         for at in 1..=trace.len() {
             let control = Control {
                 trace: Mutex::new(vec![]),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(project(&value,&source,&control),Err(ExpressionLoweringError::Control(actual)) if actual==cause)
@@ -374,7 +374,7 @@ fn completed_mismatch_tail_observes_control_before_returning_data_error() {
         for at in 1..=trace.len() {
             let control = Control {
                 trace: Mutex::new(vec![]),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(project(&value,&source,&control),Err(ExpressionLoweringError::Control(actual)) if actual==cause)

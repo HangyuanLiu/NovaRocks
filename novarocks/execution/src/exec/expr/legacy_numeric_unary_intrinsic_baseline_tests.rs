@@ -49,7 +49,10 @@ fn zero(t: &DataType) -> LiteralValue {
         _ => panic!("fixture only covers original native zero admission"),
     }
 }
-fn actual(input: ArrayRef, allow: bool) -> Result<ArrayRef, String> {
+fn actual(
+    input: ArrayRef,
+    allow: bool,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let t = input.data_type().clone();
     let ty = FunctionValueType::new(t.clone(), true);
     let batch = RecordBatch::try_new(
@@ -110,11 +113,12 @@ fn numeric_unary_raw_small_integer_minimum_casts_to_null_not_wrapping() {
 fn numeric_unary_raw_int64_minimum_original_arrow_full_error() {
     for allow in [false, true] {
         assert_eq!(
-            actual(
+            (actual(
                 Arc::new(Int64Array::from(vec![None, Some(i64::MIN)])),
                 allow
             )
-            .unwrap_err(),
+            .unwrap_err())
+            .to_string(),
             "Arithmetic overflow: Overflow happened on: 0 - -9223372036854775808"
         );
         let out = actual(

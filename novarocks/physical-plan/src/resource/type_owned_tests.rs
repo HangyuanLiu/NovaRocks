@@ -48,7 +48,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after type refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -398,7 +398,7 @@ fn every_actual_small_success_and_ordinary_type_callback_preserves_three_causes(
         for at in 0..trace.len() {
             for cause in CAUSES {
                 let control = Control {
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 assert!(
@@ -516,7 +516,7 @@ fn actual_metadata_take_257_has_real_quantum_and_keeps_original_overlimit_law() 
     for at in [0, quantum, trace.len() - 1] {
         for cause in CAUSES {
             let control = Control {
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(matches!(run_raw(&ty,source,OPEN,&control),
@@ -578,7 +578,7 @@ fn all_owned_axes_exact_replay_and_saturated_original_usage_remain_distinct() {
     .unwrap();
     work.finish().unwrap();
     assert_eq!(resources.facts(), ControlOwnedResourceFacts::default());
-    assert!(errors.errors.is_empty());
+    assert!(errors.is_empty());
     assert_eq!(control.trace(), [0, 0]);
 }
 

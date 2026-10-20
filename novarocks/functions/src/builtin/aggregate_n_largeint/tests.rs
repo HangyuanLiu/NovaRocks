@@ -396,6 +396,15 @@ fn null_limit_before_null_value_is_full_data_and_retains_its_domain_until_last_c
             data.message(),
             "update aggregate state: min_n/max_n limit cannot be null"
         );
+        {
+            use novarocks_failure_contract::FailureProjection;
+            let source = data.original_source().expect("the actual NULL limit cause");
+            assert_eq!(
+                source.failure_fact(),
+                crate::DataFailureReason::InvalidValue.failure_fact()
+            );
+            assert_eq!(data.failure_fact(), source.failure_fact());
+        }
         assert_eq!(data.input_rows(), &[1]);
         assert_eq!(data.state_indices(), &[0]);
         assert_eq!(data.batch_rows(), 2);
@@ -530,7 +539,7 @@ fn payload(tag: u8, body: &[u8]) -> ArrayRef {
 }
 
 #[test]
-fn all_original_merge_tags_survive_intermediate_and_incompatible_final_is_late_data() {
+fn all_original_merge_tags_survive_intermediate_and_incompatible_final_is_late_contract() {
     let cases = [
         (1, vec![1]),
         (2, 7_i64.to_le_bytes().to_vec()),
@@ -573,14 +582,16 @@ fn all_original_merge_tags_survive_intermediate_and_incompatible_final_is_late_d
             } else {
                 let attempts_before = host.ledger.lock().unwrap().attempts;
                 let error = emit(&final_kernel, &target, &host).unwrap_err();
-                let EvaluationFailure::InvocationData(data) = error else {
-                    panic!("late full Data required")
+                let EvaluationFailure::Kernel(cause) = error else {
+                    panic!("incompatible frozen output is an outer contract failure")
                 };
+                use novarocks_failure_contract::{FailureClass, FailureProjection};
+                assert_eq!(cause.failure_fact().class(), FailureClass::Invariant);
+                assert_eq!(cause.failure_fact().reason().code(), 315);
                 assert_eq!(
-                    data.message(),
-                    "build aggregate final output: scalar output type mismatch for LargeInt"
+                    cause.to_string(),
+                    "scalar output type mismatch for LargeInt"
                 );
-                assert_eq!(data.state_indices(), &[0]);
                 assert!(target.failed.get());
                 // The original conversion runs only after whole-emission admission.
                 assert!(host.ledger.lock().unwrap().attempts >= attempts_before + 2);
@@ -946,4 +957,58 @@ fn original_empty_binary_builder_capacities_are_an_upgrade_sensitive_budget_fact
     assert_eq!(data.buffers()[0].capacity(), 1025 * size_of::<i32>());
     assert_eq!(data.buffers()[1].capacity(), 1024);
     assert_eq!(array.len(), 0);
+}
+
+#[test]
+fn a_real_null_limit_origin_survives_a_refused_diagnostic_and_keeps_both_typed_sources() {
+    use crate::builtin::aggregate_n_largeint_operation::{NDiagnosticFailure, project_failure};
+    use novarocks_failure_contract::FailureProjection;
+    use std::error::Error;
+    let host = Arc::new(Host::default());
+    let weak_host = Arc::downgrade(&host);
+    let failure = {
+        let kernel = kernel(AggregateKernelPhase::Single);
+        let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+        let limits: ArrayRef = Arc::new(Int64Array::from(vec![None]));
+        let origin =
+            crate::builtin::aggregate_n_core::parse_limit(&limits, 0, &mut ScalarWork::new(None))
+                .unwrap_err();
+        let control = control(&host, Some((0, KernelFailure::DeadlineExceeded)));
+        let mut work = crate::kernel_input::EvaluationCheckpoints::new(&control);
+        let error = project_failure(
+            origin.clone().into(),
+            &NDataDomain::Mutation {
+                contract: &kernel.contract,
+                phase: AggregateInvocationPhase::Update,
+                selection: Selection::all(1),
+                mapping: &[0],
+            },
+            &allocator,
+            &mut work,
+        );
+        let EvaluationFailure::Kernel(failure) = error else {
+            panic!("the diagnostic did not complete")
+        };
+        assert_eq!(failure.failure_fact(), origin.failure_fact());
+        let mut source = failure.source();
+        let mut found = false;
+        while let Some(actual) = source {
+            if let Some(actual) = actual.downcast_ref::<NDiagnosticFailure>() {
+                assert_eq!(actual.origin, origin);
+                assert_eq!(actual.diagnostic, KernelFailure::DeadlineExceeded);
+                found = true;
+            }
+            source = actual.source();
+        }
+        assert!(found, "both actual causes remain locally inspectable");
+        assert_eq!(control.checks.lock().unwrap().len(), 1);
+        failure
+    };
+    clean(&host);
+    drop(host);
+    assert!(weak_host.upgrade().is_none());
+    assert_eq!(
+        failure.failure_fact(),
+        crate::DataFailureReason::InvalidValue.failure_fact()
+    );
 }

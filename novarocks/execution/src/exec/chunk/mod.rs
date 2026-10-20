@@ -18,6 +18,7 @@
 mod additional_buffers;
 mod chunk_impl;
 mod compiled_layout_metadata_request;
+mod construction_failure;
 mod filtered_output;
 mod hydrate;
 mod memory;
@@ -27,6 +28,7 @@ mod root_array_storage;
 mod root_chunk_storage;
 mod root_schema_backing;
 mod schema;
+pub use construction_failure::{ChunkConstructionFailure, ChunkSchemaViolation};
 mod slot_layout;
 mod source_authority;
 #[cfg(test)]
@@ -39,8 +41,10 @@ mod typed_array_normalization;
 pub(crate) mod typed_fixture;
 
 pub(crate) use additional_buffers::AdditionalBufferLedger;
-pub use chunk_impl::{Chunk, ChunkBatchProjection};
-pub use compiled_layout_metadata_request::original_compiled_schema_metadata_request;
+pub use chunk_impl::{Chunk, ChunkAccessFailure, ChunkBatchProjection};
+pub use compiled_layout_metadata_request::{
+    CompiledSchemaRequestFailure, original_compiled_schema_metadata_request,
+};
 pub(crate) use filtered_output::normalize_filter_mask_observed;
 pub use hydrate::dictionary_hydration_required_observed;
 pub use hydrate::hydrate_dictionary_columns_except;

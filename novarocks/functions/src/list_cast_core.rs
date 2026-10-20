@@ -29,7 +29,7 @@ pub enum ListCastObservation {
 }
 #[derive(Debug)]
 pub enum ListCastError<E> {
-    Data(String),
+    Domain(ListCastFailure),
     Host(E),
 }
 
@@ -48,13 +48,13 @@ pub fn null_source(len: usize, target: &DataType) -> ArrayRef {
     null_source_observed::<std::convert::Infallible>(len, target, &mut |_| Ok(())).unwrap_or_else(
         |error| match error {
             ListCastError::Host(never) => match never {},
-            ListCastError::Data(_) => unreachable!("original Null lifting has no data error"),
+            ListCastError::Domain(_) => unreachable!("original Null lifting has no data error"),
         },
     )
 }
 
 /// Preserve the original physical null-count test, target Field, offsets,
-/// full data errors and ListArray constructor panic. No decoder is introduced.
+/// original child failures and checked ListArray construction. No decoder is introduced.
 pub fn cast_observed<E>(
     array: &ArrayRef,
     target_field: &FieldRef,
@@ -65,16 +65,19 @@ pub fn cast_observed<E>(
     let list = array
         .as_any()
         .downcast_ref::<ListArray>()
-        .ok_or_else(|| ListCastError::Data("failed to downcast to ListArray".to_string()))?;
+        .ok_or_else(|| ListCastError::Domain(ListCastFailure::Carrier))?;
     // This is the original child carrier equality, not an identity of Fields.
     if list.values().data_type() == target_field.data_type() {
         observe(ListCastObservation::OpaqueBoundary).map_err(ListCastError::Host)?;
-        let out: ArrayRef = Arc::new(ListArray::new(
-            target_field.clone(),
-            list.offsets().clone(),
-            list.values().clone(),
-            list.nulls().cloned(),
-        ));
+        let out: ArrayRef = Arc::new(
+            ListArray::try_new(
+                target_field.clone(),
+                list.offsets().clone(),
+                list.values().clone(),
+                list.nulls().cloned(),
+            )
+            .map_err(|cause| ListCastError::Domain(ListCastFailure::Arrow(cause)))?,
+        );
         observe(ListCastObservation::OpaqueBoundary).map_err(ListCastError::Host)?;
         return Ok(out);
     }
@@ -98,29 +101,72 @@ pub fn cast_observed<E>(
         observe(ListCastObservation::Step).map_err(ListCastError::Host)?;
     }
     observe(ListCastObservation::OpaqueBoundary).map_err(ListCastError::Host)?;
-    let out: ArrayRef = Arc::new(ListArray::new(
-        target_field.clone(),
-        OffsetBuffer::new(offsets.into()),
-        cast_values,
-        list.nulls().cloned(),
-    ));
+    let out: ArrayRef = Arc::new(
+        ListArray::try_new(
+            target_field.clone(),
+            OffsetBuffer::new(offsets.into()),
+            cast_values,
+            list.nulls().cloned(),
+        )
+        .map_err(|cause| ListCastError::Domain(ListCastFailure::Arrow(cause)))?,
+    );
     observe(ListCastObservation::OpaqueBoundary).map_err(ListCastError::Host)?;
     Ok(out)
 }
 
-pub fn cast(
+pub fn cast<E: From<ListCastFailure>>(
     array: &ArrayRef,
     target_field: &FieldRef,
-    cast_child: &mut dyn FnMut(&ArrayRef, &DataType) -> Result<ArrayRef, String>,
-) -> Result<ArrayRef, String> {
-    cast_observed::<std::convert::Infallible>(
+    cast_child: &mut dyn FnMut(&ArrayRef, &DataType) -> Result<ArrayRef, E>,
+) -> Result<ArrayRef, E> {
+    cast_observed(
         array,
         target_field,
-        &mut |child, target| cast_child(child, target).map_err(ListCastError::Data),
+        &mut |child, target| cast_child(child, target).map_err(ListCastError::Host),
         &mut |_| Ok(()),
     )
-    .map_err(|error| match error {
-        ListCastError::Data(message) => message,
-        ListCastError::Host(never) => match never {},
+    .map_err(|cause| match cause {
+        ListCastError::Domain(cause) => E::from(cause),
+        ListCastError::Host(cause) => cause,
     })
+}
+#[derive(Debug)]
+pub enum ListCastFailure {
+    Carrier,
+    Arrow(arrow_schema::ArrowError),
+}
+impl std::fmt::Display for ListCastFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Carrier => f.write_str("failed to downcast to ListArray"),
+            Self::Arrow(cause) => write!(f, "List CAST construction: {cause}"),
+        }
+    }
+}
+impl std::error::Error for ListCastFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Arrow(cause) => Some(cause),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ListCastFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        let (class, code) = match self {
+            Self::Arrow(arrow_schema::ArrowError::MemoryError(_)) => (FailureClass::Resource, 223),
+            _ => (FailureClass::Invariant, 224),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for ListCastFailure {}
+impl From<ListCastFailure> for crate::KernelFailure {
+    fn from(cause: ListCastFailure) -> Self {
+        Self::from_domain(cause)
+    }
 }

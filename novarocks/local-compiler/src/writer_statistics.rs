@@ -296,7 +296,7 @@ fn resolved_signature(
         AggregateOverloadIdentity::try_new(function.overload.as_str()).map_err(|error| {
             FragmentCompileError::Owner {
                 phase: "writer aggregate overload identity",
-                error: Box::new(error),
+                error: novarocks_failure_contract::SharedFailureCause::new(error),
             }
         })?;
     work.flush()?;
@@ -594,7 +594,7 @@ fn constant_error(error: ConstantReferenceError) -> FragmentCompileError {
         ConstantReferenceError::Control(cause) => FragmentCompileError::Control(cause),
         error => FragmentCompileError::Owner {
             phase: "writer grouped Unpivot constant",
-            error: Box::new(error),
+            error: novarocks_failure_contract::SharedFailureCause::new(error),
         },
     }
 }

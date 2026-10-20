@@ -510,11 +510,7 @@ fn compose_fragment_effects_observed(
             calls,
         })
     })();
-    if matches!(&result, Err(PhysicalFragmentEffectsError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    work.finish_result(result, PhysicalFragmentEffectsError::from)
 }
 
 /// Borrow the original call selected by the sole visitor's node/ordinal site.

@@ -34,9 +34,7 @@ use novarocks_query_application::{
 use novarocks_result_contract::{ClientRowProfile, ClientRowStreamCursor, RootProfileV1};
 use novarocks_result_render::RenderTurnStatus;
 use novarocks_workload_control::ResultWindowAlias;
-use opensrv_mysql::{
-    Column, ColumnFlags, ColumnType, ErrorKind, QueryResultWriter, StreamingResponseLease,
-};
+use opensrv_mysql::{Column, ColumnFlags, ColumnType, QueryResultWriter, StreamingResponseLease};
 use std::{io, sync::Arc};
 use tokio::{io::AsyncWrite, time::Instant};
 
@@ -396,11 +394,7 @@ impl<'writer, W: AsyncWrite + Unpin> InitialLocalClosingWriter<'writer, W> {
             .expect("initial closing owns its writer")
             .into_streaming_result()
             .await?;
-        let kind = if is_terminal_cancellation(&self.error) {
-            ErrorKind::ER_QUERY_INTERRUPTED
-        } else {
-            ErrorKind::ER_UNKNOWN_ERROR
-        };
+        let kind = crate::error_mapping::execution_error_kind(&self.error);
         let payload = error_payload(
             &self.error,
             lease.writer().protocol_limits().diagnostic_bytes,
@@ -481,11 +475,7 @@ async fn close_local<'writer, W: AsyncWrite + Unpin>(
         )?);
     }
     let payload = error_payload(&error, lease.writer().protocol_limits().diagnostic_bytes);
-    let kind = if is_terminal_cancellation(&error) {
-        ErrorKind::ER_QUERY_INTERRUPTED
-    } else {
-        ErrorKind::ER_UNKNOWN_ERROR
-    };
+    let kind = crate::error_mapping::execution_error_kind(&error);
     let writer = match lease.into_closing_lease(tail, kind, &payload[9..]) {
         Ok(writer) => writer,
         Err((lease, error)) => {
@@ -724,6 +714,27 @@ mod tests {
             std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
         }
     }
+    fn canonical_fixture_error() -> novarocks_query_application::session_error::QueryServiceError {
+        use novarocks_execution_contract::{
+            SafeDetail,
+            failure::{FailureClass, FailureFact, FailureReason},
+        };
+        use novarocks_query_application::api::{ExecutionFailureInput, ExecutionFailureSite};
+        use std::num::NonZeroU16;
+        novarocks_query_application::session_error::QueryServiceError::from_execution_failure(
+            ExecutionFailureInput::new(
+                FailureFact::new(
+                    FailureClass::Resource,
+                    FailureReason::new(
+                        NonZeroU16::new(u16::MAX).unwrap(),
+                        NonZeroU16::new(7).unwrap(),
+                    ),
+                ),
+                SafeDetail::new("selected bounded resource refusal").unwrap(),
+                ExecutionFailureSite::Coordinator,
+            ),
+        )
+    }
     #[async_trait::async_trait]
     impl<W: AsyncWrite + Unpin + Send> AsyncMysqlShim<W> for Shim {
         type Error = io::Error;
@@ -754,6 +765,14 @@ mod tests {
             schema: &'a str,
             writer: opensrv_mysql::InitWriter<'a, W>,
         ) -> io::Result<()> {
+            if schema == "canonical-error" {
+                return crate::terminal::write_governed_init_error(
+                    canonical_fixture_error(),
+                    self.fixture.protocol(),
+                    writer,
+                )
+                .await;
+            }
             if schema == "slow-init" {
                 self.gate
                     .remaining
@@ -881,6 +900,18 @@ mod tests {
                     MysqlStatementWriteOutcome::Continue(writer) => writer.no_more_results().await,
                     MysqlStatementWriteOutcome::Terminated => Ok(()),
                 };
+            }
+            if query == "canonical-error-late-cancel" {
+                let error = canonical_fixture_error();
+                let protocol = self.fixture.protocol();
+                self.fixture.control.cancel_session_statement(
+                    self.fixture.session.token(),
+                    QueryCancellationReason::ExplicitKill {
+                        requester_connection_id: 901,
+                    },
+                );
+                return crate::terminal::write_governed_terminal_error(error, protocol, results)
+                    .await;
             }
             if matches!(query, "typed-error" | "slow-typed") {
                 if query == "slow-typed" {
@@ -1346,6 +1377,47 @@ mod tests {
         .await
         .unwrap();
     }
+    #[tokio::test]
+    async fn canonical_init_and_late_cancel_errors_keep_the_selected_wire_descriptor() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let fixture = Fixture::new();
+            let capacity = fixture.capacity.clone();
+            let control = fixture.control.clone();
+            let (mut client, server) = socket_with(fixture, Arc::new(WriteGate::new())).await;
+            let mut errors = Vec::new();
+            for command in [
+                b"\x02canonical-error".as_slice(),
+                b"\x03canonical-error-late-cancel",
+            ] {
+                packet(&mut client, 0, command).await;
+                errors.push(read_packet(&mut client).await);
+            }
+            packet(&mut client, 0, b"\x03again").await;
+            let mut following = Vec::new();
+            for _ in 0..5 {
+                following.push(read_packet(&mut client).await);
+            }
+            packet(&mut client, 0, &[1]).await;
+            let exited = server.await.unwrap();
+            // The original socket/session owner has exited before any oracle.
+            assert!(exited.is_ok());
+            for (sequence, error) in errors {
+                assert_eq!(sequence, 1);
+                assert_eq!(&error[..3], &[0xff, 0x11, 0x04]);
+                assert_eq!(&error[4..9], b"HY000");
+                assert_eq!(
+                    &error[9..],
+                    b"[query.execution.resource_exhausted] selected bounded resource refusal"
+                );
+            }
+            assert_eq!(following[3].1, b"\x05again");
+            assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+            assert!(control.list_processes().is_empty());
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn finite_terminal_and_init_packets_preserve_types_and_next_command() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {

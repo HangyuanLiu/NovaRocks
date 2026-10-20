@@ -19,7 +19,7 @@ use novarocks_sql::{
     literal::{expr_to_literal, latin1_string_to_bytes},
     semantic::Literal,
 };
-fn literal_source(source: &str) -> Result<Literal, String> {
+fn literal_source(source: &str) -> Result<Literal, novarocks_sql::literal::LiteralFailure> {
     let tokens = novarocks_parser::lex(source).unwrap();
     let expression = novarocks_parser::parser::parse_expression(source, &tokens).unwrap();
     expr_to_literal(&expression)
@@ -79,7 +79,7 @@ fn original_hll_insert_literal_narrowing_cast_refusal_and_allowed_peel() {
         "FLOAT",
     ] {
         assert_eq!(
-            literal_source(&format!("hll_hash(CAST(7 AS {name}))")).unwrap_err(),
+            (literal_source(&format!("hll_hash(CAST(7 AS {name}))")).unwrap_err()).to_string(),
             "hll_hash with narrowing CAST argument is not supported in INSERT VALUES; wrap the value directly without CAST"
         );
     }
@@ -94,12 +94,12 @@ fn original_hll_insert_literal_narrowing_cast_refusal_and_allowed_peel() {
 fn original_hll_insert_literal_arity_and_unsupported_full_text() {
     for source in ["hll_hash()", "hll_hash(1,2)"] {
         assert_eq!(
-            literal_source(source).unwrap_err(),
+            (literal_source(source).unwrap_err()).to_string(),
             "hll_hash expects 1 argument"
         );
     }
     assert_eq!(
-        literal_source("hll_hash([1,2])").unwrap_err(),
+        (literal_source("hll_hash([1,2])").unwrap_err()).to_string(),
         "hll_hash unsupported literal: Array([Int(1), Int(2)])"
     );
 }

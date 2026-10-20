@@ -56,7 +56,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut t = self.trace.lock().unwrap();
         let at = t.len();
-        let stop = *self.stop.lock().unwrap();
+        let stop = self.stop.lock().unwrap().clone();
         if let Some((stop, _)) = stop {
             assert!(at <= stop, "callback after primary refusal");
         }
@@ -1092,7 +1092,7 @@ fn prefixes<T>(
     assert!(!trace.is_empty());
     for i in 0..trace.len() {
         for cause in CAUSES {
-            let (out, actual) = run(Some((i, cause)));
+            let (out, actual) = run(Some((i, cause.clone())));
             assert!(matches!(out,Err(E::Control(c))if c==cause));
             assert_eq!(actual, &trace[..=i]);
         }
@@ -1250,7 +1250,7 @@ fn wide_real_assignments_and_columns_preserve_order_and_actual_sampled_controls(
         .expect("wide actual read construction observes a full work quantum");
     for at in [0, quantum, trace.len() / 2, trace.len() - 1] {
         for cause in CAUSES {
-            let (out, actual) = decode_run(&raw, limits(), Some((at, cause)));
+            let (out, actual) = decode_run(&raw, limits(), Some((at, cause.clone())));
             assert!(matches!(out,Err(E::Control(c))if c==cause));
             assert_eq!(actual, &trace[..=at]);
         }

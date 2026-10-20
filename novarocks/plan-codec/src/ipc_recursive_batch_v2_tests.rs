@@ -49,7 +49,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         calls.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -121,7 +121,7 @@ fn prefixes(field: &Field, metadata: &[u8], body: &[u8]) {
         for cause in CAUSES {
             let control = Control {
                 calls: Mutex::new(Vec::new()),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(checked(field,metadata,body,&control),Err(TypeCodecError::Control(actual)) if actual==cause)

@@ -226,7 +226,7 @@ where
         Some(input.contract().result_type().data_type()),
         &mut observe,
     )?
-    .map_err(|error| internal(&error.legacy_message("bitwise")))?;
+    .map_err(crate::bit_array::BitArrayError::into_kernel)?;
     work.finish()?;
     Ok(values)
 }
@@ -280,7 +280,7 @@ fn largeint<'a>(
         Some(input.contract().result_type().data_type()),
         &mut observe,
     )?
-    .map_err(|error| internal(&error.legacy_message("bitwise")))?;
+    .map_err(crate::bit_array::BitArrayError::into_kernel)?;
     work.finish()?;
     Ok(values)
 }

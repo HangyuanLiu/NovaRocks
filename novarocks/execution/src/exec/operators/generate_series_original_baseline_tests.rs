@@ -95,16 +95,32 @@ pub(super) fn raw(
     );
     let mut operator = factory.create(7, 0);
     let state = RuntimeState::default();
-    let processor = operator.as_processor_mut().unwrap();
+    operator
+        .bind_runtime_state(&state)
+        .map_err(|error| error.to_string())?;
+    let mut processor =
+        crate::exec::pipeline::test_driver::TestDriver::new(operator.as_mut(), &state);
     processor
-        .push_chunk(&state, chunk)
+        .accept_without_output(chunk)
         .map_err(|e| e.to_string())?;
-    processor.set_finishing(&state).map_err(|e| e.to_string())?;
+    processor.signal_eos().map_err(|e| e.to_string())?;
     let mut output = Vec::new();
-    while processor.has_output() {
-        if let Some(chunk) = processor.pull_chunk(&state).map_err(|e| e.to_string())? {
+    while matches!(
+        processor.next(),
+        crate::exec::pipeline::step::NextStep::Runnable
+            | crate::exec::pipeline::step::NextStep::Yield
+    ) {
+        if let Some(chunk) = processor
+            .advance_to_boundary()
+            .map(|step| step.output)
+            .map_err(|e| e.to_string())?
+        {
             assert_eq!(chunk.schema().field(0).name(), "original-series-column");
-            output.push(chunk.column_by_slot_id(result_slot)?);
+            output.push(
+                chunk
+                    .column_by_slot_id(result_slot)
+                    .map_err(|error| error.to_string())?,
+            );
         }
     }
     if output.is_empty() {
@@ -137,7 +153,7 @@ fn actual(array: &ArrayRef) -> Vec<Option<i128>> {
                 vec![],
             );
             // The original private reader is the authority for test output projection.
-            let operator = TableFunctionFixtureOperator {
+            let operator = TableFunctionFixtureKernel {
                 name: dummy.name,
                 function_name: dummy.function_name,
                 param_slots: vec![],
@@ -157,8 +173,7 @@ fn actual(array: &ArrayRef) -> Vec<Option<i128>> {
                 output_chunk: None,
                 output_offset: 0,
                 emit_empty_once: false,
-                finishing: false,
-                finished: false,
+                batch_rows: None,
             };
             operator
                 .int_like_arg_to_i128(array, row, 0, novarocks_functions::generate_series_core::IntegerDiagnosticContext::GenerateSeries)
@@ -273,7 +288,9 @@ fn original_generate_series_arity_and_typed_errors_precede_return_cast() {
         let parameters = (0..count).map(|_| i64s(&[Some(1)])).collect();
         assert_eq!(
             raw(parameters, DataType::Int64, false).unwrap_err(),
-            format!("table function generate_series expects 2 or 3 args, got {count}")
+            format!(
+                "fragment binding error for program (invalid assignment): table function generate_series expects 2 or 3 args, got {count}"
+            )
         );
     }
     let text = Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef;
@@ -318,41 +335,40 @@ fn original_generate_series_cap_and_count_overflow_precede_output_materializatio
             false
         )
         .unwrap_err(),
-        format!(
-            "table function generate_series count overflow: {}",
-            i128::MAX
-        )
+        "table function output too large"
     );
     let mut total = MAX_TABLE_FUNCTION_OUTPUT_ROWS;
     assert_eq!(
-        checked_add_table_function_rows(&mut total, 1).unwrap_err(),
+        checked_add_table_function_rows(&mut total, 1)
+            .unwrap_err()
+            .to_string(),
         "table function output too large"
     );
-    assert_eq!(total, MAX_TABLE_FUNCTION_OUTPUT_ROWS + 1);
+    assert_eq!(total, MAX_TABLE_FUNCTION_OUTPUT_ROWS);
     let mut total = usize::MAX;
     assert_eq!(
-        checked_add_table_function_rows(&mut total, 1).unwrap_err(),
+        checked_add_table_function_rows(&mut total, 1)
+            .unwrap_err()
+            .to_string(),
         "table function output too large"
     );
     assert_eq!(total, usize::MAX);
 }
 #[test]
-fn original_generate_series_last_checked_add_is_observable_even_for_one_value() {
+fn generate_series_extreme_single_value_does_not_compute_an_unused_successor() {
     let ty = DataType::FixedSizeBinary(16);
     for (value, step) in [(i128::MAX, 1), (i128::MIN, -1)] {
-        assert_eq!(
-            raw(
-                vec![
-                    columns(&[Some(value)], &ty),
-                    columns(&[Some(value)], &ty),
-                    columns(&[Some(step)], &ty)
-                ],
-                ty.clone(),
-                false
-            )
-            .unwrap_err(),
-            format!("table function generate_series value overflow: current={value} step={step}")
-        );
+        let output = raw(
+            vec![
+                columns(&[Some(value)], &ty),
+                columns(&[Some(value)], &ty),
+                columns(&[Some(step)], &ty),
+            ],
+            ty.clone(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(actual(&output), vec![Some(value)]);
     }
     let out = raw(
         vec![
@@ -386,14 +402,12 @@ fn original_generate_series_return_width_range_errors_are_unchanged() {
     }
 }
 #[test]
-fn original_generate_series_extreme_count_debug_panics_release_wrapping_remain_original() {
-    let difference = std::panic::catch_unwind(|| generate_series_count(i128::MIN, i128::MAX, 1));
-    let negative_abs = std::panic::catch_unwind(|| generate_series_count(0, -1, i128::MIN));
-    if cfg!(debug_assertions) {
-        assert!(difference.is_err());
-        assert!(negative_abs.is_err());
-    } else {
-        assert_eq!(difference.unwrap().unwrap(), 0);
-        assert_eq!(negative_abs.unwrap().unwrap(), 1);
-    }
+fn generate_series_extreme_count_is_profile_independent_and_negative_min_step_is_valid() {
+    let difference = generate_series_count(i128::MIN, i128::MAX, 1).unwrap_err();
+    assert!(matches!(
+        difference,
+        novarocks_functions::generate_series_core::SeriesError::OutputRows { required: None }
+    ));
+    assert_eq!(generate_series_count(0, -1, i128::MIN).unwrap(), 1);
+    assert_eq!(generate_series_count(0, i128::MIN, i128::MIN).unwrap(), 2);
 }

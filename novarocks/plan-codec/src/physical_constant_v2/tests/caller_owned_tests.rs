@@ -324,7 +324,7 @@ fn caller_constant_namespace_actual_success_and_ordinary_tails_keep_every_first_
         let trace = baseline.trace();
         for stop in 0..trace.len() {
             for cause in CAUSES {
-                let refusing = Control::refusing(CompilePhase::Encode, stop, cause);
+                let refusing = Control::refusing(CompilePhase::Encode, stop, cause.clone());
                 assert!(
                     matches!(caller_write(&pools, ids, &typed, &refusing), Err(PhysicalConstantCodecError::Control(actual)) if actual == cause)
                 );
@@ -340,7 +340,7 @@ fn caller_constant_namespace_actual_success_and_ordinary_tails_keep_every_first_
         let trace = baseline.trace();
         for stop in 0..trace.len() {
             for cause in CAUSES {
-                let refusing = Control::refusing(CompilePhase::Decode, stop, cause);
+                let refusing = Control::refusing(CompilePhase::Decode, stop, cause.clone());
                 assert!(
                     matches!(caller_read(records, &decoded, &refusing), Err(PhysicalConstantCodecError::Control(actual)) if actual == cause)
                 );

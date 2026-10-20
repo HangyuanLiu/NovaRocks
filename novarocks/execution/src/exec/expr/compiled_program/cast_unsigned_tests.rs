@@ -641,7 +641,7 @@ fn actual_compiled_unsigned_cast_every_compile_and_runtime_callback_keeps_primar
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = CompileCallbacks::new(cause, at);
+            let control = CompileCallbacks::new(cause.clone(), at);
             assert!(
                 matches!(compile(&functions,p.clone(),&control),Err(FragmentCompileError::Control(actual)) if actual==cause)
             );

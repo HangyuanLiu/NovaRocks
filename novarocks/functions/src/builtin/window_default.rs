@@ -118,12 +118,7 @@ impl DefaultValueRecipe {
             work.step().map_err(compile_failure)?;
             Ok(recipe)
         })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
+        if result.as_ref().is_err_and(KernelFailure::is_interruption) {
             return result;
         }
         work.finish().map_err(compile_failure)?;
@@ -298,12 +293,7 @@ impl DefaultValueRecipe {
             work.step()?;
             Ok(converted)
         })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
+        if result.as_ref().is_err_and(KernelFailure::is_interruption) {
             return result;
         }
         work.finish()?;
@@ -417,14 +407,7 @@ fn copy_result(
 ) -> Result<(), KernelFailure> {
     match result {
         Ok(()) => work.flush(),
-        Err(crate::selected_copy::CopyError::Control(cause)) => Err(cause),
-        Err(crate::selected_copy::CopyError::Extent) => Err(KernelFailure::ResourceExhausted),
-        Err(_) => {
-            work.flush()?;
-            Err(invalid(
-                "window default logical gather profile is unsupported",
-            ))
-        }
+        Err(source) => Err(source.into_kernel()),
     }
 }
 

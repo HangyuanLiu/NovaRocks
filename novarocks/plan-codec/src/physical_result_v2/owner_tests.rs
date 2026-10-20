@@ -220,7 +220,7 @@ fn caller_result_known_root_requests_refuse_before_pending_quantum_and_late_caus
         for pending in [0, 254, 255] {
             for cause in CAUSES {
                 for decode in [false, true] {
-                    c.arm(Some((1, cause)));
+                    c.arm(Some((1, cause.clone())));
                     let phase = if decode {
                         CompilePhase::Decode
                     } else {
@@ -372,7 +372,7 @@ fn caller_result_every_actual_small_callback_and_emit_parent_refusal_keep_first_
                 assert!(trace.len() > 1);
                 for at in 0..trace.len() {
                     for cause in CAUSES {
-                        c.arm(Some((at, cause)));
+                        c.arm(Some((at, cause.clone())));
                         control_error(invoke(), cause);
                         assert_eq!(c.trace(), trace[..=at]);
                     }
@@ -504,7 +504,7 @@ fn caller_result_wide_actual_text_copy_keeps_quantum_and_sampled_first_causes() 
             let quantum = trace.iter().position(|(_, units)| *units == 256).unwrap();
             for at in [0, 1, quantum, trace.len() / 2, trace.len() - 1] {
                 for cause in CAUSES {
-                    c.arm(Some((at, cause)));
+                    c.arm(Some((at, cause.clone())));
                     control_error(invoke(), cause);
                     assert_eq!(c.trace(), trace[..=at]);
                 }

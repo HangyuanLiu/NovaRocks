@@ -39,10 +39,12 @@
 //! tracker. Owner-reported retained heap inside a state is not reconciled yet;
 //! the formal memory grant remains an open host obligation.
 
+use crate::exec::fragment::error::{
+    FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
+};
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use std::alloc::Layout;
-use std::collections::VecDeque;
 use std::num::NonZeroUsize;
-use std::ptr::NonNull;
 use std::sync::Arc;
 
 use arrow::array::ArrayRef;
@@ -67,9 +69,15 @@ use crate::exec::hash_table::key_builder::build_group_key_views;
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::hash_table::key_table::KeyTable;
 use crate::exec::pipeline::operator::{
-    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator,
+    ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{Transform, TransformKernel},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
@@ -85,8 +93,55 @@ const OUTPUT_CHUNK_ROWS: usize = 4096;
 const STATE_BLOCK_BYTES: usize = 64 * 1024;
 const MAX_STATES_PER_BLOCK: usize = 4096;
 
-fn failure(context: &str, error: impl std::fmt::Display) -> ExecutionFailure {
-    ExecutionFailure::from(format!("{context}: {error}"))
+#[derive(Debug)]
+struct AggregateSourceFailure {
+    operation: &'static str,
+    source: crate::runtime::fragment::SharedDomainFailure,
+}
+impl std::fmt::Display for AggregateSourceFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.operation, self.source)
+    }
+}
+impl std::error::Error for AggregateSourceFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for AggregateSourceFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        self.source.failure_fact()
+    }
+}
+fn failure<E>(operation: &'static str, error: E) -> ExecutionFailure
+where
+    E: std::error::Error + novarocks_failure_contract::FailureProjection + Send + Sync + 'static,
+{
+    ExecutionFailure::from_domain(AggregateSourceFailure {
+        operation,
+        source: crate::runtime::fragment::SharedDomainFailure::new(error),
+    })
+}
+#[derive(Debug)]
+struct AggregateGroupContractFailure(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for AggregateGroupContractFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+impl std::error::Error for AggregateGroupContractFailure {}
+impl novarocks_failure_contract::FailureProjection for AggregateGroupContractFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::AggregateGroupContract.reason(),
+        )
+    }
+}
+fn group_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(AggregateGroupContractFailure(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
 }
 
 fn root_value_type(
@@ -111,96 +166,7 @@ fn root_value_type(
     }
 }
 
-/// State backing charged to the operator's memory tracker. A block is charged
-/// before it is allocated and released after it is returned, so the tracker
-/// never undercounts live backing.
-pub(crate) struct TrackedStateAllocator {
-    tracker: Arc<MemTracker>,
-}
-
-impl TrackedStateAllocator {
-    /// Read only the original host's immutable tracker ancestry. The caller
-    /// must establish the actual instance-host loan before consuming facts.
-    pub(crate) fn limit_failure_request_facts(
-        &self,
-    ) -> Result<
-        crate::runtime::mem_tracker::TrackerLimitFailureRequestFacts,
-        novarocks_type_contract::ControlResourceError,
-    > {
-        self.tracker.limit_failure_request_facts()
-    }
-}
-
-/// Actual expression and aggregate backing share the same tracker adapter.
-pub(crate) fn expression_allocation_host(tracker: Arc<MemTracker>) -> Arc<TrackedStateAllocator> {
-    Arc::new(TrackedStateAllocator { tracker })
-}
-
-/// Differential probes borrow the actual production allocator and explicit
-/// tracker authority. The unaccounted allocator's default remains unchanged.
-#[cfg(test)]
-pub(crate) fn differential_aggregate_state_allocator(
-    tracker: Arc<MemTracker>,
-) -> Arc<dyn AggregateStateAllocator> {
-    Arc::new(TrackedStateAllocator { tracker })
-}
-
-impl novarocks_functions::opaque_memory::OpaqueAllocationHost for TrackedStateAllocator {
-    fn reserve_opaque(&self, bytes: usize) -> Result<(), KernelFailure> {
-        if bytes == 0 {
-            return Ok(());
-        }
-        let bytes = i64::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
-        if self.tracker.consume_and_check_limit_nominal(bytes).is_err() {
-            self.tracker.release(bytes);
-            return Err(KernelFailure::ResourceExhausted);
-        }
-        Ok(())
-    }
-    fn release_opaque(&self, bytes: usize) {
-        if bytes != 0 {
-            // Successful reservation was represented exactly as i64.
-            self.tracker
-                .release(i64::try_from(bytes).expect("successful opaque reservation size"));
-        }
-    }
-}
-impl AggregateStateAllocator for TrackedStateAllocator {
-    fn opaque_allocation_host(
-        &self,
-    ) -> Option<&dyn novarocks_functions::opaque_memory::OpaqueAllocationHost> {
-        Some(self)
-    }
-
-    fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, KernelFailure> {
-        if layout.size() == 0 {
-            return Err(KernelFailure::Internal(KernelDiagnostic::new(
-                "aggregate state block has no size",
-            )));
-        }
-        let bytes = i64::try_from(layout.size()).map_err(|_| KernelFailure::ResourceExhausted)?;
-        if self.tracker.consume_and_check_limit_nominal(bytes).is_err() {
-            self.tracker.release(bytes);
-            return Err(KernelFailure::ResourceExhausted);
-        }
-        // SAFETY: the layout has a nonzero size.
-        match NonNull::new(unsafe { std::alloc::alloc(layout) }) {
-            Some(block) => Ok(block),
-            None => {
-                self.tracker.release(bytes);
-                Err(KernelFailure::ResourceExhausted)
-            }
-        }
-    }
-
-    unsafe fn release(&self, block: NonNull<u8>, layout: Layout) {
-        // SAFETY: the column returns a block this allocator produced with
-        // exactly this layout, after destroying every state inside it.
-        unsafe { std::alloc::dealloc(block.as_ptr(), layout) };
-        self.tracker
-            .release(i64::try_from(layout.size()).unwrap_or(i64::MAX));
-    }
-}
+use crate::runtime::tracked_state_allocator::TrackedStateAllocator;
 
 /// One call's exact prepared handle and the roots that feed it: the logical
 /// arguments of an update phase, or the one state input of a merge phase.
@@ -284,7 +250,7 @@ impl CompiledAggregateProcessorFactory {
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         Self::try_new_parts(program, node, error, false)
     }
 
@@ -308,7 +274,7 @@ impl CompiledAggregateProcessorFactory {
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         Self::try_new_parts(program, node, error, true)
     }
 
@@ -361,13 +327,14 @@ impl CompiledAggregateProcessorFactory {
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
         allow_ordered: bool,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let at = node.index();
-        let graph_node = program
-            .graph()
-            .nodes()
-            .get(at)
-            .ok_or_else(|| format!("compiled Aggregate node {at} is absent"))?;
+        let graph_node = program.graph().nodes().get(at).ok_or_else(|| {
+            program_binding_failure(
+                PlanBindingKind::MissingAssignment,
+                format!("compiled Aggregate node {at} is absent"),
+            )
+        })?;
         let ProgramNodeKind::Aggregate {
             group_by,
             functions,
@@ -376,28 +343,42 @@ impl CompiledAggregateProcessorFactory {
             ..
         } = graph_node.kind()
         else {
-            return Err(format!("compiled local node {at} is not an Aggregate"));
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!("compiled local node {at} is not an Aggregate"),
+            ));
         };
         let owns_ordered_endpoint = !topn_filters.is_empty();
         if owns_ordered_endpoint && !allow_ordered {
-            return Err(format!(
-                "compiled Aggregate at local node {at} with TopN runtime filters is not executable"
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!(
+                    "compiled Aggregate at local node {at} with TopN runtime filters is not executable"
+                ),
             ));
         }
         if streaming_preaggregation_mode.is_some() {
-            return Err(format!(
-                "compiled Aggregate at local node {at} with streaming pre-aggregation is not executable"
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!(
+                    "compiled Aggregate at local node {at} with streaming pre-aggregation is not executable"
+                ),
             ));
         }
         let grouping = program
             .aggregates()
             .get(&node)
-            .ok_or_else(|| format!("compiled Aggregate at local node {at} has no grouping fact"))?
+            .ok_or_else(|| {
+                program_binding_failure(
+                    PlanBindingKind::MissingAssignment,
+                    format!("compiled Aggregate at local node {at} has no grouping fact"),
+                )
+            })?
             .grouping;
         let mut sites = Vec::new();
         for group in 0..group_by.len() {
-            let group = u32::try_from(group)
-                .map_err(|_| format!("compiled Aggregate at local node {at} has too many keys"))?;
+            let group = novarocks_local_program::checked_program_ordinal(group)
+                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
             sites.push(ProgramExpressionRootSite::Node {
                 node,
                 role: ProgramNodeExpressionRole::AggregateGroup { group },
@@ -405,13 +386,16 @@ impl CompiledAggregateProcessorFactory {
         }
         let mut calls = Vec::with_capacity(functions.len());
         for (ordinal, function) in functions.iter().enumerate() {
-            let call = u32::try_from(ordinal)
-                .map_err(|_| format!("compiled Aggregate at local node {at} has too many calls"))?;
+            let call = novarocks_local_program::checked_program_ordinal(ordinal)
+                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
             let Some(ProgramStateTemplate::Aggregate { kernel, .. }) =
                 program.state_template(ProgramCallSite::Aggregate { node, call })
             else {
-                return Err(format!(
-                    "compiled Aggregate call {call} at local node {at} has no prepared aggregate"
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    format!(
+                        "compiled Aggregate call {call} at local node {at} has no prepared aggregate"
+                    ),
                 ));
             };
             let handle = kernel.clone();
@@ -423,15 +407,23 @@ impl CompiledAggregateProcessorFactory {
                 contract.logical_argument_types().len() + contract.order_keys().len()
             };
             if function.inputs.len() != roots {
-                return Err(format!(
-                    "compiled Aggregate call {call} at local node {at} has {} roots for {roots} channels",
-                    function.inputs.len()
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    format!(
+                        "compiled Aggregate call {call} at local node {at} has {} roots for {roots} channels",
+                        function.inputs.len()
+                    ),
                 ));
             }
             let first_root = sites.len();
             for argument in 0..roots {
                 let argument = u32::try_from(argument).map_err(|_| {
-                    format!("compiled Aggregate call {call} at local node {at} has too many inputs")
+                    program_binding_failure(
+                        PlanBindingKind::InvalidAssignment,
+                        format!(
+                            "compiled Aggregate call {call} at local node {at} has too many inputs"
+                        ),
+                    )
                 })?;
                 sites.push(ProgramExpressionRootSite::Node {
                     node,
@@ -448,12 +440,18 @@ impl CompiledAggregateProcessorFactory {
         }
         let output_layout = graph_node.output_layout().clone();
         if !output_layout.is_typed() {
-            return Err("compiled Aggregate has no complete output declaration".into());
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                "compiled Aggregate has no complete output declaration",
+            ));
         }
         let fields = graph_node.output_layout().schema().fields();
         if fields.len() != group_by.len() + calls.len() {
-            return Err(format!(
-                "compiled Aggregate at local node {at} output is not its keys followed by its calls"
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!(
+                    "compiled Aggregate at local node {at} output is not its keys followed by its calls"
+                ),
             ));
         }
         let key_types = fields[..group_by.len()]
@@ -489,27 +487,35 @@ impl CompiledAggregateProcessorFactory {
     }
     /// Consume the already prepared local lifecycle. The intermediate schema
     /// is authored by each exact call's existing full intermediate type.
-    pub(crate) fn into_local_update_stages(self) -> Result<(Self, Self), String> {
+    pub(crate) fn into_local_update_stages(self) -> ExecutionResult<(Self, Self)> {
         if self.topn.is_some() {
-            return Err(
-                "compiled aggregate must split before installing its ordered producer".into(),
-            );
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                "compiled aggregate must split before installing its ordered producer",
+            ));
         }
         if !self.requires_local_update_stages() {
-            return Err(
-                "compiled aggregate local stages differ from its actual update node".into(),
-            );
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                "compiled aggregate local stages differ from its actual update node",
+            ));
         }
         let mut partial_calls = Vec::with_capacity(self.calls.len());
         let mut final_calls = Vec::with_capacity(self.calls.len());
         for (ordinal, original) in self.calls.iter().enumerate() {
             let stages = original.handle.local_stages().ok_or_else(|| {
-                format!("compiled aggregate call {ordinal} has no prepared local lifecycle")
+                program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    format_args!(
+                        "compiled aggregate call {ordinal} has no prepared local lifecycle"
+                    ),
+                )
             })?;
             if !Arc::ptr_eq(stages.source(), &original.contract) {
-                return Err(
-                    "compiled aggregate local stages have a different original call".into(),
-                );
+                return Err(program_binding_failure(
+                    PlanBindingKind::InvalidAssignment,
+                    "compiled aggregate local stages have a different original call",
+                ));
             }
             let handle = stages.partial().clone();
             partial_calls.push(CallPlan {
@@ -593,7 +599,7 @@ impl OperatorFactory for CompiledAggregateProcessorFactory {
             Ok(topn) => (topn, None),
             Err(error) => (None, Some(error)),
         };
-        Box::new(CompiledAggregateProcessor {
+        Box::new(Transform::hydrating(CompiledAggregateProcessor {
             name: self.name.clone(),
             program: Arc::clone(&self.program),
             sites: self.sites.clone(),
@@ -612,12 +618,10 @@ impl OperatorFactory for CompiledAggregateProcessorFactory {
             key_table: None,
             states: None,
             groups: 0,
-            pending: VecDeque::new(),
-            finishing: false,
-            finished: false,
+            emission: None,
             failed,
             topn,
-        })
+        }))
     }
 }
 
@@ -643,12 +647,15 @@ struct CompiledAggregateProcessor {
     states: Option<Vec<AggregateStateColumn>>,
     /// Groups created so far; every state column holds exactly this many.
     groups: usize,
-    pending: VecDeque<Chunk>,
-    finishing: bool,
-    finished: bool,
+    emission: Option<AggregateOutputCursor>,
     /// The first failure owns its original typed category and diagnostic.
     failed: Option<ExecutionFailure>,
     topn: Option<CompiledAggregateTopN>,
+}
+
+struct AggregateOutputCursor {
+    output: Chunk,
+    offset: usize,
 }
 
 impl CompiledAggregateProcessor {
@@ -665,7 +672,7 @@ impl CompiledAggregateProcessor {
         self.key_table = None;
         self.instances = None;
         self.topn = None;
-        drop(std::mem::take(&mut self.pending));
+        self.emission = None;
         self.groups = 0;
     }
 
@@ -681,8 +688,6 @@ impl CompiledAggregateProcessor {
                     if let Some(topn) = &mut self.topn {
                         let _ = topn.fail(RuntimeFilterProducerFailure::ExecutionFailed);
                     }
-                    self.finishing = true;
-                    self.finished = true;
                     // A failed update may have changed a prefix of the calls,
                     // and a failed emission may have built a prefix of output.
                     // Neither prefix can be resumed or exposed after failure.
@@ -710,9 +715,9 @@ impl CompiledAggregateProcessor {
         }
         #[cfg(not(test))]
         {
-            Err(ExecutionFailure::from(
-                "compiled aggregate memory tracker must be bound before its first state",
-            ))
+            Err(crate::runtime::runtime_state::RuntimeBindingFailure::MissingOperatorMemoryTracker {
+                operator: novarocks_failure_contract::BoundedDetail::truncating("compiled aggregate"),
+            }.into())
         }
     }
 
@@ -732,9 +737,9 @@ impl CompiledAggregateProcessor {
                 .map_err(|error| failure("compiled aggregate key table", error))?,
             );
         }
-        let allocator: Arc<dyn AggregateStateAllocator> = Arc::new(TrackedStateAllocator {
-            tracker: MemTracker::new_child("CompiledAggregateStates", &tracker),
-        });
+        let allocator: Arc<dyn AggregateStateAllocator> = Arc::new(TrackedStateAllocator::new(
+            MemTracker::new_child("CompiledAggregateStates", &tracker),
+        ));
         let mut states = Vec::with_capacity(self.calls.len());
         for call in &self.calls {
             let stride = call.handle.state_layout().pad_to_align().size().max(1);
@@ -774,7 +779,7 @@ impl CompiledAggregateProcessor {
         }
         for (ordinal, (key, expected)) in keys.iter().zip(&self.key_types).enumerate() {
             if !novarocks_type_contract::arrow_data_types_exact(key.data_type(), expected) {
-                return Err(ExecutionFailure::from(format!(
+                return Err(group_contract(format_args!(
                     "compiled aggregate group key {ordinal} is {:?}, frozen {expected:?}",
                     key.data_type()
                 )));
@@ -798,7 +803,7 @@ impl CompiledAggregateProcessor {
         let mut record = |row, lookup: crate::exec::hash_table::key_table::KeyLookup| {
             if lookup.is_new {
                 if lookup.group_id != next {
-                    return Err(ExecutionFailure::from(
+                    return Err(group_contract(
                         "compiled aggregate key table created a group out of order",
                     ));
                 }
@@ -810,7 +815,7 @@ impl CompiledAggregateProcessor {
             group_ids.push(lookup.group_id);
             Ok(())
         };
-        let key_error = |error: String| failure("compiled aggregate group lookup", error);
+        let key_error = |error| failure("compiled aggregate group lookup", error);
         match table.key_strategy() {
             GroupKeyStrategy::Serialized => {
                 let rows_bytes = table.build_rows_fallback(keys).map_err(key_error)?;
@@ -819,7 +824,7 @@ impl CompiledAggregateProcessor {
                     let bytes = rows_bytes
                         .get(row)
                         .map(|bytes| bytes.as_slice())
-                        .ok_or_else(|| ExecutionFailure::from("serialized group row missing"))?;
+                        .ok_or_else(|| group_contract("serialized group row missing"))?;
                     record(
                         row,
                         table
@@ -829,14 +834,14 @@ impl CompiledAggregateProcessor {
                 }
             }
             GroupKeyStrategy::Scalar => {
-                return Err(ExecutionFailure::from(
+                return Err(group_contract(
                     "group key strategy Scalar is invalid for group keys",
                 ));
             }
             GroupKeyStrategy::OneNumber => {
                 let view = views
                     .first()
-                    .ok_or_else(|| ExecutionFailure::from("one number key view missing"))?;
+                    .ok_or_else(|| group_contract("one number key view missing"))?;
                 let hashes = table
                     .build_one_number_hashes(view, rows)
                     .map_err(key_error)?;
@@ -852,7 +857,7 @@ impl CompiledAggregateProcessor {
             GroupKeyStrategy::OneString => {
                 let view = views
                     .first()
-                    .ok_or_else(|| ExecutionFailure::from("one string key view missing"))?;
+                    .ok_or_else(|| group_contract("one string key view missing"))?;
                 let hashes = table.build_group_hashes(&views, rows).map_err(key_error)?;
                 for (row, hash) in hashes.iter().copied().enumerate().take(rows) {
                     record(
@@ -900,7 +905,7 @@ impl CompiledAggregateProcessor {
                             .and_then(|rows| rows.get(row))
                             .map(|bytes| bytes.as_slice())
                             .ok_or_else(|| {
-                                ExecutionFailure::from("compressed fallback group row missing")
+                                group_contract("compressed fallback group row missing")
                             })?;
                         table
                             .find_or_insert_from_row(&views, row, bytes, hash)
@@ -911,7 +916,7 @@ impl CompiledAggregateProcessor {
             }
         }
         if group_ids.len() != rows {
-            return Err(ExecutionFailure::from(
+            return Err(group_contract(
                 "compiled aggregate group id count differs from its rows",
             ));
         }
@@ -926,7 +931,7 @@ impl CompiledAggregateProcessor {
                 .as_ref()
                 .ok_or(ConstructionFailure::MissingOwner)?;
             if chunk.chunk_schema() != expected.as_ref() {
-                return Err(ExecutionFailure::from(
+                return Err(group_contract(
                     "compiled local aggregate state chunk differs from its actual intermediate schema",
                 ));
             }
@@ -1001,7 +1006,7 @@ impl CompiledAggregateProcessor {
     }
 
     /// Every group's keys and call emissions, in group creation order.
-    fn emit(&mut self) -> ExecutionResult<()> {
+    fn build_output(&mut self) -> ExecutionResult<Option<Chunk>> {
         let output_schema = Arc::clone(self.prepared_output()?);
         self.ensure_state()?;
         if self.group_roots == 0 && self.groups == 0 {
@@ -1011,7 +1016,7 @@ impl CompiledAggregateProcessor {
         }
         let groups = self.groups;
         if groups == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let fields = output_schema.arrow_schema_ref();
         let owner = self.control.construction_owner(output_schema.as_ref())?;
@@ -1034,13 +1039,13 @@ impl CompiledAggregateProcessor {
                     .map_err(|error| failure("compiled aggregate key output", error))?;
                 let expected = fields.field(ordinal).data_type();
                 if !novarocks_type_contract::arrow_data_types_exact(array.data_type(), expected) {
-                    return Err(ExecutionFailure::from(format!(
+                    return Err(group_contract(format_args!(
                         "compiled aggregate key output {ordinal} is {:?}, frozen {expected:?}",
                         array.data_type()
                     )));
                 }
                 if array.len() != groups {
-                    return Err(ExecutionFailure::from(
+                    return Err(group_contract(
                         "compiled aggregate key output differs from its group count",
                     ));
                 }
@@ -1091,23 +1096,7 @@ impl CompiledAggregateProcessor {
             owner.storage_lifetime(),
             |step| owner.observe(0, &[], step),
         )?;
-        if groups <= OUTPUT_CHUNK_ROWS {
-            self.pending.push_back(output);
-            return Ok(());
-        }
-        let mut offset = 0;
-        while offset < groups {
-            let len = OUTPUT_CHUNK_ROWS.min(groups - offset);
-            let slice_owner = self.control.construction_owner(output_schema.as_ref())?;
-            self.pending.push_back(output.slice_typed_observed::<
-                crate::exec::pipeline::operator::ConstructionFailure, _,
-            >(
-                offset, len, slice_owner.storage_lifetime(),
-                |step| slice_owner.observe(0, &[], step),
-            )?);
-            offset += len;
-        }
-        Ok(())
+        Ok(Some(output))
     }
 }
 
@@ -1117,7 +1106,7 @@ impl Drop for CompiledAggregateProcessor {
     }
 }
 
-impl Operator for CompiledAggregateProcessor {
+impl OperatorLifecycle for CompiledAggregateProcessor {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -1175,26 +1164,16 @@ impl Operator for CompiledAggregateProcessor {
         self.failure_result(result)
     }
     fn cancel(&mut self) {
-        let Some(topn) = &mut self.topn else {
-            return;
-        };
-        let _ = topn.fail(RuntimeFilterProducerFailure::Cancelled);
+        if let Some(topn) = &mut self.topn {
+            let _ = topn.fail(RuntimeFilterProducerFailure::Cancelled);
+        }
         self.release_owned();
     }
     fn on_driver_failure(&mut self) {
-        let Some(topn) = &mut self.topn else {
-            return;
-        };
-        let _ = topn.fail(RuntimeFilterProducerFailure::ExecutionFailed);
+        if let Some(topn) = &mut self.topn {
+            let _ = topn.fail(RuntimeFilterProducerFailure::ExecutionFailed);
+        }
         self.release_owned();
-    }
-    fn close(&mut self) -> ExecutionResult<()> {
-        let Some(topn) = &mut self.topn else {
-            return Ok(());
-        };
-        let result = topn.fail(RuntimeFilterProducerFailure::ExecutionFailed);
-        self.release_owned();
-        result
     }
     fn name(&self) -> &str {
         &self.name
@@ -1203,32 +1182,32 @@ impl Operator for CompiledAggregateProcessor {
         self.control.bind_mem_tracker(Arc::clone(&tracker));
         self.tracker = Some(tracker);
     }
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        let result = self.topn.as_mut().map_or(Ok(()), |topn| {
+            topn.fail(RuntimeFilterProducerFailure::ExecutionFailed)
+        });
+        self.release_owned();
+        result
     }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
     }
 }
 
-impl ProcessorOperator for CompiledAggregateProcessor {
-    fn need_input(&self) -> bool {
-        self.failed.is_none() && !self.finishing && !self.finished
-    }
-    fn has_output(&self) -> bool {
-        self.failed.is_none() && !self.pending.is_empty()
-    }
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+impl InputEncodingPolicy for CompiledAggregateProcessor {}
+impl TransformKernel for CompiledAggregateProcessor {
+    fn apply(
+        &mut self,
+        ctx: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
         if let Some(error) = &self.failed {
             return Err(error.clone());
         }
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         let result = if let Err(error) = self.prepared_output() {
             Err(error)
-        } else if self.finishing || self.finished {
-            Err("compiled Aggregate received input after finishing".into())
         } else if chunk.is_empty() {
             Ok(())
         } else {
@@ -1238,41 +1217,78 @@ impl ProcessorOperator for CompiledAggregateProcessor {
                     .map_or(Ok(()), |topn| topn.after_successful_input(chunk.len()))
             })
         };
-        self.failure_result(result)
-    }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if let Some(error) = &self.failed {
-            return Err(error.clone());
+        if let Err(error) = &result {
+            ctx.report_failure(error.clone());
         }
-        let output = self.pending.pop_front();
-        if self.finishing && self.pending.is_empty() {
-            self.finished = true;
-        }
-        Ok(output)
-    }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        if let Some(error) = &self.failed {
-            return Err(error.clone());
-        }
-        if self.finishing || self.finished {
-            return Ok(());
-        }
-        self.finishing = true;
-        let result = self.emit().and_then(|()| {
-            self.topn
-                .as_mut()
-                .map_or(Ok(()), CompiledAggregateTopN::finish)
-        });
         self.failure_result(result)?;
+        Ok(StepResult::new(None, NextStep::NeedInput, rows))
+    }
+    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
+        let Some(cursor) = self.emission.as_ref() else {
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
+        };
+        if !ctx.work().try_consume(1) {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
+        }
+        let rows = OUTPUT_CHUNK_ROWS.min(cursor.output.len() - cursor.offset);
+        let result = (|| -> ExecutionResult<Chunk> {
+            let owner = self
+                .control
+                .construction_owner(cursor.output.chunk_schema())?;
+            Ok(cursor
+                .output
+                .slice_typed_observed::<ConstructionFailure, _>(
+                    cursor.offset,
+                    rows,
+                    owner.storage_lifetime(),
+                    |step| owner.observe(0, &[], step),
+                )?)
+        })();
+        if let Err(error) = &result {
+            ctx.report_failure(error.clone());
+        }
+        let output = self.failure_result(result)?;
+        let cursor = self
+            .emission
+            .as_mut()
+            .expect("aggregate output remains installed");
+        cursor.offset += rows;
+        let next = if cursor.offset == cursor.output.len() {
+            self.emission = None;
+            NextStep::Finished
+        } else {
+            NextStep::Runnable
+        };
+        Ok(StepResult::new(Some(output), next, 0))
+    }
+    fn finish(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
+        let result = self.build_output().and_then(|output| {
+            if let Some(topn) = &mut self.topn {
+                topn.finish()?;
+            }
+            Ok(output)
+        });
+        if let Err(error) = &result {
+            ctx.report_failure(error.clone());
+        }
+        let output = self.failure_result(result)?;
         self.topn = None;
-        // The states and keys are released once their output is built.
         self.states = None;
         self.key_table = None;
         self.instances = None;
-        if self.pending.is_empty() {
-            self.finished = true;
+        match output {
+            Some(output) if output.len() > OUTPUT_CHUNK_ROWS => {
+                self.emission = Some(AggregateOutputCursor { output, offset: 0 });
+                Ok(StepResult::new(None, NextStep::Runnable, 0))
+            }
+            output => Ok(StepResult::new(output, NextStep::Finished, 0)),
         }
-        Ok(())
     }
 }
 
@@ -1416,9 +1432,7 @@ mod failure_latch_tests {
             key_table: None,
             states: None,
             groups: 0,
-            pending: VecDeque::new(),
-            finishing: false,
-            finished: false,
+            emission: None,
             failed: None,
             topn: None,
         };
@@ -1432,30 +1446,50 @@ mod failure_latch_tests {
             .expect("prepare actual aggregate schema");
         (processor, input, error, tracker)
     }
+    fn with_context<T>(state: &RuntimeState, action: impl FnOnce(&mut StepContext<'_>) -> T) -> T {
+        let error = state.error_state();
+        let mut work =
+            crate::exec::pipeline::step_context::TurnWork::new(std::num::NonZeroU64::MIN, 64);
+        action(&mut StepContext::new(&error, &mut work))
+    }
+    impl CompiledAggregateProcessor {
+        fn apply_for_test(
+            &mut self,
+            state: &RuntimeState,
+            input: Chunk,
+        ) -> ExecutionResult<StepResult> {
+            with_context(state, |ctx| self.apply(ctx, PreparedInput::for_test(input)))
+        }
+        fn drive_for_test(&mut self, state: &RuntimeState) -> ExecutionResult<StepResult> {
+            with_context(state, |ctx| self.drive(ctx))
+        }
+        fn finalize_for_test(&mut self, state: &RuntimeState) -> ExecutionResult<StepResult> {
+            with_context(state, |ctx| self.finish(ctx))
+        }
+    }
     fn assert_failed_reentry(
         processor: &mut CompiledAggregateProcessor,
         expected: &ExecutionFailure,
         input: &Chunk,
     ) {
         let state = RuntimeState::default();
-        assert!(!processor.need_input());
-        assert!(!processor.has_output());
-        assert!(processor.is_finished());
+        assert!(processor.failed.is_some());
         assert!(processor.states.is_none());
         assert!(processor.key_table.is_none());
         assert!(processor.instances.is_none());
-        assert!(processor.pending.is_empty());
-        assert_eq!(processor.pending.capacity(), 0);
+        assert!(processor.emission.is_none());
         assert_eq!(
-            processor.push_chunk(&state, input.clone()).unwrap_err(),
+            processor.apply_for_test(&state, input.clone()).unwrap_err(),
             *expected
         );
         assert_eq!(
-            processor.push_chunk(&state, Chunk::default()).unwrap_err(),
+            processor
+                .apply_for_test(&state, Chunk::default())
+                .unwrap_err(),
             *expected
         );
-        assert_eq!(processor.pull_chunk(&state).unwrap_err(), *expected);
-        assert_eq!(processor.set_finishing(&state).unwrap_err(), *expected);
+        assert_eq!(processor.drive_for_test(&state).unwrap_err(), *expected);
+        assert_eq!(processor.finalize_for_test(&state).unwrap_err(), *expected);
     }
     fn pending_prefix(
         processor: &mut CompiledAggregateProcessor,
@@ -1464,7 +1498,10 @@ mod failure_latch_tests {
         let column = Arc::new(Int64Array::from(vec![999, 1000])) as ArrayRef;
         let weak = Arc::downgrade(&column);
         let batch = RecordBatch::try_new(input.record_batch().schema(), vec![column]).unwrap();
-        processor.pending.push_back(Chunk::new_like(batch, input));
+        processor.emission = Some(AggregateOutputCursor {
+            output: Chunk::new_like(batch, input),
+            offset: 0,
+        });
         weak
     }
     #[test]
@@ -1472,8 +1509,8 @@ mod failure_latch_tests {
         let (mut processor, input, error, tracker) = processor_for_count(true);
         let creator_bytes = tracker.current();
         let state = RuntimeState::default();
-        processor.push_chunk(&state, input.clone()).unwrap();
-        processor.push_chunk(&state, input.clone()).unwrap();
+        processor.apply_for_test(&state, input.clone()).unwrap();
+        processor.apply_for_test(&state, input.clone()).unwrap();
         assert_eq!(processor.groups, 2);
         assert!(tracker.current() > 0);
         assert!(processor.instances.is_some());
@@ -1483,8 +1520,12 @@ mod failure_latch_tests {
                 .as_ref()
                 .is_some_and(|states| states[0].len() == 2)
         );
-        error.set_error("stop installed COUNT DISTINCT after accumulation");
-        let original = processor.push_chunk(&state, input.clone()).unwrap_err();
+        error.set_error(novarocks_functions::KernelFailure::Internal(
+            novarocks_functions::KernelDiagnostic::new(
+                &("stop installed COUNT DISTINCT after accumulation"),
+            ),
+        ));
+        let original = processor.apply_for_test(&state, input.clone()).unwrap_err();
         assert_eq!(
             original.cause(),
             &ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
@@ -1501,7 +1542,7 @@ mod failure_latch_tests {
     fn compiled_aggregate_failure_latch_count_distinct_drop_releases_live_state() {
         let (mut processor, input, _, tracker) = processor_for_count(true);
         processor
-            .push_chunk(&RuntimeState::default(), input)
+            .apply_for_test(&RuntimeState::default(), input)
             .unwrap();
         assert!(tracker.current() > 0);
         assert!(
@@ -1520,11 +1561,13 @@ mod failure_latch_tests {
         let (mut processor, input, error, tracker) = processor();
         let creator_bytes = tracker.current();
         let state = RuntimeState::default();
-        processor.push_chunk(&state, input.clone()).unwrap();
+        processor.apply_for_test(&state, input.clone()).unwrap();
         assert_eq!(processor.groups, 2);
         assert!(tracker.current() > 0);
-        error.set_error("originating task stop");
-        let original = processor.push_chunk(&state, input.clone()).unwrap_err();
+        error.set_error(novarocks_functions::KernelFailure::Internal(
+            novarocks_functions::KernelDiagnostic::new(&("originating task stop")),
+        ));
+        let original = processor.apply_for_test(&state, input.clone()).unwrap_err();
         assert_eq!(
             original.cause(),
             &ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
@@ -1542,12 +1585,14 @@ mod failure_latch_tests {
         let (mut processor, input, error, tracker) = processor();
         let creator_bytes = tracker.current();
         let state = RuntimeState::default();
-        processor.push_chunk(&state, input.clone()).unwrap();
+        processor.apply_for_test(&state, input.clone()).unwrap();
         let prefix = pending_prefix(&mut processor, &input);
         assert!(prefix.upgrade().is_some());
-        error.set_error("stop before aggregate emission");
+        error.set_error(novarocks_functions::KernelFailure::Internal(
+            novarocks_functions::KernelDiagnostic::new(&("stop before aggregate emission")),
+        ));
         let originating = error.error().unwrap();
-        let original = processor.set_finishing(&state).unwrap_err();
+        let original = processor.finalize_for_test(&state).unwrap_err();
         assert_eq!(original.cause(), originating.cause());
         assert!(
             prefix.upgrade().is_none(),
@@ -1557,11 +1602,78 @@ mod failure_latch_tests {
         assert_failed_reentry(&mut processor, &original, &input);
     }
     #[test]
+    fn compiled_aggregate_reports_resource_refusal_before_discarding_unpublished_work() {
+        struct ObserveDrop {
+            report: Arc<RuntimeErrorState>,
+            observed: Arc<std::sync::Mutex<Option<ExecutionFailure>>>,
+        }
+        impl novarocks_type_contract::ValueTypeStorageHold for ObserveDrop {}
+        impl Drop for ObserveDrop {
+            fn drop(&mut self) {
+                *self.observed.lock().unwrap() = self.report.error();
+            }
+        }
+        let (mut processor, input, kernel_control, tracker) = processor_for_count(true);
+        let state = RuntimeState::default();
+        processor.apply_for_test(&state, input.clone()).unwrap();
+        let report = state.error_state();
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let marker =
+            novarocks_type_contract::ValueTypeStorageLifetime::held(Arc::new(ObserveDrop {
+                report: report.clone(),
+                observed: observed.clone(),
+            }));
+        let prefix = input.clone().retaining_array_type_storage_observed::<
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError
+        >(&marker, |_| Ok(())).unwrap();
+        drop(marker);
+        processor.emission = Some(AggregateOutputCursor {
+            output: prefix,
+            offset: 0,
+        });
+        tracker.install_limit_once(tracker.current() + 1).unwrap();
+        let first = with_context(&state, |ctx| {
+            let mut step = ctx.operator_step(7, PipelineOperation::Finishing);
+            processor.finish(&mut step).unwrap_err()
+        });
+        use novarocks_failure_contract::FailureProjection;
+        assert_eq!(
+            first.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Resource
+        );
+        let seen = observed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("known failure reported before prefix destruction");
+        assert!(seen.same_occurrence(&first));
+        assert_eq!(
+            seen.context(),
+            Some(crate::runtime::fragment::ExecutionFailureContext {
+                operator_ordinal: 7,
+                operation: PipelineOperation::Finishing,
+            })
+        );
+        assert!(processor.states.is_none());
+        assert!(processor.key_table.is_none());
+        assert!(processor.emission.is_none());
+        assert_failed_reentry(&mut processor, &first, &input);
+        drop(processor);
+        drop(input);
+        drop(kernel_control);
+        drop(first);
+        drop(seen);
+        drop(report);
+        drop(state);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
     fn compiled_aggregate_failure_latch_keeps_first_typed_payload_and_context() {
         let (mut processor, input, _, tracker) = processor();
         let creator_bytes = tracker.current();
         let state = RuntimeState::default();
-        processor.push_chunk(&state, input.clone()).unwrap();
+        processor.apply_for_test(&state, input.clone()).unwrap();
         let row = RequiredExpressionRowError::try_new(
             processor.sites[0],
             Selection::all(2),
@@ -1586,7 +1698,7 @@ mod failure_latch_tests {
     fn compiled_aggregate_failure_latch_drop_releases_live_owners_and_pending() {
         let (mut processor, input, _, tracker) = processor();
         processor
-            .push_chunk(&RuntimeState::default(), input.clone())
+            .apply_for_test(&RuntimeState::default(), input.clone())
             .unwrap();
         let prefix = pending_prefix(&mut processor, &input);
         assert!(tracker.current() > 0);
@@ -1607,12 +1719,11 @@ mod failure_latch_tests {
         let (mut processor, input, error, tracker) = processor();
         let error_weak = Arc::downgrade(&error);
         let state = RuntimeState::default();
-        processor.push_chunk(&state, input.clone()).unwrap();
-        processor.set_finishing(&state).unwrap();
-        let output = processor.pull_chunk(&state).unwrap().unwrap();
+        processor.apply_for_test(&state, input.clone()).unwrap();
+        let output = processor.finalize_for_test(&state).unwrap().output.unwrap();
         assert_eq!(output.len(), 2);
         assert!(output.chunk_schema().is_typed());
-        assert!(processor.pull_chunk(&state).unwrap().is_none());
+        assert!(processor.drive_for_test(&state).unwrap().output.is_none());
         let projection = output.into_batch_projection();
         drop(input);
         drop(processor);
@@ -1640,6 +1751,93 @@ mod failure_latch_tests {
         drop(projection);
         assert!(tracker.current() > 0);
         drop(clone);
+        assert_eq!(tracker.current(), 0);
+    }
+    #[test]
+    fn compiled_aggregate_output_cursor_yields_without_allocating_and_emits_each_group_once() {
+        use crate::exec::pipeline::step_context::TurnWork;
+        let (mut processor, original, error, tracker) = processor();
+        let groups = OUTPUT_CHUNK_ROWS + 17;
+        let input = Chunk::try_new_with_chunk_schema(
+            RecordBatch::try_new(
+                original.schema().clone(),
+                vec![
+                    Arc::new(Int64Array::from((0..groups as i64).collect::<Vec<_>>())) as ArrayRef,
+                ],
+            )
+            .unwrap(),
+            original.chunk_schema_ref(),
+        )
+        .unwrap();
+        let state = RuntimeState::default();
+        assert_eq!(
+            processor
+                .apply_for_test(&state, input)
+                .unwrap()
+                .committed_rows,
+            groups as u64
+        );
+        let finalized = processor.finalize_for_test(&state).unwrap();
+        assert!(finalized.output.is_none());
+        assert!(matches!(finalized.next, NextStep::Runnable));
+        assert!(processor.states.is_none());
+        assert!(processor.key_table.is_none());
+        let mut work = TurnWork::new(std::num::NonZeroU64::new(41).unwrap(), 1);
+        let first = processor
+            .drive(&mut StepContext::new(&error, &mut work))
+            .unwrap();
+        assert!(matches!(first.next, NextStep::Runnable));
+        let first = first.output.unwrap();
+        assert_eq!(first.len(), OUTPUT_CHUNK_ROWS);
+        let allocated = tracker.allocated();
+        let cursor = processor.emission.as_ref().unwrap().offset;
+        let yielded = processor
+            .drive(&mut StepContext::new(&error, &mut work))
+            .unwrap();
+        assert!(yielded.output.is_none());
+        assert!(matches!(yielded.next, NextStep::Yield));
+        assert_eq!(tracker.allocated(), allocated);
+        assert_eq!(processor.emission.as_ref().unwrap().offset, cursor);
+        work.begin_turn(1).unwrap();
+        let last = processor
+            .drive(&mut StepContext::new(&error, &mut work))
+            .unwrap();
+        assert!(matches!(last.next, NextStep::Finished));
+        let last = last.output.unwrap();
+        assert_eq!(last.len(), 17);
+        assert!(processor.emission.is_none());
+        let mut observed = std::collections::BTreeMap::new();
+        for chunk in [&first, &last] {
+            let keys = chunk.columns()[0]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let counts = chunk.columns()[1]
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for row in 0..chunk.len() {
+                assert!(
+                    observed
+                        .insert(keys.value(row), counts.value(row))
+                        .is_none()
+                );
+            }
+        }
+        assert_eq!(observed, (0..groups as i64).map(|key| (key, 1)).collect());
+        drop(original);
+        drop(processor);
+        drop(error);
+        assert!(
+            tracker.current() > 0,
+            "returned pages retain their actual construction"
+        );
+        drop(first);
+        assert!(
+            tracker.current() > 0,
+            "the final page is an independent storage owner"
+        );
+        drop(last);
         assert_eq!(tracker.current(), 0);
     }
 }
@@ -1765,20 +1963,18 @@ mod schema_prepare_tests {
             )
         ));
         assert_eq!(operator.prepare().unwrap_err(), error);
-        let processor = operator.as_processor_mut().unwrap();
-        assert_eq!(
-            processor
-                .push_chunk(&RuntimeState::default(), Chunk::default())
-                .unwrap_err(),
-            error
+        let mut processor = crate::exec::pipeline::test_driver::TestDriver::new(
+            operator.as_mut(),
+            &RuntimeState::default(),
         );
         assert_eq!(
             processor
-                .set_finishing(&RuntimeState::default())
+                .input_without_output(Chunk::default())
                 .unwrap_err(),
             error
         );
-        assert!(processor.is_finished());
+        assert_eq!(processor.signal_eos().unwrap_err(), error);
+        assert!(processor.drive().unwrap_err().same_occurrence(&error));
     }
 
     #[test]
@@ -1803,16 +1999,14 @@ mod schema_prepare_tests {
         ));
         assert_eq!(tracker.current(), installed_bytes);
         assert_eq!(operator.prepare().unwrap_err(), first);
-        let processor = operator.as_processor_mut().unwrap();
-        assert_eq!(
-            processor
-                .set_finishing(&RuntimeState::default())
-                .unwrap_err(),
-            first
+        let mut processor = crate::exec::pipeline::test_driver::TestDriver::new(
+            operator.as_mut(),
+            &RuntimeState::default(),
         );
+        assert_eq!(processor.signal_eos().unwrap_err(), first);
         assert_eq!(
             processor
-                .push_chunk(&RuntimeState::default(), Chunk::default())
+                .input_without_output(Chunk::default())
                 .unwrap_err(),
             first
         );
@@ -1834,17 +2028,15 @@ mod schema_prepare_tests {
         ));
         operator.set_mem_tracker(tracker.clone());
         operator.prepare().unwrap();
-        operator
-            .as_processor_mut()
-            .unwrap()
-            .set_finishing(&RuntimeState::default())
-            .unwrap();
-        let output = operator
-            .as_processor_mut()
-            .unwrap()
-            .pull_chunk(&RuntimeState::default())
-            .unwrap()
-            .unwrap();
+        operator.finish_for_test(&RuntimeState::default()).unwrap();
+        let output = crate::exec::pipeline::test_driver::TestDriver::new(
+            operator.as_mut(),
+            &RuntimeState::default(),
+        )
+        .advance_to_boundary()
+        .map(|step| step.output)
+        .unwrap()
+        .unwrap();
         let schema = output.chunk_schema_ref();
         let slot = schema.slots()[0].clone();
         drop(operator);
@@ -1879,16 +2071,16 @@ mod schema_prepare_tests {
         partial_operator.set_mem_tracker(tracker.clone());
         partial_operator.prepare().unwrap();
         partial_operator
-            .as_processor_mut()
-            .unwrap()
-            .set_finishing(&RuntimeState::default())
+            .finish_for_test(&RuntimeState::default())
             .unwrap();
-        let intermediate = partial_operator
-            .as_processor_mut()
-            .unwrap()
-            .pull_chunk(&RuntimeState::default())
-            .unwrap()
-            .unwrap();
+        let intermediate = crate::exec::pipeline::test_driver::TestDriver::new(
+            partial_operator.as_mut(),
+            &RuntimeState::default(),
+        )
+        .advance_to_boundary()
+        .map(|step| step.output)
+        .unwrap()
+        .unwrap();
         let slot = partial.output_layout.slots()[partial.groups];
         let actual = intermediate
             .chunk_schema()
@@ -1911,22 +2103,23 @@ mod schema_prepare_tests {
         ));
         final_operator.set_mem_tracker(tracker.clone());
         final_operator.prepare().unwrap();
+        crate::exec::pipeline::test_driver::TestDriver::new(
+            final_operator.as_mut(),
+            &RuntimeState::default(),
+        )
+        .input_without_output(intermediate)
+        .unwrap();
         final_operator
-            .as_processor_mut()
-            .unwrap()
-            .push_chunk(&RuntimeState::default(), intermediate)
+            .finish_for_test(&RuntimeState::default())
             .unwrap();
-        final_operator
-            .as_processor_mut()
-            .unwrap()
-            .set_finishing(&RuntimeState::default())
-            .unwrap();
-        let output = final_operator
-            .as_processor_mut()
-            .unwrap()
-            .pull_chunk(&RuntimeState::default())
-            .unwrap()
-            .unwrap();
+        let output = crate::exec::pipeline::test_driver::TestDriver::new(
+            final_operator.as_mut(),
+            &RuntimeState::default(),
+        )
+        .advance_to_boundary()
+        .map(|step| step.output)
+        .unwrap()
+        .unwrap();
         assert_eq!(
             output.chunk_schema().slots()[0].typed_binding(),
             final_stage.calls[0].contract.final_type().typed_binding()

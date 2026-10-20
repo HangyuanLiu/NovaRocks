@@ -15,9 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Original ARRAY aggregate computation, scalar output author and row-state codec.
+use super::aggregate_array_source_failure as failure;
+use crate::KernelFailure;
+use crate::aggregate_scalar::{
+    checked_list_output_offset, checked_map_output_offset, checked_utf8_output_offset,
+};
 use crate::{
     aggregate_scalar::{
-        AggScalarValue, ScalarStateAllocator, ScalarStateError, ScalarWork, TrackedAggScalarValue,
+        AggScalarValue, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue,
         aggregate_vec_with_capacity, tracked_scalar_from_array, tracked_scalar_heap_capacity,
         tracked_scalar_to_output,
     },
@@ -87,7 +92,7 @@ impl<A: ScalarStateAllocator> ArrayAggState<A> {
         &mut self,
         row: &ScalarVec<Option<TrackedAggScalarValue<A>>, A>,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), KernelFailure> {
         let mut retained = row.capacity() * std::mem::size_of::<Option<TrackedAggScalarValue<A>>>();
         for value in row.iter().flatten() {
             work.step()?;
@@ -112,11 +117,11 @@ impl<A: ScalarStateAllocator> ArrayAggState<A> {
         &mut self,
         row: ScalarVec<Option<TrackedAggScalarValue<A>>, A>,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), KernelFailure> {
         work.flush()?;
-        self.rows.try_reserve(1).map_err(|_| {
+        self.rows.try_reserve(1).map_err(|source| {
             self.allocator
-                .scalar_allocation_error("reserve array_agg row")
+                .scalar_allocation_error("reserve array_agg row", source)
         })?;
         work.flush()?;
         self.note_row_backing(&row, work)?;
@@ -156,7 +161,7 @@ fn order_by_kind<'a>(kind: &ArrayAggKind<'a>) -> (&'a [bool], &'a [bool]) {
 pub fn to_common_scalar(
     value: &ArrayAggValue,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<AggScalarValue, ScalarStateError> {
+) -> Result<AggScalarValue, KernelFailure> {
     work.step()?;
     Ok(match value {
         ArrayAggValue::Bool(v) => AggScalarValue::Bool(*v),
@@ -194,7 +199,7 @@ pub fn to_common_scalar(
 pub fn distinct_key(
     value: &Option<ArrayAggValue>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Vec<u8>, ScalarStateError> {
+) -> Result<Vec<u8>, KernelFailure> {
     work.step()?;
     Ok(match value {
         None => vec![0],
@@ -211,7 +216,7 @@ fn compare_optional_values(
     asc: bool,
     nulls_first: bool,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Ordering, ScalarStateError> {
+) -> Result<Ordering, KernelFailure> {
     work.step()?;
     let ord = match (left, right) {
         (None, None) => Ordering::Equal,
@@ -242,14 +247,14 @@ fn compare_optional_values(
 fn array_value_from_tracked<A: ScalarStateAllocator>(
     value: &TrackedAggScalarValue<A>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ArrayAggValue, ScalarStateError> {
+) -> Result<ArrayAggValue, KernelFailure> {
     array_value_from_common(tracked_scalar_to_output(value, work)?, work)
 }
 
 fn array_value_from_common(
     value: AggScalarValue,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ArrayAggValue, ScalarStateError> {
+) -> Result<ArrayAggValue, KernelFailure> {
     work.step()?;
     Ok(match value {
         AggScalarValue::Bool(value) => ArrayAggValue::Bool(value),
@@ -289,13 +294,12 @@ fn array_value_from_common(
                             .transpose()?,
                     ])))
                 })
-                .collect::<Result<Vec<_>, ScalarStateError>>()?,
+                .collect::<Result<Vec<_>, KernelFailure>>()?,
         ),
         AggScalarValue::Decimal256(_) | AggScalarValue::Binary(_) => {
-            return Err(
-                ("array_agg tracked scalar type is not supported by its output ABI".to_string())
-                    .into(),
-            );
+            return Err(failure::contract(
+                "array_agg tracked scalar type is not supported by its output ABI",
+            ));
         }
     })
 }
@@ -305,13 +309,13 @@ fn sort_rows(
     is_asc_order: &[bool],
     nulls_first: &[bool],
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), KernelFailure> {
     let order_by_num = is_asc_order.len();
     if order_by_num == 0 {
         return Ok(());
     }
     work.flush()?;
-    let mut error: Option<ScalarStateError> = None;
+    let mut error: Option<KernelFailure> = None;
     rows.sort_by(|left, right| {
         if error.is_some() {
             return Ordering::Equal;
@@ -331,10 +335,10 @@ fn sort_rows(
         }
         Ordering::Equal
     });
-    work.flush()?;
     if let Some(err) = error {
         return Err(err);
     }
+    work.flush()?;
     Ok(())
 }
 
@@ -342,7 +346,7 @@ fn extract_final_values<A: ScalarStateAllocator>(
     spec: &ArrayAggConfig<'_>,
     state: &ArrayAggState<A>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Vec<Option<ArrayAggValue>>, ScalarStateError> {
+) -> Result<Vec<Option<ArrayAggValue>>, KernelFailure> {
     let mut rows = state
         .rows
         .iter()
@@ -356,7 +360,7 @@ fn extract_final_values<A: ScalarStateAllocator>(
                         .map(|v| array_value_from_tracked(v, work))
                         .transpose()
                 })
-                .collect::<Result<Vec<_>, ScalarStateError>>()
+                .collect::<Result<Vec<_>, KernelFailure>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
     let (is_asc_order, nulls_first) = order_by_kind(&spec.kind);
@@ -385,7 +389,7 @@ fn reconcile_field_to_field(
     actual: &Arc<Field>,
     context: &str,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Arc<Field>, ScalarStateError> {
+) -> Result<Arc<Field>, KernelFailure> {
     work.step()?;
     work.flush()?;
     let result = (|| {
@@ -411,7 +415,7 @@ fn reconcile_field_to_data_type(
     actual: &DataType,
     context: &str,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Arc<Field>, ScalarStateError> {
+) -> Result<Arc<Field>, KernelFailure> {
     work.step()?;
     work.flush()?;
     let result = (|| {
@@ -435,7 +439,7 @@ fn reconcile_data_type(
     actual: &DataType,
     context: &str,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<DataType, ScalarStateError> {
+) -> Result<DataType, KernelFailure> {
     work.step()?;
     work.flush()?;
     let result = (|| {
@@ -464,11 +468,10 @@ fn reconcile_data_type(
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(DataType::Struct(Fields::from(fields)))
             }
-            _ => Err((format!(
+            _ => Err(failure::shape_mismatch(format_args!(
                 "{context} type mismatch: expected {:?}, got {:?}",
                 expected, actual
-            ))
-            .into()),
+            ))),
         }
     })();
     work.flush()?;
@@ -480,17 +483,16 @@ fn reconcile_fields_for_columns(
     columns: &[ArrayRef],
     context: &str,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Fields, ScalarStateError> {
+) -> Result<Fields, KernelFailure> {
     work.step()?;
     work.flush()?;
     let result = (|| {
         if expected_fields.len() != columns.len() {
-            return Err((format!(
+            return Err(failure::contract(format_args!(
                 "{context} field count mismatch: expected {}, got {}",
                 expected_fields.len(),
                 columns.len()
-            ))
-            .into());
+            )));
         }
         let fields = expected_fields
             .iter()
@@ -511,7 +513,7 @@ fn append_value<A: ScalarStateAllocator>(
     value: Option<TrackedAggScalarValue<A>>,
     distinct: bool,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), KernelFailure> {
     if distinct {
         let key = tracked_optional_key_fingerprint(&value, &state.allocator, work)?;
         if state.distinct_seen.contains(&key) {
@@ -524,15 +526,15 @@ fn append_value<A: ScalarStateAllocator>(
             work,
         )?;
         row.push(value);
-        state.rows.try_reserve(1).map_err(|_| {
+        state.rows.try_reserve(1).map_err(|source| {
             state
                 .allocator
-                .scalar_allocation_error("reserve array_agg row")
+                .scalar_allocation_error("reserve array_agg row", source)
         })?;
-        state.distinct_seen.try_reserve(1).map_err(|_| {
+        state.distinct_seen.try_reserve(1).map_err(|source| {
             state
                 .allocator
-                .scalar_allocation_error("reserve array_agg distinct key")
+                .scalar_allocation_error("reserve array_agg distinct key", source)
         })?;
         state.note_row_backing(&row, work)?;
         state.key_backing_bytes = state
@@ -554,7 +556,7 @@ pub fn unwrap_update_value_array<'a>(
     spec: &ArrayAggConfig<'_>,
     array: &'a ArrayRef,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(&'a ArrayRef, Option<&'a StructArray>), ScalarStateError> {
+) -> Result<(&'a ArrayRef, Option<&'a StructArray>), KernelFailure> {
     work.step()?;
     work.flush()?;
     let result = (|| {
@@ -565,16 +567,24 @@ pub fn unwrap_update_value_array<'a>(
             return Ok((array, None));
         };
         let first = wrapper.columns().first().ok_or_else(|| {
-            "array_agg struct input must contain at least 1 field for value extraction".to_string()
+            failure::contract(
+                "array_agg struct input must contain at least 1 field for value extraction",
+            )
         })?;
-        let first_matches_expected = first.data_type() == expected_item_type
-            || reconcile_data_type(
+        let first_matches_expected = if first.data_type() == expected_item_type {
+            true
+        } else {
+            match reconcile_data_type(
                 expected_item_type,
                 first.data_type(),
                 "array_agg update input",
                 work,
-            )
-            .is_ok();
+            ) {
+                Ok(_) => true,
+                Err(error) if failure::is_shape_mismatch(&error) => false,
+                Err(error) => return Err(error),
+            }
+        };
         if first_matches_expected {
             Ok((first, Some(wrapper)))
         } else {
@@ -589,7 +599,7 @@ fn build_scalar_array(
     output_type: &DataType,
     values: Vec<Option<ArrayAggValue>>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ArrayRef, ScalarStateError> {
+) -> Result<ArrayRef, KernelFailure> {
     match output_type {
         DataType::Null => {
             let mut any = false;
@@ -599,7 +609,7 @@ fn build_scalar_array(
             }
             if any {
                 work.step()?;
-                return Err(("scalar output type mismatch for Null".to_string()).into());
+                return Err(failure::contract("scalar output type mismatch for Null"));
             }
             Ok(Arc::new(NullArray::new(values.len())) as ArrayRef)
         }
@@ -610,7 +620,7 @@ fn build_scalar_array(
                 match value {
                     Some(ArrayAggValue::Bool(v)) => out.push(Some(v)),
                     None => out.push(None),
-                    _ => return Err(("scalar output type mismatch for Boolean".to_string()).into()),
+                    _ => return Err(failure::contract("scalar output type mismatch for Boolean")),
                 }
             }
             Ok(Arc::new(BooleanArray::from(out)) as ArrayRef)
@@ -621,11 +631,12 @@ fn build_scalar_array(
                 work.step()?;
                 match value {
                     Some(ArrayAggValue::Int64(v)) => {
-                        let v = i8::try_from(v).map_err(|_| "int8 overflow".to_string())?;
+                        let v =
+                            i8::try_from(v).map_err(|source| failure::narrow("int8", source))?;
                         out.push(Some(v));
                     }
                     None => out.push(None),
-                    _ => return Err(("scalar output type mismatch for Int8".to_string()).into()),
+                    _ => return Err(failure::contract("scalar output type mismatch for Int8")),
                 }
             }
             Ok(Arc::new(Int8Array::from(out)) as ArrayRef)
@@ -636,11 +647,12 @@ fn build_scalar_array(
                 work.step()?;
                 match value {
                     Some(ArrayAggValue::Int64(v)) => {
-                        let v = i16::try_from(v).map_err(|_| "int16 overflow".to_string())?;
+                        let v =
+                            i16::try_from(v).map_err(|source| failure::narrow("int16", source))?;
                         out.push(Some(v));
                     }
                     None => out.push(None),
-                    _ => return Err(("scalar output type mismatch for Int16".to_string()).into()),
+                    _ => return Err(failure::contract("scalar output type mismatch for Int16")),
                 }
             }
             Ok(Arc::new(Int16Array::from(out)) as ArrayRef)
@@ -651,11 +663,12 @@ fn build_scalar_array(
                 work.step()?;
                 match value {
                     Some(ArrayAggValue::Int64(v)) => {
-                        let v = i32::try_from(v).map_err(|_| "int32 overflow".to_string())?;
+                        let v =
+                            i32::try_from(v).map_err(|source| failure::narrow("int32", source))?;
                         out.push(Some(v));
                     }
                     None => out.push(None),
-                    _ => return Err(("scalar output type mismatch for Int32".to_string()).into()),
+                    _ => return Err(failure::contract("scalar output type mismatch for Int32")),
                 }
             }
             Ok(Arc::new(Int32Array::from(out)) as ArrayRef)
@@ -667,7 +680,7 @@ fn build_scalar_array(
                 match value {
                     Some(ArrayAggValue::Int64(v)) => out.push(Some(v)),
                     None => out.push(None),
-                    _ => return Err(("scalar output type mismatch for Int64".to_string()).into()),
+                    _ => return Err(failure::contract("scalar output type mismatch for Int64")),
                 }
             }
             Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
@@ -679,7 +692,7 @@ fn build_scalar_array(
                 match value {
                     Some(ArrayAggValue::Float64(v)) => out.push(Some(v as f32)),
                     None => out.push(None),
-                    _ => return Err(("scalar output type mismatch for Float32".to_string()).into()),
+                    _ => return Err(failure::contract("scalar output type mismatch for Float32")),
                 }
             }
             Ok(Arc::new(Float32Array::from(out)) as ArrayRef)
@@ -691,19 +704,23 @@ fn build_scalar_array(
                 match value {
                     Some(ArrayAggValue::Float64(v)) => out.push(Some(v)),
                     None => out.push(None),
-                    _ => return Err(("scalar output type mismatch for Float64".to_string()).into()),
+                    _ => return Err(failure::contract("scalar output type mismatch for Float64")),
                 }
             }
             Ok(Arc::new(Float64Array::from(out)) as ArrayRef)
         }
         DataType::Utf8 => {
             let mut out = Vec::with_capacity(values.len());
+            let mut bytes = 0_i32;
             for value in values {
                 work.step()?;
                 match value {
-                    Some(ArrayAggValue::Utf8(v)) => out.push(Some(v)),
+                    Some(ArrayAggValue::Utf8(v)) => {
+                        bytes = checked_utf8_output_offset(bytes, v.len())?;
+                        out.push(Some(v));
+                    }
                     None => out.push(None),
-                    _ => return Err(("scalar output type mismatch for Utf8".to_string()).into()),
+                    _ => return Err(failure::contract("scalar output type mismatch for Utf8")),
                 }
             }
             Ok(Arc::new(StringArray::from(out)) as ArrayRef)
@@ -715,7 +732,7 @@ fn build_scalar_array(
                 match value {
                     Some(ArrayAggValue::Date32(v)) => out.push(Some(v)),
                     None => out.push(None),
-                    _ => return Err(("scalar output type mismatch for Date32".to_string()).into()),
+                    _ => return Err(failure::contract("scalar output type mismatch for Date32")),
                 }
             }
             Ok(Arc::new(Date32Array::from(out)) as ArrayRef)
@@ -728,9 +745,9 @@ fn build_scalar_array(
                     Some(ArrayAggValue::Timestamp(v)) => out.push(Some(v)),
                     None => out.push(None),
                     _ => {
-                        return Err(
-                            ("scalar output type mismatch for Timestamp".to_string()).into()
-                        );
+                        return Err(failure::contract(
+                            "scalar output type mismatch for Timestamp",
+                        ));
                     }
                 }
             }
@@ -779,15 +796,15 @@ fn build_scalar_array(
                     Some(ArrayAggValue::Decimal128(v)) => out.push(Some(v)),
                     None => out.push(None),
                     _ => {
-                        return Err(
-                            ("scalar output type mismatch for Decimal128".to_string()).into()
-                        );
+                        return Err(failure::contract(
+                            "scalar output type mismatch for Decimal128",
+                        ));
                     }
                 }
             }
             let arr = Decimal128Array::from(out)
                 .with_precision_and_scale(*precision, *scale)
-                .map_err(|e| e.to_string())?;
+                .map_err(failure::constructor)?;
             Ok(Arc::new(arr) as ArrayRef)
         }
         DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
@@ -798,21 +815,22 @@ fn build_scalar_array(
                     Some(ArrayAggValue::Decimal128(v)) => out.push(Some(v)),
                     None => out.push(None),
                     _ => {
-                        return Err(("scalar output type mismatch for LargeInt".to_string()).into());
+                        return Err(failure::contract(
+                            "scalar output type mismatch for LargeInt",
+                        ));
                     }
                 }
             }
             largeint::array_from_i128_observed(&out, &mut |event| match event {
                 largeint::LargeIntObservation::Step => work.step(),
                 largeint::LargeIntObservation::OpaqueBoundary => work.flush(),
-            })?
-            .map_err(Into::into)
+            })
         }
         DataType::Struct(fields) => {
             if fields.is_empty() {
-                return Err(
-                    ("array_agg cannot build Struct output with no fields".to_string()).into(),
-                );
+                return Err(failure::contract(
+                    "array_agg cannot build Struct output with no fields",
+                ));
             }
             let mut null_builder = NullBufferBuilder::new(values.len());
             let mut by_field: Vec<Vec<Option<ArrayAggValue>>> = (0..fields.len())
@@ -830,12 +848,11 @@ fn build_scalar_array(
                     }
                     Some(ArrayAggValue::Struct(items)) => {
                         if items.len() != fields.len() {
-                            return Err((format!(
+                            return Err(failure::contract(format_args!(
                                 "scalar output type mismatch for Struct: expected {} fields, got {}",
                                 fields.len(),
                                 items.len()
-                            ))
-                            .into());
+                            )));
                         }
                         null_builder.append_non_null();
                         for (idx, item) in items.into_iter().enumerate() {
@@ -844,11 +861,10 @@ fn build_scalar_array(
                         }
                     }
                     Some(other) => {
-                        return Err((format!(
+                        return Err(failure::contract(format_args!(
                             "scalar output type mismatch for Struct: got {:?}",
                             other
-                        ))
-                        .into());
+                        )));
                     }
                 }
             }
@@ -864,31 +880,30 @@ fn build_scalar_array(
             let output_fields =
                 reconcile_fields_for_columns(fields, &columns, "array_agg struct output", work)?;
             work.flush()?;
-            let out = StructArray::new(output_fields, columns, null_builder.finish());
+            let out = StructArray::try_new(output_fields, columns, null_builder.finish())
+                .map_err(failure::constructor)?;
             work.flush()?;
             Ok(Arc::new(out) as ArrayRef)
         }
         DataType::Map(entries_field, ordered) => {
             let DataType::Struct(entry_fields) = entries_field.data_type() else {
-                return Err((format!(
+                return Err(failure::contract(format_args!(
                     "array_agg map entries field must be Struct, got {:?}",
                     entries_field.data_type()
-                ))
-                .into());
+                )));
             };
             if entry_fields.len() != 2 {
-                return Err((format!(
+                return Err(failure::contract(format_args!(
                     "array_agg map entries field must contain key/value, got {} fields",
                     entry_fields.len()
-                ))
-                .into());
+                )));
             }
 
             let mut key_values = Vec::new();
             let mut value_values = Vec::new();
             let mut offsets = Vec::with_capacity(values.len() + 1);
             offsets.push(0_i32);
-            let mut current: i64 = 0;
+            let mut current: i32 = 0;
             let mut null_builder = NullBufferBuilder::new(values.len());
 
             for value in values {
@@ -896,38 +911,35 @@ fn build_scalar_array(
                 match value {
                     None => {
                         null_builder.append_null();
-                        offsets.push(current as i32);
+                        offsets.push(current);
                     }
                     Some(ArrayAggValue::List(items)) => {
+                        let next = checked_map_output_offset(current, items.len())?;
                         null_builder.append_non_null();
                         for item in items {
                             work.step()?;
                             let Some(ArrayAggValue::Struct(entry)) = item else {
-                                return Err(("scalar output type mismatch for Map entry"
-                                    .to_string())
-                                .into());
+                                return Err(failure::contract(
+                                    "scalar output type mismatch for Map entry",
+                                ));
                             };
                             if entry.len() != 2 {
-                                return Err((format!(
+                                return Err(failure::contract(format_args!(
                                     "scalar output type mismatch for Map entry field count: expected 2, got {}",
                                     entry.len()
-                                )).into());
+                                )));
                             }
                             key_values.push(entry[0].clone());
                             value_values.push(entry[1].clone());
-                            current += 1;
-                            if current > i32::MAX as i64 {
-                                return Err(("array_agg map offset overflow".to_string()).into());
-                            }
                         }
-                        offsets.push(current as i32);
+                        current = next;
+                        offsets.push(current);
                     }
                     Some(other) => {
-                        return Err((format!(
+                        return Err(failure::contract(format_args!(
                             "scalar output type mismatch for Map: got {:?}",
                             other
-                        ))
-                        .into());
+                        )));
                     }
                 }
             }
@@ -946,49 +958,47 @@ fn build_scalar_array(
                 entry_fields.clone()
             };
             let entries =
-                StructArray::new(entries_fields.clone(), vec![key_array, value_array], None);
+                StructArray::try_new(entries_fields.clone(), vec![key_array, value_array], None)
+                    .map_err(failure::constructor)?;
             let entries_field = Arc::new(Field::new(
                 entries_field.name(),
                 DataType::Struct(entries_fields),
                 entries_field.is_nullable(),
             ));
-            let out = MapArray::new(
+            let out = MapArray::try_new(
                 entries_field,
                 OffsetBuffer::new(offsets.into()),
                 entries,
                 null_builder.finish(),
                 *ordered,
-            );
+            )
+            .map_err(failure::constructor)?;
             Ok(Arc::new(out) as ArrayRef)
         }
         DataType::List(field) => {
             let mut flattened = Vec::<Option<ArrayAggValue>>::new();
             let mut offsets = Vec::with_capacity(values.len() + 1);
             offsets.push(0_i32);
-            let mut current: i64 = 0;
+            let mut current: i32 = 0;
             let mut null_builder = NullBufferBuilder::new(values.len());
             for value in values {
                 work.step()?;
                 match value {
                     None => {
                         null_builder.append_null();
-                        offsets.push(current as i32);
+                        offsets.push(current);
                     }
                     Some(ArrayAggValue::List(items)) => {
-                        current += items.len() as i64;
-                        if current > i32::MAX as i64 {
-                            return Err(("array_agg offset overflow".to_string()).into());
-                        }
+                        current = checked_list_output_offset(current, items.len())?;
                         flattened.extend(items);
                         null_builder.append_non_null();
-                        offsets.push(current as i32);
+                        offsets.push(current);
                     }
                     Some(other) => {
-                        return Err((format!(
+                        return Err(failure::contract(format_args!(
                             "scalar output type mismatch for List: got {:?}",
                             other
-                        ))
-                        .into());
+                        )));
                     }
                 }
             }
@@ -999,40 +1009,81 @@ fn build_scalar_array(
                 "array_agg list item",
                 work,
             )?;
-            let out = ListArray::new(
+            let out = ListArray::try_new(
                 list_field,
                 OffsetBuffer::new(offsets.into()),
                 child_values,
                 null_builder.finish(),
-            );
+            )
+            .map_err(failure::constructor)?;
             Ok(Arc::new(out) as ArrayRef)
         }
-        other => Err((format!("unsupported scalar output type: {:?}", other)).into()),
+        other => Err(failure::contract(format_args!(
+            "unsupported scalar output type: {:?}",
+            other
+        ))),
     }
 }
 
+/// Frozen intermediate-carrier rejection. The error retains shape facts only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArrayAggMergeInputError {
+    EmptyStruct { fields: usize },
+    FirstFieldNotList,
+    NotListOrStruct,
+}
+impl std::fmt::Display for ArrayAggMergeInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyStruct { fields } => write!(
+                f,
+                "array_agg merge struct input expects at least 1 field, got {fields}"
+            ),
+            Self::FirstFieldNotList => {
+                f.write_str("array_agg merge struct field[0] must be ListArray")
+            }
+            Self::NotListOrStruct => {
+                f.write_str("array_agg merge input must be ListArray or StructArray")
+            }
+        }
+    }
+}
+impl std::error::Error for ArrayAggMergeInputError {}
+impl novarocks_failure_contract::FailureProjection for ArrayAggMergeInputError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(154).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for ArrayAggMergeInputError {}
+impl From<ArrayAggMergeInputError> for KernelFailure {
+    fn from(source: ArrayAggMergeInputError) -> Self {
+        crate::KernelFailure::from_domain(source)
+    }
+}
 pub fn merge_input_list_array(
     array: &ArrayRef,
-) -> Result<(&ListArray, Option<&StructArray>), ScalarStateError> {
+) -> Result<(&ListArray, Option<&StructArray>), ArrayAggMergeInputError> {
     if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
         return Ok((list, None));
     }
     if let Some(struct_arr) = array.as_any().downcast_ref::<StructArray>() {
         if struct_arr.num_columns() < 1 {
-            return Err((format!(
-                "array_agg merge struct input expects at least 1 field, got {}",
-                struct_arr.num_columns()
-            ))
-            .into());
+            return Err(ArrayAggMergeInputError::EmptyStruct {
+                fields: struct_arr.num_columns(),
+            });
         }
         let list = struct_arr
             .column(0)
             .as_any()
             .downcast_ref::<ListArray>()
-            .ok_or_else(|| "array_agg merge struct field[0] must be ListArray".to_string())?;
+            .ok_or(ArrayAggMergeInputError::FirstFieldNotList)?;
         return Ok((list, Some(struct_arr)));
     }
-    Err(("array_agg merge input must be ListArray or StructArray".to_string()).into())
+    Err(ArrayAggMergeInputError::NotListOrStruct)
 }
 /// Exact arena-free row computation. Each address came from an evaluated carrier.
 pub fn update_row<
@@ -1046,12 +1097,12 @@ pub fn update_row<
     wrapped: bool,
     parent_null: bool,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), KernelFailure> {
     work.step()?;
     if !wrapped {
         let (array, row) = columns
             .next()
-            .ok_or_else(|| ScalarStateError::from("array_agg input missing".to_string()))?;
+            .ok_or_else(|| failure::contract("array_agg input missing"))?;
         if matches!(kind, ArrayAggKind::Unique)
             && let Some(list) = array.as_any().downcast_ref::<ListArray>()
         {
@@ -1094,7 +1145,7 @@ pub fn merge_row<A: ScalarStateAllocator>(
     array: &ArrayRef,
     row: usize,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), KernelFailure> {
     let (first_list, struct_arr) = merge_input_list_array(array)?;
     let first_values = first_list.values();
     let first_offsets = first_list.value_offsets();
@@ -1121,10 +1172,10 @@ pub fn merge_row<A: ScalarStateAllocator>(
             for (col_idx, col) in struct_arr.columns().iter().enumerate() {
                 work.step()?;
                 let list = col.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                    format!(
+                    failure::contract(format_args!(
                         "array_agg merge struct field[{}] must be ListArray",
                         col_idx
-                    )
+                    ))
                 })?;
                 if list.is_null(row) {
                     row_values.push(None);
@@ -1133,11 +1184,10 @@ pub fn merge_row<A: ScalarStateAllocator>(
                 let offsets = list.value_offsets();
                 if offsets[row] != first_offsets[row] || offsets[row + 1] != first_offsets[row + 1]
                 {
-                    return Err(format!(
+                    return Err(failure::contract(format_args!(
                         "array_agg merge struct field[{}] offsets mismatch",
                         col_idx
-                    )
-                    .into());
+                    )));
                 }
                 row_values.push(tracked_scalar_from_array(
                     list.values(),
@@ -1164,7 +1214,7 @@ pub fn build_array<
     states: I,
     output_intermediate: bool,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ArrayRef, ScalarStateError> {
+) -> Result<ArrayRef, KernelFailure> {
     let target_type = if output_intermediate {
         &spec.intermediate_type
     } else {
@@ -1175,7 +1225,7 @@ pub fn build_array<
             let mut flattened = Vec::<Option<ArrayAggValue>>::new();
             let mut out_offsets = Vec::with_capacity(states.len() + 1);
             out_offsets.push(0_i32);
-            let mut current: i64 = 0;
+            let mut current: i32 = 0;
             for state in states {
                 work.step()?;
                 let values = if output_intermediate {
@@ -1193,11 +1243,8 @@ pub fn build_array<
                 } else {
                     extract_final_values(spec, state, work)?
                 };
-                current += values.len() as i64;
-                if current > i32::MAX as i64 {
-                    return Err(("array_agg offset overflow".to_string()).into());
-                }
-                out_offsets.push(current as i32);
+                current = checked_list_output_offset(current, values.len())?;
+                out_offsets.push(current);
                 flattened.extend(values);
             }
             let values = build_scalar_array(list_field.data_type(), flattened, work)?;
@@ -1207,30 +1254,30 @@ pub fn build_array<
                 "array_agg output list item",
                 work,
             )?;
-            let list_out = ListArray::new(
+            let list_out = ListArray::try_new(
                 output_list_field,
                 OffsetBuffer::new(out_offsets.into()),
                 values,
                 None,
-            );
+            )
+            .map_err(failure::constructor)?;
             Ok(Arc::new(list_out) as ArrayRef)
         }
         DataType::Struct(fields) => {
             let first = fields.first().ok_or_else(|| {
-                "array_agg struct target type must contain at least 1 field".to_string()
+                failure::contract("array_agg struct target type must contain at least 1 field")
             })?;
             let DataType::List(first_list_field) = first.data_type() else {
-                return Err((format!(
+                return Err(failure::contract(format_args!(
                     "array_agg struct field[0] must be List, got {:?}",
                     first.data_type()
-                ))
-                .into());
+                )));
             };
             let mut flattened_by_col: Vec<Vec<Option<ArrayAggValue>>> =
                 (0..fields.len()).map(|_| Vec::new()).collect();
             let mut out_offsets = Vec::with_capacity(states.len() + 1);
             out_offsets.push(0_i32);
-            let mut current: i64 = 0;
+            let mut current: i32 = 0;
 
             for state in states {
                 work.step()?;
@@ -1248,7 +1295,7 @@ pub fn build_array<
                                         .map(|v| array_value_from_tracked(v, work))
                                         .transpose()
                                 })
-                                .collect::<Result<Vec<_>, ScalarStateError>>()
+                                .collect::<Result<Vec<_>, KernelFailure>>()
                         })
                         .collect::<Result<Vec<_>, _>>()?
                 } else {
@@ -1257,11 +1304,8 @@ pub fn build_array<
                         .map(|value| vec![value])
                         .collect()
                 };
-                current += rows.len() as i64;
-                if current > i32::MAX as i64 {
-                    return Err(("array_agg offset overflow".to_string()).into());
-                }
-                out_offsets.push(current as i32);
+                current = checked_list_output_offset(current, rows.len())?;
+                out_offsets.push(current);
                 for row in rows {
                     work.step()?;
                     for (col_idx, values) in flattened_by_col.iter_mut().enumerate() {
@@ -1275,12 +1319,11 @@ pub fn build_array<
             for (idx, field) in fields.iter().enumerate() {
                 work.step()?;
                 let DataType::List(list_field) = field.data_type() else {
-                    return Err((format!(
+                    return Err(failure::contract(format_args!(
                         "array_agg struct field[{}] must be List, got {:?}",
                         idx,
                         field.data_type()
-                    ))
-                    .into());
+                    )));
                 };
                 let values = if idx == 0 {
                     build_scalar_array(
@@ -1297,12 +1340,13 @@ pub fn build_array<
                     "array_agg intermediate list item",
                     work,
                 )?;
-                let list = ListArray::new(
+                let list = ListArray::try_new(
                     output_list_field,
                     OffsetBuffer::new(out_offsets.clone().into()),
                     values,
                     None,
-                );
+                )
+                .map_err(failure::constructor)?;
                 columns.push(Arc::new(list) as ArrayRef);
             }
 
@@ -1312,12 +1356,150 @@ pub fn build_array<
                 "array_agg intermediate struct output",
                 work,
             )?;
-            Ok(Arc::new(StructArray::new(output_fields, columns, None)) as ArrayRef)
+            Ok(Arc::new(
+                StructArray::try_new(output_fields, columns, None).map_err(failure::constructor)?,
+            ) as ArrayRef)
         }
-        other => Err((format!(
+        other => Err(failure::contract(format_args!(
             "array_agg target type must be List or Struct(List...), got {:?}",
             other
-        ))
-        .into()),
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod merge_input_failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn merge_carrier_refusal_retains_its_author_and_drops_schema_owners() {
+        let field = Arc::new(Field::new(
+            "ResourceExhausted numeric overflow",
+            DataType::Int32,
+            true,
+        ));
+        let weak = Arc::downgrade(&field);
+        let input: ArrayRef = Arc::new(
+            StructArray::try_new(
+                vec![field.clone()].into(),
+                vec![Arc::new(Int32Array::from(vec![1]))],
+                None,
+            )
+            .unwrap(),
+        );
+        let source = merge_input_list_array(&input).unwrap_err();
+        assert_eq!(source, ArrayAggMergeInputError::FirstFieldNotList);
+        let original = source.failure_fact();
+        let failure = KernelFailure::from(source);
+        assert_eq!(failure.failure_fact(), original);
+        assert_eq!(original.class(), FailureClass::Invariant);
+        assert!(
+            matches!(failure, crate::KernelFailure::Source(ref cause) if std::error::Error::source(cause).unwrap().downcast_ref::<ArrayAggMergeInputError>().is_some())
+        );
+        drop(input);
+        drop(field);
+        assert!(weak.upgrade().is_none());
+    }
+}
+
+#[cfg(test)]
+mod typed_array_source_properties {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+
+    #[test]
+    fn actual_whole_array_numeric_refusal_keeps_the_integer_source() {
+        for (ty, value) in [
+            (DataType::Int8, 128),
+            (DataType::Int16, 32768),
+            (DataType::Int32, i64::from(i32::MAX) + 1),
+        ] {
+            let failure = build_scalar_array(
+                &ty,
+                vec![Some(ArrayAggValue::Int64(value))],
+                &mut ScalarWork::new(None),
+            )
+            .unwrap_err();
+            assert_eq!(
+                failure.failure_fact(),
+                crate::DataFailureReason::NumericOutOfRange.failure_fact()
+            );
+            let KernelFailure::Source(source) = failure else {
+                panic!("actual numeric source required")
+            };
+            assert!(
+                source
+                    .source()
+                    .unwrap()
+                    .source()
+                    .unwrap()
+                    .is::<std::num::TryFromIntError>()
+            );
+        }
+    }
+
+    #[test]
+    fn actual_list_constructor_refusal_releases_its_input_field() {
+        let field = Arc::new(Field::new("ResourceExhausted", DataType::Int64, false));
+        let weak = Arc::downgrade(&field);
+        let ty = DataType::List(field.clone());
+        let failure = build_scalar_array(
+            &ty,
+            vec![Some(ArrayAggValue::List(vec![None]))],
+            &mut ScalarWork::new(None),
+        )
+        .unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+        let KernelFailure::Source(source) = failure else {
+            panic!("actual Arrow source required")
+        };
+        assert!(
+            source
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .is::<arrow_schema::ArrowError>()
+        );
+        drop(ty);
+        drop(field);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn real_unordered_sort_failure_precedes_optional_footer() {
+        use crate::{KernelEvaluationControl, kernel_input::EvaluationCheckpoints};
+        use std::{
+            sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            time::Duration,
+        };
+        struct NoFooter(AtomicUsize);
+        impl KernelEvaluationControl for NoFooter {
+            fn checkpoint(&self, _: u32) -> Result<(), KernelFailure> {
+                assert_eq!(
+                    self.0.fetch_add(1, AtomicOrdering::SeqCst),
+                    0,
+                    "no footer after actual NaN refusal"
+                );
+                Ok(())
+            }
+            fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+                panic!("sort does not wait")
+            }
+        }
+        let control = NoFooter(AtomicUsize::new(0));
+        let mut checkpoints = EvaluationCheckpoints::new(&control);
+        let mut work = ScalarWork::new(Some(&mut checkpoints));
+        let mut rows = vec![
+            vec![None, Some(ArrayAggValue::Float64(f64::NAN))],
+            vec![None, Some(ArrayAggValue::Float64(1.0))],
+        ];
+        let failure = sort_rows(&mut rows, &[true], &[false], &mut work).unwrap_err();
+        assert_eq!(
+            failure.failure_fact(),
+            crate::DataFailureReason::InvalidValue.failure_fact()
+        );
+        assert_eq!(control.0.load(AtomicOrdering::SeqCst), 1);
     }
 }

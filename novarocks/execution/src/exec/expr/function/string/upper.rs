@@ -15,15 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
-use novarocks_functions::builtin::string_case::{StringCaseOp, evaluate_legacy_case};
+use novarocks_functions::builtin::string_case::{StringCaseOp, evaluate_required_case};
 /// V1 retains child evaluation; the shared core owns whole-string calculation.
 pub fn eval_upper<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     value_expr: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let input = arena.eval(value_expr, chunk)?;
-    Ok((evaluate_legacy_case(StringCaseOp::Upper, &input))?)
+    evaluate_required_case(StringCaseOp::Upper, &input).map_err(ExecutionFailure::from)
 }

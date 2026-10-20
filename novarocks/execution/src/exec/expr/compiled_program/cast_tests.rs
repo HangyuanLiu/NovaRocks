@@ -1035,7 +1035,7 @@ impl PureCompileControl for CompileCallbacks {
         trace.push((phase, units));
         if trace.len() == self.stop_at {
             *refused = true;
-            Err(self.cause)
+            Err(self.cause.clone())
         } else {
             Ok(())
         }
@@ -1067,7 +1067,7 @@ fn cast_compile_preserves_all_original_refusals_and_observes_ordinary_narrowing_
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
             ] {
-                let control = CompileCallbacks::new(cause, stop_at);
+                let control = CompileCallbacks::new(cause.clone(), stop_at);
                 assert!(
                     matches!(compile(&functions, package.clone(), &control), Err(FragmentCompileError::Control(actual)) if actual == cause)
                 );

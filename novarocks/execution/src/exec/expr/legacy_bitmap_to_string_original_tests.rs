@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Original dispatcher/ExprArena baselines; no pure owner or decoder replacement.
+use super::legacy_array_append_baseline_tests::{
+    assert_frozen_target as assert_expression_contract, assert_original_arrow,
+};
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::function::{FunctionKind, object::eval_object_function};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
@@ -24,6 +27,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
+use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_functions::{ConstantPool, FunctionValueType};
 use novarocks_type_contract::CompilePhase;
 use novarocks_types::{SlotId, value::bitmap};
@@ -47,7 +51,11 @@ fn setup(a: ArrayRef) -> (ExprArena, ExprId, Chunk) {
     let id = arena.push_typed(ExprNode::SlotId(slot), ty);
     (arena, id, chunk)
 }
-fn raw(a: ArrayRef, target: Option<DataType>, tails: usize) -> Result<ArrayRef, String> {
+fn raw(
+    a: ArrayRef,
+    target: Option<DataType>,
+    tails: usize,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (mut arena, id, chunk) = setup(a);
     let mut args = vec![id];
     args.extend(std::iter::repeat_n(ExprId(usize::MAX), tails));
@@ -160,28 +168,46 @@ fn legacy_bitmap_to_string_original_full_error_and_first_row_order() {
     let long = "雪".repeat(600);
     for token in ["bad", "-1", "18446744073709551616", long.as_str()] {
         let expected = format!("bitmap string contains invalid value: {token}");
+        let actual = raw(
+            array(&[
+                Some(token.as_bytes().to_vec()),
+                Some(b"later-error".to_vec()),
+            ]),
+            None,
+            0,
+        )
+        .unwrap_err();
         assert_eq!(
-            raw(
-                array(&[
-                    Some(token.as_bytes().to_vec()),
-                    Some(b"later-error".to_vec())
-                ]),
-                None,
-                0
-            )
-            .unwrap_err(),
-            expected
+            actual.failure_fact(),
+            novarocks_functions::DataFailureReason::InvalidEncoding.failure_fact()
         );
+        let expected_bounded =
+            novarocks_failure_contract::BoundedDetail::truncating_display(&expected);
+        assert_eq!(actual.detail(), expected_bounded.as_str());
+        let mut source: &(dyn std::error::Error + 'static) = &actual;
+        loop {
+            if let Some(original) =
+                source.downcast_ref::<novarocks_functions::bitmap_value::BitmapValueFailure>()
+            {
+                assert!(matches!(
+                    original,
+                    novarocks_functions::bitmap_value::BitmapValueFailure::InvalidEncoding(_)
+                ));
+                assert_eq!(original.to_string(), expected_bounded.as_str());
+                break;
+            }
+            source = source.source().expect("original bitmap decode failure");
+        }
         if token == long {
             assert!(expected.len() > 512);
         }
     }
     assert_eq!(
-        raw(array(&[Some(vec![0xff])]), None, 0).unwrap_err(),
+        (raw(array(&[Some(vec![0xff])]), None, 0).unwrap_err()).to_string(),
         "bitmap payload is not utf8 text"
     );
     assert_eq!(
-        raw(array(&[None, Some(b"later-error".to_vec())]), None, 0).unwrap_err(),
+        (raw(array(&[None, Some(b"later-error".to_vec())]), None, 0).unwrap_err()).to_string(),
         "bitmap string contains invalid value: later-error"
     );
 }
@@ -201,7 +227,13 @@ fn legacy_bitmap_to_string_original_downcast_before_empty_and_null_mask() {
     ] {
         let expected = format!("bitmap_to_string expects BITMAP/BINARY input, got {ty:?}");
         for n in [0, 1] {
-            assert_eq!(raw(new_null_array(&ty, n), None, 0).unwrap_err(), expected);
+            let actual = raw(new_null_array(&ty, n), None, 0).unwrap_err();
+            assert_eq!(actual.failure_fact().class(), FailureClass::Invariant);
+            assert!(actual.detail().len() <= 512);
+            assert!(expected.starts_with(actual.detail()));
+            if expected.len() <= 512 {
+                assert_eq!(actual.detail(), expected);
+            }
         }
         if matches!(ty, DataType::Struct(_)) {
             assert!(expected.len() > 512);
@@ -251,7 +283,7 @@ fn legacy_bitmap_to_string_original_raw_demand_target_and_production_arity() {
         Some(DataType::Null),
     ] {
         assert_eq!(
-            text(raw(array(&[Some(b"7,1".to_vec())]), target, 4).unwrap()),
+            text(raw(array(&[Some(b"7,1".to_vec())]), target, 0).unwrap()),
             vec![Some("1,7".into())]
         );
     }
@@ -264,28 +296,31 @@ fn legacy_bitmap_to_string_original_raw_demand_target_and_production_arity() {
         DataType::Utf8,
     );
     assert_eq!(
-        arena.eval(expr, &chunk).unwrap_err(),
+        (arena.eval(expr, &chunk).unwrap_err()).to_string(),
         "bitmap_to_string expects 1 to 1 arguments, got 2"
     );
     assert_eq!(
-        eval_object_function(
+        (eval_object_function(
             "bitmap_to_string",
             &arena,
             ExprId(usize::MAX),
             &[ExprId(usize::MAX), id],
             &chunk
         )
-        .unwrap_err(),
-        "invalid ExprId"
+        .unwrap_err())
+        .to_string(),
+        "bitmap_to_string requires exactly one argument"
     );
-    assert!(
-        catch_unwind(AssertUnwindSafe(|| eval_object_function(
-            "bitmap_to_string",
-            &arena,
-            ExprId(usize::MAX),
-            &[],
-            &chunk
-        )))
-        .is_err()
-    );
+    let actual = eval_object_function("bitmap_to_string", &arena, ExprId(usize::MAX), &[], &chunk)
+        .unwrap_err();
+    assert_expression_contract(&actual);
+    let actual = eval_object_function(
+        "bitmap_to_string",
+        &arena,
+        ExprId(usize::MAX),
+        &[ExprId(usize::MAX)],
+        &chunk,
+    )
+    .unwrap_err();
+    assert_eq!(actual.detail(), "invalid ExprId");
 }

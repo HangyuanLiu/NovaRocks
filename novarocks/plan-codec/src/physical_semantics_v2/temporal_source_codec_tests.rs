@@ -32,7 +32,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push((phase, units));
-        match self.refuse {
+        match self.refuse.clone() {
             Some((at, cause)) if at == trace.len() => Err(cause),
             _ => Ok(()),
         }
@@ -168,7 +168,7 @@ fn encode_and_decode_preserve_each_compile_cause_without_checkpoint_after_refusa
             ] {
                 let control = Control {
                     trace: Mutex::new(vec![]),
-                    refuse: Some((at, cause)),
+                    refuse: Some((at, cause.clone())),
                 };
                 if decoding {
                     assert!(

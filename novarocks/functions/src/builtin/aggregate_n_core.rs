@@ -17,14 +17,15 @@
 //! Original N admission, stable sort and scalar codec, over explicit storage.
 use super::aggregate_by_core::ByEncodeBuffer;
 use crate::aggregate_scalar::{
-    self as scalar, AggScalarValue, ScalarStateAllocator, ScalarStateError, ScalarWork,
-    TrackedAggScalarValue,
+    self as scalar, AggScalarValue, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue,
 };
 use allocator_api2::vec::Vec as ScalarVec;
 use arrow_array::{Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
 use arrow_buffer::i256;
 use arrow_schema::DataType;
 use std::cmp::Ordering;
+#[path = "aggregate_n_source_failure.rs"]
+mod source_failure;
 
 /// Source-qualified consumers provide an owned scope around the original sort.
 /// This interface does not itself grant memory or cover other N operations.
@@ -36,8 +37,9 @@ pub trait NSortResources {
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<Self::Lease, crate::KernelFailure>;
 
-    /// A reached comparator may create one original discarded diagnostic.
-    /// Default callers retain their original unobserved comparison behavior.
+    /// Optional source work around a reached comparison. The normal scalar
+    /// comparator produces a partial-order value without allocating a diagnostic;
+    /// its production adapter needs no per-comparison memory grant.
     fn before_comparison(
         &mut self,
         _work: &mut ScalarWork<'_, '_>,
@@ -130,18 +132,17 @@ impl<A: ScalarStateAllocator> NState<A> {
         self.payload_bytes = 0;
         self.values = ScalarVec::new_in(self.allocator.clone());
     }
-    pub fn init_limit_if_needed(&mut self, limit: usize) -> Result<(), ScalarStateError> {
+    pub fn init_limit_if_needed(&mut self, limit: usize) -> Result<(), crate::KernelFailure> {
         if !self.initialized {
             self.initialized = true;
             self.limit = limit;
             return Ok(());
         }
         if self.limit != limit {
-            return Err(format!(
+            return Err(source_failure::value(format_args!(
                 "min_n/max_n limit mismatch while merging states: {} vs {}",
                 self.limit, limit
-            )
-            .into());
+            )));
         }
         Ok(())
     }
@@ -153,7 +154,7 @@ impl<A: ScalarStateAllocator> NState<A> {
         limit_row: usize,
         keep_smallest: bool,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         self.update_from_arrays_with_sort_resources(
             values,
             value_row,
@@ -173,7 +174,7 @@ impl<A: ScalarStateAllocator> NState<A> {
         keep_smallest: bool,
         resources: &mut R,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         let limit = parse_limit(limits, limit_row, work)?;
         self.init_limit_if_needed(limit)?;
         let Some(value) =
@@ -189,7 +190,7 @@ impl<A: ScalarStateAllocator> NState<A> {
         row: usize,
         keep_smallest: bool,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         self.merge_from_array_with_sort_resources(
             array,
             row,
@@ -205,7 +206,7 @@ impl<A: ScalarStateAllocator> NState<A> {
         keep_smallest: bool,
         resources: &mut R,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         self.merge_from_array_with_resources(
             array,
             row,
@@ -223,7 +224,7 @@ impl<A: ScalarStateAllocator> NState<A> {
         sort_resources: &mut S,
         codec_resources: &mut C,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         let Some((limit, values)) = decode_payload_at_with_codec_resources(
             array,
             row,
@@ -248,12 +249,12 @@ impl<A: ScalarStateAllocator> NState<A> {
         &mut self,
         resources: &mut R,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         work.flush()?;
         let lease = resources.before_sort(self.values.len(), work)?;
         let mut primary = None;
-        // Keep the original library stable sort and its error->Equal rule.
-        // Only observed host-control errors remain outer typed failures.
+        // Keep the original stable ordering policy for heterogeneous values
+        // and NaN. Actual comparison/control failures always propagate.
         self.values.sort_by(|left, right| {
             if primary.is_some() {
                 return Ordering::Equal;
@@ -261,19 +262,21 @@ impl<A: ScalarStateAllocator> NState<A> {
             let comparison_lease = match resources.before_comparison(work) {
                 Ok(lease) => lease,
                 Err(cause) => {
-                    primary = Some(ScalarStateError::Kernel(cause));
+                    primary = Some(cause);
                     return Ordering::Equal;
                 }
             };
-            let ordering = match scalar::compare_tracked_scalar_values(left, right, work) {
-                Ok(order) => order,
-                Err(ScalarStateError::Legacy(_)) => Ordering::Equal,
+            let ordering = match scalar::compare_tracked_scalar_values_partial(left, right, work) {
+                Ok(scalar::ScalarOrdering::Ordered(order)) => order,
+                Ok(
+                    scalar::ScalarOrdering::UnorderedFloat
+                    | scalar::ScalarOrdering::MismatchedKinds,
+                ) => Ordering::Equal,
                 Err(error) => {
                     primary = Some(error);
                     Ordering::Equal
                 }
             };
-            // The discarded Legacy String has ended with the match statement.
             drop(comparison_lease);
             ordering
         });
@@ -290,7 +293,7 @@ impl<A: ScalarStateAllocator> NState<A> {
         value: TrackedAggScalarValue<A>,
         keep_smallest: bool,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         self.push_value_with_sort_resources(value, keep_smallest, &mut NoopSortResources, work)
     }
     pub fn push_value_with_sort_resources<R: NSortResources>(
@@ -299,15 +302,15 @@ impl<A: ScalarStateAllocator> NState<A> {
         keep_smallest: bool,
         resources: &mut R,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         if self.limit == 0 {
             return Ok(());
         }
         work.flush()?;
-        self.values.try_reserve(1).map_err(|_| {
+        self.values.try_reserve(1).map_err(|source| {
             self.values
                 .allocator()
-                .scalar_allocation_error("reserve min_n/max_n values")
+                .scalar_allocation_error("reserve min_n/max_n values", source)
         })?;
         work.flush()?;
         let retained = scalar::tracked_scalar_heap_capacity(&value, work)?;
@@ -338,7 +341,7 @@ impl<A: ScalarStateAllocator> NState<A> {
         &self,
         out: &mut B,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         self.serialize_with_codec_resources(out, &mut NoopCodecResources, work)
     }
     pub fn serialize_with_codec_resources<B: ByEncodeBuffer, R: NCodecResources>(
@@ -346,9 +349,16 @@ impl<A: ScalarStateAllocator> NState<A> {
         out: &mut B,
         resources: &mut R,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
-        out.append(&(self.limit as u32).to_le_bytes(), work)?;
-        out.append(&(self.values.len() as u32).to_le_bytes(), work)?;
+    ) -> Result<(), crate::KernelFailure> {
+        out.append(
+            &source_failure::encoded_len(source_failure::Length::Limit, self.limit)?.to_le_bytes(),
+            work,
+        )?;
+        out.append(
+            &source_failure::encoded_len(source_failure::Length::Count, self.values.len())?
+                .to_le_bytes(),
+            work,
+        )?;
         for value in &self.values {
             work.step()?;
             encode_scalar(out, value, resources, work)?;
@@ -358,7 +368,7 @@ impl<A: ScalarStateAllocator> NState<A> {
     pub fn output(
         &self,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<AggScalarValue, ScalarStateError> {
+    ) -> Result<AggScalarValue, crate::KernelFailure> {
         let mut list = Vec::with_capacity(self.values.len());
         for value in &self.values {
             work.step()?;
@@ -371,24 +381,29 @@ pub fn parse_limit(
     array: &ArrayRef,
     row: usize,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<usize, ScalarStateError> {
+) -> Result<usize, crate::KernelFailure> {
     let Some(value) = scalar::scalar_from_array(array, row, work)? else {
-        return Err("min_n/max_n limit cannot be null".to_string().into());
+        return Err(source_failure::value("min_n/max_n limit cannot be null"));
     };
     let AggScalarValue::Int64(value) = value else {
-        return Err("min_n/max_n limit must be integer".to_string().into());
+        return Err(source_failure::contract(
+            "min_n/max_n limit must be integer",
+        ));
     };
     if value <= 0 {
-        return Err(format!("min_n/max_n limit must be positive, got {}", value).into());
+        return Err(source_failure::value(format_args!(
+            "min_n/max_n limit must be positive, got {}",
+            value
+        )));
     }
-    usize::try_from(value).map_err(|_| "min_n/max_n limit overflow".to_string().into())
+    usize::try_from(value).map_err(source_failure::numeric_conversion)
 }
 pub fn decode_payload_at<A: ScalarStateAllocator>(
     array: &ArrayRef,
     row: usize,
     allocator: &A,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Option<(usize, ScalarVec<TrackedAggScalarValue<A>, A>)>, ScalarStateError> {
+) -> Result<Option<(usize, ScalarVec<TrackedAggScalarValue<A>, A>)>, crate::KernelFailure> {
     decode_payload_at_with_codec_resources(array, row, allocator, &mut NoopCodecResources, work)
 }
 pub fn decode_payload_at_with_codec_resources<A: ScalarStateAllocator, R: NCodecResources>(
@@ -397,43 +412,50 @@ pub fn decode_payload_at_with_codec_resources<A: ScalarStateAllocator, R: NCodec
     allocator: &A,
     resources: &mut R,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Option<(usize, ScalarVec<TrackedAggScalarValue<A>, A>)>, ScalarStateError> {
+) -> Result<Option<(usize, ScalarVec<TrackedAggScalarValue<A>, A>)>, crate::KernelFailure> {
     work.step()?;
     let payload = match array.data_type() {
         DataType::Binary => {
             let array = array
                 .as_any()
                 .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| "min_n/max_n merge input must be BinaryArray".to_string())?;
+                .ok_or_else(|| {
+                    source_failure::contract("min_n/max_n merge input must be BinaryArray")
+                })?;
             (!array.is_null(row)).then_some(array.value(row))
         }
         DataType::Utf8 => {
             let array = array
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| "min_n/max_n merge input must be StringArray".to_string())?;
+                .ok_or_else(|| {
+                    source_failure::contract("min_n/max_n merge input must be StringArray")
+                })?;
             (!array.is_null(row)).then_some(array.value(row).as_bytes())
         }
         DataType::LargeBinary => {
             let array = array
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| "min_n/max_n merge input must be LargeBinaryArray".to_string())?;
+                .ok_or_else(|| {
+                    source_failure::contract("min_n/max_n merge input must be LargeBinaryArray")
+                })?;
             (!array.is_null(row)).then_some(array.value(row))
         }
         DataType::LargeUtf8 => {
             let array = array
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| "min_n/max_n merge input must be LargeStringArray".to_string())?;
+                .ok_or_else(|| {
+                    source_failure::contract("min_n/max_n merge input must be LargeStringArray")
+                })?;
             (!array.is_null(row)).then_some(array.value(row).as_bytes())
         }
         other => {
-            return Err(format!(
+            return Err(source_failure::contract(format_args!(
                 "min_n/max_n merge input must be binary-like, got {:?}",
                 other
-            )
-            .into());
+            )));
         }
     };
     let Some(payload) = payload else {
@@ -458,27 +480,31 @@ pub fn decode_payload_at_with_codec_resources<A: ScalarStateAllocator, R: NCodec
     Ok(Some((limit, values)))
 }
 
-fn read_u32(bytes: &[u8], pos: &mut usize, label: &str) -> Result<u32, ScalarStateError> {
+fn read_u32(bytes: &[u8], pos: &mut usize, label: &str) -> Result<u32, crate::KernelFailure> {
     need_len(bytes, *pos, 4, label)?;
     let value = u32::from_le_bytes(
         bytes[*pos..*pos + 4]
             .try_into()
-            .map_err(|_| format!("min_n/max_n decode {} failed", label))?,
+            .map_err(|source| source_failure::slice(label, source))?,
     );
     *pos += 4;
     Ok(value)
 }
 
-fn need_len(bytes: &[u8], pos: usize, need: usize, label: &str) -> Result<(), ScalarStateError> {
-    if pos + need > bytes.len() {
-        return Err(format!(
+fn need_len(
+    bytes: &[u8],
+    pos: usize,
+    need: usize,
+    label: &str,
+) -> Result<(), crate::KernelFailure> {
+    if pos.checked_add(need).is_none_or(|end| end > bytes.len()) {
+        return Err(source_failure::malformed(format_args!(
             "min_n/max_n decode {} overflow: pos={} need={} len={}",
             label,
             pos,
             need,
             bytes.len()
-        )
-        .into());
+        )));
     }
     Ok(())
 }
@@ -488,7 +514,7 @@ fn encode_scalar<A: ScalarStateAllocator, B: ByEncodeBuffer, R: NCodecResources>
     value: &TrackedAggScalarValue<A>,
     resources: &mut R,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), crate::KernelFailure> {
     work.step()?;
     match value {
         TrackedAggScalarValue::Bool(v) => {
@@ -505,8 +531,7 @@ fn encode_scalar<A: ScalarStateAllocator, B: ByEncodeBuffer, R: NCodecResources>
         }
         TrackedAggScalarValue::Utf8(v) => {
             out.push(4)?;
-            let len = u32::try_from(v.len())
-                .map_err(|_| "min_n/max_n utf8 length overflow".to_string())?;
+            let len = source_failure::encoded_len(source_failure::Length::Utf8, v.len())?;
             out.append(&len.to_le_bytes(), work)?;
             out.append(v, work)?;
         }
@@ -527,8 +552,7 @@ fn encode_scalar<A: ScalarStateAllocator, B: ByEncodeBuffer, R: NCodecResources>
             let lease = resources.before_decimal256_format(work)?;
             let text = v.to_string();
             resources.after_decimal256_format(&text, text.capacity(), work)?;
-            let len = u32::try_from(text.len())
-                .map_err(|_| "min_n/max_n decimal256 length overflow".to_string())?;
+            let len = source_failure::encoded_len(source_failure::Length::DecimalText, text.len())?;
             out.append(&len.to_le_bytes(), work)?;
             out.append(text.as_bytes(), work)?;
             // The returned OWN String ends before either reservation.
@@ -537,9 +561,10 @@ fn encode_scalar<A: ScalarStateAllocator, B: ByEncodeBuffer, R: NCodecResources>
             drop(lease);
         }
         other => {
-            return Err(
-                format!("min_n/max_n does not support serialized value {:?}", other).into(),
-            );
+            return Err(source_failure::contract(format_args!(
+                "min_n/max_n does not support serialized value {:?}",
+                other
+            )));
         }
     }
     Ok(())
@@ -551,7 +576,7 @@ fn decode_scalar<A: ScalarStateAllocator, R: NCodecResources>(
     allocator: &A,
     resources: &mut R,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<TrackedAggScalarValue<A>, ScalarStateError> {
+) -> Result<TrackedAggScalarValue<A>, crate::KernelFailure> {
     work.step()?;
     need_len(bytes, *pos, 1, "tag")?;
     let tag = bytes[*pos];
@@ -568,7 +593,7 @@ fn decode_scalar<A: ScalarStateAllocator, R: NCodecResources>(
             let value = i64::from_le_bytes(
                 bytes[*pos..*pos + 8]
                     .try_into()
-                    .map_err(|_| "min_n/max_n int64 decode failed".to_string())?,
+                    .map_err(|source| source_failure::slice("int64", source))?,
             );
             *pos += 8;
             Ok(TrackedAggScalarValue::Int64(value))
@@ -578,7 +603,7 @@ fn decode_scalar<A: ScalarStateAllocator, R: NCodecResources>(
             let bits = u64::from_le_bytes(
                 bytes[*pos..*pos + 8]
                     .try_into()
-                    .map_err(|_| "min_n/max_n float64 decode failed".to_string())?,
+                    .map_err(|source| source_failure::slice("float64", source))?,
             );
             *pos += 8;
             Ok(TrackedAggScalarValue::Float64(f64::from_bits(bits)))
@@ -591,8 +616,7 @@ fn decode_scalar<A: ScalarStateAllocator, R: NCodecResources>(
                 work.step()?;
             }
             work.flush()?;
-            std::str::from_utf8(raw)
-                .map_err(|e| format!("min_n/max_n utf8 decode failed: {}", e))?;
+            std::str::from_utf8(raw).map_err(|source| source_failure::utf8("utf8", source))?;
             let value = scalar::scalar_bytes(allocator.clone(), raw, work)?;
             *pos += len;
             Ok(TrackedAggScalarValue::Utf8(value))
@@ -602,7 +626,7 @@ fn decode_scalar<A: ScalarStateAllocator, R: NCodecResources>(
             let value = i32::from_le_bytes(
                 bytes[*pos..*pos + 4]
                     .try_into()
-                    .map_err(|_| "min_n/max_n date32 decode failed".to_string())?,
+                    .map_err(|source| source_failure::slice("date32", source))?,
             );
             *pos += 4;
             Ok(TrackedAggScalarValue::Date32(value))
@@ -612,7 +636,7 @@ fn decode_scalar<A: ScalarStateAllocator, R: NCodecResources>(
             let value = i64::from_le_bytes(
                 bytes[*pos..*pos + 8]
                     .try_into()
-                    .map_err(|_| "min_n/max_n timestamp decode failed".to_string())?,
+                    .map_err(|source| source_failure::slice("timestamp", source))?,
             );
             *pos += 8;
             Ok(TrackedAggScalarValue::Timestamp(value))
@@ -622,7 +646,7 @@ fn decode_scalar<A: ScalarStateAllocator, R: NCodecResources>(
             let value = i128::from_le_bytes(
                 bytes[*pos..*pos + 16]
                     .try_into()
-                    .map_err(|_| "min_n/max_n decimal128 decode failed".to_string())?,
+                    .map_err(|source| source_failure::slice("decimal128", source))?,
             );
             *pos += 16;
             Ok(TrackedAggScalarValue::Decimal128(value))
@@ -635,17 +659,20 @@ fn decode_scalar<A: ScalarStateAllocator, R: NCodecResources>(
             }
             work.flush()?;
             let text = std::str::from_utf8(&bytes[*pos..*pos + len])
-                .map_err(|e| format!("min_n/max_n decimal256 decode failed: {}", e))?;
+                .map_err(|source| source_failure::utf8("decimal256", source))?;
             *pos += len;
             let lease = resources.before_decimal256_parse(text.len(), work)?;
             let value = text
                 .parse::<i256>()
-                .map_err(|_| "min_n/max_n decimal256 parse failed".to_string())?;
+                .map_err(source_failure::decimal_parse)?;
             resources.after_decimal256_parse(work)?;
             drop(lease);
             Ok(TrackedAggScalarValue::Decimal256(value))
         }
-        other => Err(format!("min_n/max_n decode unknown tag {}", other).into()),
+        other => Err(source_failure::malformed(format_args!(
+            "min_n/max_n decode unknown tag {}",
+            other
+        ))),
     }
 }
 

@@ -31,12 +31,14 @@
 //! type; there is no cast, unlike the legacy operator. Expressions are
 //! evaluated only through compiled roots.
 
-use std::collections::VecDeque;
+use crate::exec::fragment::error::{
+    FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
+};
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, new_null_array};
 use arrow::datatypes::DataType;
-use arrow::record_batch::RecordBatch;
 use novarocks_local_program::{
     LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
     ProgramNodeKind,
@@ -45,12 +47,18 @@ use novarocks_local_program::{
 use super::compiled_expression::{
     RuntimeKernelControl, evaluate_all, evaluate_selected, instances,
 };
-use crate::exec::chunk::{Chunk, ChunkSchemaRef};
+use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{
-    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator,
+    ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{Transform, TransformKernel},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
@@ -80,13 +88,14 @@ impl CompiledChangeEventProcessorFactory {
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let at = node.index();
-        let graph_node = program
-            .graph()
-            .nodes()
-            .get(at)
-            .ok_or_else(|| format!("compiled change-event node {at} is absent"))?;
+        let graph_node = program.graph().nodes().get(at).ok_or_else(|| {
+            program_binding_failure(
+                PlanBindingKind::MissingAssignment,
+                format!("compiled change-event node {at} is absent"),
+            )
+        })?;
         let ProgramNodeKind::ChangeEventExpand {
             events,
             output_slot_ids,
@@ -94,11 +103,17 @@ impl CompiledChangeEventProcessorFactory {
             ..
         } = graph_node.kind()
         else {
-            return Err(format!(
-                "compiled local node {at} is not a ChangeEventExpand"
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!("compiled local node {at} is not a ChangeEventExpand"),
             ));
         };
-        let invalid = |what: String| format!("compiled change-event node {at} {what}");
+        let invalid = |what: String| {
+            program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!("compiled change-event node {at} {what}"),
+            )
+        };
         let layout = graph_node.output_layout();
         if layout.slots() != output_slot_ids.as_slice() {
             return Err(invalid("output slots differ from its layout".to_string()));
@@ -165,7 +180,7 @@ impl CompiledChangeEventProcessorFactory {
                                 .borrowed()
                                 .same_physical_binding_ignoring_root_nullability_observed(
                                     target.borrowed(),
-                                    || Ok::<(), String>(()),
+                                    || Ok::<(), crate::runtime::fragment::ExecutionFailure>(()),
                                 )?
                         {
                             return Err(invalid(format!(
@@ -210,7 +225,7 @@ impl OperatorFactory for CompiledChangeEventProcessorFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(CompiledChangeEventProcessor {
+        Box::new(Transform::hydrating(CompiledChangeEventProcessor {
             name: self.name.clone(),
             program: Arc::clone(&self.program),
             sites: self.sites.clone(),
@@ -221,11 +236,10 @@ impl OperatorFactory for CompiledChangeEventProcessorFactory {
             construction: None,
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             instances: None,
-            pending: VecDeque::new(),
-            finishing: false,
-            finished: false,
+            input: None,
+            next_event: 0,
             failed: false,
-        })
+        }))
     }
 }
 
@@ -240,25 +254,76 @@ struct CompiledChangeEventProcessor {
     construction: Option<Arc<dyn InputConstructionFactory>>,
     control: RuntimeKernelControl,
     instances: Option<Vec<CompiledExpressionInstance>>,
-    pending: VecDeque<Chunk>,
-    finishing: bool,
-    finished: bool,
+    input: Option<ChunkBatchProjection>,
+    next_event: usize,
     failed: bool,
 }
 
-fn failure(message: String) -> ExecutionFailure {
-    ExecutionFailure::from(message)
+#[derive(Debug)]
+enum ChangeEventFailure {
+    PredicateType {
+        event: usize,
+    },
+    AssignmentType {
+        event: usize,
+        channel: usize,
+        detail: novarocks_failure_contract::BoundedDetail,
+    },
+    AlreadyFailed,
+}
+impl std::fmt::Display for ChangeEventFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PredicateType { event } => {
+                write!(f, "compiled change-event predicate {event} is not Boolean")
+            }
+            Self::AssignmentType {
+                event,
+                channel,
+                detail,
+            } => write!(
+                f,
+                "compiled change-event {event} assignment channel {channel}: {detail}"
+            ),
+            Self::AlreadyFailed => f.write_str("compiled change-event instance has already failed"),
+        }
+    }
+}
+impl std::error::Error for ChangeEventFailure {}
+impl novarocks_failure_contract::FailureProjection for ChangeEventFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        let reason = match self {
+            Self::PredicateType { .. } => ExecutionReason::ChangeEventPredicateType,
+            Self::AssignmentType { .. } => ExecutionReason::ChangeEventAssignmentType,
+            Self::AlreadyFailed => ExecutionReason::ChangeEventAlreadyFailed,
+        };
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            reason.reason(),
+        )
+    }
+}
+impl From<ChangeEventFailure> for ExecutionFailure {
+    fn from(cause: ChangeEventFailure) -> Self {
+        Self::from_domain(cause)
+    }
 }
 
 impl CompiledChangeEventProcessor {
     fn alive(&self) -> ExecutionResult<()> {
         if self.failed {
-            Err(novarocks_functions::KernelFailure::InstanceFailed.into())
+            Err(ChangeEventFailure::AlreadyFailed.into())
         } else {
             Ok(())
         }
     }
-    fn expand(&mut self, input: &RecordBatch) -> ExecutionResult<()> {
+    fn expand_event(
+        &mut self,
+        source: &Chunk,
+        event_ordinal: usize,
+    ) -> ExecutionResult<Option<Chunk>> {
+        let input = source.record_batch();
         let output = self
             .output
             .as_ref()
@@ -271,84 +336,92 @@ impl CompiledChangeEventProcessor {
         )?;
         let instances = self.instances.as_mut().expect("instances were created");
         let schema = output.arrow_schema_ref();
-        for (event_ordinal, event) in self.events.iter().enumerate() {
-            let rows: Vec<usize> = match event.predicate {
-                Some(root) => {
-                    let truth =
-                        evaluate_all(&mut instances[root], self.sites[root], input, &self.control)?;
-                    let truth = truth
-                        .as_any()
-                        .downcast_ref::<BooleanArray>()
-                        .ok_or_else(|| {
-                            failure(format!(
-                                "compiled change-event predicate {event_ordinal} is not Boolean"
-                            ))
-                        })?;
-                    // TruthOnly: FALSE and NULL both leave the row unselected.
-                    (0..truth.len())
-                        .filter(|&row| truth.is_valid(row) && truth.value(row))
-                        .collect()
-                }
-                None => (0..input.num_rows()).collect(),
-            };
-            if rows.is_empty() {
-                continue;
+        let event = &self.events[event_ordinal];
+        let rows: Vec<usize> = match event.predicate {
+            Some(root) => {
+                let truth =
+                    evaluate_all(&mut instances[root], self.sites[root], input, &self.control)?;
+                let truth = truth
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| ChangeEventFailure::PredicateType {
+                        event: event_ordinal,
+                    })?;
+                // TruthOnly: FALSE and NULL both leave the row unselected.
+                (0..truth.len())
+                    .filter(|&row| truth.is_valid(row) && truth.value(row))
+                    .collect()
             }
-            let factory = self
-                .construction
-                .as_ref()
-                .ok_or(ConstructionFailure::MissingOwner)?;
-            let owner = factory.begin_typed_construction(output)?;
-            owner.observe(
-                0,
-                &[],
-                crate::exec::chunk::ArrayNormalizationStep::CreateChunkColumns {
-                    channels: schema.fields().len(),
-                },
-            )?;
-            let mut columns = Vec::<ArrayRef>::with_capacity(schema.fields().len());
-            for (ordinal, field) in schema.fields().iter().enumerate() {
-                let column = if ordinal == self.effect_ordinal {
-                    Arc::new(Int8Array::from_value(event.effect, rows.len())) as ArrayRef
-                } else if let Some(root) = event.assigned[ordinal] {
-                    let values = evaluate_selected(
-                        &mut instances[root],
-                        self.sites[root],
-                        input,
-                        &rows,
-                        &self.control,
-                    )?;
-                    if values.data_type() != field.data_type() {
-                        return Err(failure(format!(
-                            "compiled change-event assignment for {} has type {:?}, not {:?}",
-                            field.name(),
-                            values.data_type(),
-                            field.data_type()
-                        )));
-                    }
-                    values
-                } else {
-                    new_null_array(field.data_type(), rows.len())
-                };
-                columns.push(column);
-            }
-            self.pending
-                .push_back(Chunk::try_new_typed_with_columns_owned_observed::<
-                    ConstructionFailure,
-                    _,
-                >(
-                    Arc::clone(output),
-                    columns,
-                    rows.len(),
-                    owner.storage_lifetime(),
-                    |step| owner.observe(0, &[], step),
-                )?);
+            None => (0..input.num_rows()).collect(),
+        };
+        if rows.is_empty() {
+            return Ok(None);
         }
-        Ok(())
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let owner = factory.begin_typed_construction(output)?;
+        owner.observe(
+            0,
+            &[],
+            crate::exec::chunk::ArrayNormalizationStep::CreateChunkColumns {
+                channels: schema.fields().len(),
+            },
+        )?;
+        let mut columns = Vec::<ArrayRef>::with_capacity(schema.fields().len());
+        for (ordinal, field) in schema.fields().iter().enumerate() {
+            let column = if ordinal == self.effect_ordinal {
+                Arc::new(Int8Array::from_value(event.effect, rows.len())) as ArrayRef
+            } else if let Some(root) = event.assigned[ordinal] {
+                let values = evaluate_selected(
+                    &mut instances[root],
+                    self.sites[root],
+                    input,
+                    &rows,
+                    &self.control,
+                )?;
+                if values.data_type() != field.data_type() {
+                    return Err(ChangeEventFailure::AssignmentType {
+                        event: event_ordinal,
+                        channel: ordinal,
+                        detail: novarocks_failure_contract::BoundedDetail::truncating_display(
+                            format_args!(
+                                "{} has type {:?}, not {:?}",
+                                field.name(),
+                                values.data_type(),
+                                field.data_type()
+                            ),
+                        ),
+                    }
+                    .into());
+                }
+                values
+            } else {
+                new_null_array(field.data_type(), rows.len())
+            };
+            columns.push(column);
+        }
+        let storage = if event.assigned.iter().any(Option::is_some) {
+            source.source_storage_lifetime_observed::<ConstructionFailure>(
+                owner.storage_lifetime(),
+                |layout| owner.request(layout),
+            )?
+        } else {
+            owner.storage_lifetime()
+        };
+        let output = Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            Arc::clone(output),
+            columns,
+            rows.len(),
+            storage,
+            |step| owner.observe(0, &[], step),
+        )?;
+        Ok(Some(output))
     }
 }
 
-impl Operator for CompiledChangeEventProcessor {
+impl OperatorLifecycle for CompiledChangeEventProcessor {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -388,66 +461,68 @@ impl Operator for CompiledChangeEventProcessor {
     fn name(&self) -> &str {
         &self.name
     }
-    fn is_finished(&self) -> bool {
-        self.failed || self.finished
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.input = None;
+        self.instances = None;
+        Ok(())
+    }
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
     }
     fn cancel(&mut self) {
         self.failed = true;
-        self.pending.clear();
+        self.input = None;
         self.instances = None;
-    }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
     }
 }
 
-impl ProcessorOperator for CompiledChangeEventProcessor {
-    fn need_input(&self) -> bool {
-        !self.failed && !self.finishing && !self.finished && self.pending.is_empty()
-    }
-    fn has_output(&self) -> bool {
-        !self.failed && !self.pending.is_empty()
-    }
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+impl InputEncodingPolicy for CompiledChangeEventProcessor {}
+impl TransformKernel for CompiledChangeEventProcessor {
+    fn apply(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
         self.alive()?;
+        let chunk = input.into_uncovered_chunk()?;
         self.output
             .as_ref()
             .ok_or(ConstructionFailure::MissingOwner)?;
-        if !self.pending.is_empty() {
-            return Err(
-                "compiled change-event expand received input while output is pending".into(),
-            );
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
+        let next = if chunk.is_empty() || self.events.is_empty() {
+            NextStep::NeedInput
+        } else {
+            self.input = Some(chunk.into_batch_projection());
+            self.next_event = 0;
+            NextStep::Runnable
+        };
+        Ok(StepResult::new(None, next, rows))
+    }
+    fn drive(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+        self.alive()?;
+        let Some(input) = self.input.as_ref() else {
+            return Ok(StepResult::new(None, NextStep::NeedInput, 0));
+        };
+        if !ctx.work().try_consume(1) {
+            return Ok(StepResult::new(None, NextStep::Yield, 0));
         }
-        if chunk.is_empty() {
-            return Ok(());
-        }
-        match self.expand(chunk.record_batch()) {
-            Ok(()) => Ok(()),
+        let input = input.clone().into_chunk();
+        let output = match self.expand_event(&input, self.next_event) {
+            Ok(output) => output,
             Err(cause) => {
                 self.failed = true;
-                self.pending.clear();
+                self.input = None;
                 self.instances = None;
-                Err(cause)
+                return Err(cause);
             }
-        }
-    }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        self.alive()?;
-        let output = self.pending.pop_front();
-        if self.finishing && self.pending.is_empty() {
-            self.finished = true;
-        }
-        Ok(output)
-    }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
-        self.alive()?;
-        self.finishing = true;
-        if self.pending.is_empty() {
-            self.finished = true;
-        }
-        Ok(())
+        };
+        self.next_event += 1;
+        let next = if self.next_event == self.events.len() {
+            self.input = None;
+            NextStep::NeedInput
+        } else {
+            NextStep::Runnable
+        };
+        Ok(StepResult::new(output, next, 0))
     }
 }

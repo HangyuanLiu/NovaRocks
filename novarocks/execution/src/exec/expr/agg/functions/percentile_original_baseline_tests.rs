@@ -58,7 +58,11 @@ impl Legacy {
     fn pointer(&mut self) -> AggStatePtr {
         self.raw.as_mut_ptr() as AggStatePtr
     }
-    fn update(&mut self, values: ArrayRef, rates: ArrayRef) -> Result<(), String> {
+    fn update(
+        &mut self,
+        values: ArrayRef,
+        rates: ArrayRef,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let input: ArrayRef = Arc::new(StructArray::new(
             Fields::from(vec![
                 Field::new("v", values.data_type().clone(), true),
@@ -70,11 +74,11 @@ impl Legacy {
         let pointers = vec![self.pointer(); input.len()];
         PercentilePlaceholderAgg.update_batch(&self.spec, 0, &pointers, &AggInputView::Any(&input))
     }
-    fn merge(&mut self, input: ArrayRef) -> Result<(), String> {
+    fn merge(&mut self, input: ArrayRef) -> crate::runtime::fragment::ExecutionResult<()> {
         let pointers = vec![self.pointer(); input.len()];
         PercentilePlaceholderAgg.merge_batch(&self.spec, 0, &pointers, &AggInputView::Any(&input))
     }
-    fn output(&mut self, partial: bool) -> Result<ArrayRef, String> {
+    fn output(&mut self, partial: bool) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         let pointer = self.pointer();
         PercentilePlaceholderAgg.build_array(&self.spec, 0, &[pointer], partial)
     }
@@ -218,9 +222,10 @@ fn original_percentile_null_rate_defaults_zero_empty_is_null_and_rate_precedes_v
         assert_eq!(state.rate(), None);
         let mut invalid = Legacy::new(name, DataType::Float64);
         assert_eq!(
-            invalid
+            (invalid
                 .update(ints(vec![None]), rates(vec![Some(2.0)]))
-                .unwrap_err(),
+                .unwrap_err())
+            .to_string(),
             "Percentile rate must be between 0 and 1"
         );
         assert_eq!(invalid.len(), 0);
@@ -231,20 +236,22 @@ fn original_percentile_rate_errors_nan_infinity_epsilon_and_partial_mutation_kee
     for rate in [-0.1, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         let mut state = Legacy::new("percentile_cont", DataType::Float64);
         assert_eq!(
-            state
+            (state
                 .update(ints(vec![Some(1)]), rates(vec![Some(rate)]))
-                .unwrap_err(),
+                .unwrap_err())
+            .to_string(),
             "Percentile rate must be between 0 and 1"
         );
     }
     let mut state = Legacy::new("percentile_cont", DataType::Float64);
     assert_eq!(
-        state
+        (state
             .update(
                 ints(vec![Some(1), Some(2)]),
                 rates(vec![Some(0.5), Some(0.75)])
             )
-            .unwrap_err(),
+            .unwrap_err())
+        .to_string(),
         "percentile rate mismatch while merging states: existing=0.5 incoming=0.75"
     );
     assert_eq!(state.len(), 1);
@@ -304,15 +311,16 @@ fn original_percentile_malformed_state_header_and_merge_rate_preserve_original_e
             "unsupported exact percentile payload version: expected=1 actual=2",
         ),
     ] {
-        assert_eq!(state.merge(bin(bytes)).unwrap_err(), expected);
+        assert_eq!((state.merge(bin(bytes)).unwrap_err()).to_string(), expected);
     }
     state
         .update(ints(vec![Some(1)]), rates(vec![Some(0.5)]))
         .unwrap();
     assert_eq!(
-        state
+        (state
             .merge(bin(b"\xc3\x01{\"rate\":0.75,\"values\":[{\"Int64\":9}]}"))
-            .unwrap_err(),
+            .unwrap_err())
+        .to_string(),
         "percentile rate mismatch while merging states: existing=0.5 incoming=0.75"
     );
     assert_eq!(state.len(), 1);
@@ -337,7 +345,7 @@ fn original_percentile_cont_keeps_non_interpolating_success_and_original_output_
         let mut inner = Legacy::new("percentile_cont", ty.clone());
         inner.update(values, rates(vec![Some(0.5); 2])).unwrap();
         assert_eq!(
-            inner.output(false).unwrap_err(),
+            (inner.output(false).unwrap_err()).to_string(),
             format!("unsupported percentile_cont output type {:?}", ty)
         );
     }
@@ -348,7 +356,7 @@ fn original_percentile_cont_keeps_non_interpolating_success_and_original_output_
     )
     .unwrap();
     assert_eq!(
-        text.output(false).unwrap_err(),
+        (text.output(false).unwrap_err()).to_string(),
         "percentile_cont: unsupported percentile_cont interpolation input Utf8(\"a\")"
     );
 }
@@ -356,19 +364,21 @@ fn original_percentile_cont_keeps_non_interpolating_success_and_original_output_
 fn original_percentile_unsupported_value_and_rate_type_errors_preserve_full_debug() {
     let mut state = Legacy::new("percentile_disc", DataType::Boolean);
     assert_eq!(
-        state
+        (state
             .update(
                 Arc::new(BooleanArray::from(vec![true])),
                 rates(vec![Some(0.5)])
             )
-            .unwrap_err(),
+            .unwrap_err())
+        .to_string(),
         "unsupported percentile_disc/cont input scalar Bool(true)"
     );
     let mut invalidrate = Legacy::new("percentile_disc", DataType::Int64);
     assert_eq!(
-        invalidrate
+        (invalidrate
             .update(ints(vec![None]), Arc::new(BooleanArray::from(vec![true])))
-            .unwrap_err(),
+            .unwrap_err())
+        .to_string(),
         "percentile_disc_cont_update: unsupported numeric input type Boolean"
     );
     assert_eq!(invalidrate.len(), 0);
@@ -434,42 +444,42 @@ fn original_percentile_original_scalar_rate_carriers_and_missing_tracker_type_si
         state.update(ints(vec![Some(3)]), rate).unwrap();
         assert_eq!(f64_output(&mut state), Some(3.0));
     }
-    assert_eq!(
-        PercentilePlaceholderAgg
+    crate::exec::expr::agg::functions::common::assert_plan_contract(
+        &(PercentilePlaceholderAgg
             .build_spec_from_type(
                 &AggFunction {
                     name: "percentile_cont".into(),
                     ..Default::default()
                 },
                 None,
-                false
+                false,
             )
             .err()
-            .unwrap(),
-        "aggregate type signature is required"
+            .unwrap()),
+        &"aggregate type signature is required",
     );
     let mut state = Legacy::new("percentile_disc_lc|original-suffix", DataType::Int64);
     assert!(matches!(state.spec.kind, AggKind::PercentileDiscLc));
     let mut unused = MaybeUninit::<ExactPercentileState>::uninit();
-    assert_eq!(
-        PercentilePlaceholderAgg
+    crate::exec::expr::agg::functions::common::assert_plan_contract(
+        &(PercentilePlaceholderAgg
             .init_state_with_tracker(&state.spec, unused.as_mut_ptr().cast(), None)
-            .unwrap_err(),
-        "allocation-tracked exact percentile requires an aggregate memory tracker"
+            .unwrap_err()),
+        &"allocation-tracked exact percentile requires an aggregate memory tracker",
     );
-    assert_eq!(
-        PercentilePlaceholderAgg
+    crate::exec::expr::agg::functions::common::assert_view_contract(
+        &(PercentilePlaceholderAgg
             .build_input_view(&state.spec, &None)
             .err()
-            .unwrap(),
-        "percentile_disc/cont input missing"
+            .unwrap()),
+        &"percentile_disc/cont input missing",
     );
-    assert_eq!(
-        PercentilePlaceholderAgg
+    crate::exec::expr::agg::functions::common::assert_view_contract(
+        &(PercentilePlaceholderAgg
             .build_merge_view(&state.spec, &None)
             .err()
-            .unwrap(),
-        "percentile_disc/cont merge input missing"
+            .unwrap()),
+        &"percentile_disc/cont merge input missing",
     );
     state
         .update(ints(vec![Some(7)]), rates(vec![Some(0.5)]))

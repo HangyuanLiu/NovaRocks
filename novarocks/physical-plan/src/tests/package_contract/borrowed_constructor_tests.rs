@@ -51,7 +51,7 @@ impl PureCompileControl for BorrowedControl {
         }
         let at = trace.len();
         trace.push((phase, units));
-        if let Some((refusal, cause)) = self.refusal
+        if let Some((refusal, cause)) = self.refusal.clone()
             && at == refusal
         {
             Err(cause)
@@ -89,10 +89,10 @@ fn every_prefix(input: &FragmentPackageInput, expected: Result<(), FragmentPacka
     assert_eq!(trace.first(), Some(&(CompilePhase::Decode, 0)));
     for cause in CAUSES {
         for at in 0..trace.len() {
-            let c = BorrowedControl::new(Some((at, cause)));
+            let c = BorrowedControl::new(Some((at, cause.clone())));
             assert_eq!(
                 construct(input, &c).map(|_| ()),
-                Err(FragmentPackageError::Control(cause))
+                Err(FragmentPackageError::Control(cause.clone()))
             );
             assert_eq!(c.trace(), trace[..=at]);
         }

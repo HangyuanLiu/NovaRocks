@@ -39,7 +39,7 @@ impl AggregateFunction for CountStateAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         build_count_state_spec(func, input_type, input_is_intermediate, AggKind::CountState)
     }
 
@@ -51,7 +51,7 @@ impl AggregateFunction for CountStateAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_count_state_input_view(spec, array)
     }
 
@@ -59,7 +59,7 @@ impl AggregateFunction for CountStateAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_count_state_merge_view(array)
     }
 
@@ -83,7 +83,7 @@ impl AggregateFunction for CountStateAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         update_count_state(spec, offset, state_ptrs, input)
     }
 
@@ -93,7 +93,7 @@ impl AggregateFunction for CountStateAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         merge_count_state(offset, state_ptrs, input)
     }
 
@@ -103,7 +103,7 @@ impl AggregateFunction for CountStateAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         _output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         build_count_state_array(offset, group_states)
     }
 }
@@ -114,7 +114,7 @@ impl AggregateFunction for CountStateSignedAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
         build_count_state_spec(
             func,
             input_type,
@@ -131,10 +131,12 @@ impl AggregateFunction for CountStateSignedAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "count_state_signed input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "count_state_signed input missing",
+            )
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -142,7 +144,7 @@ impl AggregateFunction for CountStateSignedAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         build_count_state_merge_view(array)
     }
 
@@ -166,7 +168,7 @@ impl AggregateFunction for CountStateSignedAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         update_count_state_signed(offset, state_ptrs, input)
     }
 
@@ -176,7 +178,7 @@ impl AggregateFunction for CountStateSignedAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         merge_count_state(offset, state_ptrs, input)
     }
 
@@ -186,7 +188,7 @@ impl AggregateFunction for CountStateSignedAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         _output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         build_count_state_array(offset, group_states)
     }
 }
@@ -196,28 +198,37 @@ fn build_count_state_spec(
     input_type: Option<&DataType>,
     input_is_intermediate: bool,
     kind: AggKind,
-) -> Result<AggSpec, String> {
+) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
     let count_all = matches!(kind, AggKind::CountState) && input_type.is_none();
     if matches!(kind, AggKind::CountStateSigned) && !input_is_intermediate {
-        let input_type =
-            input_type.ok_or_else(|| "count_state_signed input type missing".to_string())?;
+        let input_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "count_state_signed input type missing",
+            )
+        })?;
         let DataType::Struct(fields) = input_type else {
-            return Err(format!(
-                "count_state_signed expects struct input (value, change_op), got {:?}",
-                input_type
-            ));
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "count_state_signed expects struct input (value, change_op), got {:?}",
+                    input_type
+                )),
+            );
         };
         if fields.len() != 2 {
-            return Err(format!(
-                "count_state_signed expects 2 arguments, got struct with {} fields",
-                fields.len()
-            ));
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "count_state_signed expects 2 arguments, got struct with {} fields",
+                    fields.len()
+                )),
+            );
         }
         if fields[1].data_type() != &DataType::Int8 {
-            return Err(format!(
-                "count_state_signed change_op must be Int8, got {:?}",
-                fields[1].data_type()
-            ));
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "count_state_signed change_op must be Int8, got {:?}",
+                    fields[1].data_type()
+                )),
+            );
         }
     }
 
@@ -250,27 +261,28 @@ fn count_state_layout_for(kind: &AggKind) -> (usize, usize) {
 fn build_count_state_input_view<'a>(
     spec: &AggSpec,
     array: &'a Option<ArrayRef>,
-) -> Result<AggInputView<'a>, String> {
+) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
     if spec.count_all {
         Ok(AggInputView::None)
     } else {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "count_state input missing".to_string())?;
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("count_state input missing")
+        })?;
         Ok(AggInputView::Any(arr))
     }
 }
 
 fn build_count_state_merge_view<'a>(
     array: &'a Option<ArrayRef>,
-) -> Result<AggInputView<'a>, String> {
-    let arr = array
-        .as_ref()
-        .ok_or_else(|| "count_state merge input missing".to_string())?;
-    let binary = arr
-        .as_any()
-        .downcast_ref::<BinaryArray>()
-        .ok_or_else(|| "count_state merge input must be BinaryArray".to_string())?;
+) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+    let arr = array.as_ref().ok_or_else(|| {
+        crate::exec::expr::agg::views::aggregate_input_contract("count_state merge input missing")
+    })?;
+    let binary = arr.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| {
+        crate::exec::expr::agg::views::aggregate_input_contract(
+            "count_state merge input must be BinaryArray",
+        )
+    })?;
     Ok(AggInputView::Binary(binary))
 }
 
@@ -284,12 +296,14 @@ fn state_slot(base: AggStatePtr, offset: usize) -> *mut i64 {
     unsafe { (base as *mut u8).add(offset) as *mut i64 }
 }
 
-fn add_delta(slot: *mut i64, delta: i64, context: &str) -> Result<(), String> {
+fn add_delta(
+    slot: *mut i64,
+    delta: i64,
+    context: &str,
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     unsafe {
         let current = *slot;
-        let next = current
-            .checked_add(delta)
-            .ok_or_else(|| format!("{context} overflow while adding count delta"))?;
+        let next = super::failure::add_count(current, delta, context)?;
         *slot = next;
     }
     Ok(())
@@ -300,7 +314,7 @@ fn update_count_state(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     match input {
         AggInputView::None => {
             for &base in state_ptrs {
@@ -322,7 +336,9 @@ fn update_count_state(
             }
             Ok(())
         }
-        _ => Err("count_state batch input type mismatch".to_string()),
+        _ => Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "count_state batch input type mismatch",
+        )),
     }
 }
 
@@ -330,18 +346,26 @@ fn update_count_state_signed(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let AggInputView::Any(array) = input else {
-        return Err("count_state_signed batch input type mismatch".to_string());
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "count_state_signed batch input type mismatch",
+        ));
     };
     let struct_arr = array
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| "count_state_signed expects struct input".to_string())?;
+        .ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "count_state_signed expects struct input",
+            )
+        })?;
     if struct_arr.num_columns() != 2 {
-        return Err(format!(
-            "count_state_signed expects 2 arguments, got {}",
-            struct_arr.num_columns()
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            format_args!(
+                "count_state_signed expects 2 arguments, got {}",
+                struct_arr.num_columns()
+            ),
         ));
     }
     let key_arr = struct_arr.column(0);
@@ -350,10 +374,10 @@ fn update_count_state_signed(
         .as_any()
         .downcast_ref::<Int8Array>()
         .ok_or_else(|| {
-            format!(
+            crate::exec::expr::agg::views::aggregate_input_contract(format_args!(
                 "count_state_signed change_op must be Int8, got {:?}",
                 op_arr_ref.data_type()
-            )
+            ))
         })?;
 
     for (row, &base) in state_ptrs.iter().enumerate() {
@@ -367,7 +391,9 @@ fn update_count_state_signed(
                 CHANGE_OP_INSERT => 1,
                 CHANGE_OP_DELETE => -1,
                 other => {
-                    return Err(format!("unknown count_state_signed change_op: {other}"));
+                    return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                        format_args!("unknown count_state_signed change_op: {other}"),
+                    ));
                 }
             }
         };
@@ -380,9 +406,11 @@ fn merge_count_state(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     input: &AggInputView,
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let AggInputView::Binary(array) = input else {
-        return Err("count_state merge input type mismatch".to_string());
+        return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+            "count_state merge input type mismatch",
+        ));
     };
     for (row, &base) in state_ptrs.iter().enumerate() {
         if array.is_null(row) {
@@ -397,14 +425,17 @@ fn merge_count_state(
 fn build_count_state_array(
     offset: usize,
     group_states: &[AggStatePtr],
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut builder = BinaryBuilder::new();
+    let mut extent = super::failure::BinaryOutput::default();
     for &base in group_states {
         let count = unsafe { *state_slot(base, offset) };
         if count == 0 {
             builder.append_value([]);
         } else {
-            builder.append_value(encode_count_state(count));
+            let bytes = encode_count_state(count);
+            extent.append(bytes.len())?;
+            builder.append_value(bytes);
         }
     }
     Ok(Arc::new(builder.finish()))
@@ -496,7 +527,7 @@ mod tests {
             &mut self,
             input: super::super::super::AggInputView<'_>,
             rows: usize,
-        ) -> Result<(), String> {
+        ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
             let ptr = self.ptr();
             let state_ptrs = vec![ptr; rows];
             super::super::super::update_batch(&self.spec, 0, &state_ptrs, &input)
@@ -644,7 +675,10 @@ mod tests {
 
         let err = cell.try_update(view, 1).unwrap_err();
 
-        assert!(err.contains("unknown count_state_signed change_op"));
+        assert!(
+            err.to_string()
+                .contains("unknown count_state_signed change_op")
+        );
     }
 
     #[test]
@@ -697,6 +731,9 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("state combinator output_type must be Binary"));
+        assert!(
+            err.to_string()
+                .contains("state combinator output_type must be Binary")
+        );
     }
 }

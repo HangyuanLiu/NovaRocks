@@ -15,27 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{
     Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
     Int32Array, Int64Array,
 };
 use arrow::datatypes::DataType;
-use novarocks_functions::builtin::string_extended::{StringOperation, evaluate_legacy};
+use novarocks_functions::builtin::string_extended::{StringOperation, evaluate_required};
 
 pub fn eval_money_format<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let input = arena.eval(args[0], chunk)?;
     macro_rules! checked {
         ($ty:ty, $message:expr) => {
             input
                 .as_any()
                 .downcast_ref::<$ty>()
-                .ok_or_else(|| $message.to_string())?
+                .ok_or_else(|| expression_contract($message))?
         };
     }
     match input.data_type() {
@@ -60,8 +61,13 @@ pub fn eval_money_format<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         DataType::Decimal128(..) => {
             checked!(Decimal128Array, "money_format expects decimal");
         }
-        other => return Err((format!("money_format expects numeric, got {:?}", other)).into()),
+        other => {
+            return Err(expression_contract(format_args!(
+                "money_format expects numeric, got {:?}",
+                other
+            )));
+        }
     }
     let rows = input.len();
-    Ok((evaluate_legacy(StringOperation::Money, &[input], rows))?)
+    evaluate_required(StringOperation::Money, &[input], rows).map_err(ExecutionFailure::from)
 }

@@ -38,7 +38,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -282,7 +282,7 @@ fn source_token_every_actual_lookup_boundary_preserves_three_causes_and_ordinary
                 for cause in CAUSES {
                     let control = Control {
                         trace: Mutex::new(Vec::new()),
-                        stop: Some((at, cause)),
+                        stop: Some((at, cause.clone())),
                     };
                     assert!(
                         matches!(call(&control), Err(TypeCodecError::Control(actual)) if actual == cause)
@@ -369,7 +369,7 @@ fn root_value_binding_defends_private_emission_presence_and_keeps_ordinary_tail(
             for cause in CAUSES {
                 let control = Control {
                     trace: Mutex::new(Vec::new()),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
                 assert!(
                     matches!(call(&control), Err(TypeCodecError::Control(actual)) if actual == cause)

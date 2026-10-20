@@ -168,7 +168,7 @@ mod tests {
     impl PureCompileControl for Control {
         fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             self.calls.lock().unwrap().push((phase, units));
-            if let Some(error) = self.error
+            if let Some(error) = self.error.clone()
                 && (!self.at_positive || units > 0)
             {
                 return Err(error);
@@ -380,7 +380,7 @@ mod tests {
                 let mut calls = self.calls.lock().unwrap();
                 calls.push((phase, units));
                 if calls.len() == self.at {
-                    return Err(self.error);
+                    return Err(self.error.clone());
                 }
                 Ok(())
             }
@@ -395,13 +395,13 @@ mod tests {
         ] {
             for at in [3, 4] {
                 let control = StopAtCall {
-                    error,
+                    error: error.clone(),
                     at,
                     calls: Mutex::new(vec![]),
                 };
                 assert_eq!(
                     selected.utf8_observed(CompilePhase::FunctionSpecialization, &control),
-                    Err(ConstantError::Control(error))
+                    Err(ConstantError::Control(error.clone()))
                 );
                 let calls = control.calls.lock().unwrap();
                 assert_eq!(calls.len(), at);
@@ -434,10 +434,10 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             for at_positive in [false, true] {
-                let control = Control::failing(error, at_positive);
+                let control = Control::failing(error.clone(), at_positive);
                 assert_eq!(
                     long.utf8_observed(CompilePhase::LowerProgram, &control),
-                    Err(ConstantError::Control(error))
+                    Err(ConstantError::Control(error.clone()))
                 );
                 assert_eq!(
                     *control.calls.lock().unwrap(),
@@ -451,10 +451,10 @@ mod tests {
                     }
                 );
             }
-            let control = Control::failing(error, true);
+            let control = Control::failing(error.clone(), true);
             assert_eq!(
                 short.int64_observed(CompilePhase::ProviderValidation, &control),
-                Err(ConstantError::Control(error))
+                Err(ConstantError::Control(error.clone()))
             );
             let calls = control.calls.lock().unwrap();
             assert_eq!(calls[0], (CompilePhase::ProviderValidation, 0));
@@ -462,7 +462,7 @@ mod tests {
             assert!(calls[1].1 > 0 && calls[1].1 < 256);
             drop(calls);
             // Even a carrier mismatch observes the mandatory entry control.
-            let control = Control::failing(error, false);
+            let control = Control::failing(error.clone(), false);
             assert_eq!(
                 short.utf8_observed(CompilePhase::Encode, &control),
                 Err(ConstantError::Control(error))
@@ -663,10 +663,10 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             for at_positive in [false, true] {
-                let control = Control::failing(error, at_positive);
+                let control = Control::failing(error.clone(), at_positive);
                 assert_eq!(
                     selected.signed_integer_observed(CompilePhase::LowerProgram, &control),
-                    Err(ConstantError::Control(error))
+                    Err(ConstantError::Control(error.clone()))
                 );
                 assert_eq!(
                     *control.calls.lock().unwrap(),
@@ -680,7 +680,7 @@ mod tests {
                     }
                 );
             }
-            let control = Control::failing(error, true);
+            let control = Control::failing(error.clone(), true);
             assert_eq!(
                 short.signed_integer_observed(CompilePhase::FunctionSpecialization, &control),
                 Err(ConstantError::Control(error))

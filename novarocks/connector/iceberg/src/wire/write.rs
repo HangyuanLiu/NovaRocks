@@ -1599,7 +1599,7 @@ mod compile_control_tests {
         fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
             let mut trace = self.trace.lock().unwrap();
             trace.push((phase, units));
-            if let Some((index, cause)) = self.refuse
+            if let Some((index, cause)) = self.refuse.clone()
                 && trace.len() == index
             {
                 return Err(cause);
@@ -1922,11 +1922,14 @@ mod compile_control_tests {
                 for cause in causes() {
                     let control = Control {
                         trace: Default::default(),
-                        refuse: Some((index, cause)),
+                        refuse: Some((index, cause.clone())),
                     };
                     let error = run_writer(&bytes, &control).unwrap_err();
-                    assert_eq!(error.compile_control_error(), Some(cause));
-                    assert_eq!(error.kind(), ConnectorCodecErrorKind::CompileControl(cause));
+                    assert_eq!(error.compile_control_error(), Some(&cause));
+                    assert_eq!(
+                        error.kind(),
+                        &ConnectorCodecErrorKind::CompileControl(cause)
+                    );
                     assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
                 }
             }
@@ -1943,13 +1946,13 @@ mod compile_control_tests {
                 for cause in causes() {
                     let control = Control {
                         trace: Default::default(),
-                        refuse: Some((index, cause)),
+                        refuse: Some((index, cause.clone())),
                     };
                     assert_eq!(
                         run_fragment(&bytes, &control)
                             .unwrap_err()
                             .compile_control_error(),
-                        Some(cause)
+                        Some(&cause)
                     );
                     assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
                 }
@@ -1989,7 +1992,7 @@ mod compile_control_tests {
             for index in [2, 3] {
                 let control = Control {
                     trace: Default::default(),
-                    refuse: Some((index, cause)),
+                    refuse: Some((index, cause.clone())),
                 };
                 let mut budget = ledger();
                 let mut context =
@@ -2004,7 +2007,7 @@ mod compile_control_tests {
                     finish_decode(result, &mut context)
                         .unwrap_err()
                         .compile_control_error(),
-                    Some(cause)
+                    Some(&cause)
                 );
                 let count = control.trace.lock().unwrap().len();
                 assert_eq!(
@@ -2012,7 +2015,7 @@ mod compile_control_tests {
                         .flush_compile_control()
                         .unwrap_err()
                         .compile_control_error(),
-                    Some(cause)
+                    Some(&cause)
                 );
                 assert_eq!(control.trace.lock().unwrap().len(), count);
             }
@@ -2025,7 +2028,7 @@ mod compile_control_tests {
             &mut context,
         )
         .unwrap_err();
-        assert_eq!(error.kind(), ConnectorCodecErrorKind::InvalidValue);
+        assert_eq!(error.kind(), &ConnectorCodecErrorKind::InvalidValue);
         assert_eq!(error.detail(), "split offset must be nonnegative");
     }
     #[test]
@@ -2041,13 +2044,13 @@ mod compile_control_tests {
             for cause in causes() {
                 let control = Control {
                     trace: Default::default(),
-                    refuse: Some((trace.len(), cause)),
+                    refuse: Some((trace.len(), cause.clone())),
                 };
                 assert_eq!(
                     run_writer(&bytes, &control)
                         .unwrap_err()
                         .compile_control_error(),
-                    Some(cause)
+                    Some(&cause)
                 );
                 assert_eq!(*control.trace.lock().unwrap(), trace);
             }
@@ -2077,7 +2080,7 @@ mod compile_control_tests {
             for compare in [false, true] {
                 let control = Control {
                     trace: Default::default(),
-                    refuse: Some((2, cause)),
+                    refuse: Some((2, cause.clone())),
                 };
                 let mut budget = ledger();
                 let mut context =
@@ -2089,7 +2092,7 @@ mod compile_control_tests {
                 } else {
                     copy_bytes(value.as_bytes(), &mut context).unwrap_err()
                 };
-                assert_eq!(error.compile_control_error(), Some(cause));
+                assert_eq!(error.compile_control_error(), Some(&cause));
                 assert_eq!(control.trace.lock().unwrap()[1].1, 256);
             }
         }
@@ -2150,14 +2153,14 @@ mod compile_control_tests {
         for cause in causes() {
             let control = Control {
                 trace: Default::default(),
-                refuse: Some((refuse_at, cause)),
+                refuse: Some((refuse_at, cause.clone())),
             };
             let mut budget = ledger();
             let mut context =
                 ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
                     .unwrap();
             let error = left.compare(right, &mut context).unwrap_err();
-            assert_eq!(error.compile_control_error(), Some(cause));
+            assert_eq!(error.compile_control_error(), Some(&cause));
             assert_eq!(*control.trace.lock().unwrap(), trace[..refuse_at]);
             assert_eq!(control.trace.lock().unwrap().last().unwrap().1, 256);
             let count = control.trace.lock().unwrap().len();
@@ -2166,7 +2169,7 @@ mod compile_control_tests {
                     .flush_compile_control()
                     .unwrap_err()
                     .compile_control_error(),
-                Some(cause)
+                Some(&cause)
             );
             assert_eq!(control.trace.lock().unwrap().len(), count);
         }
@@ -2210,8 +2213,8 @@ mod compile_control_tests {
                 &mut ConnectorDecodeContext::new(&expected, &mut budget),
             )
             .unwrap_err();
-            assert_eq!(error.kind(), kind);
-            assert_eq!(legacy.kind(), kind);
+            assert_eq!(error.kind(), &kind);
+            assert_eq!(legacy.kind(), &kind);
             assert_eq!(error.detail(), legacy.detail());
             assert_eq!(error.compile_control_error(), None);
         }
@@ -2222,7 +2225,7 @@ mod compile_control_tests {
         for cause in causes() {
             let control = Control {
                 trace: Default::default(),
-                refuse: Some((2, cause)),
+                refuse: Some((2, cause.clone())),
             };
             let mut budget = ledger();
             let mut context =
@@ -2237,12 +2240,12 @@ mod compile_control_tests {
             )
             .unwrap_err();
             assert!(bytes.is_empty());
-            assert_eq!(error.compile_control_error(), Some(cause));
+            assert_eq!(error.compile_control_error(), Some(&cause));
             assert_eq!(
                 finish_decode::<u64>(Err(error), &mut context)
                     .unwrap_err()
                     .compile_control_error(),
-                Some(cause)
+                Some(&cause)
             );
             assert_eq!(control.trace.lock().unwrap().len(), 2);
         }

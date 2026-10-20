@@ -108,6 +108,7 @@ use novarocks_query_application::sql::{
     SpecializedStatementRoute, parse_single_statement, query_service_parse_error,
     strip_leading_line_comments,
 };
+use novarocks_type_contract::CompileControlError;
 use novarocks_types::ClusterRole;
 use novarocks_types::naming::normalize_identifier;
 use novarocks_user_error::UserError;
@@ -126,6 +127,42 @@ const DEFAULT_CATALOG: &str = "default_catalog";
 enum GovernedPreparationError {
     Service(QueryServiceError),
     Cancelled(QueryServiceError),
+}
+
+fn governed_compile_control_failure(
+    cause: novarocks_type_contract::CompileControlError,
+) -> GovernedPreparationError {
+    let cancelled = matches!(
+        &cause,
+        novarocks_type_contract::CompileControlError::Cancelled
+            | novarocks_type_contract::CompileControlError::DeadlineExceeded
+    );
+    let failure = QueryServiceError::from_compile_control(cause);
+    if cancelled {
+        GovernedPreparationError::Cancelled(failure)
+    } else {
+        GovernedPreparationError::Service(failure)
+    }
+}
+
+/// Selects the session representation while SQL analysis still has its source.
+/// A compiler source carries its author's fact; its diagnostic is not a SQL policy.
+fn governed_compiler_failure(
+    error: FrontendQueryCompilerError,
+    sql: &str,
+) -> GovernedPreparationError {
+    match error {
+        FrontendQueryCompilerError::Engine(error) => {
+            GovernedPreparationError::Service(internal_error(error))
+        }
+        FrontendQueryCompilerError::Control(error) => governed_compile_control_failure(error),
+        FrontendQueryCompilerError::Source(source) => GovernedPreparationError::Service(
+            QueryServiceError::from_compile_control(CompileControlError::Source(source)),
+        ),
+        FrontendQueryCompilerError::Analyze(error) => GovernedPreparationError::Service(
+            QueryServiceError::from_user_error(error.to_user_error(Some(sql))),
+        ),
+    }
 }
 
 fn command_error(kind: CommandErrorKind, error: impl Into<String>) -> CommandError {
@@ -707,25 +744,44 @@ impl SpecializedStatementRoute for TypedCommandRoute {
 }
 
 enum RoutedExecutionError {
+    Execution {
+        input: novarocks_query_application::execution_error::ExecutionFailureInput,
+        terminal: Option<novarocks_spi::connector::LakePublicationTerminal>,
+        compile_control: Option<novarocks_type_contract::CompileControlError>,
+    },
     Engine(String),
     Control(novarocks_type_contract::CompileControlError),
     User(UserError),
     Publication {
         message: String,
         terminal: novarocks_spi::connector::LakePublicationTerminal,
+        compile_control: Option<novarocks_type_contract::CompileControlError>,
     },
 }
 
-impl RoutedExecutionError {
-    fn into_query_service_error(self) -> QueryServiceError {
-        match self {
-            Self::Control(error) => QueryServiceError::from_compile_control(error),
-            Self::Engine(error) => internal_error(error),
-            Self::User(error) => QueryServiceError::from_user_error(error),
-            Self::Publication { message, terminal } => {
-                QueryServiceError::with_publication_terminal(message, terminal)
-            }
+fn routed_compiler_failure(error: FrontendQueryCompilerError, sql: &str) -> RoutedExecutionError {
+    match error {
+        FrontendQueryCompilerError::Engine(error) => RoutedExecutionError::Engine(error),
+        FrontendQueryCompilerError::Control(error) => RoutedExecutionError::Control(error),
+        FrontendQueryCompilerError::Source(source) => {
+            RoutedExecutionError::Control(CompileControlError::Source(source))
         }
+        FrontendQueryCompilerError::Analyze(error) => {
+            RoutedExecutionError::User(error.to_user_error(Some(sql)))
+        }
+    }
+}
+
+/// The distributed coordinator owns domain, root-read and selected-input
+/// projection. Keep its rich compile-control sidecar on this routed handoff.
+fn routed_distributed_query_failure(
+    error: crate::query_execution::contract::DistributedQueryError,
+) -> RoutedExecutionError {
+    let compile_control = error.compile_control_error();
+    RoutedExecutionError::Execution {
+        input: error.into_execution_failure_input(),
+        terminal: None,
+        compile_control,
     }
 }
 
@@ -737,6 +793,13 @@ fn dml_statement_result(
 
 fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExecutionError> {
     result.map_err(|mut error| {
+        if let Some(input) = error.execution_failure().cloned() {
+            return RoutedExecutionError::Execution {
+                input,
+                terminal: error.publication_terminal().cloned(),
+                compile_control: error.compile_control_error(),
+            };
+        }
         if let Some(failure) = error.take_cow_failure() {
             // Both production COW callers reach this branch inside the
             // execute_prepared_dml_statement synchronous command closure.
@@ -744,11 +807,22 @@ fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExe
             // its original WorkOwner and result_window remain on that worker.
             let message = failure.retire_on_original_worker(error.publication_terminal());
             return match error.publication_terminal().cloned() {
-                Some(terminal) => RoutedExecutionError::Publication { message, terminal },
+                Some(terminal) => RoutedExecutionError::Publication {
+                    message,
+                    terminal,
+                    compile_control: None,
+                },
                 None => RoutedExecutionError::Engine(message),
             };
         }
         if let Some(control) = error.compile_control_error() {
+            if let Some(terminal) = error.publication_terminal().cloned() {
+                return RoutedExecutionError::Publication {
+                    message: error.to_string(),
+                    terminal,
+                    compile_control: Some(control),
+                };
+            }
             RoutedExecutionError::Control(control)
         } else if let Some(user_error) = error.user_error().cloned() {
             RoutedExecutionError::User(user_error)
@@ -758,11 +832,65 @@ fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExe
                 None => error.to_string(),
             };
             match error.publication_terminal().cloned() {
-                Some(terminal) => RoutedExecutionError::Publication { message, terminal },
+                Some(terminal) => RoutedExecutionError::Publication {
+                    message,
+                    terminal,
+                    compile_control: None,
+                },
                 None => RoutedExecutionError::Engine(message),
             }
         }
     })
+}
+
+fn routed_execution_service_error(error: RoutedExecutionError) -> QueryServiceError {
+    match error {
+        RoutedExecutionError::Execution {
+            input,
+            terminal,
+            compile_control,
+        } => {
+            let mut service = QueryServiceError::from_execution_failure(input)
+                .with_compile_control(compile_control);
+            if let Some(terminal) = terminal {
+                service = service.attach_publication_terminal(terminal);
+            }
+            service
+        }
+        RoutedExecutionError::Control(error) => QueryServiceError::from_compile_control(error),
+        RoutedExecutionError::Engine(error) => internal_error(error),
+        RoutedExecutionError::User(error) => QueryServiceError::from_user_error(error),
+        RoutedExecutionError::Publication {
+            message,
+            terminal,
+            compile_control,
+        } => QueryServiceError::with_publication_terminal(message, terminal)
+            .with_compile_control(compile_control),
+    }
+}
+
+/// The worker may have selected an execution failure before cleanup outlived
+/// the caller deadline. A local timeout cannot replace that accepted input.
+/// Publication and rich control facts remain independent sidecars when the
+/// original caller cancellation is selected as the fallback.
+fn selected_execution_or_worker_fallback(
+    result: Result<StatementResult, RoutedExecutionError>,
+    fallback: QueryServiceError,
+) -> QueryServiceError {
+    match result {
+        Err(error @ RoutedExecutionError::Execution { .. }) => {
+            routed_execution_service_error(error)
+        }
+        Err(RoutedExecutionError::Publication {
+            terminal,
+            compile_control,
+            ..
+        }) => fallback
+            .with_compile_control(compile_control)
+            .attach_publication_terminal(terminal),
+        Err(RoutedExecutionError::Control(control)) => fallback.with_compile_control(Some(control)),
+        _ => fallback,
+    }
 }
 
 /// Executes one declared synchronous command edge after its bounded admission.
@@ -920,6 +1048,8 @@ fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
 pub struct FrontendQueryService {
     #[cfg(novarocks_dev_controls)]
     statement_observation: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
+    #[cfg(novarocks_dev_controls)]
+    result_handoff: Option<Arc<crate::test_session::result_handoff::ResultHandoffControl>>,
     session_catalog_resolver: SessionCatalogService,
     query_compiler: FrontendQueryCompiler,
     command_executor: Arc<dyn SpecializedStatementRoute>,
@@ -957,6 +1087,15 @@ impl FrontendQueryService {
         self
     }
 
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn with_result_handoff(
+        mut self,
+        control: Option<Arc<crate::test_session::result_handoff::ResultHandoffControl>>,
+    ) -> Self {
+        self.result_handoff = control;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         session_catalog_resolver: SessionCatalogService,
@@ -989,6 +1128,8 @@ impl FrontendQueryService {
         Self {
             #[cfg(novarocks_dev_controls)]
             statement_observation: None,
+            #[cfg(novarocks_dev_controls)]
+            result_handoff: None,
             session_catalog_resolver,
             query_compiler,
             command_executor: Arc::new(TypedCommandRoute::new(
@@ -1467,28 +1608,7 @@ impl FrontendQuerySession {
                 GovernedPreparationError::Service(internal_error(error))
             }
         })?;
-        match prepared {
-            Ok(operation) => Ok(operation),
-            Err(FrontendQueryCompilerError::Engine(error)) => {
-                Err(GovernedPreparationError::Service(internal_error(error)))
-            }
-            Err(FrontendQueryCompilerError::Control(error)) => {
-                let failure = QueryServiceError::from_compile_control(error);
-                if matches!(
-                    error,
-                    novarocks_type_contract::CompileControlError::ResourceExhausted
-                ) {
-                    Err(GovernedPreparationError::Service(failure))
-                } else {
-                    Err(GovernedPreparationError::Cancelled(failure))
-                }
-            }
-            Err(FrontendQueryCompilerError::Analyze(error)) => {
-                Err(GovernedPreparationError::Service(
-                    QueryServiceError::from_user_error(error.to_user_error(Some(sql))),
-                ))
-            }
-        }
+        prepared.map_err(|error| governed_compiler_failure(error, sql))
     }
 
     async fn execute_governed_set(
@@ -1834,12 +1954,29 @@ impl FrontendQuerySession {
                 return Err(governed_execution_error(error, completion));
             }
         };
-        novarocks_query_application::protocol_delivery::StreamingStatementResult::try_from_execution(
+        #[cfg(novarocks_dev_controls)]
+        let handoff_statement = statement.token();
+        #[cfg(novarocks_dev_controls)]
+        let handoff_target = self
+            .service
+            .statement_observation
+            .as_ref()
+            .and_then(|owner| owner.bound_statement(handoff_statement))
+            .and_then(|handle| handle.statement_target());
+        let result = novarocks_query_application::protocol_delivery::StreamingStatementResult::try_from_execution(
             execution,
             statement,
-        )
-        .map(StatementResult::StreamingQuery)
-        .map_err(governed_query_execution_error)
+        ).map_err(governed_query_execution_error)?;
+        #[cfg(novarocks_dev_controls)]
+        if let Some(control) = &self.service.result_handoff {
+            // Only an independent, exact role grant may delay this original
+            // protocol handoff. Observation identity alone grants no control.
+            control
+                .before_protocol(handoff_statement, handoff_target, result.failure_view())
+                .await
+                .map_err(internal_error)?;
+        }
+        Ok(StatementResult::StreamingQuery(result))
     }
 
     async fn execute_typed_statement(
@@ -2129,17 +2266,7 @@ impl FrontendQuerySession {
                                     #[cfg(novarocks_dev_controls)]
                                     None,
                                 )
-                                .map_err(|error| match error {
-                                    FrontendQueryCompilerError::Engine(error) => {
-                                        RoutedExecutionError::Engine(error)
-                                    }
-                                    FrontendQueryCompilerError::Control(error) => {
-                                        RoutedExecutionError::Control(error)
-                                    }
-                                    FrontendQueryCompilerError::Analyze(error) => {
-                                        RoutedExecutionError::User(error.to_user_error(Some(&sql)))
-                                    }
-                                })
+                                .map_err(|error| routed_compiler_failure(error, &sql))
                         };
                         // The result receipt retains the alias even when its
                         // awaiting session disappears before CPU work exits.
@@ -2152,10 +2279,7 @@ impl FrontendQuerySession {
                     execution_owner,
                     producer_window,
                     prepared,
-                    move |operation| {
-                        execute_prepared_query(operation, &query_execution)
-                            .map_err(RoutedExecutionError::Engine)
-                    },
+                    move |operation| execute_prepared_query(operation, &query_execution),
                 )
                 .await
             }),
@@ -2542,12 +2666,14 @@ impl FrontendQuerySession {
                     // A timeout is not complete until the worker releases the
                     // statement lease. Waiting here also fences Backend abort
                     // acknowledgement before this session admits its next SQL.
-                    let (_, execution_owner) = worker.await.map_err(internal_error)?;
+                    let (result, execution_owner) = worker.await.map_err(internal_error)?;
                     statement.restore_execution_owner(execution_owner);
                     return Ok(self.governed_typed_error(
-                        QueryServiceError::new(
-                            QueryServiceErrorKind::Timeout,
-                            format!("query timed out after {timeout_ms} ms"),
+                        selected_execution_or_worker_fallback(
+                            result,
+                            cancellation_error(cancellation.reason().unwrap_or(
+                                QueryCancellationReason::DeadlineExceeded { timeout_ms },
+                            )),
                         ),
                         statement,
                     ));
@@ -2589,7 +2715,10 @@ impl FrontendQuerySession {
         statement.restore_execution_owner(execution_owner);
         if cancellation.is_cancelled() {
             return Ok(self.governed_typed_error(
-                cancellation_error(cancellation.reason().expect("cancelled view has a reason")),
+                selected_execution_or_worker_fallback(
+                    result,
+                    cancellation_error(cancellation.reason().expect("cancelled view has a reason")),
+                ),
                 statement,
             ));
         }
@@ -2608,7 +2737,7 @@ impl FrontendQuerySession {
                 statement,
             )),
             Err(error) => {
-                Ok(self.governed_typed_error(error.into_query_service_error(), statement))
+                Ok(self.governed_typed_error(routed_execution_service_error(error), statement))
             }
         }
     }
@@ -2672,15 +2801,15 @@ fn with_query_hints(
 fn execute_prepared_query(
     operation: PreparedQueryOperation,
     query_execution: &QueryExecutionService,
-) -> Result<StatementResult, String> {
+) -> Result<StatementResult, RoutedExecutionError> {
     match operation {
         PreparedQueryOperation::Immediate(operation) => Ok(operation.into_result()),
-        PreparedQueryOperation::LogicalRead(_) => {
-            Err("logical read requires the governed Query Application launcher".to_string())
-        }
+        PreparedQueryOperation::LogicalRead(_) => Err(RoutedExecutionError::Engine(
+            "logical read requires the governed Query Application launcher".to_string(),
+        )),
         PreparedQueryOperation::Distributed(operation) => query_execution
             .execute_prepared(operation)
-            .map_err(|error| error.to_string()),
+            .map_err(routed_distributed_query_failure),
     }
 }
 
@@ -3185,42 +3314,53 @@ mod tests {
 
     #[test]
     fn runtime_task_refusal_survives_distributed_dml_and_final_user_projection() {
-        use novarocks_execution_contract::{
-            SafeDetail, TaskFailure, TaskFailureCategory, TerminationDetail,
-        };
-        for category in [
-            TaskFailureCategory::Unsupported,
-            TaskFailureCategory::Protocol,
+        use novarocks_failure_contract::FailureProjection;
+        let backend = novarocks_types::BackendProcessId::new_v7();
+        let query = novarocks_types::QueryExecutionId::new(
+            novarocks_types::QueryId::new(31, 32),
+            novarocks_types::AttemptId::new(1).unwrap(),
+        )
+        .unwrap();
+        let identity = novarocks_execution_contract::TaskIdentity::new(
+            query,
+            novarocks_types::StageId::new(1).unwrap(),
+            novarocks_types::TaskId::new(1).unwrap(),
+            backend,
+        );
+        for original in [
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                "FULL OUTER hash join".into(),
+            ),
+            novarocks_plan_codec::PhysicalEncodeError::Invalid("FULL OUTER hash join".into()),
         ] {
-            let detail = TerminationDetail::Failed(TaskFailure::new(
-                category,
-                SafeDetail::truncating("unsupported diagnostic"),
-            ));
-            let error = crate::query_execution::contract::DistributedQueryError::new(
-                crate::query_execution::contract::DistributedQueryErrorKind::Failed,
-                "task runtime refusal",
-            )
-            .with_task_termination(&detail);
-            let failure = crate::dml::error::DmlExecutionError::from(error).into_dml_error(None);
-            let error = dml_result::<()>(Err(failure)).unwrap_err();
-            let RoutedExecutionError::Engine(message) = error else {
-                panic!("engine failure expected");
-            };
-            assert_eq!(
-                message.starts_with("[UnsupportedCompiledShape] "),
-                category == TaskFailureCategory::Unsupported
+            let fact = original.failure_fact();
+            let selected = novarocks_query_application::coordination::SelectedTaskTermination::new(
+                identity.clone(),
+                novarocks_execution_contract::TerminationDetail::Failed(
+                    novarocks_execution_contract::TaskFailure::new_in_phase(
+                        fact,
+                        novarocks_execution_contract::SafeDetail::truncating(
+                            "FULL OUTER hash join",
+                        ),
+                        novarocks_execution_contract::TaskFailurePhase::Preparation,
+                    ),
+                ),
             );
-            if category == TaskFailureCategory::Unsupported {
-                assert_eq!(
-                    message,
-                    "[UnsupportedCompiledShape] Executor: task runtime refusal"
-                );
-            }
+            let input = novarocks_query_application::execution_error::ExecutionFailureInput::from_selected_task(&selected).unwrap();
+            let error = crate::query_execution::contract::DistributedQueryError::from_execution(
+                input.clone(),
+            );
+            let failure = crate::dml::error::DmlExecutionError::from(error).into_dml_error(None);
+            let service =
+                routed_execution_service_error(dml_result::<()>(Err(failure)).unwrap_err());
+            assert_eq!(service.execution_failure(), Some(&input));
+            assert_eq!(service.user_error(), Some(&input.user_error()));
         }
     }
 
     #[test]
     fn compiled_dml_refusal_preserves_publication_terminal_at_the_client_boundary() {
+        use novarocks_failure_contract::FailureProjection;
         use novarocks_spi::connector::{
             LakePublicationDisposition, LakePublicationFamily, LakePublicationId,
             LakePublicationTarget,
@@ -3236,45 +3376,46 @@ mod tests {
         );
         attempt.terminal_known_uncommitted().unwrap();
         let terminal = attempt.terminal().unwrap().clone();
-        for code in [
-            None,
-            Some(novarocks_types::EngineErrorCode::UnsupportedCompiledShape),
+        for original in [
+            novarocks_plan_codec::PhysicalEncodeError::Invalid("post-begin staging failed".into()),
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                "post-begin staging failed".into(),
+            ),
         ] {
-            let mut failure = crate::dml::error::DmlError::executor("post-begin staging failed")
+            let expected = original.failure_fact();
+            let failure = crate::dml::error::DmlExecutionError::from_encode(original)
+                .into_dml_error(None)
                 .with_publication_terminal(terminal.clone());
-            if let Some(code) = code {
-                failure = failure.with_engine_error_code(code);
-            }
-            let service = dml_result::<()>(Err(failure))
-                .err()
-                .expect("staging must fail")
-                .into_query_service_error();
-            assert_eq!(service.kind(), QueryServiceErrorKind::Internal);
+            let service =
+                routed_execution_service_error(dml_result::<()>(Err(failure)).unwrap_err());
+            assert_eq!(service.execution_failure().unwrap().fact(), expected);
             assert_eq!(service.publication_terminal(), Some(&terminal));
             assert_eq!(
                 service.publication_terminal().unwrap().disposition(),
                 LakePublicationDisposition::KnownUncommitted
-            );
-            assert_eq!(
-                service
-                    .message()
-                    .starts_with("[UnsupportedCompiledShape] Executor: post-begin staging failed"),
-                code.is_some()
             );
         }
     }
 
     #[test]
     fn compiled_dml_refusal_survives_outer_executor_message_wrapping() {
-        let failure = crate::dml::error::DmlExecutionError::from_encode(
-            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
-                "change-stream router".into(),
-            ),
-        )
-        .into_dml_error(None);
-        let error = dml_result::<()>(Err(failure)).unwrap_err();
-        assert!(matches!(error, RoutedExecutionError::Engine(message)
-            if message == "[UnsupportedCompiledShape] Executor: change-stream router"));
+        use novarocks_failure_contract::FailureProjection;
+        let original = novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+            "change-stream router".into(),
+        );
+        let expected = original.failure_fact();
+        let failure =
+            crate::dml::error::DmlExecutionError::from_encode(original).into_dml_error(None);
+        let service = routed_execution_service_error(dml_result::<()>(Err(failure)).unwrap_err());
+        assert_eq!(service.execution_failure().unwrap().fact(), expected);
+        let Some(novarocks_type_contract::CompileControlError::Source(source)) =
+            service.compile_control_error()
+        else {
+            panic!("retain the original encode source")
+        };
+        assert!(
+            matches!(source.downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>(), Some(novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(detail)) if detail == "change-stream router")
+        );
     }
 
     use std::sync::Mutex;
@@ -3947,6 +4088,345 @@ mod tests {
     }
 
     #[test]
+    fn prepared_distributed_failure_route_keeps_selected_task_and_root_input() {
+        use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+        use novarocks_execution_contract::{SafeDetail, TaskFailurePhase, TaskIdentity};
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_query_application::{
+            coordination::RootResultFetchFailure,
+            execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
+        };
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        use novarocks_types::{BackendProcessId, StageId, TaskId};
+
+        let identity = TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(91, 8), AttemptId::new(1).unwrap()).unwrap(),
+            StageId::new(2).unwrap(),
+            TaskId::new(3).unwrap(),
+            BackendProcessId::new_v7(),
+        );
+        let task_input = ExecutionFailureInput::new(
+            ConnectorError::new(ConnectorErrorKind::Internal, "private selected Task cause")
+                .failure_fact(),
+            SafeDetail::new("native operation failed").unwrap(),
+            ExecutionFailureSite::Task {
+                identity,
+                phase: TaskFailurePhase::Execution,
+            },
+        );
+        let root_input = ExecutionFailureInput::new(
+            QueryFailureReason::DeadlineExceeded.failure_fact(),
+            SafeDetail::new("root read reached its original deadline").unwrap(),
+            ExecutionFailureSite::RootRead { root: identity },
+        );
+        for (error, expected) in [
+            (
+                DistributedQueryError::from_execution(task_input.clone()).with_root_fetch_failure(
+                    RootResultFetchFailure::from_input(root_input.clone()),
+                ),
+                task_input,
+            ),
+            (
+                DistributedQueryError::new(
+                    DistributedQueryErrorKind::Failed,
+                    "private coordinator wrapper must not replace root input",
+                )
+                .with_root_fetch_failure(RootResultFetchFailure::from_input(root_input.clone())),
+                root_input,
+            ),
+        ] {
+            // This is the same cold-path projection called by the production
+            // execute_prepared_query Distributed arm, before caller fallback.
+            let routed = routed_distributed_query_failure(error);
+            let service = selected_execution_or_worker_fallback(
+                Err(routed),
+                cancellation_error(QueryCancellationReason::ExplicitKill {
+                    requester_connection_id: 7,
+                }),
+            );
+            assert_eq!(service.execution_failure(), Some(&expected));
+            assert_eq!(service.user_error(), Some(&expected.user_error()));
+            assert!(!service.message().contains("private"));
+            assert!(service.compile_control_error().is_none());
+        }
+    }
+
+    #[test]
+    fn prepared_distributed_failure_route_uses_original_domain_and_control_projection() {
+        use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureSite, QueryFailureReason,
+        };
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+
+        let source = ConnectorError::new(ConnectorErrorKind::Unavailable, "private provider cause");
+        let expected = source.failure_fact();
+        let service = routed_execution_service_error(routed_distributed_query_failure(
+            DistributedQueryError::from_source(
+                DistributedQueryErrorKind::Failed,
+                SharedFailureCause::new(source),
+            ),
+        ));
+        let input = service.execution_failure().unwrap();
+        assert_eq!(input.fact(), expected);
+        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+        assert!(!service.message().contains("private"));
+
+        let raw = LayoutResourceError::SourceModel;
+        let control = CompileControlError::from_domain(raw);
+        let service = routed_execution_service_error(routed_distributed_query_failure(
+            DistributedQueryError::from_encode(novarocks_plan_codec::PhysicalEncodeError::Control(
+                control.clone(),
+            )),
+        ));
+        assert_eq!(
+            service.execution_failure().unwrap().fact(),
+            control.failure_fact()
+        );
+        assert_eq!(
+            service.execution_failure().unwrap().site(),
+            ExecutionFailureSite::Coordinator
+        );
+        assert_eq!(service.compile_control_error(), Some(control));
+        let Some(CompileControlError::Source(source)) = service.compile_control_error() else {
+            panic!("the original control source must survive the routed boundary")
+        };
+        assert_eq!(source.downcast_ref::<LayoutResourceError>(), Some(&raw));
+
+        let service = routed_execution_service_error(routed_distributed_query_failure(
+            DistributedQueryError::new(DistributedQueryErrorKind::Failed, "private legacy detail"),
+        ));
+        assert_eq!(
+            service.execution_failure().unwrap().fact(),
+            QueryFailureReason::PreparationFailed.failure_fact(),
+        );
+        assert!(!service.message().contains("private"));
+    }
+
+    #[test]
+    fn caller_cancellation_keeps_publication_verdict_without_replacing_selected_input() {
+        use novarocks_spi::connector::{
+            LakePublicationDisposition, LakePublicationFamily, LakePublicationId,
+            LakePublicationMarkerHeader, LakePublicationNextAction, LakePublicationTarget,
+            LakePublicationTerminal,
+        };
+        use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+
+        let control = CompileControlError::from_domain(LayoutResourceError::SourceModel);
+        for reason in [
+            QueryCancellationReason::DeadlineExceeded { timeout_ms: 1 },
+            QueryCancellationReason::ExplicitKill {
+                requester_connection_id: 7,
+            },
+        ] {
+            for disposition in [
+                LakePublicationDisposition::KnownUncommitted,
+                LakePublicationDisposition::CommitUnknown,
+                LakePublicationDisposition::KnownCommitted,
+            ] {
+                let terminal = LakePublicationTerminal::new(
+                    LakePublicationMarkerHeader::new(
+                        LakePublicationId::new_v7(),
+                        LakePublicationFamily::Write,
+                    ),
+                    LakePublicationTarget::try_new(
+                        "private-catalog".into(),
+                        "private-namespace".into(),
+                        Some("private-table".into()),
+                        None,
+                    )
+                    .unwrap(),
+                    disposition,
+                    if disposition.do_not_retry() {
+                        LakePublicationNextAction::InspectPublishedState
+                    } else {
+                        LakePublicationNextAction::RetryStatement
+                    },
+                    None,
+                );
+                let expected = cancellation_error(reason.clone());
+                let service = selected_execution_or_worker_fallback(
+                    Err(RoutedExecutionError::Publication {
+                        message: "private provider diagnostic must not become the cause".into(),
+                        terminal: terminal.clone(),
+                        compile_control: Some(control.clone()),
+                    }),
+                    cancellation_error(reason.clone()),
+                );
+                assert_eq!(service.execution_failure(), expected.execution_failure());
+                assert_eq!(service.user_error(), expected.user_error());
+                assert_eq!(service.publication_terminal(), Some(&terminal));
+                assert_eq!(service.compile_control_error(), Some(control.clone()));
+                assert_eq!(
+                    service
+                        .message()
+                        .contains("do_not_retry=true; do not retry statement"),
+                    disposition.do_not_retry(),
+                );
+                assert!(!service.message().contains("private"));
+            }
+            let service = selected_execution_or_worker_fallback(
+                Err(RoutedExecutionError::Control(control.clone())),
+                cancellation_error(reason.clone()),
+            );
+            assert_eq!(
+                service.execution_failure(),
+                cancellation_error(reason).execution_failure()
+            );
+            assert_eq!(service.compile_control_error(), Some(control.clone()));
+        }
+    }
+
+    #[test]
+    fn selected_task_execution_survives_dml_publication_and_sql_descriptor() {
+        use novarocks_execution_contract::{SafeDetail, TaskFailurePhase, identity::TaskIdentity};
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite,
+        };
+        use novarocks_spi::connector::{
+            ConnectorError, ConnectorErrorKind, LakePublicationFamily, LakePublicationId,
+            LakePublicationTarget,
+        };
+        use novarocks_types::{
+            AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+        };
+        let identity = TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(91, 7), AttemptId::new(1).unwrap()).unwrap(),
+            StageId::new(2).unwrap(),
+            TaskId::new(3).unwrap(),
+            BackendProcessId::new_v7(),
+        );
+        let source =
+            ConnectorError::new(ConnectorErrorKind::Internal, "private provider diagnostic");
+        let input = ExecutionFailureInput::new(
+            source.failure_fact(),
+            SafeDetail::new("Unexpected failure (reason 4:10)").unwrap(),
+            ExecutionFailureSite::Task {
+                identity,
+                phase: TaskFailurePhase::Execution,
+            },
+        );
+        let target = LakePublicationTarget::try_new(
+            "catalog".into(),
+            "namespace".into(),
+            Some("table".into()),
+            None,
+        )
+        .unwrap();
+        let mut attempt = crate::dml::attempt::DmlPublicationAttempt::new(
+            LakePublicationId::new_v7(),
+            LakePublicationFamily::Write,
+            target,
+            None,
+        );
+        attempt.terminal_pre_dispatch_uncommitted().unwrap();
+        let terminal = attempt.terminal().unwrap().clone();
+        let control = novarocks_type_contract::CompileControlError::ResourceExhausted;
+        let error = crate::dml::error::DmlExecutionError::from_distributed(
+            crate::query_execution::contract::DistributedQueryError::from_execution(input.clone()),
+        )
+        .into_dml_error(None)
+        .with_publication_terminal(terminal.clone())
+        .with_compile_control(Some(control.clone()));
+        let routed = dml_result::<()>(Err(error)).unwrap_err();
+        let service = routed_execution_service_error(routed);
+        assert_eq!(service.execution_failure(), Some(&input));
+        assert_eq!(service.publication_terminal(), Some(&terminal));
+        assert_eq!(service.compile_control_error(), Some(control));
+        assert_eq!(
+            service.message(),
+            "[query.execution.unexpected] Unexpected failure (reason 4:10)"
+        );
+        assert_eq!(service.user_error().unwrap().to_string(), service.message());
+        assert!(!service.message().contains("private"));
+        assert!(!service.message().contains("Executor:"));
+        let delayed = selected_execution_or_worker_fallback(
+            Err(RoutedExecutionError::Execution {
+                input: input.clone(),
+                terminal: Some(terminal.clone()),
+                compile_control: None,
+            }),
+            cancellation_error(QueryCancellationReason::DeadlineExceeded { timeout_ms: 1 }),
+        );
+        assert_eq!(delayed.execution_failure(), Some(&input));
+        assert_eq!(delayed.publication_terminal(), Some(&terminal));
+        assert_eq!(delayed.message(), service.message());
+        let legacy = selected_execution_or_worker_fallback(
+            Err(RoutedExecutionError::Engine("legacy worker stopped".into())),
+            cancellation_error(QueryCancellationReason::DeadlineExceeded { timeout_ms: 1 }),
+        );
+        let fallback =
+            cancellation_error(QueryCancellationReason::DeadlineExceeded { timeout_ms: 1 });
+        assert_eq!(legacy.execution_failure(), fallback.execution_failure());
+        assert!(legacy.execution_failure().is_some());
+        assert_eq!(legacy.kind(), QueryServiceErrorKind::Timeout);
+        assert_eq!(legacy.message(), fallback.message());
+    }
+
+    #[test]
+    fn original_control_failure_preserves_publication_verdict_and_is_not_cancellation() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_spi::connector::{
+            LakePublicationFamily, LakePublicationId, LakePublicationTarget,
+        };
+        use novarocks_type_contract::{
+            CompileControlError, owned_resources::layout::LayoutResourceError,
+        };
+        let target = LakePublicationTarget::try_new(
+            "catalog".into(),
+            "namespace".into(),
+            Some("table".into()),
+            None,
+        )
+        .unwrap();
+        let mut attempt = crate::dml::attempt::DmlPublicationAttempt::new(
+            LakePublicationId::new_v7(),
+            LakePublicationFamily::DataMutation,
+            target,
+            None,
+        );
+        attempt.terminal_pre_dispatch_uncommitted().unwrap();
+        let terminal = attempt.terminal().unwrap().clone();
+        for raw in [
+            LayoutResourceError::SourceModel,
+            LayoutResourceError::Arithmetic,
+        ] {
+            let expected = raw.failure_fact();
+            let cause = CompileControlError::from_domain(raw);
+            let error = crate::dml::error::DmlError::compile_control(cause.clone())
+                .with_publication_terminal(terminal.clone());
+            let result = dml_result::<()>(Err(error));
+            let Err(RoutedExecutionError::Publication {
+                message,
+                terminal: actual,
+                compile_control,
+            }) = result
+            else {
+                panic!("both publication and original control must survive")
+            };
+            assert_eq!(actual, terminal);
+            assert_eq!(compile_control, Some(cause.clone()));
+            let service = QueryServiceError::with_publication_terminal(message, actual)
+                .with_compile_control(compile_control);
+            assert_eq!(service.publication_terminal(), Some(&terminal));
+            assert_eq!(service.compile_control_error(), Some(cause.clone()));
+            assert_eq!(
+                service.compile_control_error().unwrap().failure_fact(),
+                expected
+            );
+            let GovernedPreparationError::Service(service) =
+                governed_compile_control_failure(cause.clone())
+            else {
+                panic!("an arbitrary caller source is not cancellation")
+            };
+            assert_eq!(service.compile_control_error(), Some(cause));
+        }
+    }
+
+    #[test]
     fn cow_dml_route_keeps_publication_terminal_and_original_client_prefix() {
         use crate::query_execution::dml::mutation_flow::CowFailure;
         use novarocks_spi::connector::{
@@ -3983,6 +4463,7 @@ mod tests {
             Err(RoutedExecutionError::Publication {
                 message,
                 terminal: actual,
+                compile_control: None,
             }) => {
                 assert_eq!(actual, terminal);
                 assert_eq!(message, legacy_message);
@@ -4665,7 +5146,9 @@ mod tests {
             _prepared: &dyn DeletePrepared,
         ) -> Result<DeleteWriteReport, crate::dml::error::DmlExecutionError> {
             self.native_encoding_requests.fetch_add(1, Ordering::SeqCst);
-            Err("recording DELETE stops at the native dispatch edge".into())
+            Err(crate::dml::error::DmlExecutionError::Engine(
+                "recording DELETE stops at the native dispatch edge".to_string(),
+            ))
         }
 
         fn finalize_delete(&self, _prepared: &dyn DeletePrepared) -> Result<(), String> {
@@ -4743,7 +5226,9 @@ mod tests {
             &self,
             _prepared: &dyn IcebergPreparedInsert,
         ) -> Result<IcebergWriteReport, crate::dml::error::DmlExecutionError> {
-            Err("unexpected Iceberg INSERT".into())
+            Err(crate::dml::error::DmlExecutionError::Engine(
+                "unexpected Iceberg INSERT".to_string(),
+            ))
         }
 
         fn finalize_iceberg_write(

@@ -57,7 +57,7 @@ impl std::error::Error for StaticSinkError {}
 
 /// Sink shape failures and original request-control failures stay distinct.
 /// Validation retains no control capability in the immutable sink.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SinkCompileError {
     Sink(StaticSinkError),
     Control(CompileControlError),
@@ -469,7 +469,7 @@ mod tests {
             let mut trace = self.trace.lock().unwrap();
             let index = trace.len();
             trace.push(units);
-            if let Some((at, cause)) = self.stop
+            if let Some((at, cause)) = self.stop.clone()
                 && at == index
             {
                 return Err(cause);
@@ -500,7 +500,7 @@ mod tests {
         let trace = baseline.trace();
         for at in 0..trace.len() {
             for cause in all_causes() {
-                let control = Control::new(Some((at, cause)));
+                let control = Control::new(Some((at, cause.clone())));
                 assert_eq!(
                     sink.validate_for_compile(&control),
                     Err(SinkCompileError::Control(cause))
@@ -597,7 +597,7 @@ mod tests {
             );
             assert_eq!(control.trace(), [0, units]);
             for cause in all_causes() {
-                let control = Control::new(Some((1, cause)));
+                let control = Control::new(Some((1, cause.clone())));
                 assert_eq!(
                     sink.validate_for_compile(&control),
                     Err(SinkCompileError::Control(cause))

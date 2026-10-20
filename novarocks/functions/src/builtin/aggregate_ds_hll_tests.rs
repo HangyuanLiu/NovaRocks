@@ -353,12 +353,13 @@ fn ds_hll_host_all_four_identities_original_null_empty_and_full_data() {
     }
 }
 #[test]
-fn ds_hll_host_sparse_full_diagnostic_actual_type_no_tail_and_latch() {
+fn ds_hll_host_sparse_frozen_shape_is_bounded_and_does_not_retain_the_type_owner() {
     let field = Arc::new(Field::new(
         "item",
         DataType::Struct(vec![Field::new("x".repeat(900), DataType::UInt32, true)].into()),
         true,
     ));
+    let weak = Arc::downgrade(&field);
     let values = Arc::new(arrow_array::ListArray::new_null(field, 4)) as ArrayRef;
     let kernel = kernel(
         "ds_hll_count_distinct",
@@ -384,24 +385,27 @@ fn ds_hll_host_sparse_full_diagnostic_actual_type_no_tail_and_latch() {
         &Control::default(),
     )
     .unwrap_err();
-    let EvaluationFailure::InvocationData(data) = failure else {
-        panic!("unbounded whole invocation Data")
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    let EvaluationFailure::Kernel(KernelFailure::Source(ref source)) = failure else {
+        panic!("frozen shape must remain an outer typed cause")
     };
-    assert_eq!(
-        data.message(),
-        format!(
-            "update aggregate state: ds_hll_count_distinct: unsupported sketch hash input type {:?}",
-            values.data_type()
-        )
+    assert_eq!(source.failure_fact().class(), FailureClass::Invariant);
+    let expected =
+        crate::sketch_hash::prehash_array_value(&values, 2, "ds_hll_count_distinct").unwrap_err();
+    assert_eq!(source.failure_fact(), expected.failure_fact());
+    let original = source
+        .source()
+        .unwrap()
+        .downcast_ref::<crate::sketch_hash::SketchHashContractFailure>()
+        .unwrap();
+    assert_eq!(original.failure_fact(), expected.failure_fact());
+    assert!(
+        source
+            .detail()
+            .starts_with("ds_hll_count_distinct: unsupported sketch hash input type List")
     );
-    assert!(data.message().len() > 512);
-    assert_eq!(data.input_rows(), &[2]);
-    assert_eq!(data.state_indices(), &[7]);
-    assert!(std::ptr::eq(
-        data.aggregate_contract(),
-        kernel.contract.as_ref()
-    ));
-    assert_eq!(data.aggregate_phase(), AggregateInvocationPhase::Update);
+    assert!(source.detail().len() <= novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES);
     assert!(state.failed);
     assert!(state.handle.is_none());
     assert_eq!(state.charge.bytes(), 0);
@@ -418,8 +422,11 @@ fn ds_hll_host_sparse_full_diagnostic_actual_type_no_tail_and_latch() {
         .unwrap_err(),
         EvaluationFailure::Kernel(KernelFailure::InstanceFailed)
     );
-    drop(data);
     drop(state);
+    drop(kernel);
+    drop(values);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(source.failure_fact().class(), FailureClass::Invariant);
     empty(&host);
 }
 #[test]
@@ -803,7 +810,7 @@ fn ds_hll_host_specialization_observer_all_three_control_causes_no_tail() {
                 assert!(at <= stop, "callback after compilation refusal");
             }
             trace.push(units);
-            match self.refusal {
+            match self.refusal.clone() {
                 Some((stop, cause)) if at == stop => Err(cause),
                 _ => Ok(()),
             }
@@ -837,7 +844,7 @@ fn ds_hll_host_specialization_observer_all_three_control_causes_no_tail() {
         ] {
             let control = CompileCounter {
                 trace: Mutex::new(vec![]),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert_eq!(run(&control).unwrap_err(), compile_failure(cause));
             assert_eq!(control.trace.lock().unwrap().len(), at + 1);
@@ -847,18 +854,10 @@ fn ds_hll_host_specialization_observer_all_three_control_causes_no_tail() {
 
 #[test]
 fn ds_hll_host_every_actual_owned_frontier_all_seven_causes_and_last_drop() {
-    let field = Arc::new(
-        Field::new("unsupported", DataType::UInt32, true).with_metadata(
-            std::collections::HashMap::from([("original".into(), "y".repeat(900))]),
-        ),
-    );
-    let value = Arc::new(arrow_array::ListArray::new_null(field, 1)) as ArrayRef;
+    let value = Arc::new(arrow_array::BinaryArray::from(vec![Some(&[1u8, 2, 3][..])])) as ArrayRef;
     let kernel = kernel(
-        "ds_hll_count_distinct",
-        &[FunctionValueType::from_legacy_declared_projection(
-            value.data_type().clone(),
-            true,
-        )],
+        "ds_hll_count_distinct_union",
+        &[FunctionValueType::new(DataType::Binary, false)],
         AggregateKernelPhase::Single,
     );
     for cause in causes() {

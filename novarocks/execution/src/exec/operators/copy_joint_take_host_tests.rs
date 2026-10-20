@@ -17,7 +17,8 @@
 
 //! Complete take probes borrow the actual production expression host. Test
 //! ledgers are diagnostics, never an alternative allocator or capacity wallet.
-use super::{MemTracker, expression_allocation_host};
+use super::MemTracker;
+use crate::runtime::tracked_state_allocator::expression_allocation_host;
 use arrow::array::{
     Array, ArrayRef, DictionaryArray, Int8Array, Int16Array, Int32Array, Int64Array,
     LargeStringArray, ListArray, NullArray, RunArray, StringArray, StringViewArray, StructArray,
@@ -364,12 +365,12 @@ fn by_copy_joint_take_real_host_capacity_denial_rolls_back_full_copy_scope() {
     tr.install_limit_once(peak - 1).unwrap();
     let host = Host::new(tr.clone(), None);
     let control = Control::new(tr, None);
-    assert!(matches!(
-        take_copy_in(input(), selected(), (), host.clone(), &control),
-        Err(CopyOperationError::Control(
-            KernelFailure::ResourceExhausted
-        ))
-    ));
+    let Err(CopyOperationError::Control(refusal)) =
+        take_copy_in(input(), selected(), (), host.clone(), &control)
+    else {
+        panic!("the real complete-copy host must refuse");
+    };
+    super::opaque_memory_host_tests::assert_tracker_refusal(&refusal, peak - 1, None);
     assert_released(&host);
 }
 #[test]

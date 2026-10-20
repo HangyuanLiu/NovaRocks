@@ -34,7 +34,7 @@ impl PureCompileControl for Control {
             assert!(ordinal <= stop, "callback after original refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if ordinal == stop => Err(cause),
             _ => Ok(()),
         }
@@ -116,7 +116,7 @@ fn capture_refuses_uncertified_same_signature_and_observes_every_control_prefix(
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert!(

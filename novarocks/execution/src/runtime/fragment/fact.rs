@@ -22,18 +22,18 @@ use novarocks_types::UniqueId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FragmentCancelReason {
-    detail: String,
+    detail: novarocks_failure_contract::BoundedDetail,
 }
 
 impl FragmentCancelReason {
-    pub fn new(detail: impl Into<String>) -> Self {
+    pub fn new(detail: impl std::fmt::Display) -> Self {
         Self {
-            detail: detail.into(),
+            detail: novarocks_failure_contract::BoundedDetail::truncating_display(detail),
         }
     }
 
     pub fn detail(&self) -> &str {
-        &self.detail
+        self.detail.as_str()
     }
 }
 
@@ -81,5 +81,24 @@ impl FragmentTerminalFact {
 
     pub const fn profile(&self) -> Option<&RuntimeProfileTree> {
         self.profile.as_ref()
+    }
+}
+
+impl std::fmt::Display for FragmentCancelReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.detail.fmt(f)
+    }
+}
+impl std::error::Error for FragmentCancelReason {}
+impl novarocks_failure_contract::FailureProjection for FragmentCancelReason {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::stop_observation(
+            crate::runtime::fragment::ExecutionReason::FragmentStopRequested.reason(),
+        )
+    }
+}
+impl From<FragmentCancelReason> for crate::runtime::fragment::ExecutionFailure {
+    fn from(source: FragmentCancelReason) -> Self {
+        Self::from_domain(source)
     }
 }

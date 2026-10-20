@@ -281,12 +281,12 @@ fn text_time_kernel_exact_compact_and_nonzero_pool_ordinals_keep_original_row_ad
     }
 }
 #[test]
-fn text_time_kernel_target_data_error_is_full_and_precedes_any_observer() {
+fn text_time_frozen_target_contract_precedes_any_observer() {
     use crate::time_text_cast::{TimeTextParseMode, evaluate_arrays_observed};
     let input: ArrayRef = Arc::new(StringArray::from(Vec::<Option<&str>>::new()));
     let target = DataType::Time64(TimeUnit::Nanosecond);
     let mut observer =
-        |_| -> Result<(), KernelFailure> { panic!("target Data error precedes observation") };
+        |_| -> Result<(), KernelFailure> { panic!("target contract failure precedes observation") };
     let error = evaluate_arrays_observed(
         &input,
         &target,
@@ -295,8 +295,10 @@ fn text_time_kernel_target_data_error_is_full_and_precedes_any_observer() {
     )
     .unwrap()
     .unwrap_err();
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
     assert_eq!(
-        error,
+        error.to_string(),
         "CAST failed: TIME target must be Time64(Microsecond), got Time64(Nanosecond)"
     );
 }

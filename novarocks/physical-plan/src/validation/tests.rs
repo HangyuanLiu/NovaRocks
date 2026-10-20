@@ -172,14 +172,13 @@ mod validation_error_tests {
             ));
         }
         let errors = ValidationErrors::from_collector(collector);
-        assert_eq!(errors.errors().len(), MAX_VALIDATION_ERRORS + 1);
-        assert_eq!(
+        assert_eq!(errors.errors().len(), MAX_VALIDATION_ERRORS);
+        assert!(errors.diagnostics_truncated());
+        assert!(
             errors
                 .errors()
                 .iter()
-                .filter(|error| error.message().contains("truncated"))
-                .count(),
-            1
+                .all(|error| error.category() == ValidationErrorCategory::StructuralInvariant)
         );
         assert!(errors.to_string().len() < 16 * 1024);
     }

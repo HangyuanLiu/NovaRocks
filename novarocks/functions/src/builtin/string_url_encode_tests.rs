@@ -87,7 +87,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -373,7 +373,7 @@ fn string_url_encode_child_error_is_refused_before_the_ordinary_body() {
     let mut kernel = instance("url_encode", true);
     assert!(matches!(
         kernel.evaluate(selection, &arguments, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let after = Control::default();
     assert_eq!(
@@ -386,15 +386,21 @@ fn string_url_encode_child_error_is_refused_before_the_ordinary_body() {
 #[test]
 fn string_url_encode_output_layout_refuses_before_requests() {
     assert_eq!(
-        output_capacity(usize::MAX, 0),
+        output_layout(usize::MAX, 0),
         Err(KernelFailure::ResourceExhausted)
     );
-    assert_eq!(
-        output_capacity(1, i32::MAX as usize + 1),
-        Err(KernelFailure::ResourceExhausted)
-    );
-    assert!(output_capacity(0, 0).is_ok());
-    assert!(output_capacity(3, 12).is_ok());
+    assert!(output_layout(1, i32::MAX as usize + 1).is_ok());
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+    let failure = value_extent(i32::MAX as u128 + 1).unwrap_err();
+    assert_eq!(failure.failure_fact().class(), FailureClass::Representation);
+    assert_eq!(failure.failure_fact().reason().code(), 363);
+    let extent = failure.failure_fact().representation().unwrap();
+    assert_eq!(extent.boundary, RepresentationBoundary::MinimumUnit);
+    assert_eq!(extent.required, Some(i32::MAX as u64 + 1));
+    assert_eq!(extent.extent_limit, Some(i32::MAX as u64));
+    assert!(failure.failure_fact().resource().is_none());
+    assert!(output_layout(0, 0).is_ok());
+    assert!(output_layout(3, 12).is_ok());
 }
 
 #[test]
@@ -671,7 +677,7 @@ fn string_url_encode_compile_success_and_ordinary_tail_preserve_all_callback_cau
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let actual = prepared_for_test_with_control(
                     "url_encode",
@@ -698,4 +704,21 @@ fn string_url_encode_compile_success_and_ordinary_tail_preserve_all_callback_cau
             }
         }
     }
+}
+
+#[test]
+fn required_url_encoding_shares_oracles_and_exact_scalar_broadcast() {
+    for (input, expected) in ORACLES {
+        let source: ArrayRef = Arc::new(StringArray::from(vec![input]));
+        let output = evaluate_required(&source, 3).unwrap();
+        let values = output.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), vec![Some(expected); 3]);
+    }
+    let source: ArrayRef = Arc::new(StringArray::from(vec![Some("/+"), None, Some("")]));
+    let output = evaluate_required(&source, 3).unwrap();
+    let values = output.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(
+        values.iter().collect::<Vec<_>>(),
+        vec![Some("%2F%2B"), None, Some("")]
+    );
 }

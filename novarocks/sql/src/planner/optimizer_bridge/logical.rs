@@ -1300,7 +1300,7 @@ mod tests {
                 }
                 self.calls.lock().unwrap().push(units);
                 if self.entry || units > 0 {
-                    Err(self.reason)
+                    Err(self.reason.clone())
                 } else {
                     Ok(())
                 }
@@ -1321,13 +1321,13 @@ mod tests {
                     None,
                 );
                 let control = Stop {
-                    reason,
+                    reason: reason.clone(),
                     entry,
                     calls: Mutex::new(Vec::new()),
                 };
                 let result = try_to_optimizer_expr(&plan, &mut ScalarArena::new(), &control);
                 assert!(
-                    matches!(result, Err(ref error) if *error == crate::compiler::SqlCompileError::from(reason))
+                    matches!(result, Err(ref error) if *error == crate::compiler::SqlCompileError::from(reason.clone()))
                 );
                 let calls = control.calls.lock().unwrap();
                 let positive = calls.iter().find(|&&units| units > 0).copied();
@@ -1365,7 +1365,7 @@ mod tests {
                 // Small child interners complete first. Refuse the parent's
                 // actual wide InList traversal at its first full quantum.
                 if self.entry || units == 256 {
-                    Err(self.reason)
+                    Err(self.reason.clone())
                 } else {
                     Ok(())
                 }
@@ -1400,13 +1400,13 @@ mod tests {
         ] {
             for entry in [true, false] {
                 let control = StopInterner {
-                    reason,
+                    reason: reason.clone(),
                     entry,
                     calls: Mutex::new(Vec::new()),
                 };
                 let mut scalars = ScalarArena::new();
                 assert!(
-                    matches!(try_to_optimizer_expr(&plan, &mut scalars, &control), Err(error) if error == crate::compiler::SqlCompileError::from(reason))
+                    matches!(try_to_optimizer_expr(&plan, &mut scalars, &control), Err(error) if error == crate::compiler::SqlCompileError::from(reason.clone()))
                 );
                 let calls = control.calls.lock().unwrap();
                 if entry {

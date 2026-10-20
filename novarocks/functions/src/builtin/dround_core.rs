@@ -104,11 +104,11 @@ pub fn evaluate_legacy_dround(
     batch_rows: usize,
     output_type: Option<&DataType>,
 ) -> Result<ArrayRef, MathNumericError> {
-    let value = NumericArrayView::new(value).map_err(MathNumericError::Legacy)?;
+    let value = NumericArrayView::new(value).map_err(MathNumericError::Carrier)?;
     let digits = digits
         .map(NumericArrayView::new)
         .transpose()
-        .map_err(MathNumericError::Legacy)?;
+        .map_err(MathNumericError::Carrier)?;
     compute_dround(
         operation,
         Selection::all(batch_rows),

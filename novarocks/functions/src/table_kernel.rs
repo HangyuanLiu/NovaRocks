@@ -17,7 +17,6 @@
 
 //! Pure selected-input table cursors and explicitly bounded output steps.
 
-use crate::aggregate_kernel::finish_lifecycle;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
@@ -182,7 +181,7 @@ fn specialize_table_once<O: PureTableImplementation + ?Sized>(
         |contract| {
             owner
                 .prepare_table(input, contract, control)
-                .map_err(FunctionSpecializationFailure::Kernel)
+                .map_err(FunctionSpecializationFailure::from)
         },
     )
 }
@@ -213,7 +212,7 @@ pub(crate) fn specialize_table_once_checked<O: PureTableImplementation + ?Sized>
                 .prepare_table_checked(input, checked, contract, control)
                 .map_err(|error| match error {
                     crate::CheckedOwnerFailure::Original(error) => {
-                        crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::Kernel(
+                        crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::from(
                             error,
                         ))
                     }
@@ -244,10 +243,10 @@ fn specialize_table_once_core<
     let (receipt, effects) = refine(arguments)?;
     let call = Arc::new(
         FunctionCallContract::from_refined(input, &receipt, selected, control)
-            .map_err(FunctionSpecializationFailure::Kernel)?,
+            .map_err(FunctionSpecializationFailure::from)?,
     );
     let contract = Arc::new(
-        TableCallContract::try_new(call, control).map_err(FunctionSpecializationFailure::Kernel)?,
+        TableCallContract::try_new(call, control).map_err(FunctionSpecializationFailure::from)?,
     );
     let prepared = prepare(contract.clone())?;
     if !Arc::ptr_eq(prepared.contract(), &contract) {
@@ -477,8 +476,13 @@ impl<'input> TableEvaluationCursor<'input> {
             control.checkpoint(0)?;
             Ok(step)
         })();
-        let result = finish_lifecycle(result, self.validate_retained());
-        let result = finish_lifecycle(result, self.validate_metadata());
+        // Only successful work starts fallible post-validation. The cursor/
+        // partition still owns its real finish operation and eventual Drop.
+        let result = result.and_then(|value| {
+            self.validate_retained()?;
+            self.validate_metadata()?;
+            Ok(value)
+        });
         if result.is_err() {
             self.status = CursorStatus::Failed;
         }
@@ -501,8 +505,13 @@ impl<'input> TableEvaluationCursor<'input> {
             }
             control.checkpoint(0)
         })();
-        let result = finish_lifecycle(result, self.validate_retained());
-        let result = finish_lifecycle(result, self.validate_metadata());
+        // Only successful work starts fallible post-validation. The cursor/
+        // partition still owns its real finish operation and eventual Drop.
+        let result = result.and_then(|value| {
+            self.validate_retained()?;
+            self.validate_metadata()?;
+            Ok(value)
+        });
         if result.is_err() {
             self.status = CursorStatus::Failed;
         }

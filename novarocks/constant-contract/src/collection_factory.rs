@@ -144,9 +144,7 @@ fn array(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ArrayData, ConstantError> {
     work.flush()?;
-    let result = builder
-        .build()
-        .map_err(|error| ConstantError::Arrow(error.to_string()));
+    let result = builder.build().map_err(ConstantError::arrow_validation);
     work.flush()?;
     result
 }

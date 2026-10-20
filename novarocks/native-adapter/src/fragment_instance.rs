@@ -426,6 +426,6 @@ mod tests {
             FragmentSinkKind::Noop,
         )
         .expect_err("one node cannot own two initial assignments");
-        assert_eq!(error.kind(), ProtocolErrorKind::DuplicateField);
+        assert_eq!(error.kind(), &ProtocolErrorKind::DuplicateField);
     }
 }

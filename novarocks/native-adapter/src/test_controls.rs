@@ -354,9 +354,13 @@ impl NativeTestControls {
                 .ok_or("Native fault action is missing")?;
             if matches!(
                 action,
-                "ingress-hold" | "registry-hold" | "preparation-hold"
+                "ingress-hold"
+                    | "registry-hold"
+                    | "preparation-hold"
+                    | "prepared-failure-exit-hold"
             ) {
-                let preparation = action == "preparation-hold";
+                let preparation =
+                    matches!(action, "preparation-hold" | "prepared-failure-exit-hold");
                 let keys = if preparation {
                     vec![
                         "action",
@@ -879,16 +883,86 @@ impl NativeTestControls {
         process: BackendProcessId,
         persistent: bool,
     ) -> Result<Option<NativeFaultClaim>, String> {
+        self.claim_inner(kind, execution, process, persistent, false)
+    }
+
+    /// Reserve the real once grant before the second Root read can offer Data.
+    /// This permits only a finite hold, never an execution failure or a hit.
+    /// Activation must still be probed before the original Task submission.
+    pub(crate) fn claim_dormant_after_visible_prefix(
+        &self,
+        execution: QueryExecutionId,
+        process: BackendProcessId,
+    ) -> Result<Option<NativeFaultClaim>, String> {
+        self.claim_inner(
+            QueryLifecycleFaultKind::TaskExecutionFailureAfterVisiblePrefix,
+            execution,
+            process,
+            true,
+            true,
+        )
+    }
+
+    /// Only this owner's original reservation can observe its exact enable.
+    /// A missing, ended or cancelled activation is not permission to fail.
+    pub(crate) fn after_visible_prefix_enabled(
+        &self,
+        claim: &NativeFaultClaim,
+    ) -> Result<bool, String> {
+        if claim.inner.kind != QueryLifecycleFaultKind::TaskExecutionFailureAfterVisiblePrefix {
+            return Err("visible-prefix activation requires its own Native action".into());
+        }
+        let same_owner = self
+            .claimed
+            .lock()
+            .map_err(|_| "Native fault claim lock failed")?
+            .get(&(claim.inner.kind, claim.execution_id))
+            .is_some_and(|owned| Arc::ptr_eq(&owned.inner, &claim.inner));
+        if !same_owner {
+            return Err(
+                "visible-prefix activation requires the original Native claim owner".into(),
+            );
+        }
+        if !claim.cancellation().is_active() || claim.action_ended()? {
+            return Ok(false);
+        }
+        visible_prefix_activation(&claim.inner.root, &claim.inner.binding)
+    }
+
+    fn claim_inner(
+        &self,
+        kind: QueryLifecycleFaultKind,
+        execution: QueryExecutionId,
+        process: BackendProcessId,
+        persistent: bool,
+        allow_dormant_visible_prefix: bool,
+    ) -> Result<Option<NativeFaultClaim>, String> {
+        if allow_dormant_visible_prefix
+            && kind != QueryLifecycleFaultKind::TaskExecutionFailureAfterVisiblePrefix
+        {
+            return Err("dormant Native claim is restricted to the visible-prefix action".into());
+        }
         let mut claimed = self
             .claimed
             .lock()
             .map_err(|_| "Native fault claim lock failed")?;
         if let Some(scope) = claimed.get(&(kind, execution)) {
-            return Ok((persistent
-                && scope.process_id == process
-                && scope.cancellation().is_active()
-                && !scope.action_ended()?)
-            .then(|| scope.clone()));
+            if !persistent
+                || scope.process_id != process
+                || !scope.cancellation().is_active()
+                || scope.action_ended()?
+            {
+                return Ok(None);
+            }
+            // A prior dormant reservation must not make ordinary persistent
+            // claims bypass the exact activation requirement.
+            if kind == QueryLifecycleFaultKind::TaskExecutionFailureAfterVisiblePrefix
+                && !allow_dormant_visible_prefix
+                && !visible_prefix_activation(&scope.inner.root, &scope.inner.binding)?
+            {
+                return Ok(None);
+            }
+            return Ok(Some(scope.clone()));
         }
         for grant in self.faults.iter().filter(|grant| grant.kind == kind) {
             if !grant.handle.cancellation().is_active()
@@ -930,6 +1004,12 @@ impl NativeTestControls {
                 continue;
             }
             if action_ended(&grant.root, kind, &binding, &grant.ended)? {
+                continue;
+            }
+            if kind == QueryLifecycleFaultKind::TaskExecutionFailureAfterVisiblePrefix
+                && !allow_dormant_visible_prefix
+                && !visible_prefix_activation(&grant.root, &binding)?
+            {
                 continue;
             }
             let scope = QueryLifecycleFaultScope {
@@ -1020,13 +1100,26 @@ impl NativeTestControls {
         &self,
         identity: TaskIdentity,
     ) -> Result<Option<NativeHoldClaim>, String> {
+        self.claim_task_hold("preparation-hold", identity)
+    }
+    pub(crate) fn claim_prepared_failure_exit_hold(
+        &self,
+        identity: TaskIdentity,
+    ) -> Result<Option<NativeHoldClaim>, String> {
+        self.claim_task_hold("prepared-failure-exit-hold", identity)
+    }
+    fn claim_task_hold(
+        &self,
+        action: &str,
+        identity: TaskIdentity,
+    ) -> Result<Option<NativeHoldClaim>, String> {
         let mut held_once = self
             .held_once
             .lock()
             .map_err(|_| "Native hold claim lock failed")?;
         for (index, grant) in self.holds.iter().enumerate() {
             if held_once.contains(&index)
-                || grant.action != "preparation-hold"
+                || grant.action != action
                 || grant.execution != identity.query_execution_id()
                 || grant.task != Some((identity.stage_id().get(), identity.task_id().get()))
                 || grant.handle.cancellation().process()
@@ -1192,6 +1285,28 @@ fn action_ended(
     Ok(true)
 }
 
+fn visible_prefix_activation(
+    root: &Path,
+    binding: &StatementExecutionBinding,
+) -> Result<bool, String> {
+    let path = fault_binding_path(
+        root,
+        QueryLifecycleFaultKind::TaskExecutionFailureAfterVisiblePrefix,
+        binding.backend_index,
+        &binding.statement_run_token,
+    )
+    .with_extension("enable.json");
+    let enabled = match StatementExecutionBinding::read_private(&path) {
+        Ok(enabled) => enabled,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("read deferred Native action activation: {error}")),
+    };
+    if enabled != *binding {
+        return Err("deferred Native action activation names a foreign execution".into());
+    }
+    Ok(true)
+}
+
 pub fn fault_binding_path(
     root: &Path,
     kind: QueryLifecycleFaultKind,
@@ -1270,7 +1385,7 @@ pub(crate) mod tests {
             QueryExecutionId::new(QueryId::new(71, 73), AttemptId::new(1).unwrap()).unwrap();
         let mut parameters = if matches!(action, "ingress-hold" | "registry-hold") {
             serde_json::json!({"action":action,"token":token,"backend_index":0,"query_id_hi":71,"query_id_lo":73,"attempt_id":1,"frontend_process_id":frontend.to_string()})
-        } else if action == "preparation-hold" {
+        } else if matches!(action, "preparation-hold" | "prepared-failure-exit-hold") {
             serde_json::json!({"action":action,"token":token,"backend_index":0,"query_id_hi":71,"query_id_lo":73,"attempt_id":1,"stage_id":1,"task_id":2})
         } else {
             serde_json::json!({"action":action,"root":directory.path(),"backend_index":0,"statement_run_token":token,"target_session_id":"native-tests"})
@@ -1286,7 +1401,10 @@ pub(crate) mod tests {
         if follow_up {
             assert!(!matches!(
                 action,
-                "ingress-hold" | "registry-hold" | "preparation-hold"
+                "ingress-hold"
+                    | "registry-hold"
+                    | "preparation-hold"
+                    | "prepared-failure-exit-hold"
             ));
             let mut second = parameters;
             second["statement_run_token"] = serde_json::json!(format!("{token}-next"));
@@ -2370,6 +2488,277 @@ pub(crate) mod tests {
                 .is_some()
         );
     }
+    #[test]
+    fn after_visible_prefix_action_is_dormant_until_its_exact_activation_and_end_is_final() {
+        let kind = QueryLifecycleFaultKind::TaskExecutionFailureAfterVisiblePrefix;
+        let fixture = controlled(kind.as_str());
+        let binding = bind_fixture(&fixture, kind);
+        assert!(
+            fixture
+                .controls
+                .claim(kind, fixture.execution, fixture.process, false)
+                .unwrap()
+                .is_none()
+        );
+        binding
+            .write_private(
+                &fault_binding_path(
+                    fixture.directory.path(),
+                    kind,
+                    0,
+                    &binding.statement_run_token,
+                )
+                .with_extension("enable.json"),
+            )
+            .unwrap();
+        assert!(
+            fixture
+                .controls
+                .claim(kind, fixture.execution, fixture.process, true)
+                .unwrap()
+                .is_some()
+        );
+        end_fixture(&fixture, kind, &binding);
+        assert!(
+            fixture
+                .controls
+                .claim(kind, fixture.execution, fixture.process, true)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn visible_prefix_dormant_reservation_uses_one_real_grant_without_activating_or_recording_hit()
+    {
+        let kind = QueryLifecycleFaultKind::TaskExecutionFailureAfterVisiblePrefix;
+        let fixture = controlled(kind.as_str());
+        assert!(
+            fixture
+                .controls
+                .claim_dormant_after_visible_prefix(fixture.execution, fixture.process)
+                .unwrap()
+                .is_none()
+        );
+        let binding = bind_fixture(&fixture, kind);
+        let foreign_execution =
+            QueryExecutionId::new(QueryId::new(71, 73), AttemptId::new(2).unwrap()).unwrap();
+        assert!(
+            fixture
+                .controls
+                .claim_dormant_after_visible_prefix(foreign_execution, fixture.process)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .controls
+                .claim_dormant_after_visible_prefix(fixture.execution, BackendProcessId::new_v7())
+                .unwrap()
+                .is_none()
+        );
+        let claim = fixture
+            .controls
+            .claim_dormant_after_visible_prefix(fixture.execution, fixture.process)
+            .unwrap()
+            .unwrap();
+        let same = fixture
+            .controls
+            .claim_dormant_after_visible_prefix(fixture.execution, fixture.process)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&claim.inner, &same.inner));
+        assert!(
+            !fixture
+                .controls
+                .after_visible_prefix_enabled(&claim)
+                .unwrap()
+        );
+        for persistent in [false, true] {
+            assert!(
+                fixture
+                    .controls
+                    .claim(kind, fixture.execution, fixture.process, persistent)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let path = fault_binding_path(fixture.directory.path(), kind, 0, &fixture.token);
+        assert!(!path.with_extension("hit.json").exists());
+        assert!(
+            !fixture
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .any(|event| event.event == "hit")
+        );
+        binding
+            .write_private(&path.with_extension("enable.json"))
+            .unwrap();
+        assert!(
+            fixture
+                .controls
+                .after_visible_prefix_enabled(&claim)
+                .unwrap()
+        );
+        let enabled = fixture
+            .controls
+            .claim(kind, fixture.execution, fixture.process, true)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&claim.inner, &enabled.inner));
+        assert!(
+            fixture
+                .controls
+                .claim(kind, fixture.execution, fixture.process, false)
+                .unwrap()
+                .is_none()
+        );
+        // Activation is still not an action hit or a Task acceptance receipt.
+        assert!(!path.with_extension("hit.json").exists());
+        claim.record_hit().unwrap();
+        let bytes = std::fs::read(path.with_extension("hit.json")).unwrap();
+        enabled.record_hit().unwrap();
+        assert_eq!(
+            std::fs::read(path.with_extension("hit.json")).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            fixture
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .filter(|event| event.event == "hit")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn visible_prefix_dormant_activation_rejects_foreign_binding_and_foreign_claim_owner() {
+        let kind = QueryLifecycleFaultKind::TaskExecutionFailureAfterVisiblePrefix;
+        let fixture = controlled(kind.as_str());
+        let mut binding = bind_fixture(&fixture, kind);
+        let claim = fixture
+            .controls
+            .claim_dormant_after_visible_prefix(fixture.execution, fixture.process)
+            .unwrap()
+            .unwrap();
+        let other = controlled(kind.as_str());
+        assert!(other.controls.after_visible_prefix_enabled(&claim).is_err());
+        binding.attempt_id += 1;
+        let path = fault_binding_path(fixture.directory.path(), kind, 0, &fixture.token);
+        binding
+            .write_private(&path.with_extension("enable.json"))
+            .unwrap();
+        assert!(
+            fixture
+                .controls
+                .after_visible_prefix_enabled(&claim)
+                .is_err()
+        );
+        assert!(
+            fixture
+                .controls
+                .claim(kind, fixture.execution, fixture.process, true)
+                .is_err()
+        );
+        assert!(!path.with_extension("hit.json").exists());
+        assert!(
+            !fixture
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .any(|event| event.event == "hit")
+        );
+    }
+
+    #[test]
+    fn visible_prefix_dormant_action_end_is_sticky_even_if_the_enable_and_end_files_change() {
+        let kind = QueryLifecycleFaultKind::TaskExecutionFailureAfterVisiblePrefix;
+        let fixture = controlled(kind.as_str());
+        let binding = bind_fixture(&fixture, kind);
+        let claim = fixture
+            .controls
+            .claim_dormant_after_visible_prefix(fixture.execution, fixture.process)
+            .unwrap()
+            .unwrap();
+        let ended = end_fixture(&fixture, kind, &binding);
+        assert!(
+            !fixture
+                .controls
+                .after_visible_prefix_enabled(&claim)
+                .unwrap()
+        );
+        std::fs::remove_file(ended).unwrap();
+        let path = fault_binding_path(fixture.directory.path(), kind, 0, &fixture.token);
+        binding
+            .write_private(&path.with_extension("enable.json"))
+            .unwrap();
+        assert!(
+            !fixture
+                .controls
+                .after_visible_prefix_enabled(&claim)
+                .unwrap()
+        );
+        assert!(
+            fixture
+                .controls
+                .claim_dormant_after_visible_prefix(fixture.execution, fixture.process)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .controls
+                .claim(kind, fixture.execution, fixture.process, true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!path.with_extension("hit.json").exists());
+    }
+
+    #[test]
+    fn visible_prefix_dormant_role_close_disables_the_original_reservation_without_hit() {
+        let kind = QueryLifecycleFaultKind::TaskExecutionFailureAfterVisiblePrefix;
+        let mut fixture = controlled(kind.as_str());
+        let binding = bind_fixture(&fixture, kind);
+        let claim = fixture
+            .controls
+            .claim_dormant_after_visible_prefix(fixture.execution, fixture.process)
+            .unwrap()
+            .unwrap();
+        fixture.runner.end_and_join().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while fixture.role.scope().is_active() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(!fixture.role.scope().is_active());
+        assert!(
+            !fixture
+                .controls
+                .after_visible_prefix_enabled(&claim)
+                .unwrap()
+        );
+        assert!(
+            fixture
+                .controls
+                .claim_dormant_after_visible_prefix(fixture.execution, fixture.process)
+                .unwrap()
+                .is_none()
+        );
+        let path = fault_binding_path(
+            fixture.directory.path(),
+            kind,
+            0,
+            &binding.statement_run_token,
+        );
+        assert!(!path.with_extension("hit.json").exists());
+    }
+
     #[test]
     fn role_end_disables_unclaimed_native_action() {
         let mut fixture = controlled("registry-hold");

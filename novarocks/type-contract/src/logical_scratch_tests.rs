@@ -51,7 +51,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, error)) if at == stop => Err(error),
             _ => Ok(()),
         }
@@ -165,9 +165,9 @@ fn borrowed_scratch_every_control_prefix_matches_the_original_walk() {
             for scratch in [false, true] {
                 let control = Control {
                     trace: Mutex::new(Vec::new()),
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                 };
-                assert_eq!(run(&control, scratch), Err(Error::Control(cause)));
+                assert_eq!(run(&control, scratch), Err(Error::Control(cause.clone())));
                 assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
             }
         }
@@ -217,7 +217,7 @@ fn layout_scratch_observes_unknown_annotations_without_authoring_semantics() {
                     assert!(ordinal <= at, "callback after original refusal");
                     prefix.push(event(visit));
                     if ordinal == at {
-                        Err(Error::Control(cause))
+                        Err(Error::Control(cause.clone()))
                     } else {
                         Ok(())
                     }

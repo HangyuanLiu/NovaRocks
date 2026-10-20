@@ -128,7 +128,7 @@ fn compare(
                 panic!("original data error lost")
             };
             assert_eq!(error.selected_ordinal(), ordinal);
-            assert_eq!(error.message(), message);
+            assert_eq!(error.message(), message.to_string());
         }
     }
 }
@@ -233,7 +233,7 @@ fn integral_decimal128_recipe_exact_column_slice_selected_scalar_and_pool_ordina
     }
 }
 #[test]
-fn integral_decimal128_recipe_own_null_exact_policy_effects_and_named_error_only_shape_refusal() {
+fn integral_decimal128_recipe_exact_policy_null_effects_and_wide_negative_scale_values() {
     let context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(31),
         domain: EvaluationDomainId::new(4),
@@ -290,17 +290,42 @@ fn integral_decimal128_recipe_own_null_exact_policy_effects_and_named_error_only
             }
         }
         for scale in [-39, i8::MIN] {
-            assert!(matches!(
-                PreparedCastRecipe::try_new(
-                    CastOperation::Carrier,
-                    &FunctionValueType::from_legacy_declared_projection(dtype.clone(), true),
-                    &FunctionValueType::new(DataType::Decimal128(38, scale), true),
-                    DecimalOverflowPolicy::OutputNull,
-                    false,
-                    &Control::default()
-                ),
-                Err(CastPrepareError::Unsupported)
-            ));
+            let prepared = PreparedCastRecipe::try_new(
+                CastOperation::Carrier,
+                &FunctionValueType::from_legacy_declared_projection(dtype.clone(), true),
+                &FunctionValueType::new(DataType::Decimal128(38, scale), true),
+                DecimalOverflowPolicy::OutputNull,
+                false,
+                &Control::default(),
+            )
+            .unwrap();
+            let (minimum, maximum) = match dtype {
+                DataType::Int8 => (i8::MIN as i64, i8::MAX as i64),
+                DataType::Int16 => (i16::MIN as i64, i16::MAX as i64),
+                DataType::Int32 => (i32::MIN as i64, i32::MAX as i64),
+                DataType::Int64 => (i64::MIN, i64::MAX),
+                _ => unreachable!("signed test carrier"),
+            };
+            let array = input(&dtype, vec![Some(minimum), Some(0), Some(maximum), None]);
+            for row in 0..3 {
+                assert_eq!(
+                    prepared
+                        .evaluate_row(
+                            EvaluatedArgument::Column(&array),
+                            row,
+                            row,
+                            &Control::default()
+                        )
+                        .unwrap(),
+                    CastRowResult::Decimal128(0)
+                );
+            }
+            assert_eq!(
+                prepared
+                    .evaluate_row(EvaluatedArgument::Column(&array), 3, 3, &Control::default())
+                    .unwrap(),
+                CastRowResult::Null
+            );
         }
     }
 }
@@ -365,7 +390,7 @@ fn integral_decimal128_observed_original_capacity_and_large_work_refusal_is_type
                 Ok(a)
             }
             Err(DecimalRescaleError::Host(cause)) => Err(cause),
-            Err(DecimalRescaleError::Data(message)) => {
+            Err(DecimalRescaleError::Domain(message)) => {
                 panic!("original success fixture failed: {message}")
             }
         }
@@ -403,7 +428,7 @@ impl PureCompileControl for CompileRefusal {
             );
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if ordinal == stop => Err(cause),
             _ => Ok(()),
         }
@@ -444,7 +469,7 @@ fn integral_decimal128_preparation_every_callback_preserves_three_compile_causes
             ] {
                 let refused = CompileRefusal {
                     trace: Mutex::new(vec![]),
-                    stop: Some((stop, cause)),
+                    stop: Some((stop, cause.clone())),
                 };
                 let error = prepare(&refused).unwrap_err();
                 assert_eq!(error.control_error(), Some(cause));

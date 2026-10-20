@@ -40,7 +40,7 @@ impl PureCompileControl for ProofControl {
             assert!(at <= stop, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -80,7 +80,7 @@ fn prefixes(run: impl Fn(&ProofControl) -> Result<(), FrozenCallError>, succeeds
         ] {
             let control = ProofControl {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((at, expected)),
+                refusal: Some((at, expected.clone())),
             };
             assert!(
                 matches!(run(&control), Err(FrozenCallError::Control(actual)) if actual == expected)
@@ -600,7 +600,7 @@ impl PureCompileControl for BorrowedProofControl {
             assert!(at <= stop, "callback after borrowed primary refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -756,7 +756,7 @@ fn borrowed_property_source_and_complete_formulas_keep_actual_admission_exact_re
                 &mut |_| {
                     assert!(at_refusal.is_none(), "admission after first refusal");
                     at_refusal = Some(control.trace.lock().unwrap().clone());
-                    Err(cause)
+                    Err(cause.clone())
                 }), Err(FragmentPropertyError::Control(actual)) if actual==cause)
             );
             assert_eq!(*control.trace.lock().unwrap(), at_refusal.unwrap());
@@ -811,7 +811,7 @@ fn borrowed_property_success_and_ordinary_source_error_keep_every_actual_primary
                 ] {
                     let control = BorrowedProofControl {
                         trace: Mutex::new(vec![]),
-                        refusal: Some((at, cause)),
+                        refusal: Some((at, cause.clone())),
                     };
                     assert!(
                         matches!(borrowed_proof_run(&fixture, &calls, source, complete, &control,

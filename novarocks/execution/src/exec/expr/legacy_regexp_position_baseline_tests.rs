@@ -46,7 +46,10 @@ fn chunk(columns: Vec<ArrayRef>) -> Chunk {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     Chunk::new_with_chunk_schema(batch, schema)
 }
-fn eval(name: &str, columns: Vec<ArrayRef>) -> Result<ArrayRef, String> {
+fn eval(
+    name: &str,
+    columns: Vec<ArrayRef>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut arena = ExprArena::default();
     let args = columns
         .iter()
@@ -218,7 +221,7 @@ fn legacy_regexp_position_baseline_position_masks_regex_errors_before_compile() 
             regex::Regex::new("(invalid").unwrap_err()
         );
         assert_eq!(
-            eval(
+            (eval(
                 "regexp_position",
                 vec![
                     column(vec![Some("中a")]),
@@ -226,7 +229,8 @@ fn legacy_regexp_position_baseline_position_masks_regex_errors_before_compile() 
                     indices(vec![Some(3)], wide)
                 ]
             )
-            .unwrap_err(),
+            .unwrap_err())
+            .to_string(),
             expected
         );
     }
@@ -258,40 +262,35 @@ fn legacy_regexp_position_baseline_typed_and_untyped_null_masks_all_payloads() {
     }
 }
 #[test]
-fn legacy_regexp_position_baseline_full_error_first_needed_row_and_literal_agree() {
+fn regexp_position_first_needed_row_and_literal_keep_the_same_original_sdk() {
+    use super::legacy_regexp_count_long_error_baseline_tests::assert_regex_failure;
     let long = format!("{}(", "a".repeat(900));
-    let expected = format!(
-        "Invalid regex expression: {long}. Detail message: {}",
-        regex::Regex::new(&long).unwrap_err()
-    );
+    let sdk = regex::Regex::new(&long).unwrap_err().to_string();
+    let expected = format!("Invalid regex expression: {long}. Detail message: {sdk}");
     assert!(expected.len() > 512);
-    assert_eq!(
-        eval(
-            "regexp_position",
-            vec![
-                column(vec![None, Some("a"), Some("b")]),
-                column(vec![Some("(masked"), Some(&long), Some("(later")])
-            ]
-        )
-        .unwrap_err()
-        .as_bytes(),
-        expected.as_bytes()
-    );
+    let failure = eval(
+        "regexp_position",
+        vec![
+            column(vec![None, Some("a"), Some("b")]),
+            column(vec![Some("(masked"), Some(&long), Some("(later")]),
+        ],
+    )
+    .unwrap_err();
+    assert_regex_failure(&failure, &sdk, &expected);
     let mut arena = ExprArena::default();
     let input = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
     let pattern = arena.push_typed(ExprNode::Literal(LiteralValue::Utf8(long)), DataType::Utf8);
-    assert_eq!(
-        eval_string_function(
-            "regexp_position",
-            &arena,
-            input,
-            &[input, pattern],
-            &chunk(vec![column(vec![Some("a")])])
-        )
-        .unwrap_err(),
-        expected
-    );
+    let failure = eval_string_function(
+        "regexp_position",
+        &arena,
+        input,
+        &[input, pattern],
+        &chunk(vec![column(vec![Some("a")])]),
+    )
+    .unwrap_err();
+    assert_regex_failure(&failure, &sdk, &expected);
 }
+
 #[test]
 fn legacy_regexp_position_baseline_recurrent_patterns_slices_and_empty() {
     let source = (0..300)
@@ -326,34 +325,34 @@ fn legacy_regexp_position_baseline_downcast_before_null_and_later_child_errors()
             } else {
                 column(vec![None])
             };
-            assert_eq!(
+            super::legacy_regexp_count_long_error_baseline_tests::assert_regex_contract(
                 eval("regexp_position", columns).unwrap_err(),
-                format!(
+                &format!(
                     "regexp_position expects {}",
                     if argument < 2 { "string" } else { "int" }
-                )
+                ),
             );
         }
     }
     let large = Arc::new(LargeStringArray::from(vec![Some("a")])) as ArrayRef;
-    assert_eq!(
+    super::legacy_regexp_count_long_error_baseline_tests::assert_regex_contract(
         eval("regexp_position", vec![large, column(vec![Some("a")])]).unwrap_err(),
-        "regexp_position expects string"
+        "regexp_position expects string",
     );
     let mut arena = ExprArena::default();
     let input = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
     let pattern = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Utf8);
     let missing = arena.push_typed(ExprNode::SlotId(SlotId::new(999)), DataType::Int64);
-    assert_eq!(
+    super::legacy_regexp_count_long_error_baseline_tests::assert_regex_contract(
         eval_string_function(
             "regexp_position",
             &arena,
             input,
             &[input, pattern, missing],
-            &chunk(vec![indices(vec![Some(1)], true), column(vec![Some("a")])])
+            &chunk(vec![indices(vec![Some(1)], true), column(vec![Some("a")])]),
         )
         .unwrap_err(),
-        "regexp_position expects string"
+        "regexp_position expects string",
     );
 }
 #[test]

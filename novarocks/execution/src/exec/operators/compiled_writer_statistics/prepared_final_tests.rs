@@ -130,7 +130,7 @@ fn source() -> Source {
         grouping_output,
     }
 }
-fn create(source: &Source) -> Box<CompiledWriterFinalAggregate> {
+fn create(source: &Source) -> Box<WriterFinalStep> {
     let owner = source
         .factory
         .begin_typed_construction(&source.input)
@@ -153,7 +153,7 @@ fn plan_tree_prepared_final_schema_and_last_independent_child_keep_actual_creati
     let source = source();
     let mut operator = create(&source);
     operator.prepare().unwrap();
-    let slot = operator.output.as_ref().unwrap().slots()[1].clone();
+    let slot = operator.kernel_for_test().output.as_ref().unwrap().slots()[1].clone();
     assert_eq!(
         slot.typed_binding(),
         source.calls.calls()[0]
@@ -243,7 +243,7 @@ fn plan_tree_prepared_final_preserves_first_memory_and_original_caller_without_t
         .factory
         .begin_typed_construction(&source.input)
         .unwrap();
-    let original = ExecutionFailure::from("original writer Final caller")
+    let original = ExecutionFailure::from(KernelFailure::DeadlineExceeded)
         .at_operator(7, crate::runtime::fragment::PipelineOperation::Admission);
     source.state.error_state().set_error(original.clone());
     let before = source.tracker.allocated();

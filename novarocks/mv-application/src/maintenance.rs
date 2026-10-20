@@ -154,7 +154,7 @@ pub enum MaintenanceAdmission {
 }
 
 /// Actual action classification and optional compilation cause; policy uses `kind` only.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceActionFailure {
     pub action: MaintenanceActionKind,
     pub kind: MvBackgroundEngineErrorKind,
@@ -244,10 +244,8 @@ impl MvBackgroundEngineError {
         self.compile_control = control;
         self
     }
-    pub const fn compile_control_error(
-        &self,
-    ) -> Option<novarocks_type_contract::CompileControlError> {
-        self.compile_control
+    pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control.clone()
     }
 
     pub const fn kind(&self) -> MvBackgroundEngineErrorKind {
@@ -990,7 +988,7 @@ mod tests {
                     kind,
                     "maintenance operation did not complete",
                 )
-                .with_compile_control(self.compile_control));
+                .with_compile_control(self.compile_control.clone()));
             }
             Ok(MaintenanceActionOutcome::ExpireSnapshots {
                 deleted_data_files_count: None,
@@ -1372,14 +1370,14 @@ mod tests {
                 );
                 let mut runner = Runner {
                     expire_error: Some(kind),
-                    compile_control: Some(control),
+                    compile_control: Some(control.clone()),
                     ..Runner::default()
                 };
                 let report = run_attempt(&mut typed, typed_attempt, &mut runner, NOW);
                 assert_eq!(runner.calls, [MaintenanceActionKind::Expire]);
                 assert_eq!(report.failures.len(), 1);
                 assert_eq!(report.failures[0].kind, baseline_report.failures[0].kind);
-                assert_eq!(report.failures[0].compile_control, Some(control));
+                assert_eq!(report.failures[0].compile_control, Some(control.clone()));
                 assert_eq!(baseline_report.failures[0].compile_control, None);
                 let baseline_next = baseline
                     .try_begin(1, target("mv"), &policy_facts(), NOW + 1)

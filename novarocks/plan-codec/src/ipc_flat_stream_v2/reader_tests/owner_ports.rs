@@ -26,7 +26,7 @@ use std::alloc::Layout;
 
 fn cause(result: &Result<ConstantPool, FlatReaderError>) -> Option<CompileControlError> {
     match result {
-        Err(FlatReaderError::Projection(FlatPoolResourceError::Control(c))) => Some(*c),
+        Err(FlatReaderError::Projection(FlatPoolResourceError::Control(c))) => Some(c.clone()),
         _ => None,
     }
 }
@@ -233,7 +233,7 @@ fn prefixes(
     assert!(!baseline.is_empty());
     for at in 0..baseline.len() {
         for c in CAUSES {
-            let control = Control::refusing(at, c);
+            let control = Control::refusing(at, c.clone());
             assert_eq!(cause(&run(&control)), Some(c));
             assert_eq!(control.trace(), baseline[..=at]);
         }

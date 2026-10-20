@@ -2773,10 +2773,10 @@ mod tests {
         assert!(cell.ready.initialized());
         assert_eq!(fixture.gate.loads.load(Ordering::Relaxed), 1);
         fixture.operations.seal();
-        fixture
-            .runtime
-            .block_on(fixture.operations.exited())
-            .unwrap();
+        assert_eq!(
+            fixture.runtime.block_on(fixture.operations.exited()),
+            novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited
+        );
     }
     #[test]
     fn last_demand_drop_requests_stop_but_physical_exit_remains_owned() {
@@ -2826,7 +2826,10 @@ mod tests {
         assert_eq!(fixture.operations.live_operations(), 0);
         fixture.operations.seal();
         let exited = Box::pin(fixture.operations.exited());
-        fixture.runtime.block_on(exited).unwrap();
+        assert_eq!(
+            fixture.runtime.block_on(exited),
+            novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited
+        );
         assert_eq!(fixture.operations.live_operations(), 0);
         assert!(!cell.ready.initialized());
         // A dropped initializer leaves the application slot reusable.

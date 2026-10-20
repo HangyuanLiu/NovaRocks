@@ -46,7 +46,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after first refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -92,7 +92,7 @@ fn all_prefixes(
         ] {
             let control = Control {
                 trace: Default::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(run(entry, pools, &control), Err(PhysicalWindowRequestError::Control(actual)) if actual == cause)
@@ -379,7 +379,7 @@ fn window_journal_wide_order_channels_observe_real_comparison_quantum() {
         ] {
             let control = Control {
                 trace: Default::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(run(&entry, owner.plan().constants(), &control), Err(PhysicalWindowRequestError::Control(actual)) if actual == cause)

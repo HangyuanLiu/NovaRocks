@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprArena, ExprId, expression_contract};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
 #[cfg(test)]
@@ -29,7 +30,7 @@ pub fn eval_murmur_hash3_32<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let mut inputs = Vec::with_capacity(args.len());
     for arg in args {
         let input = arena.eval(*arg, chunk)?;
@@ -44,25 +45,21 @@ pub fn eval_murmur_hash3_32<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 | DataType::FixedSizeBinary(16)
         );
         if numeric_text {
-            inputs.push(
-                crate::exec::expr::cast_with_special_rules(&input, &DataType::Utf8).map_err(
-                    |error| {
-                        format!("numeric VARCHAR conversion for murmur_hash3_32 failed: {error}")
-                    },
-                )?,
-            );
+            inputs.push(crate::exec::expr::cast_with_special_rules(
+                &input,
+                &DataType::Utf8,
+            )?);
         } else {
             inputs.push(input);
         }
     }
 
-    Ok(
-        (novarocks_functions::builtin::string_extended::evaluate_legacy(
-            novarocks_functions::builtin::string_extended::StringOperation::Murmur,
-            &inputs,
-            chunk.len(),
-        ))?,
+    novarocks_functions::builtin::string_extended::evaluate_required(
+        novarocks_functions::builtin::string_extended::StringOperation::Murmur,
+        &inputs,
+        chunk.len(),
     )
+    .map_err(ExecutionFailure::from)
 }
 
 #[cfg(test)]

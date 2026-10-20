@@ -216,7 +216,7 @@ mod tests {
         )
         .expect_err("a malformed duplicate must not reach watermark classification");
 
-        assert_eq!(error.kind(), crate::ProtocolErrorKind::MissingField);
+        assert_eq!(error.kind(), &crate::ProtocolErrorKind::MissingField);
         assert_eq!(error.path().to_string(), "split_assignment.splits[0].split");
     }
 }

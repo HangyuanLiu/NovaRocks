@@ -47,7 +47,7 @@ impl PureCompileControl for Control {
         assert!(work <= 256);
         self.work.lock().unwrap().push(work);
         if !self.positive || work > 0 {
-            self.failure.map_or(Ok(()), Err)
+            self.failure.clone().map_or(Ok(()), Err)
         } else {
             Ok(())
         }
@@ -609,13 +609,13 @@ fn entry_and_positive_quantum_failures_keep_exact_typed_control_categories() {
     ] {
         for positive in [false, true] {
             let control = Control {
-                failure: Some(failure),
+                failure: Some(failure.clone()),
                 positive,
                 work: Mutex::default(),
             };
             assert_eq!(
                 ProgramExpressionRoots::collect(&program, &control).unwrap_err(),
-                ProgramExpressionRootError::Control(failure)
+                ProgramExpressionRootError::Control(failure.clone())
             );
             assert_eq!(
                 *control.work.lock().unwrap(),
@@ -683,7 +683,7 @@ fn non_expression_constants_and_zero_expression_nodes_still_observe_work() {
             CompileControlError::ResourceExhausted,
         ] {
             let control = Control {
-                failure: Some(failure),
+                failure: Some(failure.clone()),
                 positive: true,
                 work: Mutex::default(),
             };

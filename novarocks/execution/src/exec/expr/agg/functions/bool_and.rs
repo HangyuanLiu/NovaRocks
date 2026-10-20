@@ -30,13 +30,19 @@ impl AggregateFunction for BoolAndAgg {
         _func: &AggFunction,
         input_type: Option<&DataType>,
         _input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let data_type = input_type.ok_or_else(|| "bool_and input type missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let data_type = input_type.ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "bool_and input type missing",
+            )
+        })?;
         if !matches!(data_type, DataType::Boolean) {
-            return Err(format!(
-                "bool_and expects boolean input, got {:?}",
-                data_type
-            ));
+            return Err(
+                crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                    "bool_and expects boolean input, got {:?}",
+                    data_type
+                )),
+            );
         }
         Ok(AggSpec {
             kind: AggKind::BoolAnd,
@@ -61,14 +67,15 @@ impl AggregateFunction for BoolAndAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "bool_and input missing".to_string())?;
-        let arr = arr
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract("bool_and input missing")
+        })?;
+        let arr = arr.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "failed to downcast to BooleanArray",
+            )
+        })?;
         Ok(AggInputView::Bool(arr))
     }
 
@@ -76,7 +83,7 @@ impl AggregateFunction for BoolAndAgg {
         &self,
         spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
         self.build_input_view(spec, array)
     }
 
@@ -109,9 +116,11 @@ impl AggregateFunction for BoolAndAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         if !matches!(input, AggInputView::Bool(_)) {
-            return Err("bool_and batch input type mismatch".to_owned());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "bool_and batch input type mismatch",
+            ));
         }
         super::aggregate_basic_adapter::update(spec, offset, state_ptrs, input, None)
     }
@@ -122,9 +131,11 @@ impl AggregateFunction for BoolAndAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         if !matches!(input, AggInputView::Bool(_)) {
-            return Err("bool_and merge input type mismatch".to_owned());
+            return Err(crate::exec::expr::agg::views::aggregate_input_contract(
+                "bool_and merge input type mismatch",
+            ));
         }
         super::aggregate_basic_adapter::merge(spec, offset, state_ptrs, input)
     }
@@ -135,7 +146,7 @@ impl AggregateFunction for BoolAndAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         super::aggregate_basic_adapter::build(spec, offset, group_states, output_intermediate)
     }
 }

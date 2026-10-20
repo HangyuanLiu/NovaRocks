@@ -56,17 +56,17 @@ fn legacy_ndv_hll_baseline_null_row_bounds_and_original_unsupported_errors() {
     let integers: ArrayRef = Arc::new(Int32Array::from(vec![None, Some(1)]));
     assert_eq!(hash_array_value_for_hll(&integers, 0).unwrap(), None);
     assert_eq!(
-        hash_array_value_for_hll(&integers, 2).unwrap_err(),
+        (hash_array_value_for_hll(&integers, 2).unwrap_err()).to_string(),
         "hll_raw row 2 out of bounds for len 2"
     );
     let unsigned: ArrayRef = Arc::new(UInt32Array::from(vec![1]));
     assert_eq!(
-        hash_array_value_for_hll(&unsigned, 0).unwrap_err(),
+        (hash_array_value_for_hll(&unsigned, 0).unwrap_err()).to_string(),
         "hll_raw does not support input type UInt32"
     );
     let nulls: ArrayRef = Arc::new(NullArray::new(1));
     assert_eq!(
-        hash_array_value_for_hll(&nulls, 0).unwrap_err(),
+        (hash_array_value_for_hll(&nulls, 0).unwrap_err()).to_string(),
         "hll_raw does not support input type Null"
     );
 }
@@ -100,7 +100,10 @@ fn legacy_ndv_hll_baseline_empty_and_short_codec_errors_remain_exact() {
         ),
     ] {
         let mut state = HllRawState::default();
-        assert_eq!(merge_hll_bytes(&mut state, bytes).unwrap_err(), message);
+        assert_eq!(
+            (merge_hll_bytes(&mut state, bytes).unwrap_err()).to_string(),
+            message
+        );
     }
 }
 #[test]

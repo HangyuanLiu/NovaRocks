@@ -45,7 +45,7 @@ struct Compile(Option<CompileControlError>);
 impl PureCompileControl for Compile {
     fn checkpoint(&self, _: CompilePhase, work: u32) -> Result<(), CompileControlError> {
         assert!(work <= 256);
-        self.0.map_or(Ok(()), Err)
+        self.0.clone().map_or(Ok(()), Err)
     }
 }
 const COMPILE: Compile = Compile(None);
@@ -1841,7 +1841,7 @@ impl PureCompileControl for Stop {
         assert!(work <= 256);
         self.observed.lock().unwrap().push(work);
         if work == self.at {
-            Err(self.error)
+            Err(self.error.clone())
         } else {
             Ok(())
         }
@@ -1864,7 +1864,7 @@ fn resolved_relational_entry_and_positive_quantum_keep_all_three_typed_controls(
         for at in [0, 256] {
             let stop = Stop {
                 at,
-                error,
+                error: error.clone(),
                 observed: Mutex::default(),
             };
             let result = ProgramResolvedCalls::try_new(
@@ -1880,7 +1880,7 @@ fn resolved_relational_entry_and_positive_quantum_keep_all_three_typed_controls(
             );
             assert_eq!(
                 result.unwrap_err(),
-                ProgramResolvedCallsError::Control(error)
+                ProgramResolvedCallsError::Control(error.clone())
             );
             assert!(stop.observed.lock().unwrap().contains(&at));
         }

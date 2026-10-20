@@ -332,7 +332,8 @@ impl CopyInvoiceTotals {
             DataType::Boolean => self.required(bitmap),
             DataType::FixedSizeBinary(w) => self.required(mul(
                 rows,
-                usize::try_from(*w).map_err(|_| CopyError::Extent)?,
+                usize::try_from(*w)
+                    .map_err(|_| CopyError::Invalid("copy frozen carrier has a negative width"))?,
             )?),
             DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => {
                 let width = if matches!(ty, DataType::LargeUtf8 | DataType::LargeBinary) {
@@ -345,9 +346,11 @@ impl CopyInvoiceTotals {
                 self.required(mul(add(rows, 2)?, width)?)
             }
             DataType::Utf8View | DataType::BinaryView => self.required(mul(rows, 16)?),
-            DataType::Dictionary(key, _) => {
-                self.required(mul(rows, key.primitive_width().ok_or(CopyError::Extent)?)?)
-            }
+            DataType::Dictionary(key, _) => self.required(mul(
+                rows,
+                key.primitive_width()
+                    .ok_or(CopyError::Invalid("copy frozen primitive width is absent"))?,
+            )?),
             DataType::List(_) | DataType::Map(..) => self.required(mul(add(rows, 2)?, 4)?),
             DataType::LargeList(_) => self.required(mul(add(rows, 2)?, 8)?),
             DataType::ListView(_) => self.required(mul(rows, 8)?),
@@ -357,7 +360,12 @@ impl CopyInvoiceTotals {
                 if mode.is_take() {
                     // Original take_value_indices_from_fixed_size_list builds
                     // a UInt32 child index and validity, including NULL parents.
-                    let child = mul(rows, usize::try_from(*w).map_err(|_| CopyError::Extent)?)?;
+                    let child = mul(
+                        rows,
+                        usize::try_from(*w).map_err(|_| {
+                            CopyError::Invalid("copy frozen carrier has a negative width")
+                        })?,
+                    )?;
                     self.required(mul(child, 4)?)?;
                     self.required(add(child / 8, usize::from(!child.is_multiple_of(8)))?)?;
                 }
@@ -389,7 +397,7 @@ impl CopyInvoiceTotals {
                 let width = ends
                     .data_type()
                     .primitive_width()
-                    .ok_or(CopyError::Extent)?;
+                    .ok_or(CopyError::Invalid("copy frozen primitive width is absent"))?;
                 if mode.is_take() {
                     // RunEndBuffer owns ordered_indices AND physical_indices
                     // simultaneously. Unstable index sort allocates no heap.
@@ -409,7 +417,7 @@ impl CopyInvoiceTotals {
                     self.required(mul(rows, width)?)
                 }
             }
-            other => Err(CopyError::Unsupported(other.clone())),
+            other => Err(CopyError::unsupported(other)),
         }
     }
     pub(super) fn original_concat_node(
@@ -484,7 +492,9 @@ impl CopyInvoiceTotals {
                 usize::from(!array.len().is_multiple_of(8)),
             )?)?;
         }
-        let key_width = key.primitive_width().ok_or(CopyError::Extent)?;
+        let key_width = key
+            .primitive_width()
+            .ok_or(CopyError::Invalid("copy frozen primitive width is absent"))?;
         // Actual masked-values Vec tuples (index, optional borrowed bytes),
         // one native mapping per domain element and interleave source choices.
         self.temporary_exact(mul(domain, size_of::<(usize, Option<&[u8]>)>())?)?;
@@ -498,13 +508,13 @@ impl CopyInvoiceTotals {
         // ONE original fixed interner formula, with capacity bounded by the
         // actual full domain; no hash/equality computation or key-limit gate.
         // u64 has the largest installed dictionary native key width/alignment.
-        let capacity = u64::try_from(domain).map_err(|_| CopyError::Extent)?;
+        let capacity = u64::try_from(domain).map_err(|_| CopyError::arithmetic(None))?;
         let shift = capacity
             .checked_add(128)
-            .ok_or(CopyError::Extent)?
+            .ok_or_else(|| CopyError::arithmetic(None))?
             .leading_zeros();
         let buckets = (u64::MAX >> shift).saturating_add(1);
-        let buckets = usize::try_from(buckets).map_err(|_| CopyError::Extent)?;
+        let buckets = usize::try_from(buckets).map_err(|_| CopyError::arithmetic(None))?;
         self.temporary_exact(mul(buckets, size_of::<Option<(Option<&[u8]>, u64)>>())?)
     }
 
@@ -553,7 +563,8 @@ impl CopyInvoiceTotals {
             }
             DataType::FixedSizeBinary(w) => self.initial(mul(
                 capacity,
-                usize::try_from(*w).map_err(|_| CopyError::Extent)?,
+                usize::try_from(*w)
+                    .map_err(|_| CopyError::Invalid("copy frozen carrier has a negative width"))?,
             )?),
             DataType::List(_) | DataType::Map(..) => self.initial(mul(add(capacity, 1)?, 4)?),
             DataType::LargeList(_) => self.initial(mul(add(capacity, 1)?, 8)?),
@@ -562,7 +573,8 @@ impl CopyInvoiceTotals {
             DataType::Utf8View | DataType::BinaryView => self.initial(mul(capacity, 16)?),
             DataType::Dictionary(key, _) => self.initial(mul(
                 capacity,
-                key.primitive_width().ok_or(CopyError::Extent)?,
+                key.primitive_width()
+                    .ok_or(CopyError::Invalid("copy frozen primitive width is absent"))?,
             )?),
             DataType::Union(_, mode) => {
                 self.initial(capacity)?;
@@ -575,7 +587,7 @@ impl CopyInvoiceTotals {
             | DataType::Struct(_)
             | DataType::FixedSizeList(..)
             | DataType::RunEndEncoded(..) => Ok(()),
-            other => Err(CopyError::Unsupported(other.clone())),
+            other => Err(CopyError::unsupported(other)),
         }
     }
     pub(super) fn finish(self, source_metadata: usize) -> Result<CopyOperationFacts, CopyError> {

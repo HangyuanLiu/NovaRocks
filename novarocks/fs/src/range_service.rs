@@ -1177,8 +1177,12 @@ impl FileRangeService {
         drop(std::mem::take(&mut request.holds));
         if let Some(ticket) = request.ticket.take() {
             ticket.end(match &request.exit_error {
-                None => Ok(()),
-                Some(error) => Err(ConnectorError::from(error)),
+                None => novarocks_spi::connector::read_stack::ConnectorOperationExit::Exited,
+                Some(error) => {
+                    novarocks_spi::connector::read_stack::ConnectorOperationExit::WorkFailed(
+                        ConnectorError::from(error),
+                    )
+                }
             });
         }
         if let Some(sender) = request.exit.take() {
@@ -1699,7 +1703,10 @@ mod tests {
         );
         operations.seal();
         spawner.release(1);
-        operations.exited().await.expect("the source exits");
+        assert_eq!(
+            operations.exited().await,
+            novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited
+        );
         assert_eq!(
             Arc::strong_count(&charge),
             1,
@@ -1781,8 +1788,10 @@ mod tests {
         assert_eq!(service.state.lock().expect("state").active, 1);
 
         spawner.release(1);
-        exit.await
-            .expect("the source exits cleanly once the task exited");
+        assert_eq!(
+            exit.await,
+            novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited
+        );
         request.drained().await.expect("request exit");
         {
             let state = service.state.lock().expect("state");
@@ -1852,10 +1861,12 @@ mod tests {
             outcome.expect_err("sealed").kind(),
             FileErrorKind::Cancelled
         );
-        tokio::time::timeout(std::time::Duration::from_secs(1), operations.exited())
-            .await
-            .expect("a wait that never queued leaves nothing behind")
-            .expect("clean exit");
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), operations.exited())
+                .await
+                .expect("a wait that never queued leaves nothing behind"),
+            novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited
+        );
 
         spawner.release(2);
         running
@@ -1923,10 +1934,10 @@ mod tests {
                 .expect("the other source still reads")[..],
             b"efgh"
         );
-        first_operations
-            .exited()
-            .await
-            .expect("first source exited");
+        assert_eq!(
+            first_operations.exited().await,
+            novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited
+        );
         second_read.drained().await.expect("second read exit");
         assert_eq!(second_operations.live_operations(), 0);
         assert!(
@@ -1934,10 +1945,10 @@ mod tests {
             "an idle open source has not exited"
         );
         second_operations.seal();
-        second_operations
-            .exited()
-            .await
-            .expect("second source exited");
+        assert_eq!(
+            second_operations.exited().await,
+            novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited
+        );
         first_read.drained().await.expect("first read exit");
         service.drain().await.expect("service drain");
     }
@@ -2002,9 +2013,20 @@ mod tests {
         assert!(io_runtime.block_on(stuck.drained()).is_err());
         assert_eq!(operations.live_operations(), 0);
         operations.seal();
-        let exit = io_runtime
-            .block_on(operations.exited())
-            .expect_err("the source keeps the supervisor's exit error");
+        let mut failures = operations
+            .claim_failure_receiver()
+            .expect("the actual source outcome consumer");
+        assert_eq!(
+            io_runtime.block_on(operations.exited()),
+            novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited
+        );
+        let Some(novarocks_spi::connector::read_stack::ConnectorSourceFailureEvent::Required(exit)) =
+            io_runtime.block_on(futures::future::poll_fn(|cx| failures.poll_event(cx)))
+        else {
+            panic!(
+                "the source keeps the actual supervisor work failure independently of physical exit"
+            );
+        };
         assert_eq!(
             exit.kind(),
             novarocks_spi::connector::ConnectorErrorKind::Internal
@@ -2769,10 +2791,10 @@ mod tests {
         assert!(!operations.is_exited());
         spawner.gate.add_permits(1);
         request.drained().await.expect("sibling exit");
-        operations
-            .exited()
-            .await
-            .expect("a result error is not an exit error");
+        assert_eq!(
+            operations.exited().await,
+            novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited
+        );
         service.close_admission();
         service.drain().await.expect("service drain");
     }

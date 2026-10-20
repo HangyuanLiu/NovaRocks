@@ -186,7 +186,9 @@ fn connector_error(path: FieldPath, error: ConnectorCodecError) -> ProtocolError
         ConnectorCodecErrorKind::Unsupported => ProtocolErrorKind::Unsupported,
         ConnectorCodecErrorKind::Capacity => ProtocolErrorKind::Capacity,
         ConnectorCodecErrorKind::VersionMismatch => ProtocolErrorKind::VersionMismatch,
-        ConnectorCodecErrorKind::CompileControl(cause) => ProtocolErrorKind::CompileControl(cause),
+        ConnectorCodecErrorKind::CompileControl(cause) => {
+            ProtocolErrorKind::CompileControl(cause.clone())
+        }
     };
     ProtocolError::new(path, kind, error.to_string())
 }
@@ -380,7 +382,7 @@ mod compile_control_adapter_tests {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let provider = ConnectorCodecError::from(cause)
+            let provider = ConnectorCodecError::from(cause.clone())
                 .with_path(ConnectorFieldPath::root("columns").index(17));
             let expected_detail = provider.to_string();
             let outer = FieldPath::root("fragment")
@@ -389,7 +391,10 @@ mod compile_control_adapter_tests {
                 .field("provider_payload");
             let error = connector_error(outer.clone(), provider);
             assert_eq!(error.path(), &outer);
-            assert_eq!(error.kind(), ProtocolErrorKind::CompileControl(cause));
+            assert_eq!(
+                error.kind(),
+                &ProtocolErrorKind::CompileControl(cause.clone())
+            );
             assert_eq!(error.detail(), expected_detail);
             assert!(error.detail().contains("columns[17]"));
             assert_eq!(
@@ -450,7 +455,7 @@ mod compile_control_adapter_tests {
             );
             let expected_detail = provider.to_string();
             let error = connector_error(FieldPath::root("scan"), provider);
-            assert_eq!(error.kind(), expected_kind);
+            assert_eq!(error.kind(), &expected_kind);
             assert_eq!(error.detail(), expected_detail);
             assert!(error.source().is_none());
         }
@@ -467,7 +472,7 @@ mod compile_control_adapter_tests {
         )
         .unwrap_err();
         assert_eq!(missing.path(), &path);
-        assert_eq!(missing.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(missing.kind(), &ProtocolErrorKind::MissingField);
         assert!(missing.source().is_none());
 
         let payload = ConnectorEncodedPayload::new(
@@ -491,7 +496,7 @@ mod compile_control_adapter_tests {
         )
         .unwrap_err();
         assert_eq!(mismatch.path(), &path.field("header"));
-        assert_eq!(mismatch.kind(), ProtocolErrorKind::InconsistentFields);
+        assert_eq!(mismatch.kind(), &ProtocolErrorKind::InconsistentFields);
         assert_eq!(
             mismatch.detail(),
             "connector payload category does not match its public carrier"

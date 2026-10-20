@@ -15,15 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
 use arrow::array::ArrayRef;
 pub fn eval_hll_hash<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    if args.len() != 1 {
+        return Err(expression_contract(
+            "hll_hash requires exactly one argument",
+        ));
+    }
     let _ = expr;
     let input = arena.eval(args[0], chunk)?;
-    Ok((novarocks_functions::hll_hash_core::array(&input))?)
+    novarocks_functions::hll_hash_core::array(&input).map_err(Into::into)
 }

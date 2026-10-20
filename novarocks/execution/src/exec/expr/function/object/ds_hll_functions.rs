@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 #[cfg(test)]
+#[cfg(test)]
+use crate::exec::expr::ExprArena;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -22,14 +24,18 @@ use crate::exec::hll::HllHandle;
 use arrow::array::ArrayRef;
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 
 pub fn eval_ds_hll_count_distinct_state<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    novarocks_functions::builtin::ds_hll_state_core::validate_raw_call(
+        args.len(),
+        arena.data_type(expr),
+    )?;
     let values = arena.eval(args[0], chunk)?;
     let log_ks = if args.len() >= 2 {
         Some(arena.eval(args[1], chunk)?)
@@ -42,7 +48,8 @@ pub fn eval_ds_hll_count_distinct_state<__Eval: crate::exec::expr::ExprEvaluatio
         None
     };
 
-    Ok((novarocks_functions::builtin::ds_hll_state_core::evaluate(&values, log_ks, target_types))?)
+    novarocks_functions::builtin::ds_hll_state_core::evaluate(&values, log_ks, target_types)
+        .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)
 }
 
 #[cfg(test)]

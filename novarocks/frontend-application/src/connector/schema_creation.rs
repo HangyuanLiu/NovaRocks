@@ -122,14 +122,7 @@ pub(crate) fn connector_schema_error(
 ) -> ConnectorError {
     match error {
         PureProviderCompileError::Provider(error) => error,
-        PureProviderCompileError::Control(cause) => ConnectorError::new(
-            match cause {
-                CompileControlError::Cancelled => ConnectorErrorKind::Cancelled,
-                CompileControlError::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
-                CompileControlError::ResourceExhausted => ConnectorErrorKind::ResourceExhausted,
-            },
-            cause.to_string(),
-        ),
+        PureProviderCompileError::Control(cause) => ConnectorError::compile_interruption(cause),
     }
 }
 
@@ -137,6 +130,19 @@ pub(crate) fn connector_schema_error(
 mod tests {
     use super::*;
     use novarocks_spi::connector::ConnectorStopOwner;
+
+    #[test]
+    fn original_schema_control_source_keeps_its_author_and_interruption_role() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+        let raw = LayoutResourceError::SourceModel;
+        let expected = raw.failure_fact();
+        let cause = CompileControlError::from_domain(raw);
+        let error = connector_schema_error(PureProviderCompileError::Control(cause.clone()));
+        assert_eq!(error.kind(), ConnectorErrorKind::Interrupted);
+        assert_eq!(error.failure_fact(), expected);
+        assert!(!error.retryable_before_progress());
+    }
 
     #[test]
     fn a_provider_refusal_keeps_its_original_classification_when_stop_arrives_at_return() {

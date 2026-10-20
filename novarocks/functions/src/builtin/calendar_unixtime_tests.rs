@@ -66,7 +66,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop);
         }
         trace.push(n);
-        if let Some((stop, cause)) = self.refusal
+        if let Some((stop, cause)) = self.refusal.clone()
             && at == stop
         {
             return Err(cause);
@@ -400,7 +400,7 @@ fn unixtime_every_runtime_and_compile_prefix_preserves_all_seven_and_three_prima
             CompileControlError::ResourceExhausted,
         ] {
             let c = CompileControl {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..Default::default()
             };
             let error = format_kernel(&constant, Some("UTC"), &c).err().unwrap();

@@ -58,7 +58,7 @@ impl PureCompileControl for TraceControl {
             );
         }
         calls.push((phase, units));
-        match self.refuse {
+        match self.refuse.clone() {
             Some((refused_at, cause)) if at == refused_at => Err(cause),
             _ => Ok(()),
         }
@@ -139,11 +139,7 @@ fn pool(
 }
 
 fn kernel_cause(cause: CompileControlError) -> KernelFailure {
-    match cause {
-        CompileControlError::Cancelled => KernelFailure::Cancelled,
-        CompileControlError::DeadlineExceeded => KernelFailure::DeadlineExceeded,
-        CompileControlError::ResourceExhausted => KernelFailure::ResourceExhausted,
-    }
+    KernelFailure::CompileControl(cause.clone())
 }
 
 fn validate_type(
@@ -269,7 +265,7 @@ fn carrier_map_original_control_prefixes_cover_pool_and_full_type_ordinary_tails
     let expected = valid.trace();
     for at in 0..expected.len() {
         for cause in CAUSES {
-            let control = TraceControl::new(Some((at, cause)));
+            let control = TraceControl::new(Some((at, cause.clone())));
             assert!(
                 matches!(pool(&field, &ty, &array, &control), Err(ConstantError::Control(actual)) if actual == cause)
             );
@@ -285,7 +281,7 @@ fn carrier_map_original_control_prefixes_cover_pool_and_full_type_ordinary_tails
         let expected = recording.trace();
         for at in 0..expected.len() {
             for cause in CAUSES {
-                let control = TraceControl::new(Some((at, cause)));
+                let control = TraceControl::new(Some((at, cause.clone())));
                 assert_eq!(validate_type(target, &control), Err(kernel_cause(cause)));
                 assert_eq!(control.trace(), expected[..=at]);
             }
@@ -301,7 +297,7 @@ fn carrier_map_original_control_prefixes_cover_pool_and_full_type_ordinary_tails
     assert!(expected.last().unwrap().1 > 0);
     for at in 0..expected.len() {
         for cause in CAUSES {
-            let control = TraceControl::new(Some((at, cause)));
+            let control = TraceControl::new(Some((at, cause.clone())));
             assert!(
                 matches!(pool(&invalid_field, &ty, &array, &control), Err(ConstantError::Control(actual)) if actual == cause)
             );
@@ -332,7 +328,7 @@ fn carrier_map_actual_wide_rows_observe_quantum_and_keep_nullable_value() {
             continue;
         }
         for cause in CAUSES {
-            let control = TraceControl::new(Some((at, cause)));
+            let control = TraceControl::new(Some((at, cause.clone())));
             assert!(
                 matches!(pool(&field, &ty, &array, &control), Err(ConstantError::Control(actual)) if actual == cause)
             );

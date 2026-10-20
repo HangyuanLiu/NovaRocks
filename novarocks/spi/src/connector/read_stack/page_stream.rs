@@ -38,12 +38,13 @@
 
 // Design: ADR-0159 (docs/adr/ADR-0159-driver-polled-connector-scan-streams.md)
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use futures::Stream;
@@ -155,7 +156,7 @@ impl ConnectorPollBudget {
         }
     }
 
-    fn try_take(&self, units: u64) -> bool {
+    pub fn try_take(&self, units: u64) -> bool {
         self.inner
             .remaining
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
@@ -209,252 +210,15 @@ impl Future for BudgetConsume {
     }
 }
 
-type StopRequest = Arc<dyn Fn() + Send + Sync>;
-
-/// The operations one connector source started, so that closing the source
-/// stops them and can observe their exit.
-///
-/// A provider admits an operation before it submits any work for it and ends
-/// the returned ticket once the work has actually exited. Sealing the source
-/// refuses every later admission and asks every admitted operation to stop,
-/// so an operation either is admitted before the seal, and is then stopped
-/// by it, or is refused. The source has exited once it is sealed and every
-/// admitted operation ended; the first real error is kept.
-#[derive(Clone, Default)]
-pub struct ConnectorSourceOperations {
-    inner: Arc<Mutex<SourceOperationsState>>,
-}
-
-#[derive(Default)]
-struct SourceOperationsState {
-    sealed: bool,
-    next_id: u64,
-    live: BTreeMap<u64, StopRequest>,
-    first_error: Option<ConnectorError>,
-    waiters: Vec<Waker>,
-    /// For a child source, its one operation in the parent source, ended
-    /// once this source has exited.
-    parent: Option<ConnectorOperationTicket>,
-}
-
-/// What a source hands over once it has exited: its observers to wake and,
-/// for a child, its operation in the parent with the child's outcome.
-struct SourceExitNotice {
-    waiters: Vec<Waker>,
-    parent: Option<(ConnectorOperationTicket, Result<(), ConnectorError>)>,
-}
-
-impl SourceExitNotice {
-    fn deliver(self) {
-        for waiter in self.waiters {
-            waiter.wake();
-        }
-        if let Some((ticket, outcome)) = self.parent {
-            ticket.end(outcome);
-        }
-    }
-}
-
-impl SourceOperationsState {
-    /// Takes the exit notice once the source is sealed and every admitted
-    /// operation ended; an open or busy source hands over nothing.
-    fn take_exit_notice(&mut self) -> SourceExitNotice {
-        if !self.sealed || !self.live.is_empty() {
-            return SourceExitNotice {
-                waiters: Vec::new(),
-                parent: None,
-            };
-        }
-        let outcome = self.first_error.clone().map_or(Ok(()), Err);
-        SourceExitNotice {
-            waiters: std::mem::take(&mut self.waiters),
-            parent: self.parent.take().map(|ticket| (ticket, outcome)),
-        }
-    }
-}
-
-impl ConnectorSourceOperations {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Admits one operation together with the request that stops it.
-    /// Refused once the source is sealed.
-    pub fn admit(&self, stop: StopRequest) -> Result<ConnectorOperationTicket, ConnectorError> {
-        let mut state = self.lock();
-        if state.sealed {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Cancelled,
-                "connector source is closed and admits no new operation",
-            ));
-        }
-        let id = state.next_id;
-        state.next_id = state.next_id.wrapping_add(1);
-        state.live.insert(id, stop);
-        Ok(ConnectorOperationTicket {
-            operations: self.clone(),
-            id,
-            ended: false,
-        })
-    }
-
-    /// Admits a child source as one operation of this one.
-    ///
-    /// Sealing this source seals the child, and the child's exit -- sealed,
-    /// with every operation it admitted ended -- ends that operation with the
-    /// child's first real error. A stream that reads one unit of a larger
-    /// source owns a child, so closing the unit stops and observes only its
-    /// own operations while the larger source stays open. A child dropped
-    /// without being sealed ends its operation as one that exited cleanly.
-    /// Refused once this source is sealed.
-    pub fn child(&self) -> Result<ConnectorSourceOperations, ConnectorError> {
-        let child = ConnectorSourceOperations::new();
-        // The parent holds only a weak way to stop the child; the child holds
-        // its ticket, and with it the parent, until it exits.
-        let weak = Arc::downgrade(&child.inner);
-        let ticket = self.admit(Arc::new(move || {
-            if let Some(inner) = weak.upgrade() {
-                ConnectorSourceOperations { inner }.seal();
-            }
-        }))?;
-        // A parent sealed between the admission and here already sealed the
-        // child; the check below then ends the operation at once.
-        let notice = {
-            let mut state = child.lock();
-            state.parent = Some(ticket);
-            state.take_exit_notice()
-        };
-        notice.deliver();
-        Ok(child)
-    }
-
-    /// Seals the source: refuses every later admission and asks every
-    /// admitted operation to stop. Idempotent.
-    pub fn seal(&self) {
-        let (stops, notice) = {
-            let mut state = self.lock();
-            if state.sealed {
-                return;
-            }
-            state.sealed = true;
-            let stops = state.live.values().cloned().collect::<Vec<_>>();
-            (stops, state.take_exit_notice())
-        };
-        for stop in stops {
-            stop();
-        }
-        notice.deliver();
-    }
-
-    pub fn is_sealed(&self) -> bool {
-        self.lock().sealed
-    }
-
-    /// Admitted operations that have not ended yet.
-    pub fn live_operations(&self) -> usize {
-        self.lock().live.len()
-    }
-
-    /// Whether the source is sealed and every admitted operation ended.
-    pub fn is_exited(&self) -> bool {
-        let state = self.lock();
-        state.sealed && state.live.is_empty()
-    }
-
-    /// Resolves once the source is sealed and every admitted operation has
-    /// ended, with the first real error. Any number of observers may wait.
-    pub fn exited(&self) -> ConnectorSourceExit {
-        ConnectorSourceExit {
-            operations: self.clone(),
-        }
-    }
-
-    fn end(&self, id: u64, result: Result<(), ConnectorError>) {
-        let notice = {
-            let mut state = self.lock();
-            if state.live.remove(&id).is_none() {
-                return;
-            }
-            if let Err(error) = result
-                && state.first_error.is_none()
-            {
-                state.first_error = Some(error);
-            }
-            state.take_exit_notice()
-        };
-        notice.deliver();
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, SourceOperationsState> {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-impl fmt::Debug for ConnectorSourceOperations {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self.lock();
-        formatter
-            .debug_struct("ConnectorSourceOperations")
-            .field("sealed", &state.sealed)
-            .field("live", &state.live.len())
-            .field("first_error", &state.first_error)
-            .finish()
-    }
-}
-
-/// One admitted operation of a connector source.
-///
-/// End it once the operation has actually exited. A ticket dropped without
-/// being ended counts as an operation that exited without an error, which
-/// is what an admitted operation that never started is.
-#[must_use = "an admitted operation must end its ticket when it exits"]
-pub struct ConnectorOperationTicket {
-    operations: ConnectorSourceOperations,
-    id: u64,
-    ended: bool,
-}
-
-impl ConnectorOperationTicket {
-    /// Ends the operation with its real outcome.
-    pub fn end(mut self, result: Result<(), ConnectorError>) {
-        self.ended = true;
-        self.operations.end(self.id, result);
-    }
-}
-
-impl Drop for ConnectorOperationTicket {
-    fn drop(&mut self) {
-        if !self.ended {
-            self.operations.end(self.id, Ok(()));
-        }
-    }
-}
-
-/// Future returned by [`ConnectorSourceOperations::exited`].
-pub struct ConnectorSourceExit {
-    operations: ConnectorSourceOperations,
-}
-
-impl Future for ConnectorSourceExit {
-    type Output = Result<(), ConnectorError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.operations.lock();
-        if state.sealed && state.live.is_empty() {
-            return Poll::Ready(state.first_error.clone().map_or(Ok(()), Err));
-        }
-        if !state
-            .waiters
-            .iter()
-            .any(|waiter| waiter.will_wake(cx.waker()))
-        {
-            state.waiters.push(cx.waker().clone());
-        }
-        Poll::Pending
-    }
-}
+#[path = "source_operations.rs"]
+mod source_operations;
+#[cfg(test)]
+use source_operations::StopRequest;
+pub use source_operations::{
+    ConnectorOperationExit, ConnectorOperationTicket, ConnectorSourceExit,
+    ConnectorSourceExitProof, ConnectorSourceFailure, ConnectorSourceFailureEvent,
+    ConnectorSourceFailureReceiver, ConnectorSourceOperations,
+};
 
 #[cfg(test)]
 mod tests {
@@ -517,6 +281,7 @@ mod tests {
     #[test]
     fn a_sealed_source_stops_its_operations_refuses_new_ones_and_exits_when_they_end() {
         let operations = ConnectorSourceOperations::new();
+        let mut failures = operations.claim_failure_receiver().unwrap();
         let stopped = Arc::new(AtomicUsize::new(0));
         let stop = {
             let stopped = Arc::clone(&stopped);
@@ -543,7 +308,7 @@ mod tests {
         assert!(operations.admit(Arc::new(|| {})).is_err());
         assert!(poll_once(&mut exit, &wakes).is_pending());
 
-        first.end(Err(ConnectorError::new(
+        first.end(ConnectorOperationExit::WorkFailed(ConnectorError::new(
             ConnectorErrorKind::Unavailable,
             "object store went away",
         )));
@@ -557,19 +322,25 @@ mod tests {
         let Poll::Ready(result) = poll_once(&mut exit, &wakes) else {
             panic!("every operation ended");
         };
-        assert_eq!(
-            result.expect_err("first error").kind(),
-            ConnectorErrorKind::Unavailable
-        );
+        assert_eq!(result, ConnectorSourceExitProof::Exited);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let Poll::Ready(Some(ConnectorSourceFailureEvent::Required(error))) =
+            failures.poll_event(&mut cx)
+        else {
+            panic!("the actual work author supplies the original failure once");
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
+        assert!(matches!(failures.poll_event(&mut cx), Poll::Ready(None)));
         let Poll::Ready(again) = poll_once(&mut operations.exited(), &wakes) else {
             panic!("exit is observable again");
         };
-        assert!(again.is_err());
+        assert_eq!(again, ConnectorSourceExitProof::Exited);
     }
 
     #[test]
     fn sealing_a_source_seals_its_child_and_exits_only_after_the_child_did() {
         let parent = ConnectorSourceOperations::new();
+        let mut failures = parent.claim_failure_receiver().unwrap();
         let child = parent.child().expect("child admitted");
         assert_eq!(parent.live_operations(), 1, "the child is one operation");
         let stopped = Arc::new(AtomicUsize::new(0));
@@ -588,7 +359,7 @@ mod tests {
         assert!(child.admit(Arc::new(|| {})).is_err());
         assert!(!parent.is_exited(), "the child's leaf still runs");
 
-        leaf.end(Err(ConnectorError::new(
+        leaf.end(ConnectorOperationExit::WorkFailed(ConnectorError::new(
             ConnectorErrorKind::Unavailable,
             "leaf exit failed",
         )));
@@ -598,12 +369,14 @@ mod tests {
         let Poll::Ready(result) = poll_once(&mut parent.exited(), &wakes) else {
             panic!("the parent exited");
         };
-        assert_eq!(
-            result
-                .expect_err("the child's error reaches the parent")
-                .kind(),
-            ConnectorErrorKind::Unavailable
-        );
+        assert_eq!(result, ConnectorSourceExitProof::Exited);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let Poll::Ready(Some(ConnectorSourceFailureEvent::Required(error))) =
+            failures.poll_event(&mut cx)
+        else {
+            panic!("the child's actual work cause reaches the parent");
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
     }
 
     #[test]
@@ -670,5 +443,143 @@ mod tests {
             drop(admitted);
             assert!(operations.is_exited());
         }
+    }
+}
+
+#[cfg(test)]
+mod source_stop_tests {
+    use super::*;
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicUsize;
+
+    fn poll_exit(exit: &mut ConnectorSourceExit) -> Poll<ConnectorSourceExitProof> {
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        Pin::new(exit).poll(&mut cx)
+    }
+    #[test]
+    fn panicking_stop_keeps_sibling_stop_and_actual_exit_responsibilities() {
+        for original in [
+            None,
+            Some(ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "original operation failed",
+            )),
+        ] {
+            let operations = ConnectorSourceOperations::new();
+            let mut failures = operations.claim_failure_receiver().unwrap();
+            if let Some(error) = &original {
+                operations
+                    .admit(Arc::new(|| {}))
+                    .unwrap()
+                    .end(ConnectorOperationExit::WorkFailed(error.clone()));
+            }
+            let stopped = Arc::new(AtomicUsize::new(0));
+            let first = operations
+                .admit(Arc::new(|| panic!("source stop failed")))
+                .unwrap();
+            let counter = stopped.clone();
+            let second = operations
+                .admit(Arc::new(move || {
+                    counter.fetch_add(1, Ordering::AcqRel);
+                }))
+                .unwrap();
+            let mut exit = operations.exited();
+            assert!(poll_exit(&mut exit).is_pending());
+            let sealed =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operations.seal()));
+            assert!(
+                sealed.is_ok(),
+                "one failed stop must not skip a sibling stop"
+            );
+            assert!(operations.is_sealed());
+            assert_eq!(stopped.load(Ordering::Acquire), 1);
+            assert!(!operations.is_exited());
+            assert!(poll_exit(&mut exit).is_pending());
+            first.end(ConnectorOperationExit::Exited);
+            assert!(poll_exit(&mut exit).is_pending());
+            second.end(ConnectorOperationExit::Exited);
+            assert_eq!(
+                operations.live_operations(),
+                0,
+                "both actual operations ended; the failed callback still has unknown custody"
+            );
+            assert_eq!(
+                poll_exit(&mut exit),
+                Poll::Ready(ConnectorSourceExitProof::Unresolved)
+            );
+            assert!(!operations.is_exited());
+            let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+            if let Some(expected) = original {
+                let Poll::Ready(Some(ConnectorSourceFailureEvent::Required(actual))) =
+                    failures.poll_event(&mut cx)
+                else {
+                    panic!("the original work failure remains independent");
+                };
+                assert_eq!(actual, expected);
+            }
+            let Poll::Ready(Some(ConnectorSourceFailureEvent::CleanupUnresolved(actual))) =
+                failures.poll_event(&mut cx)
+            else {
+                panic!("stop callback panic is cleanup plus unresolved health");
+            };
+            use novarocks_failure_contract::FailureProjection;
+            assert_eq!(
+                actual.failure_fact(),
+                ConnectorSourceFailure::StopCallbackPanicked.failure_fact()
+            );
+            assert!(matches!(failures.poll_event(&mut cx), Poll::Ready(None)));
+            operations.seal();
+            assert_eq!(stopped.load(Ordering::Acquire), 1);
+            assert_eq!(
+                poll_exit(&mut operations.exited()),
+                Poll::Ready(ConnectorSourceExitProof::Unresolved)
+            );
+        }
+    }
+    #[test]
+    fn ending_the_last_ticket_inside_stop_cannot_publish_exit_before_that_stop_returns() {
+        let operations = ConnectorSourceOperations::new();
+        let ticket = Arc::new(Mutex::new(None::<ConnectorOperationTicket>));
+        let entered = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let stop_ticket = ticket.clone();
+        let stop_entered = entered.clone();
+        let stop_resume = resume.clone();
+        *ticket.lock().unwrap() = Some(
+            operations
+                .admit(Arc::new(move || {
+                    stop_ticket
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .unwrap()
+                        .end(ConnectorOperationExit::Exited);
+                    stop_entered.wait();
+                    stop_resume.wait();
+                }))
+                .unwrap(),
+        );
+        let mut exit = operations.exited();
+        assert!(poll_exit(&mut exit).is_pending());
+        let (exited_during_stop, poll_during_stop) = std::thread::scope(|scope| {
+            let stop = scope.spawn(|| operations.seal());
+            entered.wait();
+            let observations = (operations.is_exited(), poll_exit(&mut exit));
+            // Release and join before asserting, so a failing oracle leaves no
+            // blocked thread or ticket behind.
+            resume.wait();
+            stop.join().unwrap();
+            observations
+        });
+        assert!(
+            !exited_during_stop,
+            "the stop callback itself still owns work"
+        );
+        assert!(poll_during_stop.is_pending());
+        assert!(operations.is_exited());
+        assert_eq!(
+            poll_exit(&mut exit),
+            Poll::Ready(ConnectorSourceExitProof::Exited)
+        );
     }
 }

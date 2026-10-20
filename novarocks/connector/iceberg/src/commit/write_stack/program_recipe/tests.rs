@@ -46,7 +46,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push((phase, units));
-        if let Some((at, cause)) = self.refusal
+        if let Some((at, cause)) = self.refusal.clone()
             && trace.len() == at
         {
             return Err(cause);
@@ -537,7 +537,7 @@ fn actual_long_schema_and_copy_keep_original_entry_quantum_and_tail_causes() {
     for cause in causes() {
         for &at in &stops {
             let control = Control {
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert!(
@@ -561,7 +561,7 @@ fn actual_input_field_copy_refuses_before_publication_without_rechecking_control
     for cause in causes() {
         for at in stops {
             let control = Control {
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 ..Control::default()
             };
             let result = (|| {
@@ -589,7 +589,7 @@ fn ordinary_source_failure_still_observes_original_terminal_control() {
     let trace = success.trace.lock().unwrap().clone();
     for cause in causes() {
         let control = Control {
-            refusal: Some((trace.len(), cause)),
+            refusal: Some((trace.len(), cause.clone())),
             ..Control::default()
         };
         assert!(

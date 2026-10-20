@@ -29,10 +29,26 @@ pub struct ControlOwnedResourceFacts {
     pub allocation_request_bytes_upper_bound: usize,
     pub cumulative_work_upper_bound: usize,
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlResourceError {
     Control(CompileControlError),
     SourceModel(&'static str),
+}
+impl std::fmt::Display for ControlResourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Control(source) => source.fmt(f),
+            Self::SourceModel(detail) => f.write_str(detail),
+        }
+    }
+}
+impl std::error::Error for ControlResourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::SourceModel(_) => None,
+        }
+    }
 }
 impl From<CompileControlError> for ControlResourceError {
     fn from(e: CompileControlError) -> Self {

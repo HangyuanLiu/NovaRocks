@@ -45,7 +45,10 @@ fn chunk(columns: Vec<ArrayRef>) -> Chunk {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     Chunk::new_with_chunk_schema(batch, schema)
 }
-fn eval(name: &str, columns: Vec<ArrayRef>) -> Result<ArrayRef, String> {
+fn eval(
+    name: &str,
+    columns: Vec<ArrayRef>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut arena = ExprArena::default();
     let args = columns
         .iter()
@@ -123,7 +126,7 @@ fn legacy_regexp_extract_baseline_negative_index_regex_error_order_differs() {
             indices(vec![Some(-1)], wide),
         ];
         assert_eq!(
-            eval("regexp_extract", columns.clone()).unwrap_err(),
+            (eval("regexp_extract", columns.clone()).unwrap_err()).to_string(),
             regex::Regex::new("(bad").unwrap_err().to_string()
         );
         assert_rows(
@@ -176,7 +179,7 @@ fn legacy_regexp_extract_baseline_optional_capture_unicode_and_json_escaping() {
     );
 }
 #[test]
-fn legacy_regexp_extract_baseline_full_regex_error_above_512_and_first_needed_row() {
+fn regexp_extract_first_needed_row_keeps_full_sdk_with_bounded_outer_detail() {
     let pattern = format!("{}(", "a".repeat(900));
     let expected = regex::Regex::new(&pattern).unwrap_err().to_string();
     assert!(expected.len() > 512);
@@ -194,7 +197,9 @@ fn legacy_regexp_extract_baseline_full_regex_error_above_512_and_first_needed_ro
             ],
         )
         .unwrap_err();
-        assert_eq!(actual.as_bytes(), expected.as_bytes());
+        super::legacy_regexp_count_long_error_baseline_tests::assert_regex_failure(
+            &actual, &expected, &expected,
+        );
     }
 }
 #[test]
@@ -256,7 +261,7 @@ fn legacy_regexp_extract_baseline_empty_batch_and_exact_type_errors() {
                 "{name} expects {}",
                 if argument == 2 { "int" } else { "string" }
             );
-            assert_eq!(eval(name, columns).unwrap_err(), expected);
+            assert_eq!((eval(name, columns).unwrap_err()).to_string(), expected);
         }
     }
 }
@@ -287,7 +292,7 @@ fn legacy_regexp_extract_baseline_literal_pattern_matches_column_pattern() {
             );
             match (actual, dynamic) {
                 (Ok(a), Ok(b)) => assert_eq!(a.to_data(), b.to_data()),
-                (Err(a), Err(b)) => assert_eq!(a.as_bytes(), b.as_bytes()),
+                (Err(a), Err(b)) => assert_eq!(a.to_string().as_bytes(), b.to_string().as_bytes()),
                 other => panic!("literal/column disagreement: {other:?}"),
             }
         }

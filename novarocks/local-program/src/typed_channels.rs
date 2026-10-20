@@ -1081,6 +1081,7 @@ fn validate(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProgramChannelTypeError> {
     validate_function_value_type_observed(value, work).map_err(|error| match error {
+        KernelFailure::CompileControl(cause) => ProgramChannelTypeError::Control(cause),
         KernelFailure::Cancelled => {
             ProgramChannelTypeError::Control(CompileControlError::Cancelled)
         }

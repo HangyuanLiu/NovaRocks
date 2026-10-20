@@ -67,7 +67,11 @@ impl RawState {
             tracker,
         }
     }
-    fn input(&mut self, array: &ArrayRef, merge: bool) -> Result<(), String> {
+    fn input(
+        &mut self,
+        array: &ArrayRef,
+        merge: bool,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let ptr = self.state.as_mut_ptr() as AggStatePtr;
         let ptrs = vec![ptr; array.len()];
         if merge {
@@ -76,7 +80,7 @@ impl RawState {
             ArrayAggAgg.update_batch(&self.spec, 0, &ptrs, &AggInputView::Any(array))
         }
     }
-    fn emit(&mut self, intermediate: bool) -> Result<ArrayRef, String> {
+    fn emit(&mut self, intermediate: bool) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         ArrayAggAgg.build_array(
             &self.spec,
             0,
@@ -260,7 +264,7 @@ fn legacy_array_family_baseline_unordered_nan_order_error_text_remains_complete(
     let mut state = RawState::new(&function, input.data_type(), false);
     state.input(&input, false).unwrap();
     assert_eq!(
-        state.emit(false).unwrap_err(),
+        (state.emit(false).unwrap_err()).to_string(),
         "float comparison is not ordered"
     );
 }
@@ -278,7 +282,7 @@ fn legacy_array_family_baseline_decimal256_output_rejects_original_scalar_varian
     );
     state.input(&input, false).unwrap();
     assert_eq!(
-        state.emit(false).unwrap_err(),
+        (state.emit(false).unwrap_err()).to_string(),
         "array_agg tracked scalar type is not supported by its output ABI"
     );
 }
@@ -331,7 +335,7 @@ fn legacy_array_family_baseline_unique_scalar_binding_drift_is_not_repaired() {
     let mut state = RawState::new(&function, input.data_type(), false);
     state.input(&input, false).unwrap();
     assert_eq!(
-        state.emit(true).unwrap_err(),
+        (state.emit(true).unwrap_err()).to_string(),
         "array_agg target type must be List or Struct(List...), got Int64"
     );
     assert_eq!(ints(&state.emit(false).unwrap()), vec![Some(1), Some(2)]);

@@ -3885,7 +3885,11 @@ mod tests {
         impl PureCompileControl for RefuseInsertion {
             fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
                 self.1.lock().unwrap().push(units);
-                if units > 0 { Err(self.0) } else { Ok(()) }
+                if units > 0 {
+                    Err(self.0.clone())
+                } else {
+                    Ok(())
+                }
             }
         }
         for error in [
@@ -3916,7 +3920,7 @@ mod tests {
                 execution_props: PlanExecutionProps::default(),
             };
             let mut expected_arena = arena.clone();
-            let control = RefuseInsertion(error, Default::default());
+            let control = RefuseInsertion(error.clone(), Default::default());
             let failure = super::rewrite(
                 &mut node,
                 &mut arena,

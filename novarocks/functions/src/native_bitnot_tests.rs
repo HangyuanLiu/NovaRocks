@@ -33,7 +33,7 @@ impl PureCompileControl for Compile {
             assert!(at <= stop);
         }
         t.push((phase, units));
-        match self.fail {
+        match self.fail.clone() {
             Some((stop, e)) if stop == at => Err(e),
             _ => Ok(()),
         }
@@ -269,7 +269,7 @@ fn native_bitnot_kernel_every_preparation_callback_keeps_three_control_causes() 
             ] {
                 let c = Compile {
                     trace: Mutex::new(Vec::new()),
-                    fail: Some((at, cause)),
+                    fail: Some((at, cause.clone())),
                 };
                 assert_eq!(
                     PreparedNativeBitNotRecipe::try_new(&ty, &ty, &c)

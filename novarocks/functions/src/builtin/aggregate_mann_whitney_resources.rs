@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 //! Checked facts for the original Mann-Whitney emission containers.
 //! These stack facts neither run the statistic nor authorize an allocation.
 
@@ -21,6 +22,7 @@ use super::aggregate_mann_whitney_core::{MannResourceEvent, MannStateExtents};
 use crate::arrow_result_custody::{
     FlatByteKind, FlatDirectByteFacts, RequestUpper, direct_flat_byte_facts,
 };
+use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use crate::scalar_copy_geometry::{
     ScalarCopyDiagnosticGeometry, arrow_default_debug_bytes_upper, scalar_copy_diagnostic_geometry,
 };
@@ -147,27 +149,11 @@ fn format_string(initial: usize, output: usize) -> Result<ComponentFacts> {
     })
 }
 
-/// The original header and fixed eight-byte appends force capacities
-/// 8,16,...,q. Resource extents use actual usize counts, not truncated u32.
+/// One exact byte allocation backs the full checked state encoding.
 pub(crate) fn codec_facts(samples: usize) -> Result<(ComponentFacts, usize)> {
     let output = add(17, bytes::<f64>(samples)?)?;
-    let capacity = output
-        .checked_next_power_of_two()
-        .ok_or(ScalarResourceError::Arithmetic)?;
-    bytes::<u8>(capacity)?;
-    Ok((
-        ComponentFacts {
-            requests: RequestUpper {
-                bytes: mul(2, capacity)?
-                    .checked_sub(8)
-                    .ok_or(ScalarResourceError::Arithmetic)?,
-                requests: add(1, (capacity / 8).ilog2() as usize)?,
-            },
-            peak: mul(3, capacity / 2)?,
-            retained: capacity,
-        },
-        output,
-    ))
+    bytes::<u8>(output)?;
+    Ok((ComponentFacts::exact(output), output))
 }
 
 fn sample_sorts(state: MannStateExtents) -> Result<ComponentFacts> {
@@ -319,7 +305,7 @@ fn fresh_display_string(output: usize) -> Result<ComponentFacts> {
         retained: capacity,
     })
 }
-/// ScalarStateError Display writes its whole message once into a fresh String.
+/// MannFailure Display writes its whole message once into a fresh String.
 fn one_write_display_string(output: usize) -> Result<ComponentFacts> {
     if output == 0 {
         return Ok(ComponentFacts::ZERO);
@@ -461,9 +447,7 @@ fn row_facts(
             output,
         });
     }
-    // Preserve the original float addition/cast, separately from real pushes.
-    let initial = ((state.sample_lengths[0] as f64) + (state.sample_lengths[1] as f64)) as usize;
-    let combined = vector::<(f64, usize)>(initial, count, 4)?;
+    let combined = ComponentFacts::exact(bytes::<(f64, usize)>(count)?);
     let scratch = bytes::<(f64, usize)>(count)?;
     let scratch_requests = RequestUpper {
         bytes: scratch,

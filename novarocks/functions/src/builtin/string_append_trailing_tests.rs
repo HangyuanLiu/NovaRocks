@@ -71,7 +71,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -428,7 +428,7 @@ fn string_append_trailing_required_children_and_canonical_shape_errors_poison_on
         let mut kernel = instance(NAMES[0], 2);
         assert!(matches!(
             kernel.evaluate(selection, &arguments, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
         let after = Control::default();
         assert_eq!(
@@ -444,7 +444,7 @@ fn string_append_trailing_required_children_and_canonical_shape_errors_poison_on
     ];
     assert!(matches!(
         instance(NAMES[0], 2).evaluate(selection, &arguments, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let null = strings(vec![None]);
     let arguments = [
@@ -461,7 +461,7 @@ fn string_append_trailing_required_children_and_canonical_shape_errors_poison_on
         ScalarEvaluationInstance::instantiate(prepared)
             .unwrap()
             .evaluate(selection, &arguments, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
 }
 
@@ -792,7 +792,7 @@ fn string_append_trailing_compile_success_and_ordinary_tail_preserve_all_callbac
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let actual = prepared_for_test_with_control(
                     "append_trailing_char_if_absent",

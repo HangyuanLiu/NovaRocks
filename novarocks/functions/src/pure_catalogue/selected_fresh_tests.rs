@@ -44,7 +44,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -488,10 +488,12 @@ fn prefixes(
     assert_eq!(run(&good).is_ok(), success);
     let trace = good.trace.lock().unwrap().clone();
     assert!(!trace.is_empty());
-    assert!(
-        trace.iter().any(|units| *units > 0),
-        "completed work was not observed"
-    );
+    if success {
+        assert!(
+            trace.iter().any(|units| *units > 0),
+            "successful work was not observed"
+        );
+    }
     for at in 0..trace.len() {
         for expected in [
             CompileControlError::Cancelled,
@@ -500,7 +502,7 @@ fn prefixes(
         ] {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((at, expected)),
+                refusal: Some((at, expected.clone())),
             };
             assert_eq!(cause(run(&control).err().unwrap()), Some(expected));
             assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
@@ -508,7 +510,7 @@ fn prefixes(
     }
 }
 #[test]
-fn selected_fresh_original_controls_cover_success_and_ordinary_failure_tails() {
+fn selected_fresh_original_controls_cover_success_and_pre_failure_prefixes() {
     let fixture = Fixture::new();
     prefixes(|control| fixture.prepare(control), true);
     prefixes(
@@ -635,4 +637,69 @@ fn sealed_frozen_route_keeps_frozen_facts_mandatory_and_never_retries_fresh() {
         },
         false,
     );
+}
+
+#[test]
+fn selected_fresh_wrong_abi_and_unknown_identity_keep_real_semantic_failure_without_new_tail() {
+    let fixture = Fixture::new();
+    let foreign = FunctionId::try_new("fixture/unregistered/first-cause").unwrap();
+    for unknown in [false, true] {
+        let run = |control: &Control| {
+            let mut input = fixture.input();
+            if unknown {
+                input.function_id = &foreign;
+            }
+            let options = if unknown {
+                fixture.options()
+            } else {
+                PureCallPreparation::Table {
+                    arguments: ScopedExpressionEffects::pure_value(fixture.context()),
+                }
+            };
+            fixture.catalog.prepare_fresh_selected(
+                input,
+                fixture.selected.clone(),
+                options,
+                control,
+            )
+        };
+        let baseline = Control::default();
+        let error = run(&baseline).err().unwrap();
+        if unknown {
+            assert!(matches!(
+                error,
+                FunctionSpecializationFailure::Binding(FunctionBindingError::UnknownFunction)
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                FunctionSpecializationFailure::InvalidInput(_)
+            ));
+        }
+        let trace = baseline.trace.lock().unwrap().clone();
+        let source = CompileControlError::from_domain(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        );
+        let control = Control {
+            trace: Mutex::default(),
+            refusal: Some((trace.len(), source)),
+        };
+        let before = fixture.calls.load(Ordering::Relaxed);
+        let owners = Arc::strong_count(&fixture.selected);
+        let error = run(&control).err().unwrap();
+        if unknown {
+            assert!(matches!(
+                error,
+                FunctionSpecializationFailure::Binding(FunctionBindingError::UnknownFunction)
+            ));
+        } else {
+            assert!(matches!(
+                error,
+                FunctionSpecializationFailure::InvalidInput(_)
+            ));
+        }
+        assert_eq!(*control.trace.lock().unwrap(), trace);
+        assert_eq!(fixture.calls.load(Ordering::Relaxed), before);
+        assert_eq!(Arc::strong_count(&fixture.selected), owners);
+    }
 }

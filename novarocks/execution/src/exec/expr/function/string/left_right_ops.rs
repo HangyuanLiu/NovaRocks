@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprId, expression_contract};
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{Array, ArrayRef, StringArray};
 use std::sync::Arc;
 
@@ -24,13 +25,13 @@ fn eval_left_right_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     left: bool,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let str_arr = arena.eval(args[0], chunk)?;
     let len_arr = arena.eval(args[1], chunk)?;
     let s_arr = str_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "left expects string".to_string())?;
+        .ok_or_else(|| expression_contract("left expects string"))?;
     let len_arr = super::common::downcast_int_arg_array(&len_arr, "left")?;
     let len = s_arr.len();
     let mut out = Vec::with_capacity(len);
@@ -57,8 +58,8 @@ pub fn eval_left<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_left_right_impl(arena, args, chunk, true))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_left_right_impl(arena, args, chunk, true)
 }
 
 pub fn eval_right<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -66,8 +67,8 @@ pub fn eval_right<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_left_right_impl(arena, args, chunk, false))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_left_right_impl(arena, args, chunk, false)
 }
 
 pub fn eval_strleft<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -75,8 +76,8 @@ pub fn eval_strleft<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_left_right_impl(arena, args, chunk, true))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_left_right_impl(arena, args, chunk, true)
 }
 
 pub fn eval_strright<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -84,6 +85,6 @@ pub fn eval_strright<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_left_right_impl(arena, args, chunk, false))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_left_right_impl(arena, args, chunk, false)
 }

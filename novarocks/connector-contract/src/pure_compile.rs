@@ -34,7 +34,14 @@ impl<E: Error> fmt::Display for PureProviderCompileError<E> {
         }
     }
 }
-impl<E: Error> Error for PureProviderCompileError<E> {}
+impl<E: Error + 'static> Error for PureProviderCompileError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Provider(source) => Some(source),
+            Self::Control(source) => Some(source),
+        }
+    }
+}
 
 impl<E: Error> From<CompileControlError> for PureProviderCompileError<E> {
     fn from(error: CompileControlError) -> Self {

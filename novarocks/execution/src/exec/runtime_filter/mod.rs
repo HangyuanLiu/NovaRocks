@@ -30,6 +30,7 @@ mod apply;
 mod binary;
 mod bitset;
 mod bloom;
+mod failure;
 mod in_filter;
 mod membership;
 mod merger;

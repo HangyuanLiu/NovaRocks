@@ -619,6 +619,9 @@ fn decode_contract_with_types(
                     )
                     .into()
                 }
+                contribution::RuntimeOrderContractValidationFailure::Schema(cause) => {
+                    NativeTypeDecodeError::from_domain(path.clone(), cause)
+                }
                 contribution::RuntimeOrderContractValidationFailure::Work(cause) => cause,
             })?;
             {
@@ -2189,7 +2192,7 @@ mod tests {
                 error.path().to_string(),
                 "logical_domain.contract.membership.null_semantics"
             );
-            assert_eq!(error.kind(), ProtocolErrorKind::InvalidEnum);
+            assert_eq!(error.kind(), &ProtocolErrorKind::InvalidEnum);
         }
     }
 
@@ -2484,14 +2487,9 @@ mod typed_domain_creation_tests {
     }
     fn creator(
         tracker: Arc<MemTracker>,
-        stop: &ConnectorStopOwner,
-    ) -> NativeTypeConstruction<'static> {
-        NativeTypeConstruction::try_new(
-            tracker,
-            stop.view(),
-            novarocks_worker::TaskPreparationStopView::unstopped_for_test(),
-        )
-        .unwrap()
+        control: &crate::backend_test_support::PureConnectorCompileControl,
+    ) -> NativeTypeConstruction<'_> {
+        NativeTypeConstruction::try_with_control(tracker, control).unwrap()
     }
     #[test]
     fn independently_decoded_runtime_filter_domain_retains_actual_creator_until_last_binding_reference()
@@ -2506,7 +2504,8 @@ mod typed_domain_creation_tests {
         let tracker = MemTracker::new_root("RF complete domain fixture");
         tracker.install_limit_once(1024 * 1024).unwrap();
         let stop = ConnectorStopOwner::new();
-        let creation = creator(tracker.clone(), &stop);
+        let control = crate::backend_test_support::PureConnectorCompileControl(stop.view());
+        let creation = creator(tracker.clone(), &control);
         let mut resources = NativeTypeDecodeResources::try_new(&creation).unwrap();
         let decoded = decode_typed_contract_domain(
             7,
@@ -2556,7 +2555,8 @@ mod typed_domain_creation_tests {
             let tracker = MemTracker::new_root("RF namespace fixture");
             tracker.install_limit_once(1024 * 1024).unwrap();
             let stop = ConnectorStopOwner::new();
-            let creation = creator(tracker, &stop);
+            let control = crate::backend_test_support::PureConnectorCompileControl(stop.view());
+            let creation = creator(tracker, &control);
             let mut resources = NativeTypeDecodeResources::try_new(&creation).unwrap();
             let error = decode_typed_contract_domain(
                 1,
@@ -2642,7 +2642,8 @@ mod typed_domain_creation_tests {
         wire.logical_domain.as_mut().unwrap().execution_types = Some(table);
         let tracker = MemTracker::new_root("RF scoped child");
         let stop = ConnectorStopOwner::new();
-        let creation = creator(tracker.clone(), &stop);
+        let control = crate::backend_test_support::PureConnectorCompileControl(stop.view());
+        let creation = creator(tracker.clone(), &control);
         let mut resources = NativeTypeDecodeResources::try_new(&creation).unwrap();
         let contract = decode_typed_contract_domain(
             7,
@@ -2679,7 +2680,8 @@ mod typed_domain_creation_tests {
         let wire = domain(&source);
         let tracker = MemTracker::new_root("RF canonical scope");
         let stop = ConnectorStopOwner::new();
-        let creation = creator(tracker.clone(), &stop);
+        let control = crate::backend_test_support::PureConnectorCompileControl(stop.view());
+        let creation = creator(tracker.clone(), &control);
         let mut resources = NativeTypeDecodeResources::try_new(&creation).unwrap();
         let contract = decode_typed_contract_domain(
             7,

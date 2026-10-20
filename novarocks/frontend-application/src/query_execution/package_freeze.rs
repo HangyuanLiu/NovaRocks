@@ -97,7 +97,36 @@ impl fmt::Display for PackageFreezeError {
         }
     }
 }
-impl std::error::Error for PackageFreezeError {}
+impl std::error::Error for PackageFreezeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(cause) => Some(cause),
+            Self::Semantics(source) => Some(source),
+            Self::Encode(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for PackageFreezeError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+        };
+        let code = match self {
+            Self::Control(cause) => return cause.failure_fact(),
+            Self::Semantics(source) => return source.failure_fact(),
+            Self::Encode(source) => return source.failure_fact(),
+            Self::Extraction(_) => 200,
+            Self::Facts(_) => 201,
+            Self::Read(_) => 202,
+            Self::Write(_) => 203,
+        };
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
 
 /// A completed plan the compiled carrier cannot freeze is refused through the
 /// encoder's own error, keeping a caller's control cause primary.
@@ -105,10 +134,7 @@ impl From<PackageFreezeError> for novarocks_plan_codec::PhysicalEncodeError {
     fn from(error: PackageFreezeError) -> Self {
         match error {
             PackageFreezeError::Control(cause) => Self::Control(cause),
-            PackageFreezeError::Semantics(
-                novarocks_sql::compiler::PackageSemanticsError::UnsupportedCapability(detail),
-            ) => Self::UnsupportedCapability(format!("compiled package carrier: {detail}")),
-            other => Self::Invalid(format!("compiled package carrier: {other}")),
+            other => Self::from_domain(other),
         }
     }
 }
@@ -211,27 +237,35 @@ mod error_projection_tests {
 
     #[test]
     fn package_freeze_preserves_only_typed_semantic_capability_refusals() {
-        let detail = "cast List<Int8> to List<Int64>";
-        let error = PhysicalEncodeError::from(PackageFreezeError::Semantics(
-            PackageSemanticsError::UnsupportedCapability(detail.into()),
-        ));
-        assert_eq!(
-            error,
-            PhysicalEncodeError::UnsupportedCapability(format!(
-                "compiled package carrier: {detail}"
-            ))
-        );
-        let invalid = PhysicalEncodeError::from(PackageFreezeError::Semantics(
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        for original in [
+            PackageSemanticsError::UnsupportedCapability("cast List<Int8> to List<Int64>".into()),
             PackageSemanticsError::Effects("UnsupportedCast diagnostic".into()),
-        ));
-        assert!(matches!(invalid, PhysicalEncodeError::Invalid(_)));
+        ] {
+            let expected = original.failure_fact();
+            let error = PhysicalEncodeError::from(PackageFreezeError::Semantics(original));
+            assert_eq!(error.failure_fact(), expected);
+            let PhysicalEncodeError::Source(source) = error else {
+                panic!("retain the actual freeze author")
+            };
+            let Some(PackageFreezeError::Semantics(original)) =
+                source.downcast_ref::<PackageFreezeError>()
+            else {
+                panic!("retain the nested SQL semantics author")
+            };
+            assert_eq!(original.failure_fact(), expected);
+            assert_eq!(
+                matches!(original, PackageSemanticsError::UnsupportedCapability(_)),
+                expected.class() == FailureClass::Unsupported
+            );
+        }
         for cause in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
             assert_eq!(
-                PhysicalEncodeError::from(PackageFreezeError::Control(cause)),
+                PhysicalEncodeError::from(PackageFreezeError::Control(cause.clone())),
                 PhysicalEncodeError::Control(cause)
             );
         }

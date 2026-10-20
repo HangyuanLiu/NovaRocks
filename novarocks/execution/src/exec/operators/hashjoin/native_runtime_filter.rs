@@ -18,6 +18,21 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+fn producer_contract(detail: String) -> ExecutionFailure {
+    execution::RuntimeFilterContractViolation::new(
+        execution::RuntimeFilterContractViolationKind::ContractMismatch,
+        detail,
+    )
+    .into()
+}
+fn producer_partition(detail: String) -> ExecutionFailure {
+    execution::RuntimeFilterContractViolation::new(
+        execution::RuntimeFilterContractViolationKind::InvalidPartitionCount,
+        detail,
+    )
+    .into()
+}
 use crate::runtime_filter as execution;
 use arrow::array::ArrayRef;
 
@@ -70,19 +85,19 @@ impl NativeMembershipProducerBinding {
         eq_null_safe: &[bool],
         arena: &ExprArena,
         session: execution::RuntimeFilterSessionRef,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let build_expr = build_keys.get(spec.build_key_index).ok_or_else(|| {
-            format!(
+            producer_contract(format!(
                 "native runtime-filter binding_id={} join key ordinal {} is out of bounds for {} build keys",
                 spec.binding_id(), spec.build_key_index, build_keys.len()
-            )
+            ))
         })?;
         if *build_expr != spec.build_expr_id {
-            return Err(format!(
+            return Err(producer_contract(format!(
                 "native runtime-filter binding_id={} build expression does not match join key ordinal {}",
                 spec.binding_id(),
                 spec.build_key_index
-            ));
+            )));
         }
         Self::checked(
             spec.contract(),
@@ -90,10 +105,10 @@ impl NativeMembershipProducerBinding {
             eq_null_safe,
             || {
                 arena.data_type(spec.build_expr_id).cloned().ok_or_else(|| {
-                    format!(
+                    producer_contract(format!(
                         "native runtime-filter binding_id={} build expression has no frozen data type",
                         spec.binding_id()
-                    )
+                    ))
                 })
             },
             session,
@@ -108,37 +123,37 @@ impl NativeMembershipProducerBinding {
         contract: &execution::RuntimeFilterProducerContract,
         join_key_ordinal: usize,
         eq_null_safe: &[bool],
-        key_type: impl FnOnce() -> Result<arrow::datatypes::DataType, String>,
+        key_type: impl FnOnce() -> ExecutionResult<arrow::datatypes::DataType>,
         session: execution::RuntimeFilterSessionRef,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let binding_id = contract.binding_id().get();
         let expected_null_semantics = match eq_null_safe.get(join_key_ordinal).copied() {
             Some(false) => execution::RuntimeFilterNullSemantics::NeverMatches,
             Some(true) => execution::RuntimeFilterNullSemantics::NullSafeEqual,
             None => {
-                return Err(format!(
+                return Err(producer_contract(format!(
                     "native runtime-filter binding_id={binding_id} join key ordinal {join_key_ordinal} has no null-safe equality flag"
-                ));
+                )));
             }
         };
         let data_type = key_type()?;
         if contract.kind() != execution::RuntimeFilterProducerKind::Membership {
-            return Err(format!(
+            return Err(producer_contract(format!(
                 "native runtime-filter binding_id={binding_id} hash join producer requires a membership producer contract"
-            ));
+            )));
         }
         let RuntimeFilterExecutionContract::Membership(membership_schema) = contract.contract()
         else {
-            return Err(format!(
+            return Err(producer_contract(format!(
                 "native runtime-filter binding_id={binding_id} hash join producer requires a membership contract"
-            ));
+            )));
         };
         if membership_schema.data_type() != &data_type
             || membership_schema.null_semantics() != expected_null_semantics
         {
-            return Err(format!(
+            return Err(producer_contract(format!(
                 "native runtime-filter binding_id={binding_id} membership schema does not match build key ordinal {join_key_ordinal}"
-            ));
+            )));
         }
         Ok(Self {
             join_key_ordinal,
@@ -166,7 +181,7 @@ impl NativeRuntimeFilterProducerFactory {
         arena: &ExprArena,
         session: execution::RuntimeFilterSessionRef,
         local_partition_count: i32,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let local_partition_count = checked_local_partition_count(local_partition_count)?;
         let bindings = specs
             .iter()
@@ -193,10 +208,10 @@ impl NativeRuntimeFilterProducerFactory {
     pub(crate) fn from_compiled(
         producers: &[(usize, execution::RuntimeFilterProducerContract)],
         eq_null_safe: &[bool],
-        mut build_key_type: impl FnMut(usize) -> Result<arrow::datatypes::DataType, String>,
+        mut build_key_type: impl FnMut(usize) -> ExecutionResult<arrow::datatypes::DataType>,
         session: execution::RuntimeFilterSessionRef,
         local_partition_count: i32,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         let local_partition_count = checked_local_partition_count(local_partition_count)?;
         let bindings = producers
             .iter()
@@ -224,9 +239,11 @@ impl NativeRuntimeFilterProducerFactory {
     pub(crate) fn for_test(
         session: execution::RuntimeFilterSessionRef,
         local_partition_count: u32,
-    ) -> Result<Self, String> {
+    ) -> ExecutionResult<Self> {
         if local_partition_count == 0 {
-            return Err("native runtime-filter build DOP must be positive".to_string());
+            return Err(producer_partition(
+                "native runtime-filter build DOP must be positive".to_string(),
+            ));
         }
         Ok(Self {
             bindings: vec![NativeMembershipProducerBinding::for_test(
@@ -247,23 +264,27 @@ impl NativeRuntimeFilterProducerFactory {
         &self,
         actual_dop: i32,
         local_index: i32,
-    ) -> Result<NativeRuntimeFilterProducerSet, String> {
+    ) -> ExecutionResult<NativeRuntimeFilterProducerSet> {
         let actual_dop = u32::try_from(actual_dop).map_err(|_| {
-            format!("native runtime-filter actual DOP {actual_dop} cannot be represented")
+            producer_partition(format!(
+                "native runtime-filter actual DOP {actual_dop} cannot be represented"
+            ))
         })?;
         if actual_dop != self.local_partition_count {
-            return Err(format!(
+            return Err(producer_partition(format!(
                 "native runtime-filter build DOP drifted between factory build and operator creation: expected={} actual={actual_dop}",
                 self.local_partition_count
-            ));
+            )));
         }
         let local_index = u32::try_from(local_index).map_err(|_| {
-            format!("native runtime-filter local driver index {local_index} cannot be represented")
+            producer_partition(format!(
+                "native runtime-filter local driver index {local_index} cannot be represented"
+            ))
         })?;
         if local_index >= actual_dop {
-            return Err(format!(
+            return Err(producer_partition(format!(
                 "native runtime-filter local driver index {local_index} is outside DOP {actual_dop}"
-            ));
+            )));
         }
         Ok(NativeRuntimeFilterProducerSet {
             streams: self
@@ -277,14 +298,16 @@ impl NativeRuntimeFilterProducerFactory {
     }
 }
 
-fn checked_local_partition_count(local_partition_count: i32) -> Result<u32, String> {
+fn checked_local_partition_count(local_partition_count: i32) -> ExecutionResult<u32> {
     let local_partition_count = u32::try_from(local_partition_count).map_err(|_| {
-        format!(
+        producer_partition(format!(
             "native runtime-filter build DOP {local_partition_count} cannot be represented as a partition count"
-        )
+        ))
     })?;
     if local_partition_count == 0 {
-        return Err("native runtime-filter build DOP must be positive".to_string());
+        return Err(producer_partition(
+            "native runtime-filter build DOP must be positive".to_string(),
+        ));
     }
     Ok(local_partition_count)
 }
@@ -295,7 +318,7 @@ pub(crate) struct NativeRuntimeFilterProducerSet {
 }
 
 impl NativeRuntimeFilterProducerSet {
-    pub(crate) fn bind(&mut self, local_partition_count: u32) -> Result<(), String> {
+    pub(crate) fn bind(&mut self, local_partition_count: u32) -> ExecutionResult<()> {
         for stream in &mut self.streams {
             if let Err(error) = stream.bind(local_partition_count) {
                 let _ =
@@ -306,7 +329,7 @@ impl NativeRuntimeFilterProducerSet {
         Ok(())
     }
 
-    pub(crate) fn submit(&mut self, key_arrays: &[ArrayRef]) -> Result<(), String> {
+    pub(crate) fn submit(&mut self, key_arrays: &[ArrayRef]) -> ExecutionResult<()> {
         if self.completed {
             return Ok(());
         }
@@ -328,7 +351,7 @@ impl NativeRuntimeFilterProducerSet {
         Ok(())
     }
 
-    pub(crate) fn finish(&mut self) -> Result<(), String> {
+    pub(crate) fn finish(&mut self) -> ExecutionResult<()> {
         if self.completed {
             return Ok(());
         }
@@ -347,7 +370,7 @@ impl NativeRuntimeFilterProducerSet {
     pub(crate) fn fail(
         &mut self,
         reason: execution::RuntimeFilterProducerFailure,
-    ) -> Result<(), String> {
+    ) -> ExecutionResult<()> {
         if self.completed {
             return Ok(());
         }
@@ -359,7 +382,7 @@ impl NativeRuntimeFilterProducerSet {
     fn fail_incomplete(
         &mut self,
         reason: execution::RuntimeFilterProducerFailure,
-    ) -> Result<(), String> {
+    ) -> ExecutionResult<()> {
         let mut first_error = None;
         for stream in &mut self.streams {
             if let Err(error) = stream.fail(reason)
@@ -404,7 +427,7 @@ impl NativeMembershipProducerStream {
         }
     }
 
-    fn bind(&mut self, local_partition_count: u32) -> Result<(), String> {
+    fn bind(&mut self, local_partition_count: u32) -> ExecutionResult<()> {
         if self.producer.is_some() || self.terminal {
             return Ok(());
         }
@@ -427,38 +450,34 @@ impl NativeMembershipProducerStream {
                 self.mark_service_unavailable();
                 Ok(())
             }
-            Err(error) => Err(format!(
-                "native runtime-filter binding_id={} execution session open failed during operator bind: {error}",
-                self.binding.binding_id()
-            )),
+            Err(error) => Err(error.into()),
         }
     }
 
-    fn submit(&mut self, key_arrays: &[ArrayRef]) -> Result<NativeMembershipSubmitOutcome, String> {
+    fn submit(
+        &mut self,
+        key_arrays: &[ArrayRef],
+    ) -> ExecutionResult<NativeMembershipSubmitOutcome> {
         if self.terminal || self.binding.coordinator.failed.load(Ordering::Acquire) {
             return Ok(NativeMembershipSubmitOutcome::Applied);
         }
         let producer = self.producer.as_ref().ok_or_else(|| {
-            format!(
+            producer_contract(format!(
                 "native runtime-filter binding_id={} producer was not bound before build input",
                 self.binding.binding_id()
-            )
+            ))
         })?;
-        let array = key_arrays.get(self.binding.join_key_ordinal).ok_or_else(|| format!(
+        let array = key_arrays.get(self.binding.join_key_ordinal).ok_or_else(|| producer_contract(format!(
             "native runtime-filter binding_id={} build key ordinal {} is missing from evaluated arrays",
             self.binding.binding_id(), self.binding.join_key_ordinal
-        ))?;
+        )))?;
         let contributions = match execution::contribution::encode_membership_contributions(
             &self.binding.contract,
             array,
             producer.max_contribution_bytes(),
         )
-        .map_err(|error| {
-            format!(
-                "native runtime-filter binding_id={} membership encoding failed: {error}",
-                self.binding.binding_id()
-            )
-        })? {
+        .map_err(ExecutionFailure::from_domain)?
+        {
             execution::contribution::MembershipContributionEncodingOutcome::Contributions(
                 values,
             ) => values,
@@ -489,32 +508,26 @@ impl NativeMembershipProducerStream {
                     return Ok(NativeMembershipSubmitOutcome::Applied);
                 }
                 Err(error) => {
-                    return Err(format!(
-                        "native runtime-filter binding_id={} contribution failed: {error}",
-                        self.binding.binding_id()
-                    ));
+                    return Err(error.into());
                 }
             }
             self.next_sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
-                format!(
-                    "native runtime-filter binding_id={} producer sequence overflow",
-                    self.binding.binding_id()
-                )
+                execution::producer_sequence_extent(self.binding.binding_id(), self.next_sequence)
             })?;
         }
         Ok(NativeMembershipSubmitOutcome::Applied)
     }
 
-    fn finish(&mut self) -> Result<(), String> {
+    fn finish(&mut self) -> ExecutionResult<()> {
         if self.terminal || self.binding.coordinator.failed.load(Ordering::Acquire) {
             self.terminal = true;
             return Ok(());
         }
         let producer = self.producer.as_ref().ok_or_else(|| {
-            format!(
+            producer_contract(format!(
                 "native runtime-filter binding_id={} producer was not bound before finish",
                 self.binding.binding_id()
-            )
+            ))
         })?;
         match producer.close_partition(
             self.partition_id,
@@ -534,10 +547,7 @@ impl NativeMembershipProducerStream {
                 return Ok(());
             }
             Err(error) => {
-                return Err(format!(
-                    "native runtime-filter binding_id={} close failed: {error}",
-                    self.binding.binding_id()
-                ));
+                return Err(error.into());
             }
         }
         self.terminal = true;
@@ -552,7 +562,7 @@ impl NativeMembershipProducerStream {
         self.terminal = true;
     }
 
-    fn fail(&mut self, reason: execution::RuntimeFilterProducerFailure) -> Result<(), String> {
+    fn fail(&mut self, reason: execution::RuntimeFilterProducerFailure) -> ExecutionResult<()> {
         self.terminal = true;
         if self
             .binding
@@ -569,10 +579,7 @@ impl NativeMembershipProducerStream {
         if let Err(error) = producer.fail(reason)
             && error.kind() != execution::RuntimeFilterContractViolationKind::SessionClosed
         {
-            return Err(format!(
-                "native runtime-filter binding_id={} fail-open failed: {error}",
-                self.binding.binding_id()
-            ));
+            return Err(error.into());
         }
         Ok(())
     }
@@ -818,7 +825,11 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.contains("requires a membership producer contract"));
+        assert!(
+            error
+                .to_string()
+                .contains("requires a membership producer contract")
+        );
         assert_eq!(session.producer_open_count(), 0);
         assert!(recording.events().is_empty());
     }

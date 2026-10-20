@@ -57,7 +57,7 @@ pub fn guarded_result_extent(ty: &DataType, rows: usize) -> Result<(), CopyError
             Ok(())
         }
         _ if supports_guarded_result(ty) => guarded_interleave_extent(ty, rows),
-        other => Err(CopyError::Unsupported(other.clone())),
+        other => Err(CopyError::unsupported(other)),
     }
 }
 
@@ -111,7 +111,7 @@ pub(super) fn preflight_nested_interleave(
         }
         visit_interleave(&borrowed, &selection, &mut work)
     })();
-    if matches!(&result, Err(CopyError::Control(_))) {
+    if matches!(&result, Err(CopyError::Control(_) | CopyError::Extent(_))) {
         return result;
     }
     work.boundary()?;
@@ -193,7 +193,11 @@ fn selected_bytes<T: ByteArrayType>(
                 work.step()?;
                 let start = offset_value(array.value_offsets()[row])?;
                 let end = offset_value(array.value_offsets()[row + 1])?;
-                one = add(one, end.checked_sub(start).ok_or(CopyError::Extent)?)?;
+                one = add(
+                    one,
+                    end.checked_sub(start)
+                        .ok_or(CopyError::Invalid("copy source offsets are not monotonic"))?,
+                )?;
             }
         }
         total = add(total, mul(one, block.repeats)?)?;

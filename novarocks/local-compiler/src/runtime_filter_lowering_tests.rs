@@ -1205,7 +1205,7 @@ fn every_runtime_filter_compile_callback_keeps_the_original_control_cause() {
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = Trace::new(Some((at, cause)));
+            let control = Trace::new(Some((at, cause.clone())));
             assert!(matches!(
                 compile_with(&package, None, &control),
                 Err(FragmentCompileError::Control(actual)) if actual == cause

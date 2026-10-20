@@ -580,9 +580,8 @@ pub struct FoldRequest {
 /// - `Err(Evaluation(_))` — evaluation failed. Callers keep the original expression and
 ///   must never surface this as a planning error, because the runtime is
 ///   still allowed to produce a value or its own error for that expression.
-/// - `Err(InvalidType(_))` — invalid frozen type facts; compilation stops.
-/// - `Err(Preparation(_))` — a pure preparation failure; compilation stops.
-///   Resource, internal and static failures cannot become optional row errors.
+/// - `Err(Source(_))` — the producer owns its classification and source.
+///   Only Data may decline optional folding; every other class stops compilation.
 /// - `Err(Control(_))` — request cancellation, deadline or resource exhaustion;
 ///   compilation stops with that exact category, never an optimization decline.
 // Design: ADR-0100 (docs/adr/ADR-0100-constant-folding-reuses-execution-kernels-through-an-injected-port.md)
@@ -634,9 +633,21 @@ pub trait SqlConstantEvaluator: Send + Sync {
 pub enum SqlConstantEvaluationError {
     Control(novarocks_type_contract::CompileControlError),
     Constant(novarocks_functions::ConstantError),
-    InvalidType(novarocks_type_contract::ValueTypeError),
-    Preparation(novarocks_functions::KernelFailure),
+    Source(novarocks_failure_contract::SharedFailureCause),
     Evaluation(String),
+}
+
+impl SqlConstantEvaluationError {
+    pub fn from_domain<E>(source: E) -> Self
+    where
+        E: std::error::Error
+            + novarocks_failure_contract::FailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::Source(novarocks_failure_contract::SharedFailureCause::new(source))
+    }
 }
 
 impl From<novarocks_type_contract::CompileControlError> for SqlConstantEvaluationError {
@@ -656,22 +667,13 @@ impl From<novarocks_functions::ConstantError> for SqlConstantEvaluationError {
 
 impl From<novarocks_type_contract::ValueTypeError> for SqlConstantEvaluationError {
     fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
-        Self::InvalidType(error)
+        Self::from_domain(error)
     }
 }
 
 impl From<novarocks_functions::KernelFailure> for SqlConstantEvaluationError {
     fn from(error: novarocks_functions::KernelFailure) -> Self {
-        use novarocks_functions::KernelFailure;
-        use novarocks_type_contract::CompileControlError;
-        match error {
-            KernelFailure::Cancelled => Self::Control(CompileControlError::Cancelled),
-            KernelFailure::DeadlineExceeded => Self::Control(CompileControlError::DeadlineExceeded),
-            KernelFailure::ResourceExhausted => {
-                Self::Control(CompileControlError::ResourceExhausted)
-            }
-            other => Self::Preparation(other),
-        }
+        Self::from_domain(error)
     }
 }
 
@@ -686,14 +688,22 @@ impl fmt::Display for SqlConstantEvaluationError {
         match self {
             Self::Control(error) => error.fmt(f),
             Self::Constant(error) => error.fmt(f),
-            Self::InvalidType(error) => error.fmt(f),
-            Self::Preparation(error) => error.fmt(f),
+            Self::Source(error) => error.fmt(f),
             Self::Evaluation(error) => f.write_str(error),
         }
     }
 }
 
-impl std::error::Error for SqlConstantEvaluationError {}
+impl std::error::Error for SqlConstantEvaluationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            Self::Constant(source) => Some(source),
+            Self::Source(source) => Some(source),
+            Self::Evaluation(_) => None,
+        }
+    }
+}
 
 /// A constant evaluator that never folds.
 ///
@@ -918,6 +928,9 @@ impl SqlCompileControl {
 
     fn compile_error(error: novarocks_type_contract::CompileControlError) -> SqlCompileError {
         match error {
+            novarocks_type_contract::CompileControlError::Source(source) => {
+                SqlCompileError::CompilationSource(source)
+            }
             novarocks_type_contract::CompileControlError::Cancelled => SqlCompileError::Cancelled,
             novarocks_type_contract::CompileControlError::DeadlineExceeded => {
                 SqlCompileError::DeadlineExceeded
@@ -1439,6 +1452,7 @@ pub enum SqlCompileError {
     InvalidRequest(String),
     Analyze(AnalyzeError),
     Compilation(String),
+    CompilationSource(novarocks_failure_contract::SharedFailureCause),
 }
 
 impl From<String> for SqlCompileError {
@@ -1451,10 +1465,19 @@ impl From<novarocks_functions::FunctionBindingError> for SqlCompileError {
     fn from(error: novarocks_functions::FunctionBindingError) -> Self {
         match error {
             novarocks_functions::FunctionBindingError::Control(error) => error.into(),
+            error @ novarocks_functions::FunctionBindingError::VariantTargetType(_) => {
+                Self::Analyze(AnalyzeError::function_binding(error))
+            }
             error @ novarocks_functions::FunctionBindingError::UnavailableImplementation(_) => {
                 Self::Analyze(AnalyzeError::function_binding(error))
             }
-            other => Self::Compilation(other.to_string()),
+            error @ (novarocks_functions::FunctionBindingError::ValueType(_)
+            | novarocks_functions::FunctionBindingError::Constant(_)) => {
+                Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(error))
+            }
+            other => {
+                Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(other))
+            }
         }
     }
 }
@@ -1463,11 +1486,9 @@ impl From<novarocks_functions::ConstantError> for SqlCompileError {
     fn from(error: novarocks_functions::ConstantError) -> Self {
         match error {
             novarocks_functions::ConstantError::Control(error) => error.into(),
-            novarocks_functions::ConstantError::Limit(_) => Self::ResourceExhausted,
-            novarocks_functions::ConstantError::Type(error) => {
-                Self::InvalidRequest(error.to_string())
+            error => {
+                Self::CompilationSource(novarocks_failure_contract::SharedFailureCause::new(error))
             }
-            error => Self::Compilation(error.to_string()),
         }
     }
 }
@@ -1495,11 +1516,29 @@ impl std::fmt::Display for SqlCompileError {
             Self::ResourceExhausted => f.write_str("SQL compilation resource budget was exhausted"),
             Self::InvalidRequest(error) | Self::Compilation(error) => f.write_str(error),
             Self::Analyze(error) => error.fmt(f),
+            Self::CompilationSource(source) => source.fmt(f),
         }
     }
 }
 
-impl std::error::Error for SqlCompileError {}
+impl SqlCompileError {
+    pub fn source_failure(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
+        match self {
+            Self::CompilationSource(source) => Some(source),
+            Self::Analyze(error) => error.source_failure(),
+            _ => None,
+        }
+    }
+}
+impl std::error::Error for SqlCompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CompilationSource(source) => Some(source),
+            Self::Analyze(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Keep legacy runtime ALLOW_THROW semantics out of stateless numeric folding.
 /// The no-op port still permits structural reductions such as Nested(literal).
@@ -2064,6 +2103,35 @@ fn validate_planning_environment(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn binding_failure_preserves_its_domain_source_without_text_reclassification() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+        let original = novarocks_functions::FunctionBindingError::InvalidBinding(
+            "ResourceExhausted: cancelled S3 403".into(),
+        );
+        let super::SqlCompileError::CompilationSource(source) =
+            super::SqlCompileError::from(original.clone())
+        else {
+            panic!("binding failure must retain its actual domain source");
+        };
+        assert_eq!(
+            source.downcast_ref::<novarocks_functions::FunctionBindingError>(),
+            Some(&original)
+        );
+        assert_eq!(source.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            source.failure_fact().reason().domain(),
+            domain::FUNCTION_BINDING.get()
+        );
+        assert_eq!(source.failure_fact().reason().code(), 10);
+        assert_eq!(
+            super::SqlCompileError::from(novarocks_functions::FunctionBindingError::Control(
+                novarocks_type_contract::CompileControlError::Cancelled
+            )),
+            super::SqlCompileError::Cancelled
+        );
+    }
+
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, LazyLock};
     use std::time::{Duration, Instant};
@@ -2239,6 +2307,28 @@ mod tests {
     }
 
     #[test]
+    fn compiler_and_analyzer_control_keep_the_same_original_source() {
+        use novarocks_failure_contract::FailureProjection;
+        use novarocks_type_contract::{
+            CompileControlError, owned_resources::layout::LayoutResourceError,
+        };
+        let raw = LayoutResourceError::SourceModel;
+        let expected = raw.failure_fact();
+        let cause = CompileControlError::from_domain(raw);
+        let CompileControlError::Source(source) = &cause else {
+            panic!("original source")
+        };
+        for error in [
+            SqlCompileControl::compile_error(cause.clone()),
+            SqlCompileError::from(AnalyzeError::control(cause.clone())),
+        ] {
+            let actual = error.source_failure().expect("original source");
+            assert_eq!(actual, source);
+            assert_eq!(actual.failure_fact(), expected);
+        }
+    }
+
+    #[test]
     fn analyzer_control_keeps_all_outer_categories_and_semantic_errors() {
         use novarocks_type_contract::CompileControlError;
         for (cause, expected) in [
@@ -2252,7 +2342,7 @@ mod tests {
                 SqlCompileError::ResourceExhausted,
             ),
         ] {
-            let error = AnalyzeError::control(cause);
+            let error = AnalyzeError::control(cause.clone());
             assert_eq!(error.control_error(), Some(cause));
             assert!(error.span().is_none());
             assert_eq!(SqlCompileError::from(error), expected);
@@ -3413,7 +3503,7 @@ mod tests {
                 assert_eq!(phase, CompilePhase::FunctionSpecialization);
                 let mut checks = self.checks.lock().unwrap();
                 checks.push(units);
-                if let Some((at, error)) = self.failure
+                if let Some((at, error)) = self.failure.clone()
                     && checks.len() == at
                 {
                     return Err(error);
@@ -3452,7 +3542,7 @@ mod tests {
             for at in [1, 2] {
                 let owner = Owner {
                     checks: Default::default(),
-                    failure: Some((at, error)),
+                    failure: Some((at, error.clone())),
                 };
                 assert!(
                     matches!(noop_constant_evaluator().eval_scalar(&request, &owner), Err(SqlConstantEvaluationError::Control(actual)) if actual == error)
@@ -3717,3 +3807,64 @@ mod range_envelope_behavior_tests;
 
 #[cfg(test)]
 mod map_subscript_value_type_tests;
+
+#[cfg(test)]
+mod binding_value_type_source_properties {
+    use super::*;
+    use novarocks_failure_contract::FailureProjection;
+    use std::error::Error;
+    #[test]
+    fn sql_compilation_keeps_constant_owner_reason_through_both_entrypoints() {
+        for original in [
+            novarocks_functions::ConstantError::Limit("actual owner policy"),
+            novarocks_functions::ConstantError::Type(
+                novarocks_type_contract::ValueTypeError::TooDeep,
+            ),
+            novarocks_functions::ConstantError::Invalid("memory exhausted"),
+        ] {
+            let expected = original.failure_fact();
+            for error in [
+                SqlCompileError::from(original.clone()),
+                SqlCompileError::from(novarocks_functions::FunctionBindingError::from(
+                    original.clone(),
+                )),
+            ] {
+                assert_eq!(error.source_failure().unwrap().failure_fact(), expected);
+                let mut source: &(dyn Error + 'static) = &error;
+                loop {
+                    if let Some(actual) =
+                        source.downcast_ref::<novarocks_functions::ConstantError>()
+                    {
+                        assert_eq!(actual, &original);
+                        break;
+                    }
+                    source = source.source().expect("original constant owner source");
+                }
+            }
+        }
+    }
+    #[test]
+    fn sql_compilation_keeps_binding_type_source_and_neutral_fact() {
+        for original in [
+            novarocks_type_contract::ValueTypeError::TooDeep,
+            novarocks_type_contract::ValueTypeError::UnknownLogicalMetadata,
+        ] {
+            let error =
+                SqlCompileError::from(novarocks_functions::FunctionBindingError::from(original));
+            assert_eq!(
+                error.source_failure().unwrap().failure_fact(),
+                original.failure_fact()
+            );
+            let mut source: &(dyn Error + 'static) = &error;
+            loop {
+                if let Some(actual) =
+                    source.downcast_ref::<novarocks_type_contract::ValueTypeError>()
+                {
+                    assert_eq!(actual, &original);
+                    break;
+                }
+                source = source.source().expect("original binding value-type source");
+            }
+        }
+    }
+}

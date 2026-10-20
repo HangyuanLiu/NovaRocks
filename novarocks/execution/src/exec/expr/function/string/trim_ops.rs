@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprArena, ExprId, expression_contract};
+use crate::runtime::fragment::ExecutionResult;
 use arrow::array::{Array, ArrayRef, StringArray};
 use novarocks_functions::builtin::string_trim_core::{StringTrimOp, trimmed_observed};
 use std::{convert::Infallible, sync::Arc};
@@ -25,12 +26,12 @@ fn eval_trim_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     args: &[ExprId],
     chunk: &Chunk,
     mode: StringTrimOp,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let str_arr = arena.eval(args[0], chunk)?;
     let s_arr = str_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "trim expects string".to_string())?;
+        .ok_or_else(|| expression_contract("trim expects string"))?;
     let len = s_arr.len();
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
@@ -54,8 +55,8 @@ pub fn eval_ltrim<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_trim_impl(arena, args, chunk, StringTrimOp::Left))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_trim_impl(arena, args, chunk, StringTrimOp::Left)
 }
 
 pub fn eval_rtrim<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -63,8 +64,8 @@ pub fn eval_rtrim<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_trim_impl(arena, args, chunk, StringTrimOp::Right))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_trim_impl(arena, args, chunk, StringTrimOp::Right)
 }
 
 pub fn eval_trim<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -72,8 +73,8 @@ pub fn eval_trim<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_trim_impl(arena, args, chunk, StringTrimOp::Both))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_trim_impl(arena, args, chunk, StringTrimOp::Both)
 }
 
 #[cfg(test)]
@@ -87,7 +88,7 @@ mod legacy_trim_contract_tests {
     };
     use novarocks_types::SlotId;
 
-    fn evaluate(values: ArrayRef, mode: StringTrimOp) -> Result<ArrayRef, String> {
+    fn evaluate(values: ArrayRef, mode: StringTrimOp) -> ExecutionResult<ArrayRef> {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "s",
             values.data_type().clone(),
@@ -173,7 +174,10 @@ mod legacy_trim_contract_tests {
     fn legacy_trim_contract_tests_empty_carrier_and_exact_raw_downcast_message() {
         for mode in [StringTrimOp::Left, StringTrimOp::Right, StringTrimOp::Both] {
             let wrong = Arc::new(Int64Array::from(vec![Some(1), None])) as ArrayRef;
-            assert_eq!(evaluate(wrong, mode).unwrap_err(), "trim expects string");
+            assert_eq!(
+                evaluate(wrong, mode).unwrap_err().to_string(),
+                "trim expects string"
+            );
         }
         for mode in [StringTrimOp::Left, StringTrimOp::Right, StringTrimOp::Both] {
             let empty = Arc::new(StringArray::from(Vec::<Option<&str>>::new())) as ArrayRef;

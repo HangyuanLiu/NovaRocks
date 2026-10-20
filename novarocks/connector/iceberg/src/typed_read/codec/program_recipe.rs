@@ -324,7 +324,7 @@ fn bytes_equal(a: &[u8], b: &[u8], work: &mut CompileCheckpoints<'_>) -> Result<
 
 fn lift(error: ConnectorCodecError) -> Failure {
     match error.compile_control_error() {
-        Some(cause) => Failure::Control(cause),
+        Some(cause) => Failure::Control(cause.clone()),
         None => Failure::Provider(error),
     }
 }

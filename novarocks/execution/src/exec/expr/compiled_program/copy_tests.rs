@@ -107,6 +107,29 @@ fn list(length: usize) -> ArrayRef {
     )
 }
 
+fn assert_nested_dictionary_extent(result: Result<ArrayRef, KernelFailure>) {
+    use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+    let failure =
+        result.expect_err("the nested mutable constructor must refuse its real dictionary extent");
+    let fact = failure.failure_fact();
+    assert_eq!(fact.class(), FailureClass::Representation);
+    assert_eq!(fact.reason().code(), 259);
+    assert!(fact.resource().is_none());
+    let extent = fact.representation().unwrap();
+    assert_eq!(extent.boundary, RepresentationBoundary::SingleOutput);
+    assert_eq!(extent.layout.code.get(), 51);
+    assert_eq!(extent.required, Some(128));
+    assert_eq!(extent.extent_limit, Some(127));
+    assert_eq!(extent.representable_prefix, None);
+    let mut source: &dyn std::error::Error = &failure;
+    loop {
+        if source.is::<novarocks_functions::selected_copy::CopyExtentFailure>() {
+            break;
+        }
+        source = source.source().expect("the original copy-format author");
+    }
+}
+
 #[test]
 fn nested_dictionary_128_is_refused_before_arrow_copy_for_values_and_all_null_indices() {
     let array = list(128);
@@ -116,7 +139,7 @@ fn nested_dictionary_128_is_refused_before_arrow_copy_for_values_and_all_null_in
         vec![None, Some(1)],
     ] {
         let result = copy(&array, &indices, &Control::accepting());
-        assert!(matches!(result, Err(KernelFailure::ResourceExhausted)));
+        assert_nested_dictionary_extent(result);
     }
 }
 
@@ -182,10 +205,7 @@ fn fixed_list_null_indices_still_construct_its_nested_list_dictionary() {
         )
         .unwrap(),
     ) as ArrayRef;
-    assert!(matches!(
-        copy(&array, &[None, None], &Control::accepting()),
-        Err(KernelFailure::ResourceExhausted)
-    ));
+    assert_nested_dictionary_extent(copy(&array, &[None, None], &Control::accepting()));
     // Zero output bypasses the library copy constructor and remains legal.
     let empty = copy(&array, &[], &Control::accepting()).unwrap();
     assert_eq!(empty.len(), 0);
@@ -243,10 +263,7 @@ fn long_copy_preserves_every_control_callback_category_and_never_retries_refusal
 fn capacity_failure_does_not_replace_an_originating_preflight_control_failure() {
     let array = list(128);
     let recorder = Control::accepting();
-    assert!(matches!(
-        copy(&array, &[None, None], &recorder),
-        Err(KernelFailure::ResourceExhausted)
-    ));
+    assert_nested_dictionary_extent(copy(&array, &[None, None], &recorder));
     let trace = recorder.trace.lock().unwrap().clone();
     for stop_at in 1..=trace.len() {
         for cause in causes() {

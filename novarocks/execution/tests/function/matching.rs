@@ -163,10 +163,7 @@ fn string_column(values: Vec<Option<&str>>) -> ArrayRef {
 
 /// The error `regexp` reports for a pattern the regex engine rejects.
 fn invalid_pattern_error(pattern: &str) -> String {
-    format!(
-        "regexp: invalid pattern: {}",
-        Regex::new(pattern).unwrap_err()
-    )
+    Regex::new(pattern).unwrap_err().to_string()
 }
 
 /// Evaluate `regexp(input, pattern)` over `chunk` and collect its rows.
@@ -175,7 +172,7 @@ fn regexp_rows(
     input: ExprId,
     pattern: ExprId,
     chunk: &Chunk,
-) -> Result<Vec<Option<bool>>, String> {
+) -> novarocks_execution::runtime::fragment::ExecutionResult<Vec<Option<bool>>> {
     let out = eval_regexp(arena, input, &[input, pattern], chunk)?;
     let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
     Ok(out.iter().collect())
@@ -304,10 +301,15 @@ fn test_regexp_invalid_constant_pattern_errors() {
     let input = common::slot_ref(&mut arena, 1, DataType::Utf8);
     let pattern = common::literal_string(&mut arena, "(unclosed");
 
+    let failure = regexp_rows(&arena, input, pattern, &chunk).unwrap_err();
+    assert_eq!(failure.to_string(), invalid_pattern_error("(unclosed"));
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&failure);
+    assert_eq!(fact.class(), novarocks_failure_contract::FailureClass::Data);
     assert_eq!(
-        regexp_rows(&arena, input, pattern, &chunk).unwrap_err(),
-        invalid_pattern_error("(unclosed")
+        fact.reason().domain(),
+        novarocks_failure_contract::domain::KERNEL.get()
     );
+    assert_eq!(fact.reason().code(), 40);
 }
 
 #[test]
@@ -335,10 +337,15 @@ fn test_regexp_invalid_per_row_pattern_errors_at_first_row_that_needs_it() {
     let input = common::slot_ref(&mut arena, 1, DataType::Utf8);
     let pattern = common::slot_ref(&mut arena, 2, DataType::Utf8);
 
+    let failure = regexp_rows(&arena, input, pattern, &chunk).unwrap_err();
+    assert_eq!(failure.to_string(), invalid_pattern_error("[bad"));
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&failure);
+    assert_eq!(fact.class(), novarocks_failure_contract::FailureClass::Data);
     assert_eq!(
-        regexp_rows(&arena, input, pattern, &chunk).unwrap_err(),
-        invalid_pattern_error("[bad")
+        fact.reason().domain(),
+        novarocks_failure_contract::domain::KERNEL.get()
     );
+    assert_eq!(fact.reason().code(), 40);
 }
 
 // ---------------------------------------------------------------------------

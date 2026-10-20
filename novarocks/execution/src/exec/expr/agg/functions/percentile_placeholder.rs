@@ -42,8 +42,11 @@ impl ExactPercentileState {
         )))
     }
     #[cfg(test)]
-    fn push(&mut self, value: super::common::TrackedAggScalarValue) -> Result<(), String> {
-        self.0.push(value)
+    fn push(
+        &mut self,
+        value: super::common::TrackedAggScalarValue,
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
+        self.0.push(value).map_err(Into::into)
     }
 }
 impl std::ops::Deref for ExactPercentileState {
@@ -65,7 +68,7 @@ fn merge_payload_array(
     offset: usize,
     state_ptrs: &[AggStatePtr],
     diagnostic: core::ExactMergeDiagnostic,
-) -> Result<(), String> {
+) -> crate::runtime::fragment::ExecutionResult<()> {
     for (row, &base) in state_ptrs.iter().enumerate() {
         let ptr = unsafe { (base as *mut u8).add(offset) };
         let state = unsafe { &mut *(ptr as *mut ExactPercentileState) };
@@ -77,13 +80,12 @@ fn update_from_struct(
     array: &StructArray,
     offset: usize,
     state_ptrs: &[AggStatePtr],
-) -> Result<(), String> {
+) -> crate::runtime::fragment::ExecutionResult<()> {
     let fields = array.columns();
     if fields.len() < 2 {
-        return Err(
-            "percentile_disc_cont_update: percentile_disc/cont expects STRUCT(value, rate) input"
-                .to_string(),
-        );
+        return Err(super::aggregate_binding_contract(
+            "percentile_disc_cont_update: percentile_disc/cont expects STRUCT(value, rate) input",
+        ));
     }
     let values = fields[0].clone();
     let rates = fields[1].clone();
@@ -100,20 +102,23 @@ impl AggregateFunction for PercentilePlaceholderAgg {
         func: &AggFunction,
         input_type: Option<&DataType>,
         _input_is_intermediate: bool,
-    ) -> Result<AggSpec, String> {
-        let sig = func
-            .types
-            .as_ref()
-            .ok_or_else(|| "aggregate type signature is required".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggSpec> {
+        let sig = func.types.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "aggregate type signature is required",
+            )
+        })?;
         let kind = match canonical_agg_name(func.name.as_str()) {
             "percentile_cont" => AggKind::PercentileCont,
             "percentile_disc" => AggKind::PercentileDisc,
             "percentile_disc_lc" => AggKind::PercentileDiscLc,
             other => {
-                return Err(format!(
-                    "unsupported percentile aggregate function: {}",
-                    other
-                ));
+                return Err(
+                    crate::exec::expr::agg::functions::aggregate_binding_contract(format_args!(
+                        "unsupported percentile aggregate function: {}",
+                        other
+                    )),
+                );
             }
         };
         let output_type = sig
@@ -150,10 +155,12 @@ impl AggregateFunction for PercentilePlaceholderAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "percentile_disc/cont input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "percentile_disc/cont input missing",
+            )
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -161,10 +168,12 @@ impl AggregateFunction for PercentilePlaceholderAgg {
         &self,
         _spec: &AggSpec,
         array: &'a Option<ArrayRef>,
-    ) -> Result<AggInputView<'a>, String> {
-        let arr = array
-            .as_ref()
-            .ok_or_else(|| "percentile_disc/cont merge input missing".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<AggInputView<'a>> {
+        let arr = array.as_ref().ok_or_else(|| {
+            crate::exec::expr::agg::views::aggregate_input_contract(
+                "percentile_disc/cont merge input missing",
+            )
+        })?;
         Ok(AggInputView::Any(arr))
     }
 
@@ -178,9 +187,11 @@ impl AggregateFunction for PercentilePlaceholderAgg {
         _spec: &AggSpec,
         ptr: *mut u8,
         tracker: Option<Arc<MemTracker>>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let tracker = tracker.ok_or_else(|| {
-            "allocation-tracked exact percentile requires an aggregate memory tracker".to_string()
+            crate::exec::expr::agg::functions::aggregate_binding_contract(
+                "allocation-tracked exact percentile requires an aggregate memory tracker",
+            )
         })?;
         unsafe {
             std::ptr::write(
@@ -212,9 +223,11 @@ impl AggregateFunction for PercentilePlaceholderAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("percentile_disc/cont input type mismatch".to_string());
+            return Err(super::aggregate_binding_contract(
+                "percentile_disc/cont input type mismatch",
+            ));
         };
         if let Some(struct_array) = array.as_any().downcast_ref::<StructArray>() {
             update_from_struct(struct_array, offset, state_ptrs)
@@ -234,9 +247,11 @@ impl AggregateFunction for PercentilePlaceholderAgg {
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         let AggInputView::Any(array) = input else {
-            return Err("percentile_disc/cont merge input type mismatch".to_string());
+            return Err(super::aggregate_binding_contract(
+                "percentile_disc/cont merge input type mismatch",
+            ));
         };
         merge_payload_array(array, offset, state_ptrs, core::ExactMergeDiagnostic::Merge)
     }
@@ -247,7 +262,7 @@ impl AggregateFunction for PercentilePlaceholderAgg {
         offset: usize,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         let output_type = if output_intermediate {
             &spec.intermediate_type
         } else {
@@ -259,7 +274,7 @@ impl AggregateFunction for PercentilePlaceholderAgg {
             for &base in group_states {
                 let ptr = unsafe { (base as *mut u8).add(offset) };
                 let state = unsafe { &*(ptr as *const ExactPercentileState) };
-                builder.append_value(encode_state(state));
+                builder.append_value(encode_state(state)?);
             }
             return Ok(Arc::new(builder.finish()));
         }
@@ -269,12 +284,15 @@ impl AggregateFunction for PercentilePlaceholderAgg {
             let ptr = unsafe { (base as *mut u8).add(offset) };
             let state = unsafe { &*(ptr as *const ExactPercentileState) };
             let value = match &spec.kind {
-                AggKind::PercentileCont => finalize_cont(state, output_type),
-                AggKind::PercentileDisc | AggKind::PercentileDiscLc => finalize_disc(state),
-                other => Err(format!(
+                AggKind::PercentileCont => finalize_cont(state, output_type)
+                    .map_err(crate::runtime::fragment::ExecutionFailure::from),
+                AggKind::PercentileDisc | AggKind::PercentileDiscLc => {
+                    finalize_disc(state).map_err(crate::runtime::fragment::ExecutionFailure::from)
+                }
+                other => Err(super::aggregate_binding_contract(format_args!(
                     "unexpected percentile placeholder kind: {:?}",
                     other
-                )),
+                ))),
             }?;
             values.push(value);
         }
@@ -297,7 +315,7 @@ mod retained_bytes_tests {
                     .unwrap(),
             ))
             .unwrap();
-        let encoded = encode_state(&state);
+        let encoded = encode_state(&state).unwrap();
 
         let mut decoded = ExactPercentileState::new(tracker.clone());
         let (rate, values) = decode_state_into(&encoded, &decoded.allocator).unwrap();

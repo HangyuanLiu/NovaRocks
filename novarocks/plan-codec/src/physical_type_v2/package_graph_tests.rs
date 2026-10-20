@@ -41,7 +41,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         events.push(units);
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -456,7 +456,7 @@ fn package_graph_every_actual_small_callback_success_and_ordinary_prefix_keeps_t
         for at in 0..baseline.len() {
             for cause in CAUSES {
                 let control = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 assert!(

@@ -22,6 +22,7 @@
 //! use existing tracker/control APIs, and add no performance or product hook.
 
 use super::*;
+use crate::exec::pipeline::{shape::StepOperator, test_driver::TestDriver};
 use arrow::array::{BinaryArray, ListArray};
 use novarocks_functions::AggregateStateMemoryPolicy;
 
@@ -144,7 +145,7 @@ fn n_results(chunks: &[Chunk]) -> Vec<NOutput> {
     result.sort_by_key(|(key, _, _)| *key);
     result
 }
-fn populated_n_consumer(f: &Fixture, tracker: Arc<MemTracker>) -> CompiledGroupedTopNProcessor {
+fn populated_n_consumer(f: &Fixture, tracker: Arc<MemTracker>) -> GroupedTopNStep {
     let factory = CompiledGroupedTopNProcessorFactory::try_new(
         Arc::clone(&f.program),
         f.grouped,
@@ -161,11 +162,18 @@ fn populated_n_consumer(f: &Fixture, tracker: Arc<MemTracker>) -> CompiledGroupe
     processor.set_mem_tracker(tracker);
     prepare_typed_fixture_operator(&mut processor);
     let state = RuntimeState::default();
+    let mut calls = TestDriver::new(&mut processor, &state);
     let mut saw_heap = false;
     for offset in (0..N_ROWS.len()).step_by(3) {
         for chunk in partial_chunks(f, offset, 3) {
-            processor.push_chunk(&state, chunk).unwrap();
-            let entries = &processor.candidates.as_ref().unwrap().entries;
+            calls.input_without_output(chunk).unwrap();
+            let entries = &calls
+                .operator()
+                .kernel_for_test()
+                .candidates
+                .as_ref()
+                .unwrap()
+                .entries;
             assert!(entries.len() <= factory.plan.limit);
             saw_heap |= entries.iter().any(|candidate| {
                 candidate
@@ -173,20 +181,18 @@ fn populated_n_consumer(f: &Fixture, tracker: Arc<MemTracker>) -> CompiledGroupe
                     .iter()
                     .any(|state| state.retained_heap_bytes() > 0)
             });
-            assert!(!processor.has_output());
+            assert!(matches!(calls.next(), NextStep::NeedInput));
         }
     }
     assert!(saw_heap, "exercise original populated HostVec state");
+    drop(calls);
     processor
 }
-fn drain(processor: &mut CompiledGroupedTopNProcessor) -> Vec<Chunk> {
+fn drain(processor: &mut GroupedTopNStep) -> Vec<Chunk> {
     let state = RuntimeState::default();
-    processor.set_finishing(&state).unwrap();
-    let mut chunks = Vec::new();
-    while let Some(chunk) = processor.pull_chunk(&state).unwrap() {
-        chunks.push(chunk);
-    }
-    chunks
+    let mut calls = TestDriver::new(processor, &state);
+    calls.signal_eos().unwrap();
+    calls.collect_until_finished().unwrap()
 }
 
 #[test]
@@ -288,37 +294,45 @@ fn compiled_grouped_topn_populated_n_state_drop_cancel_and_host_refusal_release_
     let mut processor = populated_n_consumer(&f, tracker.clone());
     assert!(tracker.current() > 0);
     processor.cancel();
-    assert!(processor.is_finished());
-    assert!(!processor.has_output());
+    let closed = processor.drive_for_test(&RuntimeState::default()).unwrap();
+    assert!(matches!(closed.next, NextStep::Finished));
+    assert!(closed.output.is_none());
     assert_eq!(tracker.current(), 0);
-    let cancelled = processor.close().unwrap_err();
-    assert_eq!(
-        cancelled.cause(),
-        &ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
+    processor.close().unwrap();
+    assert!(
+        processor
+            .drive_for_test(&RuntimeState::default())
+            .map(|step| step.output)
+            .unwrap()
+            .is_none()
     );
-    assert_eq!(
-        processor.pull_chunk(&RuntimeState::default()).unwrap_err(),
-        cancelled
+    assert!(
+        processor.kernel_for_test().failed.is_none(),
+        "mechanical exit does not invent a Task cancellation cause"
     );
 
     let tracker = MemTracker::new_root("grouped-n-host-refusal");
     let mut processor = populated_n_consumer(&f, tracker.clone());
     tracker.install_limit_once(tracker.current() + 1).unwrap();
     let next = partial_chunks(&f, 0, 3).remove(0);
-    let error = processor
-        .push_chunk(&RuntimeState::default(), next)
+    let state = RuntimeState::default();
+    let error = TestDriver::new(&mut processor, &state)
+        .input_without_output(next)
         .unwrap_err();
     assert_eq!(
         error.cause(),
         &ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted)
     );
     assert_eq!(tracker.current(), 0);
-    assert!(!processor.has_output());
+    assert!(processor.drive_for_test(&RuntimeState::default()).is_err());
     assert_eq!(
-        processor.pull_chunk(&RuntimeState::default()).unwrap_err(),
+        processor
+            .drive_for_test(&RuntimeState::default())
+            .map(|step| step.output)
+            .unwrap_err(),
         error
     );
-    assert_eq!(processor.close().unwrap_err(), error);
+    processor.close().unwrap();
 }
 
 #[test]

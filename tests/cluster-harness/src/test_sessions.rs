@@ -609,6 +609,42 @@ impl ClusterTestSessionPlan {
         }
         Ok(())
     }
+    pub(crate) fn activate_deferred_native_fault(
+        &self,
+        index: usize,
+        action: &str,
+        token: &str,
+    ) -> Result<()> {
+        ensure!(
+            action == "task-execution-failure-after-visible-prefix",
+            "Native action has no deferred activation contract"
+        );
+        let selected = self.original_native_selection(index, action, token)?;
+        // Recheck the authenticated original role; no retargeting to a successor.
+        self.validate_native_fault_target(index, action, token)?;
+        let path = selected.root.join(format!(
+            "be-{index}.native-fault-{action}.{token}.execution.json"
+        ));
+        ensure!(
+            read_private_action_json(&path.with_extension("retired.json"))?.is_none()
+                && read_private_action_json(&path.with_extension("end.json"))?.is_none(),
+            "deferred action was already ended"
+        );
+        let value = read_private_action_json(&path)?
+            .context("deferred action has no real execution binding")?;
+        let binding: novarocks_failpoint::target_binding::StatementExecutionBinding =
+            serde_json::from_value(value.clone())?;
+        binding.validate()?;
+        ensure!(
+            binding.target_session_id == selected.session_id
+                && binding.statement_run_token == selected.token
+                && binding.backend_index == selected.index
+                && binding.backend_process_id == selected.process_id,
+            "deferred activation differs from original selected process/statement"
+        );
+        publish_private_action_json(&path.with_extension("enable.json"), &value)
+    }
+
     pub(crate) fn native_fault_hit(&self, index: usize, action: &str, token: &str) -> Result<bool> {
         let selected = self.original_native_selection(index, action, token)?;
         let root = &selected.root;

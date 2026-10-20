@@ -71,7 +71,7 @@ impl PureCompileControl for Compile {
             assert!(at <= stop)
         }
         t.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -280,7 +280,7 @@ fn map_parts_every_actual_compile_callback_three_causes_preserve_prefix() {
             ] {
                 let c = Compile {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let error = prepared(name, &source, &c).err().unwrap();
                 let actual = match error {

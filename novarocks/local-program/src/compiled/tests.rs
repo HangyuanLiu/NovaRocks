@@ -44,7 +44,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         let index = trace.len();
         trace.push(units);
-        match self.stop {
+        match self.stop.clone() {
             Some((at, cause)) if at == index => Err(cause),
             _ => Ok(()),
         }
@@ -554,7 +554,7 @@ fn every_final_author_callback_propagates_original_control_without_rechecking() 
             CompileControlError::ResourceExhausted,
         ] {
             let control = Control {
-                stop: Some((index, cause)),
+                stop: Some((index, cause.clone())),
                 ..Control::default()
             };
             let error = LocalProgram::try_new(
@@ -573,7 +573,7 @@ fn every_final_author_callback_propagates_original_control_without_rechecking() 
                 &control,
             )
             .unwrap_err();
-            assert_eq!(error, LocalProgramCompileError::Control(cause));
+            assert_eq!(error, LocalProgramCompileError::Control(cause.clone()));
             assert_eq!(*control.trace.lock().unwrap(), trace[..=index]);
             assert_eq!(
                 std::error::Error::source(&error)

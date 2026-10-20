@@ -34,7 +34,7 @@ impl PureCompileControl for Control {
         assert_eq!(phase, CompilePhase::LowerProgram);
         assert!(work <= 256);
         self.seen.lock().unwrap().push(work);
-        if let Some((at, error)) = self.failure
+        if let Some((at, error)) = self.failure.clone()
             && work == at
         {
             Err(error)
@@ -645,13 +645,13 @@ fn typed_channel_entry_and_positive_work_preserve_control_categories() {
     ] {
         for at in [0, 256] {
             let control = Control {
-                failure: Some((at, error)),
+                failure: Some((at, error.clone())),
                 seen: Mutex::default(),
             };
             assert_eq!(
                 ProgramTypedChannels::try_new(source.clone(), entries.clone(), &control)
                     .unwrap_err(),
-                ProgramChannelTypeError::Control(error)
+                ProgramChannelTypeError::Control(error.clone())
             );
             assert!(control.seen.lock().unwrap().contains(&at));
         }

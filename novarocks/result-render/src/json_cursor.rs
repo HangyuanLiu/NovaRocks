@@ -19,8 +19,16 @@
 use crate::{RenderError, RenderErrorKind};
 fn invalid() -> RenderError {
     RenderError {
-        kind: RenderErrorKind::UnsupportedPresentation,
+        kind: RenderErrorKind::InvalidJson,
         output_ordinal: None,
+        required: None,
+    }
+}
+fn invalid_utf8() -> RenderError {
+    RenderError {
+        kind: RenderErrorKind::InvalidUtf8,
+        output_ordinal: None,
+        required: None,
     }
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -33,7 +41,7 @@ impl Utf8 {
     pub fn feed(&mut self, b: u8) -> Result<(), RenderError> {
         if self.remaining != 0 {
             if b < self.first_min || b > self.first_max {
-                return Err(invalid());
+                return Err(invalid_utf8());
             }
             self.remaining -= 1;
             self.first_min = 0x80;
@@ -49,7 +57,7 @@ impl Utf8 {
             0xf0 => (3, 0x90, 0xbf),
             0xf1..=0xf3 => (3, 0x80, 0xbf),
             0xf4 => (3, 0x80, 0x8f),
-            _ => return Err(invalid()),
+            _ => return Err(invalid_utf8()),
         };
         Ok(())
     }
@@ -57,7 +65,7 @@ impl Utf8 {
         if self.remaining == 0 {
             Ok(())
         } else {
-            Err(invalid())
+            Err(invalid_utf8())
         }
     }
 }
@@ -286,6 +294,7 @@ impl JsonCursor {
                         return Err(RenderError {
                             kind: RenderErrorKind::DepthLimit,
                             output_ordinal: None,
+                            required: u64::try_from(self.base_depth + self.depth + 1).ok(),
                         });
                     }
                     self.depth += 1;

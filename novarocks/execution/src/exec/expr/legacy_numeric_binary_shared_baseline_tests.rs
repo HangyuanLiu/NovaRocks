@@ -33,7 +33,7 @@ fn evaluate(
     name: &'static str,
     columns: Vec<ArrayRef>,
     result: DataType,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let fields = columns
         .iter()
         .enumerate()
@@ -236,21 +236,23 @@ fn original_binary_raw_largeint_decimal256_utf8_admission_errors_are_unchanged()
         for name in names() {
             let expected = format!("unsupported numeric type: {:?}", source.data_type());
             assert_eq!(
-                evaluate(
+                (evaluate(
                     name,
                     vec![source.clone(), ints(vec![Some(2)])],
                     DataType::Float64
                 )
-                .unwrap_err(),
+                .unwrap_err())
+                .to_string(),
                 expected
             );
             assert_eq!(
-                evaluate(
+                (evaluate(
                     name,
                     vec![ints(vec![Some(7)]), source.clone()],
                     DataType::Float64
                 )
-                .unwrap_err(),
+                .unwrap_err())
+                .to_string(),
                 expected
             );
         }

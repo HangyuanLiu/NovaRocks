@@ -33,8 +33,9 @@ use std::sync::Arc;
 
 use super::driver::{PipelineDriver, PipelineDriverBindings};
 use super::fragment_context::FragmentContext;
+use super::instance::OperatorInstance;
 use super::operator::input_construction::{
-    InputConstructionFactory, InputConstructionProfile, try_runtime_input_construction_factory,
+    InputConstructionProfile, try_runtime_input_construction_factory,
 };
 use super::operator_factory::OperatorFactory;
 use crate::runtime::mem_tracker::MemTracker;
@@ -119,9 +120,6 @@ impl Pipeline {
             let mut operators = Vec::with_capacity(self.op_factories.len());
             let mut operator_profiles = Vec::new();
             let mem_root = ctx.runtime_state().mem_tracker();
-            let mut operator_mem_trackers = Vec::with_capacity(self.op_factories.len());
-            let mut input_construction_factories: Vec<Option<Arc<dyn InputConstructionFactory>>> =
-                Vec::with_capacity(self.op_factories.len());
             let mut source_idx = None;
             let mut sink_idx = None;
             let driver_id = ctx.next_driver_id();
@@ -147,13 +145,13 @@ impl Pipeline {
             for (idx, factory) in self.op_factories.iter().enumerate() {
                 if factory.is_source() {
                     if source_idx.is_some() {
-                        return Err("pipeline has multiple source operators".to_string().into());
+                        return Err(PipelineShapeFailure::MultipleSource.into());
                     }
                     source_idx = Some(idx);
                 }
                 if factory.is_sink() {
                     if sink_idx.is_some() {
-                        return Err("pipeline has multiple sink operators".to_string().into());
+                        return Err(PipelineShapeFailure::MultipleSink.into());
                     }
                     sink_idx = Some(idx);
                 }
@@ -166,10 +164,7 @@ impl Pipeline {
                 }
                 // Keep the original-input root edge outside ordinary input
                 // construction. Its permit and actual-exit owner stay intact.
-                let ordinary_input = op
-                    .as_processor_ref()
-                    .is_some_and(|processor| !processor.takes_original_input());
-                let construction_factory = if ordinary_input || op.creates_typed_storage() {
+                let construction_factory = if op.creates_typed_storage() {
                     operator_mem_tracker
                         .as_ref()
                         .map(|tracker| {
@@ -186,12 +181,6 @@ impl Pipeline {
                 if let Some(factory) = construction_factory.as_ref() {
                     op.set_construction_factory(Arc::clone(factory));
                 }
-                input_construction_factories.push(if ordinary_input {
-                    construction_factory
-                } else {
-                    None
-                });
-                operator_mem_trackers.push(operator_mem_tracker);
                 if let Some(driver_profiler) = driver_profiler.as_ref() {
                     let op_profile = driver_profiler.child(op.name().to_string());
                     let profiles = OperatorProfiles::new(op_profile);
@@ -219,31 +208,73 @@ impl Pipeline {
                     _ => op.prepare()?,
                 }
                 op.bind_runtime_state(ctx.runtime_state())?;
-                operators.push(op);
+                operators.push(OperatorInstance::new(
+                    idx,
+                    op,
+                    operator_mem_tracker,
+                    ctx.runtime_state().error_state(),
+                ));
             }
-            let source_idx =
-                source_idx.ok_or_else(|| "pipeline missing source operator".to_string())?;
-            let sink_idx = sink_idx.ok_or_else(|| "pipeline missing sink operator".to_string())?;
+            let source_idx = source_idx.ok_or(PipelineShapeFailure::MissingSource)?;
+            let sink_idx = sink_idx.ok_or(PipelineShapeFailure::MissingSink)?;
             if source_idx != 0 {
-                return Err("pipeline source must be the first operator"
-                    .to_string()
-                    .into());
+                return Err(PipelineShapeFailure::SourcePosition.into());
             }
             if sink_idx + 1 != operators.len() {
-                return Err("pipeline sink must be the last operator".to_string().into());
+                return Err(PipelineShapeFailure::SinkPosition.into());
             }
-            drivers.push(PipelineDriver::new_with_event_sink(
+            drivers.push(PipelineDriver::from_prepared(
                 driver_id,
                 operators,
                 driver_profiler,
                 operator_profiles,
                 std::sync::Arc::clone(ctx.runtime_state()),
                 ctx.fragment_instance_id(),
-                PipelineDriverBindings::new(ctx.event_sink(), Some(operator_mem_trackers))
-                    .with_query_memory(ctx.runtime_state().query_memory().cloned())
-                    .with_input_construction_factories(input_construction_factories),
+                PipelineDriverBindings::new(ctx.event_sink())
+                    .with_query_memory(ctx.runtime_state().query_memory().cloned()),
             ));
         }
         Ok(drivers)
+    }
+}
+
+/// The pipeline author validates its own endpoint topology before activation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PipelineShapeFailure {
+    MultipleSource,
+    MultipleSink,
+    MissingSource,
+    MissingSink,
+    SourcePosition,
+    SinkPosition,
+}
+impl std::fmt::Display for PipelineShapeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::MultipleSource => "pipeline has multiple source operators",
+            Self::MultipleSink => "pipeline has multiple sink operators",
+            Self::MissingSource => "pipeline missing source operator",
+            Self::MissingSink => "pipeline missing sink operator",
+            Self::SourcePosition => "pipeline source must be the first operator",
+            Self::SinkPosition => "pipeline sink must be the last operator",
+        })
+    }
+}
+impl std::error::Error for PipelineShapeFailure {}
+impl novarocks_failure_contract::FailureProjection for PipelineShapeFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let reason = match self {
+            Self::MultipleSource | Self::MultipleSink => ExecutionReason::PipelineMultipleEndpoint,
+            Self::MissingSource | Self::MissingSink => ExecutionReason::PipelineMissingEndpoint,
+            Self::SourcePosition | Self::SinkPosition => ExecutionReason::PipelineEndpointPosition,
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+impl From<PipelineShapeFailure> for crate::runtime::fragment::ExecutionFailure {
+    fn from(cause: PipelineShapeFailure) -> Self {
+        Self::from_domain(cause)
     }
 }

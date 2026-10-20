@@ -207,6 +207,7 @@ pub struct QueryResultCapacityBinding {
 struct ResultCapacityActivity {
     count: std::sync::Mutex<usize>,
     exited: std::sync::Condvar,
+    async_exited: tokio::sync::Notify,
 }
 
 /// Actual execution ownership, independent of a cancelled waiter. Drop this
@@ -218,10 +219,14 @@ pub struct ResultCapacityActivityLease {
 impl Drop for ResultCapacityActivityLease {
     fn drop(&mut self) {
         drop(self.window.take());
-        let mut count = self.activity.count.lock().expect("result activity lock");
-        *count = count.checked_sub(1).expect("one result activity exit");
-        if *count == 0 {
+        let exited = {
+            let mut count = self.activity.count.lock().expect("result activity lock");
+            *count = count.checked_sub(1).expect("one result activity exit");
+            *count == 0
+        };
+        if exited {
             self.activity.exited.notify_all();
+            self.activity.async_exited.notify_waiters();
         }
     }
 }
@@ -271,6 +276,22 @@ impl QueryResultCapacityBinding {
                 .exited
                 .wait(count)
                 .expect("result activity lock");
+        }
+    }
+
+    /// Async observation of the same actual-input/unclaimed-output counter.
+    /// Close producers before awaiting: zero is not a new admission seal.
+    pub async fn result_activities_exited(&self) {
+        loop {
+            let exited = self.activity.async_exited.notified();
+            tokio::pin!(exited);
+            // Register before inspecting count. A zero transition between the
+            // inspection and await is retained by this registered waiter.
+            exited.as_mut().enable();
+            if *self.activity.count.lock().expect("result activity lock") == 0 {
+                return;
+            }
+            exited.await;
         }
     }
 

@@ -21,6 +21,7 @@
 use super::family_fixture::{
     FixtureControl, cell, compile, constant_policy, int64_rows, package, run, try_run,
 };
+use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
 use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::DataType;
 use novarocks_functions::{ConstantPool, largeint};
@@ -176,7 +177,7 @@ pub(super) fn pooled_source(
 /// Invoke the real original dispatcher over the same exact Frame-opened bounds.
 fn original_dispatcher(
     program: &Arc<LocalProgram>,
-) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
+) -> Result<Vec<crate::exec::chunk::Chunk>, Box<dyn std::error::Error>> {
     use crate::exec::chunk::ChunkSchema;
     use crate::exec::node::table_function::TableFunctionOutputSlot;
     use crate::exec::operators::TableFunctionFixtureFactory;
@@ -199,22 +200,16 @@ fn original_dispatcher(
         tracker,
         Arc::new(RuntimeErrorState::default()),
     ));
-    source.prepare().map_err(|error| error.to_string())?;
-    source
-        .bind_runtime_state(&state)
-        .map_err(|error| error.to_string())?;
-    let chunk = source
-        .as_processor_mut()
-        .unwrap()
-        .pull_chunk(&state)
-        .map_err(|error| error.to_string())?
+    source.prepare()?;
+    source.bind_runtime_state(&state)?;
+    let chunk = TestDriver::new(source.as_mut(), &state)
+        .advance_to_boundary()
+        .map(|step| step.output)?
         .unwrap();
     assert!(
-        source
-            .as_processor_mut()
-            .unwrap()
-            .pull_chunk(&state)
-            .map_err(|error| error.to_string())?
+        TestDriver::new(source.as_mut(), &state)
+            .advance_to_boundary()
+            .map(|step| step.output)?
             .is_none(),
         "opening evaluates once"
     );
@@ -239,19 +234,13 @@ fn original_dispatcher(
         vec![TableFunctionOutputSlot::Result { index: 0 }],
     );
     let mut operator = factory.create(8, 0);
-    let processor = operator.as_processor_mut().unwrap();
-    processor
-        .push_chunk(&state, chunk)
-        .map_err(|error| error.to_string())?;
-    processor
-        .set_finishing(&state)
-        .map_err(|error| error.to_string())?;
+    operator.bind_runtime_state(&state)?;
+    let mut processor = TestDriver::new(operator.as_mut(), &state);
+    processor.accept_without_output(chunk)?;
+    processor.signal_eos()?;
     let mut output = vec![];
-    while processor.has_output() {
-        if let Some(chunk) = processor
-            .pull_chunk(&state)
-            .map_err(|error| error.to_string())?
-        {
+    while matches!(processor.next(), NextStep::Runnable | NextStep::Yield) {
+        if let Some(chunk) = processor.advance_to_boundary().map(|step| step.output)? {
             output.push(chunk);
         }
     }
@@ -287,7 +276,7 @@ fn assert_original(program: &Arc<LocalProgram>) {
             );
         }
         (Err(original), Err(selected)) => assert!(
-            selected.contains(&original),
+            selected.contains(&original.to_string()),
             "original={original:?} selected={selected:?}"
         ),
         (original, selected) => panic!("original={original:?} selected={selected:?}"),
@@ -407,7 +396,10 @@ fn compiled_generate_series_source_pooled_complete_reader_domain_and_original_re
                     )
                     .unwrap_err();
                     let actual = try_run(&program).unwrap_err();
-                    assert!(actual.contains(&original), "{actual:?} vs {original:?}");
+                    assert!(
+                        actual.contains(&original.to_string()),
+                        "{actual:?} vs {original:?}"
+                    );
                 }
                 _ => {
                     let out = run(&program);
@@ -500,11 +492,18 @@ fn compiled_generate_series_source_complete_signed_endpoints_nonzero_pool_and_hi
         pooled_source(ty, &[Some(1), Some(i128::MAX), Some(i128::MAX)], true),
         2,
     );
-    let expected = format!(
-        "table function generate_series value overflow: current={} step=1",
+    let original = original_dispatcher(&program).unwrap();
+    assert_eq!(original.iter().map(|chunk| chunk.len()).sum::<usize>(), 1);
+    let values = original[0].record_batch();
+    let value = values
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+        .unwrap();
+    assert_eq!(
+        largeint::i128_from_be_bytes(value.value(0)).unwrap(),
         i128::MAX
     );
-    assert_eq!(original_dispatcher(&program).unwrap_err(), expected);
     assert_original(&program);
 }
 
@@ -528,7 +527,7 @@ fn compiled_generate_series_compile_three_causes_return_at_original_callback_pre
             let at = trace.len();
             trace.push((phase, units));
             if self.at == Some(at) {
-                Err(self.cause)
+                Err(self.cause.clone())
             } else {
                 Ok(())
             }
@@ -565,7 +564,7 @@ fn compiled_generate_series_compile_three_causes_return_at_original_callback_pre
             let control = Observe {
                 trace: Mutex::new(vec![]),
                 at: Some(at),
-                cause,
+                cause: cause.clone(),
             };
             let validated =
                 validate_fragment_providers(Arc::clone(&source), &providers, &FixtureControl)
@@ -624,9 +623,14 @@ fn compiled_series_schema_and_slice_use_actual_creator_without_retaining_program
     drop(program);
     assert!(weak.upgrade().is_none());
     let state = RuntimeState::default();
-    let processor = operator.as_processor_mut().unwrap();
-    processor.push_chunk(&state, input).unwrap();
-    let output = processor.pull_chunk(&state).unwrap().unwrap();
+    operator.bind_runtime_state(&state).unwrap();
+    let mut processor = TestDriver::new(operator.as_mut(), &state);
+    processor.accept_without_output(input).unwrap();
+    let output = processor
+        .advance_to_boundary()
+        .map(|step| step.output)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         int64_rows(std::slice::from_ref(&output)),
         vec![vec![Some(1)], vec![Some(2)], vec![Some(3)]]
@@ -634,6 +638,7 @@ fn compiled_series_schema_and_slice_use_actual_creator_without_retaining_program
     let schema = output.chunk_schema_ref();
     assert!(schema.is_typed());
     assert_eq!(schema.slots()[0].field_ref().metadata().capacity(), 0);
+    drop(processor);
     drop(operator);
     assert!(tracker.current() > 0);
     drop(output);
@@ -674,11 +679,12 @@ fn compiled_series_prepare_keeps_typed_first_memory_refusal_without_later_constr
         ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
     ));
     assert_eq!(tracker.current(), installed_bytes);
-    assert!(matches!(
-        operator.prepare().unwrap_err().cause(),
-        ExecutionFailureCause::Kernel(novarocks_functions::KernelFailure::InstanceFailed)
-    ));
-    assert!(operator.is_finished());
+    assert_eq!(operator.prepare().unwrap_err(), error);
+    assert!(
+        operator
+            .drive_for_test(&crate::runtime::runtime_state::RuntimeState::default())
+            .is_err()
+    );
     assert_eq!(tracker.current(), installed_bytes);
     drop(operator);
     assert_eq!(tracker.current(), 0);

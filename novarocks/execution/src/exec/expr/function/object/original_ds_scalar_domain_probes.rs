@@ -19,6 +19,7 @@
 use super::*;
 use arrow::array::{Array, ListArray};
 use arrow::datatypes::Int64Type;
+use novarocks_failure_contract::FailureProjection;
 
 #[test]
 fn original_ds_scalar_null_tuning_defaults_are_not_strict_null_propagation() {
@@ -37,7 +38,7 @@ fn original_ds_scalar_null_tuning_defaults_are_not_strict_null_propagation() {
 }
 
 #[test]
-fn original_ds_scalar_full_nested_target_diagnostic_exceeds_row_message_limit() {
+fn original_ds_scalar_target_refusal_borrows_metadata_and_skips_null_key() {
     let text = "diagnostic-source-".repeat(80);
     let mut builder = arrow::array::ListBuilder::new(arrow::array::StringBuilder::new());
     builder.values().append_value(&text);
@@ -50,10 +51,23 @@ fn original_ds_scalar_full_nested_target_diagnostic_exceeds_row_message_limit() 
     ])
     .unwrap_err();
     let expected = format!(
-        "ds_hll_count_distinct_state target type expects string input, got List([Some(Utf8({text:?}))])"
+        "ds_hll_count_distinct_state target type expects string input, got {:?}",
+        target.data_type()
     );
-    assert_eq!(actual, expected);
-    assert!(actual.len() > novarocks_functions::MAX_ROW_ERROR_MESSAGE_BYTES);
+    assert_eq!(actual.detail(), expected);
+    assert!(actual.detail().len() <= novarocks_functions::MAX_ROW_ERROR_MESSAGE_BYTES);
+    assert!(!actual.detail().contains(&text));
+    assert_eq!(
+        actual.failure_fact().class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert_eq!(
+        actual.failure_fact().reason(),
+        novarocks_failure_contract::FailureReason::new(
+            novarocks_failure_contract::domain::KERNEL,
+            std::num::NonZeroU16::new(311).unwrap()
+        )
+    );
     let output = evaluate(vec![
         Arc::new(Int64Array::from(vec![None])),
         Arc::new(Int64Array::from(vec![10])),
@@ -73,7 +87,7 @@ fn original_ds_scalar_tuning_data_has_exact_single_row_source_and_first_error_or
     let target = Arc::new(StringArray::from(vec!["HLL_6", "HLL_8"])) as ArrayRef;
     let arrays = vec![value, log, target];
     assert_eq!(
-        evaluate(arrays.clone()).unwrap_err(),
+        (evaluate(arrays.clone()).unwrap_err()).to_string(),
         "ds_hll_count_distinct_state log_k out of range: -1"
     );
     for (row, expected) in [
@@ -84,7 +98,7 @@ fn original_ds_scalar_tuning_data_has_exact_single_row_source_and_first_error_or
     .enumerate()
     {
         assert_eq!(
-            evaluate(arrays.iter().map(|a| a.slice(row, 1)).collect()).unwrap_err(),
+            (evaluate(arrays.iter().map(|a| a.slice(row, 1)).collect()).unwrap_err()).to_string(),
             expected
         );
     }

@@ -67,7 +67,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original primary refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -509,7 +509,7 @@ fn physical_call_request_every_small_actual_callback_prefix_preserves_three_prim
                 CompileControlError::ResourceExhausted,
             ] {
                 let refused = Control {
-                    refusal: Some((position, cause)),
+                    refusal: Some((position, cause.clone())),
                     ..Control::good()
                 };
                 assert!(
@@ -571,7 +571,7 @@ fn physical_call_request_wide_lambda_observes_real_parameter_quantum_and_exact_o
             CompileControlError::ResourceExhausted,
         ] {
             let refused = Control {
-                refusal: Some((position, cause)),
+                refusal: Some((position, cause.clone())),
                 ..Control::good()
             };
             assert!(

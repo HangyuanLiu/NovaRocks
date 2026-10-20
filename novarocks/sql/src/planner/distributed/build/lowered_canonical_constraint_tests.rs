@@ -129,7 +129,7 @@ fn assert_loan_prefixes(
             CompileControlError::ResourceExhausted,
         ] {
             let control = Control {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..Control::default()
             };
             assert!(matches!(loan(owner, fragment, source, &control),

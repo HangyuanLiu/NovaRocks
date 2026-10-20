@@ -21,28 +21,132 @@ use arrow_schema::{DataType, Field, Fields};
 
 use crate::{FunctionValueType, ValueLogicalType, wider_type};
 
+#[derive(Debug)]
+pub enum ComparisonCoercionFailure {
+    Operands(novarocks_failure_contract::BoundedDetail),
+    InvalidPrecision { precision: i16, scale: i8 },
+    PrecisionExtent { precision: i16, scale: i8 },
+    SemanticRule(novarocks_failure_contract::BoundedDetail),
+    ValueType(crate::ExecutionValueTypeError),
+    Layout(crate::owned_resources::layout::LayoutResourceError),
+    Vec(crate::ControlResourceError),
+    HashMap(crate::owned_resources::hashmap::HashMapResourceError),
+}
+impl ComparisonCoercionFailure {
+    fn operands(detail: impl std::fmt::Display) -> Self {
+        Self::Operands(novarocks_failure_contract::BoundedDetail::truncating_display(detail))
+    }
+    fn from_construction(cause: crate::ValueConstructionFailure<std::convert::Infallible>) -> Self {
+        match cause {
+            crate::ValueConstructionFailure::ValueType(cause) => Self::ValueType(cause),
+            // A construction Rule is this domain's rejected semantic unification,
+            // distinct from its typed physical metadata and allocation failures.
+            crate::ValueConstructionFailure::Rule(detail) => Self::SemanticRule(
+                novarocks_failure_contract::BoundedDetail::truncating(&detail),
+            ),
+            crate::ValueConstructionFailure::Observer(never) => match never {},
+            crate::ValueConstructionFailure::Layout(cause) => Self::Layout(cause),
+            crate::ValueConstructionFailure::Vec(cause) => Self::Vec(cause),
+            crate::ValueConstructionFailure::HashMap(cause) => Self::HashMap(cause),
+        }
+    }
+}
+impl std::fmt::Display for ComparisonCoercionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Operands(detail) | Self::SemanticRule(detail) => f.write_str(detail.as_str()),
+            Self::InvalidPrecision { precision, scale } => write!(
+                f,
+                "decimal comparison invalid precision {precision}, scale {scale}"
+            ),
+            Self::PrecisionExtent { precision, scale } => write!(
+                f,
+                "decimal comparison precision overflow: requires Decimal256({precision}, {scale}), maximum 76 digits"
+            ),
+            Self::ValueType(cause) => cause.fmt(f),
+            Self::Layout(cause) => cause.fmt(f),
+            Self::Vec(cause) => write!(f, "comparison type construction: {cause:?}"),
+            Self::HashMap(cause) => cause.fmt(f),
+        }
+    }
+}
+impl std::error::Error for ComparisonCoercionFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ValueType(cause) => Some(cause),
+            Self::Layout(cause) => Some(cause),
+            Self::HashMap(cause) => Some(cause),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ComparisonCoercionFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureReason, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        let (class, code) = match self {
+            Self::Operands(_) => (FailureClass::Invariant, 66),
+            Self::InvalidPrecision { .. } => (FailureClass::Invariant, 67),
+            Self::PrecisionExtent { .. } => (FailureClass::Representation, 68),
+            Self::SemanticRule(_) => (FailureClass::Data, 69),
+            Self::ValueType(cause) => return cause.failure_fact(),
+            Self::Layout(cause) => return cause.failure_fact(),
+            Self::HashMap(cause) => return cause.failure_fact(),
+            Self::Vec(crate::ControlResourceError::Control(cause)) => return cause.failure_fact(),
+            Self::Vec(crate::ControlResourceError::SourceModel(_)) => (FailureClass::Invariant, 70),
+        };
+        let fact = FailureFact::new(
+            class,
+            FailureReason::new(
+                domain::TYPE_CONTRACT,
+                std::num::NonZeroU16::new(code).unwrap(),
+            ),
+        );
+        if let Self::PrecisionExtent { precision, .. } = self {
+            fact.with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::MinimumUnit,
+                layout: RepresentationLayout {
+                    domain: domain::TYPE_CONTRACT,
+                    code: std::num::NonZeroU16::new(3).unwrap(),
+                },
+                required: u64::try_from(*precision).ok(),
+                extent_limit: Some(76),
+                representable_prefix: None,
+            })
+        } else {
+            fact
+        }
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for ComparisonCoercionFailure {}
+
 /// Common decimal type for a decimal-vs-decimal comparison / equi-join key.
 /// scale = max(s1,s2); precision = max(p1-s1, p2-s2) + scale. Promotes to
 /// Decimal256 when the precision exceeds 38 or either side is already 256;
 /// errors when it would exceed 76 (Decimal256 max). This is the single source
 /// shared by `comparison_common_type`, lower binary_pred, and lower join-key.
-pub fn decimal_compare_type(left: &DataType, right: &DataType) -> Result<DataType, String> {
+pub fn decimal_compare_type(
+    left: &DataType,
+    right: &DataType,
+) -> Result<DataType, ComparisonCoercionFailure> {
     let (lp, ls, left_is_256) = match left {
         DataType::Decimal128(p, s) => (*p, *s, false),
         DataType::Decimal256(p, s) => (*p, *s, true),
         _ => {
-            return Err(format!(
+            return Err(ComparisonCoercionFailure::operands(format_args!(
                 "decimal comparison requires decimal operands (left={left:?}, right={right:?})"
-            ));
+            )));
         }
     };
     let (rp, rs, right_is_256) = match right {
         DataType::Decimal128(p, s) => (*p, *s, false),
         DataType::Decimal256(p, s) => (*p, *s, true),
         _ => {
-            return Err(format!(
+            return Err(ComparisonCoercionFailure::operands(format_args!(
                 "decimal comparison requires decimal operands (left={left:?}, right={right:?})"
-            ));
+            )));
         }
     };
 
@@ -52,16 +156,18 @@ pub fn decimal_compare_type(left: &DataType, right: &DataType) -> Result<DataTyp
     let int_digits: i16 = lhs_int_digits.max(rhs_int_digits).max(0);
     let target_precision: i16 = int_digits + (target_scale as i16);
     if target_precision <= 0 {
-        return Err(format!(
-            "decimal comparison invalid precision (left={left:?}, right={right:?})"
-        ));
+        return Err(ComparisonCoercionFailure::InvalidPrecision {
+            precision: target_precision,
+            scale: target_scale,
+        });
     }
     let need_decimal256 = left_is_256 || right_is_256 || target_precision > 38;
     if need_decimal256 {
         if target_precision > 76 {
-            return Err(format!(
-                "decimal comparison precision overflow (left={left:?}, right={right:?}, target=Decimal256({target_precision}, {target_scale}))"
-            ));
+            return Err(ComparisonCoercionFailure::PrecisionExtent {
+                precision: target_precision,
+                scale: target_scale,
+            });
         }
         let target_precision_u8 = target_precision as u8;
         return Ok(DataType::Decimal256(target_precision_u8, target_scale));
@@ -82,7 +188,7 @@ pub fn decimal_compare_type(left: &DataType, right: &DataType) -> Result<DataTyp
 pub fn comparison_common_type(
     left: &DataType,
     right: &DataType,
-) -> Result<Option<DataType>, String> {
+) -> Result<Option<DataType>, ComparisonCoercionFailure> {
     if left == right {
         return Ok(None);
     }
@@ -167,7 +273,7 @@ pub fn comparison_common_type(
 fn comparison_common_complex_type(
     left: &DataType,
     right: &DataType,
-) -> Result<Option<DataType>, String> {
+) -> Result<Option<DataType>, ComparisonCoercionFailure> {
     match (left, right) {
         (DataType::List(left_item), DataType::List(right_item)) => {
             let Some((item, changed)) = comparison_common_field(left_item, right_item)? else {
@@ -212,7 +318,7 @@ fn comparison_common_complex_type(
 fn comparison_common_struct_type(
     left_fields: &Fields,
     right_fields: &Fields,
-) -> Result<Option<DataType>, String> {
+) -> Result<Option<DataType>, ComparisonCoercionFailure> {
     if let Some(fields) = comparison_common_struct_fields_by_name(left_fields, right_fields)? {
         return Ok(Some(DataType::Struct(fields)));
     }
@@ -235,7 +341,7 @@ fn comparison_common_struct_type(
 fn comparison_common_struct_fields_by_name(
     left_fields: &Fields,
     right_fields: &Fields,
-) -> Result<Option<Fields>, String> {
+) -> Result<Option<Fields>, ComparisonCoercionFailure> {
     let right_by_name = right_fields
         .iter()
         .map(|field| (field.name().as_str(), field))
@@ -268,7 +374,7 @@ fn comparison_common_struct_fields_by_name(
 fn comparison_common_field(
     left: &Field,
     right: &Field,
-) -> Result<Option<(Arc<Field>, bool)>, String> {
+) -> Result<Option<(Arc<Field>, bool)>, ComparisonCoercionFailure> {
     let data_type = if left.data_type() == right.data_type() {
         left.data_type().clone()
     } else if let Some(common) =
@@ -293,7 +399,7 @@ fn comparison_common_field(
 fn comparison_common_nested_field_type(
     left: &DataType,
     right: &DataType,
-) -> Result<Option<DataType>, String> {
+) -> Result<Option<DataType>, ComparisonCoercionFailure> {
     let common = comparison_common_type(left, right)?;
     if common.is_some() && (is_string_type(left) || is_string_type(right)) {
         return Ok(Some(wider_type(left, right)));
@@ -317,7 +423,7 @@ fn is_string_type(data_type: &DataType) -> bool {
 pub fn comparison_common_value_type(
     left: &FunctionValueType,
     right: &FunctionValueType,
-) -> Result<Option<FunctionValueType>, String> {
+) -> Result<Option<FunctionValueType>, ComparisonCoercionFailure> {
     validate_operands(left, right)?;
     if left.data_type() == &DataType::Null || right.data_type() == &DataType::Null {
         let value = null_common_value(left, right);
@@ -343,7 +449,7 @@ pub fn comparison_common_value_type(
 pub fn wider_comparison_value_type(
     left: &FunctionValueType,
     right: &FunctionValueType,
-) -> Result<FunctionValueType, String> {
+) -> Result<FunctionValueType, ComparisonCoercionFailure> {
     validate_operands(left, right)?;
     if left.data_type() == &DataType::Null || right.data_type() == &DataType::Null {
         return Ok(null_common_value(left, right));
@@ -351,10 +457,13 @@ pub fn wider_comparison_value_type(
     value_type_for_common_layout(wider_type(left.data_type(), right.data_type()), left, right)
 }
 
-fn validate_operands(left: &FunctionValueType, right: &FunctionValueType) -> Result<(), String> {
+fn validate_operands(
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+) -> Result<(), ComparisonCoercionFailure> {
     left.validate()
         .and_then(|()| right.validate())
-        .map_err(|error| error.to_string())
+        .map_err(|error| ComparisonCoercionFailure::ValueType(error.into()))
 }
 
 fn null_common_value(left: &FunctionValueType, right: &FunctionValueType) -> FunctionValueType {
@@ -384,7 +493,7 @@ pub fn value_type_for_common_layout(
     carrier: DataType,
     left: &FunctionValueType,
     right: &FunctionValueType,
-) -> Result<FunctionValueType, String> {
+) -> Result<FunctionValueType, ComparisonCoercionFailure> {
     value_type_for_common_layout_with_construction::<std::convert::Infallible>(
         carrier,
         left,
@@ -392,7 +501,7 @@ pub fn value_type_for_common_layout(
         crate::ValueTypeStorageLifetime::pure(),
         None,
     )
-    .map_err(crate::ValueConstructionFailure::into_pure_string)
+    .map_err(ComparisonCoercionFailure::from_construction)
 }
 pub fn value_type_for_common_layout_with_construction<E>(
     carrier: DataType,
@@ -687,6 +796,31 @@ fn has_nominal_child(value: &crate::ValueTypeRef) -> bool {
 
 #[cfg(test)]
 mod value_tests {
+    #[test]
+    fn decimal_common_precision_boundary_is_exact_and_does_not_retain_operand_fields() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+        let error =
+            decimal_compare_type(&DataType::Decimal256(76, 0), &DataType::Decimal256(76, 38))
+                .unwrap_err();
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Representation);
+        let representation = fact.representation().unwrap();
+        assert_eq!(representation.boundary, RepresentationBoundary::MinimumUnit);
+        assert_eq!(representation.required, Some(114));
+        assert_eq!(representation.extent_limit, Some(76));
+        assert_eq!(
+            decimal_compare_type(&DataType::Decimal256(76, 0), &DataType::Decimal256(76, 0))
+                .unwrap(),
+            DataType::Decimal256(76, 0)
+        );
+        let field = Arc::new(Field::new("item", DataType::Int32, true));
+        let weak = Arc::downgrade(&field);
+        let invalid =
+            decimal_compare_type(&DataType::List(field), &DataType::Decimal128(3, 0)).unwrap_err();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(invalid.failure_fact().class(), FailureClass::Invariant);
+    }
+
     use super::*;
     use arrow_schema::TimeUnit;
 

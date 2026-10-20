@@ -469,7 +469,7 @@ impl PureCompileControl for Trace {
         let mut trace = self.callbacks.lock().unwrap();
         let at = trace.len();
         trace.push((phase, units));
-        if let Some((refused, cause)) = self.refusal
+        if let Some((refused, cause)) = self.refusal.clone()
             && at == refused
         {
             return Err(cause);
@@ -544,7 +544,7 @@ fn canonical_resolved_helper_materializes_text_and_preserves_success_error_contr
             ] {
                 let control = Trace {
                     callbacks: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let error = execute(&control).unwrap_err();
                 assert_eq!(error.control_error(), Some(cause));

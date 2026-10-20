@@ -81,6 +81,10 @@ pub(crate) fn prune_catalogs(
 pub(super) type AuthenticatedNovaRocksGrpcClient =
     NovaRocksGrpcClient<InterceptedService<NativeLaneChannel, NativeClientAuthInterceptor>>;
 
+/// The Root-only client keeps the original authenticated ResultData channel.
+pub(super) type AuthenticatedRootResultGrpc =
+    tonic::client::Grpc<InterceptedService<NativeLaneChannel, NativeClientAuthInterceptor>>;
+
 /// A Native channel either fails before an outbound connection is attempted,
 /// or while that connection is being established.  TaskUpdate must preserve
 /// that distinction: the latter has an unknown remote outcome, while the
@@ -88,7 +92,7 @@ pub(super) type AuthenticatedNovaRocksGrpcClient =
 #[derive(Debug)]
 pub(super) enum ChannelAcquisitionError {
     Fatal(String),
-    RetryableNetwork(String),
+    RetryableNetwork(ChannelEstablishmentFailure),
 }
 
 impl ChannelAcquisitionError {
@@ -97,19 +101,123 @@ impl ChannelAcquisitionError {
     }
 
     pub(super) fn retryable_network(detail: impl Into<String>) -> Self {
-        Self::RetryableNetwork(detail.into())
+        Self::RetryableNetwork(ChannelEstablishmentFailure {
+            detail: detail.into(),
+            connection_lost: false,
+        })
     }
 }
 
 impl std::fmt::Display for ChannelAcquisitionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Fatal(detail) | Self::RetryableNetwork(detail) => formatter.write_str(detail),
+            Self::Fatal(detail) => formatter.write_str(detail),
+            Self::RetryableNetwork(error) => formatter.write_str(&error.detail),
         }
     }
 }
 
 impl std::error::Error for ChannelAcquisitionError {}
+
+/// Establishment may fail in a local admission/cache owner without observing a
+/// broken backend connection. Keep that distinction before rendering text.
+#[derive(Debug)]
+pub(super) struct ChannelEstablishmentFailure {
+    detail: String,
+    connection_lost: bool,
+}
+impl ChannelAcquisitionError {
+    pub(super) fn observed_connection_loss(&self) -> bool {
+        matches!(self, Self::RetryableNetwork(error) if error.connection_lost)
+    }
+    fn failed_connection(error: tonic::transport::Error) -> Self {
+        Self::RetryableNetwork(ChannelEstablishmentFailure {
+            connection_lost: is_observed_connection_loss(&error),
+            detail: format!("connect Native endpoint failed: {error}"),
+        })
+    }
+}
+
+/// Inspect original typed transport evidence only. A local timeout, a closed
+/// admission gate, a TLS refusal or a source-less RPC status supplies no such
+/// evidence. The bounded walk protects diagnostics from a pathological chain.
+fn observed_dial_loss(failure: &novarocks_native_trust::NativeConnectFailure) -> bool {
+    // DNS/configuration/TLS phases retain their own cause. In particular, an
+    // EOF during certificate negotiation is not a failed Task process.
+    match failure {
+        novarocks_native_trust::NativeConnectFailure::Unreachable(error) => observed_io_loss(error),
+        novarocks_native_trust::NativeConnectFailure::Resolution(_)
+        | novarocks_native_trust::NativeConnectFailure::Handshake(_)
+        | novarocks_native_trust::NativeConnectFailure::UnverifiableServerName => false,
+    }
+}
+fn observed_io_loss(error: &std::io::Error) -> bool {
+    // io::Error::source may skip the custom payload itself. Inspect that
+    // original phase-bearing owner before following a child error.
+    if let Some(failure) = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<novarocks_native_trust::NativeConnectFailure>())
+    {
+        return match failure {
+            novarocks_native_trust::NativeConnectFailure::Unreachable(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::NotConnected
+            ),
+            _ => false,
+        };
+    }
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected
+    )
+}
+pub(super) fn is_observed_connection_loss(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    for _ in 0..16 {
+        let Some(error) = current else {
+            break;
+        };
+        if let Some(failure) = error.downcast_ref::<novarocks_native_trust::NativeConnectFailure>()
+        {
+            return observed_dial_loss(failure);
+        }
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            if error
+                .get_ref()
+                .is_some_and(|source| source.is::<novarocks_native_trust::NativeConnectFailure>())
+            {
+                return observed_io_loss(error);
+            }
+            if observed_io_loss(error) {
+                return true;
+            }
+        }
+        if let Some(error) = error.downcast_ref::<h2::Error>() {
+            // Locked h2 keeps IO in get_io rather than Error::source.
+            if let Some(error) = error.get_io() {
+                return observed_io_loss(error);
+            }
+            if error.is_remote()
+                && error.is_go_away()
+                && error.reason() == Some(h2::Reason::NO_ERROR)
+            {
+                return true;
+            }
+        }
+        current = error.source();
+    }
+    false
+}
 
 #[derive(Clone)]
 enum FrozenClientEndpoints {
@@ -238,6 +346,23 @@ impl Client {
         Ok((grpc, acquired))
     }
 
+    /// Acquire the same cached channel identity as generated Native calls.
+    /// The caller supplies the Root codec and retains its original window.
+    pub(super) async fn root_result_grpc_with_channel_identity(
+        &self,
+    ) -> Result<(AuthenticatedRootResultGrpc, CachedNativeChannel), ChannelAcquisitionError> {
+        let method = NativeRpcMethod::FetchRootResult;
+        let acquired = channel(&self.data_runtime, self.channel_key(method)?).await?;
+        let service = InterceptedService::new(
+            acquired.channel.clone(),
+            NativeClientAuthInterceptor::new(self.data_runtime.native_trust().as_ref().clone()),
+        );
+        let grpc = tonic::client::Grpc::new(service)
+            .max_encoding_message_size(super::root_result_codec::ROOT_REQUEST_MAX_BYTES)
+            .max_decoding_message_size(super::root_result_codec::ROOT_RESPONSE_MAX_BYTES);
+        Ok((grpc, acquired))
+    }
+
     pub(super) fn invalidate_channel_if_current(
         &self,
         method: NativeRpcMethod,
@@ -306,11 +431,7 @@ async fn channel(
     .timeout(Duration::from_secs(600))
     .connect_with_connector(connector)
     .await
-    .map_err(|error| {
-        ChannelAcquisitionError::retryable_network(format!(
-            "connect Native endpoint failed: {error}"
-        ))
-    })?;
+    .map_err(ChannelAcquisitionError::failed_connection)?;
     // One Channel is one connection; its stream positions live with it.
     let channel = NativeLaneChannel::new(
         created,
@@ -326,17 +447,36 @@ async fn channel(
 // channel occupying the replacement's one live Control connection. This
 // retires only the acquired cache generation; topology and attempt verdicts
 // remain with their existing owners.
-struct HeartbeatChannelAttempt<'a> {
+pub(super) struct NativeChannelAttempt<'a> {
     client: &'a Client,
     acquired: CachedNativeChannel,
+    method: NativeRpcMethod,
     rpc_completed: bool,
 }
 
-impl Drop for HeartbeatChannelAttempt<'_> {
+impl<'a> NativeChannelAttempt<'a> {
+    pub(super) fn new(
+        client: &'a Client,
+        method: NativeRpcMethod,
+        acquired: CachedNativeChannel,
+    ) -> Self {
+        Self {
+            client,
+            method,
+            acquired,
+            rpc_completed: false,
+        }
+    }
+    pub(super) fn rpc_completed(&mut self) {
+        self.rpc_completed = true;
+    }
+}
+
+impl Drop for NativeChannelAttempt<'_> {
     fn drop(&mut self) {
         if !self.rpc_completed {
             self.client
-                .invalidate_channel_if_current(NativeRpcMethod::Heartbeat, &self.acquired);
+                .invalidate_channel_if_current(self.method, &self.acquired);
         }
     }
 }
@@ -361,7 +501,8 @@ pub(crate) fn heartbeat(
                     .grpc_with_channel_identity(NativeRpcMethod::Heartbeat)
                     .await
                     .map_err(|error| error.to_string())?;
-                let mut attempt = HeartbeatChannelAttempt {
+                let mut attempt = NativeChannelAttempt {
+                    method: NativeRpcMethod::Heartbeat,
                     client: &client,
                     acquired,
                     rpc_completed: false,
@@ -588,7 +729,8 @@ mod routing_tests {
                 .unwrap()
                 .publish(lane_channel(channel))
                 .unwrap();
-            drop(HeartbeatChannelAttempt {
+            drop(NativeChannelAttempt {
+                method: NativeRpcMethod::Heartbeat,
                 client: &client,
                 acquired,
                 rpc_completed,
@@ -603,13 +745,78 @@ mod routing_tests {
             .unwrap()
             .publish(lane_channel(channel))
             .unwrap();
-        drop(HeartbeatChannelAttempt {
+        drop(NativeChannelAttempt {
+            method: NativeRpcMethod::Heartbeat,
             client: &client,
             acquired: old,
             rpc_completed: false,
         });
         assert!(runtime.cached_channel(&key).is_some());
         assert!(client.invalidate_channel_if_current(NativeRpcMethod::Heartbeat, &replacement));
+    }
+
+    #[tokio::test]
+    async fn original_admitted_root_dial_preserves_actual_tcp_failure_evidence() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint =
+            NativeEndpoint::from_host_port("127.0.0.1", listener.local_addr().unwrap().port())
+                .unwrap();
+        drop(listener);
+        let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let client = Client::for_endpoint(
+            endpoint,
+            NativeEndpointDomain::BackendData,
+            BackendProcessId::new_v7(),
+            runtime,
+        );
+        let failure = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.root_result_grpc_with_channel_identity(),
+        )
+        .await
+        .expect("original local dial exits")
+        .err()
+        .expect("unbound local endpoint refuses TCP");
+        assert!(matches!(
+            failure,
+            ChannelAcquisitionError::RetryableNetwork(_)
+        ));
+        assert!(
+            failure.observed_connection_loss(),
+            "the original admitted connector must retain its TCP evidence"
+        );
+    }
+
+    #[tokio::test]
+    async fn original_connection_phase_and_h2_io_are_preserved_without_text_classification() {
+        use novarocks_native_trust::NativeConnectFailure;
+        let tcp = std::io::Error::other(NativeConnectFailure::Unreachable(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "private endpoint detail",
+        )));
+        assert!(is_observed_connection_loss(&tcp));
+        let tls = std::io::Error::other(NativeConnectFailure::Handshake(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "peer closed TLS",
+        )));
+        assert!(!is_observed_connection_loss(&tls));
+        let dns = std::io::Error::other(NativeConnectFailure::Resolution(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "resolver reset",
+        )));
+        assert!(!is_observed_connection_loss(&dns));
+        let timeout = std::io::Error::other(NativeConnectFailure::Unreachable(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "dial budget expired"),
+        ));
+        assert!(!is_observed_connection_loss(&timeout));
+        let (local, peer) = tokio::io::duplex(64);
+        drop(peer);
+        let h2 = h2::client::handshake(local)
+            .await
+            .err()
+            .expect("the actual closed IO refuses the h2 preface");
+        assert!(h2.get_io().is_some());
+        assert!(is_observed_connection_loss(&h2));
     }
 
     /// Accepts and holds every connection; a stock Tonic dial completes

@@ -51,6 +51,7 @@
 
 pub mod adapter;
 pub mod budget;
+mod failure;
 pub mod limits;
 pub mod prepared;
 pub mod relation;

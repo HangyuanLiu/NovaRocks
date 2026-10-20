@@ -21,4 +21,4 @@
 mod output_filter;
 mod stream_source;
 
-pub(crate) use stream_source::StreamScanSourceFactory;
+pub(crate) use stream_source::{StreamScanSourceFactory, is_scan_exit_unwind};

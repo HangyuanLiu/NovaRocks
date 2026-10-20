@@ -70,7 +70,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -435,7 +435,7 @@ fn string_concat_ws_compile_success_and_ordinary_tail_preserve_all_callback_caus
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let actual = prepared_for_test_with_control(
                     "concat_ws",
@@ -791,7 +791,7 @@ fn string_concat_ws_separator_null_and_cap_reject_never_mask_bad_required_childr
             let mut kernel = instance(&types);
             assert!(matches!(
                 kernel.evaluate(Selection::all(1), &arguments, &Control::default()),
-                Err(KernelFailure::InvalidProgram(_))
+                Err(ref cause) if crate::kernel_control::test_contract::input(cause)
             ));
             let after = Control::default();
             let valid_arguments = [

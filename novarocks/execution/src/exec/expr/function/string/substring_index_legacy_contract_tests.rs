@@ -62,7 +62,7 @@ fn fixture(arrays: Vec<ArrayRef>) -> (ExprArena, Vec<ExprId>, ExprId, Chunk) {
         chunk,
     )
 }
-fn evaluate(arrays: Vec<ArrayRef>) -> Result<ArrayRef, String> {
+fn evaluate(arrays: Vec<ArrayRef>) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (arena, args, expr, chunk) = fixture(arrays);
     eval_substring_index(&arena, expr, &args, &chunk)
 }
@@ -170,17 +170,18 @@ fn legacy_substring_index_contract_tests_carrier_messages_eager_children_and_ign
         let mut arrays = vec![strings(vec![None]), strings(vec![None]), integer.clone()];
         arrays[bad] = integer.clone();
         assert_eq!(
-            evaluate(arrays).unwrap_err(),
+            (evaluate(arrays).unwrap_err()).to_string(),
             "substring_index expects string"
         );
     }
     assert_eq!(
-        evaluate(vec![
+        (evaluate(vec![
             strings(vec![None]),
             strings(vec![None]),
             Arc::new(Float64Array::from(vec![1.0]))
         ])
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "substring_index expects int"
     );
     let (arena, good, expr, chunk) =
@@ -192,10 +193,10 @@ fn legacy_substring_index_contract_tests_carrier_messages_eager_children_and_ign
         vec![good[0], good[1], expr],
         vec![good[0], expr, expr],
     ] {
-        assert_eq!(
-            eval_substring_index(&arena, expr, &args, &chunk).unwrap_err(),
-            earliest
-        );
+        let observed = eval_substring_index(&arena, expr, &args, &chunk).unwrap_err();
+        use novarocks_failure_contract::FailureProjection;
+        assert_eq!(observed.failure_fact(), earliest.failure_fact());
+        assert_eq!(observed.detail(), earliest.detail());
     }
     let (arena, mut args, expr, chunk) = fixture(vec![
         strings(vec![Some("left/right")]),

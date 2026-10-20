@@ -40,13 +40,23 @@ fn run_optional_dop(
     ));
     operator.set_mem_tracker(tracker);
     operator.prepare().expect("prepare actual aggregate schema");
-    let processor = operator.as_processor_mut().unwrap();
+    let mut processor =
+        crate::exec::pipeline::test_driver::TestDriver::new(operator.as_mut(), &state);
     for input in inputs {
-        processor.push_chunk(&state, input.clone()).unwrap();
+        processor.input_without_output(input.clone()).unwrap();
     }
-    processor.set_finishing(&state).unwrap();
-    let output = processor.pull_chunk(&state).unwrap();
-    assert!(processor.pull_chunk(&state).unwrap().is_none());
+    processor.signal_eos().unwrap();
+    let output = processor
+        .advance_to_boundary()
+        .map(|step| step.output)
+        .unwrap();
+    assert!(
+        processor
+            .advance_to_boundary()
+            .map(|step| step.output)
+            .unwrap()
+            .is_none()
+    );
     output
 }
 #[test]
@@ -121,8 +131,16 @@ fn ds_hll_grouped_local_after_hash_slots_real_identity_native_and_nulls() {
                 LocalExchangePartitionSpec::InputSlotIds(partition_slots),
                 Arc::new(crate::exec::expr::ExprArena::default()),
             );
-            let state =
-                RuntimeState::new(None, None, None, None, None, Some(tracker.clone()), None);
+            let state = RuntimeState::for_local_execution(
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(tracker.clone()),
+                None,
+            );
+            let queue_tracker = exchange.queue_mem_tracker(&state);
             for driver in 0..2 {
                 let offset = if driver == 0 { 0 } else { split };
                 let count = if driver == 0 { split } else { length - split };
@@ -138,7 +156,7 @@ fn ds_hll_grouped_local_after_hash_slots_real_identity_native_and_nulls() {
                         part.chunk_schema(),
                         prepared_schema(&partial, tracker.clone()).as_ref()
                     );
-                    exchange.accept(&state, part, driver).unwrap();
+                    exchange.accept(queue_tracker.as_ref(), part).unwrap();
                 }
                 assert_eq!(exchange.finish_producer(), driver == 1);
             }
@@ -213,24 +231,31 @@ fn ds_hll_grouped_local_after_actual_partial_final_cancel_latch_drop() {
             operator.set_mem_tracker(tracker.clone());
             operator.prepare().expect("prepare actual aggregate schema");
             let creator_bytes = tracker.current();
-            let processor = operator.as_processor_mut().unwrap();
-            processor.push_chunk(&state, first.clone()).unwrap();
-            assert!(tracker.current() > 0);
-            phase
-                .error
-                .set_error("grouped local aggregate actual task stop");
-            let primary = processor.push_chunk(&state, first.clone()).unwrap_err();
-            assert_eq!(
-                primary.cause(),
-                &crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
+            let mut processor = crate::exec::pipeline::test_driver::TestDriver::with_control(
+                operator.as_mut(),
+                phase.error.clone(),
             );
+            processor.input_without_output(first.clone()).unwrap();
+            assert!(tracker.current() > 0);
+            let originating =
+                crate::runtime::fragment::ExecutionFailure::from(KernelFailure::ResourceExhausted);
+            phase.error.set_error(originating.clone());
+            let primary = processor.input_without_output(first.clone()).unwrap_err();
+            assert!(primary.same_occurrence(&originating));
+            assert_eq!(primary.context(), originating.context());
+            // The local driver preserves its already known originating cause.
+            assert!(phase.error.error().unwrap().same_occurrence(&originating));
             assert_eq!(tracker.current(), creator_bytes);
-            assert!(processor.is_finished());
-            assert!(!processor.need_input());
-            assert!(!processor.has_output());
-            assert_eq!(processor.push_chunk(&state, first).unwrap_err(), primary);
-            assert_eq!(processor.set_finishing(&state).unwrap_err(), primary);
-            assert_eq!(processor.pull_chunk(&state).unwrap_err(), primary);
+            assert_eq!(processor.drive().unwrap_err(), primary);
+            assert_eq!(processor.input_without_output(first).unwrap_err(), primary);
+            assert_eq!(processor.signal_eos().unwrap_err(), primary);
+            assert_eq!(
+                processor
+                    .advance_to_boundary()
+                    .map(|step| step.output)
+                    .unwrap_err(),
+                primary
+            );
         }
         assert_eq!(tracker.current(), 0);
     }

@@ -109,7 +109,11 @@ impl<'a> NumericInput<'a> {
                     .as_any()
                     .downcast_ref::<$array>()
                     .map(Self::$variant)
-                    .ok_or_else(|| NumericElementaryError::LegacyCarrier($message.into()))
+                    .ok_or_else(|| {
+                        NumericElementaryError::Carrier(
+                            crate::math_numeric::NumericArrayFailure::new($message),
+                        )
+                    })
             };
         }
         match array.data_type() {
@@ -128,14 +132,16 @@ impl<'a> NumericInput<'a> {
                 .downcast_ref::<Decimal128Array>()
                 .map(|array| Self::Decimal128(array, *scale))
                 .ok_or_else(|| {
-                    NumericElementaryError::LegacyCarrier(
-                        "failed to downcast to Decimal128Array".into(),
-                    )
+                    NumericElementaryError::Carrier(crate::math_numeric::NumericArrayFailure::new(
+                        "failed to downcast to Decimal128Array",
+                    ))
                 }),
             DataType::Null => Ok(Self::Null),
-            other => Err(NumericElementaryError::LegacyCarrier(format!(
-                "unsupported numeric type: {other:?}"
-            ))),
+            other => Err(NumericElementaryError::Carrier(
+                crate::math_numeric::NumericArrayFailure::new(format_args!(
+                    "unsupported numeric type: {other:?}"
+                )),
+            )),
         }
     }
     fn value(&self, row: usize) -> Option<f64> {
@@ -367,18 +373,42 @@ pub(super) fn evaluate_numeric_elementary<'a>(
 /// contract and control failures retain their typed kernel failure.
 #[derive(Debug)]
 pub enum NumericElementaryError {
-    LegacyCarrier(String),
+    Carrier(crate::math_numeric::NumericArrayFailure),
     Kernel(KernelFailure),
+}
+impl NumericElementaryError {
+    pub fn into_kernel(self) -> KernelFailure {
+        match self {
+            Self::Kernel(cause) => cause,
+            cause => KernelFailure::from_domain(cause),
+        }
+    }
 }
 impl std::fmt::Display for NumericElementaryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::LegacyCarrier(message) => f.write_str(message),
+            Self::Carrier(cause) => cause.fmt(f),
             Self::Kernel(error) => std::fmt::Display::fmt(error, f),
         }
     }
 }
-impl std::error::Error for NumericElementaryError {}
+impl std::error::Error for NumericElementaryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Carrier(cause) => Some(cause),
+            Self::Kernel(cause) => Some(cause),
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for NumericElementaryError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        match self {
+            Self::Carrier(cause) => cause.failure_fact(),
+            Self::Kernel(cause) => cause.failure_fact(),
+        }
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for NumericElementaryError {}
 
 #[derive(Clone, Copy)]
 enum ElementaryProjection {

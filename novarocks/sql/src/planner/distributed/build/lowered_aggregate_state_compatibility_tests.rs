@@ -478,7 +478,7 @@ fn state_compat_actual_repeat_lowerer_and_stateformat_refusal_keep_every_origina
             ] {
                 let control = Control {
                     trace: Default::default(),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 assert!(
                     matches!(authored(source, &control), Err(ContractLoweringError::Control(actual)) if actual == cause)

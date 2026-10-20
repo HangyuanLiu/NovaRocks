@@ -22,7 +22,7 @@ pub fn eval_any_match<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     let arr = arena.eval(args[0], chunk)?;
-    Ok((novarocks_functions::builtin::array_match_core::any_match(&arr, chunk.len()))?)
+    novarocks_functions::builtin::array_match_core::any_match(&arr, chunk.len()).map_err(Into::into)
 }

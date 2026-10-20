@@ -53,7 +53,7 @@ impl PureCompileControl for CompileControl {
         assert!(units <= novarocks_type_contract::MAX_UNOBSERVED_COMPILE_WORK);
         self.work.lock().unwrap().push(units);
         if (!self.positive_only || units > 0)
-            && let Some(failure) = self.failure
+            && let Some(failure) = self.failure.clone()
         {
             Err(failure)
         } else {
@@ -303,7 +303,7 @@ fn aggregate_contract(
 fn assert_invalid<T: std::fmt::Debug>(result: Result<T, KernelFailure>) {
     assert!(matches!(
         result.unwrap_err(),
-        KernelFailure::InvalidProgram(_)
+        ref cause if crate::kernel_control::test_contract::input(cause)
     ));
 }
 fn selected<'a>(
@@ -678,8 +678,13 @@ fn compile_control_failures_preserve_entry_and_positive_work_classification() {
             KernelFailure::ResourceExhausted,
         ),
     ] {
+        assert_eq!(
+            novarocks_failure_contract::FailureProjection::failure_fact(&expected).class(),
+            novarocks_failure_contract::FailureProjection::failure_fact(&failure).class()
+        );
+        let expected = KernelFailure::CompileControl(failure.clone());
         let control = CompileControl {
-            failure: Some(failure),
+            failure: Some(failure.clone()),
             ..Default::default()
         };
         assert_eq!(
@@ -695,7 +700,7 @@ fn compile_control_failures_preserve_entry_and_positive_work_classification() {
             expected
         );
         let control = CompileControl {
-            failure: Some(failure),
+            failure: Some(failure.clone()),
             positive_only: true,
             ..Default::default()
         };
@@ -769,7 +774,9 @@ fn runtime_control_failures_preserve_entry_and_mid_partition_quantum() {
 }
 
 fn assert_internal<T: std::fmt::Debug>(result: Result<T, KernelFailure>) {
-    assert!(matches!(result.unwrap_err(), KernelFailure::Internal(_)));
+    assert!(
+        matches!(result.unwrap_err(), ref cause if crate::kernel_control::test_contract::output(cause))
+    );
 }
 #[test]
 fn output_projection_borrows_complete_input_and_checks_sparse_and_empty_results() {

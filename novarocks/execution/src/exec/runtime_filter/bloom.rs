@@ -88,7 +88,7 @@ impl SimdBlockFilter {
     pub(in crate::exec::runtime_filter) fn merge_from(
         &mut self,
         other: &SimdBlockFilter,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         if !self.can_use() || !other.can_use() {
             return Ok(());
         }
@@ -96,7 +96,9 @@ impl SimdBlockFilter {
             || self.directory_mask != other.directory_mask
             || self.directory.len() != other.directory.len()
         {
-            return Err("runtime bloom filter merge size mismatch".to_string());
+            return Err(crate::exec::runtime_filter::failure::contract(
+                "runtime bloom filter merge size mismatch",
+            ));
         }
         for (dst, src) in self.directory.iter_mut().zip(other.directory.iter()) {
             *dst |= *src;
@@ -146,15 +148,19 @@ impl SimdBlockFilter {
     pub(in crate::exec::runtime_filter) fn deserialize(
         data: &[u8],
         offset: &mut usize,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
         let log_num_buckets = read_i32_le(data, offset)?;
         let directory_mask = read_u32_le(data, offset)?;
         let data_size = read_i32_le(data, offset)? as usize;
         if data.len() < *offset + data_size {
-            return Err("runtime bloom filter data truncated".to_string());
+            return Err(crate::exec::runtime_filter::failure::contract(
+                "runtime bloom filter data truncated",
+            ));
         }
         if !data_size.is_multiple_of(4) {
-            return Err("runtime bloom filter data size invalid".to_string());
+            return Err(crate::exec::runtime_filter::failure::contract(
+                "runtime bloom filter data size invalid",
+            ));
         }
         let mut directory = Vec::with_capacity(data_size / 4);
         for _ in 0..(data_size / 4) {
@@ -277,9 +283,14 @@ impl RuntimeBloomFilter {
         }
     }
 
-    pub fn merge_from(&mut self, other: &RuntimeBloomFilter) -> Result<(), String> {
+    pub fn merge_from(
+        &mut self,
+        other: &RuntimeBloomFilter,
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         if self.filter_id != other.filter_id || self.ltype != other.ltype {
-            return Err("runtime bloom filter metadata mismatch".to_string());
+            return Err(crate::exec::runtime_filter::failure::contract(
+                "runtime bloom filter metadata mismatch",
+            ));
         }
         self.has_null |= other.has_null;
         self.size = self.size.saturating_add(other.size);
@@ -295,7 +306,10 @@ impl RuntimeBloomFilter {
     }
 
     #[allow(dead_code)]
-    pub fn filter_chunk(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+    pub fn filter_chunk(
+        &self,
+        chunk: Chunk,
+    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
         if self.is_empty() {
             return Ok(Some(chunk));
         }
@@ -319,7 +333,9 @@ impl RuntimeBloomFilter {
         }
         let mask = BooleanArray::from(keep);
         let filtered_batch =
-            filter_record_batch(&chunk.record_batch(), &mask).map_err(|e| e.to_string())?;
+            filter_record_batch(&chunk.record_batch(), &mask).map_err(|source| {
+                crate::exec::runtime_filter::failure::arrow("filter batch", source)
+            })?;
         Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
     }
 
@@ -327,7 +343,7 @@ impl RuntimeBloomFilter {
         &self,
         array: &ArrayRef,
         chunk: Chunk,
-    ) -> Result<Option<Chunk>, String> {
+    ) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
         if self.is_empty() {
             return Ok(Some(chunk));
         }
@@ -335,7 +351,9 @@ impl RuntimeBloomFilter {
             return Ok(Some(chunk));
         }
         if array.len() != chunk.len() {
-            return Err("runtime bloom filter array length mismatch".to_string());
+            return Err(crate::exec::runtime_filter::failure::contract(
+                "runtime bloom filter array length mismatch",
+            ));
         }
         let len = chunk.len();
         let mut keep = vec![true; len];
@@ -350,7 +368,9 @@ impl RuntimeBloomFilter {
         }
         let mask = BooleanArray::from(keep);
         let filtered_batch =
-            filter_record_batch(&chunk.record_batch(), &mask).map_err(|e| e.to_string())?;
+            filter_record_batch(&chunk.record_batch(), &mask).map_err(|source| {
+                crate::exec::runtime_filter::failure::arrow("filter batch", source)
+            })?;
         Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
     }
 
@@ -358,7 +378,7 @@ impl RuntimeBloomFilter {
         &self,
         array: &ArrayRef,
         keep: &mut [bool],
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         let Some(bf) = self.bf.as_ref() else {
             return Ok(());
         };
@@ -372,7 +392,7 @@ impl RuntimeBloomFilter {
         ltype: RuntimeFilterType,
         array: &ArrayRef,
         join_mode: i8,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, crate::runtime::fragment::ExecutionFailure> {
         let size = array.len() as u64;
         let min_max = RuntimeMinMaxFilter::from_arrays(ltype, std::slice::from_ref(array))?;
         if size == 0 {
@@ -412,7 +432,10 @@ impl RuntimeBloomFilter {
         )
     }
 
-    pub fn insert_array(&mut self, array: &ArrayRef) -> Result<(), String> {
+    pub fn insert_array(
+        &mut self,
+        array: &ArrayRef,
+    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
         let Some(bf) = self.bf.as_mut() else {
             return Ok(());
         };
@@ -501,17 +524,23 @@ fn apply_bloom_filter(
     has_null: bool,
     array: ArrayRef,
     keep: &mut [bool],
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     let len = array.len();
     if keep.len() != len {
-        return Err("runtime bloom filter selection size mismatch".to_string());
+        return Err(crate::exec::runtime_filter::failure::contract(
+            "runtime bloom filter selection size mismatch",
+        ));
     }
     match array.data_type() {
         DataType::Boolean => {
             let arr = array
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Boolean".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bloom filter type mismatch for Boolean",
+                    )
+                })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -526,10 +555,11 @@ fn apply_bloom_filter(
             }
         }
         DataType::Int8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Int8".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                crate::exec::runtime_filter::failure::contract(
+                    "runtime bloom filter type mismatch for Int8",
+                )
+            })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -543,10 +573,11 @@ fn apply_bloom_filter(
             }
         }
         DataType::Int16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Int16".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
+                crate::exec::runtime_filter::failure::contract(
+                    "runtime bloom filter type mismatch for Int16",
+                )
+            })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -560,10 +591,11 @@ fn apply_bloom_filter(
             }
         }
         DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Int32".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                crate::exec::runtime_filter::failure::contract(
+                    "runtime bloom filter type mismatch for Int32",
+                )
+            })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -577,10 +609,11 @@ fn apply_bloom_filter(
             }
         }
         DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Int64".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                crate::exec::runtime_filter::failure::contract(
+                    "runtime bloom filter type mismatch for Int64",
+                )
+            })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -597,7 +630,11 @@ fn apply_bloom_filter(
             let arr = array
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Float32".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bloom filter type mismatch for Float32",
+                    )
+                })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -614,7 +651,11 @@ fn apply_bloom_filter(
             let arr = array
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Float64".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bloom filter type mismatch for Float64",
+                    )
+                })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -631,7 +672,11 @@ fn apply_bloom_filter(
             let arr = array
                 .as_any()
                 .downcast_ref::<Date32Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Date32".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bloom filter type mismatch for Date32",
+                    )
+                })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -650,7 +695,9 @@ fn apply_bloom_filter(
                     .as_any()
                     .downcast_ref::<TimestampSecondArray>()
                     .ok_or_else(|| {
-                        "runtime bloom filter type mismatch for TimestampSecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bloom filter type mismatch for TimestampSecond",
+                        )
                     })?;
                 for (i, keep) in keep.iter_mut().enumerate().take(len) {
                     if !*keep {
@@ -669,7 +716,9 @@ fn apply_bloom_filter(
                     .as_any()
                     .downcast_ref::<TimestampMillisecondArray>()
                     .ok_or_else(|| {
-                        "runtime bloom filter type mismatch for TimestampMillisecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bloom filter type mismatch for TimestampMillisecond",
+                        )
                     })?;
                 for (i, keep) in keep.iter_mut().enumerate().take(len) {
                     if !*keep {
@@ -688,7 +737,9 @@ fn apply_bloom_filter(
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .ok_or_else(|| {
-                        "runtime bloom filter type mismatch for TimestampMicrosecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bloom filter type mismatch for TimestampMicrosecond",
+                        )
                     })?;
                 for (i, keep) in keep.iter_mut().enumerate().take(len) {
                     if !*keep {
@@ -707,7 +758,9 @@ fn apply_bloom_filter(
                     .as_any()
                     .downcast_ref::<TimestampNanosecondArray>()
                     .ok_or_else(|| {
-                        "runtime bloom filter type mismatch for TimestampNanosecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bloom filter type mismatch for TimestampNanosecond",
+                        )
                     })?;
                 for (i, keep) in keep.iter_mut().enumerate().take(len) {
                     if !*keep {
@@ -726,7 +779,11 @@ fn apply_bloom_filter(
             let arr = array
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Utf8".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bloom filter type mismatch for Utf8",
+                    )
+                })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -743,7 +800,11 @@ fn apply_bloom_filter(
             let arr = array
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Decimal128".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bloom filter type mismatch for Decimal128",
+                    )
+                })?;
             for (i, keep) in keep.iter_mut().enumerate().take(len) {
                 if !*keep {
                     continue;
@@ -757,9 +818,8 @@ fn apply_bloom_filter(
             }
         }
         _ => {
-            return Err(format!(
-                "unsupported runtime bloom filter type: {:?}",
-                ltype
+            return Err(crate::exec::runtime_filter::failure::contract(
+                format_args!("unsupported runtime bloom filter type: {:?}", ltype),
             ));
         }
     }
@@ -770,7 +830,7 @@ fn build_bloom_from_array(
     ltype: &RuntimeFilterType,
     array: &ArrayRef,
     bf: &mut SimdBlockFilter,
-) -> Result<bool, String> {
+) -> Result<bool, crate::runtime::fragment::ExecutionFailure> {
     let len = array.len();
     let mut has_null = false;
     match array.data_type() {
@@ -778,7 +838,11 @@ fn build_bloom_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Boolean".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bloom filter type mismatch for Boolean",
+                    )
+                })?;
             for i in 0..len {
                 if arr.is_null(i) {
                     has_null = true;
@@ -789,10 +853,11 @@ fn build_bloom_from_array(
             }
         }
         DataType::Int8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Int8".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                crate::exec::runtime_filter::failure::contract(
+                    "runtime bloom filter type mismatch for Int8",
+                )
+            })?;
             for i in 0..len {
                 if arr.is_null(i) {
                     has_null = true;
@@ -803,10 +868,11 @@ fn build_bloom_from_array(
             }
         }
         DataType::Int16 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Int16".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
+                crate::exec::runtime_filter::failure::contract(
+                    "runtime bloom filter type mismatch for Int16",
+                )
+            })?;
             for i in 0..len {
                 if arr.is_null(i) {
                     has_null = true;
@@ -817,10 +883,11 @@ fn build_bloom_from_array(
             }
         }
         DataType::Int32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Int32".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                crate::exec::runtime_filter::failure::contract(
+                    "runtime bloom filter type mismatch for Int32",
+                )
+            })?;
             for i in 0..len {
                 if arr.is_null(i) {
                     has_null = true;
@@ -831,10 +898,11 @@ fn build_bloom_from_array(
             }
         }
         DataType::Int64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Int64".to_string())?;
+            let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                crate::exec::runtime_filter::failure::contract(
+                    "runtime bloom filter type mismatch for Int64",
+                )
+            })?;
             for i in 0..len {
                 if arr.is_null(i) {
                     has_null = true;
@@ -848,7 +916,11 @@ fn build_bloom_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Float32".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bloom filter type mismatch for Float32",
+                    )
+                })?;
             for i in 0..len {
                 if arr.is_null(i) {
                     has_null = true;
@@ -862,7 +934,11 @@ fn build_bloom_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Float64".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bloom filter type mismatch for Float64",
+                    )
+                })?;
             for i in 0..len {
                 if arr.is_null(i) {
                     has_null = true;
@@ -876,7 +952,11 @@ fn build_bloom_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<Date32Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Date32".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bloom filter type mismatch for Date32",
+                    )
+                })?;
             for i in 0..len {
                 if arr.is_null(i) {
                     has_null = true;
@@ -892,7 +972,9 @@ fn build_bloom_from_array(
                     .as_any()
                     .downcast_ref::<TimestampSecondArray>()
                     .ok_or_else(|| {
-                        "runtime bloom filter type mismatch for TimestampSecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bloom filter type mismatch for TimestampSecond",
+                        )
                     })?;
                 for i in 0..len {
                     if arr.is_null(i) {
@@ -908,7 +990,9 @@ fn build_bloom_from_array(
                     .as_any()
                     .downcast_ref::<TimestampMillisecondArray>()
                     .ok_or_else(|| {
-                        "runtime bloom filter type mismatch for TimestampMillisecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bloom filter type mismatch for TimestampMillisecond",
+                        )
                     })?;
                 for i in 0..len {
                     if arr.is_null(i) {
@@ -924,7 +1008,9 @@ fn build_bloom_from_array(
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()
                     .ok_or_else(|| {
-                        "runtime bloom filter type mismatch for TimestampMicrosecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bloom filter type mismatch for TimestampMicrosecond",
+                        )
                     })?;
                 for i in 0..len {
                     if arr.is_null(i) {
@@ -940,7 +1026,9 @@ fn build_bloom_from_array(
                     .as_any()
                     .downcast_ref::<TimestampNanosecondArray>()
                     .ok_or_else(|| {
-                        "runtime bloom filter type mismatch for TimestampNanosecond".to_string()
+                        crate::exec::runtime_filter::failure::contract(
+                            "runtime bloom filter type mismatch for TimestampNanosecond",
+                        )
                     })?;
                 for i in 0..len {
                     if arr.is_null(i) {
@@ -956,7 +1044,11 @@ fn build_bloom_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Utf8".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bloom filter type mismatch for Utf8",
+                    )
+                })?;
             for i in 0..len {
                 if arr.is_null(i) {
                     has_null = true;
@@ -969,7 +1061,11 @@ fn build_bloom_from_array(
             let arr = array
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "runtime bloom filter type mismatch for Decimal128".to_string())?;
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "runtime bloom filter type mismatch for Decimal128",
+                    )
+                })?;
             for i in 0..len {
                 if arr.is_null(i) {
                     has_null = true;
@@ -979,9 +1075,8 @@ fn build_bloom_from_array(
             }
         }
         _ => {
-            return Err(format!(
-                "unsupported runtime bloom filter type: {:?}",
-                ltype
+            return Err(crate::exec::runtime_filter::failure::contract(
+                format_args!("unsupported runtime bloom filter type: {:?}", ltype),
             ));
         }
     }

@@ -1222,7 +1222,7 @@ fn state(
     scan_wait: Option<Duration>,
 ) -> Arc<RuntimeState> {
     Arc::new(
-        RuntimeState::new(
+        RuntimeState::for_local_execution(
             Some(QueryOptions {
                 runtime_filter_wait_timeout_ms: Some(i32::try_from(wait.as_millis()).unwrap()),
                 runtime_filter_scan_wait_time_ms: scan_wait
@@ -1439,19 +1439,18 @@ fn first_read_wait(
         .bind_runtime_state(state)
         .expect("bind scan runtime state");
     let before = Instant::now();
-    let pulled = operator
-        .as_processor_mut()
-        .expect("a scan is a processor")
-        .pull_chunk(state)
+    let step = operator
+        .drive_for_test(state)
         .expect("a pending gate is not an error");
     let after = Instant::now();
-    assert!(pulled.is_none(), "the pending gate holds the first read");
-    let deadline = operator
-        .as_processor_ref()
-        .expect("a scan is a processor")
-        .source_block_deadline()
-        .expect("a pending gate bounds the wait")
-        .at();
+    assert!(
+        step.output.is_none(),
+        "the pending gate holds the first read"
+    );
+    let crate::exec::pipeline::step::NextStep::Wait(wait) = step.next else {
+        panic!("a pending gate reports its exact wait");
+    };
+    let deadline = wait.deadline.expect("a pending gate bounds the wait").at();
     (deadline - after, deadline - before)
 }
 
@@ -1502,11 +1501,38 @@ fn compiled_scan_runtime_filter_shapes_outside_m1_are_refused_by_name() {
     let subscription = ControlledSubscription::new();
     let session = || Some(FakeSession::consumers(&[(7, &subscription)]));
 
-    // Ordered Batch live consumers are supported by the dedicated compiled
-    // owner. Their positive pipeline and exact subscription/digest failures
-    // live in compiled_ordered_pipeline_tests, compiled_complete_ordered_tests
-    // and compiled_ordered_scan_tests. This fixture returns Blocking handles,
-    // so it cannot author a negative capability claim about that live owner.
+    // Ordered Batch live consumers have a dedicated compiled owner. This
+    // blocking-only session cannot claim that the valid shape is unsupported;
+    // it must fail at its actual subscription kind, without claiming a stream.
+    let ordered = StaticFilterConsumer::try_new(
+        7,
+        7,
+        FilterConsumerActivation::NonBlockingLive {
+            late_apply: FilterLateApplyGranularity::Batch,
+        },
+        ordered_int64_contract(),
+        FilterReduction::TightenOrderedBound,
+    )
+    .unwrap();
+    let program = scan_with_consumers(1, vec![(ordered, V0_OUTPUT)]).unwrap();
+    // The production builder installs its real ordered context. A valid
+    // single-key contract reaches subscription binding; this blocking-only
+    // session must be refused rather than treated as an unsupported plan.
+    let ordered_session = session().unwrap();
+    let message = scan_refusal(&program, Some(Arc::clone(&ordered_session)));
+    assert!(
+        message.contains("compiled ordered Scan received a non-live subscription"),
+        "{message}"
+    );
+    let requests = ordered_session.subscribed.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].binding_id().get(), 7);
+    assert!(matches!(
+        requests[0].contract(),
+        execution::RuntimeFilterExecutionContract::Ordered(_)
+    ));
+    drop(requests);
+
     let live = StaticFilterConsumer::try_new(
         7,
         7,
@@ -2278,6 +2304,7 @@ fn join_probe_owned_shared_processor_gate_starts_at_input_and_has_exact_observab
     );
     let factory = NativeRuntimeFilterProcessorFactory::new_compiled(7, consumers.clone());
     let mut operator = factory.create(1, 0);
+    operator.bind_runtime_state(&runtime).unwrap();
     operator.activate(&runtime).unwrap();
     let ProgramNodeKind::Join { left_layout, .. } = program.graph().nodes()[join.index()].kind()
     else {
@@ -2299,63 +2326,69 @@ fn join_probe_owned_shared_processor_gate_starts_at_input_and_has_exact_observab
         crate::exec::chunk::ChunkSchema::from_compiled_layout(left_layout).unwrap(),
     )
     .unwrap();
-    assert!(operator.as_processor_ref().unwrap().need_input());
-    assert!(
-        operator
-            .as_processor_ref()
-            .unwrap()
-            .sink_block_deadline()
-            .is_none()
-    );
-    assert!(
-        !operator
-            .as_processor_ref()
-            .unwrap()
-            .can_accept_input(&chunk)
-            .unwrap()
-    );
-    assert!(!operator.as_processor_ref().unwrap().need_input());
-    assert!(
-        operator
-            .as_processor_ref()
-            .unwrap()
-            .sink_block_deadline()
-            .is_some()
-    );
+    use crate::exec::pipeline::{
+        input::RawInput,
+        step::{AdmissionNext, InputResult, NextStep},
+        step_context::{StepContext, TurnWork},
+    };
+    let source_array = chunk.columns()[0].clone();
+    let step = operator.as_mut();
+    assert!(matches!(step.initial_step(), NextStep::NeedInput));
+    assert!(consumers.state().gate_deadline().is_none());
+    let control = runtime.error_state();
+    let mut turn = TurnWork::new(std::num::NonZeroU64::MIN, 64);
+    let mut ctx = StepContext::new(&control, &mut turn);
+    let InputResult::Deferred {
+        input,
+        next: AdmissionNext::Wait(wait),
+    } = step.try_push(&mut ctx, RawInput::for_test(chunk))
+    else {
+        panic!("the original input must remain unaccepted at a closed gate");
+    };
+    assert!(wait.deadline.is_some());
     assert!(Arc::ptr_eq(
-        &operator
-            .as_processor_ref()
-            .unwrap()
-            .sink_observable()
-            .unwrap(),
+        &wait.observable,
         &consumers.state().gate_observable()
     ));
+    assert!(Arc::ptr_eq(
+        &source_array,
+        &input.original_for_test().columns()[0]
+    ));
+    let InputResult::Deferred {
+        input,
+        next: AdmissionNext::Wait(same),
+    } = step.try_push(&mut ctx, input)
+    else {
+        panic!("an unchanged gate must return the same unaccepted input");
+    };
+    assert!(Arc::ptr_eq(&wait.observable, &same.observable));
+    assert_eq!(wait.observed_generation, same.observed_generation);
+    assert_eq!(wait.deadline.unwrap().at(), same.deadline.unwrap().at());
+    assert!(Arc::ptr_eq(
+        &source_array,
+        &input.original_for_test().columns()[0]
+    ));
     subscription.publish(accepting(7, &[2]));
-    assert!(
-        operator
-            .as_processor_ref()
-            .unwrap()
-            .can_accept_input(&chunk)
-            .unwrap()
+    assert!(matches!(
+        step.try_push(&mut ctx, input),
+        InputResult::Accepted(Ok(_))
+    ));
+    let output = step.drive(&mut ctx).unwrap();
+    assert_eq!(output.committed_rows, 3);
+    assert!(matches!(output.next, NextStep::NeedInput));
+    assert_eq!(
+        int64_rows(&[output.output.unwrap()]),
+        vec![vec![Some(2), Some(20)]]
     );
-    operator
-        .as_processor_mut()
-        .unwrap()
-        .push_chunk(&runtime, chunk)
-        .unwrap();
-    let output = operator
-        .as_processor_mut()
-        .unwrap()
-        .pull_chunk(&runtime)
-        .unwrap()
-        .unwrap();
-    assert_eq!(int64_rows(&[output]), vec![vec![Some(2), Some(20)]]);
-    operator
-        .as_processor_mut()
-        .unwrap()
-        .set_finishing(&runtime)
-        .unwrap();
-    assert!(operator.is_finished());
+    step.finish(&mut ctx).unwrap();
+    assert!(matches!(
+        step.drive(&mut ctx).unwrap().next,
+        NextStep::Finished
+    ));
+    assert!(matches!(
+        step.drive(&mut ctx).unwrap().next,
+        NextStep::Finished
+    ));
     assert_eq!(subscription.records(), vec!["published"]);
 }
 
@@ -2693,9 +2726,14 @@ fn runtime_scalar_memory_actual_scan_driver_bind_funds_original_shift_key() {
             tracker,
             state.error_state(),
         ));
+        let budget = novarocks_spi::connector::read_stack::ConnectorPollBudget::new();
+        budget.refill(u64::from(
+            crate::exec::pipeline::step_context::DEFAULT_TURN_WORK_UNITS,
+        ));
+        operator.bind_poll_budget(budget);
         operator.prepare().unwrap();
         operator.bind_runtime_state(&state).unwrap();
-        let result = operator.as_processor_mut().unwrap().pull_chunk(&state);
+        let result = operator.drive_for_test(&state).map(|step| step.output);
         if funded {
             let chunk = result
                 .unwrap()
@@ -2833,7 +2871,8 @@ pub(crate) fn ordered_scan_with_numeric_membership_fixture(
         consumer.channel_id(),
         runtime_filters[0].consumer.channel_id()
     );
-    let installed = super::runtime_filter_consumer_contract(&consumer)?;
+    let installed =
+        super::runtime_filter_consumer_contract(&consumer).map_err(|source| source.to_string())?;
     let mut filters = runtime_filters.as_slice().to_vec();
     filters.push(FilterConsumerAtExpr {
         expr_id: definition,

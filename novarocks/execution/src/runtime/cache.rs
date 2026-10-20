@@ -44,31 +44,25 @@ pub struct ExecutionCacheOptions {
 impl ExecutionCacheOptions {
     pub fn from_query_options(
         options: Option<&crate::runtime::query_options::QueryOptions>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, CacheOptionError> {
         let cache = options.map(|options| &options.cache);
         let probability = cache
             .and_then(|cache| cache.datacache_evict_probability)
             .unwrap_or(100);
         if !(0..=100).contains(&probability) {
-            return Err(format!(
-                "invalid query option: datacache_evict_probability must be in [0, 100], got {probability}"
-            ));
+            return Err(CacheOptionError::EvictionProbability(probability));
         }
         let priority = cache
             .and_then(|cache| cache.datacache_priority)
             .unwrap_or(0);
         if !(-1..=127).contains(&priority) {
-            return Err(format!(
-                "invalid query option: datacache_priority must be in [-1, 127], got {priority}"
-            ));
+            return Err(CacheOptionError::Priority(priority));
         }
         let ttl_seconds = cache
             .and_then(|cache| cache.datacache_ttl_seconds)
             .unwrap_or(0);
         if ttl_seconds < 0 {
-            return Err(format!(
-                "invalid query option: datacache_ttl_seconds must be >= 0, got {ttl_seconds}"
-            ));
+            return Err(CacheOptionError::Ttl(ttl_seconds));
         }
         Ok(Self {
             enable_scan_datacache: cache
@@ -92,5 +86,49 @@ impl ExecutionCacheOptions {
             datacache_sharing_work_period: cache
                 .and_then(|cache| cache.datacache_sharing_work_period),
         })
+    }
+}
+
+/// A request's frozen cache policy violates a supported option range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheOptionError {
+    EvictionProbability(i32),
+    Priority(i32),
+    Ttl(i64),
+}
+impl std::fmt::Display for CacheOptionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EvictionProbability(value) => write!(
+                f,
+                "invalid query option: datacache_evict_probability must be in [0, 100], got {value}"
+            ),
+            Self::Priority(value) => write!(
+                f,
+                "invalid query option: datacache_priority must be in [-1, 127], got {value}"
+            ),
+            Self::Ttl(value) => write!(
+                f,
+                "invalid query option: datacache_ttl_seconds must be >= 0, got {value}"
+            ),
+        }
+    }
+}
+impl std::error::Error for CacheOptionError {}
+impl novarocks_failure_contract::FailureProjection for CacheOptionError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureFact};
+        let reason = match self {
+            Self::EvictionProbability(_) => ExecutionReason::CacheEvictionProbability,
+            Self::Priority(_) => ExecutionReason::CachePriority,
+            Self::Ttl(_) => ExecutionReason::CacheTtl,
+        };
+        FailureFact::new(FailureClass::Invariant, reason.reason())
+    }
+}
+impl From<CacheOptionError> for crate::runtime::fragment::ExecutionFailure {
+    fn from(cause: CacheOptionError) -> Self {
+        Self::from_domain(cause)
     }
 }

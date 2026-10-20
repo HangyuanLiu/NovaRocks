@@ -106,11 +106,11 @@ fn like_core_original_unicode_nul_recursion_backslash_and_full_errors() {
     let wrong: ArrayRef = Arc::new(Int32Array::from(vec![1]));
     let valid: ArrayRef = Arc::new(StringArray::from(vec!["a"]));
     assert_eq!(
-        evaluate_legacy(&wrong, &valid).unwrap_err(),
+        evaluate_required(&wrong, &valid).unwrap_err().to_string(),
         "like: first argument must be a string array"
     );
     assert_eq!(
-        evaluate_legacy(&valid, &wrong).unwrap_err(),
+        evaluate_required(&valid, &wrong).unwrap_err().to_string(),
         "like: second argument must be a string array"
     );
     for wide in [
@@ -118,11 +118,11 @@ fn like_core_original_unicode_nul_recursion_backslash_and_full_errors() {
         Arc::new(StringViewArray::from(vec!["a"])) as ArrayRef,
     ] {
         assert_eq!(
-            evaluate_legacy(&wide, &valid).unwrap_err(),
+            evaluate_required(&wide, &valid).unwrap_err().to_string(),
             "like: first argument must be a string array"
         );
         assert_eq!(
-            evaluate_legacy(&valid, &wide).unwrap_err(),
+            evaluate_required(&valid, &wide).unwrap_err().to_string(),
             "like: second argument must be a string array"
         );
     }
@@ -192,7 +192,7 @@ fn like_selected_original_columns_sparse_slice_dense_scalar_and_pool_ordinal() {
     for negated in [false, true] {
         for truth in [false, true] {
             let r = recipe(negated);
-            let old = evaluate_legacy(&text, &pattern).unwrap();
+            let old = evaluate_required(&text, &pattern).unwrap();
             let old = old.as_any().downcast_ref::<BooleanArray>().unwrap();
             let wanted = rows
                 .iter()
@@ -321,15 +321,13 @@ fn like_selected_row_errors_are_not_nullable_success_and_empty_still_checks_carr
     ));
 }
 #[test]
-fn like_original_short_pattern_retains_panic_and_selected_sql_null_truth() {
+fn like_short_pattern_is_a_typed_contract_failure_and_selected_sql_null_truth_is_preserved() {
     let text: ArrayRef = Arc::new(StringArray::from(vec![Some("apple"), None]));
     let short: ArrayRef = Arc::new(StringArray::from(Vec::<&str>::new()));
-    assert!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| evaluate_legacy(
-            &text, &short
-        )))
-        .is_err()
-    );
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let error = evaluate_required(&text, &short).unwrap_err();
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(error.failure_fact().reason().code(), 384);
     let patterns: ArrayRef = Arc::new(StringArray::from(vec!["a%", "a%"]));
     for negated in [false, true] {
         for truth in [false, true] {
@@ -413,7 +411,7 @@ fn like_recipe_actual_compile_callbacks_three_causes_no_footer() {
             assert!(t.len() < self.at);
             t.push((p, n));
             if t.len() == self.at {
-                Err(self.cause)
+                Err(self.cause.clone())
             } else {
                 Ok(())
             }
@@ -437,7 +435,7 @@ fn like_recipe_actual_compile_callbacks_three_causes_no_footer() {
             let c = Compile {
                 trace: Mutex::new(vec![]),
                 at,
-                cause,
+                cause: cause.clone(),
             };
             let e = PreparedNativeLikeRecipe::try_new(false, &s, &s, &b, &c).unwrap_err();
             assert_eq!(e.control_error(), Some(cause));

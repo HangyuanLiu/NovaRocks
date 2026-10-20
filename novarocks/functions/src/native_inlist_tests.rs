@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Shared original signed IN/state/control witnesses. Not formal MEM admission.
-use super::{InError, InObservation, InRows, signed_equality_legacy, signed_equality_observed};
+use super::{InError, InObservation, InRows, signed_equality_observed, signed_equality_required};
 use crate::{KernelDiagnostic, KernelEvaluationControl, KernelFailure};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, NullArray,
@@ -44,12 +44,12 @@ fn inlist_core_signed_full_pair_matrix_original_nulls_and_scalar() {
             let left = source(left);
             let column = source(right);
             assert_eq!(
-                values(&signed_equality_legacy(&left, &column).unwrap().unwrap()),
+                values(&signed_equality_required(&left, &column).unwrap().unwrap()),
                 vec![Some(true), None, Some(true)]
             );
             let scalar = column.slice(0, 1);
             assert_eq!(
-                values(&signed_equality_legacy(&left, &scalar).unwrap().unwrap()),
+                values(&signed_equality_required(&left, &scalar).unwrap().unwrap()),
                 vec![Some(true), None, Some(false)]
             );
         }
@@ -60,19 +60,32 @@ fn inlist_core_original_match_dominates_null_and_root_null() {
     let input: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), Some(2), None]));
     let candidate: ArrayRef = Arc::new(Int32Array::from(vec![Some(1); 3]));
     for negated in [false, true] {
-        let mut state = InRows::legacy(&input);
-        state.candidate_nulls_legacy(&candidate).unwrap();
-        state.equalities_legacy(&signed_equality_legacy(&input, &candidate).unwrap().unwrap());
+        let mut state = InRows::begin_required(&input).unwrap();
+        state.candidate_nulls_required(&candidate).unwrap();
+        state
+            .equalities_required(
+                &signed_equality_required(&input, &candidate)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
         let null: ArrayRef = Arc::new(Int32Array::from(vec![None; 3]));
-        state.candidate_nulls_legacy(&null).unwrap();
-        state.equalities_legacy(&signed_equality_legacy(&input, &null).unwrap().unwrap());
+        state.candidate_nulls_required(&null).unwrap();
+        state
+            .equalities_required(&signed_equality_required(&input, &null).unwrap().unwrap())
+            .unwrap();
         assert_eq!(
-            values(&state.finish_legacy(&input, negated)),
+            values(&state.finish_required(&input, negated).unwrap()),
             vec![Some(!negated), None, None]
         );
         let bare: ArrayRef = Arc::new(NullArray::new(3));
         assert_eq!(
-            values(&InRows::legacy(&bare).finish_legacy(&bare, negated)),
+            values(
+                &InRows::begin_required(&bare)
+                    .unwrap()
+                    .finish_required(&bare, negated)
+                    .unwrap()
+            ),
             vec![None; 3]
         );
     }
@@ -80,15 +93,20 @@ fn inlist_core_original_match_dominates_null_and_root_null() {
 #[test]
 fn inlist_core_original_length_message_is_full_and_empty_assembly_exact() {
     let input = source(32);
-    let mut state = InRows::legacy(&input);
+    let mut state = InRows::begin_required(&input).unwrap();
     let empty = input.slice(0, 0);
     assert_eq!(
-        state.candidate_nulls_legacy(&empty).unwrap_err(),
+        state
+            .candidate_nulls_required(&empty)
+            .unwrap_err()
+            .to_string(),
         "IN predicate value length mismatch: input has 3, value has 0"
     );
     assert_eq!(
-        InRows::legacy(&empty)
-            .finish_legacy(&empty, false)
+        InRows::begin_required(&empty)
+            .unwrap()
+            .finish_required(&empty, false)
+            .unwrap()
             .to_data(),
         BooleanArray::from(Vec::<bool>::new()).to_data()
     );
@@ -245,7 +263,7 @@ fn inlist_shared_selected_parent_mapping_truthonly_and_error_placeholder_are_dis
     let input: ArrayRef = Arc::new(Int32Array::from(vec![Some(7), None, Some(9), Some(11)]));
     let candidate: ArrayRef = Arc::new(Int32Array::from(vec![None, Some(9)]));
     for truth_only in [false, true] {
-        let mut state = InRows::legacy(&input);
+        let mut state = InRows::begin_required(&input).unwrap();
         state
             .candidate_nulls_selected_observed(&candidate, &[0, 2], &mut |_| Ok::<_, ()>(()))
             .unwrap();
@@ -288,7 +306,7 @@ fn inlist_recipe_actual_compile_callbacks_preserve_three_causes_and_no_footer() 
             assert!(trace.len() < self.stop, "no compile footer after refusal");
             trace.push((phase, units));
             if trace.len() == self.stop {
-                Err(self.cause)
+                Err(self.cause.clone())
             } else {
                 Ok(())
             }
@@ -315,7 +333,7 @@ fn inlist_recipe_actual_compile_callbacks_preserve_three_causes_and_no_footer() 
             let control = Compile {
                 trace: Mutex::new(vec![]),
                 stop,
-                cause,
+                cause: cause.clone(),
             };
             let error = PreparedNativeInListRecipe::try_new(
                 false,
@@ -441,7 +459,7 @@ fn inlist_recipe_created_callbacks_keep_original_control_and_no_request_tail() {
     impl PureCompileControl for Compile<'_> {
         fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
             let at = self.next.fetch_add(1, Ordering::Relaxed);
-            if let Some((boundary, error)) = self.fail
+            if let Some((boundary, error)) = self.fail.clone()
                 && at == boundary
             {
                 self.refused_requests
@@ -454,11 +472,11 @@ fn inlist_recipe_created_callbacks_keep_original_control_and_no_request_tail() {
     }
     let input = FunctionValueType::new(DataType::Int64, false);
     let output = FunctionValueType::new(DataType::Boolean, false);
-    let run = |fail| {
+    let run = |fail: Option<(usize, CompileControlError)>| {
         let requests = AtomicUsize::new(0);
         let control = Compile {
             next: AtomicUsize::new(0),
-            fail,
+            fail: fail.clone(),
             requests: &requests,
             refused_requests: AtomicUsize::new(usize::MAX),
         };
@@ -498,7 +516,7 @@ fn inlist_recipe_created_callbacks_keep_original_control_and_no_request_tail() {
         CompileControlError::ResourceExhausted,
     ] {
         for at in 0..total {
-            run(Some((at, cause)));
+            run(Some((at, cause.clone())));
         }
     }
 }
@@ -522,7 +540,7 @@ fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefi
                 assert!(at <= stop, "callback after original IN refusal");
             }
             trace.push((phase, units));
-            match self.refusal {
+            match self.refusal.clone() {
                 Some((stop, cause)) if at == stop => Err(cause),
                 _ => Ok(()),
             }
@@ -574,7 +592,7 @@ fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefi
         for stop in 0..trace.len() {
             let control = Compile {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             let error = PreparedNativeInListRecipe::refine_borrowed_profile(
                 &source,
@@ -584,7 +602,7 @@ fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefi
                 &control,
             )
             .unwrap_err();
-            assert_eq!(error.control_error(), Some(cause));
+            assert_eq!(error.control_error(), Some(cause.clone()));
             assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
         }
     }
@@ -621,4 +639,56 @@ fn inlist_borrowed_refinement_matches_original_profile_effects_and_control_prefi
             *borrowed.trace.lock().unwrap()
         );
     }
+}
+
+#[test]
+fn inlist_operation_guards_are_unmaskable_and_do_not_mutate_the_match_state() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let input = source(32);
+    let mut state = InRows::begin_required(&input).unwrap();
+    let failure = state
+        .equalities_required(&BooleanArray::from(vec![true]))
+        .unwrap_err();
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(failure.failure_fact().reason().code(), 381);
+    assert_eq!(
+        values(&state.finish_required(&input, false).unwrap()),
+        vec![Some(false), None, Some(false)]
+    );
+    let mut state = InRows::begin_required(&input).unwrap();
+    let candidate = input.slice(0, 1);
+    let failure = state
+        .candidate_nulls_selected_observed(&candidate, &[3], &mut |_| Ok::<_, ()>(()))
+        .unwrap_err();
+    assert!(
+        matches!(failure, InError::Operation(ref cause) if cause.failure_fact().class() == FailureClass::Invariant)
+    );
+}
+#[test]
+fn inlist_actual_arrow_equality_error_retains_sdk_source_without_its_inputs() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+    let left: ArrayRef = Arc::new(Int32Array::from(vec![1]));
+    let right: ArrayRef = Arc::new(arrow_array::StringArray::from(vec!["one"]));
+    let weak = Arc::downgrade(&right);
+    let source = arrow_ord::cmp::eq(
+        &left.as_ref() as &dyn arrow_array::Datum,
+        &right.as_ref() as &dyn arrow_array::Datum,
+    )
+    .unwrap_err();
+    let original = source.to_string();
+    let failure = super::arrow_failure(source);
+    drop(left);
+    drop(right);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+    let source = failure
+        .source()
+        .unwrap()
+        .source()
+        .unwrap()
+        .source()
+        .unwrap();
+    assert!(source.downcast_ref::<arrow_schema::ArrowError>().is_some());
+    assert_eq!(source.to_string(), original);
 }

@@ -30,17 +30,24 @@ pub fn naive_to_date32(date: NaiveDate) -> i32 {
 
 pub use novarocks_functions::builtin::calendar_time_text_shared::parse_time;
 
-pub fn extract_i64_array(array: &ArrayRef, func_name: &str) -> Result<Vec<Option<i64>>, String> {
+pub fn extract_i64_array(
+    array: &ArrayRef,
+    func_name: &str,
+) -> Result<Vec<Option<i64>>, novarocks_functions::KernelFailure> {
     novarocks_functions::builtin::calendar_add_interval::legacy_extract_calendar_intervals(
         array, func_name,
     )
 }
 
-pub fn extract_datetime_array(array: &ArrayRef) -> Result<Vec<Option<NaiveDateTime>>, String> {
+pub fn extract_datetime_array(
+    array: &ArrayRef,
+) -> Result<Vec<Option<NaiveDateTime>>, novarocks_functions::KernelFailure> {
     novarocks_functions::builtin::calendar_extended_shared::legacy_extract_datetimes(array)
 }
 
-pub fn extract_date_array(array: &ArrayRef) -> Result<Vec<Option<NaiveDate>>, String> {
+pub fn extract_date_array(
+    array: &ArrayRef,
+) -> Result<Vec<Option<NaiveDate>>, novarocks_functions::KernelFailure> {
     novarocks_functions::builtin::calendar_extended_shared::legacy_extract_dates(array)
 }
 
@@ -77,12 +84,7 @@ pub fn seconds_to_time(seconds: i64) -> NaiveTime {
     NaiveTime::from_hms_opt(h, m, s).unwrap_or_else(|| NaiveTime::from_hms_opt(0, 0, 0).unwrap())
 }
 
-pub fn to_timestamp_value(dt: NaiveDateTime, output_type: &DataType) -> Result<i64, String> {
-    novarocks_functions::builtin::calendar_extended_shared::legacy_to_timestamp_value(
-        dt,
-        output_type,
-    )
-}
+pub use novarocks_functions::builtin::calendar_timestamp::timestamp_value as to_timestamp_value;
 
 pub fn format_datetime_with_pattern(dt: NaiveDateTime, pattern: &str) -> String {
     dt.format(pattern).to_string()
@@ -157,5 +159,71 @@ mod date32_checked_tests {
             extract_datetime_array(&input.slice(1, 3)).unwrap(),
             [Some(epoch), None, None]
         );
+    }
+}
+
+impl From<novarocks_functions::builtin::calendar_extended_shared::RawCalendarFailure>
+    for crate::runtime::fragment::ExecutionFailure
+{
+    fn from(
+        source: novarocks_functions::builtin::calendar_extended_shared::RawCalendarFailure,
+    ) -> Self {
+        use novarocks_functions::builtin::calendar_extended_shared::CalendarFailure;
+        match source {
+            CalendarFailure::Outer(source) => source.into(),
+            CalendarFailure::Row(source) => Self::from_domain(source),
+        }
+    }
+}
+
+/// Expression roots are frozen by the planner; runtime arrays never choose a default.
+pub(super) fn frozen_type(
+    arena: &crate::exec::expr::ExprArena,
+    expr: crate::exec::expr::ExprId,
+) -> crate::runtime::fragment::ExecutionResult<&DataType> {
+    arena.data_type(expr).ok_or_else(|| {
+        novarocks_functions::builtin::calendar_parts_shared::part_contract(
+            "calendar expression requires a frozen result type",
+        )
+        .into()
+    })
+}
+pub(super) fn require_frozen_type(
+    arena: &crate::exec::expr::ExprArena,
+    expr: crate::exec::expr::ExprId,
+    expected: &DataType,
+) -> crate::runtime::fragment::ExecutionResult<()> {
+    if frozen_type(arena, expr)? != expected {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "calendar expression has an incompatible frozen result type",
+            )
+            .into(),
+        );
+    }
+    Ok(())
+}
+
+impl From<novarocks_functions::builtin::calendar_time_text_shared::TimeTextError>
+    for crate::runtime::fragment::ExecutionFailure
+{
+    fn from(
+        source: novarocks_functions::builtin::calendar_time_text_shared::TimeTextError,
+    ) -> Self {
+        source.into_kernel().into()
+    }
+}
+
+impl From<novarocks_functions::builtin::calendar_time_text_shared::DurationCastError>
+    for crate::runtime::fragment::ExecutionFailure
+{
+    fn from(
+        source: novarocks_functions::builtin::calendar_time_text_shared::DurationCastError,
+    ) -> Self {
+        use novarocks_functions::builtin::calendar_time_text_shared::DurationCastError;
+        match source {
+            DurationCastError::Outer(source) => source.into(),
+            DurationCastError::Data(source) => Self::from_domain(source),
+        }
     }
 }

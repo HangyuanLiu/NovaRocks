@@ -288,7 +288,7 @@ fn utf8_largeint_every_real_binding_callback_preserves_compile_control_cause() {
             CompileControlError::ResourceExhausted,
         ] {
             let c = CompileControl {
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
                 ..Default::default()
             };
             assert_eq!(

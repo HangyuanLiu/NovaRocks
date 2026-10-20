@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 //! The original ARRAY_SORTBY math, shared by legacy and installed invocation owners.
-use crate::largeint;
+use super::collection_arrow::{self, ArrowSite};
+use crate::{KernelFailure, largeint};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, ListArray,
@@ -26,6 +27,9 @@ use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_cast::cast;
 use arrow_data::{ArrayData, transform::MutableArrayData};
 use arrow_schema::{DataType, FieldRef};
+use novarocks_failure_contract::{
+    BoundedDetail, FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+};
 use std::{cmp::Ordering, fmt, sync::Arc};
 
 pub(crate) enum SortByOperation<'a> {
@@ -75,17 +79,17 @@ pub(crate) enum SortByOperation<'a> {
 /// The port supplies original diagnostics and typed operation observations.
 /// Source/result custody is owned by the actual invocation host, not this math.
 pub(crate) trait SortByPort {
-    type Failure;
-    fn diagnostic(&mut self, original: fmt::Arguments<'_>) -> Self::Failure;
+    type Failure: From<KernelFailure>;
+    fn value_error(&mut self, original: SortByLengthMismatch) -> Self::Failure;
     fn step(&mut self) -> Result<(), Self::Failure>;
     fn before_operation(&mut self, original: SortByOperation<'_>) -> Result<(), Self::Failure>;
     fn after_operation(&mut self) -> Result<(), Self::Failure>;
 }
-struct LegacyPort<E>(std::marker::PhantomData<E>);
-impl<E: From<String>> SortByPort for LegacyPort<E> {
+struct RequiredPort<E>(std::marker::PhantomData<E>);
+impl<E: From<KernelFailure>> SortByPort for RequiredPort<E> {
     type Failure = E;
-    fn diagnostic(&mut self, original: fmt::Arguments<'_>) -> E {
-        fmt::format(original).into()
+    fn value_error(&mut self, original: SortByLengthMismatch) -> E {
+        KernelFailure::from_domain(original).into()
     }
     fn step(&mut self) -> Result<(), E> {
         Ok(())
@@ -97,6 +101,45 @@ impl<E: From<String>> SortByPort for LegacyPort<E> {
         Ok(())
     }
 }
+/// An actual source row and key row disagree in element count. This is an
+/// invocation Data error, independently of later outer selection or throw mode.
+#[derive(Debug)]
+pub(crate) struct SortByLengthMismatch {
+    pub(crate) row: usize,
+    pub(crate) source_elements: usize,
+    pub(crate) key_elements: usize,
+}
+impl fmt::Display for SortByLengthMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Expr evaluate meet error: Input arrays' size are not equal in array_sortby.")
+    }
+}
+impl std::error::Error for SortByLengthMismatch {}
+impl FailureProjection for SortByLengthMismatch {
+    fn failure_fact(&self) -> FailureFact {
+        crate::DataFailureReason::InvalidValue.failure_fact()
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for SortByLengthMismatch {}
+
+#[derive(Debug)]
+struct UnsupportedOrderedType(BoundedDetail);
+impl fmt::Display for UnsupportedOrderedType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "array ordered compare unsupported type: {}", self.0)
+    }
+}
+impl std::error::Error for UnsupportedOrderedType {}
+impl FailureProjection for UnsupportedOrderedType {
+    fn failure_fact(&self) -> FailureFact {
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(402).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for UnsupportedOrderedType {}
+
 fn is_logically_null(array: &dyn Array, index: usize) -> bool {
     matches!(array.data_type(), DataType::Null) || array.is_null(index)
 }
@@ -105,10 +148,17 @@ pub fn compare_values_ordered(
     values: &ArrayRef,
     left_idx: usize,
     right_idx: usize,
-) -> Result<Ordering, String> {
+) -> Result<Ordering, KernelFailure> {
+    if left_idx >= values.len() || right_idx >= values.len() {
+        return Err(collection_arrow::contract(
+            "array ordered comparison index is outside its physical carrier",
+        ));
+    }
     if is_logically_null(values.as_ref(), left_idx) || is_logically_null(values.as_ref(), right_idx)
     {
-        return Err("array ordered compare does not accept null indices".to_string());
+        return Err(collection_arrow::contract(
+            "array ordered compare does not accept null indices",
+        ));
     }
     match values.data_type() {
         DataType::Int8 => {
@@ -189,17 +239,18 @@ pub fn compare_values_ordered(
             let arr = values
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
-            let left = largeint::i128_from_be_bytes(arr.value(left_idx))
-                .map_err(|e| format!("array ordered compare LARGEINT decode failed: {}", e))?;
-            let right = largeint::i128_from_be_bytes(arr.value(right_idx))
-                .map_err(|e| format!("array ordered compare LARGEINT decode failed: {}", e))?;
+                .ok_or_else(|| {
+                    collection_arrow::contract("failed to downcast to FixedSizeBinaryArray")
+                })?;
+            let left =
+                largeint::i128_from_be_bytes(arr.value(left_idx)).map_err(KernelFailure::from)?;
+            let right =
+                largeint::i128_from_be_bytes(arr.value(right_idx)).map_err(KernelFailure::from)?;
             Ok(left.cmp(&right))
         }
-        other => Err(format!(
-            "array ordered compare unsupported type: {:?}",
-            other
-        )),
+        other => Err(KernelFailure::from_domain(UnsupportedOrderedType(
+            BoundedDetail::truncating_display(format_args!("{other:?}")),
+        ))),
     }
 }
 
@@ -208,7 +259,7 @@ fn compare_key_positions(
     key_starts: &[Option<usize>],
     left_pos: usize,
     right_pos: usize,
-) -> Result<Ordering, String> {
+) -> Result<Ordering, KernelFailure> {
     for (idx, key_values) in key_values.iter().enumerate() {
         let Some(key_start) = key_starts[idx] else {
             continue;
@@ -244,7 +295,7 @@ fn insertion_sort_by_keys<P: SortByPort>(
             let left = indices[j - 1];
             let right = indices[j];
             let ord = compare_key_positions(key_values, key_starts, left, right)
-                .map_err(|cause| port.diagnostic(format_args!("{}", cause)))?;
+                .map_err(P::Failure::from)?;
 
             if ord == Ordering::Greater {
                 indices.swap(j - 1, j);
@@ -261,14 +312,14 @@ fn insertion_sort_by_keys<P: SortByPort>(
 pub fn evaluate(
     source: &ArrayRef,
     key_count: usize,
-    key: impl FnMut(usize) -> Result<ArrayRef, String>,
+    key: impl FnMut(usize) -> Result<ArrayRef, KernelFailure>,
     output_type: Option<&DataType>,
     rows: usize,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, KernelFailure> {
     evaluate_fallible(source, key_count, key, output_type, rows)
 }
 /// Preserve the caller's error when evaluating a demanded key.
-pub fn evaluate_fallible<E: From<String>>(
+pub fn evaluate_fallible<E: From<KernelFailure>>(
     source: &ArrayRef,
     key_count: usize,
     key: impl FnMut(usize) -> Result<ArrayRef, E>,
@@ -281,7 +332,7 @@ pub fn evaluate_fallible<E: From<String>>(
         key,
         output_type,
         rows,
-        &mut LegacyPort(std::marker::PhantomData),
+        &mut RequiredPort(std::marker::PhantomData),
     )
 }
 pub(crate) fn evaluate_with_port<P: SortByPort>(
@@ -293,11 +344,12 @@ pub(crate) fn evaluate_with_port<P: SortByPort>(
     port: &mut P,
 ) -> Result<ArrayRef, P::Failure> {
     let src = source.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-        port.diagnostic(format_args!(
+        collection_arrow::contract(format_args!(
             "array_sortby expects ListArray src, got {:?}",
             source.data_type()
         ))
     })?;
+    validate_rows(src.len(), rows, "array_sortby source")?;
     port.before_operation(SortByOperation::KeyArrays { count: key_count })?;
     let mut key_arrays = Vec::with_capacity(key_count);
     port.after_operation()?;
@@ -315,23 +367,30 @@ pub(crate) fn evaluate_with_port<P: SortByPort>(
             .as_any()
             .downcast_ref::<ListArray>()
             .ok_or_else(|| {
-                port.diagnostic(format_args!(
+                collection_arrow::contract(format_args!(
                     "array_sortby expects ListArray key, got {:?}",
                     key_arr.data_type()
                 ))
             })?;
+        validate_rows(key.len(), rows, "array_sortby key")?;
         key_lists.push(key);
     }
 
     let output_field = match output_type {
         Some(DataType::List(field)) => field.clone(),
-        _ => match src.data_type() {
+        Some(other) => {
+            return Err(collection_arrow::contract(format_args!(
+                "array_sortby output type must be List, got {other:?}"
+            ))
+            .into());
+        }
+        None => match src.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(port.diagnostic(format_args!(
-                    "array_sortby output type must be List, got {:?}",
-                    other
-                )));
+                return Err(collection_arrow::contract(format_args!(
+                    "array_sortby output type must be List, got {other:?}"
+                ))
+                .into());
             }
         },
     };
@@ -347,13 +406,8 @@ pub(crate) fn evaluate_with_port<P: SortByPort>(
             values: &src_values,
             target: &target_item_type,
         })?;
-        src_values = cast(&src_values, &target_item_type).map_err(|e| {
-            port.diagnostic(format_args!(
-                "array_sortby failed to cast src element {:?} -> {:?}: {}",
-                src_values.data_type(),
-                target_item_type,
-                e
-            ))
+        src_values = cast(&src_values, &target_item_type).map_err(|source| {
+            collection_arrow::arrow_failure("array_sortby source", ArrowSite::Cast, source)
         })?;
         port.after_operation()?;
     }
@@ -376,10 +430,11 @@ pub(crate) fn evaluate_with_port<P: SortByPort>(
 
     let src_offsets = src.value_offsets();
     port.before_operation(SortByOperation::Offsets { rows })?;
-    let mut out_offsets = Vec::with_capacity(rows + 1);
+    let offset_entries = collection_arrow::list_offset_entries(rows)?;
+    let mut out_offsets = Vec::with_capacity(offset_entries);
     port.after_operation()?;
     out_offsets.push(0_i32);
-    let mut current: i64 = 0;
+    let mut current = 0i32;
     port.before_operation(SortByOperation::NullBuilder { rows })?;
     let mut null_builder = NullBufferBuilder::new(rows);
     port.after_operation()?;
@@ -413,9 +468,11 @@ pub(crate) fn evaluate_with_port<P: SortByPort>(
             let key_end = key_offsets[key_row + 1] as usize;
             let key_len = key_end.saturating_sub(key_start);
             if src_len != key_len {
-                return Err(port.diagnostic(format_args!(
-                    "Expr evaluate meet error: Input arrays' size are not equal in array_sortby."
-                )));
+                return Err(port.value_error(SortByLengthMismatch {
+                    row,
+                    source_elements: src_len,
+                    key_elements: key_len,
+                }));
             }
             key_starts.push(Some(key_start));
         }
@@ -430,14 +487,12 @@ pub(crate) fn evaluate_with_port<P: SortByPort>(
             port.before_operation(SortByOperation::Extend {
                 source_index: src_idx,
             })?;
+            let next = crate::aggregate_scalar::checked_list_output_offset(current, 1)?;
             mutable.extend(0, src_idx, src_idx + 1);
             port.after_operation()?;
-            current += 1;
+            current = next;
         }
 
-        if current > i32::MAX as i64 {
-            return Err(port.diagnostic(format_args!("array_sortby offset overflow")));
-        }
         out_offsets.push(current as i32);
         null_builder.append_non_null();
     }
@@ -449,15 +504,28 @@ pub(crate) fn evaluate_with_port<P: SortByPort>(
         values: &out_values,
         field: &output_field,
     })?;
-    let out = ListArray::new(
+    let out = ListArray::try_new(
         output_field,
         OffsetBuffer::new(out_offsets.into()),
         out_values,
         null_builder.finish(),
-    );
+    )
+    .map_err(|source| {
+        collection_arrow::arrow_failure("array_sortby result", ArrowSite::Construct, source)
+    })?;
     let output = Arc::new(out) as ArrayRef;
     port.after_operation()?;
     Ok(output)
+}
+
+fn validate_rows(actual: usize, rows: usize, label: &'static str) -> Result<(), KernelFailure> {
+    if actual == rows || actual == 1 {
+        Ok(())
+    } else {
+        Err(collection_arrow::contract(format_args!(
+            "{label} length {actual} differs from {rows} rows"
+        )))
+    }
 }
 
 #[cfg(test)]

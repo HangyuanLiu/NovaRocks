@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(test)]
-use std::collections::VecDeque;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -40,10 +38,7 @@ use crate::query_execution::contract::{
 use crate::query_execution::internal_result_cpu::{
     InternalResultCpu, InternalResultCpuJob, InternalResultValue, require_internal_result_capacity,
 };
-use crate::query_execution::lifecycle_diagnostics::{
-    FrontendLifecycleDiagnostics, QueryLifecycleConvergenceSnapshot,
-    RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
-};
+use crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics;
 use crate::query_execution::lifecycle_plan::{QueryCredentialLeases, QueryInitOptions};
 use crate::query_execution::native_execution_adapter::ProductionRootDelivery;
 use crate::query_execution::outcome::{DistributedQueryOutcome, QueryOutcomeFactory};
@@ -65,8 +60,11 @@ use novarocks_types::{
     QueryIdAttribution, QueryProcessNamespace,
 };
 
-use super::query_registry::{FrontendQueryRegistry, QueryFailureCause};
+use super::query_registry::{
+    ActiveQueryGuard, FrontendQueryRegistry, LatchedQueryFailure, QueryFailureCause,
+};
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
+use super::statement_native_attempt::StatementNativeAttempt;
 use super::task_round::{
     AssembledRound, AttemptPumps, AttemptTransport, assemble_round, install_attempt_pumps,
 };
@@ -81,7 +79,6 @@ use crate::native::task_transport::AttemptWireFacts;
 use crate::query_execution::attempt_initialization::{
     AttemptInitializing, RoundCredentialLeaseSource,
 };
-use crate::query_execution::runtime_filter_terminal_rollup::rollup_from_release_contributions;
 use crate::query_execution::split_assignment_round::{
     RoundSplitAssignmentPlan, SplitAssignmentRoundGuard,
 };
@@ -89,18 +86,22 @@ use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
+use crate::task_execution::attempt_convergence::{
+    NativeAttemptConvergenceMode, NativeAttemptConvergenceOwner, NativeAttemptConvergenceTarget,
+    advance_task_round,
+};
 use crate::task_execution::completion::{WriteCompletionTracker, WriteVerdict, accept_final_info};
 use crate::task_execution::error::TaskExecutionError;
-use crate::task_execution::execution::ReleasedRuntimeFilterContributions;
 use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
 use crate::task_execution::graph::TaskNode;
 use crate::task_execution::remote_task::RemoteTaskState;
-use crate::task_execution::round::{TaskRound, TurnReport};
+use crate::task_execution::round::TaskRound;
 use crate::task_execution::split_transport::SplitDeliveryBridge;
 use crate::task_execution::status_intake::{CondvarWake, StatusIntakeWake};
 use novarocks_execution::task_execution::{
     AbortCause, FinalTaskInfo, MaxWait, OperationKind, TaskIdentity, TaskState, TerminationDetail,
 };
+use novarocks_query_application::api::StatementNativeAttemptOwner;
 
 trait QueryIdSource: Send + Sync + 'static {
     fn next_query_id(&self) -> Result<QueryId, DistributedQueryError>;
@@ -296,6 +297,8 @@ pub struct FrontendDistributedQueryCoordinator {
     statement_observation: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
 
     backend_topology: novarocks_query_application::api::BackendTopologyService,
+    process_observation: Option<novarocks_query_application::api::BackendProcessObservationService>,
+    native_residual: Option<novarocks_query_application::coordination::StatementNativeResidualPort>,
     #[cfg(test)]
     backend_services: Option<BackendServicesSource>,
     runtime_filter_worker_count: NonZeroUsize,
@@ -348,6 +351,8 @@ impl FrontendDistributedQueryCoordinator {
         data_runtime: FrontendDataRuntime,
         lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
         internal_result_cpu: InternalResultCpu,
+        process_observation: novarocks_query_application::api::BackendProcessObservationService,
+        native_residual: novarocks_query_application::coordination::StatementNativeResidualPort,
     ) -> Result<Self, DistributedQueryError> {
         let query_id_source = UniqueQueryIdSource::default();
         let query_namespace = query_id_source.namespace();
@@ -363,6 +368,8 @@ impl FrontendDistributedQueryCoordinator {
             #[cfg(novarocks_dev_controls)]
             statement_observation: None,
             backend_topology,
+            process_observation: Some(process_observation),
+            native_residual: Some(native_residual),
             #[cfg(test)]
             backend_services: None,
             runtime_filter_worker_count,
@@ -425,6 +432,8 @@ impl FrontendDistributedQueryCoordinator {
             transport_budget: novarocks_task_codec::TransportBudget::DEFAULT,
             frontend_process_id: FrontendProcessId::new_v7(),
             backend_topology,
+            process_observation: None,
+            native_residual: None,
             backend_services: Some(BackendServicesSource::Fixed { scheduler }),
             runtime_filter_worker_count,
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
@@ -492,6 +501,8 @@ impl FrontendDistributedQueryCoordinator {
             transport_budget: novarocks_task_codec::TransportBudget::DEFAULT,
             frontend_process_id: FrontendProcessId::new_v7(),
             backend_topology,
+            process_observation: None,
+            native_residual: None,
             backend_services: Some(BackendServicesSource::Sequence {
                 schedulers: Mutex::new(schedulers.into()),
             }),
@@ -687,7 +698,7 @@ impl FrontendDistributedQueryCoordinator {
         };
         #[cfg(not(test))]
         let backend_services = production_backend_services(parts.topology.targets())?;
-        let _query = self.registry.register(query_id, intent)?;
+        let query_registration = self.registry.register(query_id, intent)?;
         let scheduler = &backend_services.scheduler;
         #[cfg(novarocks_dev_controls)]
         let nominated_execution = match (
@@ -896,6 +907,7 @@ impl FrontendDistributedQueryCoordinator {
             None => init_options,
         };
         let handoff = RoundHandoff {
+            query_registration,
             delivery,
             internal_capacity,
             subscription_scope,
@@ -940,6 +952,7 @@ impl FrontendDistributedQueryCoordinator {
         handoff: RoundHandoff<'_>,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         let RoundHandoff {
+            query_registration,
             delivery,
             internal_capacity,
             subscription_scope,
@@ -1060,6 +1073,15 @@ impl FrontendDistributedQueryCoordinator {
         // route is re-pointed at it. Held to the end of this call so neither
         // that route nor a write session's commit finds it already dropped.
         let attempt_storage = prepared.take_terminal_storage_resolver();
+        // The SAME write session must retain this attempt's terminal storage
+        // capability on failure too, before any Native return can drop it.
+        if let Some(session) = write_stack_session.as_ref()
+            && let Some(resolver) = attempt_storage.as_ref()
+        {
+            session
+                .retain_terminal_storage_resolver(Arc::clone(resolver)
+                    as Arc<dyn novarocks_spi::connector::ConnectorStorageResolver>);
+        }
 
         // Declared from the encoded plans, before they are consumed. A write's
         // completion turns on every writer having finished, and "this query is
@@ -1122,7 +1144,7 @@ impl FrontendDistributedQueryCoordinator {
                     .status_subscription_error_budget,
                 attempt,
                 data_runtime: self.data_runtime.clone(),
-                subscription_scope,
+                subscription_scope: subscription_scope.clone(),
             },
         )
         .map_err(|error| failed(error.to_string()))?;
@@ -1241,290 +1263,203 @@ impl FrontendDistributedQueryCoordinator {
             None
         };
 
-        let mut final_task_info = FinalTaskInfoCollector::new(
-            result_transport.as_ref(),
+        let final_task_info = FinalTaskInfoCollector::new(
+            Arc::clone(&result_transport) as Arc<dyn TaskResultTransport>,
             intent == DistributedQueryIntent::Profile,
+            &round,
+            Arc::clone(&wake),
+            self.data_runtime.clone(),
         );
+        let contexts = round
+            .execution()
+            .graph()
+            .contexts()
+            .copied()
+            .collect::<Vec<_>>();
+        let process_observation = self
+            .process_observation
+            .as_ref()
+            .ok_or_else(|| failed("Native attempt has no process observation owner"))?;
+        let targets = contexts
+            .iter()
+            .map(|context| {
+                let target = backend_services
+                    .live_backends
+                    .iter()
+                    .find(|target| target.descriptor().process_id() == context.backend_process_id())
+                    .ok_or_else(|| failed("Native convergence context has no original backend"))?;
+                Ok(NativeAttemptConvergenceTarget::new(
+                    *context,
+                    target
+                        .endpoint()
+                        .map_err(|error| failed(error.to_string()))?,
+                ))
+            })
+            .collect::<Result<Vec<_>, DistributedQueryError>>()?;
+        let convergence =
+            NativeAttemptConvergenceOwner::new(&round, Arc::clone(process_observation), targets)
+                .map_err(|error| failed(error.to_string()))?;
+        let owner = Box::new(StatementNativeAttempt {
+            execution: execution_id,
+            scope: subscription_scope.clone(),
+            contexts: contexts.into_boxed_slice(),
+            _prepared: prepared,
+            _query_registration: query_registration,
+            wake: Arc::clone(&wake),
+            _attempt_storage: attempt_storage,
+            round,
+            split_delivery,
+            convergence,
+            split_assignment,
+            feedback_state,
+            relayed_reader,
+            root_result_polls: None,
+            pending_internal,
+            retiring_internal: None,
+            internal_domain,
+            internal_capacity,
+            final_task_info,
+            diagnostics: Arc::clone(&self.lifecycle_diagnostics),
+            accepted_failure: None,
+            mode: None,
+            profile_waits_for_terminals: false,
+            health: None,
+            remote_closed: None,
+            close_started: false,
+            close_turn_error_reported: false,
+        });
+        let mut native = self
+            .native_residual
+            .as_ref()
+            .ok_or_else(|| failed("Native attempt has no original process supervision port"))?
+            .register(execution_id, &subscription_scope, owner)
+            .map_err(|rejected| {
+                DistributedQueryError::from_execution(rejected.error.into_execution_failure_input())
+            })?;
         // The task protocol's analogue of the two lifecycle gates: every query
         // context established is ControlReady, every task created is Stage and
         // Start. Both close exactly once, and until the first one closes a
         // failure may still be a replaced backend rather than this query's.
-        let mut contexts_established = false;
-        let mut tasks_created = false;
-        // The membership owner gets the same window the old Init RPC had to
-        // prove a replacement, taken from the task protocol's own establish
-        // cap rather than a second number invented here.
-        let establish_wait = MaxWait::default_for(OperationKind::UpdateQueryContext).get();
-        // Recorded rather than inferred, exactly as the old path recorded it: a
-        // write commits on the strength of this fact.
-        let mut observed_result_eof = false;
-        let mut last_root_poll = RootResultPoll::default();
-        let mut root_batch_count = 0_u64;
-        let mut root_row_count = 0_u64;
-        let mut root_result_polls: Option<RootResultPolls> = None;
-        let mut wait_witness = TaskRoundWaitWitness::new(
-            task_round_wait_facts(
-                &round,
-                root_task,
-                0,
-                last_root_poll,
-                write_completion.as_mut(),
-            ),
-            Instant::now(),
-        );
-        let outcome = loop {
-            // Recomputed each turn so the two gates and the classification
-            // window are read from this turn's state rather than last turn's.
-            let classification = TaskRoundFailureClassification {
-                before_contexts_established: !contexts_established,
-                recovery_observation_allowed: retry_boundary.is_some(),
-                captured: &captured_topology,
-                observation_deadline: statement_deadline.min(
-                    Instant::now()
-                        .checked_add(establish_wait)
-                        .unwrap_or(statement_deadline),
-                ),
-                cancellation: &cancellation,
-            };
-            if cancellation.is_cancelled() {
-                break Err(self.fail_task_round_with_root_reader(
-                    &mut relayed_reader,
-                    &mut root_result_polls,
-                    root_task,
-                    query_id,
-                    &mut round,
-                    &split_delivery,
-                    classification,
-                    QueryFailureCause::ClientCancellation,
-                    "query cancelled while fetching result",
-                ));
-            }
-            if let Some(message) = self.registry.first_failure(query_id) {
-                close_failed_root_reads(&mut relayed_reader, &mut root_result_polls, root_task);
-                break Err(self.fail_latched_task_round(
-                    query_id,
-                    &mut round,
-                    &split_delivery,
-                    message,
-                ));
-            }
-            let now = Instant::now();
-            if now >= statement_deadline {
-                // The message names the facts rather than only the elapsed
-                // time. A completion rule that waits on absent facts has to
-                // say which one was absent, or its timeout is indistinguishable
-                // from every other timeout.
-                let waiting_on = task_round_wait_facts(
-                    &round,
-                    root_task,
-                    usize::try_from(root_batch_count).unwrap_or(usize::MAX),
-                    last_root_poll,
-                    write_completion.as_mut(),
-                );
-                break Err(self.fail_task_round_with_root_reader(
-                    &mut relayed_reader,
-                    &mut root_result_polls,
-                    root_task,
-                    query_id,
-                    &mut round,
-                    &split_delivery,
-                    classification,
-                    QueryFailureCause::FrontendExecution,
-                    format!("query timed out after {timeout_ms} ms waiting on {waiting_on}"),
-                ));
-            }
-
-            let advanced = advance_task_round(&mut round, &split_delivery);
-            if matches!(
-                intent,
-                DistributedQueryIntent::Result | DistributedQueryIntent::CowMatch
-            ) && round.accepted_root_success_sealed()
-                && pending_internal.is_none()
-                && internal_domain
-                    .as_ref()
-                    .is_none_or(|domain| domain.value().end().is_some())
-            {
-                if let Err(error) = &advanced {
-                    tracing::warn!(%error, "Task failure after the accepted root seal belongs to cleanup");
-                }
-                break Ok(());
-            }
-            let mut moved = match advanced {
-                Ok(report) => !report.is_idle(),
-                Err(error) => {
-                    break Err(self.fail_task_round_with_root_reader(
-                        &mut relayed_reader,
-                        &mut root_result_polls,
+        let prepared_write_result = native.catch_foreground(|same_owner| {
+            let StatementNativeAttempt {
+                round,
+                split_assignment,
+                split_delivery,
+                feedback_state,
+                relayed_reader,
+                root_result_polls,
+                pending_internal,
+                retiring_internal,
+                internal_domain,
+                internal_capacity,
+                final_task_info,
+                health,
+                ..
+            } = same_owner;
+            let mut round = round;
+            let mut relayed_reader = relayed_reader;
+            let mut root_result_polls = root_result_polls;
+            (|| -> Result<_, DistributedQueryError> {
+                let mut contexts_established = false;
+                let mut tasks_created = false;
+                // The membership owner gets the same window the old Init RPC had to
+                // prove a replacement, taken from the task protocol's own establish
+                // cap rather than a second number invented here.
+                let establish_wait = MaxWait::default_for(OperationKind::UpdateQueryContext).get();
+                // Recorded rather than inferred, exactly as the old path recorded it: a
+                // write commits on the strength of this fact.
+                let mut observed_result_eof = false;
+                let mut last_root_poll = RootResultPoll::default();
+                let mut root_batch_count = 0_u64;
+                let mut root_row_count = 0_u64;
+                let mut wait_witness = TaskRoundWaitWitness::new(
+                    task_round_wait_facts(
+                        &round,
                         root_task,
-                        query_id,
-                        &mut round,
-                        &split_delivery,
-                        classification,
-                        QueryFailureCause::FrontendExecution,
-                        format!("task execution did not advance: {error}"),
-                    ));
-                }
-            };
-            if let Some(reply) = root_seal_reply.as_mut() {
-                let refusal = match reply.try_recv() {
-                    Ok(Err(error)) => Some(error.to_string()),
-                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                        Some("root success-seal owner closed without a verdict".to_owned())
-                    }
-                    Ok(Ok(())) => Some(
-                        "root success-seal reply arrived without the owner's accepted seal"
-                            .to_owned(),
+                        0,
+                        last_root_poll,
+                        write_completion.as_mut(),
                     ),
-                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
-                };
-                if let Some(detail) = refusal {
-                    break Err(self.fail_task_round_with_root_reader(
-                        &mut relayed_reader,
-                        &mut root_result_polls,
-                        root_task,
-                        query_id,
-                        &mut round,
-                        &split_delivery,
-                        classification,
-                        QueryFailureCause::FrontendExecution,
-                        detail,
-                    ));
-                }
-            }
-            final_task_info.observe(&round);
-            if !contexts_established && round.contexts_established() {
-                contexts_established = true;
-                if let Some(retry_boundary) = retry_boundary {
-                    retry_boundary.close_after_control_ready();
-                }
-            }
-            if contexts_established && !tasks_created && round.tasks_created() {
-                tasks_created = true;
-                if let Some(retry_boundary) = retry_boundary {
-                    retry_boundary.close_after_stage_or_start();
-                }
-            }
-            // Re-read after the gates moved: a failure seen from here on is
-            // judged against the window this turn actually reached.
-            let classification = TaskRoundFailureClassification {
-                before_contexts_established: !contexts_established,
-                recovery_observation_allowed: retry_boundary.is_some(),
-                captured: &captured_topology,
-                observation_deadline: statement_deadline.min(
-                    Instant::now()
-                        .checked_add(establish_wait)
-                        .unwrap_or(statement_deadline),
-                ),
-                cancellation: &cancellation,
-            };
-            let terminal_cause =
-                match synchronous_root_failure_cause(&mut round, root_task, &mut root_result_polls)
-                {
-                    Ok(cause) => cause,
-                    Err(error) => {
-                        break Err(self.fail_task_round_with_root_reader(
-                            &mut relayed_reader,
-                            &mut root_result_polls,
-                            root_task,
-                            query_id,
-                            &mut round,
-                            &split_delivery,
-                            classification,
-                            QueryFailureCause::FrontendExecution,
-                            format!("root terminal-control registration was refused: {error}"),
-                        ));
-                    }
-                };
-            if let Some(detail) = terminal_cause {
-                let waiting_on = task_round_wait_facts(
-                    &round,
-                    root_task,
-                    usize::try_from(root_batch_count).unwrap_or(usize::MAX),
-                    last_root_poll,
-                    write_completion.as_mut(),
+                    Instant::now(),
                 );
-                let message = format!(
-                    "task execution terminated: {}; terminal_round={waiting_on}",
-                    render_termination_detail(Some(&detail))
-                );
-                break Err(self
-                    .fail_task_round_with_root_reader(
-                        &mut relayed_reader,
-                        &mut root_result_polls,
-                        root_task,
-                        query_id,
-                        &mut round,
-                        &split_delivery,
-                        classification,
-                        QueryFailureCause::BackendLocalFailure,
-                        message,
-                    )
-                    .with_task_termination(&detail));
-            }
-            // A deliverer that failed will never feed the scans it had left,
-            // so the round cannot reach its own exit and would otherwise run
-            // out the statement deadline reporting the wait instead of the
-            // cause. Read every turn, and only a failure ends the attempt:
-            // a worker that stopped because every source went terminal is the
-            // normal case and says nothing about the query.
-            let delivery_failure = split_assignment
-                .as_ref()
-                .and_then(SplitAssignmentRoundGuard::failure)
-                .map(|error| format!("split assignment stopped delivering: {error}"));
-            if let Some(detail) = delivery_failure {
-                break Err(self.fail_task_round_with_root_reader(
-                    &mut relayed_reader,
-                    &mut root_result_polls,
-                    root_task,
-                    query_id,
-                    &mut round,
-                    &split_delivery,
-                    classification,
-                    QueryFailureCause::FrontendExecution,
-                    detail,
-                ));
-            }
-
-            // Control, cancellation and split failure are observed before
-            // claiming CPU progress. A pending codec never blocks this loop.
-            let mut cpu_answer = None;
-            let mut claimed_internal = false;
-            if let Some(claimed) = pending_internal
-                .as_mut()
-                .and_then(InternalResultCpuJob::try_take)
-            {
-                pending_internal = None;
-                claimed_internal = true;
-                moved = true;
-                let domain = match claimed.and_then(|value| value.try_transform(|result, _| result))
-                {
-                    Ok(domain) => domain,
-                    Err(error) => {
-                        break Err(self.fail_task_round_with_root_reader(
-                            &mut relayed_reader,
-                            &mut root_result_polls,
-                            root_task,
-                            query_id,
-                            &mut round,
-                            &split_delivery,
-                            classification,
-                            QueryFailureCause::FrontendExecution,
-                            error,
-                        ));
-                    }
+                let outcome = loop {
+                    // Recomputed each turn so the two gates and the classification
+                    // window are read from this turn's state rather than last turn's.
+                    let classification = TaskRoundFailureClassification {
+                        before_contexts_established: !contexts_established,
+                        recovery_observation_allowed: retry_boundary.is_some(),
+                        captured: &captured_topology,
+                        observation_deadline: statement_deadline.min(
+                            Instant::now()
+                                .checked_add(establish_wait)
+                                .unwrap_or(statement_deadline),
+                        ),
+                        cancellation: &cancellation,
+                    };
+                    if cancellation.is_cancelled() {
+                        use novarocks_execution_contract::{
+                            SafeDetail, failure::FailureProjection,
+                        };
+                        use novarocks_query_application::execution_error::{
+                            ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+                        };
+                        let reason = match cancellation.reason().expect("cancelled statement retains its reason") {
+                    novarocks_query_application::cancellation::QueryCancellationReason::DeadlineExceeded { .. }
+                    | novarocks_query_application::cancellation::QueryCancellationReason::FrontendDrainDeadlineExceeded { .. } => QueryFailureReason::DeadlineExceeded,
+                    _ => QueryFailureReason::Cancelled,
                 };
-                if let Some(packet_sequence) = domain.value().receipt() {
-                    let consumed = round
-                        .consume_root_result_packet(packet_sequence, false)
-                        .map_err(|error| error.to_string())
-                        .and_then(|()| {
-                            root_result_polls
-                                .as_ref()
-                                .ok_or("CPU receipt lost its reader".to_owned())?
-                                .acknowledge(packet_sequence)
-                        });
-                    if let Err(error) = consumed {
-                        break Err(self.fail_task_round_with_root_reader(
+                        break Err(self.fail_execution_task_round_with_root_reader(
+                            &mut relayed_reader,
+                            &mut root_result_polls,
+                            root_task,
+                            query_id,
+                            &mut round,
+                            &split_delivery,
+                            classification,
+                            QueryFailureCause::ClientCancellation,
+                            ExecutionFailureInput::new(
+                                reason.failure_fact(),
+                                SafeDetail::truncating(
+                                    "statement execution was stopped by its control owner",
+                                ),
+                                ExecutionFailureSite::Coordinator,
+                            ),
+                        ));
+                    }
+                    if let Some(failure) = self.registry.first_failure_record(query_id) {
+                        close_failed_root_reads(
+                            &mut relayed_reader,
+                            &mut root_result_polls,
+                            root_task,
+                        );
+                        break Err(self.fail_latched_task_round(
+                            query_id,
+                            &mut round,
+                            &split_delivery,
+                            failure,
+                        ));
+                    }
+                    let now = Instant::now();
+                    if now >= statement_deadline {
+                        // The message names the facts rather than only the elapsed
+                        // time. A completion rule that waits on absent facts has to
+                        // say which one was absent, or its timeout is indistinguishable
+                        // from every other timeout.
+                        let waiting_on = task_round_wait_facts(
+                            &round,
+                            root_task,
+                            usize::try_from(root_batch_count).unwrap_or(usize::MAX),
+                            last_root_poll,
+                            write_completion.as_mut(),
+                        );
+                        tracing::debug!(timeout_ms, %waiting_on, "statement execution deadline expired");
+                        use novarocks_execution_contract::{
+                            SafeDetail, failure::FailureProjection,
+                        };
+                        use novarocks_query_application::execution_error::{
+                            ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+                        };
+                        break Err(self.fail_execution_task_round_with_root_reader(
                             &mut relayed_reader,
                             &mut root_result_polls,
                             root_task,
@@ -1533,46 +1468,152 @@ impl FrontendDistributedQueryCoordinator {
                             &split_delivery,
                             classification,
                             QueryFailureCause::FrontendExecution,
-                            error,
+                            ExecutionFailureInput::new(
+                                QueryFailureReason::DeadlineExceeded.failure_fact(),
+                                SafeDetail::truncating("statement execution deadline expired"),
+                                ExecutionFailureSite::Coordinator,
+                            ),
                         ));
                     }
-                    root_batch_count = root_batch_count.saturating_add(1);
-                    last_root_poll = RootResultPoll::Packet(packet_sequence);
-                } else if let Some(end) = domain.value().end() {
-                    relayed_end = Some(end);
-                    root_row_count = end.output_rows;
-                    cpu_answer = Some(RootPollAnswer::Control(RootPollControl::EndOfStream {
-                        packet_sequence: end.sequence.get() - 1,
-                    }));
-                }
-                internal_domain = Some(domain);
-            }
 
-            // The polls run until this loop has observed the end of the
-            // result stream, and that fact alone stops them. Not the root
-            // task leaving its created state: delivering the end of stream is
-            // what retires that task, so stopping on its terminal status
-            // races the last answer -- and losing that answer leaves the read
-            // waiting for an end of stream nothing will send again.
-            //
-            // The first poll waits for Installed. Accepted proves the Worker
-            // owns the create, but preparation may still be in progress and
-            // the result plane cannot serve the task yet.
-            if observed_result_eof || round.execution().result_terminal_control_required() {
-                root_result_polls = None;
-            } else if root_result_polls.is_none() && round.result_pump_ready() {
-                match RootResultPolls::start_for_delivery(
-                    &delivery,
-                    relayed_reader.as_ref(),
-                    root_task,
-                    statement_deadline,
-                    Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
-                    self.data_runtime.clone(),
-                ) {
-                    Ok(polls) => {
-                        root_result_polls = Some(polls);
+                    let advanced = advance_task_round(&mut round, &split_delivery);
+                    if matches!(
+                        intent,
+                        DistributedQueryIntent::Result | DistributedQueryIntent::CowMatch
+                    ) && round.accepted_root_success_sealed()
+                        && (pending_internal.is_none() && retiring_internal.is_none())
+                        && internal_domain
+                            .as_ref()
+                            .is_none_or(|domain| domain.value().end().is_some())
+                    {
+                        if let Err(error) = &advanced {
+                            tracing::warn!(%error, "Task failure after the accepted root seal belongs to cleanup");
+                        }
+                        break Ok(());
                     }
-                    Err(error) => {
+                    let mut moved = match advanced {
+                        Ok(report) => !report.is_idle(),
+                        Err(error) => {
+                            break Err(self.fail_execution_task_round_with_root_reader(
+                                &mut relayed_reader,
+                                &mut root_result_polls,
+                                root_task,
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                error.preparation_input(),
+                            ));
+                        }
+                    };
+                    if let Some(reply) = root_seal_reply.as_mut() {
+                        let refusal = match reply.try_recv() {
+                            Ok(Err(error)) => Some(error.to_string()),
+                            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                                Some("root success-seal owner closed without a verdict".to_owned())
+                            }
+                            Ok(Ok(())) => Some(
+                                "root success-seal reply arrived without the owner's accepted seal"
+                                    .to_owned(),
+                            ),
+                            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+                        };
+                        if let Some(detail) = refusal {
+                            break Err(self.fail_task_round_with_root_reader(
+                                &mut relayed_reader,
+                                &mut root_result_polls,
+                                root_task,
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                detail,
+                            ));
+                        }
+                    }
+                    final_task_info.observe(&round);
+                    if !contexts_established && round.contexts_established() {
+                        contexts_established = true;
+                        if let Some(retry_boundary) = retry_boundary {
+                            retry_boundary.close_after_control_ready();
+                        }
+                    }
+                    if contexts_established && !tasks_created && round.tasks_created() {
+                        tasks_created = true;
+                        if let Some(retry_boundary) = retry_boundary {
+                            retry_boundary.close_after_stage_or_start();
+                        }
+                    }
+                    // Re-read after the gates moved: a failure seen from here on is
+                    // judged against the window this turn actually reached.
+                    let classification = TaskRoundFailureClassification {
+                        before_contexts_established: !contexts_established,
+                        recovery_observation_allowed: retry_boundary.is_some(),
+                        captured: &captured_topology,
+                        observation_deadline: statement_deadline.min(
+                            Instant::now()
+                                .checked_add(establish_wait)
+                                .unwrap_or(statement_deadline),
+                        ),
+                        cancellation: &cancellation,
+                    };
+                    let terminal_cause = match synchronous_root_failure_cause(
+                        &mut round,
+                        root_task,
+                        &mut root_result_polls,
+                    ) {
+                        Ok(cause) => cause,
+                        Err(error) => {
+                            break Err(self.fail_task_round_with_root_reader(
+                                &mut relayed_reader,
+                                &mut root_result_polls,
+                                root_task,
+                                query_id,
+                                &mut round,
+                                &split_delivery,
+                                classification,
+                                QueryFailureCause::FrontendExecution,
+                                format!("root terminal-control registration was refused: {error}"),
+                            ));
+                        }
+                    };
+                    if let Some(detail) = terminal_cause {
+                        let waiting_on = task_round_wait_facts(
+                            &round,
+                            root_task,
+                            usize::try_from(root_batch_count).unwrap_or(usize::MAX),
+                            last_root_poll,
+                            write_completion.as_mut(),
+                        );
+                        let detail = format!(
+                            "task execution terminated: {}; terminal_round={waiting_on}",
+                            render_termination_detail(Some(&detail))
+                        );
+                        break Err(self.fail_task_round_with_root_reader(
+                            &mut relayed_reader,
+                            &mut root_result_polls,
+                            root_task,
+                            query_id,
+                            &mut round,
+                            &split_delivery,
+                            classification,
+                            QueryFailureCause::BackendLocalFailure,
+                            detail,
+                        ));
+                    }
+                    // A deliverer that failed will never feed the scans it had left,
+                    // so the round cannot reach its own exit and would otherwise run
+                    // out the statement deadline reporting the wait instead of the
+                    // cause. Read every turn, and only a failure ends the attempt:
+                    // a worker that stopped because every source went terminal is the
+                    // normal case and says nothing about the query.
+                    let delivery_failure = split_assignment
+                        .as_ref()
+                        .and_then(SplitAssignmentRoundGuard::failure)
+                        .map(|error| format!("split assignment stopped delivering: {error}"));
+                    if let Some(detail) = delivery_failure {
                         break Err(self.fail_task_round_with_root_reader(
                             &mut relayed_reader,
                             &mut root_result_polls,
@@ -1582,42 +1623,47 @@ impl FrontendDistributedQueryCoordinator {
                             &split_delivery,
                             classification,
                             QueryFailureCause::FrontendExecution,
-                            error,
+                            detail,
                         ));
                     }
-                }
-            }
-            // One answer per turn. Consuming it makes the turn non-idle, so
-            // the loop comes straight back for the next one instead of
-            // parking on the wake the poller raised.
-            if let Some(answer) = cpu_answer.or_else(|| {
-                if pending_internal.is_some() || claimed_internal {
-                    None
-                } else {
-                    root_result_polls
+
+                    if let Some(job) = retiring_internal.as_mut() {
+                        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                        match job.poll_closed(&mut cx) {
+                            std::task::Poll::Ready(Ok(())) => {
+                                retiring_internal.take();
+                            }
+                            std::task::Poll::Ready(Err(_)) => {
+                                *health = Some(novarocks_query_application::api::StatementNativeHealthFailure::actual_exit_unproven(
+                            "Original Internal CPU forwarder exit is unproven", job.join_failure().expect("original CPU join error")));
+                                break Err(failed("Internal CPU forwarder did not exit normally"));
+                            }
+                            std::task::Poll::Pending => {}
+                        }
+                    }
+                    // Control, cancellation and split failure are observed before
+                    // claiming CPU progress. A pending codec never blocks this loop.
+                    let mut cpu_answer = None;
+                    let mut claimed_internal = false;
+                    if let Some(claimed) = pending_internal
                         .as_mut()
-                        .and_then(RootResultPolls::take_next)
-                }
-            }) {
-                let answer = match answer {
-                    RootPollAnswer::Control(answer) => answer,
-                    RootPollAnswer::Relayed(RelayedRootAnswer::Data(reply)) => {
-                        let input = internal_domain
-                            .take()
-                            .ok_or_else(|| {
-                                "relayed data has no admitted Internal consumer".to_owned()
-                            })
-                            .and_then(|domain| {
-                                domain
-                                    .transform(|domain, _| (domain, reply))
-                                    .track_actual_exit(
-                                        internal_capacity
-                                            .as_ref()
-                                            .expect("Internal slot requires its binding"),
-                                    )
-                            });
-                        let input = match input {
-                            Ok(input) => input,
+                        .and_then(InternalResultCpuJob::try_take)
+                    {
+                        *retiring_internal = pending_internal.take();
+                        if let Some(job) = retiring_internal.as_mut() {
+                            job.begin_close();
+                        }
+                        claimed_internal = true;
+                        moved = true;
+                        let claimed = match claimed {
+                            Ok(value) => value,
+                            Err(input) => break Err(self.fail_execution_task_round_with_root_reader(
+                                &mut relayed_reader, &mut root_result_polls, root_task, query_id,
+                                &mut round, &split_delivery, classification,
+                                QueryFailureCause::FrontendExecution, input)),
+                        };
+                        let domain = match claimed.try_transform(|result, _| result) {
+                            Ok(domain) => domain,
                             Err(error) => {
                                 break Err(self.fail_task_round_with_root_reader(
                                     &mut relayed_reader,
@@ -1632,34 +1678,242 @@ impl FrontendDistributedQueryCoordinator {
                                 ));
                             }
                         };
-                        pending_internal = Some(
-                            self.internal_result_cpu
-                                .as_ref()
-                                .expect("Internal admission validates its CPU runtime")
-                                .submit(
-                                    input,
-                                    cancellation.clone(),
-                                    &self.data_runtime,
-                                    Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
-                                    |(domain, reply), _| domain.apply_body(reply),
-                                ),
-                        );
-                        // The actual CPU completion, never enqueue, owns ACK.
-                        continue;
-                    }
-                    RootPollAnswer::Relayed(RelayedRootAnswer::End(end)) => {
-                        if let Some(binding) = internal_capacity.as_ref() {
-                            let input = internal_domain
-                                .take()
-                                .ok_or_else(|| "Internal EOF has no serial domain state".to_owned())
-                                .and_then(|domain| {
-                                    domain
-                                        .transform(|domain, _| (domain, end))
-                                        .track_actual_exit(binding)
+                        if let Some(packet_sequence) = domain.value().receipt() {
+                            let consumed = round
+                                .consume_root_result_packet(packet_sequence, false)
+                                .map_err(|error| error.to_string())
+                                .and_then(|()| {
+                                    root_result_polls
+                                        .as_ref()
+                                        .ok_or("CPU receipt lost its reader".to_owned())?
+                                        .acknowledge(packet_sequence)
                                 });
-                            let input = match input {
-                                Ok(input) => input,
-                                Err(error) => {
+                            if let Err(error) = consumed {
+                                break Err(self.fail_task_round_with_root_reader(
+                                    &mut relayed_reader,
+                                    &mut root_result_polls,
+                                    root_task,
+                                    query_id,
+                                    &mut round,
+                                    &split_delivery,
+                                    classification,
+                                    QueryFailureCause::FrontendExecution,
+                                    error,
+                                ));
+                            }
+                            root_batch_count = root_batch_count.saturating_add(1);
+                            last_root_poll = RootResultPoll::Packet(packet_sequence);
+                        } else if let Some(end) = domain.value().end() {
+                            relayed_end = Some(end);
+                            root_row_count = end.output_rows;
+                            cpu_answer =
+                                Some(RootPollAnswer::Control(RootPollControl::EndOfStream {
+                                    packet_sequence: end.sequence.get() - 1,
+                                }));
+                        }
+                        *internal_domain = Some(domain);
+                    }
+
+                    // The polls run until this loop has observed the end of the
+                    // result stream, and that fact alone stops them. Not the root
+                    // task leaving its created state: delivering the end of stream is
+                    // what retires that task, so stopping on its terminal status
+                    // races the last answer -- and losing that answer leaves the read
+                    // waiting for an end of stream nothing will send again.
+                    //
+                    // The first poll waits for Installed. Accepted proves the Worker
+                    // owns the create, but preparation may still be in progress and
+                    // the result plane cannot serve the task yet.
+                    if observed_result_eof || round.execution().result_terminal_control_required() {
+                        if let Some(polls) = root_result_polls.as_mut() { polls.begin_close(); }
+                    } else if root_result_polls.is_none() && round.result_pump_ready() {
+                        match RootResultPolls::start_for_delivery(
+                            &delivery,
+                            relayed_reader.as_ref(),
+                            root_task,
+                            statement_deadline,
+                            Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+                            self.data_runtime.clone(),
+                        ) {
+                            Ok(polls) => {
+                                *root_result_polls = Some(polls);
+                            }
+                            Err(error) => {
+                                break Err(self.fail_task_round_with_root_reader(
+                                    &mut relayed_reader,
+                                    &mut root_result_polls,
+                                    root_task,
+                                    query_id,
+                                    &mut round,
+                                    &split_delivery,
+                                    classification,
+                                    QueryFailureCause::FrontendExecution,
+                                    error,
+                                ));
+                            }
+                        }
+                    }
+                    // One answer per turn. Consuming it makes the turn non-idle, so
+                    // the loop comes straight back for the next one instead of
+                    // parking on the wake the poller raised.
+                    if let Some(answer) = cpu_answer.or_else(|| {
+                        if pending_internal.is_some()
+                            || retiring_internal.is_some()
+                            || claimed_internal
+                        {
+                            None
+                        } else {
+                            root_result_polls
+                                .as_mut()
+                                .and_then(RootResultPolls::take_next)
+                        }
+                    }) {
+                        let answer = match answer {
+                            RootPollAnswer::Control(answer) => answer,
+                            RootPollAnswer::Relayed(RelayedRootAnswer::Data(reply)) => {
+                                let input = internal_domain
+                                    .take()
+                                    .ok_or_else(|| {
+                                        "relayed data has no admitted Internal consumer".to_owned()
+                                    })
+                                    .and_then(|domain| {
+                                        domain
+                                            .transform(|domain, _| (domain, reply))
+                                            .track_actual_exit(
+                                                internal_capacity
+                                                    .as_ref()
+                                                    .expect("Internal slot requires its binding"),
+                                            )
+                                    });
+                                let input = match input {
+                                    Ok(input) => input,
+                                    Err(error) => {
+                                        break Err(self.fail_task_round_with_root_reader(
+                                            &mut relayed_reader,
+                                            &mut root_result_polls,
+                                            root_task,
+                                            query_id,
+                                            &mut round,
+                                            &split_delivery,
+                                            classification,
+                                            QueryFailureCause::FrontendExecution,
+                                            error,
+                                        ));
+                                    }
+                                };
+                                *pending_internal = Some(
+                                    self.internal_result_cpu
+                                        .as_ref()
+                                        .expect("Internal admission validates its CPU runtime")
+                                        .submit(
+                                            input,
+                                            cancellation.clone(),
+                                            &self.data_runtime,
+                                            Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+                                            |(domain, reply), _| domain.apply_body(reply),
+                                        ),
+                                );
+                                // The actual CPU completion, never enqueue, owns ACK.
+                                continue;
+                            }
+                            RootPollAnswer::Relayed(RelayedRootAnswer::End(end)) => {
+                                if let Some(binding) = internal_capacity.as_ref() {
+                                    let input = internal_domain
+                                        .take()
+                                        .ok_or_else(|| {
+                                            "Internal EOF has no serial domain state".to_owned()
+                                        })
+                                        .and_then(|domain| {
+                                            domain
+                                                .transform(|domain, _| (domain, end))
+                                                .track_actual_exit(binding)
+                                        });
+                                    let input = match input {
+                                        Ok(input) => input,
+                                        Err(error) => {
+                                            break Err(self.fail_task_round_with_root_reader(
+                                                &mut relayed_reader,
+                                                &mut root_result_polls,
+                                                root_task,
+                                                query_id,
+                                                &mut round,
+                                                &split_delivery,
+                                                classification,
+                                                QueryFailureCause::FrontendExecution,
+                                                error,
+                                            ));
+                                        }
+                                    };
+                                    *pending_internal = Some(
+                                        self.internal_result_cpu
+                                            .as_ref()
+                                            .expect("Internal admission validates its CPU runtime")
+                                            .submit(
+                                                input,
+                                                cancellation.clone(),
+                                                &self.data_runtime,
+                                                Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+                                                |(domain, end), _| domain.finish_eof(end),
+                                            ),
+                                    );
+                                    continue;
+                                }
+                                relayed_end = Some(end);
+                                root_row_count = end.output_rows;
+                                RootPollControl::EndOfStream {
+                                    packet_sequence: end.sequence.get() - 1,
+                                }
+                            }
+                            RootPollAnswer::Relayed(RelayedRootAnswer::NotReady) => {
+                                RootPollControl::NotReady
+                            }
+                            RootPollAnswer::Relayed(RelayedRootAnswer::AwaitTerminalControl) => {
+                                RootPollControl::AwaitTerminalControl
+                            }
+                            RootPollAnswer::Relayed(RelayedRootAnswer::FetchFailure(error)) => {
+                                use novarocks_query_application::coordination::AttemptFailureClass as C;
+                                let cause = if error.class() == C::RecoverableInfrastructure {
+                                    QueryFailureCause::RemoteTransportObservation
+                                } else {
+                                    QueryFailureCause::FrontendExecution
+                                };
+                                let failed = self.fail_execution_task_round_with_root_reader(
+                                    &mut relayed_reader,
+                                    &mut root_result_polls,
+                                    root_task,
+                                    query_id,
+                                    &mut round,
+                                    &split_delivery,
+                                    classification,
+                                    cause,
+                                    error.input().clone(),
+                                );
+                                break Err(failed.with_root_fetch_failure(error));
+                            }
+                        };
+                        match answer {
+                            RootPollControl::EndOfStream { packet_sequence } => {
+                                let required_terminals =
+                                    if let Some(tracker) = write_completion.as_ref() {
+                                        tracker.writers().copied().collect::<Vec<_>>()
+                                    } else if intent == DistributedQueryIntent::Statistics {
+                                        round
+                                            .execution()
+                                            .graph()
+                                            .tasks()
+                                            .map(|task| task.identity())
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    };
+                                let consumed = round
+                                    .consume_root_result_packet(packet_sequence, true)
+                                    .and_then(|()| {
+                                        round
+                                            .execution_mut()
+                                            .require_terminal_evidence(required_terminals)
+                                    });
+                                if let Err(error) = consumed {
                                     break Err(self.fail_task_round_with_root_reader(
                                         &mut relayed_reader,
                                         &mut root_result_polls,
@@ -1669,115 +1923,20 @@ impl FrontendDistributedQueryCoordinator {
                                         &split_delivery,
                                         classification,
                                         QueryFailureCause::FrontendExecution,
-                                        error,
+                                        format!("root result end of stream was refused: {error}"),
                                     ));
                                 }
-                            };
-                            pending_internal = Some(
-                                self.internal_result_cpu
-                                    .as_ref()
-                                    .expect("Internal admission validates its CPU runtime")
-                                    .submit(
-                                        input,
-                                        cancellation.clone(),
-                                        &self.data_runtime,
-                                        Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
-                                        |(domain, end), _| domain.finish_eof(end),
-                                    ),
-                            );
-                            continue;
-                        }
-                        relayed_end = Some(end);
-                        root_row_count = end.output_rows;
-                        RootPollControl::EndOfStream {
-                            packet_sequence: end.sequence.get() - 1,
-                        }
-                    }
-                    RootPollAnswer::Relayed(RelayedRootAnswer::NotReady) => {
-                        RootPollControl::NotReady
-                    }
-                    RootPollAnswer::Relayed(RelayedRootAnswer::AwaitTerminalControl) => {
-                        RootPollControl::AwaitTerminalControl
-                    }
-                    RootPollAnswer::Relayed(RelayedRootAnswer::FetchFailure(error)) => {
-                        use novarocks_query_application::coordination::AttemptFailureClass as C;
-                        let cause = if error.class() == C::RecoverableInfrastructure {
-                            QueryFailureCause::RemoteTransportObservation
-                        } else {
-                            QueryFailureCause::FrontendExecution
-                        };
-                        let failed = self.fail_task_round_with_root_reader(
-                            &mut relayed_reader,
-                            &mut root_result_polls,
-                            root_task,
-                            query_id,
-                            &mut round,
-                            &split_delivery,
-                            classification,
-                            cause,
-                            error.error().to_string(),
-                        );
-                        break Err(failed.with_root_fetch_failure(error));
-                    }
-                    RootPollAnswer::Relayed(RelayedRootAnswer::Refused(error)) => {
-                        break Err(self.fail_task_round_with_root_reader(
-                            &mut relayed_reader,
-                            &mut root_result_polls,
-                            root_task,
-                            query_id,
-                            &mut round,
-                            &split_delivery,
-                            classification,
-                            QueryFailureCause::FrontendExecution,
-                            error,
-                        ));
-                    }
-                };
-                match answer {
-                    RootPollControl::EndOfStream { packet_sequence } => {
-                        let required_terminals = if let Some(tracker) = write_completion.as_ref() {
-                            tracker.writers().copied().collect::<Vec<_>>()
-                        } else if intent == DistributedQueryIntent::Statistics {
-                            round
-                                .execution()
-                                .graph()
-                                .tasks()
-                                .map(|task| task.identity())
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-                        let consumed = round
-                            .consume_root_result_packet(packet_sequence, true)
-                            .and_then(|()| {
-                                round
-                                    .execution_mut()
-                                    .require_terminal_evidence(required_terminals)
-                            });
-                        if let Err(error) = consumed {
-                            break Err(self.fail_task_round_with_root_reader(
-                                &mut relayed_reader,
-                                &mut root_result_polls,
-                                root_task,
-                                query_id,
-                                &mut round,
-                                &split_delivery,
-                                classification,
-                                QueryFailureCause::FrontendExecution,
-                                format!("root result end of stream was refused: {error}"),
-                            ));
-                        }
-                        observed_result_eof = true;
-                        last_root_poll = RootResultPoll::EndOfStream(packet_sequence);
-                        moved = true;
-                    }
-                    RootPollControl::AwaitTerminalControl => {
-                        if let Err(error) = suspend_root_result_for_terminal_control(
-                            &mut round,
-                            root_task,
-                            &mut root_result_polls,
-                        ) {
-                            break Err(self.fail_task_round_with_root_reader(
+                                observed_result_eof = true;
+                                last_root_poll = RootResultPoll::EndOfStream(packet_sequence);
+                                moved = true;
+                            }
+                            RootPollControl::AwaitTerminalControl => {
+                                if let Err(error) = suspend_root_result_for_terminal_control(
+                                    &mut round,
+                                    root_task,
+                                    &mut root_result_polls,
+                                ) {
+                                    break Err(self.fail_task_round_with_root_reader(
                                 &mut relayed_reader,
                                 &mut root_result_polls,
                                 root_task,
@@ -1788,51 +1947,54 @@ impl FrontendDistributedQueryCoordinator {
                                 QueryFailureCause::FrontendExecution,
                                 format!("root terminal-control registration was refused: {error}"),
                             ));
+                                }
+                                // This is neither a packet acknowledgement nor EOF.
+                                // Decoders and write completion remain unfinished.
+                                last_root_poll = RootResultPoll::AwaitTerminalControl;
+                                moved = true;
+                            }
+                            RootPollControl::NotReady => {
+                                // Deliberately not progress. The poller is already
+                                // asking again, so a turn that claimed this moved
+                                // something would keep the loop spinning through
+                                // that whole wait instead of parking until the
+                                // poller, an acknowledgement or a status event wakes
+                                // it.
+                                last_root_poll = RootResultPoll::NotReady;
+                            }
                         }
-                        // This is neither a packet acknowledgement nor EOF.
-                        // Decoders and write completion remain unfinished.
-                        last_root_poll = RootResultPoll::AwaitTerminalControl;
-                        moved = true;
                     }
-                    RootPollControl::NotReady => {
-                        // Deliberately not progress. The poller is already
-                        // asking again, so a turn that claimed this moved
-                        // something would keep the loop spinning through
-                        // that whole wait instead of parking until the
-                        // poller, an acknowledgement or a status event wakes
-                        // it.
-                        last_root_poll = RootResultPoll::NotReady;
-                    }
-                }
-            }
 
-            wait_witness.observe(
-                execution_id,
-                task_round_wait_facts(
-                    &round,
-                    root_task,
-                    usize::try_from(root_batch_count).unwrap_or(usize::MAX),
-                    last_root_poll,
-                    write_completion.as_mut(),
-                ),
-                Instant::now(),
-            );
+                    wait_witness.observe(
+                        execution_id,
+                        task_round_wait_facts(
+                            &round,
+                            root_task,
+                            usize::try_from(root_batch_count).unwrap_or(usize::MAX),
+                            last_root_poll,
+                            write_completion.as_mut(),
+                        ),
+                        Instant::now(),
+                    );
 
-            if synchronous_root_completion_ready(&round) && pending_internal.is_none() {
-                match write_completion.as_mut() {
-                    // A write's completion is not the read's. Every declared
-                    // writer must reach a success-compatible terminal and the
-                    // root finish task must publish FINISHED. The independently
-                    // decoded Root prepared set later proves that every writer
-                    // output actually arrived.
-                    Some(tracker) => {
-                        observe_write_statuses(&round, tracker);
-                        let verdict = tracker.execution_verdict(round.failure_cause().is_some());
-                        if verdict.is_complete() {
-                            break Ok(());
-                        }
-                        if !verdict.is_pending() {
-                            break Err(self.fail_task_round_with_root_reader(&mut relayed_reader, &mut root_result_polls, root_task,
+                    if synchronous_root_completion_ready(&round)
+                        && (pending_internal.is_none() && retiring_internal.is_none())
+                    {
+                        match write_completion.as_mut() {
+                            // A write's completion is not the read's. Every declared
+                            // writer must reach a success-compatible terminal and the
+                            // root finish task must publish FINISHED. The independently
+                            // decoded Root prepared set later proves that every writer
+                            // output actually arrived.
+                            Some(tracker) => {
+                                observe_write_statuses(&round, tracker);
+                                let verdict =
+                                    tracker.execution_verdict(round.failure_cause().is_some());
+                                if verdict.is_complete() {
+                                    break Ok(());
+                                }
+                                if !verdict.is_pending() {
+                                    break Err(self.fail_task_round_with_root_reader(&mut relayed_reader, &mut root_result_polls, root_task,
                                 query_id,
                                 &mut round,
                                 &split_delivery,
@@ -1842,322 +2004,336 @@ impl FrontendDistributedQueryCoordinator {
                                     "distributed write reached a non-committable terminal: {verdict}"
                                 ),
                             ));
-                        }
-                    }
-                    None if intent == DistributedQueryIntent::Statistics
-                        && internal_capacity.is_some() =>
-                    {
-                        if statistics_tasks_are_terminal(&round) {
-                            if let Some(error) = statistics_all_success_error(&round) {
-                                break Err(self.fail_task_round_with_root_reader(
-                                    &mut relayed_reader,
-                                    &mut root_result_polls,
-                                    root_task,
-                                    query_id,
-                                    &mut round,
-                                    &split_delivery,
-                                    classification,
-                                    QueryFailureCause::FrontendExecution,
-                                    error.to_string(),
-                                ));
-                            }
-                            if internal_domain
-                                .as_ref()
-                                .is_some_and(|domain| domain.value().statistics_finished())
-                            {
-                                break Ok(());
-                            }
-                            let input = internal_domain
-                                .take()
-                                .ok_or_else(|| {
-                                    "Statistics finalization lost its EOF state".to_owned()
-                                })
-                                .and_then(|domain| {
-                                    domain.track_actual_exit(
-                                        internal_capacity.as_ref().expect("Internal binding"),
-                                    )
-                                });
-                            let input = match input {
-                                Ok(input) => input,
-                                Err(error) => {
-                                    break Err(self.fail_task_round_with_root_reader(
-                                        &mut relayed_reader,
-                                        &mut root_result_polls,
-                                        root_task,
-                                        query_id,
-                                        &mut round,
-                                        &split_delivery,
-                                        classification,
-                                        QueryFailureCause::FrontendExecution,
-                                        error,
-                                    ));
                                 }
-                            };
-                            pending_internal = Some(
-                                self.internal_result_cpu
-                                    .as_ref()
-                                    .expect("Internal CPU runtime")
-                                    .submit(
-                                        input,
-                                        cancellation.clone(),
-                                        &self.data_runtime,
-                                        Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
-                                        |domain, _| domain.finish_statistics(),
-                                    ),
-                            );
-                            moved = true;
-                        }
-                    }
-                    None if intent == DistributedQueryIntent::Statistics
-                        && !statistics_tasks_are_terminal(&round) =>
-                    {
-                        // Root EOF proves the statistics artifact stream is
-                        // complete, but an upstream stand-down can still be
-                        // converging through CANCELING. Wait for the frozen
-                        // task set to reach terminals before classifying those
-                        // terminals as success-compatible or failed.
-                    }
-                    None if matches!(
-                        intent,
-                        DistributedQueryIntent::Result | DistributedQueryIntent::CowMatch
-                    ) =>
-                    {
-                        if root_seal_reply.is_none() {
-                            let source = root_status_source
-                                .as_ref()
-                                .expect("result attempt owns its root status source");
-                            match source.begin_success_seal_request() {
-                                Ok(reply) => {
-                                    root_seal_reply = Some(reply);
+                            }
+                            None if intent == DistributedQueryIntent::Statistics
+                                && internal_capacity.is_some() =>
+                            {
+                                if statistics_tasks_are_terminal(&round) {
+                                    if let Some(error) = statistics_all_success_error(&round) {
+                                        break Err(self.fail_task_round_with_root_reader(
+                                            &mut relayed_reader,
+                                            &mut root_result_polls,
+                                            root_task,
+                                            query_id,
+                                            &mut round,
+                                            &split_delivery,
+                                            classification,
+                                            QueryFailureCause::FrontendExecution,
+                                            error.to_string(),
+                                        ));
+                                    }
+                                    if internal_domain
+                                        .as_ref()
+                                        .is_some_and(|domain| domain.value().statistics_finished())
+                                    {
+                                        break Ok(());
+                                    }
+                                    let input = internal_domain
+                                        .take()
+                                        .ok_or_else(|| {
+                                            "Statistics finalization lost its EOF state".to_owned()
+                                        })
+                                        .and_then(|domain| {
+                                            domain.track_actual_exit(
+                                                internal_capacity
+                                                    .as_ref()
+                                                    .expect("Internal binding"),
+                                            )
+                                        });
+                                    let input = match input {
+                                        Ok(input) => input,
+                                        Err(error) => {
+                                            break Err(self.fail_task_round_with_root_reader(
+                                                &mut relayed_reader,
+                                                &mut root_result_polls,
+                                                root_task,
+                                                query_id,
+                                                &mut round,
+                                                &split_delivery,
+                                                classification,
+                                                QueryFailureCause::FrontendExecution,
+                                                error,
+                                            ));
+                                        }
+                                    };
+                                    *pending_internal = Some(
+                                        self.internal_result_cpu
+                                            .as_ref()
+                                            .expect("Internal CPU runtime")
+                                            .submit(
+                                                input,
+                                                cancellation.clone(),
+                                                &self.data_runtime,
+                                                Arc::clone(&wake) as Arc<dyn StatusIntakeWake>,
+                                                |domain, _| domain.finish_statistics(),
+                                            ),
+                                    );
                                     moved = true;
                                 }
-                                Err(error) => {
-                                    break Err(self.fail_task_round_with_root_reader(
-                                        &mut relayed_reader,
-                                        &mut root_result_polls,
-                                        root_task,
-                                        query_id,
-                                        &mut round,
-                                        &split_delivery,
-                                        classification,
-                                        QueryFailureCause::FrontendExecution,
-                                        error.to_string(),
-                                    ));
+                            }
+                            None if intent == DistributedQueryIntent::Statistics
+                                && !statistics_tasks_are_terminal(&round) =>
+                            {
+                                // Root EOF proves the statistics artifact stream is
+                                // complete, but an upstream stand-down can still be
+                                // converging through CANCELING. Wait for the frozen
+                                // task set to reach terminals before classifying those
+                                // terminals as success-compatible or failed.
+                            }
+                            None if matches!(
+                                intent,
+                                DistributedQueryIntent::Result | DistributedQueryIntent::CowMatch
+                            ) =>
+                            {
+                                if root_seal_reply.is_none() {
+                                    let source = root_status_source
+                                        .as_ref()
+                                        .expect("result attempt owns its root status source");
+                                    match source.begin_success_seal_request() {
+                                        Ok(reply) => {
+                                            root_seal_reply = Some(reply);
+                                            moved = true;
+                                        }
+                                        Err(error) => {
+                                            break Err(self.fail_task_round_with_root_reader(
+                                                &mut relayed_reader,
+                                                &mut root_result_polls,
+                                                root_task,
+                                                query_id,
+                                                &mut round,
+                                                &split_delivery,
+                                                classification,
+                                                QueryFailureCause::FrontendExecution,
+                                                error.to_string(),
+                                            ));
+                                        }
+                                    }
                                 }
                             }
+                            None => break Ok(()),
                         }
                     }
-                    None => break Ok(()),
+                    if !moved {
+                        wake.wait(TASK_ROUND_IDLE_WAIT);
+                    }
+                };
+                // Nothing prunes for a query whose answer is already decided, success
+                // or failure. The loop is stopped before the outcome is propagated,
+                // and closing the feedback state also wakes any split source still
+                // inside its initial wait.
+                //
+                // There is no rotation to stop beside it any more: a consumer that
+                // renews for itself does so only when a request needs material, so an
+                // attempt with no reader left starts nothing (CAD-1 D3).
+                feedback_state.close();
+                if let Some(port) = relayed_reader.as_ref() {
+                    use novarocks_execution_contract::root_lifetime::RootReadConvergence;
+                    let mut convergence = RootReadConvergence::new(root_task);
+                    let sealed = if outcome.is_err() {
+                        convergence.seal_terminated()
+                    } else {
+                        convergence
+                            .consume_end(relayed_end.ok_or_else(|| {
+                                failed("root success has no locally consumed End")
+                            })?)
+                            .map_err(|error| failed(error.to_string()))?;
+                        if round
+                            .execution()
+                            .task(root_task.task_id())
+                            .and_then(|task| task.status())
+                            .is_none_or(|status| status.state() != TaskState::Finished)
+                        {
+                            return Err(failed("root success has no exact Finished observation"));
+                        }
+                        convergence.observe_root_finished();
+                        convergence
+                            .seal_normal()
+                            .map_err(|error| failed(error.to_string()))?
+                    };
+                    port.seal(sealed)
+                        .map_err(|error| failed(error.to_string()))?;
                 }
-            }
-            if !moved {
-                wake.wait(TASK_ROUND_IDLE_WAIT);
-            }
-        };
-        // Nothing prunes for a query whose answer is already decided, success
-        // or failure. The loop is stopped before the outcome is propagated,
-        // and closing the feedback state also wakes any split source still
-        // inside its initial wait.
-        //
-        // There is no rotation to stop beside it any more: a consumer that
-        // renews for itself does so only when a request needs material, so an
-        // attempt with no reader left starts nothing (CAD-1 D3).
-        feedback_state.close();
-        if let Some(port) = relayed_reader.as_ref() {
-            use novarocks_execution_contract::root_lifetime::RootReadConvergence;
-            let mut convergence = RootReadConvergence::new(root_task);
-            let sealed = if outcome.is_err() {
-                convergence.seal_terminated()
-            } else {
-                convergence
-                    .consume_end(
-                        relayed_end
-                            .ok_or_else(|| failed("root success has no locally consumed End"))?,
-                    )
-                    .map_err(|error| failed(error.to_string()))?;
-                if round
-                    .execution()
-                    .task(root_task.task_id())
-                    .and_then(|task| task.status())
-                    .is_none_or(|status| status.state() != TaskState::Finished)
-                {
-                    return Err(failed("root success has no exact Finished observation"));
+                if let Some(job) = pending_internal.as_mut() {
+                    job.begin_close();
                 }
-                convergence.observe_root_finished();
-                convergence
-                    .seal_normal()
-                    .map_err(|error| failed(error.to_string()))?
-            };
-            port.seal(sealed)
-                .map_err(|error| failed(error.to_string()))?;
+                outcome?;
+
+                // A write cannot stop its Worker producers until the Root stream has
+                // yielded a complete, committable prepared set. Freeze that evidence
+                // locally before Quiesce; the external commit still runs after drain
+                // so the normal TaskRound can keep its leases live during closure.
+                let mut prepared_write_set = if intent == DistributedQueryIntent::Write {
+                    let prepared = (|| {
+                        let tracker = write_completion.as_mut().ok_or_else(|| {
+                            DistributedQueryError::new(
+                                DistributedQueryErrorKind::ContractViolation,
+                                "distributed write execution has no write completion tracker",
+                            )
+                        })?;
+
+                        let mut barrier =
+                            crate::query_execution::write_barrier::WriteCommitBarrier::new();
+                        observe_write_statuses(&round, tracker);
+                        let execution_verdict =
+                            tracker.execution_verdict(round.failure_cause().is_some());
+                        let prepared = internal_domain
+                            .take()
+                            .ok_or_else(|| {
+                                "distributed write lost its admitted Internal domain".to_owned()
+                            })
+                            .and_then(|domain| domain.hand_off(|domain, _| domain.into_write()))
+                            .map_err(|error| {
+                                DistributedQueryError::new(
+                                    DistributedQueryErrorKind::ContractViolation,
+                                    error,
+                                )
+                            })?;
+                        barrier.observe_prepared_write_set(prepared);
+                        barrier.observe_task_execution(execution_verdict);
+                        if cancellation.is_cancelled() {
+                            barrier.observe_cancelled();
+                        }
+                        if Instant::now() >= statement_deadline {
+                            barrier.observe_deadline_expired();
+                        }
+                        barrier.into_committable().map_err(|blocked| {
+                            DistributedQueryError::new(
+                                DistributedQueryErrorKind::ContractViolation,
+                                blocked.as_str(),
+                            )
+                        })
+                    })();
+                    match prepared {
+                        Ok(prepared) => Some(prepared),
+                        Err(error) => {
+                            split_delivery
+                                .abandon("distributed write prepared set was not committable");
+                            abort_task_round(
+                                &mut round,
+                                "distributed write prepared set was not committable",
+                            );
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                Ok((prepared_write_set, relayed_end, root_row_count))
+            })()
+        }).unwrap_or_else(|health| Err(DistributedQueryError::from_execution(
+            foreground_native_execution_panic_input(health),
+        )));
+        let cut = Instant::now();
+        let convergence_request = native
+            .begin_terminal_cut(cut)
+            .map_err(|error| failed(error.to_string()))?;
+        {
+            let owner = native.borrow_mut();
+            owner.accepted_failure = prepared_write_result
+                .as_ref()
+                .err()
+                .map(|error| error.clone().into_execution_failure_input());
+            owner.begin_terminal(
+                if prepared_write_result.is_ok() {
+                    NativeAttemptConvergenceMode::Normal
+                } else {
+                    NativeAttemptConvergenceMode::Cleanup
+                },
+                intent == DistributedQueryIntent::Profile,
+            );
         }
-        drop(pending_internal.take());
-        outcome?;
-
-        // A write cannot stop its Worker producers until the Root stream has
-        // yielded a complete, committable prepared set. Freeze that evidence
-        // locally before Quiesce; the external commit still runs after drain
-        // so the normal TaskRound can keep its leases live during closure.
-        let mut prepared_write_set = if intent == DistributedQueryIntent::Write {
-            let prepared = (|| {
-                let tracker = write_completion.as_mut().ok_or_else(|| {
-                    DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "distributed write execution has no write completion tracker",
-                    )
-                })?;
-
-                let mut barrier = crate::query_execution::write_barrier::WriteCommitBarrier::new();
-                observe_write_statuses(&round, tracker);
-                let execution_verdict = tracker.execution_verdict(round.failure_cause().is_some());
-                let prepared = internal_domain
-                    .take()
-                    .ok_or_else(|| "distributed write lost its admitted Internal domain".to_owned())
-                    .and_then(|domain| domain.hand_off(|domain, _| domain.into_write()))
-                    .map_err(|error| {
-                        DistributedQueryError::new(
-                            DistributedQueryErrorKind::ContractViolation,
-                            error,
-                        )
-                    })?;
-                barrier.observe_prepared_write_set(prepared);
-                barrier.observe_task_execution(execution_verdict);
-                if cancellation.is_cancelled() {
-                    barrier.observe_cancelled();
-                }
-                if Instant::now() >= statement_deadline {
-                    barrier.observe_deadline_expired();
-                }
-                barrier.into_committable().map_err(|blocked| {
-                    DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        blocked.as_str(),
-                    )
-                })
-            })();
-            match prepared {
-                Ok(prepared) => Some(prepared),
-                Err(error) => {
-                    split_delivery.abandon("distributed write prepared set was not committable");
-                    abort_task_round(
-                        &mut round,
-                        "distributed write prepared set was not committable",
-                    );
-                    return Err(self.fail_and_cancel(query_id, error.to_string()));
-                }
-            }
-        } else {
-            None
-        };
-
-        // Profile keeps every task running until its terminal status can be
-        // observed and its final info read. Other intents can stop upstream
-        // work as soon as their result is complete.
-        let profile_waits_for_terminals = intent == DistributedQueryIntent::Profile;
-        if !profile_waits_for_terminals {
-            round.begin_normal_drain();
-        }
-
-        // The client-visible completion is linearized. Draining closes this
-        // attempt's internal resources and releases every query context; it
-        // must never be able to take that completion back, so a drain that
-        // does not finish inside the statement's own budget is reported rather
-        // than turned into a query failure.
-        drain_task_round(
-            &mut round,
-            &split_delivery,
-            &wake,
-            split_assignment.as_ref(),
+        let foreground_deadline = drain_deadline(
             statement_deadline,
             self.transport_budget.frontend_queue_residence(),
-            execution_id,
-            &mut final_task_info,
-            profile_waits_for_terminals,
+            cut,
         );
-
-        // Read once the drain has ended: a release acknowledgement is the only
-        // message that carries a backend's sealed runtime-filter observation,
-        // and the drain is what waits for every one of them. Read before the
-        // intent match so the same set feeds the convergence evidence and the
-        // profile -- two reads could disagree, and they are the same fact.
-        let runtime_filter_contributions =
-            round.execution().released_runtime_filter_contributions();
-        self.publish_task_round_convergence(execution_id, &runtime_filter_contributions);
-
-        // The split worker blocks on acknowledgements the drain above settles,
-        // so joining it is safe only now that it has stopped. A worker still
-        // waiting is woken with an unknown outcome, and the guard's own stop
-        // then keeps it from resending.
-        let split_assignment_profile = match split_assignment.take() {
-            Some(assignment) => {
-                let abandoned = !assignment.is_finished();
-                if abandoned {
-                    split_delivery.abandon("split assignment round ended with the attempt");
-                }
-                match assignment.finish_after_attempt(abandoned) {
-                    Ok(profile) => profile,
-                    Err(error) => {
-                        return Err(self.fail_and_cancel(
-                            query_id,
-                            format!("split assignment did not finish: {error}"),
-                        ));
-                    }
-                }
+        let closure = match native.catch_convergence(|owner| {
+            self.data_runtime.block_on(async {
+                tokio::time::timeout_at(
+                    foreground_deadline.into(),
+                    owner.converge(convergence_request),
+                )
+                .await
+            })
+        }) {
+            Ok(result) => Some(result.map_err(failed)?),
+            Err(health) => {
+                tracing::error!(%health, "Original Native convergence panicked and remains supervised");
+                None
             }
-            None => novarocks_spi::connector::read_stack::SplitSourceProfile::default(),
         };
-
-        if let Some(session) = write_stack_session.as_ref()
-            && let Some(resolver) = attempt_storage.as_ref()
-        {
-            // A connector write reaches its external commit after this attempt
-            // finalizes, and on a vended-credential deployment that commit
-            // reads object storage through the attempt's own leases.
-            session
-                .retain_terminal_storage_resolver(Arc::clone(resolver)
-                    as Arc<dyn novarocks_spi::connector::ConnectorStorageResolver>);
-        }
-
-        let outcome = (|| match intent {
-            DistributedQueryIntent::CowMatch => completion.cow_match(
-                internal_domain
-                    .take()
-                    .ok_or_else(|| failed("COW match lost its admitted Internal domain"))?
-                    .hand_off(|domain, _| domain.into_cow())
-                    .map_err(failed)?,
-            ),
-            DistributedQueryIntent::Result => Err(failed(
-                "generic row results require the admitted client relay owner",
-            )),
-            DistributedQueryIntent::Write => {
-                let session = write_stack_session.ok_or_else(|| {
-                    DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "distributed write execution has no connector write session",
-                    )
-                })?;
-                let prepared_set = prepared_write_set.take().ok_or_else(|| {
-                    DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "distributed write lost its validated prepared set before commit",
-                    )
-                })?;
-                completion.write_session_outcome(session, prepared_set)
-            }
-            DistributedQueryIntent::Profile => {
-                if relayed_end.is_none() {
-                    return Err(failed("CountOnly profile lost its End"));
-                }
-                let output_rows = root_row_count;
-                let mut builder = ProfileTerminalBuilder::new();
-                let graph = round.execution().graph();
-                for info in &final_task_info.collected {
-                    // Stage to fragment to sealed fragment root: each hop is a
-                    // fact this attempt froze, so a task whose stage or
-                    // fragment cannot be resolved is a disagreement between the
-                    // graph and the plan, not a profile to publish partially.
-                    let stage_id = info.final_status().identity().stage_id();
-                    let fragment_id = graph
+        let outcome = prepared_write_result.and_then(
+            |(mut prepared_write_set, relayed_end, root_row_count)| {
+                let owner = native.borrow_mut();
+                let StatementNativeAttempt {
+                    round,
+                    internal_domain,
+                    final_task_info,
+                    split_assignment,
+                    ..
+                } = owner;
+                let runtime_filter_contributions =
+                    round.execution().released_runtime_filter_contributions();
+                let split_assignment_profile = if round.pumps_closed()
+                    && split_assignment
+                        .as_ref()
+                        .is_some_and(|assignment| assignment.is_finished())
+                {
+                    split_assignment
+                        .take()
+                        .and_then(|assignment| match assignment.finish_after_attempt(false) {
+                            Ok(profile) => Some(profile),
+                            Err(error) => {
+                                tracing::warn!(%error, "Split assignment profile close diagnostic");
+                                None
+                            }
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Default::default()
+                };
+                let outcome = (|| match intent {
+                    DistributedQueryIntent::CowMatch => completion.cow_match(
+                        internal_domain
+                            .take()
+                            .ok_or_else(|| failed("COW match lost its admitted Internal domain"))?
+                            .hand_off(|domain, _| domain.into_cow())
+                            .map_err(failed)?,
+                    ),
+                    DistributedQueryIntent::Result => Err(failed(
+                        "generic row results require the admitted client relay owner",
+                    )),
+                    DistributedQueryIntent::Write => {
+                        let session = write_stack_session.ok_or_else(|| {
+                            DistributedQueryError::new(
+                                DistributedQueryErrorKind::ContractViolation,
+                                "distributed write execution has no connector write session",
+                            )
+                        })?;
+                        let prepared_set = prepared_write_set.take().ok_or_else(|| {
+                            DistributedQueryError::new(
+                                DistributedQueryErrorKind::ContractViolation,
+                                "distributed write lost its validated prepared set before commit",
+                            )
+                        })?;
+                        completion.write_session_outcome(session, prepared_set)
+                    }
+                    DistributedQueryIntent::Profile => {
+                        if relayed_end.is_none() {
+                            return Err(failed("CountOnly profile lost its End"));
+                        }
+                        let output_rows = root_row_count;
+                        let mut builder = ProfileTerminalBuilder::new();
+                        let graph = round.execution().graph();
+                        for info in &final_task_info.collected {
+                            // Stage to fragment to sealed fragment root: each hop is a
+                            // fact this attempt froze, so a task whose stage or
+                            // fragment cannot be resolved is a disagreement between the
+                            // graph and the plan, not a profile to publish partially.
+                            let stage_id = info.final_status().identity().stage_id();
+                            let fragment_id = graph
                         .stage(stage_id)
                         .ok_or_else(|| {
                             failed(format!(
@@ -2166,106 +2342,93 @@ impl FrontendDistributedQueryCoordinator {
                             ))
                         })?
                         .fragment_id();
-                    let root_node_id = fragment_root_plan_node_ids
-                        .get(&fragment_id)
-                        .copied()
-                        .ok_or_else(|| {
-                            failed(format!(
-                                "stage {stage_id} names fragment {fragment_id} which this \
+                            let root_node_id = fragment_root_plan_node_ids
+                                .get(&fragment_id)
+                                .copied()
+                                .ok_or_else(|| {
+                                    failed(format!(
+                                        "stage {stage_id} names fragment {fragment_id} which this \
                                  attempt's sealed submissions do not contain"
-                            ))
-                        })?;
-                    builder.apply_task_operator_statistics(info, root_node_id)?;
-                }
-                // The runtime-filter half of the profile comes from the
-                // participants' own terminal observations, not from any task's
-                // operator statistics: the row effects a filter applies are
-                // folded by the query context's participant, and a task's
-                // projection never carried them.
-                for (process_id, telemetry) in runtime_filter_contributions.contributions() {
-                    builder.apply_runtime_filter_contribution(
-                        execution_id,
-                        *process_id,
-                        telemetry,
-                    )?;
-                }
-                builder.apply_split_assignment_profile(split_assignment_profile);
-                completion.profile(output_rows, builder.finish())
-            }
-            DistributedQueryIntent::Statistics => {
-                if let Some(error) = statistics_all_success_error(&round) {
-                    return Err(error);
-                }
-                completion.statistics(
-                    internal_domain
-                        .take()
-                        .ok_or_else(|| failed("statistics lost its admitted Internal domain"))?
-                        .hand_off(|domain, _| domain.into_statistics())
-                        .map_err(failed)?,
-                )
-            }
-        })();
+                                    ))
+                                })?;
+                            builder.apply_task_operator_statistics(info, root_node_id)?;
+                        }
+                        // The runtime-filter half of the profile comes from the
+                        // participants' own terminal observations, not from any task's
+                        // operator statistics: the row effects a filter applies are
+                        // folded by the query context's participant, and a task's
+                        // projection never carried them.
+                        for (process_id, telemetry) in runtime_filter_contributions.contributions()
+                        {
+                            builder.apply_runtime_filter_contribution(
+                                execution_id,
+                                *process_id,
+                                telemetry,
+                            )?;
+                        }
+                        builder.apply_split_assignment_profile(split_assignment_profile);
+                        completion.profile(output_rows, builder.finish())
+                    }
+                    DistributedQueryIntent::Statistics => {
+                        if let Some(error) = statistics_all_success_error(&round) {
+                            return Err(error);
+                        }
+                        completion.statistics(
+                            internal_domain
+                                .take()
+                                .ok_or_else(|| {
+                                    failed("statistics lost its admitted Internal domain")
+                                })?
+                                .hand_off(|domain, _| domain.into_statistics())
+                                .map_err(failed)?,
+                        )
+                    }
+                })();
+                outcome
+            },
+        );
         if let Err(error) = &outcome {
-            let _ = self.registry.latch_failure(
-                query_id,
-                QueryFailureCause::FrontendExecution,
-                error.message().to_string(),
-            );
-            return Err(DistributedQueryError::new(error.kind(), error.message())
-                .with_engine_error_code(error.engine_error_code()));
+            let owner = native.borrow_mut();
+            if owner.accepted_failure.is_none() {
+                owner.accepted_failure = Some(error.clone().into_execution_failure_input());
+                if let Some(converged) = owner.remote_closed {
+                    owner.publish(converged);
+                }
+            }
+            if let Some(input) = error.execution_failure() {
+                let _ = self.registry.latch_execution_failure(
+                    query_id,
+                    QueryFailureCause::FrontendExecution,
+                    input.clone(),
+                );
+            } else {
+                let _ = self.registry.latch_failure(
+                    query_id,
+                    QueryFailureCause::FrontendExecution,
+                    error.message().to_owned(),
+                );
+            }
+        }
+        match closure {
+            Some(Ok(Ok(proof))) => match native.complete(proof) {
+                Ok(()) => {}
+                Err(rejected) => {
+                    tracing::error!(error = %rejected.error, "Native closure proof was refused");
+                    rejected.lease.handoff();
+                }
+            },
+            Some(Ok(Err(health))) => {
+                tracing::error!(
+                    detail = health.detail(),
+                    "Native local exit remains supervised"
+                );
+                native.handoff();
+            }
+            Some(Err(_)) | None => {
+                native.handoff();
+            }
         }
         outcome
-    }
-
-    /// Publishes this task-protocol attempt's immutable convergence evidence.
-    ///
-    /// Called once, after the drain, because that is the point at which every
-    /// participant's contribution is either in hand or will never arrive.
-    ///
-    /// What this attempt genuinely does not have is not invented here. The
-    /// task protocol mints no per-participant proof or attestation at all: a
-    /// task's terminal is its own status, which is why the retired protocol's
-    /// participant-outcome list is gone from this evidence rather than
-    /// published empty. `error_source` and `primary_error` are absent for a
-    /// different reason: this path is reached only after the attempt's answer
-    /// is already linearized as a success, and a failed attempt aborts its
-    /// contexts instead of releasing them, so it has no sealed contribution to
-    /// publish at all.
-    ///
-    fn publish_task_round_convergence(
-        &self,
-        execution_id: QueryExecutionId,
-        contributions: &ReleasedRuntimeFilterContributions,
-    ) {
-        if !self.lifecycle_diagnostics.is_enabled() {
-            return;
-        }
-        // A context whose release never answered may still have observed
-        // runtime-filter activity this frontend has not seen, so the rollup is
-        // refused rather than summed over the backends that did answer.
-        let runtime_filter = if contributions.is_complete() {
-            RuntimeFilterTerminalRollupSnapshot::Available(rollup_from_release_contributions(
-                contributions.contributions(),
-            ))
-        } else {
-            RuntimeFilterTerminalRollupSnapshot::Unavailable(
-                RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
-            )
-        };
-        tracing::debug!(
-            execution_id = ?execution_id,
-            contributions = contributions.contributions().len(),
-            contexts = contributions.contexts(),
-            complete = contributions.is_complete(),
-            "task protocol attempt published its runtime filter convergence evidence"
-        );
-        self.lifecycle_diagnostics
-            .publish(QueryLifecycleConvergenceSnapshot {
-                execution_id,
-                error_source: None,
-                primary_error: None,
-                runtime_filter,
-            });
     }
 
     /// Stands every query context of this attempt down, then classifies why it
@@ -2318,6 +2481,9 @@ impl FrontendDistributedQueryCoordinator {
         cause: QueryFailureCause,
         message: impl Into<String>,
     ) -> DistributedQueryError {
+        let input = round.execution().selected_task_failure().and_then(
+            novarocks_query_application::execution_error::ExecutionFailureInput::from_selected_task,
+        );
         let message = message.into();
         split_delivery.abandon(message.clone());
         // Released to the transport before any judgement below, and released
@@ -2332,7 +2498,10 @@ impl FrontendDistributedQueryCoordinator {
             &message,
         ) {
             Some(classified) => classified,
-            None => self.fail_and_cancel_with_cause(query_id, cause, message),
+            None => match input {
+                Some(input) => self.fail_and_cancel_with_input(query_id, cause, input),
+                None => self.fail_and_cancel_with_cause(query_id, cause, message),
+            },
         }
     }
 
@@ -2344,14 +2513,14 @@ impl FrontendDistributedQueryCoordinator {
     /// authority; this helper only performs the task-protocol cleanup.
     fn fail_latched_task_round(
         &self,
-        query_id: QueryId,
+        _query_id: QueryId,
         round: &mut TaskRound,
         split_delivery: &SplitDeliveryBridge,
-        message: String,
+        failure: LatchedQueryFailure,
     ) -> DistributedQueryError {
-        split_delivery.abandon(message.clone());
-        abort_task_round(round, &message);
-        failed(self.registry.first_failure(query_id).unwrap_or(message))
+        split_delivery.abandon(failure.message().to_owned());
+        abort_task_round(round, failure.message());
+        failure.into_execution_error()
     }
 
     fn fail_and_cancel(
@@ -2362,6 +2531,50 @@ impl FrontendDistributedQueryCoordinator {
         self.fail_and_cancel_with_cause(query_id, QueryFailureCause::FrontendExecution, message)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The terminal cut keeps exact read owners and original attempt authority together."
+    )]
+    fn fail_execution_task_round_with_root_reader(
+        &self,
+        reader: &mut Option<Arc<dyn novarocks_query_application::api::BoundedRootReadPort>>,
+        polls: &mut Option<RootResultPolls>,
+        root: TaskIdentity,
+        query_id: QueryId,
+        round: &mut TaskRound,
+        split_delivery: &SplitDeliveryBridge,
+        classification: TaskRoundFailureClassification<'_>,
+        cause: QueryFailureCause,
+        input: novarocks_query_application::execution_error::ExecutionFailureInput,
+    ) -> DistributedQueryError {
+        close_failed_root_reads(reader, polls, root);
+        split_delivery.abandon(input.detail().as_str());
+        abort_task_round(round, input.detail().as_str());
+        match judge_pre_ready_task_round_failure(
+            self.backend_topology.as_ref(),
+            classification,
+            input.detail().as_str(),
+        ) {
+            Some(classified) => classified,
+            None => self.fail_and_cancel_with_input(query_id, cause, input),
+        }
+    }
+
+    fn fail_and_cancel_with_input(
+        &self,
+        query_id: QueryId,
+        cause: QueryFailureCause,
+        input: novarocks_query_application::execution_error::ExecutionFailureInput,
+    ) -> DistributedQueryError {
+        match self
+            .registry
+            .latch_execution_failure(query_id, cause, input)
+        {
+            Ok(failure) => failure.into_execution_error(),
+            Err(error) => error,
+        }
+    }
+
     fn fail_and_cancel_with_cause(
         &self,
         query_id: QueryId,
@@ -2369,7 +2582,7 @@ impl FrontendDistributedQueryCoordinator {
         message: impl Into<String>,
     ) -> DistributedQueryError {
         match self.registry.latch_failure(query_id, cause, message) {
-            Ok(failure) => failed(failure.message().to_string()),
+            Ok(failure) => failure.into_execution_error(),
             Err(error) => error,
         }
     }
@@ -2671,6 +2884,23 @@ fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
 }
 
+/// The original foreground catch proves an execution panic here. Its raw
+/// payload remains in process supervision; this owner authors only its fixed
+/// safe execution fact, never a preparation failure inferred from text.
+fn foreground_native_execution_panic_input(
+    _health: novarocks_query_application::api::QueryExecutionError,
+) -> novarocks_query_application::execution_error::ExecutionFailureInput {
+    use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+    use novarocks_query_application::execution_error::{
+        ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+    };
+    ExecutionFailureInput::new(
+        QueryFailureReason::NativeFuturePanicked.failure_fact(),
+        SafeDetail::truncating("statement Native execution panicked"),
+        ExecutionFailureSite::Coordinator,
+    )
+}
+
 fn execution_id_for_round(
     query_id: QueryId,
     attempt: u32,
@@ -2837,8 +3067,8 @@ mod tests {
     use crate::topology::ClusterBackendService;
     use novarocks_execution::task_execution::domain::DomainVersion;
     use novarocks_execution::task_execution::{
-        AbortCause, CancelReason, MaxWait, SafeDetail, TaskFailure, TaskFailureCategory,
-        TaskIdentity, TaskState, TerminationDetail,
+        AbortCause, CancelReason, MaxWait, SafeDetail, TaskFailure, TaskIdentity, TaskState,
+        TerminationDetail,
     };
     use novarocks_execution_contract::{
         BackendProcessDescriptor, BackendReportedState, RuntimeEndpoint,
@@ -2852,6 +3082,58 @@ mod tests {
     use novarocks_types::identity::{StageId, TaskId};
     use novarocks_types::{AttemptId, QueryExecutionId};
     use novarocks_types::{BackendProcessId, ClusterRole, QueryId, QueryProcessNamespace};
+
+    #[test]
+    fn foreground_execution_panic_keeps_execution_fact_and_safe_detail_without_recovery() {
+        use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
+        use novarocks_query_application::{
+            api::{NativeAttemptTopologyRequirement, QueryExecutionError, QueryExecutionErrorKind},
+            coordination::{
+                AttemptFailureClass, ExecutionEffect, RecoveryDecision, RecoveryInput,
+                RecoveryMode, RecoveryRefusal, evaluate_recovery,
+            },
+            execution_error::{ExecutionFailureSite, QueryFailureReason},
+        };
+        let input = super::foreground_native_execution_panic_input(QueryExecutionError::new(
+            QueryExecutionErrorKind::Failed,
+            "private panic payload and storage credentials must not escape",
+        ));
+        assert_eq!(
+            input.fact(),
+            QueryFailureReason::NativeFuturePanicked.failure_fact()
+        );
+        assert_eq!(input.fact().reason().code(), 33);
+        assert_eq!(input.fact().evidence(), FailureEvidence::Originating);
+        assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+        assert_eq!(
+            input.descriptor().descriptor.phase,
+            novarocks_user_error::ErrorPhase::Execution
+        );
+        assert_eq!(
+            input.detail().as_str(),
+            "statement Native execution panicked"
+        );
+        assert_eq!(input.attempt_class(), AttemptFailureClass::ExecutionFailure);
+        assert_eq!(
+            input.topology_requirement(),
+            NativeAttemptTopologyRequirement::LiveSnapshot
+        );
+        assert_eq!(
+            evaluate_recovery(RecoveryInput {
+                mode: RecoveryMode::RestartAttemptBeforeVisibility,
+                effect: ExecutionEffect::None,
+                failure: input.attempt_class(),
+                output_visible: false,
+                attempts_started: 1,
+                max_attempts: 2,
+                deadline_reached: false,
+            }),
+            RecoveryDecision::Refuse(RecoveryRefusal::FailureClass)
+        );
+        let carried = DistributedQueryError::from_execution(input.clone());
+        assert_eq!(carried.execution_failure(), Some(&input));
+        assert_eq!(carried.into_execution_failure_input(), input);
+    }
 
     #[test]
     fn statistics_failure_preserves_every_incompatible_task_and_round_cause() {
@@ -2880,7 +3162,13 @@ mod tests {
             BackendProcessId::new_v7(),
         );
         let task_failure = TerminationDetail::Failed(TaskFailure::new(
-            TaskFailureCategory::ResourceExhausted,
+            novarocks_execution_contract::failure::FailureFact::new(
+                novarocks_execution_contract::failure::FailureClass::Resource,
+                novarocks_execution_contract::failure::FailureReason::new(
+                    std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                    std::num::NonZeroU16::new(5).unwrap(),
+                ),
+            ),
             SafeDetail::new("memory pool exhausted").expect("bounded safe detail"),
         ));
         let facts = vec![
@@ -3346,24 +3634,36 @@ mod tests {
             Box::pin(async move {
                 let result = answer.and_then(|outcome| {
                     novarocks_query_application::api::RetainedRootReply::try_new(
-                        novarocks_execution_contract::root_result::RootResultReply {
-                            root_task: request.root_task(),
-                            profile: request.profile(),
-                            kind: request.kind(),
-                            accepted_consumed: request.consumed(),
-                            outcome,
-                        },
+                        novarocks_execution_contract::root_result::RootReadResponse::Reply(
+                            novarocks_execution_contract::root_result::RootResultReply {
+                                root_task: request.root_task(),
+                                profile: request.profile(),
+                                kind: request.kind(),
+                                accepted_consumed: request.consumed(),
+                                outcome,
+                            },
+                        ),
                         window,
                         1024,
                     )
                     .map_err(|error| error.to_string())
                 });
-                result.map_err(|error| novarocks_query_application::coordination::RootResultFetchFailure::new(
-                    novarocks_query_application::coordination::AttemptFailureClass::ContractViolation,
-                    novarocks_query_application::api::QueryExecutionError::new(
-                        novarocks_query_application::api::QueryExecutionErrorKind::InvalidRequest, error,
-                    ),
-                ))
+                result.map_err(|error| {
+                    use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+                    use novarocks_query_application::execution_error::{
+                        ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+                    };
+                    tracing::debug!(error = %error, "scripted root fixture failed");
+                    novarocks_query_application::coordination::RootResultFetchFailure::from_input(
+                        ExecutionFailureInput::new(
+                            QueryFailureReason::ResultProtocol.failure_fact(),
+                            SafeDetail::truncating("scripted root result failed"),
+                            ExecutionFailureSite::RootRead {
+                                root: request.root_task(),
+                            },
+                        ),
+                    )
+                })
             })
         }
         fn seal(
@@ -3599,11 +3899,24 @@ mod tests {
             Some(RelayedRootAnswer::AwaitTerminalControl)
         ));
         super::suspend_root_result_for_terminal_control(&mut round, root, &mut polls).unwrap();
-        assert!(polls.is_none());
+        let original = polls
+            .as_mut()
+            .expect("terminal cut retains the original poll join");
+        assert!(
+            original.acknowledge(0).is_err(),
+            "the closing reader refuses new ACKs"
+        );
+        let joined = runtime.block_on(original.0.join_closed());
+        assert!(joined.is_ok() || joined.is_err_and(|error| error.is_cancelled()));
+        assert!(
+            polls.is_some(),
+            "closure is an observed join, not an absent owner"
+        );
         assert!(round.execution().result_terminal_control_required());
         assert!(!round.execution().root_end_of_stream_observed());
         assert!(!super::synchronous_root_completion_ready(&round));
         assert!(!round.root_success_sealed());
+        drop(polls);
         drop(release);
         drop(runtime);
         assert_eq!(Arc::strong_count(&transport), 1);
@@ -3686,7 +3999,13 @@ mod tests {
                 .unwrap()
                 .identity();
             let originator = TerminationDetail::Failed(TaskFailure::new(
-                TaskFailureCategory::Execution,
+                novarocks_execution_contract::failure::FailureFact::new(
+                    novarocks_execution_contract::failure::FailureClass::Data,
+                    novarocks_execution_contract::failure::FailureReason::new(
+                        std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                        std::num::NonZeroU16::new(1).unwrap(),
+                    ),
+                ),
                 SafeDetail::new("original synchronous upstream length error").unwrap(),
             ));
             for (version, state) in [
@@ -4030,6 +4349,7 @@ impl TaskRoundWaitWitness {
 /// The handoff keeps the inputs move-only: one attempt is scheduled, sealed
 /// and budgeted exactly once before its task graph becomes the lifecycle owner.
 struct RoundHandoff<'a> {
+    query_registration: ActiveQueryGuard,
     delivery: ProductionRootDelivery,
     internal_capacity: Option<QueryResultCapacityBinding>,
     subscription_scope: novarocks_workload_control::WorkScope,
@@ -4057,38 +4377,6 @@ struct RoundHandoff<'a> {
     feedback_state: Arc<RuntimeFilterFeedbackState>,
     split_assignment_plan: Option<RoundSplitAssignmentPlan>,
     scheduled_backend_ownership: Vec<(usize, BackendProcessId)>,
-}
-
-/// Hands the substrate whatever split delivery produced, then steps the runner.
-///
-/// The order is the reason this is one function: a submission recorded before
-/// the turn is released by that same turn, while one recorded after it waits a
-/// whole turn for no reason. Every submission taken is reported back, because
-/// a submission the substrate refused would otherwise keep its sender blocked
-/// until the driver's own timeout and then be resent -- a retry of a decision.
-fn advance_task_round(
-    round: &mut TaskRound,
-    split_delivery: &SplitDeliveryBridge,
-) -> Result<TurnReport, TaskExecutionError> {
-    for pending in split_delivery.take_pending() {
-        let delivery = pending.delivery();
-        let task = pending.task();
-        let admitted = round
-            .execution_mut()
-            .enqueue_task_update(task, pending.into_update());
-        let reported = match &admitted {
-            Ok(admission) => Ok(*admission),
-            Err(error) => Err(error),
-        };
-        split_delivery
-            .admit(delivery, reported)
-            .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
-        // A refused fact is the frontend's own disagreement about what this
-        // task may still be told, so it fails the attempt rather than being
-        // dropped after the sender has been told about it.
-        admitted?;
-    }
-    round.turn()
 }
 
 /// How one failure of an attempt that has not finished starting is judged.
@@ -4188,7 +4476,9 @@ fn suspend_root_result_for_terminal_control(
         .require_result_terminal_control(root)?;
     // Dropping the poller stops queued ACKs and the in-flight fetch. Its next
     // incarnation is prohibited by the same serialized owner fact.
-    *polls = None;
+    if let Some(polls) = polls.as_mut() {
+        polls.begin_close();
+    }
     Ok(())
 }
 
@@ -4252,7 +4542,9 @@ pub(super) fn close_failed_root_reads(
             tracing::error!(%error, %root, "Failed to seal terminal root reads");
         }
         // Abort requests cancellation; the future's own alias exits later.
-        drop(polls.take());
+        if let Some(polls) = polls.as_mut() {
+            polls.begin_close();
+        }
     }
 }
 
@@ -4267,6 +4559,18 @@ enum RootPollAnswer {
 }
 pub(super) struct RootResultPolls(pub(super) RelayedRootPolls);
 impl RootResultPolls {
+    pub(super) fn begin_close(&mut self) {
+        self.0.begin_close();
+    }
+    pub(super) fn poll_closed(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), &tokio::task::JoinError>> {
+        self.0.poll_closed(cx)
+    }
+    pub(super) fn join_failure(&self) -> Option<Arc<tokio::task::JoinError>> {
+        self.0.join_failure()
+    }
     fn start_for_delivery(
         delivery: &ProductionRootDelivery,
         port: Option<&Arc<dyn novarocks_query_application::api::BoundedRootReadPort>>,
@@ -4324,90 +4628,141 @@ fn observe_write_statuses(round: &TaskRound, tracker: &mut WriteCompletionTracke
 /// `TaskStatus` alone, so a task that cannot answer costs diagnostics and
 /// nothing else. That is why a failed read is logged and skipped rather than
 /// failing a query that already completed.
-struct FinalTaskInfoCollector<'a> {
-    transport: &'a dyn TaskResultTransport,
-    collected: Vec<FinalTaskInfo>,
-    read: BTreeSet<TaskId>,
+pub(super) struct FinalTaskInfoCollector {
+    transport: Arc<dyn TaskResultTransport>,
+    pub(super) collected: Vec<FinalTaskInfo>,
+    unread: VecDeque<TaskIdentity>,
+    pending: Option<FinalTaskInfoReadJob>,
     enabled: bool,
+    accepting: bool,
+    wake: Arc<CondvarWake>,
+    runtime: FrontendDataRuntime,
 }
-
-impl<'a> FinalTaskInfoCollector<'a> {
-    /// Collects nothing unless this attempt's intent asked for a profile.
-    ///
-    /// Final info is one extra round trip per task, and only `EXPLAIN ANALYZE`
-    /// has anything to do with it.
-    const fn new(transport: &'a dyn TaskResultTransport, enabled: bool) -> Self {
+struct FinalTaskInfoReadJob {
+    observed: novarocks_execution_contract::TaskStatus,
+    future: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<FinalTaskInfoRead, String>> + Send>,
+    >,
+}
+impl FinalTaskInfoCollector {
+    fn new(
+        transport: Arc<dyn TaskResultTransport>,
+        enabled: bool,
+        round: &TaskRound,
+        wake: Arc<CondvarWake>,
+        runtime: FrontendDataRuntime,
+    ) -> Self {
         Self {
             transport,
             collected: Vec::new(),
-            read: BTreeSet::new(),
+            unread: if enabled {
+                round
+                    .execution()
+                    .graph()
+                    .tasks()
+                    .map(TaskNode::identity)
+                    .collect()
+            } else {
+                VecDeque::new()
+            },
+            pending: None,
             enabled,
+            accepting: true,
+            wake,
+            runtime,
         }
     }
-
-    /// Reads the final info of every task that has just become terminal.
-    ///
-    /// Called on each turn rather than once at the end because releasing a
-    /// query context is what lets a backend reclaim its retained terminal
-    /// records: a sweep after the drain would find exactly the tasks whose
-    /// info it wanted already gone.
-    ///
-    /// Losing one costs diagnostics and nothing else -- success and failure
-    /// are decided by `TaskStatus` alone -- so a failed read is reported and
-    /// skipped rather than failing a query that already ran.
+    /// Poll once on the original role runtime when the synchronous statement
+    /// worker drives. The same async RPC future stays in this collector.
     fn observe(&mut self, round: &TaskRound) {
         if !self.enabled {
             return;
         }
-        for stage in round.execution().graph().stages() {
-            let Some(execution_stage) = round.execution().stage(stage.stage_id()) else {
-                continue;
-            };
-            for (task_id, task) in execution_stage.tasks() {
-                if !task.is_terminal() || self.read.contains(task_id) {
-                    continue;
+        let runtime = self.runtime.clone();
+        let wake = Arc::clone(&self.wake);
+        let _ = runtime.block_on(std::future::poll_fn(|_| {
+            let waker = std::task::Waker::from(Arc::clone(&wake));
+            let mut cx = std::task::Context::from_waker(&waker);
+            self.poll_observe(round, &mut cx);
+            std::task::Poll::Ready(())
+        }));
+    }
+    pub(super) fn stop_starting(&mut self) {
+        self.accepting = false;
+    }
+    pub(super) fn is_closed(&self) -> bool {
+        self.pending.is_none()
+    }
+    pub(super) fn all_terminal_observed(&self) -> bool {
+        // Only the exact frozen Tasks whose terminal was observed can leave
+        // this frontier. Disabled diagnostics do not manufacture that proof.
+        self.enabled && self.unread.is_empty() && self.pending.is_none()
+    }
+    /// At most one bounded final-info read is in flight. Starting it records
+    /// its exact observed Task and original transport in self before Pending.
+    pub(super) fn poll_observe(&mut self, round: &TaskRound, cx: &mut std::task::Context<'_>) {
+        use std::task::Poll;
+        if !self.enabled {
+            return;
+        }
+        if self.pending.is_none() && self.accepting {
+            // Inspect at most the original unread frontier once this turn.
+            // Already-observed Tasks never re-enter the search prefix.
+            let mut next = None;
+            for _ in 0..self.unread.len() {
+                let identity = self.unread.pop_front().expect("unread frontier item");
+                let observed = round.execution().task(identity.task_id()).and_then(|task| {
+                    (task.identity() == identity && task.is_terminal())
+                        .then(|| task.status().cloned())
+                        .flatten()
+                });
+                if let Some(observed) = observed {
+                    next = Some(observed);
+                    break;
                 }
-                let Some(observed) = task.status() else {
-                    continue;
-                };
-                self.read.insert(*task_id);
-                match self.transport.final_task_info(task.identity()) {
-                    Ok(FinalTaskInfoRead::Available(info)) => {
-                        // A final info that contradicts the terminal already
-                        // observed is a protocol conflict, not a profile: two
-                        // answers would exist to a question with one answer.
-                        match accept_final_info(observed, &info) {
-                            Ok(()) => self.collected.push(info),
-                            Err(error) => tracing::warn!(
-                                task = %task.identity(),
-                                error = %error,
-                                "final task info disagrees with the observed terminal; \
-                                 it is dropped from the profile"
-                            ),
-                        }
-                    }
-                    Ok(FinalTaskInfoRead::Unavailable(outcome)) => tracing::debug!(
-                        task = %task.identity(),
-                        outcome = ?outcome,
-                        "final task info is unavailable"
-                    ),
-                    Err(error) => tracing::warn!(
-                        task = %task.identity(),
-                        error = %error,
-                        "final task info could not be read"
-                    ),
-                }
+                self.unread.push_back(identity);
             }
+            if let Some(observed) = next {
+                let identity = observed.identity();
+                let transport = Arc::clone(&self.transport);
+                self.pending = Some(FinalTaskInfoReadJob {
+                    observed,
+                    future: Box::pin(async move { transport.final_task_info(identity).await }),
+                });
+            }
+        }
+        let Some(job) = self.pending.as_mut() else {
+            return;
+        };
+        let result = match job.future.as_mut().poll(cx) {
+            Poll::Pending => return,
+            Poll::Ready(result) => result,
+        };
+        let job = self.pending.take().expect("same original final-info read");
+        let identity = job.observed.identity();
+        match result {
+            Ok(FinalTaskInfoRead::Available(info)) => match accept_final_info(&job.observed, &info)
+            {
+                Ok(()) => self.collected.push(info),
+                Err(error) => {
+                    tracing::warn!(task = %identity, %error, "Final task info disagrees with the observed terminal")
+                }
+            },
+            Ok(FinalTaskInfoRead::Unavailable(outcome)) => {
+                tracing::debug!(task = %identity, ?outcome, "Final task info is unavailable")
+            }
+            Err(error) => {
+                tracing::warn!(task = %identity, %error, "Final task info could not be read")
+            }
+        }
+        if self.accepting && !self.unread.is_empty() {
+            // The original waiter may have consumed the RPC wake before this
+            // Ready poll. Continue serial collection without a timer turn.
+            self.wake.wake();
         }
     }
 }
 
-/// Keeps turning until every task terminated and every context was released.
-///
-/// Bounded by the statement's own deadline. A drain that does not finish
-/// inside it is reported and left to the query execution lease, which is the
-/// mechanism that exists for exactly this: it never fails a completion that
-/// has already been linearized.
 /// When a drain gives up, whichever of its own budget and the statement's
 /// deadline runs out first.
 ///
@@ -4417,74 +4772,6 @@ impl<'a> FinalTaskInfoCollector<'a> {
 /// remainder of a long statement timeout with a finished result in hand.
 fn drain_deadline(statement_deadline: Instant, drain_budget: Duration, now: Instant) -> Instant {
     statement_deadline.min(now + drain_budget)
-}
-
-fn drain_task_round(
-    round: &mut TaskRound,
-    split_delivery: &SplitDeliveryBridge,
-    wake: &CondvarWake,
-    split_assignment: Option<&SplitAssignmentRoundGuard>,
-    statement_deadline: Instant,
-    drain_budget: Duration,
-    execution_id: QueryExecutionId,
-    final_task_info: &mut FinalTaskInfoCollector<'_>,
-    profile_waits_for_terminals: bool,
-) {
-    // The drain gets a budget of its own rather than the statement's. The
-    // client-visible answer is already linearized, so every moment spent here
-    // is a moment the client waits for a result it could already have had: a
-    // query that finished in a second against one stuck backend must not hold
-    // its caller for the rest of a five-minute statement timeout.
-    //
-    // The bound is the transport's own queue-residence budget, not a number
-    // invented here. That is how long a released operation may sit before the
-    // transport itself calls it lost, so a release still unanswered after it
-    // is not going to be answered. The statement deadline still caps it: a
-    // statement already past its deadline has no time left to lend.
-    let deadline = drain_deadline(statement_deadline, drain_budget, Instant::now());
-    let mut profile_waits_for_terminals = profile_waits_for_terminals;
-    loop {
-        if profile_waits_for_terminals
-            && round.execution().attempt_drain_facts().all_tasks_terminal()
-        {
-            // Release can reclaim retained terminal records, so read every
-            // final info before Quiesce can make Release eligible.
-            final_task_info.observe(round);
-            round.begin_normal_drain();
-            profile_waits_for_terminals = false;
-        }
-        let split_worker_stopped =
-            split_assignment.is_none_or(SplitAssignmentRoundGuard::is_finished);
-        if round.attempt_drained() && split_worker_stopped {
-            return;
-        }
-        if Instant::now() >= deadline {
-            let facts = round.execution().attempt_drain_facts();
-            tracing::warn!(
-                execution_id = ?execution_id,
-                tasks_terminal = facts.all_tasks_terminal(),
-                output_released = facts.all_output_released(),
-                contexts_released = facts.all_contexts_released(),
-                split_worker_stopped,
-                "attempt did not finish draining inside its drain budget; \
-                 the query execution lease closes what is left"
-            );
-            return;
-        }
-        if let Err(error) = advance_task_round(round, split_delivery) {
-            tracing::warn!(
-                execution_id = ?execution_id,
-                error = %error,
-                "attempt could not be drained after its client-visible completion"
-            );
-            return;
-        }
-        // Each task's final info is read here, while its context still exists:
-        // releasing the context is what lets its backend reclaim the retained
-        // terminal record this reads.
-        final_task_info.observe(round);
-        wake.wait(TASK_ROUND_IDLE_WAIT);
-    }
 }
 
 /// Stands every query context of a failed attempt down.
@@ -4512,5 +4799,339 @@ fn abort_task_round(round: &mut TaskRound, reason: &str) {
                 "query context could not be aborted after the attempt failed"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod final_task_info_exit_tests {
+    use futures::future::BoxFuture;
+    use std::collections::VecDeque;
+    use std::future::poll_fn;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
+
+    use super::FinalTaskInfoCollector;
+    use crate::native::data_runtime::FrontendDataRuntime;
+    use crate::native::fragment_transport::{
+        DynamicFilterRead, DynamicFilterReadError, FinalTaskInfoRead, TaskResultTransport,
+    };
+    use crate::task_execution::intent::{AckPayload, OperationAcknowledgement, OperationIntent};
+    use crate::task_execution::status_intake::CondvarWake;
+    use novarocks_execution_contract::{
+        DomainVersion, OperationKind, OperationOutcome, QueryContextReceipt, QueryContextState,
+        ReleaseOutcome, TaskIdentity,
+    };
+
+    #[derive(Default)]
+    struct FinalReadProbe {
+        started: Mutex<Vec<TaskIdentity>>,
+        completed: Mutex<Vec<TaskIdentity>>,
+        dropped: Mutex<Vec<TaskIdentity>>,
+    }
+    struct FinalReadDrop {
+        identity: TaskIdentity,
+        probe: Arc<FinalReadProbe>,
+    }
+    impl Drop for FinalReadDrop {
+        fn drop(&mut self) {
+            self.probe.dropped.lock().unwrap().push(self.identity);
+        }
+    }
+
+    struct GatedFinalInfo {
+        release: Mutex<VecDeque<tokio::sync::oneshot::Receiver<()>>>,
+        probe: Arc<FinalReadProbe>,
+    }
+    impl TaskResultTransport for GatedFinalInfo {
+        fn final_task_info(
+            &self,
+            identity: TaskIdentity,
+        ) -> BoxFuture<'_, Result<FinalTaskInfoRead, String>> {
+            // Taking the one actual receiver detects a duplicate read even if
+            // a previous borrowed wait was cancelled and rebuilt.
+            let release = self
+                .release
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("one receiver for each original read");
+            self.probe.started.lock().unwrap().push(identity);
+            let actual_drop = FinalReadDrop {
+                identity,
+                probe: Arc::clone(&self.probe),
+            };
+            Box::pin(async move {
+                let _actual_drop = actual_drop;
+                release
+                    .await
+                    .map_err(|_| "the fixture release gate closed".to_owned())?;
+                self.probe.completed.lock().unwrap().push(identity);
+                // Missing optional diagnostics must not be fabricated as a
+                // complete final-info value for this or any unread Task.
+                Ok(FinalTaskInfoRead::Unavailable(OperationOutcome::Gone))
+            })
+        }
+        fn dynamic_filters(
+            &self,
+            _: TaskIdentity,
+            _: Option<DomainVersion>,
+        ) -> Result<DynamicFilterRead, DynamicFilterReadError> {
+            panic!("a final-info collector must not fetch dynamic filters")
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_final_info_survives_borrowed_wait_cancel_and_stop_starting_until_same_future_drops()
+     {
+        let (mut round, acks, release) =
+            crate::task_execution::tests::manifest_normal_release_ack_regression_fixture();
+        let terminal_identities = round
+            .execution()
+            .graph()
+            .stages()
+            .flat_map(|stage| {
+                round
+                    .execution()
+                    .stage(stage.stage_id())
+                    .unwrap()
+                    .tasks()
+                    .map(|(_, task)| {
+                        assert!(
+                            task.is_terminal(),
+                            "the original fixture already observed terminal Tasks"
+                        );
+                        task.identity()
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            terminal_identities.len() > 1,
+            "the original fixture must leave an unread sibling"
+        );
+        assert!(
+            !round.attempt_drained(),
+            "the original Release ACK has not arrived"
+        );
+        let original_cause = round.failure_cause().cloned();
+        let (release_read, read_gate) = tokio::sync::oneshot::channel();
+        let probe = Arc::new(FinalReadProbe::default());
+        let transport: Arc<dyn TaskResultTransport> = Arc::new(GatedFinalInfo {
+            release: Mutex::new(VecDeque::from([read_gate])),
+            probe: Arc::clone(&probe),
+        });
+        // Reuse the current test runtime and the existing role-runtime fixture.
+        // No custom task, server, thread, WorkOwner or deadline is created.
+        let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let mut collector = FinalTaskInfoCollector::new(
+            transport,
+            true,
+            &round,
+            Arc::new(CondvarWake::default()),
+            runtime,
+        );
+        let mut wait = Box::pin(poll_fn(|cx| {
+            collector.poll_observe(&round, cx);
+            if collector.is_closed() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }));
+        // This is an actual Pending poll of the same original oneshot read.
+        // No elapsed timeout is used as a stand-in for a cleanup receipt.
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+        drop(wait);
+        let started = probe.started.lock().unwrap().clone();
+        assert_eq!(started.len(), 1);
+        assert!(terminal_identities.contains(&started[0]));
+        assert!(probe.completed.lock().unwrap().is_empty());
+        assert!(
+            probe.dropped.lock().unwrap().is_empty(),
+            "dropping a borrowing wait must retain the read"
+        );
+        assert!(!collector.is_closed());
+        assert!(!collector.all_terminal_observed());
+
+        collector.stop_starting();
+        let mut stopped_wait = Box::pin(poll_fn(|cx| {
+            collector.poll_observe(&round, cx);
+            if collector.is_closed() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }));
+        assert!(futures::poll!(stopped_wait.as_mut()).is_pending());
+        drop(stopped_wait);
+        assert_eq!(*probe.started.lock().unwrap(), started);
+        assert!(
+            probe.dropped.lock().unwrap().is_empty(),
+            "stop_starting must not drop an already issued read"
+        );
+        assert!(!collector.is_closed());
+
+        release_read.send(()).unwrap();
+        poll_fn(|cx| {
+            collector.poll_observe(&round, cx);
+            if collector.is_closed() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        // Further real turns cannot issue a new read after the stop cut.
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..3 {
+            collector.poll_observe(&round, &mut cx);
+        }
+        let completed = probe.completed.lock().unwrap().clone();
+        let dropped = probe.dropped.lock().unwrap().clone();
+        let remaining_started = probe.started.lock().unwrap().clone();
+        let closed = collector.is_closed();
+        let partial_not_complete = !collector.all_terminal_observed();
+        let no_fabricated_info = collector.collected.is_empty();
+        let original_cause_preserved = round.failure_cause() == original_cause.as_ref();
+
+        // Settle the same fixture's ORIGINAL Release, rather than dropping its
+        // TaskRound and treating that as remote convergence.
+        let OperationIntent::ReleaseQueryContext(request) = &release else {
+            unreachable!("the original fixture selected its Release by kind")
+        };
+        acks.publish(OperationAcknowledgement::new(
+            release.operation_id(),
+            OperationKind::ReleaseQueryContext,
+            OperationOutcome::Accepted,
+            AckPayload::Release {
+                receipt: QueryContextReceipt::new(
+                    request.context(),
+                    QueryContextState::TerminalRetained,
+                ),
+                outcome: ReleaseOutcome::Released,
+                runtime_filter: None,
+            },
+        ));
+        round.turn().expect("the original Release ACK settles");
+        assert!(round.attempt_drained());
+        assert_eq!(
+            remaining_started, started,
+            "no unread sibling was newly dispatched"
+        );
+        assert_eq!(
+            completed, started,
+            "the originally issued read actually completed"
+        );
+        assert_eq!(
+            dropped, started,
+            "that same original future actually dropped once"
+        );
+        assert!(closed);
+        assert!(
+            partial_not_complete,
+            "one optional missing result cannot prove every Task was observed"
+        );
+        assert!(no_fabricated_info);
+        assert!(original_cause_preserved);
+    }
+
+    #[tokio::test]
+    async fn terminal_frontier_reads_each_original_task_once_and_wakes_each_ready_successor() {
+        use std::future::Future;
+        let (mut round, acks, release) =
+            crate::task_execution::tests::manifest_normal_release_ack_regression_fixture();
+        let identities = round
+            .execution()
+            .graph()
+            .tasks()
+            .map(|task| task.identity())
+            .collect::<Vec<_>>();
+        assert!(identities.len() > 1);
+        assert!(identities.iter().all(|identity| {
+            round
+                .execution()
+                .task(identity.task_id())
+                .unwrap()
+                .is_terminal()
+        }));
+        let mut releases = VecDeque::new();
+        let mut gates = VecDeque::new();
+        for _ in &identities {
+            let (release, gate) = tokio::sync::oneshot::channel();
+            releases.push_back(release);
+            gates.push_back(gate);
+        }
+        let probe = Arc::new(FinalReadProbe::default());
+        let transport: Arc<dyn TaskResultTransport> = Arc::new(GatedFinalInfo {
+            release: Mutex::new(gates),
+            probe: Arc::clone(&probe),
+        });
+        let wake = Arc::new(CondvarWake::default());
+        let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let mut collector = FinalTaskInfoCollector::new(
+            Arc::clone(&transport),
+            true,
+            &round,
+            Arc::clone(&wake),
+            runtime.clone(),
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        for (index, identity) in identities.iter().enumerate() {
+            collector.poll_observe(&round, &mut cx);
+            assert_eq!(*probe.started.lock().unwrap(), identities[..=index]);
+            assert_eq!(*probe.completed.lock().unwrap(), identities[..index]);
+            assert_eq!(collector.unread.len(), identities.len() - index - 1);
+            assert!(!collector.is_closed());
+            assert!(!collector.all_terminal_observed());
+            // This one actual read stays pending across repeated turns and
+            // cannot start the next read or consume another receiver.
+            collector.poll_observe(&round, &mut cx);
+            assert_eq!(probe.started.lock().unwrap().last(), Some(identity));
+            assert_eq!(probe.started.lock().unwrap().len(), index + 1);
+            let notified = wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            releases.pop_front().unwrap().send(()).unwrap();
+            collector.poll_observe(&round, &mut cx);
+            let successor_woken =
+                poll_fn(|cx| Poll::Ready(notified.as_mut().poll(cx).is_ready())).await;
+            assert_eq!(successor_woken, index + 1 < identities.len());
+            assert_eq!(*probe.completed.lock().unwrap(), identities[..=index]);
+            assert_eq!(*probe.dropped.lock().unwrap(), identities[..=index]);
+            assert!(collector.is_closed());
+        }
+        assert!(collector.all_terminal_observed());
+        assert!(
+            collector.collected.is_empty(),
+            "Unavailable is never fabricated as Available"
+        );
+        collector.poll_observe(&round, &mut cx);
+        assert_eq!(*probe.started.lock().unwrap(), identities);
+        let mut disabled = FinalTaskInfoCollector::new(transport, false, &round, wake, runtime);
+        disabled.poll_observe(&round, &mut cx);
+        assert_eq!(
+            disabled.unread.capacity(),
+            0,
+            "non-profile attempts allocate no task frontier"
+        );
+        assert!(!disabled.all_terminal_observed());
+        assert_eq!(*probe.started.lock().unwrap(), identities);
+        let OperationIntent::ReleaseQueryContext(request) = &release else {
+            unreachable!()
+        };
+        acks.publish(OperationAcknowledgement::new(
+            release.operation_id(),
+            OperationKind::ReleaseQueryContext,
+            OperationOutcome::Accepted,
+            AckPayload::Release {
+                receipt: QueryContextReceipt::new(
+                    request.context(),
+                    QueryContextState::TerminalRetained,
+                ),
+                outcome: ReleaseOutcome::Released,
+                runtime_filter: None,
+            },
+        ));
+        round.turn().expect("the same original Release ACK settles");
+        assert!(round.attempt_drained());
     }
 }

@@ -45,7 +45,7 @@ impl PureCompileControl for Control {
         assert!(units <= 256);
         let mut trace = self.trace.lock().unwrap();
         trace.push(units);
-        if let Some((error, stop)) = self.refusal {
+        if let Some((error, stop)) = self.refusal.clone() {
             let refuse = match stop {
                 Stop::Entry => trace.len() == 1,
                 Stop::Quantum => units == 256,
@@ -182,7 +182,7 @@ fn write(name: &str) -> ConnectorWriteRecipeDraft {
     )
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 enum Behavior {
     #[default]
     Normal,
@@ -222,7 +222,7 @@ impl Port {
         CompileCheckpoints::try_new(control, CompilePhase::ProviderValidation).map_err(Into::into)
     }
     fn refusal(&self) -> Result<(), PureProviderCompileError<ConnectorError>> {
-        match self.behavior {
+        match self.behavior.clone() {
             Behavior::Provider(kind) => Err(PureProviderCompileError::Provider(
                 ConnectorError::new(kind, "private refusal"),
             )),
@@ -588,7 +588,7 @@ fn original_control_failures_remain_typed_at_registration_entry_and_private_quan
         let port = Port::new("alpha", Behavior::Normal);
         let owner = Control {
             trace: Mutex::default(),
-            refusal: Some((error, Stop::Entry)),
+            refusal: Some((error.clone(), Stop::Entry)),
         };
         assert!(
             matches!(PureProviderProgramCatalog::try_new(&[PureProviderManifestEntry::new(id("alpha"), true, true)],
@@ -598,7 +598,7 @@ fn original_control_failures_remain_typed_at_registration_entry_and_private_quan
         for write_call in [false, true] {
             let owner = Control {
                 trace: Mutex::default(),
-                refusal: Some((error, Stop::Entry)),
+                refusal: Some((error.clone(), Stop::Entry)),
             };
             let result = if write_call {
                 catalog.compile_write(&write("alpha"), &owner).map(|_| ())
@@ -615,7 +615,7 @@ fn original_control_failures_remain_typed_at_registration_entry_and_private_quan
         assert_eq!(port.writes.load(Ordering::Relaxed), 0);
         let owner = Control {
             trace: Mutex::default(),
-            refusal: Some((error, Stop::Quantum)),
+            refusal: Some((error.clone(), Stop::Quantum)),
         };
         assert!(
             matches!(catalog.compile_read(&frozen_read("alpha", 320), &owner), Err(PureProviderProgramError::Control(cause)) if cause == error)
@@ -655,7 +655,7 @@ fn ordinary_provider_and_catalog_errors_observe_tail_without_erasing_control() {
         for cause in errors() {
             let owner = Control {
                 trace: Mutex::default(),
-                refusal: Some((cause, Stop::Call(trace.len()))),
+                refusal: Some((cause.clone(), Stop::Call(trace.len()))),
             };
             let result = if write_call {
                 catalog.compile_write(&write("alpha"), &owner).map(|_| ())
@@ -679,7 +679,7 @@ fn ordinary_provider_and_catalog_errors_observe_tail_without_erasing_control() {
     for cause in errors() {
         let owner = Control {
             trace: Mutex::default(),
-            refusal: Some((cause, Stop::Call(count))),
+            refusal: Some((cause.clone(), Stop::Call(count))),
         };
         assert!(
             matches!(catalog.compile_read(&frozen_read("missing", 1), &owner), Err(PureProviderProgramError::Control(error)) if error == cause)
@@ -708,7 +708,7 @@ fn provider_contract_resource_and_primary_control_failures_keep_distinct_owners(
         Err(PureProviderProgramError::Contract(error)) if error.kind() == ConnectorErrorKind::ResourceExhausted)
     );
     for cause in errors() {
-        let port = Port::new("alpha", Behavior::Control(cause));
+        let port = Port::new("alpha", Behavior::Control(cause.clone()));
         let catalog = catalogue(&port, true, true);
         assert!(
             matches!(catalog.compile_read(&frozen_read("alpha", 1), &Control::default()), Err(PureProviderProgramError::Control(error)) if error == cause)

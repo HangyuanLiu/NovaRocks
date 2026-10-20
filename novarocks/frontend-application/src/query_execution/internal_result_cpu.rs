@@ -22,9 +22,13 @@
 use std::num::NonZeroUsize;
 use std::time::Instant;
 
-use novarocks_query_application::cancellation::QueryCancellationView;
+use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
 use novarocks_query_application::cpu::{
     QueryBlockingExecutor, QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
+};
+use novarocks_query_application::{
+    cancellation::{QueryCancellationReason, QueryCancellationView},
+    execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason},
 };
 use novarocks_workload_control::{
     ResultCapacityConfig, ResultWindowAlias, ResultWindowClass, WorkScope,
@@ -227,15 +231,104 @@ impl<T> InternalResultValue<T> {
     }
 }
 
+fn cpu_execution_failure(detail: &'static str) -> ExecutionFailureInput {
+    ExecutionFailureInput::new(
+        QueryFailureReason::LogicalFailureUnspecified.failure_fact(),
+        SafeDetail::truncating(detail),
+        ExecutionFailureSite::Coordinator,
+    )
+}
+
+fn cpu_cancellation_failure(reason: QueryCancellationReason) -> ExecutionFailureInput {
+    let reason = match reason {
+        QueryCancellationReason::DeadlineExceeded { .. }
+        | QueryCancellationReason::FrontendDrainDeadlineExceeded { .. } => {
+            QueryFailureReason::DeadlineExceeded
+        }
+        _ => QueryFailureReason::Cancelled,
+    };
+    ExecutionFailureInput::new(
+        reason.failure_fact(),
+        SafeDetail::truncating("internal result CPU was stopped by its statement control owner"),
+        ExecutionFailureSite::Coordinator,
+    )
+}
+
 /// At most one result-codec job per serial root consumer. Its forwarder owns
-/// the bounded receipt; Drop cancels that waiter, never a running CPU closure.
+/// the bounded receipt. Closing its waiter never cancels a running CPU closure:
+/// the same forwarder still awaits its receipt and retires unclaimed output.
 /// An unclaimed output contains the same window until its actual destruction.
 pub(crate) struct InternalResultCpuJob<T> {
-    completion: oneshot::Receiver<Result<InternalResultValue<T>, String>>,
-    forwarder: tokio::task::JoinHandle<()>,
+    completion: oneshot::Receiver<Result<InternalResultValue<T>, ExecutionFailureInput>>,
+    forwarder: Option<tokio::task::JoinHandle<()>>,
+    closing: bool,
+    closed: Option<Result<(), Arc<tokio::task::JoinError>>>,
 }
 impl<T> InternalResultCpuJob<T> {
-    pub(crate) fn try_take(&mut self) -> Option<Result<InternalResultValue<T>, String>> {
+    /// Refuse further result delivery. Sender::closed wakes the same original
+    /// forwarder, which continues awaiting the already-owned CPU receipt.
+    pub(crate) fn begin_close(&mut self) {
+        self.closing = true;
+        self.completion.close();
+        if let Ok(unclaimed) = self.completion.try_recv() {
+            drop(unclaimed);
+        }
+    }
+
+    pub(crate) fn poll_closed(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), &tokio::task::JoinError>> {
+        use std::{future::Future, pin::Pin, task::Poll};
+        self.begin_close();
+        if self.closed.is_none() {
+            let result = std::task::ready!(
+                Pin::new(
+                    self.forwarder
+                        .as_mut()
+                        .expect("original CPU forwarder join")
+                )
+                .poll(cx)
+            );
+            self.closed = Some(result.map_err(Arc::new));
+            self.forwarder.take();
+        }
+        self.begin_close();
+        Poll::Ready(
+            self.closed
+                .as_ref()
+                .expect("CPU forwarder joined")
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| error.as_ref()),
+        )
+    }
+
+    /// Shares the same original join error with health custody. The task's
+    /// result was moved into this Arc once; no failure is reconstructed.
+    pub(crate) fn join_failure(&self) -> Option<Arc<tokio::task::JoinError>> {
+        self.closed
+            .as_ref()
+            .and_then(|result| result.as_ref().err())
+            .map(Arc::clone)
+    }
+
+    pub(crate) async fn join_closed(&mut self) -> Result<(), &tokio::task::JoinError> {
+        std::future::poll_fn(|cx| self.poll_closed(cx).map(|_| ())).await;
+        self.closed
+            .as_ref()
+            .expect("CPU forwarder joined")
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| error.as_ref())
+    }
+
+    pub(crate) fn try_take(
+        &mut self,
+    ) -> Option<Result<InternalResultValue<T>, ExecutionFailureInput>> {
+        if self.closing {
+            return None;
+        }
         match self.completion.try_recv() {
             Ok(mut value) => {
                 // A claimed receipt proves CPU execution has exited. The
@@ -246,15 +339,17 @@ impl<T> InternalResultCpuJob<T> {
                 Some(value)
             }
             Err(oneshot::error::TryRecvError::Empty) => None,
-            Err(oneshot::error::TryRecvError::Closed) => Some(Err(
-                "internal result CPU forwarder exited without its outcome".into(),
-            )),
+            Err(oneshot::error::TryRecvError::Closed) => Some(Err(cpu_execution_failure(
+                "internal result CPU forwarder exited without its outcome",
+            ))),
         }
     }
 }
 impl<T> Drop for InternalResultCpuJob<T> {
     fn drop(&mut self) {
-        self.forwarder.abort();
+        // Detached fallback is not exit proof. A Native aggregate retaining
+        // this job uses the original join and result activity independently.
+        self.begin_close();
     }
 }
 
@@ -273,32 +368,48 @@ impl InternalResultCpu {
         F: FnOnce(I, &ResultWindowAlias) -> O + Send + 'static,
     {
         let executor = self.executor.clone();
-        let (completed, completion) = oneshot::channel();
+        let (mut completed, completion) = oneshot::channel();
         let forwarder = data_runtime.spawn(async move {
             let worker_cancellation = cancellation.clone();
             let work = executor.execute(move || {
-                if worker_cancellation.is_cancelled() {
+                if let Some(reason) = worker_cancellation.reason() {
                     // input and its physical alias exit here, on the worker.
-                    return Err("internal result CPU cancelled before execution".to_owned());
+                    return Err(cpu_cancellation_failure(reason));
                 }
                 Ok(input.transform(apply))
             });
             tokio::pin!(work);
-            let outcome = tokio::select! {
+            let early_error = tokio::select! {
                 biased;
-                _ = cancellation.cancelled() => Err("internal result CPU waiter cancelled".into()),
-                result = &mut work => result.and_then(|result| result),
+                reason = cancellation.cancelled() => cpu_cancellation_failure(reason),
+                _ = completed.closed() => cpu_execution_failure("internal result CPU consumer closed"),
+                result = &mut work => {
+                    // An unclaimed success still owns its input/output and
+                    // original allowance until it is actually destroyed.
+                    if let Err(unclaimed) = completed.send(result.map_err(|error| {
+                        tracing::debug!(%error, "Internal result CPU executor failed");
+                        cpu_execution_failure("internal result CPU executor failed")
+                    }).and_then(|result| result)) {
+                        drop(unclaimed);
+                    }
+                    wake.wake();
+                    return;
+                }
             };
-            // If the serial consumer has exited, send returns the still-owned
-            // result. Drop it before publishing the forwarder's actual exit.
-            if let Err(unclaimed) = completed.send(outcome) {
+            if let Err(unclaimed) = completed.send(Err(early_error)) {
                 drop(unclaimed);
             }
+            wake.wake();
+            // Cancellation above is only an early result. Never drop this
+            // executor future before its original receipt resolves.
+            drop(work.await);
             wake.wake();
         });
         InternalResultCpuJob {
             completion,
-            forwarder,
+            forwarder: Some(forwarder),
+            closing: false,
+            closed: None,
         }
     }
 }
@@ -376,7 +487,9 @@ mod tests {
         (control, capacity)
     }
 
-    async fn take<T>(job: &mut InternalResultCpuJob<T>) -> Result<InternalResultValue<T>, String> {
+    async fn take<T>(
+        job: &mut InternalResultCpuJob<T>,
+    ) -> Result<InternalResultValue<T>, ExecutionFailureInput> {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(value) = job.try_take() {
@@ -659,8 +772,181 @@ mod tests {
             .shutdown_until(Instant::now() + Duration::from_secs(5))
             .await
             .unwrap();
-        exited.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The original forwarder retires the worker receipt on this runtime.
+        // Waiting for its activity fence must leave that runtime able to poll it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match exited.try_recv() {
+                    Ok(()) => break,
+                    Err(mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        panic!("result activity fence exited without its observation")
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
         fence.join().unwrap();
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+}
+
+#[cfg(test)]
+mod actual_close_tests {
+    use super::*;
+    use novarocks_query_application::cancellation::{
+        QueryCancellationReason, QueryCancellationSource,
+    };
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+        time::Duration,
+    };
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn early_cancel_and_explicit_close_keep_original_cpu_join_until_payload_exit() {
+        close_case(None).await;
+        for reason in [
+            QueryCancellationReason::ExplicitKill {
+                requester_connection_id: 1,
+            },
+            QueryCancellationReason::DeadlineExceeded { timeout_ms: 91 },
+            QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms: 92 },
+        ] {
+            close_case(Some(reason)).await;
+        }
+    }
+
+    async fn close_case(cancel: Option<QueryCancellationReason>) {
+        let explicit_close = cancel.is_none();
+        let expected_reason = match &cancel {
+            Some(
+                QueryCancellationReason::DeadlineExceeded { .. }
+                | QueryCancellationReason::FrontendDrainDeadlineExceeded { .. },
+            ) => QueryFailureReason::DeadlineExceeded,
+            _ => QueryFailureReason::Cancelled,
+        };
+        struct Payload(Arc<AtomicBool>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let (_control, root, binding, capacity) = admitted_internal_fixture();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let input =
+            InternalResultValue::try_produce(binding.scope(), binding.window_alias(), |_| {
+                Ok(Payload(Arc::clone(&dropped)))
+            })
+            .unwrap()
+            .track_actual_exit(&binding)
+            .unwrap();
+        let mut owner = InternalResultCpuOwner::try_new().unwrap();
+        let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let (entered, started) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let cancellation = QueryCancellationSource::new();
+        let mut job = owner.runtime().submit(
+            input,
+            cancellation.view(),
+            &runtime,
+            Arc::new(crate::task_execution::status_intake::CondvarWake::default()),
+            move |input, _| {
+                entered.send(()).unwrap();
+                let _ = blocked.recv();
+                input
+            },
+        );
+        root.owner.complete();
+        root.business.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while started.try_recv().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // This is the real loop race: its control observation was still clear,
+        // then cancellation arrives before the owner claims the CPU outcome.
+        let control_was_clear = !cancellation.view().is_cancelled();
+        let early = if explicit_close {
+            job.begin_close();
+            Ok(None)
+        } else {
+            cancellation.request(cancel.expect("explicit control reason"));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(result) = job.try_take() {
+                        break result.err();
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+        };
+        job.begin_close();
+        let still_joining =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(job.poll_closed(cx).is_pending()))
+                .await;
+        let mut first_waiter = Box::pin(binding.result_activities_exited());
+        let mut surviving_waiter = Box::pin(binding.result_activities_exited());
+        let waiting = std::future::poll_fn(|cx| {
+            use std::future::Future;
+            std::task::Poll::Ready(
+                first_waiter.as_mut().poll(cx).is_pending()
+                    && surviving_waiter.as_mut().poll(cx).is_pending(),
+            )
+        })
+        .await;
+        drop(first_waiter);
+        let held =
+            capacity.snapshot().held_positions == [0, 0, 1, 0] && !dropped.load(Ordering::Acquire);
+        // Release and join all real workers before asserting the observations.
+        release.send(()).unwrap();
+        let joined = tokio::time::timeout(Duration::from_secs(5), job.join_closed())
+            .await
+            .unwrap()
+            .is_ok();
+        tokio::time::timeout(Duration::from_secs(5), surviving_waiter)
+            .await
+            .unwrap();
+        binding.result_activities_exited().await;
+        let dropped_at_join = dropped.load(Ordering::Acquire);
+        let no_join_failure = job.join_failure().is_none();
+        drop(job);
+        drop(binding);
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        let early = early.unwrap();
+        if explicit_close {
+            assert!(early.is_none());
+        } else {
+            let input = early.expect("the original statement control authors the CPU result");
+            assert_eq!(input.fact(), expected_reason.failure_fact());
+            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+            assert_eq!(
+                input.detail().as_str(),
+                "internal result CPU was stopped by its statement control owner"
+            );
+            assert_eq!(
+                (input.descriptor().errno, input.descriptor().sqlstate),
+                (1317, "70100")
+            );
+            assert_eq!(
+                input.user_error().phase(),
+                novarocks_user_error::ErrorPhase::Execution
+            );
+        }
+        assert!(control_was_clear);
+        assert!(still_joining && waiting && held);
+        assert!(joined && dropped_at_join && no_join_failure);
+        // Successful joins have no failure to hand to process health.
+        // `job` was already disposed after the actual close above.
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
     }
 }

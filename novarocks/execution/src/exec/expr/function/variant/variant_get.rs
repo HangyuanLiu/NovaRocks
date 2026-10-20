@@ -23,8 +23,8 @@ use super::common::binary_value_at_any;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryBuilder, BooleanBufferBuilder, LargeBinaryArray, LargeBinaryBuilder,
-    StringArray, StructArray, new_empty_array,
+    Array, ArrayRef, BooleanBufferBuilder, LargeBinaryArray, LargeBinaryBuilder, StringArray,
+    StructArray, new_empty_array,
 };
 use arrow::buffer::NullBuffer;
 use arrow::compute::CastOptions;
@@ -34,7 +34,11 @@ use parquet::variant::{
 };
 
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
+use crate::exec::expr::expression_contract;
+use crate::exec::expr::{ExprId, ExprNode, LiteralValue};
+use crate::exec::variant_failure::{SdkStage, input_row, sdk};
+use crate::runtime::fragment::ExecutionResult;
+use novarocks_functions::aggregate_scalar::BinaryResultBuilder;
 use novarocks_types::value::variant::{
     VariantMetadata, VariantPathSegment, VariantValue, parse_variant_path, split_serialized,
     variant_get_target_type,
@@ -47,7 +51,7 @@ fn literal_utf8_arg<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     id: ExprId,
     what: &str,
     fn_name: &str,
-) -> Result<String, __Eval::Error> {
+) -> ExecutionResult<String> {
     match arena.node(id) {
         Some(ExprNode::Literal(LiteralValue::Utf8(s))) => Ok(s.clone()),
         Some(ExprNode::Constant(value))
@@ -55,22 +59,23 @@ fn literal_utf8_arg<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 == novarocks_type_contract::ValueLogicalType::Physical
                 && value.value_type().data_type() == &DataType::Utf8 =>
         {
-            Ok((value
+            value
                 .try_utf8()
-                .map_err(|error| format!("{fn_name} has an invalid frozen {what} string: {error}"))?
+                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?
                 .map(str::to_owned)
                 .ok_or_else(|| {
-                    format!("{fn_name} requires a constant string literal for the {what} argument")
-                }))?)
+                    expression_contract(format_args!(
+                        "{fn_name} requires a constant string literal for the {what} argument"
+                    ))
+                })
         }
-        _ => Err(
-            (format!("{fn_name} requires a constant string literal for the {what} argument"))
-                .into(),
-        ),
+        _ => Err(expression_contract(format_args!(
+            "{fn_name} requires a constant string literal for the {what} argument"
+        ))),
     }
 }
 
-fn kernel_path(path_str: &str) -> Result<parquet::variant::VariantPath<'static>, String> {
+fn kernel_path(path_str: &str) -> ExecutionResult<parquet::variant::VariantPath<'static>> {
     let parsed = parse_variant_path(path_str)?;
     let elems: Vec<parquet::variant::VariantPathElement<'static>> = parsed
         .segments
@@ -88,9 +93,9 @@ fn kernel_path(path_str: &str) -> Result<parquet::variant::VariantPath<'static>,
 }
 
 /// Engine LargeBinary `[size|metadata|value]` rows -> upstream VariantArray.
-fn large_binary_to_variant_array(arr: &LargeBinaryArray) -> Result<VariantArray, String> {
-    let mut metadata_builder = BinaryBuilder::new();
-    let mut value_builder = BinaryBuilder::new();
+fn large_binary_to_variant_array(arr: &LargeBinaryArray) -> ExecutionResult<VariantArray> {
+    let mut metadata_builder = BinaryResultBuilder::new();
+    let mut value_builder = BinaryResultBuilder::new();
     let mut validity = BooleanBufferBuilder::new(arr.len());
     // Compute once; the struct-level validity bit makes null-row child bytes
     // unread, but use a valid empty variant metadata rather than empty bytes
@@ -99,37 +104,37 @@ fn large_binary_to_variant_array(arr: &LargeBinaryArray) -> Result<VariantArray,
     let empty_meta_raw = empty_meta.raw();
     for row in 0..arr.len() {
         if arr.is_null(row) {
-            metadata_builder.append_value(empty_meta_raw);
-            value_builder.append_value([]);
+            metadata_builder.append_value(empty_meta_raw)?;
+            value_builder.append_value([])?;
             validity.append(false);
             continue;
         }
         let (m, v) = split_serialized(arr.value(row))
-            .map_err(|e| format!("variant_get: invalid variant input at row {row}: {e}"))?;
-        metadata_builder.append_value(m);
-        value_builder.append_value(v);
+            .map_err(|source| input_row("variant_get", row, source))?;
+        metadata_builder.append_value(m)?;
+        value_builder.append_value(v)?;
         validity.append(true);
     }
     let fields = arrow::datatypes::Fields::from(vec![
         Field::new("metadata", DataType::Binary, false),
         Field::new("value", DataType::Binary, true),
     ]);
-    let struct_arr = StructArray::new(
+    let struct_arr = StructArray::try_new(
         fields,
         vec![
-            Arc::new(metadata_builder.finish()) as ArrayRef,
-            Arc::new(value_builder.finish()) as ArrayRef,
+            Arc::new(metadata_builder.finish()?) as ArrayRef,
+            Arc::new(value_builder.finish()?) as ArrayRef,
         ],
         Some(NullBuffer::new(validity.finish())),
-    );
-    VariantArray::try_new(&struct_arr)
-        .map_err(|e| format!("variant_get: failed to assemble variant input: {e}"))
+    )
+    .map_err(|source| sdk(SdkStage::AssembleInput, source))?;
+    VariantArray::try_new(&struct_arr).map_err(|source| sdk(SdkStage::AssembleInput, source))
 }
 
 /// Upstream VariantArray -> engine LargeBinary rows (2-arg return form).
-fn variant_array_to_large_binary(va: VariantArray) -> Result<ArrayRef, String> {
+fn variant_array_to_large_binary(va: VariantArray) -> ExecutionResult<ArrayRef> {
     let va = if va.typed_value_field().is_some() {
-        unshred_variant(&va).map_err(|e| format!("variant_get: unshred failed: {e}"))?
+        unshred_variant(&va).map_err(|source| sdk(SdkStage::Unshred, source))?
     } else {
         va
     };
@@ -137,7 +142,7 @@ fn variant_array_to_large_binary(va: VariantArray) -> Result<ArrayRef, String> {
     let value = va
         .value_field()
         .cloned()
-        .ok_or_else(|| "variant_get: kernel result missing value column".to_string())?;
+        .ok_or_else(|| expression_contract("variant_get: kernel result missing value column"))?;
     let len = metadata.len();
     let mut builder = LargeBinaryBuilder::new();
     for row in 0..len {
@@ -156,7 +161,7 @@ fn variant_array_to_large_binary(va: VariantArray) -> Result<ArrayRef, String> {
             }
         };
         let serialized = VariantValue::create(m, v)
-            .map_err(|e| format!("variant_get: kernel result row {row}: {e}"))?
+            .map_err(|source| input_row("variant_get", row, source))?
             .serialize();
         builder.append_value(serialized.as_slice());
     }
@@ -169,9 +174,12 @@ fn eval_variant_get_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     chunk: &Chunk,
     strict: bool,
     fn_name: &str,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     if !(2..=3).contains(&args.len()) {
-        return Err((format!("{fn_name} expects 2 or 3 arguments, got {}", args.len())).into());
+        return Err(expression_contract(format_args!(
+            "{fn_name} expects 2 or 3 arguments, got {}",
+            args.len()
+        )));
     }
     let path_str = literal_utf8_arg(arena, args[1], "path", fn_name)?;
     let target_type = if args.len() == 3 {
@@ -194,13 +202,12 @@ fn eval_variant_get_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         // Malformed JSON is a query error in both strict and try modes —
         // try_ only relaxes the *cast*, mirroring Spark.
         let json_ref: ArrayRef = Arc::new(json.clone());
-        json_to_variant(&json_ref).map_err(|e| format!("{fn_name}: invalid JSON input: {e}"))?
+        json_to_variant(&json_ref).map_err(|source| sdk(SdkStage::ParseJson, source))?
     } else {
-        return Err((format!(
+        return Err(expression_contract(format_args!(
             "{fn_name} expects VARIANT or JSON/VARCHAR as first argument, got {:?}",
             input.data_type()
-        ))
-        .into());
+        )));
     };
 
     let mut opts =
@@ -213,14 +220,15 @@ fn eval_variant_get_impl<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     }
 
     let input_ref: ArrayRef = Arc::new(variant_array.into_inner());
-    let result = kernel_variant_get(&input_ref, opts).map_err(|e| format!("{fn_name}: {e}"))?;
+    let result =
+        kernel_variant_get(&input_ref, opts).map_err(|source| sdk(SdkStage::Extract, source))?;
 
     match target_type {
         Some(_) => Ok(result),
         None => {
             let va = VariantArray::try_new(result.as_ref())
-                .map_err(|e| format!("{fn_name}: unexpected kernel result: {e}"))?;
-            Ok((variant_array_to_large_binary(va))?)
+                .map_err(|source| sdk(SdkStage::InspectResult, source))?;
+            variant_array_to_large_binary(va)
         }
     }
 }
@@ -230,8 +238,8 @@ pub fn eval_variant_get<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_variant_get_impl(arena, args, chunk, true, "variant_get"))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_variant_get_impl(arena, args, chunk, true, "variant_get")
 }
 
 pub fn eval_try_variant_get<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -239,10 +247,86 @@ pub fn eval_try_variant_get<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_variant_get_impl(arena, args, chunk, false, "try_variant_get"))?)
+) -> ExecutionResult<ArrayRef> {
+    eval_variant_get_impl(arena, args, chunk, false, "try_variant_get")
 }
 
 #[cfg(test)]
-#[path = "variant_get_constant_tests.rs"]
-mod constant_tests;
+mod kernel_failure_properties {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use std::error::Error;
+
+    #[test]
+    fn real_upstream_cast_keeps_strict_and_try_behavior() {
+        let input: ArrayRef = Arc::new(StringArray::from(vec![r#"{"a":"not-an-integer"}"#]));
+        let variant: ArrayRef = Arc::new(json_to_variant(&input).unwrap().into_inner());
+        for safe in [false, true] {
+            let options = GetOptions::new_with_path(kernel_path("$.a").unwrap())
+                .with_as_type(Some(Arc::new(Field::new("", DataType::Int64, true))))
+                .with_cast_options(CastOptions {
+                    safe,
+                    format_options: Default::default(),
+                });
+            let result = kernel_variant_get(&variant, options)
+                .map_err(|source| sdk(SdkStage::Extract, source));
+            if safe {
+                assert!(result.unwrap().is_null(0));
+            } else {
+                let failure = result.unwrap_err();
+                assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+                assert_eq!(failure.failure_fact().reason().code(), 502);
+                assert!(
+                    failure
+                        .source()
+                        .unwrap()
+                        .source()
+                        .unwrap()
+                        .source()
+                        .unwrap()
+                        .is::<arrow::error::ArrowError>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn actual_malformed_json_is_not_a_try_cast_refusal_and_keeps_original_sdk_error() {
+        let input: ArrayRef = Arc::new(StringArray::from(vec!["{broken"]));
+        let weak = Arc::downgrade(&input);
+        let source = json_to_variant(&input).unwrap_err();
+        let failure = sdk(SdkStage::ParseJson, source);
+        drop(input);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+        let sdk_source = failure.source().unwrap().source().unwrap();
+        assert!(
+            sdk_source
+                .source()
+                .unwrap()
+                .is::<arrow::error::ArrowError>()
+        );
+    }
+
+    #[test]
+    fn assembling_real_corrupted_binary_retains_row_and_original_domain_fact_only() {
+        let input = Arc::new(LargeBinaryArray::from(vec![Some([].as_slice())]));
+        let weak = Arc::downgrade(&input);
+        let failure = large_binary_to_variant_array(&input).unwrap_err();
+        drop(input);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(failure.failure_fact().reason().code(), 60);
+        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+        assert!(failure.to_string().contains("row 0"));
+        assert!(
+            failure
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .is::<novarocks_types::value::variant::VariantFailure>()
+        );
+    }
+}

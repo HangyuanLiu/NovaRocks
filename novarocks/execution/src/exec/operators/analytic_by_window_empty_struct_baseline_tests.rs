@@ -16,27 +16,30 @@
 // under the License.
 //! Independent original empty-Struct window witness. No production changes.
 use super::*;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[test]
-fn by_window_original_empty_struct_preserves_arrow_builder_panic_and_empty_invocation() {
-    const ORIGINAL_PANIC: &str = "called `Result::unwrap()` on an `Err` value: InvalidArgumentError(\"use StructArray::try_new_with_length or StructArray::new_empty_fields to create a struct array with no fields so that the length can be set correctly\")";
+fn by_window_empty_struct_preserves_rows_nulls_and_empty_invocation() {
     for running in [false, true] {
         for null_winner in [false, true] {
             let nulls = null_winner.then(|| arrow::buffer::NullBuffer::new_null(2));
             let values: ArrayRef = Arc::new(arrow::array::StructArray::new_empty_fields(2, nulls));
-            assert_eq!(values.len(), 2);
-            assert_eq!(values.data_type(), &DataType::Struct(Fields::empty()));
             let keys: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
-            let result = catch_unwind(AssertUnwindSafe(|| original_result(values, keys, running)));
-            let panic = result
-                .expect_err("original empty Struct reaches the unchanged Arrow builder panic");
-            let message = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .expect("original Arrow unwrap panic has a textual payload");
-            assert_eq!(message, ORIGINAL_PANIC);
+            let output = original_result(values, keys, running).unwrap().unwrap();
+            let output = output
+                .as_any()
+                .downcast_ref::<arrow::array::StructArray>()
+                .unwrap();
+            assert_eq!(output.len(), 2);
+            assert_eq!(output.num_columns(), 2);
+            for column in output.columns() {
+                let value = column
+                    .as_any()
+                    .downcast_ref::<arrow::array::StructArray>()
+                    .unwrap();
+                assert!(value.fields().is_empty());
+                assert_eq!(value.len(), 2);
+                assert_eq!(value.null_count(), if null_winner { 2 } else { 0 });
+            }
         }
     }
     let empty: ArrayRef = Arc::new(arrow::array::StructArray::new_empty_fields(0, None));

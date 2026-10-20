@@ -289,7 +289,7 @@ fn run_complete_typed(
     let mut f = complete_fixture_with_types(mode, dop, key_type.clone(), int64(true));
     let tracker = MemTracker::new_root("complete-ordered-pipeline");
     tracker.install_limit_once(64 << 20).unwrap();
-    f.input.try_transfer_to_typed(&tracker).unwrap();
+    f.input.try_transfer_to(&tracker).unwrap();
     let producer = session_for(&f.program, f.producer);
     let (scan, input) = f.program.scan_inputs().iter().next().unwrap();
     let ProgramNodeKind::Scan {
@@ -551,7 +551,7 @@ fn compiled_ordered_complete_largeint_payload_keeps_real_source_and_last_buffer_
     let mut f = complete_fixture_with_payload(CompleteMode::ZeroCalls, 1, ty.clone());
     let tracker = MemTracker::new_root("complete-ordered-largeint-source");
     tracker.install_limit_once(64 << 20).unwrap();
-    f.input.try_transfer_to_typed(&tracker).unwrap();
+    f.input.try_transfer_to(&tracker).unwrap();
     let runtime = state(tracker.clone());
     let creation = construction(&tracker, &runtime);
     let host = rf::OrderedTopNAllocationHost::new(tracker.clone());
@@ -627,9 +627,13 @@ fn compiled_ordered_complete_largeint_payload_keeps_real_source_and_last_buffer_
     operator.set_fragment_event_sink(effects.clone());
     operator.prepare().unwrap();
     operator.bind_runtime_state(&runtime).unwrap();
-    let processor = operator.as_processor_mut().unwrap();
-    processor.begin_turn();
-    let filtered = processor.pull_chunk(&runtime).unwrap().unwrap();
+    let mut processor =
+        crate::exec::pipeline::test_driver::TestDriver::new(operator.as_mut(), &runtime);
+    let filtered = processor
+        .advance_to_boundary()
+        .unwrap()
+        .output
+        .expect("the original source output");
     assert_eq!(filtered.len(), 4);
     let expected_values = [10_i128, 7, 2, 1];
     let actual = filtered.columns()[1]
@@ -643,10 +647,22 @@ fn compiled_ordered_complete_largeint_payload_keeps_real_source_and_last_buffer_
         filtered.chunk_schema().slots()[1].typed_binding(),
         ty.typed_binding()
     );
-    assert!(processor.pull_chunk(&runtime).unwrap().is_none());
+    let terminal = processor.advance_to_boundary().unwrap();
+    assert!(terminal.output.is_none());
+    assert!(matches!(
+        terminal.next,
+        crate::exec::pipeline::step::NextStep::Finished
+    ));
+    drop(processor);
     operator.close().unwrap();
     assert!(source.pages.operations.is_exited());
-    assert!(operator.pending_finish().is_none());
+    let exit = operator.observe_exit();
+    assert!(matches!(
+        exit.progress,
+        crate::exec::pipeline::operator::ExitProgress::Exited
+    ));
+    assert!(exit.failure.is_none());
+    assert!(exit.unresolved_exit.is_none());
     assert_eq!(source.claims.load(Ordering::SeqCst), 1);
     assert_eq!(source.pages.closes.load(Ordering::SeqCst), 1);
     assert_eq!(source.pages.consumed.load(Ordering::SeqCst), 1);

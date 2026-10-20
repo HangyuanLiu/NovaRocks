@@ -49,7 +49,7 @@ pub(super) fn actual(
     a: &ArrayRef,
     policy: DecimalOverflowPolicy,
     allow: bool,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let ty = FunctionValueType::new(a.data_type().clone(), true);
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![
@@ -68,7 +68,9 @@ pub(super) fn actual(
     let cast = arena.push_typed(ExprNode::Cast(source, policy), DataType::Float32);
     arena.eval(cast, &chunk)
 }
-pub(super) fn project(a: &ArrayRef) -> Result<ArrayRef, String> {
+pub(super) fn project(
+    a: &ArrayRef,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     cast_array_to_target(a, &DataType::Float32)
 }
 pub(super) fn assert_same(a: &ArrayRef, b: &ArrayRef) {

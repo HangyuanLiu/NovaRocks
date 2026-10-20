@@ -20,7 +20,7 @@
 //! a Worker ordering oracle, a Native lane or GLOBAL/physical-peak evidence.
 
 use super::*;
-use crate::exec::operators::compiled_aggregate::expression_allocation_host;
+use crate::runtime::tracked_state_allocator::expression_allocation_host;
 use crate::runtime::{fragment::ExecutionFailureCause, mem_tracker::MemTracker};
 use crate::runtime_filter::RuntimeFilterFailure;
 use arrow::array::StringArray;
@@ -356,10 +356,7 @@ fn controlled_row_evaluator_refuses_a_real_positive_host_limit_as_fatal_resource
     let query = Query::literals();
     let control = Control::running();
     let error = evaluate(&query, &input(), &tracker, &control).unwrap_err();
-    assert_eq!(
-        error.cause(),
-        &ExecutionFailureCause::Kernel(KernelFailure::ResourceExhausted)
-    );
+    crate::runtime_filter::assert_real_tracker_capacity(&error, 1);
     assert_eq!(query.calls.load(Ordering::SeqCst), 0);
     assert_eq!(tracker.current(), 0);
 }

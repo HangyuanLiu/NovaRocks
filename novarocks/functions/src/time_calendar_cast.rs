@@ -47,6 +47,13 @@ pub fn can_produce_null(source: &DataType) -> bool {
         )
     )
 }
+fn contract_failure(
+    detail: impl std::fmt::Display,
+) -> crate::temporal_carrier::TemporalCastFailure {
+    crate::temporal_carrier::TemporalCastFailure::Contract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    )
+}
 fn observe<E>(
     observer: &mut Option<&mut dyn FnMut(TimeTextObservation) -> Result<(), E>>,
     event: TimeTextObservation,
@@ -60,146 +67,149 @@ pub fn evaluate_arrays_observed<E>(
     array: &ArrayRef,
     target: &DataType,
     mut observer: Option<&mut dyn FnMut(TimeTextObservation) -> Result<(), E>>,
-) -> Result<Result<ArrayRef, String>, E> {
+) -> Result<Result<ArrayRef, crate::temporal_carrier::TemporalCastFailure>, E> {
     if target != &DataType::Time64(TimeUnit::Microsecond) {
-        return Ok(Err(format!(
-            "CAST failed: TIME target must be Time64(Microsecond), got {:?}",
-            target
-        )));
+        return Ok(Err(contract_failure(format_args!(
+            "CAST failed: TIME target must be Time64(Microsecond), got {target:?}"
+        ))));
     }
-    let outcome = (|| -> Result<Result<ArrayRef, String>, E> {
-        observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
-        let mut seconds = Vec::with_capacity(array.len());
-        observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
-        let child_array = array;
-        match child_array.data_type() {
-            DataType::Date32 => {
-                let arr = child_array
-                    .as_any()
-                    .downcast_ref::<Date32Array>()
-                    .ok_or_else(|| "failed to downcast to Date32Array".to_string());
-                let arr = match arr {
-                    Ok(arr) => arr,
-                    Err(e) => return Ok(Err(e)),
-                };
-                for i in 0..arr.len() {
-                    observe(&mut observer, TimeTextObservation::Step)?;
-                    if arr.is_null(i) {
-                        seconds.push(None);
-                    } else {
-                        seconds.push(Some(0));
-                    }
-                }
-            }
-            DataType::Timestamp(unit, _) => match unit {
-                TimeUnit::Second => {
-                    let arr = child_array
-                        .as_any()
-                        .downcast_ref::<TimestampSecondArray>()
-                        .ok_or_else(|| "failed to downcast to TimestampSecondArray".to_string());
-                    let arr = match arr {
-                        Ok(arr) => arr,
-                        Err(e) => return Ok(Err(e)),
-                    };
-                    for i in 0..arr.len() {
-                        observe(&mut observer, TimeTextObservation::Step)?;
-                        if arr.is_null(i) {
-                            seconds.push(None);
-                        } else {
-                            observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
-                            seconds.push(seconds_from_timestamp(unit, arr.value(i)));
-                            observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
-                        }
-                    }
-                }
-                TimeUnit::Millisecond => {
-                    let arr = child_array
-                        .as_any()
-                        .downcast_ref::<TimestampMillisecondArray>()
-                        .ok_or_else(|| {
-                            "failed to downcast to TimestampMillisecondArray".to_string()
-                        });
-                    let arr = match arr {
-                        Ok(arr) => arr,
-                        Err(e) => return Ok(Err(e)),
-                    };
-                    for i in 0..arr.len() {
-                        observe(&mut observer, TimeTextObservation::Step)?;
-                        if arr.is_null(i) {
-                            seconds.push(None);
-                        } else {
-                            observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
-                            seconds.push(seconds_from_timestamp(unit, arr.value(i)));
-                            observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
-                        }
-                    }
-                }
-                TimeUnit::Microsecond => {
-                    let arr = child_array
-                        .as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .ok_or_else(|| {
-                            "failed to downcast to TimestampMicrosecondArray".to_string()
-                        });
-                    let arr = match arr {
-                        Ok(arr) => arr,
-                        Err(e) => return Ok(Err(e)),
-                    };
-                    for i in 0..arr.len() {
-                        observe(&mut observer, TimeTextObservation::Step)?;
-                        if arr.is_null(i) {
-                            seconds.push(None);
-                        } else {
-                            observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
-                            seconds.push(seconds_from_timestamp(unit, arr.value(i)));
-                            observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
-                        }
-                    }
-                }
-                TimeUnit::Nanosecond => {
-                    let arr = child_array
-                        .as_any()
-                        .downcast_ref::<TimestampNanosecondArray>()
-                        .ok_or_else(|| {
-                            "failed to downcast to TimestampNanosecondArray".to_string()
-                        });
-                    let arr = match arr {
-                        Ok(arr) => arr,
-                        Err(e) => return Ok(Err(e)),
-                    };
-                    for i in 0..arr.len() {
-                        observe(&mut observer, TimeTextObservation::Step)?;
-                        if arr.is_null(i) {
-                            seconds.push(None);
-                        } else {
-                            observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
-                            seconds.push(seconds_from_timestamp(unit, arr.value(i)));
-                            observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
-                        }
-                    }
-                }
-            },
-            other => {
-                return Ok(Err(format!(
-                    "TIME calendar cast requires Date32 or Timestamp, got {other:?}"
-                )));
-            }
-        }
-        if observer.is_some() {
-            for _ in &seconds {
-                observe(&mut observer, TimeTextObservation::Step)?;
-            }
-        }
-        observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
-        let output = crate::time_text_cast::seconds_to_time64_micro_array(seconds);
-        if output.is_ok() {
+    let outcome =
+        (|| -> Result<Result<ArrayRef, crate::temporal_carrier::TemporalCastFailure>, E> {
             observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
-        }
-        Ok(output)
-    })();
+            let mut seconds = Vec::with_capacity(array.len());
+            observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
+            let child_array = array;
+            match child_array.data_type() {
+                DataType::Date32 => {
+                    let arr = child_array
+                        .as_any()
+                        .downcast_ref::<Date32Array>()
+                        .ok_or_else(|| contract_failure("failed to downcast to Date32Array"));
+                    let arr = match arr {
+                        Ok(arr) => arr,
+                        Err(e) => return Ok(Err(e)),
+                    };
+                    for i in 0..arr.len() {
+                        observe(&mut observer, TimeTextObservation::Step)?;
+                        if arr.is_null(i) {
+                            seconds.push(None);
+                        } else {
+                            seconds.push(Some(0));
+                        }
+                    }
+                }
+                DataType::Timestamp(unit, _) => match unit {
+                    TimeUnit::Second => {
+                        let arr = child_array
+                            .as_any()
+                            .downcast_ref::<TimestampSecondArray>()
+                            .ok_or_else(|| {
+                                contract_failure("failed to downcast to TimestampSecondArray")
+                            });
+                        let arr = match arr {
+                            Ok(arr) => arr,
+                            Err(e) => return Ok(Err(e)),
+                        };
+                        for i in 0..arr.len() {
+                            observe(&mut observer, TimeTextObservation::Step)?;
+                            if arr.is_null(i) {
+                                seconds.push(None);
+                            } else {
+                                observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
+                                seconds.push(seconds_from_timestamp(unit, arr.value(i)));
+                                observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
+                            }
+                        }
+                    }
+                    TimeUnit::Millisecond => {
+                        let arr = child_array
+                            .as_any()
+                            .downcast_ref::<TimestampMillisecondArray>()
+                            .ok_or_else(|| {
+                                contract_failure("failed to downcast to TimestampMillisecondArray")
+                            });
+                        let arr = match arr {
+                            Ok(arr) => arr,
+                            Err(e) => return Ok(Err(e)),
+                        };
+                        for i in 0..arr.len() {
+                            observe(&mut observer, TimeTextObservation::Step)?;
+                            if arr.is_null(i) {
+                                seconds.push(None);
+                            } else {
+                                observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
+                                seconds.push(seconds_from_timestamp(unit, arr.value(i)));
+                                observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
+                            }
+                        }
+                    }
+                    TimeUnit::Microsecond => {
+                        let arr = child_array
+                            .as_any()
+                            .downcast_ref::<TimestampMicrosecondArray>()
+                            .ok_or_else(|| {
+                                contract_failure("failed to downcast to TimestampMicrosecondArray")
+                            });
+                        let arr = match arr {
+                            Ok(arr) => arr,
+                            Err(e) => return Ok(Err(e)),
+                        };
+                        for i in 0..arr.len() {
+                            observe(&mut observer, TimeTextObservation::Step)?;
+                            if arr.is_null(i) {
+                                seconds.push(None);
+                            } else {
+                                observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
+                                seconds.push(seconds_from_timestamp(unit, arr.value(i)));
+                                observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
+                            }
+                        }
+                    }
+                    TimeUnit::Nanosecond => {
+                        let arr = child_array
+                            .as_any()
+                            .downcast_ref::<TimestampNanosecondArray>()
+                            .ok_or_else(|| {
+                                contract_failure("failed to downcast to TimestampNanosecondArray")
+                            });
+                        let arr = match arr {
+                            Ok(arr) => arr,
+                            Err(e) => return Ok(Err(e)),
+                        };
+                        for i in 0..arr.len() {
+                            observe(&mut observer, TimeTextObservation::Step)?;
+                            if arr.is_null(i) {
+                                seconds.push(None);
+                            } else {
+                                observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
+                                seconds.push(seconds_from_timestamp(unit, arr.value(i)));
+                                observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
+                            }
+                        }
+                    }
+                },
+                other => {
+                    return Ok(Err(contract_failure(format_args!(
+                        "TIME calendar cast requires Date32 or Timestamp, got {other:?}"
+                    ))));
+                }
+            }
+            if observer.is_some() {
+                for _ in &seconds {
+                    observe(&mut observer, TimeTextObservation::Step)?;
+                }
+            }
+            observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
+            let output = crate::time_text_cast::seconds_to_time64_micro_array(seconds);
+            observe(&mut observer, TimeTextObservation::OpaqueBoundary)?;
+            Ok(Ok(output))
+        })();
     outcome
 }
-pub fn evaluate_arrays(array: &ArrayRef, target: &DataType) -> Result<ArrayRef, String> {
+pub fn evaluate_arrays(
+    array: &ArrayRef,
+    target: &DataType,
+) -> Result<ArrayRef, crate::temporal_carrier::TemporalCastFailure> {
     match evaluate_arrays_observed::<std::convert::Infallible>(array, target, None) {
         Ok(r) => r,
         Err(never) => match never {},

@@ -49,6 +49,10 @@
 //! is exact because a row outside that prefix can never re-enter it. A full
 //! sort buffers its whole input in memory (no spill, ADR-0162).
 
+use crate::exec::fragment::error::{
+    FragmentBindingErrorKind as PlanBindingKind, program_binding_failure,
+};
+use crate::exec::pipeline::operator::OperatorLifecycle;
 use std::sync::Arc;
 
 use arrow::array::ArrayRef;
@@ -64,8 +68,14 @@ use super::compiled_expression::{
 use super::sort::creation::{CreatedSortColumns, SortCreation};
 use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
-use crate::exec::pipeline::operator::{ConstructionFailure, Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{ConstructionFailure, InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::pipeline::{
+    input::PreparedInput,
+    shape::{Transform, TransformKernel},
+    step::{NextStep, StepResult},
+    step_context::StepContext,
+};
 use crate::runtime::fragment::ExecutionResult;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
@@ -93,12 +103,13 @@ impl CompiledSortProcessorFactory {
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
-    ) -> Result<Self, String> {
-        let graph_node = program
-            .graph()
-            .nodes()
-            .get(node.index())
-            .ok_or_else(|| format!("compiled Sort node {} is absent", node.index()))?;
+    ) -> ExecutionResult<Self> {
+        let graph_node = program.graph().nodes().get(node.index()).ok_or_else(|| {
+            program_binding_failure(
+                PlanBindingKind::MissingAssignment,
+                format!("compiled Sort node {} is absent", node.index()),
+            )
+        })?;
         let ProgramNodeKind::Sort {
             use_top_n,
             order_by,
@@ -112,42 +123,60 @@ impl CompiledSortProcessorFactory {
             ..
         } = graph_node.kind()
         else {
-            return Err(format!(
-                "compiled local node {} is not a Sort",
-                node.index()
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!("compiled local node {} is not a Sort", node.index()),
             ));
         };
         let at = node.index();
         if partition_limit.is_some() {
-            return Err(format!(
-                "compiled Sort at local node {at} with a partition limit is not executable"
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!(
+                    "compiled Sort at local node {at} with a partition limit is not executable"
+                ),
             ));
         }
         if *use_top_n && !partition_exprs.is_empty() {
-            return Err(format!(
-                "compiled TopN at local node {at} with partition keys is not executable"
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!("compiled TopN at local node {at} with partition keys is not executable"),
             ));
         }
         if *topn_type != SortTopNType::RowNumber {
-            return Err(format!(
-                "compiled TopN at local node {at} with {topn_type:?} ranking is not executable"
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!(
+                    "compiled TopN at local node {at} with {topn_type:?} ranking is not executable"
+                ),
             ));
         }
         if max_buffered_rows.is_some() || max_buffered_bytes.is_some() {
-            return Err(format!(
-                "compiled Sort at local node {at} carries a buffering cap the compiler never authors"
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!(
+                    "compiled Sort at local node {at} carries a buffering cap the compiler never authors"
+                ),
             ));
         }
         if order_by.is_empty() && partition_exprs.is_empty() {
-            return Err(format!(
-                "compiled Sort at local node {at} has no ordering key"
+            return Err(program_binding_failure(
+                PlanBindingKind::InvalidAssignment,
+                format!("compiled Sort at local node {at} has no ordering key"),
             ));
         }
         let keep = if *use_top_n {
-            let limit = limit
-                .ok_or_else(|| format!("compiled TopN at local node {at} has no row limit"))?;
+            let limit = limit.ok_or_else(|| {
+                program_binding_failure(
+                    PlanBindingKind::MissingAssignment,
+                    format!("compiled TopN at local node {at} has no row limit"),
+                )
+            })?;
             Some(offset.checked_add(limit).ok_or_else(|| {
-                format!("compiled TopN at local node {at} limit and offset overflow")
+                program_binding_failure(
+                    PlanBindingKind::MissingAssignment,
+                    format!("compiled TopN at local node {at} limit and offset overflow"),
+                )
             })?)
         } else {
             None
@@ -166,8 +195,8 @@ impl CompiledSortProcessorFactory {
                     .map(|(ordinal, key)| (ordinal, key, false)),
             );
         for (ordinal, key, partition) in keys {
-            let key_ordinal = u32::try_from(ordinal)
-                .map_err(|_| format!("compiled Sort at local node {at} has too many keys"))?;
+            let key_ordinal = novarocks_local_program::checked_program_ordinal(ordinal)
+                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
             sites.push(ProgramExpressionRootSite::Node {
                 node,
                 role: if partition {
@@ -222,7 +251,7 @@ impl OperatorFactory for CompiledSortProcessorFactory {
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(CompiledSortProcessor {
+        Box::new(Transform::hydrating(CompiledSortProcessor {
             name: self.name.clone(),
             program: Arc::clone(&self.program),
             sites: self.sites.clone(),
@@ -238,10 +267,7 @@ impl OperatorFactory for CompiledSortProcessorFactory {
             instances: None,
             runs: Vec::new(),
             buffered_rows: 0,
-            pending: None,
-            finishing: false,
-            finished: false,
-        })
+        }))
     }
 }
 
@@ -267,9 +293,6 @@ struct CompiledSortProcessor {
     instances: Option<Vec<CompiledExpressionInstance>>,
     runs: Vec<SortedRun>,
     buffered_rows: usize,
-    pending: Option<Chunk>,
-    finishing: bool,
-    finished: bool,
 }
 
 impl CompiledSortProcessor {
@@ -434,7 +457,7 @@ impl CompiledSortProcessor {
     }
 }
 
-impl Operator for CompiledSortProcessor {
+impl OperatorLifecycle for CompiledSortProcessor {
     fn creates_typed_storage(&self) -> bool {
         true
     }
@@ -469,31 +492,34 @@ impl Operator for CompiledSortProcessor {
     fn name(&self) -> &str {
         &self.name
     }
-    fn is_finished(&self) -> bool {
-        self.finished
+    fn begin_exit(&mut self) -> ExecutionResult<()> {
+        self.runs.clear();
+        self.buffered_rows = 0;
+        self.instances = None;
+        Ok(())
     }
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
+    fn close(&mut self) -> ExecutionResult<()> {
+        self.begin_exit()
     }
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
+    fn cancel(&mut self) {
+        self.runs.clear();
+        self.buffered_rows = 0;
+        self.instances = None;
     }
 }
 
-impl ProcessorOperator for CompiledSortProcessor {
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished
-    }
-    fn has_output(&self) -> bool {
-        self.pending.is_some()
-    }
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+impl InputEncodingPolicy for CompiledSortProcessor {}
+impl TransformKernel for CompiledSortProcessor {
+    fn apply(
+        &mut self,
+        _: &mut StepContext<'_>,
+        input: PreparedInput,
+    ) -> ExecutionResult<StepResult> {
+        let chunk = input.into_uncovered_chunk()?;
         self.prepared_output()?;
-        if self.finishing || self.finished {
-            return Err("compiled Sort received input after finishing".into());
-        }
+        let rows = u64::try_from(chunk.len()).expect("supported row count fits u64");
         if chunk.is_empty() {
-            return Ok(());
+            return Ok(StepResult::new(None, NextStep::NeedInput, rows));
         }
         instances(
             &mut self.instances,
@@ -541,34 +567,21 @@ impl ProcessorOperator for CompiledSortProcessor {
         // Every arriving row's keys are evaluated, even when no row can be
         // kept, so a key's row error never depends on the limit.
         if self.keep == Some(0) {
-            return Ok(());
+            return Ok(StepResult::new(None, NextStep::NeedInput, rows));
         }
         self.buffered_rows = self.buffered_rows.saturating_add(chunk.len());
         self.runs.push(SortedRun {
             batch: chunk.into_batch_projection(),
             keys,
         });
-        self.prune()
+        self.prune()?;
+        Ok(StepResult::new(None, NextStep::NeedInput, rows))
     }
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        let output = self.pending.take();
-        if self.finishing {
-            self.finished = true;
-        }
-        Ok(output)
-    }
-    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+    fn finish(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         self.prepared_output()?;
-        if self.finishing || self.finished {
-            return Ok(());
-        }
-        self.finishing = true;
-        self.pending = self.final_output()?;
+        let output = self.final_output()?;
         self.runs.clear();
         self.buffered_rows = 0;
-        if self.pending.is_none() {
-            self.finished = true;
-        }
-        Ok(())
+        Ok(StepResult::new(output, NextStep::Finished, 0))
     }
 }

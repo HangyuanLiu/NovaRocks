@@ -27,7 +27,9 @@ use arrow_array::{
 use arrow_schema::DataType;
 use novarocks_type_contract::{MAX_VALUE_TYPE_DEPTH, ValueKind, ValueTypeRef};
 
-use super::{ArrayNormalizationStep, ArrayPathStep};
+use super::{
+    ArrayNormalizationStep, ArrayPathStep, ArrayProjectionFailure, ArrayProjectionViolation,
+};
 
 pub fn validate_required_dictionary_children<E, F>(
     source: &ArrayRef,
@@ -35,7 +37,7 @@ pub fn validate_required_dictionary_children<E, F>(
     observe: &mut F,
 ) -> Result<(), E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
     // Root dictionaries were checked independently with every visible key.
@@ -54,9 +56,13 @@ where
     visit_required_paths(source, source, value, &mut path, 0, observe)
 }
 
-fn physical<'a, T: 'static, E: From<String>>(source: &'a ArrayRef) -> Result<&'a T, E> {
+fn physical<'a, T: 'static, E: From<ArrayProjectionFailure>>(
+    source: &'a ArrayRef,
+) -> Result<&'a T, E> {
     source.as_any().downcast_ref::<T>().ok_or_else(|| {
-        E::from("typed required-child validation has a different physical wrapper".to_owned())
+        E::from(ArrayProjectionFailure::Contract(
+            ArrayProjectionViolation::PhysicalWrapper,
+        ))
     })
 }
 
@@ -69,14 +75,14 @@ fn visit_required_paths<E, F>(
     observe: &mut F,
 ) -> Result<(), E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
     observe(ArrayNormalizationStep::InspectType(source.data_type()))?;
     if depth >= MAX_VALUE_TYPE_DEPTH {
-        return Err(E::from(
-            "typed required-child validation exceeds its nesting profile".to_owned(),
-        ));
+        return Err(E::from(ArrayProjectionFailure::ValueType(
+            novarocks_type_contract::ValueTypeError::TooDeep,
+        )));
     }
     if matches!(source.data_type(), DataType::Dictionary(_, _)) {
         if !value.nullable() && !source.is_empty() {
@@ -115,9 +121,9 @@ where
                 DataType::List(_) => physical::<ListArray, E>(source)?.values(),
                 DataType::LargeList(_) => physical::<LargeListArray, E>(source)?.values(),
                 _ => {
-                    return Err(E::from(
-                        "typed List required-child path has a different carrier".to_owned(),
-                    ));
+                    return Err(E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::ListCarrier,
+                    )));
                 }
             };
             visit_required_paths(root, values, item, path, depth + 1, observe)?;
@@ -153,7 +159,7 @@ fn validate_active_path<E, F>(
     observe: &mut F,
 ) -> Result<(), E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
     *pending += 1;
@@ -170,9 +176,9 @@ where
                 .values()
                 .is_null(dictionary.keys().value(row) as usize)
         {
-            return Err(E::from(
-                "typed required dictionary child contains an unmasked logical null".to_owned(),
-            ));
+            return Err(E::from(ArrayProjectionFailure::Contract(
+                ArrayProjectionViolation::UnmaskedRequiredNull,
+            )));
         }
         return Ok(());
     }
@@ -213,19 +219,23 @@ where
                     let start =
                         row.checked_mul(array.value_length() as usize)
                             .ok_or_else(|| {
-                                E::from("typed required List child range overflow".to_owned())
+                                E::from(ArrayProjectionFailure::Contract(
+                                    ArrayProjectionViolation::ChildRange,
+                                ))
                             })?;
                     let end = start
                         .checked_add(array.value_length() as usize)
                         .ok_or_else(|| {
-                            E::from("typed required List child range overflow".to_owned())
+                            E::from(ArrayProjectionFailure::Contract(
+                                ArrayProjectionViolation::ChildRange,
+                            ))
                         })?;
                     (array.values(), start, end)
                 }
                 _ => {
-                    return Err(E::from(
-                        "typed required List path has a different carrier".to_owned(),
-                    ));
+                    return Err(E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::ListCarrier,
+                    )));
                 }
             };
             for index in start..end {
@@ -246,9 +256,9 @@ where
             }
         }
         _ => {
-            return Err(E::from(
-                "typed required-child path has an unsupported encoding step".to_owned(),
-            ));
+            return Err(E::from(ArrayProjectionFailure::Contract(
+                ArrayProjectionViolation::UnsupportedPath,
+            )));
         }
     }
     Ok(())

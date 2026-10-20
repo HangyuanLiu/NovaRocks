@@ -63,7 +63,7 @@ fn evaluate(
     name: &'static str,
     inputs: Vec<ArrayRef>,
     output: Option<DataType>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = inputs.first().map_or(3, |v| v.len());
     let (mut arena, args, chunk) = fixture(inputs, rows);
     let expr = output.map_or(ExprId(usize::MAX), |ty| {
@@ -164,9 +164,13 @@ fn legacy_unary_raw_positive_keeps_actual_source_for_identity_and_text_cast() {
         vec![Some("9223372036854775807"), Some("9007199254740993"), None]
     );
     let target = DataType::Struct(vec![Arc::new(Field::new("item", DataType::Int64, true))].into());
-    let original = arrow::compute::cast(&source, &target).unwrap_err();
+    let original = arrow::compute::cast(&source, &target)
+        .unwrap_err()
+        .to_string();
     assert_eq!(
-        evaluate("positive", vec![source], Some(target)).unwrap_err(),
+        evaluate("positive", vec![source], Some(target))
+            .unwrap_err()
+            .to_string(),
         format!("math: failed to cast output: {original}")
     );
     let decimal: ArrayRef = Arc::new(
@@ -189,12 +193,12 @@ fn legacy_unary_raw_null_reader_and_positive_broad_arrow_domains_are_distinct() 
         assert_eq!(out.null_count(), 3);
         let boolean: ArrayRef = Arc::new(BooleanArray::from(vec![true, false]));
         assert_eq!(
-            evaluate(name, vec![boolean], None).unwrap_err(),
+            evaluate(name, vec![boolean], None).unwrap_err().to_string(),
             "unsupported numeric type: Boolean"
         );
         let text: ArrayRef = Arc::new(StringArray::from(vec!["3"]));
         assert_eq!(
-            evaluate(name, vec![text], None).unwrap_err(),
+            evaluate(name, vec![text], None).unwrap_err().to_string(),
             "unsupported numeric type: Utf8"
         );
     }

@@ -39,7 +39,7 @@ impl Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -351,7 +351,7 @@ fn bounded_parameters_every_actual_callback_retains_first_control_and_never_publ
         for at in 0..trace.len() {
             for cause in CAUSES {
                 let control = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 assert!(
@@ -478,7 +478,7 @@ fn bounded_parameter_sending_every_callback_and_real_source_quantum_use_original
         for at in 0..trace.len() {
             for cause in CAUSES {
                 let control = EncodeControl(Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 });
                 assert!(
@@ -504,7 +504,7 @@ fn bounded_parameter_sending_every_callback_and_real_source_quantum_use_original
     for at in [0, trace.len() / 2, trace.len() - 1] {
         for cause in CAUSES {
             let control = EncodeControl(Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Control::default()
             });
             assert!(
@@ -945,7 +945,7 @@ fn observed_parameters_every_actual_callback_keeps_primary_cause_and_caller_foot
         for at in 0..trace.len() {
             for cause in CAUSES {
                 let control = ValidateControl(Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 });
                 assert!(
@@ -963,7 +963,7 @@ fn observed_parameters_every_actual_callback_keeps_primary_cause_and_caller_foot
             for at in 0..trace.len() {
                 for cause in CAUSES {
                     let control = ValidateControl(Control {
-                        stop: Some((at, cause)),
+                        stop: Some((at, cause.clone())),
                         ..Control::default()
                     });
                     assert!(

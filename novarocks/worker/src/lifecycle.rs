@@ -50,11 +50,10 @@ pub fn classify_task_transition(from: TaskState, to: TaskState) -> TaskTransitio
             to,
             TaskState::Finished | TaskState::Canceling | TaskState::Aborting | TaskState::Failing
         ),
-        TaskState::Canceling => matches!(
-            to,
-            TaskState::Canceled | TaskState::Aborting | TaskState::Failing
-        ),
-        TaskState::Aborting => matches!(to, TaskState::Aborted),
+        TaskState::Canceling => matches!(to, TaskState::Canceled),
+        // The owner additionally requires the accepted abort to be derived.
+        // State shape alone never authorizes replacing an originating cause.
+        TaskState::Aborting => matches!(to, TaskState::Aborted | TaskState::Failing),
         TaskState::Failing => matches!(to, TaskState::Failed),
         TaskState::Finished | TaskState::Canceled | TaskState::Aborted | TaskState::Failed => false,
     };
@@ -238,8 +237,7 @@ mod tests {
         classify_task_transition,
     };
     use novarocks_execution_contract::{
-        AbortCause, QueryContextState, SafeDetail, TaskFailure, TaskFailureCategory, TaskState,
-        TerminationDetail,
+        AbortCause, QueryContextState, SafeDetail, TaskFailure, TaskState, TerminationDetail,
     };
 
     #[test]
@@ -281,7 +279,13 @@ mod tests {
         assert_eq!(latch.latch(derived.clone()), LatchOutcome::Won);
 
         let failure = TerminationDetail::Failed(TaskFailure::new(
-            TaskFailureCategory::Execution,
+            novarocks_execution_contract::failure::FailureFact::new(
+                novarocks_execution_contract::failure::FailureClass::Data,
+                novarocks_execution_contract::failure::FailureReason::new(
+                    std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                    std::num::NonZeroU16::new(1).unwrap(),
+                ),
+            ),
             SafeDetail::new("scan failed").expect("bounded detail"),
         ));
         assert_eq!(latch.latch(failure.clone()), LatchOutcome::Refined(derived));

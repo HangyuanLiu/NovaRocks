@@ -24,7 +24,7 @@
 //! request from being mistaken for a brand new task.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::{InstalledLease, MonotonicInstant, QueryContextDomains, TerminationLatch};
 use novarocks_execution_contract::task_execution::creation::PreparedTaskFacts;
@@ -84,9 +84,38 @@ impl EstablishRecord {
 /// they all observe the same failure rather than each retrying separately.
 #[derive(Clone, Debug)]
 pub(super) struct CreationFailure {
-    pub(super) outcome: OperationOutcome,
-    pub(super) detail: String,
-    pub(super) category: TaskFailureCategory,
+    pub(super) result:
+        novarocks_execution_contract::operation::OperationResult<std::convert::Infallible>,
+}
+impl CreationFailure {
+    pub(super) fn verdict(outcome: OperationOutcome, detail: impl AsRef<str>) -> Self {
+        Self {
+            result: novarocks_execution_contract::operation::OperationResult::Verdict {
+                outcome,
+                detail: Some(novarocks_execution_contract::SafeDetail::truncating(
+                    detail.as_ref(),
+                )),
+                acknowledgement: None,
+            },
+        }
+    }
+    pub(super) fn domain(
+        outcome: novarocks_execution_contract::operation::DomainFailureOutcome,
+        failure: novarocks_execution_contract::operation::OperationDomainFailure,
+    ) -> Self {
+        Self {
+            result: novarocks_execution_contract::operation::OperationResult::DomainFailure {
+                outcome,
+                failure,
+            },
+        }
+    }
+    pub(super) fn receipt<T>(&self, operation: TaskOperationId) -> crate::OperationReceipt<T> {
+        crate::OperationReceipt::from_result(
+            operation,
+            self.result.clone().map_ack(|never| match never {}),
+        )
+    }
 }
 
 /// The reservation one creation owner holds on a task identity.
@@ -97,142 +126,143 @@ pub(super) struct CreationFailure {
 /// winner's: the frontend freezes exactly one body per identity, so a request
 /// naming an identity asks for the entity that identity already names.
 pub(crate) struct CreationCell {
-    decision: Arc<CreationControlState>,
+    preparation: Arc<crate::task_preparation::TaskPreparationScope>,
+    progress: Mutex<CreationProgress>,
     accepted_status: Mutex<Option<Arc<TaskStatusOwner>>>,
 }
 
-struct CreationDecision {
+struct CreationProgress {
     failure: Option<CreationFailure>,
-    stop: Option<PreparationStop>,
+    rollback_complete: bool,
 }
 
-/// One synchronization owner for the actual winner and every borrowed view.
-pub(crate) struct CreationControlState {
-    decision: Mutex<CreationDecision>,
-    changed: Condvar,
-}
-impl CreationControlState {
-    pub(crate) fn stop(&self) -> Option<PreparationStop> {
-        self.decision.lock().expect("creation cell lock").stop
-    }
-    pub(crate) fn wait(&self, cadence: std::time::Duration) -> Result<(), PreparationStop> {
-        let decision = self.decision.lock().expect("creation cell lock");
-        if let Some(stop) = decision.stop {
-            return Err(stop);
-        }
-        let (decision, _) = self
-            .changed
-            .wait_timeout(decision, cadence)
-            .expect("creation cell wait");
-        match decision.stop {
-            Some(stop) => Err(stop),
-            None => Ok(()),
-        }
-    }
-}
-
-/// Read-only observation of the creation winner's actual stop decision.
-/// This retains no registry, task input, query context or status publication.
+/// Immutable metadata observes one exact accepted Task without retaining its
+/// owner, reporter, runtime, input, or publication capability. A short loan
+/// upgrades the owner only while an operation is actually using it.
 #[derive(Clone)]
-pub struct TaskPreparationStopView {
-    decision: Arc<CreationControlState>,
+pub struct TaskPreparationView {
+    owner: Weak<TaskStatusOwner>,
+    identity: TaskIdentity,
     cadence: std::time::Duration,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TaskPreparationStopCause {
-    Cancelled,
-    LeaseExpired,
-}
-impl TaskPreparationStopView {
-    /// Borrow the original winner's stop decision and bounded wait.
+impl TaskPreparationView {
+    pub(crate) fn from_owner(owner: &Arc<TaskStatusOwner>, cadence: std::time::Duration) -> Self {
+        Self {
+            owner: Arc::downgrade(owner),
+            identity: owner.identity(),
+            cadence,
+        }
+    }
+
+    pub const fn identity(&self) -> TaskIdentity {
+        self.identity
+    }
     pub fn borrow_control(&self) -> crate::PreparationControlLoan<'_> {
         crate::PreparationControlLoan::from_view(self)
     }
 
-    pub(crate) fn control(&self) -> (&CreationControlState, std::time::Duration) {
-        (&self.decision, self.cadence)
-    }
-
-    pub fn stop_cause(&self) -> Option<TaskPreparationStopCause> {
-        match self.decision.stop() {
-            None => None,
-            Some(PreparationStop::Abort(AbortCause::LeaseExpired)) => {
-                Some(TaskPreparationStopCause::LeaseExpired)
-            }
-            Some(PreparationStop::Cancel(_) | PreparationStop::Abort(_)) => {
-                Some(TaskPreparationStopCause::Cancelled)
-            }
-        }
-    }
-
-    #[cfg(any(test, novarocks_dev_controls))]
-    pub fn unstopped_for_test() -> Self {
-        CreationCell::new().preparation_stop_view(std::time::Duration::from_millis(1))
+    pub(crate) fn control(&self) -> (Option<Arc<TaskStatusOwner>>, std::time::Duration) {
+        (self.owner.upgrade(), self.cadence)
     }
 }
 
+#[cfg(any(test, novarocks_dev_controls))]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum PreparationStop {
+pub enum TestPreparationIntent {
     Cancel(CancelReason),
     Abort(AbortCause),
 }
 
 impl CreationCell {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(
+        identity: TaskIdentity,
+        health: Arc<novarocks_execution::runtime::execution_health::ExecutionHealth>,
+    ) -> Self {
+        Self::with_scope(Arc::new(
+            crate::task_preparation::TaskPreparationScope::new(identity, health),
+        ))
+    }
+    fn with_scope(preparation: Arc<crate::task_preparation::TaskPreparationScope>) -> Self {
         Self {
-            decision: Arc::new(CreationControlState {
-                decision: Mutex::new(CreationDecision {
-                    failure: None,
-                    stop: None,
-                }),
-                changed: Condvar::new(),
+            preparation,
+            progress: Mutex::new(CreationProgress {
+                failure: None,
+                rollback_complete: false,
             }),
             accepted_status: Mutex::new(None),
         }
     }
 
+    pub(crate) fn preparation_scope(&self) -> &crate::task_preparation::TaskPreparationScope {
+        &self.preparation
+    }
+    pub(crate) fn preparation_scope_arc(
+        &self,
+    ) -> Arc<crate::task_preparation::TaskPreparationScope> {
+        Arc::clone(&self.preparation)
+    }
+    #[cfg(any(test, novarocks_dev_controls))]
+    pub(crate) fn for_accepted_fixture(owner: &TaskStatusOwner) -> Self {
+        Self::with_scope(owner.preparation_scope_arc())
+    }
+
     pub(super) fn preparation_stop_view(
         &self,
         cadence: std::time::Duration,
-    ) -> TaskPreparationStopView {
-        TaskPreparationStopView {
-            decision: Arc::clone(&self.decision),
-            cadence,
-        }
+    ) -> TaskPreparationView {
+        let owner = self
+            .accepted_status()
+            .expect("preparation borrows an accepted Task");
+        TaskPreparationView::from_owner(&owner, cadence)
     }
 
     pub(super) fn fail(&self, failure: CreationFailure) {
-        self.decision
-            .decision
+        self.progress.lock().expect("creation cell lock").failure = Some(failure);
+    }
+
+    /// Only the transaction that actually removed its installations supplies
+    /// this fact. It is not a Task conclusion and does not prove job exit.
+    pub(super) fn finish_rollback(&self, failure: CreationFailure) {
+        let mut state = self.progress.lock().expect("creation cell lock");
+        assert!(
+            !state.rollback_complete,
+            "one preparation rollback completion"
+        );
+        state.failure = Some(failure);
+        state.rollback_complete = true;
+    }
+
+    pub(super) fn rollback_complete(&self) -> bool {
+        self.progress
             .lock()
             .expect("creation cell lock")
-            .failure = Some(failure);
+            .rollback_complete
     }
 
     pub(super) fn failure(&self) -> Option<CreationFailure> {
-        self.decision
-            .decision
+        self.progress
             .lock()
             .expect("creation cell lock")
             .failure
             .clone()
     }
 
-    /// Orders a post-Accept preparation failure against a concurrent stop.
-    ///
-    /// The failure is this creation's own cause only when no stop was
-    /// requested first; once it is claimed, no later stop is accepted. The
-    /// resulting decision is read back through [`Self::stop`].
-    pub(super) fn claim_failure(&self, failure: CreationFailure) {
-        let mut decision = self.decision.decision.lock().expect("creation cell lock");
-        if decision.stop.is_none() {
-            decision.failure = Some(failure);
-        }
-    }
-
     pub(super) fn accept(&self, status: Arc<TaskStatusOwner>) {
-        *self.accepted_status.lock().expect("creation cell lock") = Some(status);
+        // Validate pure immutable provenance before taking the association lock.
+        assert!(
+            Arc::ptr_eq(&self.preparation, &status.preparation_scope_arc()),
+            "Accepted borrows the exact original preparation scope"
+        );
+        let mut accepted = self.accepted_status.lock().expect("creation cell lock");
+        if let Some(current) = accepted.as_ref() {
+            assert!(
+                Arc::ptr_eq(current, &status),
+                "one creation has exactly one actual Task owner"
+            );
+        } else {
+            *accepted = Some(status);
+        }
     }
 
     pub(super) fn accepted_status(&self) -> Option<Arc<TaskStatusOwner>> {
@@ -241,79 +271,236 @@ impl CreationCell {
             .expect("creation cell lock")
             .clone()
     }
-
-    pub(super) fn request_stop(&self, stop: PreparationStop) -> bool {
-        let mut decision = self.decision.decision.lock().expect("creation cell lock");
-        if decision.failure.is_some() {
-            return false;
-        }
-        if decision.stop.is_none() || matches!(stop, PreparationStop::Abort(_)) {
-            decision.stop = Some(stop);
-        }
-        self.decision.changed.notify_all();
-        true
-    }
-
-    pub(crate) fn stop(&self) -> Option<PreparationStop> {
-        self.decision.stop()
-    }
-
-    pub(crate) fn control_state(&self) -> &CreationControlState {
-        &self.decision
-    }
 }
 
 #[cfg(test)]
 mod preparation_stop_view_tests {
     use super::*;
 
+    fn fixture_identity() -> TaskIdentity {
+        use novarocks_types::identity::{AttemptId, BackendProcessId, QueryExecutionId, QueryId};
+        let execution =
+            QueryExecutionId::new(QueryId::new(310, 311), AttemptId::new(1).unwrap()).unwrap();
+        TaskIdentity::new(
+            execution,
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            BackendProcessId::new_v7(),
+        )
+    }
+    fn accepted_owner() -> Arc<TaskStatusOwner> {
+        Arc::new(TaskStatusOwner::new(
+            fixture_identity(),
+            Arc::new(TaskStatusSource::new()),
+            Arc::new(crate::ManualClock::new()),
+            std::time::Duration::ZERO,
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
+        ))
+    }
+
     #[test]
-    fn borrowed_preparation_view_observes_original_cancel_and_abort_precedence() {
-        let cell = CreationCell::new();
-        let view = cell.preparation_stop_view(std::time::Duration::from_millis(1));
-        assert_eq!(view.stop_cause(), None);
-        assert!(cell.request_stop(PreparationStop::Cancel(
-            CancelReason::UpstreamNoLongerNeeded
-        )));
-        assert_eq!(view.stop_cause(), Some(TaskPreparationStopCause::Cancelled));
-        assert!(cell.request_stop(PreparationStop::Abort(AbortCause::LeaseExpired)));
-        assert_eq!(
-            view.stop_cause(),
-            Some(TaskPreparationStopCause::LeaseExpired)
+    fn a_real_accepted_task_failure_interrupts_the_preparation_view() {
+        use novarocks_execution_contract::{ConclusionDecision, TaskFailurePhase};
+        let owner = accepted_owner();
+        let cell = CreationCell::for_accepted_fixture(&owner);
+        cell.accept(owner.clone());
+        let view = cell.preparation_stop_view(std::time::Duration::ZERO);
+        let original = novarocks_execution::runtime::fragment::ExecutionFailure::from(
+            novarocks_functions::KernelFailure::ResourceExhausted,
         );
+        let receipt = owner
+            .execution_control(TaskFailurePhase::Preparation)
+            .report_failure(original.clone());
+        assert_eq!(receipt.decision, ConclusionDecision::Accept);
+        assert!(std::ptr::eq(
+            receipt.accepted.originating_failure().unwrap().cause(),
+            original.cause()
+        ));
+        let loan = view.borrow_control();
+        for observed in [loan.checkpoint().unwrap_err(), loan.wait().unwrap_err()] {
+            assert!(std::ptr::eq(observed.cause(), original.cause()));
+            assert_eq!(
+                novarocks_execution_contract::failure::FailureProjection::failure_fact(&observed),
+                novarocks_execution_contract::failure::FailureProjection::failure_fact(&original)
+            );
+        }
+    }
+
+    #[test]
+    fn an_accepted_task_cancel_interrupts_preparation_without_a_second_cell_decision() {
+        use novarocks_execution_contract::{TaskConclusionPort, TaskConclusionProposal};
+        let owner = accepted_owner();
+        let cell = CreationCell::for_accepted_fixture(&owner);
+        cell.accept(owner.clone());
+        let view = cell.preparation_stop_view(std::time::Duration::ZERO);
+        owner.submit(TaskConclusionProposal::Canceled(
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        assert!(
+            view.borrow_control().checkpoint().is_err(),
+            "the Task owner, rather than a duplicate Cell flag, decides post-Accept stop"
+        );
+    }
+
+    #[test]
+    fn a_preparation_view_does_not_keep_an_exited_task_owner_alive_or_authorize_new_work() {
+        let owner = accepted_owner();
+        let cell = CreationCell::for_accepted_fixture(&owner);
+        let weak = Arc::downgrade(&owner);
+        cell.accept(owner.clone());
+        let view = cell.preparation_stop_view(std::time::Duration::ZERO);
+        drop(owner);
         drop(cell);
+        assert!(
+            weak.upgrade().is_none(),
+            "immutable metadata may retain a weak observer only"
+        );
+        assert!(
+            view.borrow_control().checkpoint().is_err(),
+            "an expired Task cannot authorize new preparation work"
+        );
+    }
+
+    #[test]
+    fn an_active_preparation_loan_pins_only_its_actual_work_and_reads_later_refinement() {
+        use novarocks_execution_contract::{
+            TaskConclusionPort, TaskConclusionProposal, TaskFailurePhase,
+        };
+        let owner = accepted_owner();
+        let cell = CreationCell::for_accepted_fixture(&owner);
+        let weak = Arc::downgrade(&owner);
+        cell.accept(owner.clone());
+        let view = cell.preparation_stop_view(std::time::Duration::ZERO);
+        let loan = view.borrow_control();
+        owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let observed = loan.checkpoint().unwrap_err();
         assert_eq!(
-            view.stop_cause(),
-            Some(TaskPreparationStopCause::LeaseExpired)
+            novarocks_execution_contract::failure::FailureProjection::failure_fact(&observed)
+                .evidence(),
+            novarocks_execution_contract::failure::FailureEvidence::StopObservation
+        );
+        let original: novarocks_execution::runtime::fragment::ExecutionFailure =
+            novarocks_functions::KernelFailure::ResourceExhausted.into();
+        owner
+            .execution_control(TaskFailurePhase::Preparation)
+            .report_failure(original.clone());
+        assert!(
+            std::ptr::eq(loan.checkpoint().unwrap_err().cause(), original.cause()),
+            "a cached control observation cannot hide legal originating refinement"
+        );
+        drop(owner);
+        drop(cell);
+        assert!(
+            weak.upgrade().is_some(),
+            "the real in-progress operation keeps its short loan"
+        );
+        drop(loan);
+        assert!(
+            weak.upgrade().is_none(),
+            "immutable views retain no Task owner"
+        );
+        assert!(view.borrow_control().checkpoint().is_err());
+    }
+
+    #[test]
+    fn borrowed_preparation_view_keeps_the_original_accepted_cancel() {
+        use novarocks_execution_contract::{
+            TaskConclusion, TaskConclusionPort, TaskConclusionProposal,
+        };
+        let owner = accepted_owner();
+        let cell = CreationCell::for_accepted_fixture(&owner);
+        cell.accept(owner.clone());
+        let view = cell.preparation_stop_view(std::time::Duration::from_millis(1));
+        owner.submit(TaskConclusionProposal::Canceled(
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        let first = view.borrow_control();
+        let observed = first.checkpoint().unwrap_err();
+        owner.submit(TaskConclusionProposal::Aborted(AbortCause::LeaseExpired));
+        drop(cell);
+        assert!(owner.accepted().unwrap().originating_failure().is_none());
+        assert_eq!(
+            owner.accepted().unwrap().neutral().conclusion(),
+            &TaskConclusion::Terminated(TerminationDetail::Canceled(
+                CancelReason::UpstreamNoLongerNeeded
+            ))
+        );
+        assert_eq!(
+            novarocks_execution_contract::failure::FailureProjection::failure_fact(&observed)
+                .evidence(),
+            novarocks_execution_contract::failure::FailureEvidence::StopObservation
         );
     }
 
     #[test]
     fn explicit_zero_cadence_preserves_immediate_poll_and_original_stop() {
-        let cell = CreationCell::new();
+        use novarocks_execution_contract::{TaskConclusionPort, TaskConclusionProposal};
+        let owner = accepted_owner();
+        let cell = CreationCell::for_accepted_fixture(&owner);
+        cell.accept(owner.clone());
         let view = cell.preparation_stop_view(std::time::Duration::ZERO);
         assert!(view.borrow_control().wait().is_ok());
         assert!(view.borrow_control().checkpoint().is_ok());
-        assert!(cell.request_stop(PreparationStop::Abort(AbortCause::LeaseExpired)));
-        assert_eq!(
-            view.borrow_control().wait(),
-            Err(PreparationStop::Abort(AbortCause::LeaseExpired))
-        );
+        owner.submit(TaskConclusionProposal::Aborted(AbortCause::LeaseExpired));
+        let loan = view.borrow_control();
+        let original = loan.checkpoint().unwrap_err();
+        assert!(std::ptr::eq(
+            loan.wait().unwrap_err().cause(),
+            original.cause()
+        ));
     }
 
     #[test]
-    fn claimed_failure_remains_primary_and_does_not_publish_a_stop() {
-        let cell = CreationCell::new();
-        let view = cell.preparation_stop_view(std::time::Duration::from_millis(1));
-        cell.claim_failure(CreationFailure {
-            outcome: OperationOutcome::InvalidStateOrRequest,
-            detail: "original preparation failure".to_string(),
-            category: TaskFailureCategory::Execution,
-        });
-        assert!(!cell.request_stop(PreparationStop::Abort(AbortCause::LeaseExpired)));
-        assert_eq!(view.stop_cause(), None);
+    fn cached_domain_refusal_replays_the_exact_cause_without_task_acceptance() {
+        use novarocks_execution_contract::failure::FailureProjection;
+        use novarocks_execution_contract::operation::{DomainFailureOutcome, OperationResult};
+        let source: novarocks_execution::runtime::fragment::ExecutionFailure =
+            novarocks_functions::KernelFailure::ResourceExhausted.into();
+        let original = source.clone();
+        let rejection =
+            crate::HostRejection::from_failure(TaskFailureCategory::ResourceExhausted, source);
+        let frozen = rejection.operation_failure();
+        assert!(std::ptr::eq(
+            rejection.into_failure().cause(),
+            original.cause()
+        ));
+        let cell = CreationCell::new(
+            fixture_identity(),
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
+        );
+        cell.fail(CreationFailure::domain(
+            DomainFailureOutcome::ResourceExhausted,
+            frozen.clone(),
+        ));
+        let failure = cell.failure().unwrap();
+        let first: crate::OperationReceipt<()> = failure.receipt(TaskOperationId::new_v7());
+        let replay: crate::OperationReceipt<()> =
+            cell.failure().unwrap().receipt(TaskOperationId::new_v7());
+        for receipt in [&first, &replay] {
+            let OperationResult::DomainFailure { outcome, failure } = receipt.result() else {
+                panic!("cached domain cause")
+            };
+            assert_eq!(*outcome, DomainFailureOutcome::ResourceExhausted);
+            assert_eq!(failure, &frozen);
+            assert_eq!(failure.fact(), original.failure_fact());
+            assert!(receipt.acknowledgement().is_none());
+        }
+        assert!(cell.accepted_status().is_none());
+    }
+
+    #[test]
+    fn preaccept_creation_failure_is_an_operation_receipt_without_task_authority() {
+        let cell = CreationCell::new(
+            fixture_identity(),
+            Arc::new(novarocks_execution::runtime::execution_health::ExecutionHealth::default()),
+        );
+        cell.fail(CreationFailure::verdict(
+            OperationOutcome::InvalidStateOrRequest,
+            "original preparation failure",
+        ));
+        assert!(cell.accepted_status().is_none());
         assert_eq!(
-            cell.failure().unwrap().detail,
+            cell.failure().unwrap().result.detail().unwrap().as_str(),
             "original preparation failure"
         );
     }

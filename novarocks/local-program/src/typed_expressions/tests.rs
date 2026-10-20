@@ -190,7 +190,7 @@ impl PureCompileControl for Control {
         assert_eq!(phase, CompilePhase::LowerProgram);
         assert!(units <= 256);
         if self.at == Some(units) {
-            Err(self.failure.unwrap())
+            Err(self.failure.clone().unwrap())
         } else {
             Ok(())
         }
@@ -505,11 +505,11 @@ fn signature_type_work_uses_one_scope_and_preserves_all_three_control_failures()
                     main_types(vec![value(DataType::Boolean, false); 300]),
                     &Control {
                         at: Some(at),
-                        failure: Some(failure)
+                        failure: Some(failure.clone())
                     }
                 )
                 .unwrap_err(),
-                ProgramExpressionTypeError::Control(failure)
+                ProgramExpressionTypeError::Control(failure.clone())
             );
         }
     }
@@ -756,11 +756,11 @@ fn shared_constant_definition_control_never_becomes_a_partial_typed_program() {
                     main_types(vec![value(DataType::Boolean, false); 320]),
                     &Control {
                         at: Some(at),
-                        failure: Some(error)
+                        failure: Some(error.clone())
                     },
                 )
                 .unwrap_err(),
-                ProgramExpressionTypeError::Control(error)
+                ProgramExpressionTypeError::Control(error.clone())
             );
         }
     }

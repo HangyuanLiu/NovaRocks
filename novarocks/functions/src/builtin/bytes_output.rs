@@ -127,7 +127,7 @@ pub fn build_bytes_output_observed<E>(
 pub fn build_bytes_output_latin1(
     values: Vec<Option<Vec<u8>>>,
     target: Option<&DataType>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::KernelFailure> {
     Ok(infallible(build_bytes_output_observed(
         values,
         target,
@@ -138,7 +138,7 @@ pub fn build_bytes_output_latin1(
 pub fn build_bytes_output_lossy(
     values: Vec<Option<Vec<u8>>>,
     target: Option<&DataType>,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::KernelFailure> {
     Ok(infallible(build_bytes_output_observed(
         values,
         target,

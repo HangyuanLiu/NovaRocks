@@ -34,11 +34,9 @@ use super::distinct_set_shared::{DistinctSetSemantics, DistinctSetSharedState};
 pub struct IntersectSemantics;
 
 impl DistinctSetSemantics for IntersectSemantics {
-    type Marker = u16;
+    type Marker = usize;
 
     const NODE_NAME: &'static str = "INTERSECT_NODE";
-    const GROUP_ID_SEQUENCE_MISMATCH: &'static str = "intersect group id sequence mismatch";
-    const GROUP_ID_OUT_OF_BOUNDS: &'static str = "intersect hit_times group id out of bounds";
     const SINK_OPERATOR_NAME: &'static str = "IntersectSink";
     const SOURCE_OPERATOR_NAME: &'static str = "IntersectSource";
     const SOURCE_REJECT_INPUT_ERROR: &'static str =
@@ -49,21 +47,34 @@ impl DistinctSetSemantics for IntersectSemantics {
         0
     }
 
-    fn apply_probe(marker: &mut Self::Marker, stage: usize) -> Result<(), String> {
-        let stage_u16 = u16::try_from(stage).map_err(|_| "intersect stage overflow".to_string())?;
-        let prev_u16 = u16::try_from(stage.saturating_sub(1))
-            .map_err(|_| "intersect stage overflow".to_string())?;
-        if *marker == prev_u16 {
-            *marker = stage_u16;
+    fn apply_probe(marker: &mut Self::Marker, stage: usize) {
+        if *marker == stage.saturating_sub(1) {
+            *marker = stage;
         }
-        Ok(())
     }
-
-    fn marker_selected(marker: &Self::Marker, stage_total: usize) -> Result<bool, String> {
-        let final_hit = u16::try_from(stage_total.saturating_sub(1))
-            .map_err(|_| "intersect stage overflow".to_string())?;
-        Ok(*marker == final_hit)
+    fn marker_selected(marker: &Self::Marker, stage_total: usize) -> bool {
+        *marker == stage_total.saturating_sub(1)
     }
 }
 
 pub(crate) type IntersectSharedState = DistinctSetSharedState<IntersectSemantics>;
+
+#[cfg(test)]
+mod stage_marker_tests {
+    use super::*;
+    #[test]
+    fn intersect_markers_follow_actual_stage_indices_without_u16_truncation() {
+        let stage = u16::MAX as usize + 2;
+        let mut marker = stage - 1;
+        IntersectSemantics::apply_probe(&mut marker, stage);
+        assert!(IntersectSemantics::marker_selected(&marker, stage + 1));
+        IntersectSemantics::apply_probe(&mut marker, stage);
+        assert_eq!(marker, stage, "replayed stage cannot advance twice");
+        let mut missing_previous = stage - 2;
+        IntersectSemantics::apply_probe(&mut missing_previous, stage);
+        assert!(!IntersectSemantics::marker_selected(
+            &missing_previous,
+            stage + 1
+        ));
+    }
+}

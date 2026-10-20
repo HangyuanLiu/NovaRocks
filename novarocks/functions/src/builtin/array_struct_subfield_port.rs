@@ -26,11 +26,8 @@ pub(super) struct ArrayStructSubfieldPort<'work, 'control, 'rows> {
 }
 impl ProjectionPort for ArrayStructSubfieldPort<'_, '_, '_> {
     type Failure = ScalarInvocationFailure;
-    fn diagnostic(&mut self, original: fmt::Arguments<'_>) -> Self::Failure {
-        self.diagnostics.diagnostic(original)
-    }
-    fn arrow_error(&mut self, original: arrow_schema::ArrowError) -> Self::Failure {
-        self.diagnostics.arrow_error(original)
+    fn value_error(&mut self, original: fmt::Arguments<'_>) -> Self::Failure {
+        self.diagnostics.value_error(original)
     }
     fn step(&mut self) -> Result<(), Self::Failure> {
         self.diagnostics.step()

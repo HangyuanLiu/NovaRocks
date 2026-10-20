@@ -1329,11 +1329,14 @@ impl QueryTaskExecution {
                     .is_some_and(QueryContextOwner::establish_acknowledged);
                 let settlement = task.on_create_ack(ack, self.clock.now(), context_established)?;
                 if !matches!(settlement, CreateSettlement::Created) {
-                    if let CreateSettlement::FailedClosed(outcome) = settlement {
+                    if let CreateSettlement::FailedClosed(_) = settlement {
                         return Err(TaskExecutionError::OperationFailed {
+                            context,
+                            operation_id: ack.operation_id(),
                             kind: OperationKind::CreateTask,
-                            outcome,
-                            detail: ack.detail().map(|d| d.as_str().to_owned()),
+                            rejection: ack
+                                .worker_header()
+                                .expect("a checked Worker verdict has its original branch"),
                         });
                     }
                     // A genuinely unknown outcome leaves the identical request
@@ -1351,13 +1354,14 @@ impl QueryTaskExecution {
                 Ok(())
             }
             OperationKind::UpdateTask => match task.on_update_ack(ack)? {
-                UpdateSettlement::FailedClosed(outcome) => {
-                    Err(TaskExecutionError::OperationFailed {
-                        kind: OperationKind::UpdateTask,
-                        outcome,
-                        detail: ack.detail().map(|d| d.as_str().to_owned()),
-                    })
-                }
+                UpdateSettlement::FailedClosed(_) => Err(TaskExecutionError::OperationFailed {
+                    context,
+                    operation_id: ack.operation_id(),
+                    kind: OperationKind::UpdateTask,
+                    rejection: ack
+                        .worker_header()
+                        .expect("a checked Worker verdict has its original branch"),
+                }),
                 UpdateSettlement::AwaitingTerminalStatus => {
                     self.status_reconciliations.insert(context);
                     Ok(())
@@ -1405,11 +1409,14 @@ impl QueryTaskExecution {
                 owner
                     .on_release_ack(ack, now)
                     .and_then(|settlement| match settlement {
-                        ReleaseSettlement::FailedClosed(outcome) => {
+                        ReleaseSettlement::FailedClosed(_) => {
                             Err(TaskExecutionError::OperationFailed {
+                                context,
+                                operation_id: ack.operation_id(),
                                 kind: OperationKind::ReleaseQueryContext,
-                                outcome,
-                                detail: ack.detail().map(|d| d.as_str().to_owned()),
+                                rejection: ack
+                                    .worker_header()
+                                    .expect("a checked Worker verdict has its original branch"),
                             })
                         }
                         _ => Ok(()),
@@ -2102,7 +2109,10 @@ impl QueryTaskExecution {
         if let Some(terminal) = task.terminal_report() {
             if let Some(detail) = &terminal.termination
                 && !detail.is_success_compatible()
-                && matches!(self.failure.latch(detail.clone()), LatchOutcome::Won)
+                && matches!(
+                    self.failure.latch(identity, detail.clone()),
+                    LatchOutcome::Won
+                )
             {
                 // The first cause wins and is the one every observer sees.
             }
@@ -2124,7 +2134,7 @@ impl QueryTaskExecution {
             .filter(|detail| !detail.is_success_compatible())
             .cloned();
         if let Some(detail) = detail {
-            self.failure.latch(detail);
+            self.failure.latch(identity, detail);
             // Freeze normal admission in the fact's own serial turn. Returning
             // W cannot authorize another Create after the attempt has failed.
             self.begin_terminal_cleanup();
@@ -2371,13 +2381,20 @@ impl QueryTaskExecution {
         self.attempt_drain_facts().drained()
     }
 
-    /// Whether the exact Worker context acknowledged release after all of its
-    /// local Tasks became terminal. This is a positive per-context stop fact;
-    /// absence remains unknown and must not be inferred from transport loss.
-    pub(crate) fn context_released(&self, context: QueryContextRef) -> bool {
-        self.owners
-            .get(&context)
-            .is_some_and(QueryContextOwner::is_released)
+    /// The exact immutable Worker proof applied by the original covered owner.
+    /// Abort/Release acknowledgements settle control operations; they do not
+    /// prove that preparation, root payload or asynchronous work really exited.
+    pub(crate) fn context_convergence_receipt(
+        &self,
+        context: QueryContextRef,
+    ) -> Option<QueryContextConvergenceReceipt> {
+        self.covered_observation.get(&context)?.context_convergence
+    }
+
+    pub(crate) fn worker_contexts_stopped(&self) -> bool {
+        self.graph
+            .contexts()
+            .all(|&context| self.context_convergence_receipt(context).is_some())
     }
 
     /// A context absent from the Worker for the entire attempt can close
@@ -2423,6 +2440,12 @@ impl QueryTaskExecution {
     /// The first termination cause of this attempt, if one was latched.
     pub fn failure_cause(&self) -> Option<&TerminationDetail> {
         self.failure.cause()
+    }
+
+    pub(crate) fn selected_task_failure(
+        &self,
+    ) -> Option<&novarocks_query_application::coordination::SelectedTaskTermination> {
+        self.failure.selected()
     }
 
     /// Admits candidates in order, one serial pass.

@@ -67,7 +67,7 @@ pub enum AggregateTopNBoundaryError {
     },
     NonOrderedContract,
     UnsupportedOrderKeyType {
-        actual: DataType,
+        actual: novarocks_failure_contract::BoundedDetail,
     },
     GroupIdentityOutOfSequence {
         expected: usize,
@@ -83,10 +83,11 @@ pub enum AggregateTopNBoundaryError {
         len: usize,
     },
     CandidateArrayTypeMismatch {
-        expected: DataType,
-        actual: DataType,
+        expected: novarocks_failure_contract::BoundedDetail,
+        actual: novarocks_failure_contract::BoundedDetail,
     },
     InvalidCandidateValue(String),
+    CandidateCarrier(novarocks_functions::KernelFailure),
     BoundLoosened,
     Finished,
 }
@@ -108,7 +109,7 @@ impl fmt::Display for AggregateTopNBoundaryError {
             }
             Self::UnsupportedOrderKeyType { actual } => write!(
                 formatter,
-                "aggregate TopN boundary does not support order key type {actual:?}"
+                "aggregate TopN boundary does not support order key type {actual}"
             ),
             Self::GroupIdentityOutOfSequence { expected, actual } => write!(
                 formatter,
@@ -128,8 +129,9 @@ impl fmt::Display for AggregateTopNBoundaryError {
             ),
             Self::CandidateArrayTypeMismatch { expected, actual } => write!(
                 formatter,
-                "aggregate TopN candidate type mismatch: expected={expected:?} actual={actual:?}"
+                "aggregate TopN candidate type mismatch: expected={expected:?} actual={actual}"
             ),
+            Self::CandidateCarrier(source) => source.fmt(formatter),
             Self::InvalidCandidateValue(detail) => {
                 write!(
                     formatter,
@@ -147,11 +149,45 @@ impl fmt::Display for AggregateTopNBoundaryError {
     }
 }
 
-impl std::error::Error for AggregateTopNBoundaryError {}
+impl std::error::Error for AggregateTopNBoundaryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CandidateCarrier(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 impl From<OrderedTupleError> for AggregateTopNBoundaryError {
     fn from(error: OrderedTupleError) -> Self {
         Self::CandidateContractMismatch(error)
+    }
+}
+
+fn topn_type_description(value: &DataType) -> novarocks_failure_contract::BoundedDetail {
+    novarocks_failure_contract::BoundedDetail::truncating_display(format_args!("{value:?}"))
+}
+impl novarocks_failure_contract::FailureProjection for AggregateTopNBoundaryError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        let reason = match self {
+            Self::UnsupportedKeyArity { .. } => ExecutionReason::TopNKeyArity,
+            Self::NonOrderedContract => ExecutionReason::TopNNonOrdered,
+            Self::UnsupportedOrderKeyType { .. } => ExecutionReason::TopNKeyType,
+            Self::GroupIdentityOutOfSequence { .. } => ExecutionReason::TopNGroupSequence,
+            Self::CandidateContractMismatch(_) => ExecutionReason::TopNCandidateContract,
+            Self::MissingGroupKey { .. } => ExecutionReason::TopNMissingKey,
+            Self::CandidateRowOutOfBounds { .. } => ExecutionReason::TopNRowBounds,
+            Self::CandidateArrayTypeMismatch { .. } => ExecutionReason::TopNArrayType,
+            Self::CandidateCarrier(source) => return source.failure_fact(),
+            Self::InvalidCandidateValue(_) => ExecutionReason::TopNCandidateValue,
+            Self::BoundLoosened => ExecutionReason::TopNBoundLoosened,
+            Self::Finished => ExecutionReason::TopNAfterFinish,
+        };
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            reason.reason(),
+        )
     }
 }
 
@@ -252,9 +288,11 @@ impl TopNBoundaryStorage for OwnedTopNBoundaryStorage {
         control: &dyn KernelEvaluationControl,
     ) -> Result<(), Self::Error> {
         control.checkpoint(0)?;
-        self.0
-            .try_reserve(1)
-            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        self.0.try_reserve(1).map_err(|source| {
+            self.0
+                .allocator()
+                .allocation_error("reserve ordered TopN candidates", source)
+        })?;
         control.checkpoint(0)?;
         self.0.push(AggregateTopNCandidate { tuple });
         Ok(())
@@ -476,7 +514,7 @@ impl OwnedAggregateTopNBoundaryState {
         let data_type = contract.keys()[0].data_type();
         if !novarocks_local_program::is_aggregate_topn_key_carrier(data_type) {
             return Err(AggregateTopNBoundaryError::UnsupportedOrderKeyType {
-                actual: data_type.clone(),
+                actual: topn_type_description(data_type),
             }
             .into());
         }
@@ -591,7 +629,7 @@ fn validate_topn_boundary_contract(
             if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH
     ) {
         return Err(AggregateTopNBoundaryError::UnsupportedOrderKeyType {
-            actual: data_type.clone(),
+            actual: topn_type_description(data_type),
         });
     }
     Ok(())
@@ -703,14 +741,15 @@ fn scalar_from_group_array(
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .expect("matching Arrow FixedSizeBinary type");
             OrderedScalarRef::LargeInt(
-                novarocks_types::largeint::value_at(array, row)
-                    .map_err(AggregateTopNBoundaryError::InvalidCandidateValue)?,
+                novarocks_types::largeint::value_at(array, row).map_err(|source| {
+                    AggregateTopNBoundaryError::CandidateCarrier(source.into())
+                })?,
             )
         }
         _ => {
             return Err(AggregateTopNBoundaryError::CandidateArrayTypeMismatch {
-                expected: expected.clone(),
-                actual: array.data_type().clone(),
+                expected: topn_type_description(expected),
+                actual: topn_type_description(array.data_type()),
             });
         }
     })
@@ -724,8 +763,8 @@ fn require_exact_array_type(
         Ok(())
     } else {
         Err(AggregateTopNBoundaryError::CandidateArrayTypeMismatch {
-            expected: expected.clone(),
-            actual: array.data_type().clone(),
+            expected: topn_type_description(expected),
+            actual: topn_type_description(array.data_type()),
         })
     }
 }
@@ -768,8 +807,8 @@ fn utf8_value(array: &ArrayRef, row: usize) -> Result<Option<&str>, AggregateTop
         return Ok((!values.is_null(key)).then(|| values.value(key)));
     }
     Err(AggregateTopNBoundaryError::CandidateArrayTypeMismatch {
-        expected: DataType::Utf8,
-        actual: array.data_type().clone(),
+        expected: topn_type_description(&DataType::Utf8),
+        actual: topn_type_description(array.data_type()),
     })
 }
 
@@ -1073,7 +1112,7 @@ mod tests {
                 runtime_contract(DataType::Float64, SortDirection::Ascending, NullOrder::Last),
             ),
             Err(AggregateTopNBoundaryError::UnsupportedOrderKeyType {
-                actual: DataType::Float64,
+                actual: super::topn_type_description(&DataType::Float64),
             })
         );
 

@@ -170,18 +170,18 @@ impl fmt::Display for NodeCodecError {
 impl std::error::Error for NodeCodecError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Control(e) => Some(e),
-            Self::Properties(e) => Some(e),
-            Self::Type(e) => Some(e),
-            Self::Value(e) => Some(e),
-            Self::Expression(e) => Some(e),
-            Self::Binding(e) => Some(e),
-            Self::Relation(e) => Some(e),
-            Self::Payload(e) => Some(e),
-            Self::Constant(e) => Some(e),
-            Self::Identity(e) => Some(e),
-            Self::Root(error) => Some(error),
-            Self::InvalidShape(_) => None,
+            Self::Control(source) => Some(source),
+            Self::Properties(source) => Some(source),
+            Self::Type(source) => Some(source),
+            Self::Value(source) => Some(source),
+            Self::Expression(source) => Some(source),
+            Self::Binding(source) => Some(source),
+            Self::Relation(source) => Some(source),
+            Self::Payload(source) => Some(source),
+            Self::Constant(source) => Some(source),
+            Self::Identity(source) => Some(source),
+            Self::Root(source) => Some(source),
+            _ => None,
         }
     }
 }

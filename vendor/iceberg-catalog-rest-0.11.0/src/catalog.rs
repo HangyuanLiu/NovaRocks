@@ -133,7 +133,9 @@ impl RestCatalogBuilder {
     /// The builder takes ownership of the manager. The loaded catalog shares it
     /// across authentication sessions and requests.
     pub fn with_auth_manager<M>(mut self, auth_manager: M) -> Self
-    where M: AuthManager + 'static {
+    where
+        M: AuthManager + 'static,
+    {
         self.inner = self.inner.with_auth_manager(auth_manager);
         self
     }
@@ -1530,7 +1532,9 @@ impl RestSessionCatalogBuilder {
     /// The builder takes ownership of the manager. The loaded catalog shares it
     /// across authentication sessions and requests.
     pub fn with_auth_manager<M>(mut self, auth_manager: M) -> Self
-    where M: AuthManager + 'static {
+    where
+        M: AuthManager + 'static,
+    {
         self.auth_manager = Some(Box::new(auth_manager));
         self
     }
@@ -1688,7 +1692,9 @@ mod tests {
     }
 
     fn test_catalog_with<M>(config: RestCatalogConfig, auth_manager: M) -> RestSessionCatalog
-    where M: AuthManager + 'static {
+    where
+        M: AuthManager + 'static,
+    {
         RestSessionCatalog::new(
             config,
             Some(Box::new(auth_manager)),
@@ -4468,9 +4474,10 @@ mod tests {
 
         let namespaces = catalog.list_namespaces(None).await.unwrap();
 
-        assert_eq!(namespaces, vec![
-            NamespaceIdent::from_vec(vec!["ns1".to_string()]).unwrap()
-        ]);
+        assert_eq!(
+            namespaces,
+            vec![NamespaceIdent::from_vec(vec!["ns1".to_string()]).unwrap()]
+        );
 
         config_mock.assert_async().await;
         list_ns_mock.assert_async().await;

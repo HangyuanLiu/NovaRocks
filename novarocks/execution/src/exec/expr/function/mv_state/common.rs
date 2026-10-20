@@ -18,7 +18,11 @@
 use arrow::array::{Array, ArrayRef, BinaryArray, LargeBinaryArray};
 use arrow::datatypes::DataType;
 
-pub(super) fn row_count(fn_name: &str, lhs_len: usize, rhs_len: usize) -> Result<usize, String> {
+pub(super) fn row_count(
+    fn_name: &str,
+    lhs_len: usize,
+    rhs_len: usize,
+) -> Result<usize, crate::runtime::fragment::ExecutionFailure> {
     if lhs_len == rhs_len {
         return Ok(lhs_len);
     }
@@ -28,18 +32,23 @@ pub(super) fn row_count(fn_name: &str, lhs_len: usize, rhs_len: usize) -> Result
     if rhs_len == 1 {
         return Ok(lhs_len);
     }
-    Err(format!(
+    Err(super::failure::contract(format_args!(
         "{fn_name} row count mismatch: lhs_len={lhs_len} rhs_len={rhs_len}"
-    ))
+    )))
 }
 
-pub(super) fn row_index(row: usize, len: usize) -> Result<usize, String> {
+pub(super) fn row_index(
+    row: usize,
+    len: usize,
+) -> Result<usize, crate::runtime::fragment::ExecutionFailure> {
     if len == 1 {
         Ok(0)
     } else if row < len {
         Ok(row)
     } else {
-        Err(format!("row index {row} out of bounds for len {len}"))
+        Err(super::failure::contract(format_args!(
+            "row index {row} out of bounds for len {len}"
+        )))
     }
 }
 
@@ -48,14 +57,16 @@ pub(super) fn binary_value_or_empty<'a>(
     row: usize,
     fn_name: &str,
     arg_idx: usize,
-) -> Result<&'a [u8], String> {
+) -> Result<&'a [u8], crate::runtime::fragment::ExecutionFailure> {
     match array.data_type() {
         DataType::Binary => {
             let arr = array
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .ok_or_else(|| {
-                    format!("{fn_name} downcast BinaryArray failed for arg {arg_idx}")
+                    super::failure::contract(format_args!(
+                        "{fn_name} downcast BinaryArray failed for arg {arg_idx}"
+                    ))
                 })?;
             if arr.is_null(row) {
                 Ok(&[])
@@ -68,7 +79,9 @@ pub(super) fn binary_value_or_empty<'a>(
                 .as_any()
                 .downcast_ref::<LargeBinaryArray>()
                 .ok_or_else(|| {
-                    format!("{fn_name} downcast LargeBinaryArray failed for arg {arg_idx}")
+                    super::failure::contract(format_args!(
+                        "{fn_name} downcast LargeBinaryArray failed for arg {arg_idx}"
+                    ))
                 })?;
             if arr.is_null(row) {
                 Ok(&[])
@@ -76,8 +89,8 @@ pub(super) fn binary_value_or_empty<'a>(
                 Ok(arr.value(row))
             }
         }
-        other => Err(format!(
+        other => Err(super::failure::contract(format_args!(
             "{fn_name} expects Binary or LargeBinary input for arg {arg_idx}, got {other:?}"
-        )),
+        ))),
     }
 }

@@ -143,6 +143,7 @@ pub struct AnalyzeError {
     message: String,
     span: Option<Span>,
     control: Option<novarocks_type_contract::CompileControlError>,
+    source: Option<novarocks_failure_contract::SharedFailureCause>,
 }
 
 impl AnalyzeError {
@@ -152,6 +153,7 @@ impl AnalyzeError {
             message: message.into(),
             span: Some(span),
             control: None,
+            source: None,
         }
     }
 
@@ -171,6 +173,54 @@ impl AnalyzeError {
         Self::at(AnalyzeErrorKind::TypeMismatch, message, span)
     }
 
+    /// Keep semantic binding context independent of the originating facts.
+    pub(crate) fn type_mismatch_source<E>(cause: E, span: Span) -> Self
+    where
+        E: std::error::Error
+            + novarocks_failure_contract::OuterFailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut error = Self::domain_source(cause);
+        error.kind = AnalyzeErrorKind::TypeMismatch;
+        error.span = Some(span);
+        error
+    }
+    pub(crate) fn domain_source<E>(cause: E) -> Self
+    where
+        E: std::error::Error
+            + novarocks_failure_contract::OuterFailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        let source = novarocks_failure_contract::SharedFailureCause::new(cause);
+        Self {
+            kind: AnalyzeErrorKind::Internal,
+            message: source.detail().to_owned(),
+            span: None,
+            control: None,
+            source: Some(source),
+        }
+    }
+    pub fn source_failure(&self) -> Option<&novarocks_failure_contract::SharedFailureCause> {
+        self.source.as_ref()
+    }
+
+    pub(crate) fn invalid_literal_source<E>(cause: E, span: Span) -> Self
+    where
+        E: std::error::Error
+            + novarocks_failure_contract::OuterFailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut error = Self::domain_source(cause);
+        error.kind = AnalyzeErrorKind::InvalidLiteral;
+        error.span = Some(span);
+        error
+    }
     pub fn invalid_literal(message: impl Into<String>, span: Span) -> Self {
         Self::at(AnalyzeErrorKind::InvalidLiteral, message, span)
     }
@@ -199,6 +249,7 @@ impl AnalyzeError {
             message: message.into(),
             span: None,
             control: None,
+            source: None,
         }
     }
 
@@ -210,18 +261,35 @@ impl AnalyzeError {
             message: error.to_string(),
             span: None,
             control: Some(error),
+            source: None,
         }
     }
 
     pub(crate) fn function_binding(error: novarocks_functions::FunctionBindingError) -> Self {
         match error {
             novarocks_functions::FunctionBindingError::Control(error) => Self::control(error),
+            error @ novarocks_functions::FunctionBindingError::Constant(_) => {
+                let source = novarocks_failure_contract::SharedFailureCause::new(error);
+                Self {
+                    kind: AnalyzeErrorKind::Internal,
+                    message: source.detail().to_owned(),
+                    span: None,
+                    control: None,
+                    source: Some(source),
+                }
+            }
+            novarocks_functions::FunctionBindingError::VariantTargetType(source) => {
+                let mut error = Self::domain_source(source);
+                error.kind = AnalyzeErrorKind::InvalidLiteral;
+                error
+            }
             error @ novarocks_functions::FunctionBindingError::UnavailableImplementation(_) => {
                 Self {
                     kind: AnalyzeErrorKind::UnavailableImplementation,
                     message: error.to_string(),
                     span: None,
                     control: None,
+                    source: None,
                 }
             }
             error => Self::internal(error.to_string()),
@@ -245,6 +313,12 @@ impl AnalyzeError {
                 span: Some(span),
                 ..self
             }
+        } else if self.source.is_some() {
+            Self {
+                kind: AnalyzeErrorKind::TypeMismatch,
+                span: Some(span),
+                ..self
+            }
         } else {
             Self::type_mismatch(self.message, span)
         }
@@ -258,13 +332,19 @@ impl AnalyzeError {
                 span: Some(span),
                 ..self
             }
+        } else if self.source.is_some() {
+            Self {
+                kind: AnalyzeErrorKind::InvalidArgument,
+                span: Some(span),
+                ..self
+            }
         } else {
             Self::invalid_argument(self.message, span)
         }
     }
 
-    pub const fn control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
-        self.control
+    pub fn control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
+        self.control.clone()
     }
 
     pub const fn kind(&self) -> AnalyzeErrorKind {
@@ -306,10 +386,39 @@ impl fmt::Display for AnalyzeError {
     }
 }
 
-impl std::error::Error for AnalyzeError {}
+impl std::error::Error for AnalyzeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|source| source as _)
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn original_coercion_fact_survives_analyze_context_and_clone() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let cause = novarocks_type_contract::decimal_compare_type(
+            &arrow::datatypes::DataType::Decimal256(76, 0),
+            &arrow::datatypes::DataType::Decimal256(76, 38),
+        )
+        .unwrap_err();
+        let fact = cause.failure_fact();
+        let error = AnalyzeError::type_mismatch_source(cause, Span::new(7, 8));
+        let cloned = error.clone().at_invalid_argument(Span::new(9, 10));
+        assert_eq!(error.source_failure(), cloned.source_failure());
+        assert_eq!(cloned.source_failure().unwrap().failure_fact(), fact);
+        assert_eq!(fact.class(), FailureClass::Representation);
+        assert_eq!(cloned.span(), Some(Span::new(9, 10)));
+        assert_eq!(cloned.kind(), AnalyzeErrorKind::InvalidArgument);
+        assert!(
+            cloned
+                .source_failure()
+                .unwrap()
+                .downcast_ref::<novarocks_type_contract::ComparisonCoercionFailure>()
+                .is_some()
+        );
+    }
+
     use super::*;
 
     #[test]

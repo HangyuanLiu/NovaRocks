@@ -121,6 +121,11 @@ pub enum ExecutionFunctionSetError {
         overload: AggregateOverloadIdentity,
         message: Box<str>,
     },
+    PrepareAggregateSource {
+        canonical_name: Box<str>,
+        overload: AggregateOverloadIdentity,
+        source: crate::runtime::fragment::ExecutionFailure,
+    },
 }
 
 impl fmt::Display for ExecutionFunctionSetError {
@@ -194,6 +199,15 @@ impl fmt::Display for ExecutionFunctionSetError {
                 formatter,
                 "aggregate `{canonical_name}` resolved signature drift: planned={planned:?}, local={local:?}"
             ),
+            Self::PrepareAggregateSource {
+                canonical_name,
+                overload,
+                source,
+            } => write!(
+                formatter,
+                "prepare aggregate `{canonical_name}` overload `{}`: {source}",
+                overload.as_str()
+            ),
             Self::PrepareAggregate {
                 canonical_name,
                 overload,
@@ -207,7 +221,29 @@ impl fmt::Display for ExecutionFunctionSetError {
     }
 }
 
-impl std::error::Error for ExecutionFunctionSetError {}
+impl std::error::Error for ExecutionFunctionSetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Catalog(source) => Some(source),
+            Self::FunctionIdentity(source) => Some(source),
+            Self::PrepareAggregateSource { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ExecutionFunctionSetError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        match self {
+            Self::Catalog(source) => source.failure_fact(),
+            Self::FunctionIdentity(source) => source.failure_fact(),
+            Self::PrepareAggregateSource { source, .. } => source.failure_fact(),
+            _ => novarocks_failure_contract::FailureFact::new(
+                novarocks_failure_contract::FailureClass::Invariant,
+                crate::runtime::fragment::ExecutionReason::AggregateRegistryContract.reason(),
+            ),
+        }
+    }
+}
 
 impl From<FunctionCatalogError> for ExecutionFunctionSetError {
     fn from(value: FunctionCatalogError) -> Self {
@@ -221,15 +257,25 @@ impl From<novarocks_type_contract::FunctionIdentityError> for ExecutionFunctionS
     }
 }
 
+fn aggregate_prepare_contract(
+    detail: impl Into<String>,
+) -> crate::runtime::fragment::ExecutionFailure {
+    crate::exec::fragment::error::ExecPlanBuildError::new(
+        crate::exec::fragment::error::ExecPlanInvariant::Expression,
+        detail,
+    )
+    .into()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PreparedAggregateError {
     StatePointerCount { expected: usize, actual: usize },
-    Input(String),
-    CreateState(String),
-    Update(String),
-    Merge(String),
-    BuildIntermediate(String),
-    BuildFinal(String),
+    Input(crate::runtime::fragment::ExecutionFailure),
+    CreateState(crate::runtime::fragment::ExecutionFailure),
+    Update(crate::runtime::fragment::ExecutionFailure),
+    Merge(crate::runtime::fragment::ExecutionFailure),
+    BuildIntermediate(crate::runtime::fragment::ExecutionFailure),
+    BuildFinal(crate::runtime::fragment::ExecutionFailure),
 }
 
 impl fmt::Display for PreparedAggregateError {
@@ -258,7 +304,35 @@ impl fmt::Display for PreparedAggregateError {
     }
 }
 
-impl std::error::Error for PreparedAggregateError {}
+impl std::error::Error for PreparedAggregateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::StatePointerCount { .. } => None,
+            Self::Input(source)
+            | Self::CreateState(source)
+            | Self::Update(source)
+            | Self::Merge(source)
+            | Self::BuildIntermediate(source)
+            | Self::BuildFinal(source) => Some(source),
+        }
+    }
+}
+impl novarocks_failure_contract::FailureProjection for PreparedAggregateError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        match self {
+            Self::StatePointerCount { .. } => novarocks_failure_contract::FailureFact::new(
+                novarocks_failure_contract::FailureClass::Invariant,
+                crate::runtime::fragment::ExecutionReason::AggregateStatePointerCount.reason(),
+            ),
+            Self::Input(source)
+            | Self::CreateState(source)
+            | Self::Update(source)
+            | Self::Merge(source)
+            | Self::BuildIntermediate(source)
+            | Self::BuildFinal(source) => source.failure_fact(),
+        }
+    }
+}
 
 pub struct ExecutionFunctionSetBuilder {
     catalog: EngineFunctionCatalogBuilder,
@@ -631,10 +705,10 @@ impl SealedExecutionFunctionSet {
             .family
             .prepare(context)
             .map(|kernel| PreparedAggregateKernel { kernel })
-            .map_err(|message| ExecutionFunctionSetError::PrepareAggregate {
+            .map_err(|source| ExecutionFunctionSetError::PrepareAggregateSource {
                 canonical_name: definition.canonical_name().into(),
                 overload: selected.overload.clone(),
-                message: message.into(),
+                source,
             })
     }
 }
@@ -794,7 +868,7 @@ pub(crate) trait ErasedAggregateFamily: Send + Sync {
     fn prepare(
         &self,
         context: &AggregatePrepareContext<'_>,
-    ) -> Result<Arc<dyn ErasedAggregateKernel>, String>;
+    ) -> crate::runtime::fragment::ExecutionResult<Arc<dyn ErasedAggregateKernel>>;
 }
 
 pub(crate) trait ErasedAggregateKernel: Send + Sync {
@@ -851,15 +925,15 @@ where
     fn prepare(
         &self,
         context: &AggregatePrepareContext<'_>,
-    ) -> Result<Arc<dyn ErasedAggregateKernel>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<Arc<dyn ErasedAggregateKernel>> {
         let kernel = self
             .family
             .prepare(context.selected, context.options)
-            .map_err(|error| error.to_string())?;
+            .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
         if kernel.memory_policy() == AggregateStateMemoryPolicy::AllocationTracked {
-            return Err(
-                "legacy typed aggregate cannot supply an allocation-tracked state allocator".into(),
-            );
+            return Err(aggregate_prepare_contract(
+                "legacy typed aggregate cannot supply an allocation-tracked state allocator",
+            ));
         }
         Ok(Arc::new(TypedKernelAdapter { kernel }) as Arc<dyn ErasedAggregateKernel>)
     }
@@ -873,43 +947,41 @@ impl ErasedAggregateFamily for LegacyAggregateFamilyAdapter {
     fn prepare(
         &self,
         context: &AggregatePrepareContext<'_>,
-    ) -> Result<Arc<dyn ErasedAggregateKernel>, String> {
-        let legacy = context
-            .legacy
-            .ok_or_else(|| "legacy aggregate bind context is required".to_string())?;
-        let planned_types = legacy
-            .function
-            .types
-            .as_ref()
-            .ok_or_else(|| "aggregate type signature is required".to_string())?;
-        let planned_output = planned_types
-            .output_type
-            .as_ref()
-            .ok_or_else(|| "aggregate output_type signature is required".to_string())?;
+    ) -> crate::runtime::fragment::ExecutionResult<Arc<dyn ErasedAggregateKernel>> {
+        let legacy = context.legacy.ok_or_else(|| {
+            aggregate_prepare_contract("legacy aggregate bind context is required")
+        })?;
+        let planned_types =
+            legacy.function.types.as_ref().ok_or_else(|| {
+                aggregate_prepare_contract("aggregate type signature is required")
+            })?;
+        let planned_output = planned_types.output_type.as_ref().ok_or_else(|| {
+            aggregate_prepare_contract("aggregate output_type signature is required")
+        })?;
         let output_matches_catalog = planned_output == &context.selected.output_type;
         let output_matches_local_intermediate =
             !legacy.input_is_intermediate && planned_output == &context.selected.intermediate_type;
         if !output_matches_catalog && !output_matches_local_intermediate {
-            return Err(format!(
+            return Err(aggregate_prepare_contract(format!(
                 "aggregate output type drift: planned={planned_output:?}, catalog final={:?}, catalog intermediate={:?}",
                 context.selected.output_type, context.selected.intermediate_type
-            ));
+            )));
         }
         if let Some(planned_intermediate) = planned_types.intermediate_type.as_ref()
             && planned_intermediate != &context.selected.intermediate_type
         {
-            return Err(format!(
+            return Err(aggregate_prepare_contract(format!(
                 "aggregate intermediate type drift: planned={planned_intermediate:?}, catalog={:?}",
                 context.selected.intermediate_type
-            ));
+            )));
         }
         if let Some(planned_input) = planned_types.input_arg_type.as_ref()
             && context.selected.argument_types.first() != Some(planned_input)
         {
-            return Err(format!(
+            return Err(aggregate_prepare_contract(format!(
                 "aggregate input type drift: planned={planned_input:?}, catalog first argument={:?}",
                 context.selected.argument_types.first()
-            ));
+            )));
         }
 
         // The catalog selection is the only executable type authority. The
@@ -930,13 +1002,13 @@ impl ErasedAggregateFamily for LegacyAggregateFamilyAdapter {
         if spec.intermediate_type != context.selected.intermediate_type
             || spec.output_type != context.selected.output_type
         {
-            return Err(format!(
+            return Err(aggregate_prepare_contract(format!(
                 "legacy aggregate type drift: implementation intermediate={:?}, output={:?}; catalog intermediate={:?}, output={:?}",
                 spec.intermediate_type,
                 spec.output_type,
                 context.selected.intermediate_type,
                 context.selected.output_type
-            ));
+            )));
         }
         Ok(Arc::new(LegacyKernelAdapter {
             function: self.function,
@@ -1071,13 +1143,16 @@ where
     ) -> Result<(), PreparedAggregateError> {
         if self.kernel.memory_policy() == AggregateStateMemoryPolicy::AllocationTracked {
             return Err(PreparedAggregateError::CreateState(
-                "legacy typed aggregate cannot supply an allocation-tracked state allocator".into(),
+                aggregate_prepare_contract(
+                    "legacy typed aggregate cannot supply an allocation-tracked state allocator",
+                ),
             ));
         }
-        let state = self
-            .kernel
-            .create_state()
-            .map_err(|error| PreparedAggregateError::CreateState(error.to_string()))?;
+        let state = self.kernel.create_state().map_err(|error| {
+            PreparedAggregateError::CreateState(
+                crate::runtime::fragment::ExecutionFailure::from_domain(error),
+            )
+        })?;
         let slot = state_slot::<K::State>(base, offset);
         unsafe { slot.as_ptr().write(state) };
         Ok(())
@@ -1095,10 +1170,11 @@ where
         input: AggregateInputBatch<'_>,
     ) -> Result<(), PreparedAggregateError> {
         validate_state_pointer_count(state_ptrs, input.row_count())?;
-        let prepared = self
-            .kernel
-            .prepare_update(&input)
-            .map_err(|error| PreparedAggregateError::Input(error.to_string()))?;
+        let prepared = self.kernel.prepare_update(&input).map_err(|error| {
+            PreparedAggregateError::Input(crate::runtime::fragment::ExecutionFailure::from_domain(
+                error,
+            ))
+        })?;
         for (row, base) in state_ptrs.iter().copied().enumerate() {
             // A grouped batch may repeat a state address. Create exactly one
             // mutable reference for this call and let it expire before moving
@@ -1106,7 +1182,11 @@ where
             let state = unsafe { &mut *state_slot::<K::State>(base, offset).as_ptr() };
             self.kernel
                 .update_row(state, &prepared, row)
-                .map_err(|error| PreparedAggregateError::Update(error.to_string()))?;
+                .map_err(|error| {
+                    PreparedAggregateError::Update(
+                        crate::runtime::fragment::ExecutionFailure::from_domain(error),
+                    )
+                })?;
         }
         Ok(())
     }
@@ -1118,15 +1198,20 @@ where
         input: AggregateInputBatch<'_>,
     ) -> Result<(), PreparedAggregateError> {
         validate_state_pointer_count(state_ptrs, input.row_count())?;
-        let prepared = self
-            .kernel
-            .prepare_merge(&input)
-            .map_err(|error| PreparedAggregateError::Input(error.to_string()))?;
+        let prepared = self.kernel.prepare_merge(&input).map_err(|error| {
+            PreparedAggregateError::Input(crate::runtime::fragment::ExecutionFailure::from_domain(
+                error,
+            ))
+        })?;
         for (row, base) in state_ptrs.iter().copied().enumerate() {
             let state = unsafe { &mut *state_slot::<K::State>(base, offset).as_ptr() };
             self.kernel
                 .merge_row(state, &prepared, row)
-                .map_err(|error| PreparedAggregateError::Merge(error.to_string()))?;
+                .map_err(|error| {
+                    PreparedAggregateError::Merge(
+                        crate::runtime::fragment::ExecutionFailure::from_domain(error),
+                    )
+                })?;
         }
         Ok(())
     }
@@ -1137,9 +1222,11 @@ where
         group_states: &[AggStatePtr],
     ) -> Result<ArrayRef, PreparedAggregateError> {
         let states = TypedStateIter::<K::State>::new(group_states, offset);
-        self.kernel
-            .build_intermediate(states)
-            .map_err(|error| PreparedAggregateError::BuildIntermediate(error.to_string()))
+        self.kernel.build_intermediate(states).map_err(|error| {
+            PreparedAggregateError::BuildIntermediate(
+                crate::runtime::fragment::ExecutionFailure::from_domain(error),
+            )
+        })
     }
 
     unsafe fn build_final(
@@ -1148,9 +1235,11 @@ where
         group_states: &[AggStatePtr],
     ) -> Result<ArrayRef, PreparedAggregateError> {
         let states = TypedStateIter::<K::State>::new(group_states, offset);
-        self.kernel
-            .build_final(states)
-            .map_err(|error| PreparedAggregateError::BuildFinal(error.to_string()))
+        self.kernel.build_final(states).map_err(|error| {
+            PreparedAggregateError::BuildFinal(
+                crate::runtime::fragment::ExecutionFailure::from_domain(error),
+            )
+        })
     }
 
     unsafe fn retained_bytes(&self, base: AggStatePtr, offset: usize) -> usize {
@@ -1254,6 +1343,20 @@ mod tests {
             formatter.write_str(self.0)
         }
     }
+
+    impl std::error::Error for TestError {}
+    impl novarocks_failure_contract::FailureProjection for TestError {
+        fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+            novarocks_failure_contract::FailureFact::new(
+                novarocks_failure_contract::FailureClass::Invariant,
+                novarocks_failure_contract::FailureReason::new(
+                    novarocks_failure_contract::domain::EXECUTION,
+                    std::num::NonZeroU16::new(60001).unwrap(),
+                ),
+            )
+        }
+    }
+    impl novarocks_failure_contract::OuterFailureProjection for TestError {}
 
     struct SumState {
         value: i64,

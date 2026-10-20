@@ -316,21 +316,23 @@ pub enum AckPayload {
     },
 }
 
-/// One settled operation, as the transport reports it back.
+/// One settled operation. A domain failure never fabricates a positive ACK.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OperationAcknowledgement {
     operation_id: TaskOperationId,
     kind: OperationKind,
-    dispatch_result: OperationDispatchResult,
-    payload: AckPayload,
-    /// The backend's own reason for a refusal, when it gave one.
-    ///
-    /// A refusal that reaches a client as an outcome name alone tells them
-    /// nothing they can act on: the engine knew it was a struct field-count
-    /// mismatch, and the client was shown `InvalidStateOrRequest`.
-    detail: Option<SafeDetail>,
+    result: OperationAcknowledgementResult,
 }
-
+#[derive(Clone, Debug, PartialEq)]
+enum OperationAcknowledgementResult {
+    Worker(novarocks_execution_contract::operation::OperationResult<AckPayload>),
+    NonWorker {
+        dispatch: OperationDispatchResult,
+        payload: AckPayload,
+        detail: Option<SafeDetail>,
+    },
+}
+static NO_ACK_PAYLOAD: AckPayload = AckPayload::None;
 impl OperationAcknowledgement {
     pub fn new(
         operation_id: TaskOperationId,
@@ -338,26 +340,38 @@ impl OperationAcknowledgement {
         outcome: OperationOutcome,
         payload: AckPayload,
     ) -> Self {
-        let dispatch_result =
-            OperationDispatchResult::WorkerReceipt(WorkerReceiptOutcome::from_contract(outcome));
-        Self::from_dispatch_result(operation_id, kind, dispatch_result, payload)
+        Self::worker_receipt(operation_id, kind, outcome, payload)
     }
-
     pub fn worker_receipt(
         operation_id: TaskOperationId,
         kind: OperationKind,
         outcome: OperationOutcome,
         payload: AckPayload,
     ) -> Self {
-        let receipt = WorkerReceiptOutcome::from_contract(outcome);
         Self::from_dispatch_result(
             operation_id,
             kind,
-            OperationDispatchResult::WorkerReceipt(receipt),
+            OperationDispatchResult::WorkerReceipt(WorkerReceiptOutcome::from_contract(outcome)),
             payload,
         )
     }
-
+    pub fn worker_domain_failure(
+        operation_id: TaskOperationId,
+        kind: OperationKind,
+        outcome: novarocks_execution_contract::operation::DomainFailureOutcome,
+        failure: novarocks_execution_contract::operation::OperationDomainFailure,
+    ) -> Self {
+        Self {
+            operation_id,
+            kind,
+            result: OperationAcknowledgementResult::Worker(
+                novarocks_execution_contract::operation::OperationResult::DomainFailure {
+                    outcome,
+                    failure,
+                },
+            ),
+        }
+    }
     pub const fn transport_unknown(operation_id: TaskOperationId, kind: OperationKind) -> Self {
         Self::from_dispatch_result(
             operation_id,
@@ -366,59 +380,116 @@ impl OperationAcknowledgement {
             AckPayload::None,
         )
     }
-
     pub const fn from_dispatch_result(
         operation_id: TaskOperationId,
         kind: OperationKind,
         dispatch_result: OperationDispatchResult,
         payload: AckPayload,
     ) -> Self {
+        let result = match dispatch_result {
+            OperationDispatchResult::WorkerReceipt(receipt) => {
+                OperationAcknowledgementResult::Worker(
+                    novarocks_execution_contract::operation::OperationResult::Verdict {
+                        outcome: receipt.outcome(),
+                        detail: None,
+                        acknowledgement: Some(payload),
+                    },
+                )
+            }
+            dispatch => OperationAcknowledgementResult::NonWorker {
+                dispatch,
+                payload,
+                detail: None,
+            },
+        };
         Self {
             operation_id,
             kind,
-            dispatch_result,
-            payload,
-            detail: None,
+            result,
         }
     }
-
-    /// The same acknowledgement, carrying the backend's stated reason.
+    /// Protocol diagnostics cannot replace a producer's domain failure.
     pub fn with_detail(mut self, detail: Option<SafeDetail>) -> Self {
-        self.detail = detail;
+        match &mut self.result {
+            OperationAcknowledgementResult::Worker(
+                novarocks_execution_contract::operation::OperationResult::Verdict {
+                    detail: held,
+                    ..
+                },
+            )
+            | OperationAcknowledgementResult::NonWorker { detail: held, .. } => *held = detail,
+            OperationAcknowledgementResult::Worker(
+                novarocks_execution_contract::operation::OperationResult::DomainFailure { .. },
+            ) => panic!("a domain failure cannot be rewritten as a protocol diagnostic"),
+        }
         self
     }
-
     pub const fn operation_id(&self) -> TaskOperationId {
         self.operation_id
     }
-
     pub const fn kind(&self) -> OperationKind {
         self.kind
     }
-
     pub const fn worker_outcome(&self) -> Option<OperationOutcome> {
-        match self.dispatch_result {
-            OperationDispatchResult::WorkerReceipt(receipt) => Some(receipt.outcome()),
-            OperationDispatchResult::IngressRejected(_)
-            | OperationDispatchResult::NonWorkerRejected
-            | OperationDispatchResult::TransportUnknown => None,
+        match &self.result {
+            OperationAcknowledgementResult::Worker(result) => Some(result.outcome()),
+            OperationAcknowledgementResult::NonWorker { .. } => None,
         }
     }
-
     pub const fn dispatch_result(&self) -> OperationDispatchResult {
-        self.dispatch_result
+        match &self.result {
+            OperationAcknowledgementResult::Worker(result) => {
+                OperationDispatchResult::WorkerReceipt(WorkerReceiptOutcome::from_contract(
+                    result.outcome(),
+                ))
+            }
+            OperationAcknowledgementResult::NonWorker { dispatch, .. } => *dispatch,
+        }
     }
-
-    pub const fn payload(&self) -> &AckPayload {
-        &self.payload
+    pub fn payload(&self) -> &AckPayload {
+        match &self.result {
+            OperationAcknowledgementResult::Worker(
+                novarocks_execution_contract::operation::OperationResult::Verdict {
+                    acknowledgement: Some(payload),
+                    ..
+                },
+            )
+            | OperationAcknowledgementResult::NonWorker { payload, .. } => payload,
+            _ => &NO_ACK_PAYLOAD,
+        }
     }
-
     pub const fn detail(&self) -> Option<&SafeDetail> {
-        self.detail.as_ref()
+        match &self.result {
+            OperationAcknowledgementResult::Worker(result) => result.detail(),
+            OperationAcknowledgementResult::NonWorker { detail, .. } => detail.as_ref(),
+        }
     }
-
-    /// Whether the backend applied this operation, or replayed an already
-    /// applied one.
+    /// Exact result branch with the acknowledgement body left with its original owner.
+    pub fn worker_header(
+        &self,
+    ) -> Option<novarocks_execution_contract::operation::OperationResult<std::convert::Infallible>>
+    {
+        use novarocks_execution_contract::operation::OperationResult;
+        match &self.result {
+            OperationAcknowledgementResult::Worker(OperationResult::Verdict {
+                outcome,
+                detail,
+                ..
+            }) => Some(OperationResult::Verdict {
+                outcome: *outcome,
+                detail: detail.clone(),
+                acknowledgement: None,
+            }),
+            OperationAcknowledgementResult::Worker(OperationResult::DomainFailure {
+                outcome,
+                failure,
+            }) => Some(OperationResult::DomainFailure {
+                outcome: *outcome,
+                failure: failure.clone(),
+            }),
+            OperationAcknowledgementResult::NonWorker { .. } => None,
+        }
+    }
     pub const fn is_applied(&self) -> bool {
         matches!(
             self.worker_outcome(),

@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
@@ -79,8 +81,15 @@ pub fn eval_array_position<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(expression_contract(
+            "array_position requires exactly 2 prepared argument(s)",
+        ));
+    }
     if chunk.is_empty() {
+        arena.eval(args[0], chunk)?;
+        arena.eval(args[1], chunk)?;
         let out = Arc::new(Int64Array::from(Vec::<Option<i64>>::new())) as ArrayRef;
         return Ok((super::common::cast_output(out, arena.data_type(expr), "array_position"))?);
     }
@@ -99,10 +108,10 @@ pub fn eval_array_position<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         .as_any()
         .downcast_ref::<arrow::array::ListArray>()
         .ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "array_position expects ListArray, got {:?}",
                 arr.data_type()
-            )
+            ))
         })?;
     let values = list.values();
     if target_arr.data_type() != values.data_type() {

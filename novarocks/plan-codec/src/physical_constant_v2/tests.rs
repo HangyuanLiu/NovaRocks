@@ -74,7 +74,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after primary refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -872,7 +872,7 @@ fn every_prefix<T>(
     }
     for at in 0..trace.len() {
         for cause in CAUSES {
-            let control = Control::refusing(phase, at, cause);
+            let control = Control::refusing(phase, at, cause.clone());
             assert!(
                 matches!(call(&control), Err(PhysicalConstantCodecError::Control(actual))
                 if actual == cause),

@@ -17,7 +17,7 @@
 //! Independent raw deepest-source data-error baselines before typed projection.
 use super::{ExprArena, ExprId, ExprNode};
 use crate::exec::chunk::{Chunk, ChunkSchema};
-use crate::exec::expr::function::{FunctionKind, eval_date_function};
+use crate::exec::expr::function::FunctionKind;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Int64Array, StringArray,
     TimestampMicrosecondArray,
@@ -47,9 +47,12 @@ fn setup(columns: Vec<ArrayRef>) -> (ExprArena, Vec<ExprId>, Chunk) {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     (arena, args, Chunk::new_with_chunk_schema(batch, schema))
 }
-fn raw(name: &str, columns: Vec<ArrayRef>) -> Result<ArrayRef, String> {
+fn raw(
+    name: &str,
+    columns: Vec<ArrayRef>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (arena, args, chunk) = setup(columns);
-    eval_date_function(name, &arena, ExprId(usize::MAX), &args, &chunk)
+    eval_frozen_time(name, &arena, &args, &chunk)
 }
 fn ints(a: &ArrayRef) -> Vec<Option<i64>> {
     a.as_any()
@@ -85,7 +88,7 @@ fn original_datetime_out_of_range_is_null_until_deepest_phase_is_demanded() {
         let (mut arena, args, chunk) = setup(vec![array]);
         let cast = identity_cast(&mut arena, args[0], dtype);
         assert_eq!(
-            eval_date_function("time_to_sec", &arena, ExprId(0), &[cast], &chunk).unwrap_err(),
+            (eval_frozen_time("time_to_sec", &arena, &[cast], &chunk).unwrap_err()).to_string(),
             expected
         );
     }
@@ -106,7 +109,7 @@ fn original_deepest_error_is_whole_current_invocation_not_only_null_row() {
         DataType::Int64,
     );
     assert_eq!(
-        arena.eval(call, &chunk).unwrap_err(),
+        (arena.eval(call, &chunk).unwrap_err()).to_string(),
         "Cast error: Failed to convert 2147483647 to temporal for Date32"
     );
     let guarded = arena.push_typed(
@@ -136,12 +139,12 @@ fn original_binary_deepest_arrow_safe_cast_returns_null_for_invalid_utf8() {
     // Normal admission fails first. It must not be replaced with the successful
     // deepest source computation or with an invented invalid-UTF8 data error.
     assert_eq!(
-        eval_date_function("time_to_sec", &arena, ExprId(0), &[cast], &chunk).unwrap_err(),
+        (eval_frozen_time("time_to_sec", &arena, &[cast], &chunk).unwrap_err()).to_string(),
         "unsupported datetime input type: Binary"
     );
 }
 #[test]
-fn original_unknown_zone_deepest_error_retains_entire_long_string() {
+fn unknown_timezone_retains_the_original_arrow_error_and_bounds_outer_detail() {
     let zone = "invalid_zone_".repeat(60);
     let source =
         Arc::new(TimestampMicrosecondArray::from(vec![i64::MAX]).with_timezone(zone.clone()))
@@ -163,15 +166,11 @@ fn original_unknown_zone_deepest_error_retains_entire_long_string() {
         "the entire original zone is retained"
     );
     assert!(expected.len() > 512);
-    assert_eq!(
-        crate::exec::expr::function::date::parse_from_cast_source(&arena, cast, &chunk)
-            .unwrap_err(),
-        expected
-    );
-    assert_eq!(
-        eval_date_function("time_to_sec", &arena, ExprId(0), &[cast], &chunk).unwrap_err(),
-        expected
-    );
+    let failure = crate::exec::expr::function::date::parse_from_cast_source(&arena, cast, &chunk)
+        .unwrap_err();
+    assert_original_timezone_error(&failure, &expected);
+    let failure = eval_frozen_time("time_to_sec", &arena, &[cast], &chunk).unwrap_err();
+    assert_original_timezone_error(&failure, &expected);
 }
 #[test]
 fn original_no_null_guard_never_observes_unknown_deepest_zone() {
@@ -185,7 +184,28 @@ fn original_no_null_guard_never_observes_unknown_deepest_zone() {
         DataType::Timestamp(TimeUnit::Microsecond, Some(zone.into())),
     );
     assert_eq!(
-        ints(&eval_date_function("time_to_sec", &arena, ExprId(0), &[cast], &chunk).unwrap()),
+        ints(&eval_frozen_time("time_to_sec", &arena, &[cast], &chunk).unwrap()),
         vec![Some(0)]
     );
+}
+
+use super::legacy_time_text_baseline_tests::eval_frozen_time;
+
+fn assert_original_timezone_error(
+    error: &crate::runtime::fragment::ExecutionFailure,
+    expected: &str,
+) {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert!(error.detail().len() <= 512);
+    let mut source: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(original) = source.downcast_ref::<arrow::error::ArrowError>() {
+            assert_eq!(original.to_string(), expected);
+            break;
+        }
+        source = source
+            .source()
+            .expect("original Arrow timezone parser refusal must survive");
+    }
 }

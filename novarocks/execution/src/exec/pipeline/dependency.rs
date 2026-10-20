@@ -88,6 +88,10 @@ impl Dependency {
         self.ready.load(Ordering::Acquire)
     }
 
+    pub(crate) fn observable(&self) -> Arc<Observable> {
+        self.observable.clone()
+    }
+
     pub fn set_ready(&self) {
         let prev = self.ready.swap(true, Ordering::AcqRel);
         if !prev {

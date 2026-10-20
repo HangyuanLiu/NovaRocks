@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! ONE original REGEXP_COUNT computation with caller-authored source policy.
-use super::string_extended::{LegacyStringControl, StringCoreInput};
+use super::string_extended::{DirectStringControl, StringCoreInput};
 use crate::{
     EvaluatedArgument, KernelEvaluationControl, KernelFailure, RowDataError, SelectedValues,
     Selection,
@@ -37,7 +37,7 @@ pub enum PatternSource {
 }
 
 /// The original reader, shared by both entry points and their static boundary.
-pub fn string_or_null(array: &ArrayRef) -> Result<Option<&StringArray>, String> {
+pub fn string_or_null(array: &ArrayRef) -> Result<Option<&StringArray>, KernelFailure> {
     if matches!(array.data_type(), DataType::Null) {
         return Ok(None);
     }
@@ -45,7 +45,7 @@ pub fn string_or_null(array: &ArrayRef) -> Result<Option<&StringArray>, String> 
         .as_any()
         .downcast_ref::<StringArray>()
         .map(Some)
-        .ok_or_else(|| "regexp_count expects string".to_string())
+        .ok_or_else(|| internal("regexp_count expects string"))
 }
 fn reserve<T>(rows: usize, work: &mut EvaluationCheckpoints<'_>) -> Result<Vec<T>, KernelFailure> {
     Layout::array::<T>(rows).map_err(|_| KernelFailure::ResourceExhausted)?;
@@ -74,9 +74,8 @@ pub fn evaluate_selected<'a>(
         if input.arguments.len() != 2 {
             return Err(invalid("regexp_count requires two selected arguments"));
         }
-        let strings = string_or_null(input.arguments[0].array()).map_err(|e| internal(&e))?;
-        let patterns_array =
-            string_or_null(input.arguments[1].array()).map_err(|e| internal(&e))?;
+        let strings = string_or_null(input.arguments[0].array())?;
+        let patterns_array = string_or_null(input.arguments[1].array())?;
         let mut patterns = PatternMemo::new();
         let mut out = reserve::<Option<i64>>(input.selection.len(), &mut work)?;
         let mut errors = reserve::<RowDataError>(0, &mut work)?;
@@ -107,19 +106,28 @@ pub fn evaluate_selected<'a>(
             }
             observe(pattern, &mut work)?;
             work.flush()?;
-            let compiled = patterns.get_or_compile(pattern, Regex::new);
+            let compiled =
+                patterns.get_or_compile(pattern, |pattern| Regex::new(pattern).map_err(Arc::new));
             work.flush()?;
             let re = match compiled {
                 Ok(re) => re,
-                Err(err) if source == PatternSource::Utf8Literal => {
+                Err(error) => {
+                    let syntax = super::string_failure::regex_syntax(error)?;
+                    if source == PatternSource::Other {
+                        out.push(None);
+                        continue;
+                    }
                     work.flush()?;
-                    let message =
-                        format!("Invalid regex expression: {pattern}. Detail message: {err}");
+                    let cause = super::string_failure::StringDataError::RegexLiteral {
+                        pattern,
+                        source: &syntax,
+                    };
+                    let message = cause.to_string();
                     work.flush()?;
                     observe(&message, &mut work)?;
                     if let Some(boundary) = input.error_boundary {
                         work.flush()?;
-                        boundary(&message)?;
+                        boundary(ordinal, cause)?;
                         work.flush()?;
                     }
                     work.flush()?;
@@ -128,10 +136,6 @@ pub fn evaluate_selected<'a>(
                         .map_err(|_| KernelFailure::ResourceExhausted)?;
                     errors.push(RowDataError::new(ordinal, &message));
                     work.flush()?;
-                    out.push(None);
-                    continue;
-                }
-                Err(_) => {
                     out.push(None);
                     continue;
                 }
@@ -171,19 +175,16 @@ pub fn evaluate_selected<'a>(
 }
 
 /// V1 supplies evaluated arrays and the original immediate-node fact.
-pub fn evaluate_legacy(
+pub fn evaluate_required(
     arrays: &[ArrayRef; 2],
     rows: usize,
     source: PatternSource,
-) -> Result<ArrayRef, String> {
-    // Preserve the full original static reader failure before compact execution.
+) -> Result<ArrayRef, KernelFailure> {
     string_or_null(&arrays[0])?;
     string_or_null(&arrays[1])?;
     let arguments = arrays.each_ref().map(EvaluatedArgument::Column);
-    let raw_error = std::cell::RefCell::new(None);
-    let boundary = |message: &str| {
-        *raw_error.borrow_mut() = Some(message.to_string());
-        Err(KernelFailure::InstanceFailed)
+    let boundary = |row: usize, cause: super::string_failure::StringDataError<'_>| {
+        Err(super::string_failure::required_row(row, cause))
     };
     let output = evaluate_selected(
         StringCoreInput {
@@ -192,12 +193,8 @@ pub fn evaluate_legacy(
             error_boundary: Some(&boundary),
         },
         source,
-        &LegacyStringControl,
-    );
-    if let Some(error) = raw_error.into_inner() {
-        return Err(error);
-    }
-    let output = output.map_err(|error| error.to_string())?;
+        &DirectStringControl,
+    )?;
     Ok(Arc::clone(output.values()))
 }
 

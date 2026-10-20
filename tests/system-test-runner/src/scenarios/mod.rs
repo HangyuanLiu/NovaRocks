@@ -11,6 +11,11 @@ pub(crate) mod exact_mysql_native_driver;
 #[cfg(unix)]
 pub(crate) mod exact_mysql_native_oracle;
 mod exchange_normal_close;
+mod execution_failure;
+#[cfg(unix)]
+mod execution_failure_prepared;
+mod execution_failure_representation;
+mod execution_failure_streaming;
 mod frontend_lifecycle;
 #[cfg(unix)]
 pub(crate) mod hms_bulk_readonly_native;
@@ -102,6 +107,11 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(native_creation::scenarios());
     scenarios.extend(exchange_normal_close::scenarios());
     scenarios.extend(preparation_capacity::scenarios());
+    scenarios.extend(execution_failure::scenarios());
+    scenarios.extend(execution_failure_representation::scenarios());
+    scenarios.extend(execution_failure_streaming::scenarios());
+    #[cfg(unix)]
+    scenarios.extend(execution_failure_prepared::scenarios());
     scenarios.extend(state_family::scenarios());
     scenarios.extend(table_maintenance::scenarios());
     scenarios

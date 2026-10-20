@@ -21,13 +21,16 @@ use arrow::array::{Array, ArrayRef, BinaryBuilder, Decimal128Builder, Float64Bui
 use arrow::datatypes::DataType;
 
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::ExprId;
 use crate::exec::expr::decimal::{div_round_i128, pow10_i128};
-use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::mv::state_codec::{decode_count_state, decode_sum_decimal128, decode_sum_int64};
 
 use super::common::{binary_value_or_empty, row_count, row_index};
 
-pub fn avg_state_union(a: &[u8], b: &[u8]) -> Result<Vec<u8>, String> {
+pub fn avg_state_union(
+    a: &[u8],
+    b: &[u8],
+) -> Result<Vec<u8>, crate::runtime::fragment::ExecutionFailure> {
     super::sum::sum_state_union(a, b)
 }
 
@@ -36,13 +39,16 @@ pub fn eval_avg_state_union<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     _expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if args.len() != 2 {
-        return Err((format!("avg_state_union expects 2 arguments, got {}", args.len())).into());
+        return Err(super::failure::contract(format_args!(
+            "avg_state_union expects 2 arguments, got {}",
+            args.len()
+        )));
     }
     let lhs = arena.eval(args[0], chunk)?;
     let rhs = arena.eval(args[1], chunk)?;
-    Ok((eval_avg_state_union_arrays(&lhs, &rhs))?)
+    eval_avg_state_union_arrays(&lhs, &rhs)
 }
 
 pub fn eval_avg_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -50,13 +56,12 @@ pub fn eval_avg_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if !(2..=4).contains(&args.len()) {
-        return Err((format!(
+        return Err(super::failure::contract(format_args!(
             "avg_state_visible expects 2 to 4 arguments, got {}",
             args.len()
-        ))
-        .into());
+        )));
     }
     let sum_state = arena.eval(args[0], chunk)?;
     let count_state = arena.eval(args[1], chunk)?;
@@ -65,27 +70,26 @@ pub fn eval_avg_state_visible<__Eval: crate::exec::expr::ExprEvaluation + ?Sized
     } else {
         None
     };
-    let output_type = args
-        .get(3)
-        .and_then(|witness| arena.data_type(*witness))
-        .cloned()
-        .or_else(|| arena.data_type(expr).cloned())
-        .unwrap_or(DataType::Float64);
-    Ok((eval_avg_state_visible_array(
-        &sum_state,
-        &count_state,
-        input_scale.as_ref(),
-        &output_type,
-    ))?)
+    let output_expr = args.get(3).copied().unwrap_or(expr);
+    let output_type = arena.data_type(output_expr).cloned().ok_or_else(|| {
+        super::failure::contract("avg_state_visible is missing its frozen output type")
+    })?;
+    eval_avg_state_visible_array(&sum_state, &count_state, input_scale.as_ref(), &output_type)
 }
 
-pub fn eval_avg_state_union_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {
+pub fn eval_avg_state_union_arrays(
+    lhs: &ArrayRef,
+    rhs: &ArrayRef,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = row_count("avg_state_union", lhs.len(), rhs.len())?;
     let mut builder = BinaryBuilder::new();
+    let mut extent = super::failure::StateOutputTally::default();
     for row in 0..rows {
         let left = binary_value_or_empty(lhs, row_index(row, lhs.len())?, "avg_state_union", 0)?;
         let right = binary_value_or_empty(rhs, row_index(row, rhs.len())?, "avg_state_union", 1)?;
-        builder.append_value(avg_state_union(left, right)?);
+        let payload = avg_state_union(left, right)?;
+        extent.append(payload.len())?;
+        builder.append_value(payload);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -95,7 +99,7 @@ pub fn eval_avg_state_visible_array(
     count_state: &ArrayRef,
     input_scale: Option<&ArrayRef>,
     output_type: &DataType,
-) -> Result<ArrayRef, String> {
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let rows = row_count("avg_state_visible", sum_state.len(), count_state.len())?;
     let rows = if let Some(input_scale) = input_scale {
         row_count("avg_state_visible", rows, input_scale.len())?
@@ -103,7 +107,7 @@ pub fn eval_avg_state_visible_array(
         rows
     };
     match output_type {
-        DataType::Float64 | DataType::Null => {
+        DataType::Float64 => {
             let mut builder = Float64Builder::new();
             for row in 0..rows {
                 let sum = binary_value_or_empty(
@@ -142,7 +146,9 @@ pub fn eval_avg_state_visible_array(
         }
         DataType::Decimal128(precision, scale) => {
             let input_scale = input_scale.ok_or_else(|| {
-                "avg_state_visible Decimal128 output requires input decimal scale".to_string()
+                super::failure::contract(
+                    "avg_state_visible Decimal128 output requires input decimal scale",
+                )
             })?;
             let mut builder = Decimal128Builder::with_capacity(rows)
                 .with_data_type(DataType::Decimal128(*precision, *scale));
@@ -177,9 +183,9 @@ pub fn eval_avg_state_visible_array(
             }
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
-        other => Err(format!(
+        other => Err(super::failure::contract(format_args!(
             "avg_state_visible expects Float64 or Decimal128 output type, got {other:?}"
-        )),
+        ))),
     }
 }
 
@@ -187,8 +193,8 @@ fn avg_int64_state_visible_as_decimal128(
     sum_state: &[u8],
     count_state: &[u8],
     output_scale: i8,
-) -> Result<Option<i128>, String> {
-    let output_scale = validate_decimal_scale("output", i64::from(output_scale))?;
+) -> Result<Option<i128>, crate::runtime::fragment::ExecutionFailure> {
+    let output_scale = validate_decimal_scale("output", i64::from(output_scale), true)?;
     let (sum_count, sum) = decode_sum_int64(sum_state)?;
     let count = decode_count_state(count_state)?;
     validate_avg_state_counts(sum_count, count)?;
@@ -197,14 +203,14 @@ fn avg_int64_state_visible_as_decimal128(
     }
     let scaled_sum = i128::from(sum)
         .checked_mul(pow10_i128(output_scale as usize)?)
-        .ok_or_else(|| "decimal overflow".to_string())?;
-    Ok(Some(div_round_i128(scaled_sum, i128::from(count))))
+        .ok_or_else(|| super::failure::numeric("decimal overflow"))?;
+    Ok(Some(div_round_i128(scaled_sum, i128::from(count))?))
 }
 
 fn avg_state_visible_as_float64(
     sum_state: &[u8],
     count_state: &[u8],
-) -> Result<Option<f64>, String> {
+) -> Result<Option<f64>, crate::runtime::fragment::ExecutionFailure> {
     let (sum_count, sum) = decode_sum_int64(sum_state)?;
     let count = decode_count_state(count_state)?;
     validate_avg_state_counts(sum_count, count)?;
@@ -219,8 +225,8 @@ fn avg_decimal_state_visible_as_float64(
     sum_state: &[u8],
     count_state: &[u8],
     input_scale: i64,
-) -> Result<Option<f64>, String> {
-    let input_scale = validate_decimal_scale("input", input_scale)?;
+) -> Result<Option<f64>, crate::runtime::fragment::ExecutionFailure> {
+    let input_scale = validate_decimal_scale("input", input_scale, false)?;
     let (sum_count, sum) = decode_sum_decimal128(sum_state)?;
     let count = decode_count_state(count_state)?;
     validate_avg_state_counts(sum_count, count)?;
@@ -235,9 +241,9 @@ fn avg_state_visible_as_decimal128(
     count_state: &[u8],
     input_scale: i64,
     output_scale: i8,
-) -> Result<Option<i128>, String> {
-    let input_scale = validate_decimal_scale("input", input_scale)?;
-    let output_scale = validate_decimal_scale("output", i64::from(output_scale))?;
+) -> Result<Option<i128>, crate::runtime::fragment::ExecutionFailure> {
+    let input_scale = validate_decimal_scale("input", input_scale, false)?;
+    let output_scale = validate_decimal_scale("output", i64::from(output_scale), true)?;
     let (sum_count, sum) = decode_sum_decimal128(sum_state)?;
     let count = decode_count_state(count_state)?;
     validate_avg_state_counts(sum_count, count)?;
@@ -251,48 +257,64 @@ fn avg_state_visible_as_decimal128(
             if scale_diff > 0 {
                 scaled_sum = scaled_sum
                     .checked_mul(factor)
-                    .ok_or_else(|| "decimal overflow".to_string())?;
+                    .ok_or_else(|| super::failure::numeric("decimal overflow"))?;
             } else {
                 scaled_sum /= factor;
             }
         }
-        Ok(Some(div_round_i128(scaled_sum, count as i128)))
+        Ok(Some(div_round_i128(scaled_sum, count as i128)?))
     }
 }
 
-fn validate_avg_state_counts(sum_count: i64, count: i64) -> Result<(), String> {
+fn validate_avg_state_counts(
+    sum_count: i64,
+    count: i64,
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     if sum_count != count {
-        return Err(format!(
+        return Err(super::failure::invalid_state(format_args!(
             "avg_state_visible state count mismatch: sum_state={sum_count} count_state={count}"
-        ));
+        )));
     }
     Ok(())
 }
 
-fn validate_decimal_scale(label: &str, scale: i64) -> Result<i32, String> {
+fn validate_decimal_scale(
+    label: &str,
+    scale: i64,
+    frozen: bool,
+) -> Result<i32, crate::runtime::fragment::ExecutionFailure> {
     if !(0..=38).contains(&scale) {
-        return Err(format!(
-            "avg_state_visible {label} decimal scale out of range: {scale}"
-        ));
+        let detail = format_args!("avg_state_visible {label} decimal scale out of range: {scale}");
+        return Err(if frozen {
+            super::failure::contract(detail)
+        } else {
+            super::failure::numeric(detail)
+        });
     }
     Ok(scale as i32)
 }
 
-fn int64_value(array: &ArrayRef, row: usize, fn_name: &str, arg_idx: usize) -> Result<i64, String> {
+fn int64_value(
+    array: &ArrayRef,
+    row: usize,
+    fn_name: &str,
+    arg_idx: usize,
+) -> Result<i64, crate::runtime::fragment::ExecutionFailure> {
     let DataType::Int64 = array.data_type() else {
-        return Err(format!(
+        return Err(super::failure::contract(format_args!(
             "{fn_name} expects Int64 input for arg {arg_idx}, got {:?}",
             array.data_type()
-        ));
+        )));
     };
-    let arr = array
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| format!("{fn_name} downcast Int64Array failed for arg {arg_idx}"))?;
+    let arr = array.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+        super::failure::contract(format_args!(
+            "{fn_name} downcast Int64Array failed for arg {arg_idx}"
+        ))
+    })?;
     if arr.is_null(row) {
-        return Err(format!(
+        return Err(super::failure::value(format_args!(
             "{fn_name} input decimal scale is NULL at row {row}"
-        ));
+        )));
     }
     Ok(arr.value(row))
 }
@@ -456,7 +478,7 @@ mod tests {
             .expect_err("decimal visible output should require input scale");
 
         assert_eq!(
-            err,
+            err.to_string(),
             "avg_state_visible Decimal128 output requires input decimal scale"
         );
     }

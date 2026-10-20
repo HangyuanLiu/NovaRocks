@@ -16,17 +16,26 @@
 // under the License.
 use super::common::{extract_date_array, extract_datetime_array};
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 use std::sync::Arc;
 
 pub fn eval_to_iso8601<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &arrow::datatypes::DataType::Utf8)?;
+    if args.len() != 1 {
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "to_iso8601 has an incompatible argument count",
+            )
+            .into(),
+        );
+    }
     let arr = arena.eval(args[0], chunk)?;
     let out = match arr.data_type() {
         DataType::Date32 => extract_date_array(&arr)?

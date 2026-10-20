@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::{Chunk, ChunkSchema};
-use crate::exec::expr::{ExprArena, ExprId, ExprNode};
+use crate::exec::expr::expression_contract;
+use crate::exec::expr::function::array::common as array_common;
+use crate::exec::expr::{ExprId, ExprNode};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, ListArray, UInt32Array, new_empty_array};
 use arrow::compute::{concat, take};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -30,9 +33,12 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     id: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     if args.len() < 2 {
-        return Err((format!("array_map expects at least 2 arguments, got {}", args.len())).into());
+        return Err(expression_contract(format_args!(
+            "array_map expects at least 2 arguments, got {}",
+            args.len()
+        )));
     }
 
     let (lambda_id, array_args) = match arena.node(args[0]) {
@@ -42,11 +48,9 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 (args[args.len() - 1], &args[..args.len() - 1])
             }
             _ => {
-                return Err(
-                    ("array_map expects a lambda function as the first or last argument"
-                        .to_string())
-                    .into(),
-                );
+                return Err(expression_contract(
+                    "array_map expects a lambda function as the first or last argument",
+                ));
             }
         },
     };
@@ -54,14 +58,17 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let output_type = arena
         .data_type(id)
         .cloned()
-        .ok_or_else(|| "array_map missing output type".to_string())?;
+        .ok_or_else(|| expression_contract("array_map missing output type"))?;
     let (output_field, item_type) = match output_type {
         DataType::List(field) => {
             let item_type = field.data_type().clone();
             (field, item_type)
         }
         other => {
-            return Err((format!("array_map output type must be List, got {:?}", other)).into());
+            return Err(expression_contract(format_args!(
+                "array_map output type must be List, got {:?}",
+                other
+            )));
         }
     };
 
@@ -72,11 +79,17 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             common_sub_exprs,
             ..
         }) => (*body, arg_slots.clone(), common_sub_exprs.clone()),
-        _ => return Err(("array_map expects lambda function expression".to_string()).into()),
+        _ => {
+            return Err(expression_contract(
+                "array_map expects lambda function expression",
+            ));
+        }
     };
 
     if lambda_args.len() != array_args.len() {
-        return Err(("Lambda arguments should equal to lambda input arrays.".to_string()).into());
+        return Err(expression_contract(
+            "Lambda arguments should equal to lambda input arrays.",
+        ));
     }
 
     let num_rows = chunk.len();
@@ -84,12 +97,11 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     for expr_id in array_args {
         let array = arena.eval(*expr_id, chunk)?;
         if array.len() != num_rows {
-            return Err((format!(
+            return Err(expression_contract(format_args!(
                 "array_map input length mismatch: expected {}, got {}",
                 num_rows,
                 array.len()
-            ))
-            .into());
+            )));
         }
         input_arrays.push(array);
     }
@@ -101,10 +113,10 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             continue;
         }
         let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "array_map input must be ListArray, got {:?}",
                 array.data_type()
-            )
+            ))
         })?;
         list_refs.push(Some(list));
     }
@@ -129,14 +141,17 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let start = offsets[row] as i64;
             let end = offsets[row + 1] as i64;
             if end < start {
-                return Err(("array_map list offsets are invalid".to_string()).into());
+                return Err(expression_contract("array_map list offsets are invalid"));
             }
             let len = (end - start) as usize;
             if let Some(prev) = len_opt {
                 if prev != len {
-                    return Err(("Input array element's size is not equal in array_map()."
-                        .to_string())
-                    .into());
+                    return Err(array_common::length_mismatch_failure(
+                        "array_map",
+                        row,
+                        prev,
+                        len,
+                    ));
                 }
             } else {
                 len_opt = Some(len);
@@ -151,9 +166,10 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
         let len = len_opt.unwrap_or(0);
         row_lengths[row] = len;
-        total_elements = total_elements
-            .checked_add(len)
-            .ok_or_else(|| "array_map total elements overflow".to_string())?;
+        total_elements = novarocks_functions::aggregate_scalar::checked_list_output_offset(
+            total_elements as i32,
+            len,
+        )? as usize;
     }
 
     let mut offsets = Vec::with_capacity(num_rows + 1);
@@ -163,7 +179,7 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         if row_valid[row] {
             current += row_lengths[row] as i64;
             if current > i32::MAX as i64 {
-                return Err(("array_map offset overflow".to_string()).into());
+                return Err(expression_contract("array_map offset overflow"));
             }
         }
         offsets.push(current as i32);
@@ -181,12 +197,18 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     if total_elements == 0 {
         let values = new_empty_array(&item_type);
-        let list = ListArray::new(
+        let list = ListArray::try_new(
             output_field,
             OffsetBuffer::new(offsets.into()),
             values,
             nulls,
-        );
+        )
+        .map_err(|source| {
+            crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+                "array_map constructor",
+                source,
+            )
+        })?;
         return Ok(Arc::new(list));
     }
 
@@ -219,12 +241,18 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     {
         let flat_result =
             replicate_array_by_row_lengths(&row_level_result, &row_lengths, total_elements)?;
-        let list = ListArray::new(
+        let list = ListArray::try_new(
             output_field,
             OffsetBuffer::new(offsets.into()),
             flat_result,
             nulls,
-        );
+        )
+        .map_err(|source| {
+            crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+                "array_map constructor",
+                source,
+            )
+        })?;
         return Ok(Arc::new(list));
     }
 
@@ -235,7 +263,9 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         };
         let flat = flatten_list_values(list, &row_valid)?;
         if flat.len() != total_elements {
-            return Err(("array_map flattened argument length mismatch".to_string()).into());
+            return Err(expression_contract(
+                "array_map flattened argument length mismatch",
+            ));
         }
         flat_args.push(flat);
     }
@@ -252,7 +282,10 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     for (idx, slot_id) in lambda_args.iter().enumerate() {
         if !seen.insert(*slot_id) {
-            return Err((format!("duplicate lambda argument slot id: {}", slot_id)).into());
+            return Err(expression_contract(format_args!(
+                "duplicate lambda argument slot id: {}",
+                slot_id
+            )));
         }
         let col = flat_args[idx].clone();
         fields.push(Field::new(
@@ -266,7 +299,10 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     for (slot_id, col) in captured_columns {
         if !seen.insert(slot_id) {
-            return Err((format!("lambda captured slot id conflicts: {}", slot_id)).into());
+            return Err(expression_contract(format_args!(
+                "lambda captured slot id conflicts: {}",
+                slot_id
+            )));
         }
         fields.push(Field::new(
             format!("lambda_capture_{slot_id}"),
@@ -281,7 +317,10 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     for (idx, (slot_id, expr_id)) in common_sub_exprs.iter().enumerate() {
         if !seen.insert(*slot_id) {
-            return Err((format!("lambda common sub expr slot id conflicts: {}", slot_id)).into());
+            return Err(expression_contract(format_args!(
+                "lambda common sub expr slot id conflicts: {}",
+                slot_id
+            )));
         }
         let col = if let Some(source_col) = &source_row_common_sub_exprs[idx] {
             replicate_array_by_row_lengths(source_col, &row_lengths, total_elements)?
@@ -313,12 +352,11 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             }
         };
         if col.len() != total_elements {
-            return Err((format!(
+            return Err(expression_contract(format_args!(
                 "lambda common sub expr length mismatch: expected {}, got {}",
                 total_elements,
                 col.len()
-            ))
-            .into());
+            )));
         }
         fields.push(Field::new(
             format!("lambda_common_{idx}"),
@@ -332,32 +370,36 @@ pub fn eval_array_map<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     let result = arena.eval(lambda_body, &lambda_chunk)?;
     if result.len() != total_elements {
-        return Err((format!(
+        return Err(expression_contract(format_args!(
             "lambda body length mismatch: expected {}, got {}",
             total_elements,
             result.len()
-        ))
-        .into());
+        )));
     }
     if result.data_type() != &item_type {
-        return Err((format!(
+        return Err(expression_contract(format_args!(
             "array_map result type mismatch: expected {:?}, got {:?}",
             item_type,
             result.data_type()
-        ))
-        .into());
+        )));
     }
 
-    let list = ListArray::new(
+    let list = ListArray::try_new(
         output_field,
         OffsetBuffer::new(offsets.into()),
         result,
         nulls,
-    );
+    )
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "array_map constructor",
+            source,
+        )
+    })?;
     Ok(Arc::new(list))
 }
 
-fn flatten_list_values(list: &ListArray, row_valid: &[bool]) -> Result<ArrayRef, String> {
+fn flatten_list_values(list: &ListArray, row_valid: &[bool]) -> ExecutionResult<ArrayRef> {
     let values = list.values();
     let offsets = list.value_offsets();
     let mut slices: Vec<ArrayRef> = Vec::new();
@@ -368,7 +410,7 @@ fn flatten_list_values(list: &ListArray, row_valid: &[bool]) -> Result<ArrayRef,
         let start = offsets[row] as i64;
         let end = offsets[row + 1] as i64;
         if end < start {
-            return Err("array_map list offsets are invalid".to_string());
+            return Err(expression_contract("array_map list offsets are invalid"));
         }
         let len = (end - start) as usize;
         if len == 0 {
@@ -382,7 +424,12 @@ fn flatten_list_values(list: &ListArray, row_valid: &[bool]) -> Result<ArrayRef,
     }
 
     let refs: Vec<&dyn Array> = slices.iter().map(|arr| arr.as_ref()).collect();
-    concat(&refs).map_err(|e| e.to_string())
+    concat(&refs).map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "array_map Arrow operation",
+            source,
+        )
+    })
 }
 
 fn collect_captured_slots<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -513,17 +560,20 @@ fn try_eval_expr_on_source_rows<__Eval: crate::exec::expr::ExprEvaluation + ?Siz
     arena: &__Eval,
     expr_id: ExprId,
     source_chunk: &Chunk,
-) -> Result<Option<ArrayRef>, __Eval::Error> {
-    let source_result = match arena.eval(expr_id, source_chunk) {
-        Ok(value) => value,
-        Err(error) if arena.recoverable_error(&error) => return Ok(None),
-        Err(error) => return Err(error),
-    };
+) -> ExecutionResult<Option<ArrayRef>> {
+    if !can_eval_on_source_rows(arena, expr_id, source_chunk) {
+        return Ok(None);
+    }
+    let source_result = arena.eval(expr_id, source_chunk)?;
 
     let source_result = match source_result.len() {
         len if len == source_chunk.len() => source_result,
         1 => broadcast_array(&source_result, source_chunk.len())?,
-        _ => return Ok(None),
+        other => {
+            return Err(expression_contract(format_args!(
+                "array_map source result length {other} differs from its batch"
+            )));
+        }
     };
 
     Ok(Some(source_result))
@@ -536,23 +586,18 @@ fn eval_common_sub_expr_on_source_rows<__Eval: crate::exec::expr::ExprEvaluation
     lambda_chunk: &Chunk,
     row_lengths: &[usize],
     total_elements: usize,
-) -> Result<CommonSubExprEval, __Eval::Error> {
-    let source_attempt = match arena.eval(expr_id, source_chunk) {
-        Ok(value) => Some(value),
-        Err(error) if arena.recoverable_error(&error) => None,
-        Err(error) => return Err(error),
-    };
-    if let Some(source_col) = source_attempt {
+) -> ExecutionResult<CommonSubExprEval> {
+    if can_eval_on_source_rows(arena, expr_id, source_chunk) {
+        let source_col = arena.eval(expr_id, source_chunk)?;
         let source_col = match source_col.len() {
             len if len == source_chunk.len() => source_col,
             1 => broadcast_array(&source_col, source_chunk.len())?,
             other => {
-                return Err((format!(
+                return Err(expression_contract(format_args!(
                     "lambda common sub expr source length mismatch: expected {} or 1, got {}",
                     source_chunk.len(),
                     other
-                ))
-                .into());
+                )));
             }
         };
         let flat_col = replicate_array_by_row_lengths(&source_col, row_lengths, total_elements)?;
@@ -563,7 +608,7 @@ fn eval_common_sub_expr_on_source_rows<__Eval: crate::exec::expr::ExprEvaluation
     Ok(CommonSubExprEval::FlatRows(flat_col))
 }
 
-fn broadcast_array(array: &ArrayRef, len: usize) -> Result<ArrayRef, String> {
+fn broadcast_array(array: &ArrayRef, len: usize) -> ExecutionResult<ArrayRef> {
     if array.len() == len {
         return Ok(array.clone());
     }
@@ -571,45 +616,45 @@ fn broadcast_array(array: &ArrayRef, len: usize) -> Result<ArrayRef, String> {
         return Ok(new_empty_array(array.data_type()));
     }
     if array.len() != 1 {
-        return Err(format!(
+        return Err(expression_contract(format_args!(
             "cannot broadcast array of length {} to {}",
             array.len(),
             len
-        ));
+        )));
     }
     if len == 0 {
         return Ok(new_empty_array(array.data_type()));
     }
     let indices = UInt32Array::from(vec![0_u32; len]);
-    take(array.as_ref(), &indices, None).map_err(|e| e.to_string())
+    array_common::take_values(array.as_ref(), &indices, "higher-order take")
 }
 
 fn replicate_array_by_row_lengths(
     array: &ArrayRef,
     row_lengths: &[usize],
     total_elements: usize,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     if total_elements == 0 {
         return Ok(new_empty_array(array.data_type()));
     }
     if array.len() != 1 && array.len() != row_lengths.len() {
-        return Err(format!(
+        return Err(expression_contract(format_args!(
             "cannot replicate array with length {} for {} source rows",
             array.len(),
             row_lengths.len()
-        ));
+        )));
     }
 
     let mut indices: Vec<u32> = Vec::with_capacity(total_elements);
     for (row, len) in row_lengths.iter().enumerate() {
         let src_row = if array.len() == 1 { 0 } else { row };
-        let src_row = u32::try_from(src_row).map_err(|_| "array_map index overflow".to_string())?;
+        let src_row = array_common::index_u32(src_row)?;
         for _ in 0..*len {
             indices.push(src_row);
         }
     }
     let idx_array = UInt32Array::from(indices);
-    take(array.as_ref(), &idx_array, None).map_err(|e| e.to_string())
+    array_common::take_values(array.as_ref(), &idx_array, "higher-order take")
 }
 
 fn replicate_captured_columns(
@@ -617,7 +662,7 @@ fn replicate_captured_columns(
     captured_slots: &[SlotId],
     row_lengths: &[usize],
     total_elements: usize,
-) -> Result<Vec<(SlotId, ArrayRef)>, String> {
+) -> ExecutionResult<Vec<(SlotId, ArrayRef)>> {
     if captured_slots.is_empty() {
         return Ok(Vec::new());
     }
@@ -625,7 +670,7 @@ fn replicate_captured_columns(
     let mut indices: Vec<u32> = Vec::with_capacity(total_elements);
     for (row, len) in row_lengths.iter().enumerate() {
         for _ in 0..*len {
-            indices.push(u32::try_from(row).map_err(|_| "array_map index overflow".to_string())?);
+            indices.push(array_common::index_u32(row)?);
         }
     }
 
@@ -637,14 +682,14 @@ fn replicate_captured_columns(
         let flat = if total_elements == 0 {
             new_empty_array(col.data_type())
         } else {
-            take(col.as_ref(), &idx_array, None).map_err(|e| e.to_string())?
+            array_common::take_values(col.as_ref(), &idx_array, "higher-order take")?
         };
         if flat.len() != total_elements {
-            return Err(format!(
+            return Err(expression_contract(format_args!(
                 "captured column length mismatch: expected {}, got {}",
                 total_elements,
                 flat.len()
-            ));
+            )));
         }
         out.push((*slot_id, flat));
     }
@@ -655,12 +700,79 @@ fn build_chunk_from_columns(
     fields: &[Field],
     columns: &[ArrayRef],
     slot_ids: &[SlotId],
-) -> Result<Chunk, String> {
+) -> ExecutionResult<Chunk> {
     let schema = Arc::new(Schema::new(fields.to_vec()));
-    let batch =
-        RecordBatch::try_new(schema.clone(), columns.to_vec()).map_err(|e| e.to_string())?;
-    Chunk::try_new_with_chunk_schema(
+    let batch = RecordBatch::try_new(schema.clone(), columns.to_vec()).map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "array_map Arrow operation",
+            source,
+        )
+    })?;
+    Ok(Chunk::try_new_with_chunk_schema(
         batch,
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)?,
-    )
+    )?)
+}
+
+fn can_eval_on_source_rows<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
+    arena: &__Eval,
+    expr_id: ExprId,
+    source_chunk: &Chunk,
+) -> bool {
+    let mut referenced = HashSet::new();
+    collect_slot_ids(arena, expr_id, &HashSet::new(), &mut referenced);
+    referenced
+        .iter()
+        .all(|slot| source_chunk.chunk_schema().slot_ids().contains(slot))
+}
+
+#[cfg(test)]
+mod source_row_properties {
+    use super::*;
+    use crate::exec::expr::{ExprArena, LiteralValue, function::FunctionKind};
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    fn source() -> Chunk {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![1]))],
+        )
+        .unwrap();
+        Chunk::try_new_with_chunk_schema(
+            batch,
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
+                .unwrap(),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn missing_lambda_slot_is_selected_by_binding_but_real_source_failure_propagates() {
+        let chunk = source();
+        let mut arena = ExprArena::default();
+        let missing = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int32);
+        assert!(
+            try_eval_expr_on_source_rows(&arena, missing, &chunk)
+                .unwrap()
+                .is_none()
+        );
+        let message = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("actual source error".to_string())),
+            DataType::Utf8,
+        );
+        let raised = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::String("raise_error"),
+                args: vec![message],
+            },
+            DataType::Boolean,
+        );
+        let failure = try_eval_expr_on_source_rows(&arena, raised, &chunk).unwrap_err();
+        assert_eq!(failure.failure_fact().class(), FailureClass::Data);
+        assert_eq!(failure.failure_fact().reason().code(), 518);
+        assert!(failure.to_string().contains("actual source error"));
+    }
 }

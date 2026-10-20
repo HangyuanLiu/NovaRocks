@@ -293,7 +293,8 @@ fn null_node<E: From<CopyError>>(
                 (1, 0, true)
             }
             DataType::FixedSizeBinary(width) => {
-                let width = usize::try_from(*width).map_err(|_| CopyError::Extent)?;
+                let width = usize::try_from(*width)
+                    .map_err(|_| CopyError::Invalid("copy frozen carrier has a negative width"))?;
                 invoice.empty_offsets(mul(width, rows)?)?;
                 (1, 0, true)
             }
@@ -337,7 +338,7 @@ fn null_node<E: From<CopyError>>(
                 }
                 invoice.empty_offsets(rows)?;
                 if *mode == arrow_schema::UnionMode::Dense {
-                    i32::try_from(rows).map_err(|_| CopyError::Extent)?;
+                    super::limit(rows, i32::MAX as usize, super::CopyLayout::DenseUnion)?;
                     invoice.empty_offsets(mul(rows, 4)?)?;
                 }
                 (
@@ -351,7 +352,9 @@ fn null_node<E: From<CopyError>>(
                 )
             }
             DataType::Dictionary(key, _) if raw_arrow => {
-                let width = key.primitive_width().ok_or(CopyError::Extent)?;
+                let width = key
+                    .primitive_width()
+                    .ok_or(CopyError::Invalid("copy frozen primitive width is absent"))?;
                 invoice.empty_offsets(mul(width, rows)?)?;
                 (1, 1, true)
             }
@@ -367,7 +370,7 @@ fn null_node<E: From<CopyError>>(
                         .into());
                     }
                 };
-                super::limit(rows, maximum)?;
+                super::limit(rows, maximum, super::CopyLayout::RunEnd)?;
                 (0, 2, false)
             }
             DataType::Dictionary(_, _) | DataType::RunEndEncoded(_, _) => {
@@ -376,7 +379,7 @@ fn null_node<E: From<CopyError>>(
                 )
                 .into());
             }
-            other => return Err(CopyError::Unsupported(other.clone()).into()),
+            other => return Err(CopyError::unsupported(other).into()),
         }
     };
     if nulls {
@@ -398,7 +401,8 @@ fn null_node<E: From<CopyError>>(
             )?;
         }
         DataType::FixedSizeList(field, width) => {
-            let width = usize::try_from(*width).map_err(|_| CopyError::Extent)?;
+            let width = usize::try_from(*width)
+                .map_err(|_| CopyError::Invalid("copy frozen carrier has a negative width"))?;
             metadata = add(
                 metadata,
                 null_node(
@@ -449,7 +453,7 @@ fn null_node<E: From<CopyError>>(
                 invoice.empty_offsets(
                     ends.data_type()
                         .primitive_width()
-                        .ok_or(CopyError::Extent)?,
+                        .ok_or(CopyError::Invalid("copy frozen primitive width is absent"))?,
                 )?;
                 metadata = add(
                     metadata,
@@ -533,7 +537,7 @@ pub fn preflight_flat_arrow_structure_construction<H>(
     ) {
         2
     } else {
-        return Err(CopyError::Unsupported(ty.clone()).into());
+        return Err(CopyError::unsupported(ty).into());
     };
     let metadata = take_host::result_node_metadata_upper(ty, buffers, has_nulls, 0)?;
     observe(true).map_err(CopyConstructionError::Creator)?;

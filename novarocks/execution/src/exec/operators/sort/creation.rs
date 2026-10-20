@@ -14,6 +14,7 @@
 //! application owns admission; independently emitted wrappers retain only
 //! finite creation and shared type storage, never this access or an operator.
 
+use super::operation_failure::{self as failure, Operation};
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputConstructionOwner,
@@ -34,10 +35,7 @@ impl ComparisonFailure {
     fn into_execution(self) -> crate::runtime::fragment::ExecutionFailure {
         match self {
             Self::Creator(cause) => cause.into(),
-            Self::Value(cause) => ConstructionFailure::InvalidSource(format!(
-                "sort complete declaration is invalid: {cause}"
-            ))
-            .into(),
+            Self::Value(cause) => crate::runtime::fragment::ExecutionFailure::from_domain(cause),
         }
     }
 }
@@ -204,10 +202,7 @@ impl<'a> SortCreation<'a> {
                 cause,
             ) => copy_failure(cause),
             novarocks_functions::selected_copy::RowConversionStructureFailure::ValueType(cause) => {
-                ConstructionFailure::InvalidSource(format!(
-                    "sort row converter source declaration: {cause}"
-                ))
-                .into()
+                crate::runtime::fragment::ExecutionFailure::from_domain(cause)
             }
             novarocks_functions::selected_copy::RowConversionStructureFailure::Unsupported(
                 cause,
@@ -229,7 +224,8 @@ impl<'a> SortCreation<'a> {
                 arrow::row::SortField::new_with_options(column.data_type().clone(), options)
             })
             .collect::<Vec<_>>();
-        let converter = arrow::row::RowConverter::new(fields).map_err(|cause| cause.to_string())?;
+        let converter = arrow::row::RowConverter::new(fields)
+            .map_err(|source| failure::arrow(Operation::RowConverter, source))?;
         Ok(CreatedSortConverter {
             converter,
             _storage: storage,
@@ -273,11 +269,11 @@ impl<'a> SortCreation<'a> {
                 let actual = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                     actual.typed_binding().clone(),
                 )
-                .map_err(|cause| ConstructionFailure::InvalidSource(cause.to_string()))?;
+                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
                 let expected = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
                     expected.typed_binding().clone(),
                 )
-                .map_err(|cause| ConstructionFailure::InvalidSource(cause.to_string()))?;
+                .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
                 let same = actual
                     .fits_physical_binding_observed::<ComparisonFailure>(&expected, || {
                         self.factory
@@ -378,7 +374,7 @@ impl<'a> SortCreation<'a> {
         )
         .map_err(copy_failure)?;
         let indices = arrow::compute::lexsort_to_indices(columns, limit)
-            .map_err(|cause| cause.to_string())?;
+            .map_err(|source| failure::arrow(Operation::Lexsort, source))?;
         // The shared result header bound includes this ONE public Array Arc.
         let array = std::sync::Arc::new(indices) as arrow::array::ArrayRef;
         Ok(CreatedSortArray::new(array, retained.storage_lifetime()))
@@ -456,10 +452,11 @@ impl<'a> SortCreation<'a> {
             .map_err(copy_failure)?;
             columns.push(
                 arrow::compute::take(column.as_ref(), indices, None)
-                    .map_err(|cause| cause.to_string())?,
+                    .map_err(|source| failure::arrow(Operation::Take, source))?,
             );
         }
-        Ok(RecordBatch::try_new(batch.schema(), columns).map_err(|cause| cause.to_string())?)
+        Ok(RecordBatch::try_new(batch.schema(), columns)
+            .map_err(|source| failure::arrow(Operation::Batch, source))?)
     }
 
     pub(crate) fn normalize_key(
@@ -570,7 +567,8 @@ impl<'a> SortCreation<'a> {
             self.vector::<&dyn arrow::array::Array>(parts.len(), temporary.as_ref())?;
         sources.extend(parts.iter().map(|array| array.as_ref()));
         self.factory.observe_input_work(0)?;
-        let result = arrow::compute::concat(&sources).map_err(|cause| cause.to_string())?;
+        let result = arrow::compute::concat(&sources)
+            .map_err(|source| failure::arrow(Operation::Concat, source))?;
         self.factory.observe_input_work(0)?;
         Ok(result)
     }
@@ -624,7 +622,7 @@ impl<'a> SortCreation<'a> {
         .map_err(copy_failure)?;
         self.factory.observe_input_work(0)?;
         let result = arrow::compute::take(array.as_ref(), indices, None)
-            .map_err(|cause| cause.to_string())?;
+            .map_err(|source| failure::arrow(Operation::Take, source))?;
         self.factory.observe_input_work(0)?;
         Ok(result)
     }
@@ -682,7 +680,7 @@ impl<'a> SortCreation<'a> {
         // declarations are already exact; there is no NULL/name inference.
         Ok(
             arrow::compute::concat_batches(&schema, chunks.iter().map(Chunk::record_batch))
-                .map_err(|cause| cause.to_string())?,
+                .map_err(|source| failure::arrow(Operation::ConcatBatches, source))?,
         )
     }
 
@@ -744,19 +742,7 @@ fn copy_failure(
     match error {
         CopyConstructionError::Creator(cause) => cause.into(),
         CopyConstructionError::Resource(cause) => ConstructionFailure::Resource(cause).into(),
-        CopyConstructionError::Copy(CopyError::Control(cause)) => cause.into(),
-        CopyConstructionError::Copy(CopyError::Extent) => {
-            novarocks_functions::KernelFailure::ResourceExhausted.into()
-        }
-        CopyConstructionError::Copy(CopyError::Invalid(message)) => {
-            ConstructionFailure::InvalidSource(message.into()).into()
-        }
-        CopyConstructionError::Copy(CopyError::Unsupported(ty)) => {
-            ConstructionFailure::InvalidSource(format!(
-                "sort original copy does not support {ty:?}"
-            ))
-            .into()
-        }
+        CopyConstructionError::Copy(cause) => cause.into_kernel().into(),
     }
 }
 
@@ -768,11 +754,10 @@ fn concat_failure(
             copy_failure(cause)
         }
         novarocks_functions::selected_copy::ConcatStructureFailure::ValueType(cause) => {
-            ConstructionFailure::InvalidSource(format!("sort concat source declaration: {cause}"))
-                .into()
+            crate::runtime::fragment::ExecutionFailure::from_domain(cause)
         }
         novarocks_functions::selected_copy::ConcatStructureFailure::Source(cause) => {
-            ConstructionFailure::InvalidSource(cause).into()
+            ConstructionFailure::from(cause).into()
         }
     }
 }

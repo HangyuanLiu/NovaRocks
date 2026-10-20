@@ -584,30 +584,123 @@ pub(crate) enum PreReadyTopologyOutcome {
     },
 }
 
+impl novarocks_execution_contract::failure::FailureProjection for PreReadyTopologyOutcome {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, domain,
+        };
+        let (class, code) = match self {
+            Self::BackendDraining { .. } => (FailureClass::Dependency, 35),
+            Self::BackendProcessMismatch { .. } => (FailureClass::Dependency, 36),
+            Self::BackendNotEligible { .. } => (FailureClass::Dependency, 37),
+            Self::CompatibilityMismatch { .. } => (FailureClass::Invariant, 38),
+        };
+        FailureFact::new(
+            class,
+            FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+impl PreReadyTopologyOutcome {
+    fn failure_site(self) -> novarocks_query_application::execution_error::ExecutionFailureSite {
+        let process = match self {
+            Self::BackendDraining { process_id, .. }
+            | Self::BackendProcessMismatch { process_id, .. }
+            | Self::BackendNotEligible { process_id, .. }
+            | Self::CompatibilityMismatch { process_id, .. } => process_id,
+        };
+        novarocks_query_application::execution_error::ExecutionFailureSite::Backend { process }
+    }
+    fn safe_detail(self) -> &'static str {
+        match self {
+            Self::BackendDraining { .. } => {
+                "the captured backend is draining before context readiness"
+            }
+            Self::BackendProcessMismatch { .. } => {
+                "the captured backend process did not match before context readiness"
+            }
+            Self::BackendNotEligible { .. } => {
+                "the captured backend is ineligible before context readiness"
+            }
+            Self::CompatibilityMismatch { .. } => {
+                "native compatibility was rejected before context readiness"
+            }
+        }
+    }
+}
+
 /// A coordinator failure that core can surface without naming a coordinator
 /// implementation or frontend state type.
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum DistributedQueryErrorBody {
+    Coordinator(String),
+    Execution(novarocks_query_application::execution_error::ExecutionFailureInput),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DistributedQueryError {
+    domain_source: Option<novarocks_execution_contract::failure::SharedFailureCause>,
     root_fetch_failure: Option<novarocks_query_application::coordination::RootResultFetchFailure>,
     kind: DistributedQueryErrorKind,
-    message: String,
+    body: DistributedQueryErrorBody,
     pre_ready_topology_outcome: Option<PreReadyTopologyOutcome>,
     pre_ready_topology_observation: bool,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
-    engine_error_code: Option<novarocks_types::EngineErrorCode>,
 }
 
 impl DistributedQueryError {
-    pub fn new(kind: DistributedQueryErrorKind, message: impl Into<String>) -> Self {
+    /// An already selected execution input cannot become preparation text.
+    pub(crate) fn from_execution(
+        input: novarocks_query_application::execution_error::ExecutionFailureInput,
+    ) -> Self {
         Self {
+            domain_source: None,
             root_fetch_failure: None,
-            kind,
-            message: message.into(),
+            kind: DistributedQueryErrorKind::Failed,
+            body: DistributedQueryErrorBody::Execution(input),
             pre_ready_topology_outcome: None,
             pre_ready_topology_observation: false,
             compile_control: None,
-            engine_error_code: None,
         }
+    }
+
+    pub(crate) fn execution_failure(
+        &self,
+    ) -> Option<&novarocks_query_application::execution_error::ExecutionFailureInput> {
+        match &self.body {
+            DistributedQueryErrorBody::Execution(input) => Some(input),
+            DistributedQueryErrorBody::Coordinator(_) => None,
+        }
+    }
+
+    pub fn new(kind: DistributedQueryErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            domain_source: None,
+            root_fetch_failure: None,
+            kind,
+            body: DistributedQueryErrorBody::Coordinator(message.into()),
+            pre_ready_topology_outcome: None,
+            pre_ready_topology_observation: false,
+            compile_control: None,
+        }
+    }
+
+    pub(crate) fn from_source(
+        kind: DistributedQueryErrorKind,
+        source: novarocks_execution_contract::failure::SharedFailureCause,
+    ) -> Self {
+        use novarocks_failure_contract::FailureProjection;
+        let input = novarocks_query_application::execution_error::ExecutionFailureInput::new(
+            source.failure_fact(),
+            novarocks_execution_contract::SafeDetail::truncating(
+                "native attempt initialization failed in its owning domain",
+            ),
+            novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator,
+        );
+        let mut error = Self::from_execution(input);
+        error.kind = kind;
+        error.domain_source = Some(source);
+        error
     }
 
     /// Constructed only by the pre-ControlReady coordinator/barrier path.
@@ -618,13 +711,13 @@ impl DistributedQueryError {
         message: impl Into<String>,
     ) -> Self {
         Self {
+            domain_source: None,
             root_fetch_failure: None,
             kind: DistributedQueryErrorKind::Rejected,
-            message: message.into(),
+            body: DistributedQueryErrorBody::Coordinator(message.into()),
             pre_ready_topology_outcome: Some(outcome),
             pre_ready_topology_observation: false,
             compile_control: None,
-            engine_error_code: None,
         }
     }
 
@@ -634,13 +727,13 @@ impl DistributedQueryError {
     /// display text or after ControlReady.
     pub(crate) fn pre_ready_topology_observation(message: impl Into<String>) -> Self {
         Self {
+            domain_source: None,
             root_fetch_failure: None,
             kind: DistributedQueryErrorKind::Failed,
-            message: message.into(),
+            body: DistributedQueryErrorBody::Coordinator(message.into()),
             pre_ready_topology_outcome: None,
             pre_ready_topology_observation: true,
             compile_control: None,
-            engine_error_code: None,
         }
     }
 
@@ -653,53 +746,14 @@ impl DistributedQueryError {
         message: impl Into<String>,
     ) -> Self {
         Self {
+            domain_source: None,
             root_fetch_failure: None,
             kind: DistributedQueryErrorKind::TopologyRetryUnsupported,
-            message: message.into(),
+            body: DistributedQueryErrorBody::Coordinator(message.into()),
             pre_ready_topology_outcome: Some(outcome),
             pre_ready_topology_observation: false,
             compile_control: None,
-            engine_error_code: None,
         }
-    }
-
-    pub(crate) fn with_engine_error_code(
-        mut self,
-        code: Option<novarocks_types::EngineErrorCode>,
-    ) -> Self {
-        self.engine_error_code = code;
-        if code == Some(novarocks_types::EngineErrorCode::UnsupportedCompiledShape)
-            && !self.message.starts_with("[UnsupportedCompiledShape] ")
-        {
-            // The typed fact determines identity; this check only keeps the
-            // existing renderer's prefix idempotent across FE wrappers.
-            self.message =
-                novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(
-                    self.message,
-                )
-                .to_bracketed_user_message();
-        }
-        self
-    }
-
-    pub(crate) fn with_task_termination(
-        self,
-        detail: &novarocks_execution_contract::TerminationDetail,
-    ) -> Self {
-        use novarocks_execution_contract::{TaskFailureCategory, TerminationDetail};
-        let code = match detail {
-            TerminationDetail::Failed(failure)
-                if failure.category() == TaskFailureCategory::Unsupported =>
-            {
-                Some(novarocks_types::EngineErrorCode::UnsupportedCompiledShape)
-            }
-            _ => None,
-        };
-        self.with_engine_error_code(code)
-    }
-
-    pub(crate) const fn engine_error_code(&self) -> Option<novarocks_types::EngineErrorCode> {
-        self.engine_error_code
     }
 
     pub(crate) fn from_compile(error: novarocks_sql::compiler::SqlCompileError) -> Self {
@@ -731,6 +785,9 @@ impl DistributedQueryError {
                     Self::new(DistributedQueryErrorKind::ContractViolation, message)
                 }
             },
+            SqlCompileError::CompilationSource(source) => {
+                Self::from_source(DistributedQueryErrorKind::ContractViolation, source)
+            }
             error @ (SqlCompileError::InvalidRequest(_) | SqlCompileError::Compilation(_)) => {
                 Self::new(
                     DistributedQueryErrorKind::ContractViolation,
@@ -744,33 +801,27 @@ impl DistributedQueryError {
             novarocks_plan_codec::PhysicalEncodeError::Control(error) => {
                 Self::from_compile_control(error)
             }
-            novarocks_plan_codec::PhysicalEncodeError::Invalid(error) => {
-                Self::new(DistributedQueryErrorKind::ContractViolation, error)
-            }
-            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(message) => Self::new(
-                DistributedQueryErrorKind::Failed,
-                novarocks_query_application::engine_error::EngineError::unsupported_compiled_shape(
-                    message,
-                )
-                .to_bracketed_user_message(),
-            )
-            .with_engine_error_code(Some(
-                novarocks_types::EngineErrorCode::UnsupportedCompiledShape,
-            )),
+            other => Self::from_source(
+                DistributedQueryErrorKind::ContractViolation,
+                novarocks_failure_contract::SharedFailureCause::new(other),
+            ),
         }
     }
     fn from_compile_control(error: novarocks_type_contract::CompileControlError) -> Self {
-        let mut failure = Self::new(
-            DistributedQueryErrorKind::ContractViolation,
-            error.to_string(),
-        );
+        let mut failure = match &error {
+            novarocks_type_contract::CompileControlError::Source(source) => {
+                Self::from_source(DistributedQueryErrorKind::ContractViolation, source.clone())
+            }
+            _ => Self::new(
+                DistributedQueryErrorKind::ContractViolation,
+                error.to_string(),
+            ),
+        };
         failure.compile_control = Some(error);
         failure
     }
-    pub const fn compile_control_error(
-        &self,
-    ) -> Option<novarocks_type_contract::CompileControlError> {
-        self.compile_control
+    pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control.clone()
     }
 
     /// Preserve the transport verdict after this coordinator has failed its
@@ -780,15 +831,19 @@ impl DistributedQueryError {
         failure: novarocks_query_application::coordination::RootResultFetchFailure,
     ) -> Self {
         use novarocks_query_application::coordination::AttemptFailureClass as C;
+        if self.execution_failure().is_some() {
+            // This is supplemental transport evidence, not another selection.
+            self.root_fetch_failure = Some(failure);
+            return self;
+        }
         self.kind = match failure.class() {
             C::ResourceGovernance => DistributedQueryErrorKind::Rejected,
             C::ContractViolation => DistributedQueryErrorKind::ContractViolation,
             _ => DistributedQueryErrorKind::Failed,
         };
-        let code = (failure.class() == C::Unsupported)
-            .then_some(novarocks_types::EngineErrorCode::UnsupportedCompiledShape);
+        self.body = DistributedQueryErrorBody::Execution(failure.input().clone());
         self.root_fetch_failure = Some(failure);
-        self.with_engine_error_code(code)
+        self
     }
     pub(crate) fn root_fetch_failure(
         &self,
@@ -796,12 +851,80 @@ impl DistributedQueryError {
         self.root_fetch_failure.as_ref()
     }
 
+    /// The coordinator consumes its own closed state. Foreign domain facts and
+    /// already selected root-read input are forwarded without reclassification;
+    /// text-only coordinator failures explicitly select this owner's reason.
+    pub(crate) fn into_execution_failure_input(
+        self,
+    ) -> novarocks_query_application::execution_error::ExecutionFailureInput {
+        use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+        };
+        let message = match self.body {
+            DistributedQueryErrorBody::Execution(input) => return input,
+            DistributedQueryErrorBody::Coordinator(message) => message,
+        };
+        if let Some(failure) = self.root_fetch_failure {
+            return failure.input().clone();
+        }
+        if let Some(outcome) = self.pre_ready_topology_outcome {
+            return ExecutionFailureInput::new(
+                outcome.failure_fact(),
+                SafeDetail::truncating(outcome.safe_detail()),
+                outcome.failure_site(),
+            );
+        }
+        let site = ExecutionFailureSite::Coordinator;
+        if let Some(source) = self.domain_source {
+            return ExecutionFailureInput::new(
+                source.failure_fact(),
+                SafeDetail::truncating("native attempt initialization failed in its owning domain"),
+                site,
+            );
+        }
+        if let Some(control) = self.compile_control {
+            return ExecutionFailureInput::new(
+                control.failure_fact(),
+                SafeDetail::truncating(
+                    "native attempt compilation was stopped by its control owner",
+                ),
+                site,
+            );
+        }
+        let reason =
+            if self.pre_ready_topology_outcome.is_some() || self.pre_ready_topology_observation {
+                QueryFailureReason::ObservationLost
+            } else {
+                match self.kind {
+                    DistributedQueryErrorKind::ContractViolation => {
+                        QueryFailureReason::PreparationProtocol
+                    }
+                    DistributedQueryErrorKind::TopologyRetryUnsupported => {
+                        QueryFailureReason::ObservationLost
+                    }
+                    DistributedQueryErrorKind::Rejected | DistributedQueryErrorKind::Failed => {
+                        QueryFailureReason::PreparationFailed
+                    }
+                }
+            };
+        tracing::debug!(error = %message, kind = ?self.kind, "coordinator preparation failed");
+        ExecutionFailureInput::new(
+            reason.failure_fact(),
+            SafeDetail::truncating("native attempt initialization failed"),
+            site,
+        )
+    }
+
     pub fn kind(&self) -> DistributedQueryErrorKind {
         self.kind
     }
 
     pub fn message(&self) -> &str {
-        &self.message
+        match &self.body {
+            DistributedQueryErrorBody::Coordinator(message) => message,
+            DistributedQueryErrorBody::Execution(input) => input.detail().as_str(),
+        }
     }
 
     pub(crate) const fn pre_ready_topology_outcome(&self) -> Option<PreReadyTopologyOutcome> {
@@ -815,11 +938,17 @@ impl DistributedQueryError {
 
 impl fmt::Display for DistributedQueryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}", self.message)
+        write!(formatter, "{}", self.message())
     }
 }
 
-impl std::error::Error for DistributedQueryError {}
+impl std::error::Error for DistributedQueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.domain_source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// Frontend-owned distributed query execution port.
 pub trait DistributedQueryCoordinator: Send + Sync + 'static {
@@ -925,51 +1054,51 @@ mod tests {
 
     #[test]
     fn typed_task_and_root_fetch_failures_preserve_engine_identity_without_text_inference() {
-        use novarocks_execution_contract::{
-            SafeDetail, TaskFailure, TaskFailureCategory, TerminationDetail,
-        };
-        use novarocks_query_application::api::{QueryExecutionError, QueryExecutionErrorKind};
-        use novarocks_query_application::coordination::{
-            AttemptFailureClass, RootResultFetchFailure,
-        };
-        use novarocks_types::EngineErrorCode;
-        for category in [
-            TaskFailureCategory::Unsupported,
-            TaskFailureCategory::Protocol,
+        use novarocks_failure_contract::FailureProjection;
+        let backend = novarocks_types::BackendProcessId::new_v7();
+        let query = novarocks_types::QueryExecutionId::new(
+            novarocks_types::QueryId::new(31, 32),
+            novarocks_types::AttemptId::new(1).unwrap(),
+        )
+        .unwrap();
+        let identity = novarocks_execution_contract::TaskIdentity::new(
+            query,
+            novarocks_types::StageId::new(1).unwrap(),
+            novarocks_types::TaskId::new(1).unwrap(),
+            backend,
+        );
+        for original in [
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
+                "FULL OUTER hash join".into(),
+            ),
+            novarocks_plan_codec::PhysicalEncodeError::Invalid("FULL OUTER hash join".into()),
         ] {
-            let detail = TerminationDetail::Failed(TaskFailure::new(
-                category,
-                SafeDetail::truncating("unsupported diagnostic"),
-            ));
-            let error = super::DistributedQueryError::new(
-                super::DistributedQueryErrorKind::Failed,
-                "task failed",
-            )
-            .with_task_termination(&detail);
-            assert_eq!(
-                error.engine_error_code(),
-                (category == TaskFailureCategory::Unsupported)
-                    .then_some(EngineErrorCode::UnsupportedCompiledShape)
+            let fact = original.failure_fact();
+            let selected = novarocks_query_application::coordination::SelectedTaskTermination::new(
+                identity.clone(),
+                novarocks_execution_contract::TerminationDetail::Failed(
+                    novarocks_execution_contract::TaskFailure::new_in_phase(
+                        fact,
+                        novarocks_execution_contract::SafeDetail::truncating(
+                            "FULL OUTER hash join",
+                        ),
+                        novarocks_execution_contract::TaskFailurePhase::Preparation,
+                    ),
+                ),
             );
-        }
-        for class in [
-            AttemptFailureClass::Unsupported,
-            AttemptFailureClass::ContractViolation,
-        ] {
-            let failure = RootResultFetchFailure::new(
-                class,
-                QueryExecutionError::new(QueryExecutionErrorKind::Failed, "unsupported diagnostic"),
-            );
+            let input = novarocks_query_application::execution_error::ExecutionFailureInput::from_selected_task(&selected).unwrap();
+            let error = super::DistributedQueryError::from_execution(input.clone());
+            assert_eq!(error.clone().into_execution_failure_input(), input);
+            let observed =
+                novarocks_query_application::coordination::RootResultFetchFailure::from_input(
+                    input.clone(),
+                );
             let error = super::DistributedQueryError::new(
                 super::DistributedQueryErrorKind::Failed,
                 "root failed",
             )
-            .with_root_fetch_failure(failure);
-            assert_eq!(
-                error.engine_error_code(),
-                (class == AttemptFailureClass::Unsupported)
-                    .then_some(EngineErrorCode::UnsupportedCompiledShape)
-            );
+            .with_root_fetch_failure(observed);
+            assert_eq!(error.into_execution_failure_input(), input);
         }
     }
 
@@ -993,14 +1122,12 @@ mod tests {
                 .to_string()
                 .starts_with("[sql.analyze.unavailable_implementation] ")
         );
-        assert_eq!(failure.engine_error_code(), None);
         assert_eq!(failure.compile_control_error(), None);
 
         let ordinary = super::DistributedQueryError::from_compile(SqlCompileError::Analyze(
             AnalyzeError::internal("unsupported diagnostic"),
         ));
         assert_eq!(ordinary.to_string(), "unsupported diagnostic");
-        assert_eq!(ordinary.engine_error_code(), None);
         assert_eq!(ordinary.compile_control_error(), None);
         for control in [
             CompileControlError::Cancelled,
@@ -1008,36 +1135,53 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let failure = super::DistributedQueryError::from_compile(SqlCompileError::Analyze(
-                AnalyzeError::control(control),
+                AnalyzeError::control(control.clone()),
             ));
             assert_eq!(failure.compile_control_error(), Some(control));
-            assert_eq!(failure.engine_error_code(), None);
         }
     }
 
     #[test]
     fn encode_capability_refusal_is_not_a_contract_violation() {
-        let error = super::DistributedQueryError::from_encode(
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        for original in [
             novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(
                 "CTE multicast".into(),
             ),
-        );
-        assert_eq!(error.kind(), super::DistributedQueryErrorKind::Failed);
-        assert_eq!(
-            error.engine_error_code(),
-            Some(novarocks_types::EngineErrorCode::UnsupportedCompiledShape)
-        );
-        assert_eq!(
-            error.to_string(),
-            "[UnsupportedCompiledShape] CTE multicast"
-        );
-        let invalid = super::DistributedQueryError::from_encode(
-            novarocks_plan_codec::PhysicalEncodeError::Invalid("unsupported diagnostic".to_owned()),
-        );
-        assert_eq!(
-            invalid.kind(),
-            super::DistributedQueryErrorKind::ContractViolation
-        );
+            novarocks_plan_codec::PhysicalEncodeError::Invalid("unsupported diagnostic".into()),
+        ] {
+            let expected = original.failure_fact();
+            let error = super::DistributedQueryError::from_encode(original);
+            assert_eq!(error.execution_failure().unwrap().fact(), expected);
+            assert_eq!(
+                error.clone().into_execution_failure_input().fact(),
+                expected
+            );
+            assert!(
+                error
+                    .domain_source
+                    .as_ref()
+                    .unwrap()
+                    .downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>()
+                    .is_some()
+            );
+            assert_eq!(
+                expected.class(),
+                match error
+                    .domain_source
+                    .as_ref()
+                    .unwrap()
+                    .downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>()
+                    .unwrap()
+                {
+                    novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(_) =>
+                        FailureClass::Unsupported,
+                    novarocks_plan_codec::PhysicalEncodeError::Invalid(_) =>
+                        FailureClass::Invariant,
+                    other => panic!("unexpected author: {other}"),
+                }
+            );
+        }
     }
 
     #[test]
@@ -1196,7 +1340,7 @@ mod tests {
         ) -> Result<(), novarocks_type_contract::CompileControlError> {
             let mut calls = self.calls.lock().unwrap();
             calls.push((phase, units));
-            match self.refuse {
+            match self.refuse.clone() {
                 Some((ordinal, cause)) if calls.len() == ordinal + 1 => Err(cause),
                 _ => Ok(()),
             }
@@ -1277,11 +1421,11 @@ mod tests {
                 CompileControlError::ResourceExhausted,
             ] {
                 for ordinal in 0..callbacks.len() {
-                    let trace = runtime_gate_control(Some((ordinal, cause)));
+                    let trace = runtime_gate_control(Some((ordinal, cause.clone())));
                     let error =
                         super::validate_completed_runtime_options(&description, &options, &trace)
                             .unwrap_err();
-                    assert_eq!(error.compile_control_error(), Some(cause));
+                    assert_eq!(error.compile_control_error(), Some(cause.clone()));
                     assert_eq!(*trace.calls.lock().unwrap(), callbacks[..=ordinal]);
                 }
             }
@@ -1355,5 +1499,133 @@ mod tests {
         assert_eq!(runtime.cache.datacache_priority, Some(2));
         assert_eq!(runtime.cache.datacache_ttl_seconds, Some(3600));
         assert_eq!(runtime.cache.datacache_sharing_work_period, Some(10));
+    }
+}
+
+#[cfg(test)]
+mod typed_compile_source_tests {
+    use super::*;
+    use novarocks_execution_contract::failure::{
+        FailureClass, FailureProjection, SharedFailureCause,
+    };
+    use std::error::Error;
+    #[test]
+    fn typed_compile_source_remains_original_without_forging_control_or_retry_proof() {
+        let source = SharedFailureCause::new(novarocks_functions::ConstantError::Limit(
+            "finite constant policy",
+        ));
+        let failure = DistributedQueryError::from_compile(
+            novarocks_sql::compiler::SqlCompileError::CompilationSource(source.clone()),
+        );
+        let carried = failure
+            .source()
+            .unwrap()
+            .downcast_ref::<SharedFailureCause>()
+            .unwrap();
+        assert_eq!(carried, &source);
+        assert_eq!(carried.failure_fact().class(), FailureClass::Resource);
+        assert!(
+            carried
+                .downcast_ref::<novarocks_functions::ConstantError>()
+                .is_some()
+        );
+        assert_eq!(failure.compile_control_error(), None);
+        assert_eq!(failure.pre_ready_topology_outcome(), None);
+        assert!(!failure.requires_pre_ready_topology_observation());
+    }
+}
+
+#[cfg(test)]
+mod pre_ready_failure_fact_tests {
+    use super::*;
+    use novarocks_query_application::coordination::AttemptFailureClass;
+    use novarocks_query_application::execution_error::ExecutionFailureSite;
+    #[test]
+    fn pre_ready_facts_keep_exact_process_without_minting_transport_loss_or_retry() {
+        let process = BackendProcessId::new_v7();
+        for (outcome, reason, class) in [
+            (
+                PreReadyTopologyOutcome::BackendDraining {
+                    backend_idx: 3,
+                    process_id: process,
+                },
+                35,
+                AttemptFailureClass::ExecutionFailure,
+            ),
+            (
+                PreReadyTopologyOutcome::BackendProcessMismatch {
+                    backend_idx: 3,
+                    process_id: process,
+                },
+                36,
+                AttemptFailureClass::ExecutionFailure,
+            ),
+            (
+                PreReadyTopologyOutcome::BackendNotEligible {
+                    backend_idx: 3,
+                    process_id: process,
+                },
+                37,
+                AttemptFailureClass::ExecutionFailure,
+            ),
+            (
+                PreReadyTopologyOutcome::CompatibilityMismatch {
+                    backend_idx: 3,
+                    process_id: process,
+                },
+                38,
+                AttemptFailureClass::ContractViolation,
+            ),
+        ] {
+            let input = DistributedQueryError::pre_ready_topology(outcome, "private diagnostic")
+                .into_execution_failure_input();
+            assert_eq!(input.fact().reason().code(), reason);
+            assert_eq!(input.site(), ExecutionFailureSite::Backend { process });
+            assert_eq!(input.attempt_class(), class);
+            assert_eq!(
+                input.topology_requirement(),
+                novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
+            );
+            assert!(!input.detail().as_str().contains("private"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod selected_execution_carrier_tests {
+    use super::*;
+    use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+    use novarocks_query_application::execution_error::{
+        ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
+    };
+
+    #[test]
+    fn selected_execution_is_not_reclassified_by_later_root_fetch_evidence() {
+        let source = novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Internal,
+            "private provider diagnostic",
+        );
+        let original = ExecutionFailureInput::new(
+            source.failure_fact(),
+            SafeDetail::new("original safe task failure").unwrap(),
+            ExecutionFailureSite::Coordinator,
+        );
+        let later = ExecutionFailureInput::new(
+            QueryFailureReason::ResultProtocol.failure_fact(),
+            SafeDetail::new("later root protocol failure").unwrap(),
+            ExecutionFailureSite::Coordinator,
+        );
+        let failure = DistributedQueryError::from_execution(original.clone())
+            .with_root_fetch_failure(
+                novarocks_query_application::coordination::RootResultFetchFailure::from_input(
+                    later,
+                ),
+            );
+        assert_eq!(failure.execution_failure(), Some(&original));
+        assert_eq!(failure.kind(), DistributedQueryErrorKind::Failed);
+        assert!(failure.root_fetch_failure().is_some());
+        assert_eq!(failure.pre_ready_topology_outcome(), None);
+        assert!(!failure.requires_pre_ready_topology_observation());
+        assert_eq!(failure.into_execution_failure_input(), original);
     }
 }

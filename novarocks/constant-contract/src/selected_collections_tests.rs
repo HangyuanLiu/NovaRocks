@@ -51,7 +51,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after first refusal");
         }
         trace.push(units);
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -155,7 +155,7 @@ fn assert_prefix<T>(invoke: impl Fn(&Control) -> Result<T, ConstantError>, ordin
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::new(vec![]),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(invoke(&control), Err(ConstantError::Control(actual)) if actual == cause)
@@ -480,7 +480,7 @@ fn caller_owned_collection_scan_observes_real_quantum_without_item_tails() {
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::new(vec![]),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert!(
                 matches!(invoke(&control), Err(ConstantError::Control(actual)) if actual == cause)

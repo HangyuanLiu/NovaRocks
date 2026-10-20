@@ -37,7 +37,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -361,7 +361,7 @@ fn prefixes(call: impl Fn(&Control) -> Result<(), Error>, succeeds: bool) {
     for at in 0..baseline.len() {
         for cause in CAUSES {
             let refusing = Control {
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
                 ..Control::default()
             };
             assert_eq!(call(&refusing), Err(Error::Control(cause)));
@@ -439,7 +439,7 @@ fn complete_properties_real_wide_ordered_occurrences_observe_quantum_and_preserv
         ] {
             for cause in CAUSES {
                 let refusing = Control {
-                    stop: Some((at, cause)),
+                    stop: Some((at, cause.clone())),
                     ..Control::default()
                 };
                 let result = if phase == CompilePhase::Encode {
@@ -554,7 +554,7 @@ fn composing_property_preflight_preserves_each_original_callback_cause() {
             for stop in 0..expected.len() {
                 let control = Control {
                     trace: Mutex::default(),
-                    stop: Some((stop, cause)),
+                    stop: Some((stop, cause.clone())),
                 };
                 assert!(matches!(run(&control),Err(Error::Control(got)) if got==cause));
                 assert_eq!(*control.trace.lock().unwrap(), expected[..=stop]);
@@ -783,7 +783,7 @@ fn distribution_containing_node_known_four_axes_precede_pending_255_and_late_con
             for stop in 0..3 {
                 for cause in CAUSES {
                     let control = Control {
-                        stop: Some((stop, cause)),
+                        stop: Some((stop, cause.clone())),
                         ..Control::default()
                     };
                     assert!(
@@ -914,7 +914,7 @@ fn distribution_numerical_source_capacity_and_overflow_keep_original_ordinary_ta
         for stop in 0..2 {
             for cause in CAUSES {
                 let control = Control {
-                    stop: Some((stop, cause)),
+                    stop: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert_eq!(run(&control), Err(Error::Control(cause)));

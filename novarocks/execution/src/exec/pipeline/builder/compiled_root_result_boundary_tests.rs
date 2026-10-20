@@ -17,6 +17,7 @@
 
 //! RootResult boundary probes using the original checked package fixture.
 use super::*;
+use novarocks_failure_contract::FailureProjection;
 
 pub(crate) fn boundary_program(project: Option<bool>) -> Arc<LocalProgram> {
     let mut builder = FragmentBuilder::new(FragmentId::new(57));
@@ -315,8 +316,25 @@ fn compiled_project_schema_scope_keeps_original_early_factory_errors() {
         let failure = hosted_project_factory(Arc::clone(&program), node, error, &mut host)
             .err()
             .unwrap();
-        assert_eq!(direct, expected);
-        assert_eq!(failure.cause(), &ExecutionFailureCause::Pipeline(direct));
+        let ExecutionFailureCause::Domain(source) = direct.cause() else {
+            panic!("the factory must preserve its binding author");
+        };
+        let cause = source
+            .downcast_ref::<crate::exec::fragment::error::FragmentBindingError>()
+            .expect("the actual program binding source");
+        let expected_kind = if node == program.graph().root() {
+            crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment
+        } else {
+            crate::exec::fragment::error::FragmentBindingErrorKind::MissingAssignment
+        };
+        assert_eq!(cause.kind(), expected_kind);
+        assert_eq!(cause.detail(), expected);
+        assert_eq!(
+            direct.failure_fact().class(),
+            novarocks_failure_contract::FailureClass::Invariant
+        );
+        assert_eq!(failure.failure_fact(), direct.failure_fact());
+        assert_eq!(failure.detail(), direct.detail());
         assert_eq!((host.calls, host.bodies), (0, 0));
     }
     let program = crate::exec::expr::compiled_program::tests::program(
@@ -334,10 +352,21 @@ fn compiled_project_schema_scope_keeps_original_early_factory_errors() {
     let failure = hosted_final_factory(program, error, &mut host)
         .err()
         .unwrap();
+    let ExecutionFailureCause::Domain(source) = direct.cause() else {
+        panic!("the final boundary must preserve its binding author");
+    };
+    let cause = source
+        .downcast_ref::<crate::exec::fragment::error::FragmentBindingError>()
+        .unwrap();
     assert_eq!(
-        direct,
+        cause.kind(),
+        crate::exec::fragment::error::FragmentBindingErrorKind::InvalidAssignment
+    );
+    assert_eq!(
+        cause.detail(),
         "final result boundary requires its actual RootResult sink"
     );
-    assert_eq!(failure.cause(), &ExecutionFailureCause::Pipeline(direct));
+    assert_eq!(failure.failure_fact(), direct.failure_fact());
+    assert_eq!(failure.detail(), direct.detail());
     assert_eq!((host.calls, host.bodies), (0, 0));
 }

@@ -38,7 +38,7 @@ fn pre_lnp9_descriptor_bytes_are_a_hard_cut() {
     let raw = novarocks::BackendProcessDescriptor::decode(PRE_LNP9_DESCRIPTOR)
         .expect("frozen pre-LNP-9 descriptor decodes");
     let error = BackendProcessDescriptor::parse(raw).expect_err("old descriptor must reject");
-    assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
+    assert_eq!(error.kind(), &ProtocolErrorKind::MissingField);
     assert_eq!(
         error.path().to_string(),
         "backend_process_descriptor.native_compatibility_id"

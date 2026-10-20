@@ -33,7 +33,7 @@ impl PureCompileControl for Control {
             assert!(trace.len() <= stop, "callback after first refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if trace.len() == stop + 1 => Err(cause),
             _ => Ok(()),
         }
@@ -113,7 +113,7 @@ fn actual_source_owner_publication_observes_arc_completion_at_every_control_pref
         ] {
             let control = Control {
                 trace: Mutex::new(Vec::new()),
-                refusal: Some((index, cause)),
+                refusal: Some((index, cause.clone())),
             };
             let result = values_draft().finish_observed(&control);
             assert!(

@@ -919,6 +919,7 @@ fn map_mutation_failure(
 ) -> ConnectorError {
     use novarocks_spi::connector::ConnectorMutationFailureKind as Kind;
     let kind = match failure.kind() {
+        Kind::Interrupted => ConnectorErrorKind::Interrupted,
         Kind::NotFound => ConnectorErrorKind::NotFound,
         Kind::AlreadyExists | Kind::Conflict | Kind::InvalidRequest => {
             ConnectorErrorKind::InvalidRequest
@@ -932,7 +933,7 @@ fn map_mutation_failure(
         Kind::Unavailable => ConnectorErrorKind::Unavailable,
         Kind::Internal => ConnectorErrorKind::Internal,
     };
-    ConnectorError::new(kind, failure.to_string())
+    ConnectorError::from_domain(kind, failure.clone())
 }
 
 const VARIANT_SHREDDING_PROPERTY_PREFIX: &str = "write.parquet.variant-shredding.";
@@ -3211,22 +3212,12 @@ fn known_conflict(
 }
 
 fn failure(error: &ConnectorError) -> ConnectorMutationFailure {
-    ConnectorMutationFailure::new(failure_kind(error.kind()), error.to_string())
+    ConnectorMutationFailure::from_connector(error.clone())
 }
 
+#[cfg(test)]
 fn failure_kind(kind: ConnectorErrorKind) -> ConnectorMutationFailureKind {
-    match kind {
-        ConnectorErrorKind::InvalidRequest => ConnectorMutationFailureKind::InvalidRequest,
-        ConnectorErrorKind::NotFound => ConnectorMutationFailureKind::NotFound,
-        ConnectorErrorKind::PermissionDenied => ConnectorMutationFailureKind::PermissionDenied,
-        ConnectorErrorKind::Unsupported => ConnectorMutationFailureKind::Unsupported,
-        ConnectorErrorKind::Cancelled => ConnectorMutationFailureKind::Cancelled,
-        ConnectorErrorKind::DeadlineExceeded => ConnectorMutationFailureKind::DeadlineExceeded,
-        ConnectorErrorKind::ResourceExhausted => ConnectorMutationFailureKind::ResourceExhausted,
-        ConnectorErrorKind::Unavailable => ConnectorMutationFailureKind::Unavailable,
-        ConnectorErrorKind::CorruptData => ConnectorMutationFailureKind::CorruptData,
-        ConnectorErrorKind::Internal => ConnectorMutationFailureKind::Internal,
-    }
+    kind.into()
 }
 
 fn map_iceberg(error: crate::iceberg::Error) -> ConnectorError {

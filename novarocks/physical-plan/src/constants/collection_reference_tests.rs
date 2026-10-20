@@ -598,10 +598,10 @@ fn collection_gate_original_three_causes_stop_each_actual_prefix_including_ordin
             CompileControlError::ResourceExhausted,
         ] {
             for at in 0..trace.len() {
-                let control = Control::at(Some((at, cause)));
+                let control = Control::at(Some((at, cause.clone())));
                 assert_eq!(
                     gate(&fragment, &pools, PlanLimits::FROZEN, &control),
-                    Err(ConstantReferenceError::Control(cause))
+                    Err(ConstantReferenceError::Control(cause.clone()))
                 );
                 assert_eq!(control.trace(), trace[..=at]);
             }
@@ -626,7 +626,7 @@ fn collection_gate_original_three_causes_stop_each_actual_prefix_including_ordin
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = Control::at(Some((at, cause)));
+            let control = Control::at(Some((at, cause.clone())));
             assert_eq!(
                 gate(&fragment, &pools, PlanLimits::FROZEN, &control),
                 Err(ConstantReferenceError::Control(cause))
@@ -710,7 +710,7 @@ fn actual_plan_extraction_publishes_direct_collection_closure_without_scalar_pla
         CompileControlError::ResourceExhausted,
     ] {
         for at in 0..trace.len() {
-            let control = Control::at(Some((at, cause)));
+            let control = Control::at(Some((at, cause.clone())));
             assert!(
                 matches!(extract(&control), Err(crate::FragmentPackageExtractionError::Control(actual)) if actual == cause)
             );

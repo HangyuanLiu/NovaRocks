@@ -132,24 +132,12 @@ fn shared_shift_all_profiles_preserve_all_seven_actual_checkpoint_causes_and_lat
     }
 }
 #[test]
-fn shared_bit_array_error_projection_preserves_unbounded_raw_cause() {
-    let cause = "original arrow cause ".repeat(200);
+fn shared_bit_array_default_safe_conversion_keeps_invalid_rows_null() {
+    use arrow_array::{ArrayRef, Int64Array, StringArray};
+    let source: ArrayRef =
+        std::sync::Arc::new(StringArray::from(vec![Some("-42"), Some("invalid"), None]));
     assert_eq!(
-        crate::bit_array::BitArrayError::CastArgument {
-            index: 1,
-            cause: cause.clone()
-        }
-        .legacy_message("bit_shift_left"),
-        format!("bit_shift_left: failed to cast arg1 to BIGINT: {cause}")
-    );
-    assert_eq!(
-        crate::bit_array::BitArrayError::CastOutput(cause.clone())
-            .legacy_message("bit_shift_right"),
-        format!("bit_shift_right: failed to cast output: {cause}")
-    );
-    assert_eq!(
-        crate::bit_array::BitArrayError::Raw(cause.clone())
-            .legacy_message("unused compatibility label"),
-        cause
+        crate::bit_array::to_i64_array(&source, 1).unwrap(),
+        Int64Array::from(vec![Some(-42), None, None])
     );
 }

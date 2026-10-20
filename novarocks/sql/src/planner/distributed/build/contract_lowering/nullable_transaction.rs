@@ -864,7 +864,7 @@ impl ContractLoweringVisitor<'_> {
                     if producer.writer {
                         if let Err(error) = super::super::physical_writer_requests::checked_captured_writer_sources_observed(consumer, captured, work) {
                             let exit = match &error {
-                                super::super::physical_writer_requests::PhysicalWriterRequestError::Control(cause) => super::super::lowered_draft::SqlSourceJournalError::Control(*cause),
+                                super::super::physical_writer_requests::PhysicalWriterRequestError::Control(cause) => super::super::lowered_draft::SqlSourceJournalError::Control(cause.clone()),
                                 super::super::physical_writer_requests::PhysicalWriterRequestError::InvalidSource(detail) => super::super::lowered_draft::SqlSourceJournalError::InvalidSource(detail),
                                 _ => super::super::lowered_draft::SqlSourceJournalError::InvalidSource("construction Writer captured compatibility rejected"),
                             };

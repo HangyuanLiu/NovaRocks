@@ -49,7 +49,7 @@ fn primitive_append(
     control.checkpoint(0)?;
     let map = |error| match error {
         AppendFailure::Control(error) => error,
-        AppendFailure::Data(message) => invalid(&message),
+        AppendFailure::Operation(cause) => cause,
     };
     let inputs =
         ArrayAppendInputs::new(a, target, AppendOutputFacts::OriginalInputList, &mut |_| {
@@ -60,7 +60,7 @@ fn primitive_append(
     inputs
         .extensions_observed(
             selection,
-            |_, row| Ok(inputs.legacy_rows(row)),
+            |_, row| Ok(inputs.direct_rows(row)),
             |source, start, len| {
                 plan.push(crate::selected_copy::ExtendSegment {
                     source,
@@ -77,7 +77,7 @@ fn primitive_append(
     append_observed_guarded(
         &inputs,
         selection,
-        |_, row| Ok(inputs.legacy_rows(row)),
+        |_, row| Ok(inputs.direct_rows(row)),
         |inputs| {
             crate::selected_copy::preflight_extend_multi(
                 &inputs.constructor_sources(),
@@ -186,7 +186,7 @@ fn append_multi_real_plan_and_copy_share_null_offset_and_selected_row_author() {
     inputs
         .extensions_observed(
             selection,
-            |_, row| Ok(inputs.legacy_rows(row)),
+            |_, row| Ok(inputs.direct_rows(row)),
             |source, start, len| {
                 emitted.push((source, start, len));
                 Ok(())
@@ -199,7 +199,7 @@ fn append_multi_real_plan_and_copy_share_null_offset_and_selected_row_author() {
     let out = append_observed_guarded(
         &inputs,
         selection,
-        |_, row| Ok(inputs.legacy_rows(row)),
+        |_, row| Ok(inputs.direct_rows(row)),
         |inputs| {
             checked = true;
             let plan = emitted
@@ -261,7 +261,7 @@ fn append_multi_constructor_guard_refusal_precedes_original_dictionary_panic_wit
         let result = append_observed_guarded(
             &inputs,
             Selection::all(1),
-            |_, row| Ok(inputs.legacy_rows(row)),
+            |_, row| Ok(inputs.direct_rows(row)),
             |_| Err(cause.clone()),
             |_, _, _, _| Ok(()),
             &mut |_| {

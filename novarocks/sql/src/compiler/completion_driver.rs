@@ -1493,7 +1493,7 @@ mod tests {
                 let mut observations = self.observations.lock().unwrap();
                 observations.push(units);
                 if observations.len() == self.fail_at
-                    && let Some(error) = self.failure
+                    && let Some(error) = self.failure.clone()
                 {
                     return Err(error);
                 }
@@ -1522,11 +1522,13 @@ mod tests {
             for fail_at in [1, 2, observations.len()] {
                 let owner = Owner {
                     observations: Default::default(),
-                    failure: Some(error),
+                    failure: Some(error.clone()),
                     fail_at,
                 };
                 let result = collect_provider_needs(plan.clone(), 0, false, &owner);
-                assert!(matches!(result, Err(actual) if actual == SqlCompileError::from(error)));
+                assert!(
+                    matches!(result, Err(actual) if actual == SqlCompileError::from(error.clone()))
+                );
                 assert_eq!(owner.observations.lock().unwrap().len(), fail_at);
             }
         }
@@ -1550,7 +1552,7 @@ mod tests {
                 let mut observations = self.observations.lock().unwrap();
                 observations.push(units);
                 if observations.len() == self.fail_at {
-                    Err(self.failure)
+                    Err(self.failure.clone())
                 } else {
                     Ok(())
                 }
@@ -1612,7 +1614,7 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             let owner = Owner {
-                failure,
+                failure: failure.clone(),
                 fail_at,
                 observations: Default::default(),
             };

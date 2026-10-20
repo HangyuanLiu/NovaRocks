@@ -16,7 +16,7 @@
 // under the License.
 
 //! Original DS HLL aggregate computation over explicit state/allocator access.
-use crate::aggregate_scalar::{ScalarStateAllocator, ScalarStateError};
+use crate::aggregate_scalar::ScalarStateAllocator;
 use crate::builtin::aggregate_ds_hll_failure::*;
 use crate::datasketches_hll::{HllHandle, HllTargetType};
 use crate::datasketches_hll_failure::{HllFailureSink, HllObservation};
@@ -28,8 +28,8 @@ use arrow_array::{Array, ArrayRef, BinaryArray, LargeStringArray, StringArray, S
 use arrow_schema::DataType;
 use std::sync::Arc;
 
-pub(crate) const DEFAULT_LOG_K: u8 = 17;
-pub(crate) const DEFAULT_TARGET_TYPE: HllTargetType = HllTargetType::Hll6;
+pub const DEFAULT_LOG_K: u8 = 17;
+pub const DEFAULT_TARGET_TYPE: HllTargetType = HllTargetType::Hll6;
 #[derive(Clone, Copy, Debug)]
 pub enum DsHllUpdateMode {
     Hash,
@@ -41,9 +41,13 @@ pub trait DsHllStorage {
     type Allocator: ScalarStateAllocator;
     fn allocator(&self) -> Self::Allocator;
     fn handle(&self) -> Option<&HllHandle>;
-    fn ensure_handle(&mut self, log_k: u8, target: HllTargetType) -> Result<(), String>;
-    fn update_hash(&mut self, hash: u64) -> Result<(), String>;
-    fn merge_payload(&mut self, payload: &[u8]) -> Result<(), String>;
+    fn ensure_handle(
+        &mut self,
+        log_k: u8,
+        target: HllTargetType,
+    ) -> Result<(), DsHllAggregateFailure>;
+    fn update_hash(&mut self, hash: u64) -> Result<(), DsHllAggregateFailure>;
+    fn merge_payload(&mut self, payload: &[u8]) -> Result<(), DsHllAggregateFailure>;
 }
 /// This is an ordinal-to-state borrowing port, not a private aggregate arena.
 pub trait DsHllStateAccess {
@@ -52,8 +56,8 @@ pub trait DsHllStateAccess {
     fn with_state<T>(
         &mut self,
         ordinal: usize,
-        visit: impl FnOnce(&mut Self::State) -> Result<T, String>,
-    ) -> Result<T, String>;
+        visit: impl FnOnce(&mut Self::State) -> Result<T, DsHllAggregateFailure>,
+    ) -> Result<T, DsHllAggregateFailure>;
 }
 pub trait DsHllStateReadAccess {
     type State: DsHllStorage;
@@ -76,7 +80,7 @@ pub trait TypedDsHllStorage<F: DsHllFailureSink> {
     fn update_hash(&mut self, hash: u64, sink: &mut F) -> Result<(), F::Error>;
     fn merge_payload(&mut self, payload: &[u8], sink: &mut F) -> Result<(), F::Error>;
 }
-impl<T: DsHllStorage> TypedDsHllStorage<LegacyDsHllFailure> for T {
+impl<T: DsHllStorage> TypedDsHllStorage<RawDsHllFailure> for T {
     type Allocator = T::Allocator;
     fn allocator(&self) -> Self::Allocator {
         DsHllStorage::allocator(self)
@@ -88,14 +92,22 @@ impl<T: DsHllStorage> TypedDsHllStorage<LegacyDsHllFailure> for T {
         &mut self,
         log_k: u8,
         target: HllTargetType,
-        _: &mut LegacyDsHllFailure,
-    ) -> Result<(), String> {
+        _: &mut RawDsHllFailure,
+    ) -> Result<(), DsHllAggregateFailure> {
         DsHllStorage::ensure_handle(self, log_k, target)
     }
-    fn update_hash(&mut self, hash: u64, _: &mut LegacyDsHllFailure) -> Result<(), String> {
+    fn update_hash(
+        &mut self,
+        hash: u64,
+        _: &mut RawDsHllFailure,
+    ) -> Result<(), DsHllAggregateFailure> {
         DsHllStorage::update_hash(self, hash)
     }
-    fn merge_payload(&mut self, payload: &[u8], _: &mut LegacyDsHllFailure) -> Result<(), String> {
+    fn merge_payload(
+        &mut self,
+        payload: &[u8],
+        _: &mut RawDsHllFailure,
+    ) -> Result<(), DsHllAggregateFailure> {
         DsHllStorage::merge_payload(self, payload)
     }
 }
@@ -109,7 +121,7 @@ pub trait TypedDsHllStateAccess<F: DsHllFailureSink> {
         visit: impl FnOnce(&mut Self::State) -> Result<T, F::Error>,
     ) -> Result<T, F::Error>;
 }
-impl<T: DsHllStateAccess> TypedDsHllStateAccess<LegacyDsHllFailure> for T {
+impl<T: DsHllStateAccess> TypedDsHllStateAccess<RawDsHllFailure> for T {
     type State = T::State;
     fn len(&self) -> usize {
         DsHllStateAccess::len(self)
@@ -120,8 +132,8 @@ impl<T: DsHllStateAccess> TypedDsHllStateAccess<LegacyDsHllFailure> for T {
     fn with_state<V>(
         &mut self,
         ordinal: usize,
-        visit: impl FnOnce(&mut Self::State) -> Result<V, String>,
-    ) -> Result<V, String> {
+        visit: impl FnOnce(&mut Self::State) -> Result<V, DsHllAggregateFailure>,
+    ) -> Result<V, DsHllAggregateFailure> {
         DsHllStateAccess::with_state(self, ordinal, visit)
     }
 }
@@ -370,12 +382,12 @@ pub fn merge_batch<S: DsHllStateAccess>(
     array: &ArrayRef,
     access: &mut S,
     _context: &str,
-) -> Result<(), String> {
+) -> Result<(), DsHllAggregateFailure> {
     merge_batch_with_sink(
         array,
         access,
         DsHllInputContext::Merge,
-        &mut LegacyDsHllFailure,
+        &mut RawDsHllFailure,
     )
 }
 
@@ -440,8 +452,10 @@ fn payload_bytes_for_merge_with_sink<'a, A: ScalarStateAllocator, F: DsHllFailur
             if !value.is_empty() {
                 sink.observe(HllObservation::OpaqueBoundary)?;
             }
-            payload.try_reserve_exact(value.len()).map_err(|_| {
-                sink.scalar(allocator.scalar_allocation_error("reserve ds_hll string payload"))
+            payload.try_reserve_exact(value.len()).map_err(|source| {
+                sink.kernel(
+                    allocator.scalar_allocation_error("reserve ds_hll string payload", source),
+                )
             })?;
             if !value.is_empty() {
                 sink.observe(HllObservation::OpaqueBoundary)?;
@@ -470,8 +484,10 @@ fn payload_bytes_for_merge_with_sink<'a, A: ScalarStateAllocator, F: DsHllFailur
             if !value.is_empty() {
                 sink.observe(HllObservation::OpaqueBoundary)?;
             }
-            payload.try_reserve_exact(value.len()).map_err(|_| {
-                sink.scalar(allocator.scalar_allocation_error("reserve ds_hll string payload"))
+            payload.try_reserve_exact(value.len()).map_err(|source| {
+                sink.kernel(
+                    allocator.scalar_allocation_error("reserve ds_hll string payload", source),
+                )
             })?;
             if !value.is_empty() {
                 sink.observe(HllObservation::OpaqueBoundary)?;
@@ -496,8 +512,8 @@ fn payload_bytes_for_merge_with_sink<'a, A: ScalarStateAllocator, F: DsHllFailur
 pub fn update_struct_if_present<S: DsHllStateAccess>(
     array: &ArrayRef,
     access: &mut S,
-) -> Result<Option<()>, String> {
-    update_struct_if_present_with_sink(array, access, &mut LegacyDsHllFailure)
+) -> Result<Option<()>, DsHllAggregateFailure> {
+    update_struct_if_present_with_sink(array, access, &mut RawDsHllFailure)
 }
 
 pub fn update_struct_if_present_with_sink<F: DsHllFailureSink, S: TypedDsHllStateAccess<F>>(
@@ -516,8 +532,8 @@ pub fn update_batch<S: DsHllStateAccess>(
     mode: DsHllUpdateMode,
     array: &ArrayRef,
     access: &mut S,
-) -> Result<(), String> {
-    update_batch_with_sink(mode, array, access, &mut LegacyDsHllFailure)
+) -> Result<(), DsHllAggregateFailure> {
+    update_batch_with_sink(mode, array, access, &mut RawDsHllFailure)
 }
 
 pub fn update_batch_with_sink<F: DsHllFailureSink, S: TypedDsHllStateAccess<F>>(
@@ -535,8 +551,8 @@ pub fn update_nonstruct_batch<S: DsHllStateAccess>(
     mode: DsHllUpdateMode,
     array: &ArrayRef,
     access: &mut S,
-) -> Result<(), String> {
-    update_nonstruct_batch_with_sink(mode, array, access, &mut LegacyDsHllFailure)
+) -> Result<(), DsHllAggregateFailure> {
+    update_nonstruct_batch_with_sink(mode, array, access, &mut RawDsHllFailure)
 }
 
 pub fn update_nonstruct_batch_with_sink<F: DsHllFailureSink, S: TypedDsHllStateAccess<F>>(
@@ -564,7 +580,7 @@ pub fn update_nonstruct_batch_with_sink<F: DsHllFailureSink, S: TypedDsHllStateA
 }
 
 /// Payload ownership includes the actual opaque reservation in the pure
-/// host adapter, while the legacy adapter retains its original Vec owner.
+/// host adapter, while the raw adapter retains its original Vec owner.
 pub trait DsHllEmissionPort<F: DsHllFailureSink> {
     type Payload: AsRef<[u8]>;
     fn empty_payload(&mut self, sink: &mut F) -> Result<Self::Payload, F::Error>;
@@ -587,37 +603,32 @@ impl<S: DsHllStateReadAccess> DsHllEmissionStates for S {
         DsHllStorage::handle(self.state(ordinal))
     }
 }
-struct LegacyEmission;
-impl DsHllEmissionPort<LegacyDsHllFailure> for LegacyEmission {
+struct RawEmission;
+impl DsHllEmissionPort<RawDsHllFailure> for RawEmission {
     type Payload = Vec<u8>;
-    fn empty_payload(&mut self, _: &mut LegacyDsHllFailure) -> Result<Vec<u8>, String> {
-        HllHandle::new_unreserved(DEFAULT_LOG_K, DEFAULT_TARGET_TYPE)?.serialize()
+    fn empty_payload(&mut self, _: &mut RawDsHllFailure) -> Result<Vec<u8>, DsHllAggregateFailure> {
+        Ok(HllHandle::new_unreserved(DEFAULT_LOG_K, DEFAULT_TARGET_TYPE)?.serialize()?)
     }
     fn serialize(
         &mut self,
         handle: &HllHandle,
-        _: &mut LegacyDsHllFailure,
-    ) -> Result<Vec<u8>, String> {
-        handle.serialize()
+        _: &mut RawDsHllFailure,
+    ) -> Result<Vec<u8>, DsHllAggregateFailure> {
+        Ok(handle.serialize()?)
     }
     fn clone_empty(
         &mut self,
         empty: &Vec<u8>,
-        _: &mut LegacyDsHllFailure,
-    ) -> Result<Vec<u8>, String> {
+        _: &mut RawDsHllFailure,
+    ) -> Result<Vec<u8>, DsHllAggregateFailure> {
         Ok(empty.clone())
     }
 }
 pub fn build_array<S: DsHllStateReadAccess>(
     output_type: &DataType,
     access: &S,
-) -> Result<ArrayRef, String> {
-    build_array_with_sink(
-        output_type,
-        access,
-        &mut LegacyEmission,
-        &mut LegacyDsHllFailure,
-    )
+) -> Result<ArrayRef, DsHllAggregateFailure> {
+    build_array_with_sink(output_type, access, &mut RawEmission, &mut RawDsHllFailure)
 }
 /// The one original Binary/Int64 builder loop. This does not authorize its
 /// Arrow allocations: the actual invocation host still owns that scope.
@@ -637,12 +648,16 @@ pub fn build_array_with_sink<
             let mut builder = BinaryBuilder::new();
             sink.observe(HllObservation::OpaqueBoundary)?;
             let empty_payload = port.empty_payload(sink)?;
+            let mut extent = DsHllOutputTally::default();
             for ordinal in 0..access.len() {
                 sink.observe(HllObservation::Step)?;
                 let payload = match access.handle(ordinal) {
                     Some(handle) => port.serialize(handle, sink)?,
                     None => port.clone_empty(&empty_payload, sink)?,
                 };
+                extent
+                    .append(payload.as_ref().len())
+                    .map_err(|cause| sink.kernel(cause))?;
                 sink.observe(HllObservation::OpaqueBoundary)?;
                 builder.append_value(payload.as_ref());
                 drop(payload);

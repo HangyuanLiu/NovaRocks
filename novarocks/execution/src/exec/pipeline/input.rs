@@ -36,11 +36,29 @@ impl RawInput {
     pub fn rows(&self) -> usize {
         self.chunk.len()
     }
+    pub fn result_metadata(&self) -> crate::runtime::fragment::io::ResultInputMetadata {
+        (&self.chunk).into()
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test(chunk: Chunk) -> Self {
+        Self::new(chunk, None)
+    }
+    #[cfg(test)]
+    pub(crate) fn covered_for_test(chunk: Chunk, permit: RootInputPermit) -> Self {
+        Self::new(chunk, Some(permit))
+    }
+    #[cfg(test)]
+    pub(crate) fn original_for_test(&self) -> &Chunk {
+        &self.chunk
+    }
     pub(super) fn original(&self) -> &Chunk {
         &self.chunk
     }
     pub(super) fn permit(&self) -> Option<&RootInputPermit> {
         self.permit.as_ref()
+    }
+    pub(super) fn into_edge_parts(self) -> (Chunk, Option<RootInputPermit>) {
+        (self.chunk, self.permit)
     }
     /// Only the receiver's acceptance path can transfer this responsibility.
     pub(super) fn accept(mut self, tracker: Option<&Arc<MemTracker>>) -> AcceptedInput {
@@ -93,6 +111,11 @@ impl AcceptedInput {
             }),
         }
     }
+    /// Cleanup takes original custody without claiming preparation completed.
+    /// The receiving owner must retain both parts before invoking destructors.
+    pub(super) fn into_exit_parts(self) -> (Chunk, Option<RootInputPermit>) {
+        self.raw.into_edge_parts()
+    }
     /// An original-input consumer keeps its own finite carrier validation and
     /// preparation policy. This does not add a driver hydration pass.
     pub(super) fn prepare_original(self) -> PreparedInput {
@@ -111,10 +134,34 @@ pub struct PreparedInput {
     permit: Option<RootInputPermit>,
 }
 impl PreparedInput {
+    pub fn into_uncovered_chunk(self) -> ExecutionResult<Chunk> {
+        if self.permit.is_some() {
+            return Err(novarocks_functions::KernelFailure::InvalidProgram(
+                novarocks_functions::KernelDiagnostic::new(
+                    "ordinary kernel received a precovered root input",
+                ),
+            )
+            .into());
+        }
+        Ok(self.chunk)
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test(chunk: Chunk) -> Self {
+        Self {
+            chunk,
+            permit: None,
+        }
+    }
     pub fn chunk(&self) -> &Chunk {
         &self.chunk
     }
-    pub(crate) fn into_parts(self) -> (Chunk, Option<RootInputPermit>) {
+    pub fn into_parts(self) -> (Chunk, Option<RootInputPermit>) {
         (self.chunk, self.permit)
     }
+}
+
+/// A parent operation has accepted this derived branch output. Each child
+/// still performs its own admission and installed preparation policy.
+pub(crate) fn derived_raw_input(chunk: Chunk) -> RawInput {
+    RawInput::new(chunk, None)
 }

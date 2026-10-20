@@ -157,13 +157,7 @@ fn checked_view<'a>(
             ));
         }
     }
-    NumericArrayView::new(array).map_err(|_| {
-        if matches!(source.data_type(), DataType::Decimal128(..)) {
-            internal("numeric unary selected decimal cannot be downcast")
-        } else {
-            internal("numeric unary selected carrier cannot be downcast")
-        }
-    })
+    NumericArrayView::new(array).map_err(KernelFailure::from_domain)
 }
 fn compute_unary<F: Fn(f64) -> f64>(
     operation: UnaryOperation<F>,
@@ -236,11 +230,7 @@ fn compute_unary<F: Fn(f64) -> f64>(
                         let addresses = UInt64Array::from(addresses);
                         let out =
                             arrow_select::take::take(argument.array().as_ref(), &addresses, None)
-                                .map_err(|error| {
-                                MathNumericError::Legacy(format!(
-                                    "numeric unary selected gather failed: {error}"
-                                ))
-                            })?;
+                                .map_err(MathNumericError::Gather)?;
                         if let Some(work) = &mut work {
                             work.flush()?;
                         }
@@ -310,12 +300,7 @@ pub(super) fn evaluate_numeric_unary<'a>(
         Some(target.nullable()),
         Some(control),
     )
-    .map_err(|error| match error {
-        MathNumericError::Kernel(error) => error,
-        MathNumericError::Legacy(message) => {
-            KernelFailure::Operational(KernelDiagnostic::new(&message))
-        }
-    })?;
+    .map_err(MathNumericError::into_kernel)?;
     SelectedValues::try_new(
         input.selection(),
         target.data_type(),
@@ -339,7 +324,7 @@ pub fn evaluate_legacy_numeric_unary(
     let view = if op == NumericUnaryOp::Positive {
         None
     } else {
-        Some(NumericArrayView::new(array).map_err(MathNumericError::Legacy)?)
+        Some(NumericArrayView::new(array).map_err(MathNumericError::Carrier)?)
     };
     compute_unary(
         operation,
@@ -359,7 +344,7 @@ pub fn evaluate_legacy_unary_f64<F: Fn(f64) -> f64>(
     target: Option<&DataType>,
     func: F,
 ) -> Result<ArrayRef, MathNumericError> {
-    let view = NumericArrayView::new(array).map_err(MathNumericError::Legacy)?;
+    let view = NumericArrayView::new(array).map_err(MathNumericError::Carrier)?;
     compute_unary(
         UnaryOperation::Transform(func),
         UnaryArgument::Legacy { array, batch_rows },

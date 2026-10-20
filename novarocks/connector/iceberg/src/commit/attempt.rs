@@ -552,25 +552,7 @@ pub(crate) fn before_dispatch_failure(error: &Error) -> ConnectorMutationFailure
     let mut source = error.source();
     while let Some(cause) = source {
         if let Some(error) = cause.downcast_ref::<ConnectorError>() {
-            let kind = match error.kind() {
-                ConnectorErrorKind::Cancelled => ConnectorMutationFailureKind::Cancelled,
-                ConnectorErrorKind::DeadlineExceeded => {
-                    ConnectorMutationFailureKind::DeadlineExceeded
-                }
-                ConnectorErrorKind::InvalidRequest => ConnectorMutationFailureKind::InvalidRequest,
-                ConnectorErrorKind::NotFound => ConnectorMutationFailureKind::NotFound,
-                ConnectorErrorKind::PermissionDenied => {
-                    ConnectorMutationFailureKind::PermissionDenied
-                }
-                ConnectorErrorKind::Unsupported => ConnectorMutationFailureKind::Unsupported,
-                ConnectorErrorKind::ResourceExhausted => {
-                    ConnectorMutationFailureKind::ResourceExhausted
-                }
-                ConnectorErrorKind::Unavailable => ConnectorMutationFailureKind::Unavailable,
-                ConnectorErrorKind::CorruptData => ConnectorMutationFailureKind::CorruptData,
-                ConnectorErrorKind::Internal => ConnectorMutationFailureKind::Internal,
-            };
-            return ConnectorMutationFailure::new(kind, error.to_string());
+            return ConnectorMutationFailure::from_connector(error.clone());
         }
         source = cause.source();
     }

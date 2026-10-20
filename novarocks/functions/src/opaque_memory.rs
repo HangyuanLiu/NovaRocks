@@ -31,8 +31,28 @@ pub struct OpaqueRetainedUnderestimate {
     pub reserved: usize,
     pub growth: usize,
 }
-/// The original retained transfer arithmetic. The legacy shell formats its
-/// original String, while pure adapters classify the invariant as Internal.
+impl std::fmt::Display for OpaqueRetainedUnderestimate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "opaque operation preflight underestimated retained growth: reserved={} growth={}",
+            self.reserved, self.growth
+        )
+    }
+}
+impl std::error::Error for OpaqueRetainedUnderestimate {}
+impl novarocks_failure_contract::FailureProjection for OpaqueRetainedUnderestimate {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::KERNEL, std::num::NonZeroU16::new(167).unwrap()),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for OpaqueRetainedUnderestimate {}
+/// The original retained transfer arithmetic. Each adapter preserves its
+/// exact preflight violation rather than recasting it as a capacity refusal.
 pub fn reconcile_opaque_retained(
     current: &mut usize,
     reservation: &mut usize,
@@ -112,11 +132,7 @@ impl OpaqueRetainedCharge {
             new_bytes,
             |bytes| authority.release_opaque(bytes),
         )
-        .map_err(|_| {
-            KernelFailure::Internal(KernelDiagnostic::new(
-                "opaque operation preflight underestimated retained growth",
-            ))
-        })
+        .map_err(KernelFailure::from_domain)
     }
 }
 impl Drop for OpaqueRetainedCharge {
@@ -147,5 +163,47 @@ impl Drop for OpaqueReservation {
             .opaque_allocation_host()
             .expect("opaque host capability remains installed")
             .release_opaque(self.bytes);
+    }
+}
+
+#[cfg(test)]
+mod retained_failure_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn underestimated_growth_keeps_both_charge_owners_and_the_exact_violation() {
+        let mut current = 0;
+        let mut reservation = 64;
+        let mut released = 0;
+        reconcile_opaque_retained(&mut current, &mut reservation, 24, |bytes| {
+            released += bytes
+        })
+        .unwrap();
+        assert_eq!((current, reservation, released), (24, 40, 0));
+        let source = reconcile_opaque_retained(&mut current, &mut reservation, 96, |bytes| {
+            released += bytes
+        })
+        .unwrap_err();
+        assert_eq!((source.reserved, source.growth), (40, 72));
+        assert_eq!((current, reservation, released), (24, 40, 0));
+        assert_eq!(current + reservation + released, 64);
+        let expected = source.failure_fact();
+        assert_eq!(expected.class(), FailureClass::Invariant);
+        assert_eq!(expected.reason().code(), 167);
+        let failure = KernelFailure::from_domain(source);
+        assert_eq!(failure.failure_fact(), expected);
+        let KernelFailure::Source(cause) = failure else {
+            panic!("expected original opaque preflight cause")
+        };
+        assert_eq!(
+            std::error::Error::source(&cause)
+                .unwrap()
+                .downcast_ref::<OpaqueRetainedUnderestimate>(),
+            Some(&source)
+        );
+        reconcile_opaque_retained(&mut current, &mut reservation, 8, |bytes| released += bytes)
+            .unwrap();
+        assert_eq!((current, reservation, released), (8, 40, 16));
+        assert_eq!(current + reservation + released, 64);
     }
 }

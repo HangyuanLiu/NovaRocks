@@ -25,6 +25,7 @@
 
 use std::sync::Arc;
 
+use novarocks_execution::runtime::execution_health::ExecutionHealth;
 use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 
 use crate::TaskProtocolEvent;
@@ -62,6 +63,7 @@ pub struct TaskExecutionPorts {
     observer: Arc<dyn TaskProtocolObserver>,
     result_lifecycle: Arc<dyn TaskResultLifecycle>,
     metrics: Arc<dyn TaskExecutionMetrics>,
+    execution_health: Arc<ExecutionHealth>,
 }
 
 impl TaskExecutionPorts {
@@ -69,12 +71,19 @@ impl TaskExecutionPorts {
         observer: Arc<dyn TaskProtocolObserver>,
         result_lifecycle: Arc<dyn TaskResultLifecycle>,
         metrics: Arc<dyn TaskExecutionMetrics>,
+        execution_health: Arc<ExecutionHealth>,
     ) -> Self {
         Self {
             observer,
             result_lifecycle,
             metrics,
+            execution_health,
         }
+    }
+
+    /// The exact process health owner supplied by application composition.
+    pub fn execution_health(&self) -> Arc<ExecutionHealth> {
+        Arc::clone(&self.execution_health)
     }
 
     pub fn observe(&self, event: TaskProtocolEvent) {

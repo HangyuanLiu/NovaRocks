@@ -180,6 +180,12 @@ impl ConnectorWriteExecution for ObservedConnectorWriteExecution {
             request.physical,
         );
         let catalog = self.inner.catalog_handle().clone();
+        // The debug hold borrows only the already-admitted operation control.
+        // It must not wait for the longer-lived role session after Task stop.
+        #[cfg(novarocks_dev_controls)]
+        let append_control = request.context.original_operation_control();
+        #[cfg(novarocks_dev_controls)]
+        let append_stop = request.context.stop().clone();
         match self.inner.open_writer(request).await {
             Ok(inner) => {
                 self.observation
@@ -196,6 +202,10 @@ impl ConnectorWriteExecution for ObservedConnectorWriteExecution {
                     writer,
                     observation: Arc::clone(&self.observation),
                     rows: 0,
+                    #[cfg(novarocks_dev_controls)]
+                    append_control,
+                    #[cfg(novarocks_dev_controls)]
+                    append_stop,
                 }))
             }
             Err(error) => {
@@ -218,6 +228,10 @@ struct ObservedConnectorBatchWriter {
     writer: ConnectorWriterObservation,
     observation: Arc<dyn ConnectorWriteObservationPort>,
     rows: u64,
+    #[cfg(novarocks_dev_controls)]
+    append_control: novarocks_spi::connector::ConnectorOperationControlView,
+    #[cfg(novarocks_dev_controls)]
+    append_stop: novarocks_spi::connector::ConnectorStopView,
 }
 
 #[async_trait::async_trait]
@@ -225,7 +239,17 @@ impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
     async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
         #[cfg(novarocks_dev_controls)]
         if let Some(cancellation) = self.observation.hold_append(self.writer)? {
-            cancellation.cancelled().await;
+            use novarocks_spi::connector::ConnectorOperationControl;
+            // No provider append has started yet. Ending this artificial wait
+            // never drops an in-flight provider future or reborrows its writer.
+            tokio::select! {
+                _ = cancellation.cancelled() => {},
+                _ = self.append_stop.stopped() => {},
+                _ = tokio::time::sleep_until(self.append_control.deadline().into()) => {},
+            }
+            // Preserve the original operation author's typed stop/deadline
+            // failure. Session end alone just releases the debugging hold.
+            self.append_control.check_active()?;
         }
         let rows = batch.num_rows() as u64;
         self.inner.append(batch).await?;

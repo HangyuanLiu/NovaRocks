@@ -86,10 +86,10 @@ impl fmt::Display for ConnectorPayloadCodecError {
 impl std::error::Error for ConnectorPayloadCodecError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Control(e) => Some(e),
-            Self::Identity(e) => Some(e),
-            Self::Contract(e) => Some(e),
-            Self::InvalidShape(_) => None,
+            Self::Control(source) => Some(source),
+            Self::Identity(source) => Some(source),
+            Self::Contract(source) => Some(source),
+            _ => None,
         }
     }
 }

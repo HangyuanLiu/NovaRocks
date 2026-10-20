@@ -17,6 +17,7 @@
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::ArrayRef;
 #[cfg(test)]
 use arrow::array::Float64Array;
@@ -31,7 +32,7 @@ pub fn eval_log<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let (op, arguments) = if args.len() == 1 {
         (
             NumericElementaryOp::LogNatural,
@@ -45,8 +46,8 @@ pub fn eval_log<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         )
     };
     let out = evaluate_legacy_numeric_elementary(op, &arguments, chunk.len())
-        .map_err(|error| error.to_string())?;
-    Ok((super::common::cast_output(out, arena.data_type(expr)))?)
+        .map_err(ExecutionFailure::from)?;
+    super::common::cast_output(out, arena.data_type(expr))
 }
 
 #[cfg(test)]

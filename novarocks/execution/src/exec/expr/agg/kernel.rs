@@ -31,6 +31,27 @@ use super::{
     PreparedAggregateKernel, RetainedMemoryPolicy, SealedExecutionFunctionSet,
 };
 
+#[derive(Debug)]
+struct AggregateArenaContract(&'static str);
+impl std::fmt::Display for AggregateArenaContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for AggregateArenaContract {}
+impl novarocks_failure_contract::FailureProjection for AggregateArenaContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            crate::runtime::fragment::ExecutionReason::AggregateArenaContract.reason(),
+        )
+    }
+}
+impl novarocks_failure_contract::OuterFailureProjection for AggregateArenaContract {}
+fn arena_contract(detail: &'static str) -> novarocks_functions::KernelFailure {
+    novarocks_functions::KernelFailure::from_domain(AggregateArenaContract(detail))
+}
+
 pub type AggStatePtr = usize;
 
 #[derive(Clone, Debug)]
@@ -68,15 +89,14 @@ struct AggStateBlock {
 }
 
 impl AggStateBlock {
-    fn try_new(size: usize, align: usize, allocator: AggregateAllocator) -> Result<Self, String> {
-        let layout = Layout::from_size_align(size.max(1), align.max(1))
-            .map_err(|error| format!("invalid aggregate state block layout: {error}"))?;
-        let ptr = allocator
-            .allocate_zeroed(layout)
-            .map_err(|_| allocator.allocation_error("allocate aggregate state block"))?
-            .cast::<u8>();
+    fn try_new(
+        size: usize,
+        align: usize,
+        allocator: AggregateAllocator,
+    ) -> Result<Self, novarocks_functions::KernelFailure> {
+        let (pointer, layout) = allocator.allocate_zeroed_block(size.max(1), align)?;
         Ok(Self {
-            ptr,
+            ptr: pointer.cast::<u8>(),
             layout,
             allocator,
         })
@@ -121,7 +141,7 @@ pub struct AggStateArena {
     cursor: usize,
     block_size: usize,
     mem_tracker: Option<Arc<MemTracker>>,
-    memory_limit_exceeded: bool,
+    failure: Option<novarocks_functions::KernelFailure>,
 }
 
 impl AggStateArena {
@@ -131,7 +151,7 @@ impl AggStateArena {
             cursor: 0,
             block_size: block_size.max(1),
             mem_tracker: None,
-            memory_limit_exceeded: false,
+            failure: None,
         }
     }
 
@@ -140,7 +160,10 @@ impl AggStateArena {
             .expect("aggregate state tracker must be bound before allocation");
     }
 
-    pub fn try_set_mem_tracker(&mut self, tracker: Arc<MemTracker>) -> Result<(), String> {
+    pub fn try_set_mem_tracker(
+        &mut self,
+        tracker: Arc<MemTracker>,
+    ) -> Result<(), novarocks_functions::KernelFailure> {
         if let Some(current) = self.mem_tracker.as_ref()
             && Arc::ptr_eq(current, &tracker)
         {
@@ -151,15 +174,17 @@ impl AggStateArena {
             .as_ref()
             .is_some_and(|blocks| !blocks.is_empty())
         {
-            return Err("aggregate state tracker must be bound before allocation".to_string());
+            return Err(arena_contract(
+                "aggregate state tracker must be bound before allocation",
+            ));
         }
         if self.blocks.is_some() {
-            return Err("aggregate state tracker cannot be rebound".to_string());
+            return Err(arena_contract("aggregate state tracker cannot be rebound"));
         }
         let allocator = AggregateAllocator::new(Arc::clone(&tracker));
         self.blocks = Some(AggregateVec::new_in(allocator));
         self.mem_tracker = Some(tracker);
-        self.memory_limit_exceeded = false;
+        self.failure = None;
         Ok(())
     }
 
@@ -168,19 +193,25 @@ impl AggStateArena {
             .expect("unchecked aggregate arena allocation cannot report a memory limit")
     }
 
-    pub fn try_alloc(&mut self, size: usize, align: usize) -> Result<AggStatePtr, String> {
+    pub fn try_alloc(
+        &mut self,
+        size: usize,
+        align: usize,
+    ) -> Result<AggStatePtr, novarocks_functions::KernelFailure> {
         self.alloc_inner(size, align)
     }
 
-    pub fn ensure_available(&self) -> Result<(), String> {
-        if self.memory_limit_exceeded {
-            Err("aggregate state arena memory limit was previously exceeded".to_string())
-        } else {
-            Ok(())
-        }
+    pub fn ensure_available(&self) -> Result<(), novarocks_functions::KernelFailure> {
+        self.failure
+            .as_ref()
+            .map_or(Ok(()), |error| Err(error.clone()))
     }
 
-    fn alloc_inner(&mut self, size: usize, align: usize) -> Result<AggStatePtr, String> {
+    fn alloc_inner(
+        &mut self,
+        size: usize,
+        align: usize,
+    ) -> Result<AggStatePtr, novarocks_functions::KernelFailure> {
         self.ensure_available()?;
         if self.blocks.is_none() {
             self.try_set_mem_tracker(MemTracker::new_child(
@@ -188,17 +219,14 @@ impl AggStateArena {
                 &crate::runtime::mem_tracker::process_mem_tracker(),
             ))?;
         }
-        assert!(
-            align.is_power_of_two(),
-            "aggregate state alignment must be a power of two"
-        );
+        AggregateAllocator::block_layout(size.max(1), align)?;
         let align_mask = align.saturating_sub(1);
         let needed = size.max(1);
-        let mut cursor = self
-            .cursor
-            .checked_add(align_mask)
-            .expect("aggregate state arena cursor overflow")
-            & !align_mask;
+        let mut cursor = self.cursor.checked_add(align_mask).ok_or_else(|| {
+            novarocks_functions::KernelFailure::from_domain(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            )
+        })? & !align_mask;
         let blocks = self.blocks.as_mut().expect("aggregate arena tracker");
         let current_block_usable = blocks.last().is_some_and(|block| {
             block.align() >= align
@@ -209,14 +237,15 @@ impl AggStateArena {
         if !current_block_usable {
             let block_size = self.block_size.max(needed);
             let allocator = blocks.allocator().clone();
-            if blocks.try_reserve(1).is_err() {
-                self.memory_limit_exceeded = true;
-                return Err(allocator.allocation_error("reserve aggregate state blocks"));
+            if let Err(source) = blocks.try_reserve(1) {
+                let error = allocator.allocation_error("reserve aggregate state blocks", source);
+                self.failure = Some(error.clone());
+                return Err(error);
             }
             let block = match AggStateBlock::try_new(block_size, align, allocator) {
                 Ok(block) => block,
                 Err(error) => {
-                    self.memory_limit_exceeded = true;
+                    self.failure = Some(error.clone());
                     return Err(error);
                 }
             };
@@ -227,9 +256,11 @@ impl AggStateArena {
         }
         let block = blocks.last_mut().expect("arena block");
         let ptr = unsafe { block.as_mut_ptr().add(cursor) } as usize;
-        self.cursor = cursor
-            .checked_add(needed)
-            .expect("aggregate state arena cursor overflow");
+        self.cursor = cursor.checked_add(needed).ok_or_else(|| {
+            novarocks_functions::KernelFailure::from_domain(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            )
+        })?;
         Ok(ptr)
     }
 }
@@ -239,14 +270,11 @@ pub fn build_kernel_set(
     functions: &[AggFunction],
     input_types: &[Option<DataType>],
     selected_signatures: &[ResolvedAggregateSignature],
-) -> Result<AggKernelSet, String> {
+) -> crate::runtime::fragment::ExecutionResult<AggKernelSet> {
     if input_types.len() != functions.len() || selected_signatures.len() != functions.len() {
-        return Err(format!(
-            "aggregate kernel binding length mismatch: functions={} input_types={} resolved_signatures={}",
-            functions.len(),
-            input_types.len(),
-            selected_signatures.len()
-        ));
+        return Err(crate::exec::fragment::error::ExecPlanBuildError::new(crate::exec::fragment::error::ExecPlanInvariant::Expression, format!(
+            "aggregate kernel binding length mismatch: functions={} input_types={} resolved_signatures={}", functions.len(), input_types.len(), selected_signatures.len()
+        )).into());
     }
 
     let mut entries = Vec::with_capacity(functions.len());
@@ -261,7 +289,7 @@ pub fn build_kernel_set(
             &func.order.nulls_first,
             func.order.effective_group_concat_max_len(),
         )
-        .map_err(|error| format!("bind aggregate `{}` options: {error}", func.name))?;
+        .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
         let context = AggregatePrepareContext {
             frozen: func.frozen.as_deref(),
             selected,
@@ -274,23 +302,26 @@ pub fn build_kernel_set(
         };
         let kernel = function_set
             .prepare_resolved_aggregate(&func.name, &context)
-            .map_err(|error| format!("bind aggregate `{}`: {error}", func.name))?;
+            .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)?;
         let layout = kernel.state_layout();
         let size = layout.size();
         let align = layout.align();
         let align_mask = align.saturating_sub(1);
-        offset = offset
-            .checked_add(align_mask)
-            .ok_or_else(|| "aggregate state layout offset overflow".to_string())?
-            & !align_mask;
+        offset = offset.checked_add(align_mask).ok_or_else(|| {
+            crate::runtime::fragment::ExecutionFailure::from_domain(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            )
+        })? & !align_mask;
         let state = AggStateDesc {
             offset,
             size,
             align,
         };
-        offset = offset
-            .checked_add(size)
-            .ok_or_else(|| "aggregate state layout size overflow".to_string())?;
+        offset = offset.checked_add(size).ok_or_else(|| {
+            crate::runtime::fragment::ExecutionFailure::from_domain(
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+            )
+        })?;
         descs.push(state.clone());
         entries.push(AggKernelEntry {
             _frozen: func.frozen.clone(),
@@ -342,32 +373,32 @@ impl AggKernelEntry {
         self.kernel.retained_memory_policy()
     }
 
-    pub fn init_state(&self, base: AggStatePtr) -> Result<(), String> {
+    pub fn init_state(&self, base: AggStatePtr) -> crate::runtime::fragment::ExecutionResult<()> {
         // SAFETY: the arena allocated this entry's exact layout and this call
         // is made once before the state becomes visible to an operator.
         unsafe { self.kernel.init_state(base, self.state.offset) }
-            .map_err(|error| error.to_string())
+            .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)
     }
 
     pub(crate) fn init_state_with_tracker(
         &self,
         base: AggStatePtr,
         tracker: Arc<MemTracker>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         // SAFETY: identical to `init_state`; the tracker is installed before
         // an allocation-tracked state can construct any heap owner.
         unsafe {
             self.kernel
                 .init_state_with_tracker(base, self.state.offset, tracker)
         }
-        .map_err(|error| error.to_string())
+        .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)
     }
 
     pub fn update_batch(
         &self,
         state_ptrs: &[AggStatePtr],
         input: AggregateInputBatch<'_>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         // SAFETY: each pointer denotes an initialized state for this entry.
         // Repeated pointers are supported by the erased adapter, which borrows
         // one state at a time.
@@ -375,27 +406,27 @@ impl AggKernelEntry {
             self.kernel
                 .update_batch(self.state.offset, state_ptrs, input)
         }
-        .map_err(|error| error.to_string())
+        .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)
     }
 
     pub fn merge_batch(
         &self,
         state_ptrs: &[AggStatePtr],
         input: AggregateInputBatch<'_>,
-    ) -> Result<(), String> {
+    ) -> crate::runtime::fragment::ExecutionResult<()> {
         // SAFETY: see `update_batch`.
         unsafe {
             self.kernel
                 .merge_batch(self.state.offset, state_ptrs, input)
         }
-        .map_err(|error| error.to_string())
+        .map_err(crate::runtime::fragment::ExecutionFailure::from_domain)
     }
 
     pub fn build_array(
         &self,
         group_states: &[AggStatePtr],
         output_intermediate: bool,
-    ) -> Result<ArrayRef, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
         // SAFETY: all group pointers remain initialized for the duration of
         // output materialization.
         let result = unsafe {
@@ -406,7 +437,7 @@ impl AggKernelEntry {
                 self.kernel.build_final(self.state.offset, group_states)
             }
         };
-        result.map_err(|error| error.to_string())
+        result.map_err(crate::runtime::fragment::ExecutionFailure::from_domain)
     }
 
     pub fn drop_state(&self, base: AggStatePtr) {
@@ -425,6 +456,7 @@ impl AggKernelEntry {
 mod tests {
     use super::AggStateArena;
     use crate::runtime::mem_tracker::MemTracker;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
 
     #[test]
     fn arena_honors_each_requested_state_alignment() {
@@ -457,7 +489,10 @@ mod tests {
         let error = arena
             .try_set_mem_tracker(tracker)
             .expect_err("late binding must fail");
-        assert!(error.contains("before allocation"), "{error}");
+        assert_eq!(
+            error.failure_fact().reason(),
+            crate::runtime::fragment::ExecutionReason::AggregateArenaContract.reason()
+        );
     }
 
     #[test]
@@ -472,12 +507,12 @@ mod tests {
             let error = arena
                 .try_alloc(3, 8)
                 .expect_err("allocation must cross the limit");
-            assert!(error.contains("ResourceExhausted"), "{error}");
+            assert_eq!(error.failure_fact().class(), FailureClass::Resource);
             assert_eq!(tracker.current(), 0);
             let retry = arena
                 .try_alloc(3, 8)
                 .expect_err("limit crossing must latch the arena");
-            assert!(retry.contains("previously exceeded"), "{retry}");
+            assert_eq!(retry, error);
             assert_eq!(tracker.current(), 0);
         }
         assert_eq!(tracker.current(), 0);

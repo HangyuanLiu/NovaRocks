@@ -280,7 +280,7 @@ fn test_variant_get_unconvertible_cast_errors() {
     let err = eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk)
         .expect_err("strict unconvertible cast must error");
     assert!(
-        err.to_lowercase().contains("cast"),
+        err.to_string().to_lowercase().contains("cast"),
         "error mentions the cast: {err}"
     );
 }
@@ -331,7 +331,7 @@ fn test_variant_get_non_literal_path_errors() {
     let expr = common::typed_null(&mut arena, DataType::LargeBinary);
     let err = eval_variant_function("variant_get", &arena, expr, &[arg0, arg1], &chunk)
         .expect_err("non-literal path must error");
-    assert!(err.contains("constant"), "{err}");
+    assert!(err.to_string().contains("constant"), "{err}");
 }
 
 #[test]

@@ -35,7 +35,7 @@ pub const RESOURCE_DECODE_MODEL_REVISION: u32 = 1;
 // unification must not silently enable the unbounded alternative.
 const _: () = assert!(std::mem::size_of::<prost::encoding::DecodeContext>() != 0);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResourceModelError {
     Control(CompileControlError),
     Malformed,
@@ -56,7 +56,14 @@ impl fmt::Display for ResourceModelError {
         }
     }
 }
-impl std::error::Error for ResourceModelError {}
+impl std::error::Error for ResourceModelError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Control(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// No default policy is implied by the internal plan codec. These limits are
 /// supplied by the actual caller after its carrier/admission policy resolves.

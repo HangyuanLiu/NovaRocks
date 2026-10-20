@@ -33,6 +33,11 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, FieldRef, Fields, UnionFields};
 
+mod failure;
+pub use failure::{
+    ArrayProjectionFailure, ArrayProjectionOperation, ArrayProjectionViolation, StringOffsetWidth,
+};
+
 mod construction;
 pub use construction::{
     ARROW_BUFFER_OWNER_METADATA_BOUND, ArrayProjectionOpaqueBound,
@@ -57,7 +62,7 @@ pub fn normalize_typed_array_plain_observed<E, F>(
     observe: &mut F,
 ) -> Result<ArrayRef, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
     enum MatchError<E> {
@@ -79,18 +84,18 @@ where
     )
     .map_err(|error| match error {
         MatchError::Caller(error) => error,
-        MatchError::Source(error) => E::from(format!("typed carrier layout validation: {error}")),
+        MatchError::Source(error) => E::from(ArrayProjectionFailure::ValueType(error)),
     })?;
     if !matches {
-        return Err(E::from(
-            "compact typed source differs from its complete value layout".to_owned(),
-        ));
+        return Err(E::from(ArrayProjectionFailure::Contract(
+            ArrayProjectionViolation::LayoutMismatch,
+        )));
     }
     let root_null = validate_encoded_keys_and_root_nulls_observed(source, observe, 1, &mut 0)?;
     if !binding.value_type().nullable() && root_null {
-        return Err(E::from(
-            "compact typed required source contains logical NULL".to_owned(),
-        ));
+        return Err(E::from(ArrayProjectionFailure::Contract(
+            ArrayProjectionViolation::RequiredRootNull,
+        )));
     }
     validate_required_dictionary_children(source, binding.value_type(), observe)?;
     rebuild_array_mode_with_decoded(
@@ -179,8 +184,8 @@ pub enum ArrayNormalizationStep<'a> {
     },
 }
 
-pub fn normalize_execution_array(array: &ArrayRef) -> Result<ArrayRef, String> {
-    normalize_execution_array_observed::<String, _>(array, |_| Ok(()))
+pub fn normalize_execution_array(array: &ArrayRef) -> Result<ArrayRef, ArrayProjectionFailure> {
+    normalize_execution_array_observed::<ArrayProjectionFailure, _>(array, |_| Ok(()))
 }
 
 /// Normalize an actual field representation without interpreting annotations.
@@ -189,7 +194,7 @@ pub fn normalize_execution_field_observed<E, F>(
     mut observe: F,
 ) -> Result<FieldRef, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
     normalization_preflight_observed(field.data_type(), 1, &mut 0, &mut |source| {
@@ -208,7 +213,7 @@ pub fn normalize_execution_array_observed<E, F>(
     mut observe: F,
 ) -> Result<ArrayRef, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
     normalization_preflight_observed(array.data_type(), 1, &mut 0, &mut |source| {
@@ -221,7 +226,7 @@ where
     }
 }
 
-fn normalization_preflight_observed<E: From<String>>(
+fn normalization_preflight_observed<E: From<ArrayProjectionFailure>>(
     source: &DataType,
     depth: usize,
     nodes: &mut usize,
@@ -229,17 +234,19 @@ fn normalization_preflight_observed<E: From<String>>(
 ) -> Result<(), E> {
     observe(source)?;
     if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(E::from(
-            "execution array normalization exceeds its nesting depth profile".into(),
-        ));
+        return Err(E::from(ArrayProjectionFailure::ValueType(
+            novarocks_type_contract::ValueTypeError::TooDeep,
+        )));
     }
-    *nodes = nodes
-        .checked_add(1)
-        .ok_or_else(|| E::from("execution array normalization node count overflow".into()))?;
+    *nodes = nodes.checked_add(1).ok_or_else(|| {
+        E::from(ArrayProjectionFailure::ValueType(
+            novarocks_type_contract::ValueTypeError::TooManyNodes,
+        ))
+    })?;
     if *nodes > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
-        return Err(E::from(
-            "execution array normalization exceeds its node profile".into(),
-        ));
+        return Err(E::from(ArrayProjectionFailure::ValueType(
+            novarocks_type_contract::ValueTypeError::TooManyNodes,
+        )));
     }
     let mut child = |field: &Field| {
         normalization_preflight_observed(field.data_type(), depth + 1, nodes, observe)
@@ -276,11 +283,11 @@ fn normalization_preflight_observed<E: From<String>>(
 
 /// Borrowed canonical-representation validation for already-authored schemas.
 /// Empty maps with spare backing are not a canonical execution representation.
-pub fn execution_field_is_normalized(field: &Field) -> Result<bool, String> {
+pub fn execution_field_is_normalized(field: &Field) -> Result<bool, ArrayProjectionFailure> {
     execution_field_is_normalized_observed(field, &mut |_| Ok(()))
 }
 
-pub fn execution_field_is_normalized_observed<E: From<String>>(
+pub fn execution_field_is_normalized_observed<E: From<ArrayProjectionFailure>>(
     field: &Field,
     work: &mut impl FnMut(usize) -> Result<(), E>,
 ) -> Result<bool, E> {
@@ -294,9 +301,7 @@ pub fn execution_field_is_normalized_observed<E: From<String>>(
                     .len()
                     .checked_add(name.len())
                     .and_then(|n| n.checked_add(1))
-                    .ok_or_else(|| {
-                        E::from("execution field inspection work count overflow".into())
-                    })?;
+                    .ok_or_else(|| E::from(ArrayProjectionFailure::RequestArithmetic))?;
                 work(units)
             }
             _ => work(1),
@@ -305,7 +310,7 @@ pub fn execution_field_is_normalized_observed<E: From<String>>(
 
 fn field_needs_normalization<E, F>(field: &Field, name: &str, observe: &mut F) -> Result<bool, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
     observe(ArrayNormalizationStep::InspectField {
@@ -318,7 +323,7 @@ where
 
 fn needs_normalization<E, F>(source: &DataType, observe: &mut F) -> Result<bool, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
     observe(ArrayNormalizationStep::InspectType(source))?;
@@ -340,12 +345,14 @@ where
             changed |= entries.metadata().capacity() != 0 || entries.name() != "entries";
             observe(ArrayNormalizationStep::InspectType(entries.data_type()))?;
             let DataType::Struct(fields) = entries.data_type() else {
-                return Err(E::from("execution Map entries are not a Struct".into()));
+                return Err(E::from(ArrayProjectionFailure::Contract(
+                    ArrayProjectionViolation::MapEntriesType,
+                )));
             };
             if fields.len() != 2 {
-                return Err(E::from(
-                    "execution Map entries do not contain key and value".into(),
-                ));
+                return Err(E::from(ArrayProjectionFailure::Contract(
+                    ArrayProjectionViolation::MapEntriesArity,
+                )));
             }
             changed |= field_needs_normalization(&fields[0], "key", observe)?;
             changed |= field_needs_normalization(&fields[1], "value", observe)?;
@@ -370,7 +377,7 @@ where
 
 fn normalize_type<'a, E, F>(source: &'a DataType, observe: &mut F) -> Result<Cow<'a, DataType>, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'b> FnMut(ArrayNormalizationStep<'b>) -> Result<(), E>,
 {
     if !needs_normalization(source, observe)? {
@@ -395,12 +402,14 @@ where
         ),
         DataType::Map(entries, ordered) => {
             let DataType::Struct(fields) = entries.data_type() else {
-                return Err(E::from("execution Map entries are not a Struct".into()));
+                return Err(E::from(ArrayProjectionFailure::Contract(
+                    ArrayProjectionViolation::MapEntriesType,
+                )));
             };
             if fields.len() != 2 {
-                return Err(E::from(
-                    "execution Map entries do not contain key and value".into(),
-                ));
+                return Err(E::from(ArrayProjectionFailure::Contract(
+                    ArrayProjectionViolation::MapEntriesArity,
+                )));
             }
             observe(ArrayNormalizationStep::RebuildType {
                 source: entries.data_type(),
@@ -431,9 +440,9 @@ where
             normalize_field(values, values.name(), observe)?,
         ),
         _ => {
-            return Err(E::from(
-                "execution array normalization found a changed scalar type".into(),
-            ));
+            return Err(E::from(ArrayProjectionFailure::Contract(
+                ArrayProjectionViolation::ScalarChanged,
+            )));
         }
     };
     Ok(Cow::Owned(target))
@@ -441,7 +450,7 @@ where
 
 fn normalize_field<E, F>(source: &FieldRef, name: &str, observe: &mut F) -> Result<FieldRef, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
     let target = normalize_type(source.data_type(), observe)?;
@@ -465,7 +474,7 @@ pub fn rebuild_field<E, F>(
     observe: &mut F,
 ) -> Result<FieldRef, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
     observe(ArrayNormalizationStep::RebuildField {
@@ -479,10 +488,14 @@ where
             target.clone(),
             source.is_nullable(),
             source.dict_id().ok_or_else(|| {
-                E::from("normalized dictionary field has no actual dictionary ID".into())
+                E::from(ArrayProjectionFailure::Contract(
+                    ArrayProjectionViolation::MissingDictionaryId,
+                ))
             })?,
             source.dict_is_ordered().ok_or_else(|| {
-                E::from("normalized dictionary field has no actual dictionary order".into())
+                E::from(ArrayProjectionFailure::Contract(
+                    ArrayProjectionViolation::MissingDictionaryOrder,
+                ))
             })?,
         )
     } else {
@@ -491,16 +504,19 @@ where
     Ok(Arc::new(field))
 }
 
-fn physical<'a, T: 'static, E: From<String>>(array: &'a ArrayRef) -> Result<&'a T, E> {
-    array
-        .as_any()
-        .downcast_ref::<T>()
-        .ok_or_else(|| E::from("execution array type does not match its physical wrapper".into()))
+fn physical<'a, T: 'static, E: From<ArrayProjectionFailure>>(
+    array: &'a ArrayRef,
+) -> Result<&'a T, E> {
+    array.as_any().downcast_ref::<T>().ok_or_else(|| {
+        E::from(ArrayProjectionFailure::Contract(
+            ArrayProjectionViolation::PhysicalWrapper,
+        ))
+    })
 }
 
 fn rebuild_array<E, F>(source: &ArrayRef, target: &DataType, observe: &mut F) -> Result<ArrayRef, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
     rebuild_array_mode(source, target, observe, false)
@@ -515,7 +531,7 @@ pub fn rebuild_array_mode<E, F>(
     hydrate: bool,
 ) -> Result<ArrayRef, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
 {
     rebuild_array_mode_with_decoded(source, target, observe, hydrate, &mut |_, _, array, _| {
@@ -534,7 +550,7 @@ pub fn rebuild_array_mode_with_decoded<E, F, D>(
     decoded: &mut D,
 ) -> Result<ArrayRef, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
     D: FnMut(&ArrayRef, &[ArrayPathStep], ArrayRef, &mut F) -> Result<ArrayRef, E>,
 {
@@ -550,7 +566,7 @@ fn rebuild_array_at<E, F, D>(
     path: &[ArrayPathStep],
 ) -> Result<ArrayRef, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
     D: FnMut(&ArrayRef, &[ArrayPathStep], ArrayRef, &mut F) -> Result<ArrayRef, E>,
 {
@@ -569,8 +585,12 @@ where
             source,
             target,
         })?;
-        let array = arrow_cast::cast(source.as_ref(), target)
-            .map_err(|error| E::from(format!("hydrate execution dictionary values: {error}")))?;
+        let array = arrow_cast::cast(source.as_ref(), target).map_err(|error| {
+            E::from(ArrayProjectionFailure::Arrow {
+                operation: ArrayProjectionOperation::DecodeDictionary,
+                source: error,
+            })
+        })?;
         observe(ArrayNormalizationStep::OpaqueOperationFinished)?;
         return decoded(source, path, array, observe);
     }
@@ -590,7 +610,10 @@ where
         return Ok(result);
     }
     let invalid = |error: arrow_schema::ArrowError| {
-        E::from(format!("normalize execution array wrapper: {error}"))
+        E::from(ArrayProjectionFailure::Arrow {
+            operation: ArrayProjectionOperation::RebuildArray,
+            source: error,
+        })
     };
     let array: ArrayRef = match target {
         DataType::Struct(fields) => {
@@ -728,7 +751,9 @@ where
         DataType::Map(entries, ordered) => {
             let source = physical::<MapArray, E>(source)?;
             let DataType::Struct(fields) = entries.data_type() else {
-                return Err(E::from("normalized Map entries are not a Struct".into()));
+                return Err(E::from(ArrayProjectionFailure::Contract(
+                    ArrayProjectionViolation::MapEntriesType,
+                )));
             };
             let children = source
                 .entries()
@@ -817,9 +842,9 @@ where
                 DataType::UInt32 => dictionary!(UInt32Type),
                 DataType::UInt64 => dictionary!(UInt64Type),
                 _ => {
-                    return Err(E::from(
-                        "execution dictionary has an invalid key type".into(),
-                    ));
+                    return Err(E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::DictionaryKeyType,
+                    )));
                 }
             }
         }
@@ -831,9 +856,9 @@ where
             let data = source.to_data();
             let children = data.child_data();
             if children.len() != 2 {
-                return Err(E::from(
-                    "execution run-end encoding requires two children".into(),
-                ));
+                return Err(E::from(ArrayProjectionFailure::Contract(
+                    ArrayProjectionViolation::RunEndChildren,
+                )));
             }
             let values_array = make_array(children[1].clone());
             let normalized_values = rebuild_array_child(
@@ -855,9 +880,9 @@ where
             make_array(data)
         }
         _ => {
-            return Err(E::from(
-                "execution normalization cannot change a scalar representation".into(),
-            ));
+            return Err(E::from(ArrayProjectionFailure::Contract(
+                ArrayProjectionViolation::ScalarRebuild,
+            )));
         }
     };
     observe(ArrayNormalizationStep::OpaqueOperationFinished)?;
@@ -896,7 +921,7 @@ fn rebuild_default_validated_container<E, F, D>(
     path: &[ArrayPathStep],
 ) -> Result<ArrayRef, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
     D: FnMut(&ArrayRef, &[ArrayPathStep], ArrayRef, &mut F) -> Result<ArrayRef, E>,
 {
@@ -928,9 +953,9 @@ where
                     physical::<FixedSizeListArray, E>(source)?.values()
                 }
                 _ => {
-                    return Err(E::from(
-                        "normalized List has a different physical wrapper".to_owned(),
-                    ));
+                    return Err(E::from(ArrayProjectionFailure::Contract(
+                        ArrayProjectionViolation::PhysicalWrapper,
+                    )));
                 }
             };
             children.push(
@@ -949,9 +974,9 @@ where
         DataType::Map(entries, _) => {
             let array = physical::<MapArray, E>(source)?;
             let DataType::Struct(fields) = entries.data_type() else {
-                return Err(E::from(
-                    "normalized Map entries are not a Struct".to_owned(),
-                ));
+                return Err(E::from(ArrayProjectionFailure::Contract(
+                    ArrayProjectionViolation::MapEntriesType,
+                )));
             };
             let mut entries_children = Vec::with_capacity(2);
             for (index, (child, field)) in array.entries().columns().iter().zip(fields).enumerate()
@@ -982,14 +1007,17 @@ where
                     .child_data(entries_children)
                     .build()
                     .map_err(|error| {
-                        E::from(format!("normalize execution Map entries: {error}"))
+                        E::from(ArrayProjectionFailure::Arrow {
+                            operation: ArrayProjectionOperation::RebuildMapEntries,
+                            source: error,
+                        })
                     })?,
             );
         }
         _ => {
-            return Err(E::from(
-                "default validated normalization has an unsupported container".to_owned(),
-            ));
+            return Err(E::from(ArrayProjectionFailure::Contract(
+                ArrayProjectionViolation::UnsupportedContainer,
+            )));
         }
     }
     // This branch shares all payload/null/offset buffers. Arrow's public
@@ -999,7 +1027,12 @@ where
         .data_type(target.clone())
         .child_data(children)
         .build()
-        .map_err(|error| E::from(format!("normalize execution array wrapper: {error}")))?;
+        .map_err(|error| {
+            E::from(ArrayProjectionFailure::Arrow {
+                operation: ArrayProjectionOperation::RebuildArray,
+                source: error,
+            })
+        })?;
     Ok(make_array(data))
 }
 
@@ -1013,15 +1046,15 @@ fn rebuild_array_child<E, F, D>(
     child: ArrayPathStep,
 ) -> Result<ArrayRef, E>
 where
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
     D: FnMut(&ArrayRef, &[ArrayPathStep], ArrayRef, &mut F) -> Result<ArrayRef, E>,
 {
     let mut next = [ArrayPathStep::ListItem; novarocks_type_contract::MAX_VALUE_TYPE_DEPTH];
     if path.len() >= next.len() {
-        return Err(E::from(
-            "execution array rebuild exceeds its depth profile".into(),
-        ));
+        return Err(E::from(ArrayProjectionFailure::ValueType(
+            novarocks_type_contract::ValueTypeError::TooDeep,
+        )));
     }
     next[..path.len()].copy_from_slice(path);
     next[path.len()] = child;
@@ -1045,7 +1078,7 @@ fn rebuild_dictionary<K, E, F, D>(
 ) -> Result<ArrayRef, E>
 where
     K: ArrowDictionaryKeyType,
-    E: From<String>,
+    E: From<ArrayProjectionFailure>,
     F: for<'a> FnMut(ArrayNormalizationStep<'a>) -> Result<(), E>,
     D: FnMut(&ArrayRef, &[ArrayPathStep], ArrayRef, &mut F) -> Result<ArrayRef, E>,
 {
@@ -1060,8 +1093,12 @@ where
         ArrayPathStep::DictionaryValue,
     )?;
     Ok(Arc::new(
-        DictionaryArray::<K>::try_new(source.keys().clone(), values)
-            .map_err(|error| E::from(format!("normalize execution dictionary wrapper: {error}")))?,
+        DictionaryArray::<K>::try_new(source.keys().clone(), values).map_err(|error| {
+            E::from(ArrayProjectionFailure::Arrow {
+                operation: ArrayProjectionOperation::RebuildDictionary,
+                source: error,
+            })
+        })?,
     ))
 }
 
@@ -1425,25 +1462,26 @@ mod tests {
         );
         let mut fields = 0;
         let mut arrays = 0;
-        let output = normalize_execution_array_observed::<String, _>(&source, |step| {
-            match step {
-                ArrayNormalizationStep::RebuildField { target, name, .. } => {
-                    assert_eq!(target, &DataType::Utf8);
-                    assert_eq!(name, "item");
-                    fields += 1;
+        let output =
+            normalize_execution_array_observed::<crate::KernelFailure, _>(&source, |step| {
+                match step {
+                    ArrayNormalizationStep::RebuildField { target, name, .. } => {
+                        assert_eq!(target, &DataType::Utf8);
+                        assert_eq!(name, "item");
+                        fields += 1;
+                    }
+                    ArrayNormalizationStep::RebuildArray { .. } => arrays += 1,
+                    _ => {}
                 }
-                ArrayNormalizationStep::RebuildArray { .. } => arrays += 1,
-                _ => {}
-            }
-            Ok(())
-        })
-        .unwrap();
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(fields, 1);
         assert_eq!(arrays, 1);
         assert!(
-            normalize_execution_array_observed::<String, _>(&source, |step| {
+            normalize_execution_array_observed::<crate::KernelFailure, _>(&source, |step| {
                 if matches!(step, ArrayNormalizationStep::RebuildField { .. }) {
-                    Err("capacity rejected".into())
+                    Err(crate::KernelFailure::ResourceExhausted)
                 } else {
                     Ok(())
                 }
@@ -1459,19 +1497,20 @@ mod tests {
             1
         );
         let mut constructions = 0;
-        let retained = normalize_execution_array_observed::<String, _>(&output, |step| {
-            if !matches!(
-                step,
-                ArrayNormalizationStep::InspectType(_)
-                    | ArrayNormalizationStep::InspectField { .. }
-                    | ArrayNormalizationStep::InspectConstructionWork { .. }
-                    | ArrayNormalizationStep::OpaqueOperationFinished
-            ) {
-                constructions += 1;
-            }
-            Ok(())
-        })
-        .unwrap();
+        let retained =
+            normalize_execution_array_observed::<crate::KernelFailure, _>(&output, |step| {
+                if !matches!(
+                    step,
+                    ArrayNormalizationStep::InspectType(_)
+                        | ArrayNormalizationStep::InspectField { .. }
+                        | ArrayNormalizationStep::InspectConstructionWork { .. }
+                        | ArrayNormalizationStep::OpaqueOperationFinished
+                ) {
+                    constructions += 1;
+                }
+                Ok(())
+            })
+            .unwrap();
         assert!(Arc::ptr_eq(&output, &retained));
         assert_eq!(constructions, 0);
     }
@@ -1499,5 +1538,63 @@ mod tests {
         assert_buffer_sharing(&left.to_data(), &left_output.to_data());
         assert_buffer_sharing(&right.to_data(), &right_output.to_data());
         assert!(!Arc::ptr_eq(&left_output, &right_output));
+    }
+}
+
+#[cfg(test)]
+mod typed_source_tests {
+    use super::*;
+    use crate::{KernelDiagnostic, KernelFailure};
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn excessive_actual_type_depth_retains_its_type_contract_reason() {
+        let mut ty = DataType::Int32;
+        for _ in 0..=novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
+            ty = DataType::List(Arc::new(Field::new("item", ty, true)));
+        }
+        let field = Arc::new(Field::new("root", ty, true));
+        let failure =
+            normalize_execution_field_observed::<ArrayProjectionFailure, _>(&field, |_| Ok(()))
+                .unwrap_err();
+        assert!(matches!(
+            failure,
+            ArrayProjectionFailure::ValueType(novarocks_type_contract::ValueTypeError::TooDeep)
+        ));
+        assert_eq!(
+            failure.failure_fact(),
+            novarocks_type_contract::ValueTypeError::TooDeep.failure_fact()
+        );
+        assert_eq!(failure.failure_fact().class(), FailureClass::Resource);
+    }
+    #[test]
+    fn all_original_callback_causes_stop_before_construction_without_relabeling() {
+        let source = Arc::new(
+            Field::new("external-role", DataType::Int32, false).with_metadata(
+                std::collections::HashMap::from([("external".into(), "value".into())]),
+            ),
+        );
+        for original in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::InvalidProgram(KernelDiagnostic::new("original invalid")),
+            KernelFailure::Internal(KernelDiagnostic::new("original internal")),
+            KernelFailure::Operational(KernelDiagnostic::new("original operational")),
+            KernelFailure::from(novarocks_type_contract::ValueTypeError::TooManyNodes),
+        ] {
+            let mut refused = false;
+            let result = normalize_execution_field_observed::<KernelFailure, _>(&source, |step| {
+                assert!(!refused, "no callback may run after the original refusal");
+                if matches!(step, ArrayNormalizationStep::RebuildField { .. }) {
+                    refused = true;
+                    Err(original.clone())
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(refused);
+            assert_eq!(result.unwrap_err(), original);
+            assert_eq!(source.metadata().get("external").unwrap(), "value");
+        }
     }
 }

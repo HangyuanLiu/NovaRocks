@@ -53,7 +53,7 @@ impl PureCompileControl for Control {
         let mut trace = self.trace.lock().unwrap();
         let at = trace.len();
         trace.push(units);
-        if let Some((refuse_at, cause)) = self.refusal
+        if let Some((refuse_at, cause)) = self.refusal.clone()
             && at == refuse_at
         {
             return Err(cause);
@@ -284,7 +284,7 @@ fn known_role_and_table_resource_refusals_precede_pending_255_late_controls() {
     };
     for cause in CAUSES {
         for role_preflight in [false, true] {
-            let control = Control::refusing(1, cause);
+            let control = Control::refusing(1, cause.clone());
             let mut work =
                 CompileCheckpoints::try_new(&control, CompilePhase::ProviderValidation).unwrap();
             let source = [11_u8; 255];
@@ -342,7 +342,7 @@ fn actual_validation_and_copy_callbacks_keep_all_three_causes_and_ordinary_tail(
         }
         for at in 0..trace.len() {
             for cause in CAUSES {
-                let control = Control::refusing(at, cause);
+                let control = Control::refusing(at, cause.clone());
                 assert_control(invoke(shape, &control).unwrap_err(), cause);
                 assert_eq!(control.trace(), trace[..=at]);
             }

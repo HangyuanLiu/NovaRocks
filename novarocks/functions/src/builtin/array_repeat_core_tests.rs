@@ -21,7 +21,18 @@ use arrow_array::{
     IntervalYearMonthArray, ListArray, StringArray, StructArray, new_empty_array, new_null_array,
 };
 use arrow_schema::{DataType, Field};
+use novarocks_failure_contract::{FailureClass, FailureProjection};
 use std::sync::Arc;
+
+fn arrow_source(error: &crate::KernelFailure) -> &arrow_schema::ArrowError {
+    let mut source: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(arrow) = source.downcast_ref::<arrow_schema::ArrowError>() {
+            return arrow;
+        }
+        source = source.source().expect("actual Arrow source retained");
+    }
+}
 
 #[test]
 fn int64_count_keeps_the_input_identity() {
@@ -62,17 +73,17 @@ fn count_safe_cast_preserves_invalid_null_and_float_truncation() {
 #[test]
 fn interval_count_keeps_the_original_full_cast_error() {
     let year_month: ArrayRef = Arc::new(IntervalYearMonthArray::from(vec![1]));
-    assert_eq!(
-        cast_repeat_count(year_month).unwrap_err(),
-        "array_repeat failed to cast repeat count Interval(YearMonth) -> BIGINT: Cast error: Casting from Interval(YearMonth) to Int64 not supported"
-    );
     let day_time: ArrayRef = Arc::new(IntervalDayTimeArray::from(vec![
         arrow_buffer::IntervalDayTime::new(1, 0),
     ]));
-    assert_eq!(
-        cast_repeat_count(day_time).unwrap_err(),
-        "array_repeat failed to cast repeat count Interval(DayTime) -> BIGINT: Cast error: Casting from Interval(DayTime) to Int64 not supported"
-    );
+    for source in [year_month, day_time] {
+        let expected = arrow_cast::cast(&source, &DataType::Int64)
+            .unwrap_err()
+            .to_string();
+        let error = cast_repeat_count(source).unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(arrow_source(&error).to_string(), expected);
+    }
 }
 
 #[test]
@@ -136,17 +147,14 @@ fn materialized_rows_keep_null_nonpositive_and_empty_source_behavior() {
             .collect::<Vec<_>>(),
         vec![Some(1), Some(1), None]
     );
-    let out = repeat_values(
+    let error = repeat_values(
         new_empty_array(&DataType::Int32),
         &Int64Array::from(vec![3]),
         1,
         field.clone(),
     )
-    .unwrap();
-    let list = out.as_any().downcast_ref::<ListArray>().unwrap();
-    assert_eq!(list.value_offsets(), &[0, 3]);
-    assert_eq!(list.null_count(), 0);
-    assert_eq!(list.values().null_count(), 3);
+    .unwrap_err();
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
     let out = repeat_values(
         new_empty_array(&DataType::Int32),
         &Int64Array::from(Vec::<i64>::new()),
@@ -170,17 +178,13 @@ fn source_cast_keeps_the_original_arrow_error_text() {
         vec![Arc::new(Int32Array::from(vec![1]))],
         None,
     ));
-    let expected = format!(
-        "array_repeat failed to cast source type {:?} -> {:?}: {}",
-        source.data_type(),
-        DataType::Int64,
-        arrow_cast::cast(&source, &DataType::Int64).unwrap_err()
-    );
+    let expected = arrow_cast::cast(&source, &DataType::Int64)
+        .unwrap_err()
+        .to_string();
     let field = Arc::new(Field::new("item", DataType::Int64, true));
-    assert_eq!(
-        repeat_values(source, &Int64Array::from(vec![1]), 1, field).unwrap_err(),
-        expected
-    );
+    let error = repeat_values(source, &Int64Array::from(vec![1]), 1, field).unwrap_err();
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(arrow_source(&error).to_string(), expected);
 }
 
 #[test]
@@ -191,11 +195,9 @@ fn dictionary_backing_keeps_the_original_constructor_boundary() {
             DictionaryArray::<Int8Type>::try_new(vec![0_i8].into(), Arc::new(values)).unwrap(),
         );
         let field = Arc::new(Field::new("item", source.data_type().clone(), true));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            repeat_values(source, &Int64Array::from(vec![0]), 1, field)
-        }));
+        let result = repeat_values(source, &Int64Array::from(vec![0]), 1, field);
         if backing_len == 127 {
-            let out = result.unwrap().unwrap();
+            let out = result.unwrap();
             let list = out.as_any().downcast_ref::<ListArray>().unwrap();
             assert_eq!(list.value_offsets(), &[0, 0]);
             assert_eq!(
@@ -208,16 +210,34 @@ fn dictionary_backing_keeps_the_original_constructor_boundary() {
                 127
             );
         } else {
-            let panic = result.unwrap_err();
-            let message = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .expect("original string panic");
             assert_eq!(
-                message,
-                "MutableArrayData::new is infallible: DictionaryKeyOverflowError"
+                result.unwrap_err().failure_fact().class(),
+                FailureClass::Representation
             );
         }
     }
+}
+
+#[test]
+fn oversized_count_refuses_before_repetition_and_releases_source() {
+    let source: ArrayRef = Arc::new(Int32Array::from(vec![7]));
+    let weak = Arc::downgrade(&source);
+    let field = Arc::new(Field::new("item", DataType::Int32, true));
+    let error = repeat_values(source, &Int64Array::from(vec![i64::MAX]), 1, field).unwrap_err();
+    let fact = error.failure_fact();
+    assert_eq!(fact.class(), FailureClass::Representation);
+    let representation = fact.representation().unwrap();
+    assert_eq!(representation.required, Some(i64::MAX as u64));
+    assert_eq!(representation.extent_limit, Some(i32::MAX as u64));
+    assert_eq!(representation.representable_prefix, None);
+    assert!(weak.upgrade().is_none());
+}
+#[test]
+fn nested_utf8_extent_refuses_before_copying_gigabytes() {
+    let source: ArrayRef = Arc::new(StringArray::from(vec!["x".repeat(2 * 1024 * 1024)]));
+    let weak = Arc::downgrade(&source);
+    let field = Arc::new(Field::new("item", DataType::Utf8, true));
+    let error = repeat_values(source, &Int64Array::from(vec![1025]), 1, field).unwrap_err();
+    assert_eq!(error.failure_fact().class(), FailureClass::Representation);
+    assert!(weak.upgrade().is_none());
 }

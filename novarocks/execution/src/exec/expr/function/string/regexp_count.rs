@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
+use crate::exec::expr::{ExprId, ExprNode, LiteralValue};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::ArrayRef;
 use novarocks_functions::builtin::regexp_count::{self, PatternSource};
 
@@ -24,7 +25,8 @@ pub fn eval_regexp_count<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    let _ = expr;
     let len = chunk.len();
     let str_arr = arena.eval(args[0], chunk)?;
     let pat_arr = arena.eval(args[1], chunk)?;
@@ -49,5 +51,6 @@ pub fn eval_regexp_count<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     } else {
         PatternSource::Other
     };
-    Ok((regexp_count::evaluate_legacy(&[str_arr, pat_arr], len, source))?)
+    regexp_count::evaluate_required(&[str_arr, pat_arr], len, source)
+        .map_err(ExecutionFailure::from)
 }

@@ -88,6 +88,7 @@ pub(crate) struct DynamicFilterFeedbackPump {
     /// The highest version this frontend has settled per task.
     cursors: BTreeMap<TaskId, DomainVersion>,
     ingested: usize,
+    closing: bool,
 }
 
 impl DynamicFilterFeedbackPump {
@@ -111,6 +112,7 @@ impl DynamicFilterFeedbackPump {
             reads,
             cursors: BTreeMap::new(),
             ingested: 0,
+            closing: false,
         })
     }
 
@@ -247,10 +249,27 @@ impl TurnPump for DynamicFilterFeedbackPump {
     }
 
     fn drive(&mut self, execution: &mut QueryTaskExecution) -> Result<usize, TaskExecutionError> {
+        if self.closing {
+            return Ok(0);
+        }
         let mut moved = 0;
         for (task_id, identity, advertisement) in self.outstanding(execution) {
             moved += self.ingest(task_id, identity, advertisement.version())?;
         }
         Ok(moved)
+    }
+
+    fn begin_close(&mut self) {
+        self.closing = true;
+    }
+    fn close_turn(&mut self) -> Result<usize, TaskExecutionError> {
+        self.begin_close();
+        Ok(0)
+    }
+    fn is_closed(&self) -> bool {
+        self.closing
+    }
+    fn take_close_unresolved(&mut self) -> Option<super::round::PumpCloseUnresolved> {
+        None
     }
 }

@@ -73,12 +73,15 @@ fn normalized_descriptors() -> Result<Vec<ErrorCodeDescriptor>, String> {
     descriptors.extend_from_slice(ANALYZE_ERROR_CODE_DESCRIPTORS);
     descriptors.extend_from_slice(DML_ADMISSION_ERROR_CODE_DESCRIPTORS);
     descriptors.extend_from_slice(SESSION_ERROR_CODE_DESCRIPTORS);
+    descriptors.extend_from_slice(
+        novarocks_query_application::execution_error::EXECUTION_ERROR_CODE_DESCRIPTORS,
+    );
     descriptors.sort_by_key(|descriptor| descriptor.code);
 
     let mut codes = HashSet::new();
     for descriptor in &descriptors {
         let code = descriptor.code.as_str();
-        if !is_code(code) {
+        if !is_descriptor_identity(code, descriptor.phase) {
             return Err(format!("invalid error code descriptor: {code}"));
         }
         if !codes.insert(code) {
@@ -86,6 +89,20 @@ fn normalized_descriptors() -> Result<Vec<ErrorCodeDescriptor>, String> {
         }
     }
     Ok(descriptors)
+}
+
+// Only the Query-owned, registered legacy compiled identity bridges the
+// historical EngineErrorCode spelling into the descriptor manifest. Ordinary
+// SQL code syntax and all other CamelCase identities remain unchanged.
+fn is_descriptor_identity(code: &str, phase: ErrorPhase) -> bool {
+    use novarocks_query_application::execution_error::{
+        UNSUPPORTED_COMPILED_SHAPE_DESCRIPTOR, execution_descriptor_for_code,
+    };
+    is_code(code)
+        || (code == UNSUPPORTED_COMPILED_SHAPE_DESCRIPTOR.code.as_str()
+            && phase == UNSUPPORTED_COMPILED_SHAPE_DESCRIPTOR.phase
+            && execution_descriptor_for_code(UNSUPPORTED_COMPILED_SHAPE_DESCRIPTOR.code)
+                .is_some_and(|entry| entry.descriptor == UNSUPPORTED_COMPILED_SHAPE_DESCRIPTOR))
 }
 
 fn is_code(code: &str) -> bool {
@@ -172,6 +189,7 @@ fn phase_name(phase: ErrorPhase) -> &'static str {
         ErrorPhase::Validate => "Validate",
         ErrorPhase::Analyze => "Analyze",
         ErrorPhase::Admit => "Admit",
+        ErrorPhase::Execution => "Execution",
     }
 }
 
@@ -182,6 +200,7 @@ fn parse_phase(value: &str) -> Result<ErrorPhase, String> {
         "Validate" => Ok(ErrorPhase::Validate),
         "Analyze" => Ok(ErrorPhase::Analyze),
         "Admit" => Ok(ErrorPhase::Admit),
+        "Execution" => Ok(ErrorPhase::Execution),
         _ => Err(format!("invalid ledger phase: {value}")),
     }
 }
@@ -261,13 +280,20 @@ fn parse_ledger(path: &Path) -> Result<BTreeMap<String, LedgerEntry>, String> {
         let code = fields.next().unwrap_or_default();
         let phase = fields.next().unwrap_or_default();
         let status = fields.next().unwrap_or_default();
-        if fields.next().is_some() || !is_code(code) {
+        let extra = fields.next().is_some();
+        if extra
+            || (!is_code(code)
+                && code != novarocks_query_application::execution_error::UNSUPPORTED_COMPILED_SHAPE_DESCRIPTOR.code.as_str())
+        {
             return Err(format!("invalid baseline ledger entry: {line}"));
         }
         let entry = LedgerEntry {
             phase: parse_phase(phase)?,
             status: parse_status(status)?,
         };
+        if !is_descriptor_identity(code, entry.phase) {
+            return Err(format!("invalid baseline ledger entry: {line}"));
+        }
         if entries.insert(code.to_owned(), entry).is_some() {
             return Err(format!("duplicate baseline ledger code: {code}"));
         }
@@ -290,7 +316,62 @@ mod tests {
     fn manifest_and_ledger_are_deterministic() {
         let descriptors = normalized_descriptors().expect("parser descriptors are valid");
         assert!(render_manifest(&descriptors).contains("sql.parse.unsupported_statement\tParse"));
+        assert!(
+            render_manifest(&descriptors).contains("query.execution.resource_exhausted\tExecution")
+        );
+        assert!(
+            render_ledger(&descriptors)
+                .contains("query.execution.numeric_out_of_range\tExecution\tActive")
+        );
+        assert_eq!(parse_phase("Execution"), Ok(ErrorPhase::Execution));
         assert!(render_ledger(&descriptors).contains("sql.lex.unterminated_string\tLex\tActive"));
+    }
+
+    #[test]
+    fn only_registered_compiled_identity_bridges_manifest_and_ledger_syntax() {
+        use novarocks_query_application::execution_error::UNSUPPORTED_COMPILED_SHAPE_DESCRIPTOR;
+        let code = UNSUPPORTED_COMPILED_SHAPE_DESCRIPTOR.code.as_str();
+        assert_eq!(code, "UnsupportedCompiledShape");
+        assert!(!is_code(code));
+        assert!(is_descriptor_identity(code, ErrorPhase::Execution));
+        assert!(!is_descriptor_identity(code, ErrorPhase::Analyze));
+        assert!(!is_descriptor_identity(code, ErrorPhase::Parse));
+        for bad in [
+            "CommitUnknown",
+            "InternalInvariantViolation",
+            "NotARealCode",
+            "unsupportedcompiledshape",
+            "UnsupportedcompiledShape",
+            "UnsupportedCompiledShapeX",
+            "UnsupportedCompiledShape.foo",
+            " UnsupportedCompiledShape",
+            "UnsupportedCompiledShape ",
+        ] {
+            assert!(!is_descriptor_identity(bad, ErrorPhase::Execution), "{bad}");
+        }
+        let descriptors = normalized_descriptors().unwrap();
+        assert_eq!(
+            descriptors
+                .iter()
+                .filter(|entry| entry.code.as_str() == code)
+                .count(),
+            1,
+        );
+        assert!(render_manifest(&descriptors).contains("UnsupportedCompiledShape\tExecution"));
+        let path = baseline_path("compiled-identity");
+        fs::write(&path, render_ledger(&descriptors)).unwrap();
+        assert_eq!(
+            parse_ledger(&path).unwrap()[code].phase,
+            ErrorPhase::Execution
+        );
+        check_against_baseline(&descriptors, &path).unwrap();
+        fs::write(
+            &path,
+            "schema_version=1\ncode\tphase\tstatus\nUnsupportedCompiledShape\tAnalyze\tActive\n",
+        )
+        .unwrap();
+        assert!(parse_ledger(&path).is_err());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

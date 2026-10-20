@@ -35,6 +35,180 @@ use novarocks_worker::runtime_filter::domain::{
     BackendProducerOpenMetadata, BackendRouteEdgeId, BackendTransportSequence,
 };
 
+use novarocks_execution_contract::failure::{
+    FailureClass, FailureFact, FailureProjection, FailureReason, SharedFailureCause, domain,
+};
+
+/// Native wire and native-route contracts, authored before transport projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeFilterEnvelopeError {
+    UnknownKind,
+    UnspecifiedKind,
+    MissingQuery,
+    ZeroQuery,
+    ZeroChannel,
+    ZeroEpoch,
+    MissingRoute,
+    MissingRouteValue,
+    MissingFragment,
+    ZeroFragment,
+    ZeroProducerBinding,
+    ZeroRouteEdge,
+    ZeroDeliverySequence,
+    DigestWidth,
+    Route(BackendEnvelopeKind),
+    PayloadRequired(BackendEnvelopeKind),
+    PayloadForbidden(BackendEnvelopeKind),
+    ProducerOpenRequired(BackendEnvelopeKind),
+    ProducerOpenForbidden(BackendEnvelopeKind),
+    AcceptStatusRequired(BackendEnvelopeKind),
+    AcceptStatusForbidden(BackendEnvelopeKind),
+}
+impl std::fmt::Display for NativeFilterEnvelopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownKind => f.write_str("runtime filter envelope kind is unknown"),
+            Self::UnspecifiedKind => f.write_str("runtime filter envelope kind must be specified"),
+            Self::MissingQuery => f.write_str("runtime filter query id is missing"),
+            Self::ZeroQuery => f.write_str("runtime filter query id must be non-zero"),
+            Self::ZeroChannel => f.write_str("runtime filter channel id must be non-zero"),
+            Self::ZeroEpoch => f.write_str("runtime filter deployment epoch must be non-zero"),
+            Self::MissingRoute => f.write_str("runtime filter route identity is missing"),
+            Self::MissingRouteValue => {
+                f.write_str("runtime filter route identity value is missing")
+            }
+            Self::MissingFragment => f.write_str("runtime filter fragment instance id is missing"),
+            Self::ZeroFragment => {
+                f.write_str("runtime filter fragment instance id must be non-zero")
+            }
+            Self::ZeroProducerBinding => {
+                f.write_str("runtime filter producer binding id must be non-zero")
+            }
+            Self::ZeroRouteEdge => f.write_str("runtime filter route edge id must be non-zero"),
+            Self::ZeroDeliverySequence => {
+                f.write_str("runtime filter delivery sequence must be non-zero")
+            }
+            Self::DigestWidth => {
+                f.write_str("runtime filter schema digest must be exactly 32 bytes")
+            }
+            Self::Route(kind) => write!(
+                f,
+                "runtime filter envelope kind {kind:?} has an invalid route identity"
+            ),
+            Self::PayloadRequired(kind) => write!(
+                f,
+                "runtime filter envelope kind {kind:?} requires a payload"
+            ),
+            Self::PayloadForbidden(kind) => {
+                write!(f, "runtime filter envelope kind {kind:?} forbids a payload")
+            }
+            Self::ProducerOpenRequired(kind) => write!(
+                f,
+                "runtime filter envelope kind {kind:?} requires producer-open metadata"
+            ),
+            Self::ProducerOpenForbidden(kind) => write!(
+                f,
+                "runtime filter envelope kind {kind:?} forbids producer-open metadata"
+            ),
+            Self::AcceptStatusRequired(kind) => write!(
+                f,
+                "runtime filter envelope kind {kind:?} requires an accept status"
+            ),
+            Self::AcceptStatusForbidden(kind) => write!(
+                f,
+                "runtime filter envelope kind {kind:?} forbids an accept status"
+            ),
+        }
+    }
+}
+impl std::error::Error for NativeFilterEnvelopeError {}
+impl FailureProjection for NativeFilterEnvelopeError {
+    fn failure_fact(&self) -> FailureFact {
+        let code = match self {
+            Self::UnknownKind => 9500,
+            Self::UnspecifiedKind => 9501,
+            Self::MissingQuery => 9502,
+            Self::ZeroQuery => 9503,
+            Self::ZeroChannel => 9504,
+            Self::ZeroEpoch => 9505,
+            Self::MissingRoute => 9506,
+            Self::MissingRouteValue => 9507,
+            Self::MissingFragment => 9508,
+            Self::ZeroFragment => 9509,
+            Self::ZeroProducerBinding => 9510,
+            Self::ZeroRouteEdge => 9511,
+            Self::ZeroDeliverySequence => 9512,
+            Self::DigestWidth => 9513,
+            Self::Route(_) => 9520,
+            Self::PayloadRequired(_) => 9521,
+            Self::PayloadForbidden(_) => 9522,
+            Self::ProducerOpenRequired(_) => 9523,
+            Self::ProducerOpenForbidden(_) => 9524,
+            Self::AcceptStatusRequired(_) => 9525,
+            Self::AcceptStatusForbidden(_) => 9526,
+        };
+        FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(code).unwrap()),
+        )
+    }
+}
+#[derive(Debug)]
+pub(crate) enum NativeFilterIngressError {
+    Envelope(NativeFilterEnvelopeError),
+    Domain(SharedFailureCause),
+    #[cfg(novarocks_dev_controls)]
+    ControlledDelivery(tonic::Status),
+}
+impl From<NativeFilterEnvelopeError> for NativeFilterIngressError {
+    fn from(source: NativeFilterEnvelopeError) -> Self {
+        Self::Envelope(source)
+    }
+}
+impl std::fmt::Display for NativeFilterIngressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Envelope(source) => source.fmt(f),
+            Self::Domain(source) => source.fmt(f),
+            #[cfg(novarocks_dev_controls)]
+            Self::ControlledDelivery(source) => source.fmt(f),
+        }
+    }
+}
+impl std::error::Error for NativeFilterIngressError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Envelope(source) => Some(source),
+            Self::Domain(source) => Some(source),
+            #[cfg(novarocks_dev_controls)]
+            Self::ControlledDelivery(source) => Some(source),
+        }
+    }
+}
+impl FailureProjection for NativeFilterIngressError {
+    fn failure_fact(&self) -> FailureFact {
+        match self {
+            Self::Envelope(source) => source.failure_fact(),
+            Self::Domain(source) => source.failure_fact(),
+            // A test-owned lost response is not Task cancellation or a resource grant.
+            #[cfg(novarocks_dev_controls)]
+            Self::ControlledDelivery(_) => FailureFact::new(
+                FailureClass::Dependency,
+                FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(9540).unwrap()),
+            ),
+        }
+    }
+}
+impl NativeFilterIngressError {
+    fn into_status(self) -> tonic::Status {
+        #[cfg(novarocks_dev_controls)]
+        if let Self::ControlledDelivery(source) = self {
+            return source;
+        }
+        tonic::Status::invalid_argument(self.to_string())
+    }
+}
+
 /// The RPC adapter's typed, Backend-owned ingress boundary. The query
 /// lifecycle registry owns the later install/routing authorization; this port
 /// only receives a wire-valid envelope and reports its exact ACK disposition.
@@ -228,19 +402,15 @@ impl BackendNativeRuntimeFilterEnvelope {
         accept_status: Option<BackendAcceptStatus>,
         schema_digest: [u8; 32],
         payload: impl Into<CanonicalContributionBytes>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, NativeFilterEnvelopeError> {
         validate_native_route(kind, route_identity)?;
         validate_native_presence(kind, producer_open.is_some(), accept_status.is_some())?;
         let payload = payload.into();
         if native_kind_requires_payload(kind) && payload.is_empty() {
-            return Err(format!(
-                "runtime filter envelope kind {kind:?} requires a payload"
-            ));
+            return Err(NativeFilterEnvelopeError::PayloadRequired(kind));
         }
         if !native_kind_requires_payload(kind) && !payload.is_empty() {
-            return Err(format!(
-                "runtime filter envelope kind {kind:?} forbids a payload"
-            ));
+            return Err(NativeFilterEnvelopeError::PayloadForbidden(kind));
         }
         Ok(Self {
             kind,
@@ -318,7 +488,7 @@ fn native_kind_requires_payload(
 fn validate_native_route(
     kind: novarocks_worker::runtime_filter::domain::BackendEnvelopeKind,
     route: BackendNativeRouteIdentity,
-) -> Result<(), String> {
+) -> Result<(), NativeFilterEnvelopeError> {
     use novarocks_worker::runtime_filter::domain::BackendEnvelopeKind;
 
     let valid = match kind {
@@ -337,16 +507,16 @@ fn validate_native_route(
         }
         BackendEnvelopeKind::Ack => matches!(route, BackendNativeRouteIdentity::Contribution(_)),
     };
-    valid.then_some(()).ok_or_else(|| {
-        format!("runtime filter envelope kind {kind:?} has an invalid route identity")
-    })
+    valid
+        .then_some(())
+        .ok_or_else(|| NativeFilterEnvelopeError::Route(kind))
 }
 
 fn validate_native_presence(
     kind: novarocks_worker::runtime_filter::domain::BackendEnvelopeKind,
     has_producer_open: bool,
     has_accept_status: bool,
-) -> Result<(), String> {
+) -> Result<(), NativeFilterEnvelopeError> {
     use novarocks_worker::runtime_filter::domain::BackendEnvelopeKind;
 
     let producer_open_required = matches!(
@@ -354,25 +524,17 @@ fn validate_native_presence(
         BackendEnvelopeKind::Contribution | BackendEnvelopeKind::ProducerClosed
     );
     if producer_open_required && !has_producer_open {
-        return Err(format!(
-            "runtime filter envelope kind {kind:?} requires producer-open metadata"
-        ));
+        return Err(NativeFilterEnvelopeError::ProducerOpenRequired(kind));
     }
     if !producer_open_required && has_producer_open {
-        return Err(format!(
-            "runtime filter envelope kind {kind:?} forbids producer-open metadata"
-        ));
+        return Err(NativeFilterEnvelopeError::ProducerOpenForbidden(kind));
     }
     let accept_status_required = kind == BackendEnvelopeKind::Ack;
     if accept_status_required && !has_accept_status {
-        return Err(format!(
-            "runtime filter envelope kind {kind:?} requires an accept status"
-        ));
+        return Err(NativeFilterEnvelopeError::AcceptStatusRequired(kind));
     }
     if !accept_status_required && has_accept_status {
-        return Err(format!(
-            "runtime filter envelope kind {kind:?} forbids an accept status"
-        ));
+        return Err(NativeFilterEnvelopeError::AcceptStatusForbidden(kind));
     }
     Ok(())
 }
@@ -492,6 +654,14 @@ pub fn handle_runtime_filter_envelope(
     ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
     request: proto::filter::RuntimeFilterEnvelope,
 ) -> Result<proto::filter::RuntimeFilterEnvelopeResponse, tonic::Status> {
+    handle_runtime_filter_envelope_typed(ingress, request)
+        .map_err(NativeFilterIngressError::into_status)
+}
+
+pub(crate) fn handle_runtime_filter_envelope_typed(
+    ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
+    request: proto::filter::RuntimeFilterEnvelope,
+) -> Result<proto::filter::RuntimeFilterEnvelopeResponse, NativeFilterIngressError> {
     let proto::filter::RuntimeFilterEnvelope {
         kind,
         query_id,
@@ -505,28 +675,24 @@ pub fn handle_runtime_filter_envelope(
 
     let kind = decode_kind(kind)?;
     let query_id =
-        query_id.ok_or_else(|| invalid_argument("runtime filter query id is missing"))?;
+        query_id.ok_or_else(|| invalid_argument(NativeFilterEnvelopeError::MissingQuery))?;
     let query_id = UniqueId::new(query_id.hi, query_id.lo);
     if query_id == UniqueId::new(0, 0) {
-        return Err(invalid_argument("runtime filter query id must be non-zero"));
+        return Err(invalid_argument(NativeFilterEnvelopeError::ZeroQuery));
     }
     if channel_id == 0 {
-        return Err(invalid_argument(
-            "runtime filter channel id must be non-zero",
-        ));
+        return Err(invalid_argument(NativeFilterEnvelopeError::ZeroChannel));
     }
     if deployment_epoch == 0 {
-        return Err(invalid_argument(
-            "runtime filter deployment epoch must be non-zero",
-        ));
+        return Err(invalid_argument(NativeFilterEnvelopeError::ZeroEpoch));
     }
-    let route_identity = route_identity
-        .ok_or_else(|| invalid_argument("runtime filter route identity is missing"))?;
+    let route_identity =
+        route_identity.ok_or_else(|| invalid_argument(NativeFilterEnvelopeError::MissingRoute))?;
     let domain_route_identity = decode_route_identity(&route_identity)?;
     // Presence is a kind-level wire invariant. Validate it before parsing the
     // metadata body so a forbidden field is never reported as a malformed
     // producer-open value.
-    validate_native_presence(kind, producer_open.is_some(), false).map_err(invalid_argument)?;
+    validate_native_presence(kind, producer_open.is_some(), false)?;
     let producer_open = producer_open
         .map(|metadata| BackendProducerOpenMetadata::try_new(metadata.local_partition_count))
         .transpose()
@@ -542,9 +708,10 @@ pub fn handle_runtime_filter_envelope(
         domain_route_identity,
         producer_open,
         None,
-        schema_digest.as_slice().try_into().map_err(|_| {
-            invalid_argument("runtime filter schema digest must be exactly 32 bytes")
-        })?,
+        schema_digest
+            .as_slice()
+            .try_into()
+            .map_err(|_| invalid_argument(NativeFilterEnvelopeError::DigestWidth))?,
         payload,
     )
     .map_err(transport_error)?;
@@ -560,9 +727,13 @@ pub fn handle_runtime_filter_envelope(
         deployment_epoch,
         RuntimeFilterChannelId::new(channel_id),
         domain_route_identity,
-    )? {
-        return Err(tonic::Status::deadline_exceeded(
-            "runner-owned runtime-filter contribution response dropped after Accepted",
+    )
+    .map_err(NativeFilterIngressError::ControlledDelivery)?
+    {
+        return Err(NativeFilterIngressError::ControlledDelivery(
+            tonic::Status::deadline_exceeded(
+                "runner-owned runtime-filter contribution response dropped after Accepted",
+            ),
         ));
     }
     let (accept_status, rejection_reason) = match result.status() {
@@ -663,19 +834,16 @@ fn runtime_filter_fault_execution_id(
     })
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "The native transport adapter returns tonic status directly."
-)]
 fn decode_kind(
     kind: i32,
-) -> Result<novarocks_worker::runtime_filter::domain::BackendEnvelopeKind, tonic::Status> {
+) -> Result<novarocks_worker::runtime_filter::domain::BackendEnvelopeKind, NativeFilterIngressError>
+{
     let kind = proto::filter::RuntimeFilterEnvelopeKind::try_from(kind)
-        .map_err(|_| invalid_argument("runtime filter envelope kind is unknown"))?;
+        .map_err(|_| invalid_argument(NativeFilterEnvelopeError::UnknownKind))?;
     match kind {
-        proto::filter::RuntimeFilterEnvelopeKind::Unspecified => Err(invalid_argument(
-            "runtime filter envelope kind must be specified",
-        )),
+        proto::filter::RuntimeFilterEnvelopeKind::Unspecified => {
+            Err(invalid_argument(NativeFilterEnvelopeError::UnspecifiedKind))
+        }
         proto::filter::RuntimeFilterEnvelopeKind::Contribution => {
             Ok(novarocks_worker::runtime_filter::domain::BackendEnvelopeKind::Contribution)
         }
@@ -774,31 +942,25 @@ fn encode_route_identity(
     proto::filter::RuntimeFilterRouteIdentity { value: Some(value) }
 }
 
-#[expect(
-    clippy::result_large_err,
-    reason = "The native transport adapter returns tonic status directly."
-)]
 fn decode_route_identity(
     route_identity: &proto::filter::RuntimeFilterRouteIdentity,
-) -> Result<BackendNativeRouteIdentity, tonic::Status> {
+) -> Result<BackendNativeRouteIdentity, NativeFilterIngressError> {
     use proto::filter::runtime_filter_route_identity::Value;
 
     match route_identity.value.as_ref() {
         Some(Value::Contribution(identity)) => {
-            let fragment_instance_id = identity.fragment_instance_id.ok_or_else(|| {
-                invalid_argument("runtime filter fragment instance id is missing")
-            })?;
+            let fragment_instance_id = identity
+                .fragment_instance_id
+                .ok_or_else(|| invalid_argument(NativeFilterEnvelopeError::MissingFragment))?;
             let fragment_instance_id =
                 UniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo);
             if identity.producer_binding_id == 0 {
                 return Err(invalid_argument(
-                    "runtime filter producer binding id must be non-zero",
+                    NativeFilterEnvelopeError::ZeroProducerBinding,
                 ));
             }
             if fragment_instance_id == UniqueId::new(0, 0) {
-                return Err(invalid_argument(
-                    "runtime filter fragment instance id must be non-zero",
-                ));
+                return Err(invalid_argument(NativeFilterEnvelopeError::ZeroFragment));
             }
             Ok(BackendNativeRouteIdentity::contribution(
                 BackendNativeContributionRouteIdentity::new(
@@ -811,13 +973,11 @@ fn decode_route_identity(
         }
         Some(Value::Delivery(identity)) => {
             if identity.route_edge_id == 0 {
-                return Err(invalid_argument(
-                    "runtime filter route edge id must be non-zero",
-                ));
+                return Err(invalid_argument(NativeFilterEnvelopeError::ZeroRouteEdge));
             }
             if identity.sequence == 0 {
                 return Err(invalid_argument(
-                    "runtime filter delivery sequence must be non-zero",
+                    NativeFilterEnvelopeError::ZeroDeliverySequence,
                 ));
             }
             Ok(BackendNativeRouteIdentity::delivery(
@@ -828,20 +988,18 @@ fn decode_route_identity(
             ))
         }
         Some(Value::ProducerInstance(identity)) => {
-            let fragment_instance_id = identity.fragment_instance_id.ok_or_else(|| {
-                invalid_argument("runtime filter fragment instance id is missing")
-            })?;
+            let fragment_instance_id = identity
+                .fragment_instance_id
+                .ok_or_else(|| invalid_argument(NativeFilterEnvelopeError::MissingFragment))?;
             let fragment_instance_id =
                 UniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo);
             if identity.producer_binding_id == 0 {
                 return Err(invalid_argument(
-                    "runtime filter producer binding id must be non-zero",
+                    NativeFilterEnvelopeError::ZeroProducerBinding,
                 ));
             }
             if fragment_instance_id == UniqueId::new(0, 0) {
-                return Err(invalid_argument(
-                    "runtime filter fragment instance id must be non-zero",
-                ));
+                return Err(invalid_argument(NativeFilterEnvelopeError::ZeroFragment));
             }
             Ok(BackendNativeRouteIdentity::producer_instance(
                 BackendNativeProducerInstanceRouteIdentity::new(
@@ -851,17 +1009,20 @@ fn decode_route_identity(
             ))
         }
         None => Err(invalid_argument(
-            "runtime filter route identity value is missing",
+            NativeFilterEnvelopeError::MissingRouteValue,
         )),
     }
 }
 
-fn transport_error(error: impl std::fmt::Display) -> tonic::Status {
-    invalid_argument(error.to_string())
+fn transport_error<E>(source: E) -> NativeFilterIngressError
+where
+    E: std::error::Error + FailureProjection + Send + Sync + 'static,
+{
+    NativeFilterIngressError::Domain(SharedFailureCause::new(source))
 }
 
-fn invalid_argument(message: impl Into<String>) -> tonic::Status {
-    tonic::Status::invalid_argument(message.into())
+fn invalid_argument(source: NativeFilterEnvelopeError) -> NativeFilterIngressError {
+    source.into()
 }
 
 #[cfg(test)]
@@ -1675,5 +1836,41 @@ mod tests {
             proto::filter::RuntimeFilterAcceptStatus::Rejected as i32
         );
         assert_eq!(response.rejection_reason, "semantic rejection");
+    }
+}
+
+#[cfg(test)]
+mod typed_ingress_failure_tests {
+    use super::*;
+    use std::error::Error;
+    #[test]
+    fn original_backend_transport_source_survives_until_wire_projection() {
+        let original =
+            novarocks_worker::runtime_filter::domain::BackendProducerOpenMetadata::try_new(0)
+                .unwrap_err();
+        let expected = original.failure_fact();
+        let typed = transport_error(original);
+        assert_eq!(typed.failure_fact(), expected);
+        assert!(
+            typed
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .is::<novarocks_worker::runtime_filter::domain::BackendTransportError>()
+        );
+        let status = typed.into_status();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+    #[test]
+    fn native_route_and_wire_shape_are_authored_before_transport_status() {
+        let original = NativeFilterEnvelopeError::DigestWidth;
+        let typed = invalid_argument(original);
+        assert_eq!(typed.failure_fact(), original.failure_fact());
+        assert_eq!(typed.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            typed.into_status().message(),
+            "runtime filter schema digest must be exactly 32 bytes"
+        );
     }
 }

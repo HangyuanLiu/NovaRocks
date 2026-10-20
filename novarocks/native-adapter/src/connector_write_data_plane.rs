@@ -347,7 +347,7 @@ impl ConnectorCommitFragmentCarrierValidator for RootCommitFragmentCarrierValida
                 // bytes in flight. The size gate runs inside `parse`, before the
                 // ledger would have charged it, so the kind has to be recovered
                 // here or the budget's documented failure never appears.
-                if error.kind() == ProtocolErrorKind::OutOfRange {
+                if error.kind() == &ProtocolErrorKind::OutOfRange {
                     return ConnectorError::new(
                         ConnectorErrorKind::ResourceExhausted,
                         format!(
@@ -597,6 +597,197 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    mod append_hold_exit_tests {
+        use super::*;
+        use arrow::{
+            array::{Array, Int64Array, RecordBatch},
+            datatypes::{DataType, Field, Schema},
+        };
+        use novarocks_spi::connector::write_stack::{
+            ConnectorBatchWriter, ConnectorOpenWriterRequest, ConnectorWriteExecution,
+            ConnectorWriterPhysicalContext,
+        };
+        use novarocks_spi::connector::{
+            CatalogHandle, ConnectorRequestContext, ConnectorStopOwner,
+        };
+        use novarocks_worker::connector_write_runtime::ObservedConnectorWriteExecution;
+        use std::{
+            future::Future,
+            sync::atomic::{AtomicBool, AtomicUsize},
+            task::Poll,
+            time::{Duration, Instant},
+        };
+
+        #[derive(Default)]
+        struct Calls {
+            appended: AtomicUsize,
+            aborted: AtomicUsize,
+            dropped: AtomicBool,
+        }
+        struct InnerExecution(Arc<Calls>, CatalogHandle);
+        struct InnerWriter(Arc<Calls>);
+        impl Drop for InnerWriter {
+            fn drop(&mut self) {
+                self.0.dropped.store(true, Ordering::Release);
+            }
+        }
+        #[async_trait::async_trait]
+        impl ConnectorBatchWriter for InnerWriter {
+            async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+                let values = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                assert_eq!(values.value(0), 7);
+                assert!(values.is_null(1));
+                self.0.appended.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }
+            async fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+                panic!("the held-append cleanup never finishes a writer")
+            }
+            async fn abort(&mut self) -> Result<(), ConnectorError> {
+                self.0.aborted.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }
+        }
+        #[async_trait::async_trait]
+        impl ConnectorWriteExecution for InnerExecution {
+            fn catalog_handle(&self) -> &CatalogHandle {
+                &self.1
+            }
+            async fn open_writer(
+                &self,
+                _: ConnectorOpenWriterRequest,
+            ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
+                Ok(Box::new(InnerWriter(self.0.clone())))
+            }
+        }
+        #[derive(Clone, Copy)]
+        enum Release {
+            TaskStop,
+            SessionEnd,
+            OriginalDeadline,
+        }
+
+        async fn real_hold_case(release: Release) {
+            let fixture = crate::test_controls::tests::controlled("connector-write-append-hold");
+            crate::test_controls::tests::bind_fixture(
+                &fixture,
+                novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteAppendHold,
+            );
+            let observer = Arc::new(
+                NativeConnectorWriteObservationPort::new(fixture.process)
+                    .with_test_controls(fixture.controls.clone()),
+            );
+            let calls = Arc::new(Calls::default());
+            let execution = ObservedConnectorWriteExecution::new(
+                Arc::new(InnerExecution(calls.clone(), catalog_handle())),
+                fixture.execution,
+                7,
+                observer,
+                None,
+            );
+            let stop = ConnectorStopOwner::new();
+            let deadline = Instant::now()
+                + match release {
+                    Release::OriginalDeadline => Duration::from_millis(100),
+                    _ => Duration::from_secs(60),
+                };
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, true)]));
+            let mut writer = execution
+                .open_writer(ConnectorOpenWriterRequest {
+                    handle: adapter().wrap_writer_handle("held".to_owned()),
+                    target: WriteTargetOrdinal::try_new(0).unwrap(),
+                    expected_schema: schema.clone(),
+                    physical: ConnectorWriterPhysicalContext::new([1; 16], 2, [3; 16], 4, 5),
+                    context: ConnectorRequestContext::try_new(
+                        deadline,
+                        stop.view(),
+                        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+                        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+                    )
+                    .unwrap(),
+                })
+                .await
+                .unwrap();
+            let array = Arc::new(Int64Array::from(vec![Some(7), None]));
+            let original_array = Arc::downgrade(&array);
+            let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+            let mut append = Box::pin(writer.append(batch));
+            // Poll the actual Native hold through the real Worker wrapper.
+            if !matches!(release, Release::OriginalDeadline) {
+                let pending =
+                    std::future::poll_fn(|cx| Poll::Ready(append.as_mut().poll(cx).is_pending()))
+                        .await;
+                assert!(pending);
+            }
+            assert!(original_array.upgrade().is_some());
+            assert_eq!(calls.appended.load(Ordering::Acquire), 0);
+            assert_eq!(calls.aborted.load(Ordering::Acquire), 0);
+            assert!(!calls.dropped.load(Ordering::Acquire));
+            match release {
+                Release::TaskStop => stop.request_stop(),
+                Release::SessionEnd => fixture.role.close(),
+                Release::OriginalDeadline => {}
+            }
+            let outcome = tokio::time::timeout(Duration::from_secs(5), append.as_mut())
+                .await
+                .unwrap();
+            drop(append);
+            assert!(
+                original_array.upgrade().is_none(),
+                "the original held batch actually retires"
+            );
+            match release {
+                Release::TaskStop => {
+                    assert_eq!(outcome.unwrap_err().kind(), ConnectorErrorKind::Cancelled);
+                    assert!(fixture.role.scope().is_active());
+                    assert_eq!(calls.appended.load(Ordering::Acquire), 0);
+                }
+                Release::SessionEnd => {
+                    outcome.unwrap();
+                    assert!(!stop.view().is_stopped());
+                    assert_eq!(calls.appended.load(Ordering::Acquire), 1);
+                }
+                Release::OriginalDeadline => {
+                    assert_eq!(
+                        outcome.unwrap_err().kind(),
+                        ConnectorErrorKind::DeadlineExceeded
+                    );
+                    assert!(!stop.view().is_stopped());
+                    assert!(fixture.role.scope().is_active());
+                    assert_eq!(calls.appended.load(Ordering::Acquire), 0);
+                }
+            }
+            assert_eq!(
+                calls.aborted.load(Ordering::Acquire),
+                0,
+                "the gate itself has no abort authority"
+            );
+            writer.abort().await.unwrap();
+            assert_eq!(calls.aborted.load(Ordering::Acquire), 1);
+            assert!(!calls.dropped.load(Ordering::Acquire));
+            drop(writer);
+            assert!(calls.dropped.load(Ordering::Acquire));
+        }
+
+        #[tokio::test]
+        async fn held_append_retires_on_original_task_stop_while_the_role_permission_is_active() {
+            real_hold_case(Release::TaskStop).await;
+        }
+        #[tokio::test]
+        async fn role_session_end_only_releases_the_gate_without_stopping_the_original_operation() {
+            real_hold_case(Release::SessionEnd).await;
+        }
+        #[tokio::test]
+        async fn held_append_observes_the_original_operation_deadline_without_a_new_stop_owner() {
+            real_hold_case(Release::OriginalDeadline).await;
+        }
     }
 
     fn catalog_handle() -> novarocks_spi::connector::CatalogHandle {

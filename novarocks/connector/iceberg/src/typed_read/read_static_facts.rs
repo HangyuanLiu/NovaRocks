@@ -341,7 +341,7 @@ mod tests {
             assert!(units <= 256);
             let mut calls = self.calls.lock().unwrap();
             calls.push(units);
-            if let Some((index, error)) = self.refusal {
+            if let Some((index, error)) = self.refusal.clone() {
                 assert!(
                     calls.len() <= index,
                     "control must not be called after refusal"
@@ -512,7 +512,7 @@ mod tests {
         for cause in causes() {
             let control = Control {
                 calls: Default::default(),
-                refusal: Some((1, cause)),
+                refusal: Some((1, cause.clone())),
             };
             assert!(
                 matches!(iceberg_final_static_facts_for_compile(&rewrite(), &control),
@@ -536,7 +536,7 @@ mod tests {
         for cause in causes() {
             let control = Control {
                 calls: Default::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(iceberg_final_static_facts_for_compile(&relation, &control),
@@ -560,7 +560,7 @@ mod tests {
         for cause in causes() {
             let control = Control {
                 calls: Default::default(),
-                refusal: Some((2, cause)),
+                refusal: Some((2, cause.clone())),
             };
             assert!(
                 matches!(iceberg_final_static_facts_for_compile(&relation, &control),
@@ -578,7 +578,7 @@ mod tests {
         for cause in causes() {
             let control = Control {
                 calls: Default::default(),
-                refusal: Some((at, cause)),
+                refusal: Some((at, cause.clone())),
             };
             assert!(
                 matches!(iceberg_final_static_facts_for_compile(&relation, &control),

@@ -36,6 +36,7 @@ use arrow::datatypes::{DataType, Int32Type};
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use novarocks_failure_contract::FailureProjection;
 
 use super::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 
@@ -94,7 +95,7 @@ impl RuntimeFilterDictionaryFoldCache {
 
 fn dictionary_int32_string(
     array: &ArrayRef,
-) -> Result<Option<&DictionaryArray<Int32Type>>, String> {
+) -> Result<Option<&DictionaryArray<Int32Type>>, crate::runtime::fragment::ExecutionFailure> {
     match array.data_type() {
         DataType::Dictionary(key_type, value_type)
             if key_type.as_ref() == &DataType::Int32
@@ -104,41 +105,61 @@ fn dictionary_int32_string(
                 .as_any()
                 .downcast_ref::<DictionaryArray<Int32Type>>()
                 .map(Some)
-                .ok_or_else(|| "failed to downcast runtime filter dictionary probe".to_string())
+                .ok_or_else(|| {
+                    crate::exec::runtime_filter::failure::contract(
+                        "failed to downcast runtime filter dictionary probe",
+                    )
+                })
         }
-        DataType::Dictionary(_, _) => Err(format!(
-            "unsupported runtime filter dictionary probe type: {:?}",
-            array.data_type()
+        DataType::Dictionary(_, _) => Err(crate::exec::runtime_filter::failure::contract(
+            format_args!(
+                "unsupported runtime filter dictionary probe type: {:?}",
+                array.data_type()
+            ),
         )),
         _ => Ok(None),
     }
 }
 
-fn dictionary_values_tag(values: &ArrayRef) -> Result<DictionaryValuesTypeTag, String> {
+fn dictionary_values_tag(
+    values: &ArrayRef,
+) -> Result<DictionaryValuesTypeTag, crate::runtime::fragment::ExecutionFailure> {
     match values.data_type() {
         DataType::Utf8 => Ok(DictionaryValuesTypeTag::Utf8),
         DataType::LargeUtf8 => Ok(DictionaryValuesTypeTag::LargeUtf8),
-        other => Err(format!(
-            "unsupported runtime filter dictionary values type: {:?}",
-            other
+        other => Err(crate::exec::runtime_filter::failure::contract(
+            format_args!(
+                "unsupported runtime filter dictionary values type: {:?}",
+                other
+            ),
         )),
     }
 }
 
-fn dictionary_values_as_rf_utf8(values: &ArrayRef) -> Result<ArrayRef, String> {
+fn dictionary_values_as_rf_utf8(
+    values: &ArrayRef,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     match values.data_type() {
         DataType::Utf8 => Ok(Arc::clone(values)),
-        DataType::LargeUtf8 => cast(values.as_ref(), &DataType::Utf8).map_err(|e| e.to_string()),
-        other => Err(format!(
-            "unsupported runtime filter dictionary values type: {:?}",
-            other
+        DataType::LargeUtf8 => cast(values.as_ref(), &DataType::Utf8).map_err(|source| {
+            crate::exec::runtime_filter::failure::arrow("Arrow selection or string cast", source)
+        }),
+        other => Err(crate::exec::runtime_filter::failure::contract(
+            format_args!(
+                "unsupported runtime filter dictionary values type: {:?}",
+                other
+            ),
         )),
     }
 }
 
-fn min_max_probe_array(array: &ArrayRef) -> Result<ArrayRef, String> {
+fn min_max_probe_array(
+    array: &ArrayRef,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     if dictionary_int32_string(array)?.is_some() {
-        return cast(array.as_ref(), &DataType::Utf8).map_err(|e| e.to_string());
+        return cast(array.as_ref(), &DataType::Utf8).map_err(|source| {
+            crate::exec::runtime_filter::failure::arrow("Arrow selection or string cast", source)
+        });
     }
     Ok(Arc::clone(array))
 }
@@ -147,7 +168,7 @@ fn dictionary_fold_key(
     kind: DictionaryFoldKind,
     filter_id: i32,
     values: &ArrayRef,
-) -> Result<DictionaryFoldKey, String> {
+) -> Result<DictionaryFoldKey, crate::runtime::fragment::ExecutionFailure> {
     Ok(DictionaryFoldKey {
         kind,
         filter_id,
@@ -161,7 +182,7 @@ fn fold_in_filter_for_dictionary(
     filter: &RuntimeInFilter,
     dict: &DictionaryArray<Int32Type>,
     cache: &mut RuntimeFilterDictionaryFoldCache,
-) -> Result<DictionaryFold, String> {
+) -> Result<DictionaryFold, crate::runtime::fragment::ExecutionFailure> {
     let values = dict.values();
     let key = dictionary_fold_key(DictionaryFoldKind::In, filter.filter_id(), values)?;
     if let Some(fold) = cache.folds.get(&key) {
@@ -190,7 +211,7 @@ fn fold_membership_filter_for_dictionary(
     filter: &RuntimeMembershipFilter,
     dict: &DictionaryArray<Int32Type>,
     cache: &mut RuntimeFilterDictionaryFoldCache,
-) -> Result<DictionaryFold, String> {
+) -> Result<DictionaryFold, crate::runtime::fragment::ExecutionFailure> {
     let values = dict.values();
     let key = dictionary_fold_key(DictionaryFoldKind::Membership, filter.filter_id(), values)?;
     if let Some(fold) = cache.folds.get(&key) {
@@ -217,9 +238,11 @@ fn apply_dictionary_fold(
     dict: &DictionaryArray<Int32Type>,
     fold: &DictionaryFold,
     keep: &mut [bool],
-) -> Result<(), String> {
+) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
     if keep.len() != dict.len() {
-        return Err("runtime filter dictionary selection size mismatch".to_string());
+        return Err(crate::exec::runtime_filter::failure::contract(
+            "runtime filter dictionary selection size mismatch",
+        ));
     }
     let keys = dict.keys();
     for (row, selected) in keep.iter_mut().enumerate().take(dict.len()) {
@@ -231,24 +254,28 @@ fn apply_dictionary_fold(
             continue;
         }
         let code = keys.value(row);
-        let code = usize::try_from(code).map_err(|_| {
-            format!(
-                "runtime filter dictionary code must be non-negative, got {} at row {}",
-                code, row
+        let code = usize::try_from(code).map_err(|source| {
+            crate::exec::runtime_filter::failure::narrow(
+                "dictionary code",
+                i128::from(code),
+                source,
             )
         })?;
         *selected = fold.accepts.get(code).copied().ok_or_else(|| {
-            format!(
+            crate::exec::runtime_filter::failure::contract(format_args!(
                 "runtime filter dictionary code out of bounds: code={} values_len={}",
                 code,
                 fold.accepts.len()
-            )
+            ))
         })?;
     }
     Ok(())
 }
 
-fn filter_chunk_by_keep(chunk: Chunk, keep: Vec<bool>) -> Result<Option<Chunk>, String> {
+fn filter_chunk_by_keep(
+    chunk: Chunk,
+    keep: Vec<bool>,
+) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
     if keep.iter().all(|v| *v) {
         return Ok(Some(chunk));
     }
@@ -256,8 +283,9 @@ fn filter_chunk_by_keep(chunk: Chunk, keep: Vec<bool>) -> Result<Option<Chunk>, 
         return Ok(None);
     }
     let mask = BooleanArray::from(keep);
-    let filtered_batch =
-        filter_record_batch(&chunk.record_batch(), &mask).map_err(|e| e.to_string())?;
+    let filtered_batch = filter_record_batch(&chunk.record_batch(), &mask).map_err(|source| {
+        crate::exec::runtime_filter::failure::arrow("Arrow selection or string cast", source)
+    })?;
     Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
 }
 
@@ -269,7 +297,7 @@ fn filter_chunk_by_keep(chunk: Chunk, keep: Vec<bool>) -> Result<Option<Chunk>, 
 pub fn filter_chunk_by_in_filters(
     filters: &[Arc<RuntimeInFilter>],
     chunk: Chunk,
-) -> Result<Option<Chunk>, String> {
+) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
     let mut cache = RuntimeFilterDictionaryFoldCache::default();
     filter_chunk_by_in_filters_with_dict_cache(filters, chunk, &mut cache)
 }
@@ -278,7 +306,7 @@ fn filter_chunk_by_in_filters_with_dict_cache(
     filters: &[Arc<RuntimeInFilter>],
     chunk: Chunk,
     cache: &mut RuntimeFilterDictionaryFoldCache,
-) -> Result<Option<Chunk>, String> {
+) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
     if filters.is_empty() {
         return Ok(Some(chunk));
     }
@@ -329,7 +357,7 @@ pub fn filter_chunk_by_in_filters_with_exprs(
     exprs: &HashMap<i32, ExprId>,
     filters: &[Arc<RuntimeInFilter>],
     chunk: Chunk,
-) -> Result<Option<Chunk>, String> {
+) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
     let mut cache = RuntimeFilterDictionaryFoldCache::default();
     filter_chunk_by_in_filters_with_exprs_and_dict_cache(arena, exprs, filters, chunk, &mut cache)
 }
@@ -340,7 +368,7 @@ pub fn filter_chunk_by_in_filters_with_exprs_and_dict_cache(
     filters: &[Arc<RuntimeInFilter>],
     chunk: Chunk,
     cache: &mut RuntimeFilterDictionaryFoldCache,
-) -> Result<Option<Chunk>, String> {
+) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
     if filters.is_empty() {
         return Ok(Some(chunk));
     }
@@ -361,12 +389,13 @@ pub fn filter_chunk_by_in_filters_with_exprs_and_dict_cache(
         let array = match arena.eval(*expr_id, &chunk) {
             Ok(array) => array,
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("slot id") && msg.contains("not found in chunk") {
+                if e.failure_fact().reason()
+                    == crate::runtime::fragment::ExecutionReason::ChunkMissingSlot.reason()
+                {
                     current = Some(chunk);
                     continue;
                 }
-                return Err(msg);
+                return Err(e);
             }
         };
         current = filter_in_chunk_with_array_and_cache(filter_ref, &array, chunk, cache)?;
@@ -379,7 +408,7 @@ fn filter_in_chunk_with_array_and_cache(
     array: &ArrayRef,
     chunk: Chunk,
     cache: &mut RuntimeFilterDictionaryFoldCache,
-) -> Result<Option<Chunk>, String> {
+) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
     if filter.is_empty() {
         return Ok(Some(chunk));
     }
@@ -387,7 +416,9 @@ fn filter_in_chunk_with_array_and_cache(
         return Ok(Some(chunk));
     }
     if array.len() != chunk.len() {
-        return Err("runtime in-filter array length mismatch".to_string());
+        return Err(crate::exec::runtime_filter::failure::contract(
+            "runtime in-filter array length mismatch",
+        ));
     }
     if let Some(dict) = dictionary_int32_string(array)? {
         let mut keep = vec![true; chunk.len()];
@@ -404,7 +435,7 @@ pub fn filter_chunk_by_membership_filters_with_exprs(
     exprs: &HashMap<i32, ExprId>,
     filters: &[Arc<RuntimeMembershipFilter>],
     chunk: Chunk,
-) -> Result<Option<Chunk>, String> {
+) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
     let mut cache = RuntimeFilterDictionaryFoldCache::default();
     filter_chunk_by_membership_filters_with_exprs_and_dict_cache(
         arena, exprs, filters, chunk, &mut cache,
@@ -417,7 +448,7 @@ pub fn filter_chunk_by_membership_filters_with_exprs_and_dict_cache(
     filters: &[Arc<RuntimeMembershipFilter>],
     chunk: Chunk,
     cache: &mut RuntimeFilterDictionaryFoldCache,
-) -> Result<Option<Chunk>, String> {
+) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
     if filters.is_empty() {
         return Ok(Some(chunk));
     }
@@ -431,12 +462,13 @@ pub fn filter_chunk_by_membership_filters_with_exprs_and_dict_cache(
             let array = match arena.eval(*expr_id, &chunk) {
                 Ok(array) => array,
                 Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("slot id") && msg.contains("not found in chunk") {
+                    if e.failure_fact().reason()
+                        == crate::runtime::fragment::ExecutionReason::ChunkMissingSlot.reason()
+                    {
                         current = Some(chunk);
                         continue;
                     }
-                    return Err(msg);
+                    return Err(e);
                 }
             };
             current = filter_membership_chunk_with_array_and_cache(filter, &array, chunk, cache)?;
@@ -451,7 +483,7 @@ fn filter_membership_chunk_with_direct_slot_and_cache(
     filter: &RuntimeMembershipFilter,
     chunk: Chunk,
     cache: &mut RuntimeFilterDictionaryFoldCache,
-) -> Result<Option<Chunk>, String> {
+) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
     if chunk.is_empty() {
         return Ok(Some(chunk));
     }
@@ -473,12 +505,14 @@ fn filter_membership_chunk_with_array_and_cache(
     array: &ArrayRef,
     chunk: Chunk,
     cache: &mut RuntimeFilterDictionaryFoldCache,
-) -> Result<Option<Chunk>, String> {
+) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
     if chunk.is_empty() {
         return Ok(Some(chunk));
     }
     if array.len() != chunk.len() {
-        return Err("runtime membership filter array length mismatch".to_string());
+        return Err(crate::exec::runtime_filter::failure::contract(
+            "runtime membership filter array length mismatch",
+        ));
     }
     if let Some(dict) = dictionary_int32_string(array)? {
         let mut keep = vec![true; chunk.len()];
@@ -500,7 +534,7 @@ pub fn filter_chunk_by_min_max_filters_with_exprs(
     exprs: &HashMap<i32, ExprId>,
     filters: &[(i32, Arc<RuntimeMinMaxFilter>)],
     chunk: Chunk,
-) -> Result<Option<Chunk>, String> {
+) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
     let mut cache = RuntimeFilterDictionaryFoldCache::default();
     filter_chunk_by_min_max_filters_with_exprs_and_dict_cache(
         arena, exprs, filters, chunk, &mut cache,
@@ -513,7 +547,7 @@ pub fn filter_chunk_by_min_max_filters_with_exprs_and_dict_cache(
     filters: &[(i32, Arc<RuntimeMinMaxFilter>)],
     chunk: Chunk,
     _dict_cache: &mut RuntimeFilterDictionaryFoldCache,
-) -> Result<Option<Chunk>, String> {
+) -> Result<Option<Chunk>, crate::runtime::fragment::ExecutionFailure> {
     if filters.is_empty() {
         return Ok(Some(chunk));
     }
@@ -533,12 +567,13 @@ pub fn filter_chunk_by_min_max_filters_with_exprs_and_dict_cache(
         let array = match arena.eval(*expr_id, &chunk) {
             Ok(array) => array,
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("slot id") && msg.contains("not found in chunk") {
+                if e.failure_fact().reason()
+                    == crate::runtime::fragment::ExecutionReason::ChunkMissingSlot.reason()
+                {
                     current = Some(chunk);
                     continue;
                 }
-                return Err(msg);
+                return Err(e);
             }
         };
         let len = chunk.len();
@@ -556,7 +591,12 @@ pub fn filter_chunk_by_min_max_filters_with_exprs_and_dict_cache(
         }
         let mask = BooleanArray::from(keep);
         let filtered_batch =
-            filter_record_batch(&chunk.record_batch(), &mask).map_err(|e| e.to_string())?;
+            filter_record_batch(&chunk.record_batch(), &mask).map_err(|source| {
+                crate::exec::runtime_filter::failure::arrow(
+                    "Arrow selection or string cast",
+                    source,
+                )
+            })?;
         current = Some(Chunk::new_like(filtered_batch, &chunk));
     }
     Ok(current)
@@ -780,5 +820,79 @@ mod tests {
             out.columns()[0].data_type(),
             DataType::Dictionary(_, _)
         ));
+    }
+    #[test]
+    fn expression_filters_skip_only_actual_missing_slots_and_never_error_text() {
+        use crate::exec::expr::{LiteralValue, function::FunctionKind};
+        use novarocks_failure_contract::FailureClass;
+        let build: ArrayRef = Arc::new(StringArray::from(vec!["A"]));
+        let in_filter = Arc::new(RuntimeInFilter::new(
+            17,
+            SlotId::new(1),
+            RuntimeInFilterValues::Utf8(["A".to_string()].into_iter().collect()),
+        ));
+        let membership = Arc::new(RuntimeMembershipFilter::Bloom(
+            RuntimeBloomFilter::build_from_array(
+                17,
+                SlotId::new(1),
+                RuntimeFilterType::Utf8,
+                &build,
+                RUNTIME_FILTER_JOIN_MODE_BROADCAST,
+            )
+            .unwrap(),
+        ));
+        let min_max = Arc::new(RuntimeMinMaxFilter::full_range(RuntimeFilterType::Utf8).unwrap());
+        let mut arena = ExprArena::default();
+        let missing = arena.push_typed(ExprNode::SlotId(SlotId::new(999)), DataType::Utf8);
+        let message = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8(
+                "slot id 999 not found in chunk: user supplied text".into(),
+            )),
+            DataType::Utf8,
+        );
+        let raised = arena.push_typed(
+            ExprNode::FunctionCall {
+                kind: FunctionKind::String("raise_error"),
+                args: vec![message],
+            },
+            DataType::Utf8,
+        );
+        for (expression, absent) in [(missing, true), (raised, false)] {
+            let exprs = HashMap::from([(17, expression)]);
+            for shape in 0..3 {
+                let chunk = dict_chunk(vec![Some(0)], build.clone(), DataType::Utf8);
+                let result = match shape {
+                    0 => filter_chunk_by_in_filters_with_exprs(
+                        &arena,
+                        &exprs,
+                        std::slice::from_ref(&in_filter),
+                        chunk,
+                    ),
+                    1 => filter_chunk_by_membership_filters_with_exprs(
+                        &arena,
+                        &exprs,
+                        std::slice::from_ref(&membership),
+                        chunk,
+                    ),
+                    _ => filter_chunk_by_min_max_filters_with_exprs(
+                        &arena,
+                        &exprs,
+                        &[(17, min_max.clone())],
+                        chunk,
+                    ),
+                };
+                if absent {
+                    assert_eq!(
+                        output_strings(&result.unwrap().unwrap()),
+                        vec![Some("A".to_string())]
+                    );
+                } else {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.failure_fact().class(), FailureClass::Data);
+                    assert_eq!(error.failure_fact().reason().code(), 518);
+                    assert!(error.to_string().contains("user supplied text"));
+                }
+            }
+        }
     }
 }

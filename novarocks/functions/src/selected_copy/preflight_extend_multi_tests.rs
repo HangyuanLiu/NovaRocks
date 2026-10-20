@@ -178,7 +178,7 @@ fn multi_extend_dictionary_constructor_tracks_actual_ptr_eq_and_full_unused_doma
     let second = dictionary(Arc::new(StringArray::from(vec!["second"; 64])), vec![0]);
     assert!(matches!(
         preflight_extend_multi(&[first.as_ref(), second.as_ref()], &[], 0, |_| Ok(())),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
     let data = [first.to_data(), second.to_data()];
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -274,13 +274,13 @@ fn multi_extend_combined_recursive_payload_refuses_before_large_output_allocatio
     let both = [one, ExtendSegment { source: 1, ..one }];
     assert!(matches!(
         preflight_extend_multi(&[a.as_ref(), b.as_ref()], &both, 0, |_| Ok(())),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
     let a = list(a, vec![0, 1], None);
     let b = list(b, vec![0, 1], None);
     assert!(matches!(
         preflight_extend_multi(&[a.as_ref(), b.as_ref()], &both, 0, |_| Ok(())),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
     assert!(matches!(
         preflight_extend_multi(
@@ -292,7 +292,7 @@ fn multi_extend_combined_recursive_payload_refuses_before_large_output_allocatio
             0,
             |_| Ok(())
         ),
-        Err(CopyError::Extent)
+        Err(CopyError::Extent(_))
     ));
 }
 #[test]

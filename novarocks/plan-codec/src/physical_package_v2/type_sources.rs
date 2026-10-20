@@ -645,7 +645,7 @@ mod tests {
                 assert!(at <= stop, "callback after refusal");
             }
             events.push((phase, units));
-            if let Some((stop, cause)) = self.stop
+            if let Some((stop, cause)) = self.stop.clone()
                 && at == stop
             {
                 return Err(cause);
@@ -834,7 +834,7 @@ mod tests {
         assert!(trace.len() > 24);
         for at in 0..trace.len() {
             for cause in CAUSES {
-                let (outcome, stopped) = run(Some((at, cause)));
+                let (outcome, stopped) = run(Some((at, cause.clone())));
                 assert_eq!(outcome, Err(cause));
                 assert_eq!(stopped, trace[..=at]);
             }

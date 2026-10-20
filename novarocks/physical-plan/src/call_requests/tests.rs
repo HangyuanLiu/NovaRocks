@@ -52,7 +52,7 @@ impl PureCompileControl for Control {
             assert!(trace.len() < at, "callback after the original refusal");
         }
         trace.push((phase, units));
-        match self.stop {
+        match self.stop.clone() {
             Some((at, cause)) if at == trace.len() => Err(cause),
             _ => Ok(()),
         }
@@ -71,7 +71,7 @@ fn prefixes(
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::default(),
-                stop: Some((at, cause)),
+                stop: Some((at, cause.clone())),
             };
             assert_eq!(call(&control), Err(CallRequestError::Control(cause)));
             assert_eq!(*control.trace.lock().unwrap(), trace[..at]);

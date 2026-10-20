@@ -244,58 +244,63 @@ fn complete_profile(target: DataType) {
     {
         CastRowResult::RowError(e) => {
             assert_eq!(e.selected_ordinal(), 7);
-            assert_eq!(e.message(), message);
+            assert_eq!(e.message(), (message).detail());
         }
         other => panic!("expected preserved original Date32 error, got {other:?}"),
     }
-    // All i32 Date32 carriers remain admitted; original panic/wrapping is neither NULL nor row-error translated.
-    for days in [
-        i32::MAX,
-        day(262142, 12, 31),
-        day(-262143, 1, 1),
-        day(214749, 1, 1),
-        day(-214749, 1, 1),
+    // Checked calendar arithmetic handles legal years wider than i32 YYYYMMDD.
+    // Literal expectations are independent of both adapters' shared author.
+    for (days, literal) in [
+        (day(262142, 12, 31), 2_621_421_231_i64),
+        (day(-262143, 1, 1), -2_621_429_899),
+        (day(214749, 1, 1), 2_147_490_101),
+        (day(-214749, 1, 1), -2_147_489_899),
     ] {
         let input: ArrayRef = Arc::new(Date32Array::from(vec![days]));
-        let old = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            original(&input, target.clone())
-        }));
-        let new = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            r.evaluate_row(EvaluatedArgument::Column(&input), 0, 0, &Control)
-        }));
-        if cfg!(debug_assertions) {
-            assert!(old.is_err());
-            assert!(new.is_err());
+        let actual = original(&input, target.clone()).unwrap();
+        let pure = r
+            .evaluate_row(EvaluatedArgument::Column(&input), 0, 0, &Control)
+            .unwrap();
+        if target == DataType::Float32 {
+            assert_eq!(
+                actual
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .value(0)
+                    .to_bits(),
+                (literal as f32).to_bits()
+            );
+            assert_eq!(pure, CastRowResult::Float32(literal as f32));
         } else {
-            match old.unwrap() {
-                Ok(array) => match new.unwrap().unwrap() {
-                    CastRowResult::Float32(v) => assert_eq!(
-                        v.to_bits(),
-                        array
-                            .as_any()
-                            .downcast_ref::<Float32Array>()
-                            .unwrap()
-                            .value(0)
-                            .to_bits()
-                    ),
-                    CastRowResult::Float64(v) => assert_eq!(
-                        v.to_bits(),
-                        array
-                            .as_any()
-                            .downcast_ref::<Float64Array>()
-                            .unwrap()
-                            .value(0)
-                            .to_bits()
-                    ),
-                    other => panic!("wrong wrapped result {other:?}"),
-                },
-                Err(message) => match new.unwrap().unwrap() {
-                    CastRowResult::RowError(e) => assert_eq!(e.message(), message),
-                    other => panic!("wrong original invalid result {other:?}"),
-                },
-            }
+            assert_eq!(
+                actual
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(0)
+                    .to_bits(),
+                (literal as f64).to_bits()
+            );
+            assert_eq!(pure, CastRowResult::Float64(literal as f64));
         }
     }
+    let outside: ArrayRef = Arc::new(Date32Array::from(vec![i32::MAX]));
+    let failure = original(&outside, target.clone()).unwrap_err();
+    use novarocks_failure_contract::FailureProjection;
+    assert_eq!(
+        failure.failure_fact(),
+        novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
+    );
+    let CastRowResult::RowError(error) = r
+        .evaluate_row(EvaluatedArgument::Column(&outside), 3, 0, &Control)
+        .unwrap()
+    else {
+        panic!("out-of-calendar Date32 must be a row Data error");
+    };
+    assert_eq!(error.selected_ordinal(), 3);
+    assert_eq!(error.failure_fact(), failure.failure_fact());
+    assert_eq!(error.message(), failure.detail());
 }
 #[test]
 fn date_float_oracle_complete_date32_float32_profile() {

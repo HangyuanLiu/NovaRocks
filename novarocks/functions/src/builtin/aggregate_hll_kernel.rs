@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Exact NDV lifecycle over the original shared HLL register/state author.
-use super::aggregate_hll_core::{
-    self as core, HLL_REGISTERS_COUNT, HllError, HllRawState, HllWork,
-};
+use super::aggregate_hll_core::{self as core, HLL_REGISTERS_COUNT, HllRawState, HllWork};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
 use crate::kernel_control::{KernelControlObservation, compile_failure, internal, invalid};
@@ -55,19 +53,10 @@ fn observed<T>(
 }
 pub(super) struct NdvUpdate<'a> {
     input: SelectedAggregateUpdateInput<'a, 'a>,
-    diagnostic: Option<InvocationData>,
 }
 pub(super) struct NdvMerge<'a> {
     input: SelectedAggregateMergeInput<'a, 'a>,
     diagnostic: Option<(core::HllMergeFailure, InvocationData)>,
-}
-fn kernel_hash_failure(cause: HllError) -> KernelFailure {
-    match cause {
-        HllError::Kernel(cause) => cause,
-        HllError::Legacy(_) => {
-            internal("HLL no-data operation produced an undeclared input failure")
-        }
-    }
 }
 fn observed_evaluation<T>(
     control: &dyn KernelEvaluationControl,
@@ -121,12 +110,6 @@ impl PreparedAggregateKernel for NdvKernel {
                 0
             }
     }
-    fn prepared_update_retained_bytes(&self, prepared: &Self::PreparedUpdateBatch<'_>) -> usize {
-        prepared
-            .diagnostic
-            .as_ref()
-            .map_or(0, InvocationData::retained_bytes)
-    }
     fn prepared_merge_retained_bytes(&self, prepared: &Self::PreparedMergeBatch<'_>) -> usize {
         prepared
             .diagnostic
@@ -171,69 +154,8 @@ impl PreparedAggregateKernel for NdvKernel {
                     "NDV update differs from its exact phase or channels",
                 ));
             }
-            Ok(NdvUpdate {
-                input,
-                diagnostic: None,
-            })
+            Ok(NdvUpdate { input })
         })
-    }
-    fn prepare_update_evaluation<'a>(
-        &'a self,
-        input: SelectedAggregateUpdateInput<'a, 'a>,
-        mapping: &[usize],
-        allocator: Option<Arc<dyn AggregateStateAllocator>>,
-        control: &dyn KernelEvaluationControl,
-    ) -> Result<Self::PreparedUpdateBatch<'a>, EvaluationFailure> {
-        let mut prepared = self.prepare_update(input, control)?;
-        let argument = input.logical_arguments()[0];
-        let array = argument.array();
-        // The sole core classifier decides support; NULL precedence is the
-        // original reader's decision, not an eager bind-time rejection.
-        if core::hll_hash_carrier(array.data_type()) != core::HllHashCarrier::Unsupported {
-            return Ok(prepared);
-        }
-        let mut work = EvaluationCheckpoints::new(control);
-        let mut required = false;
-        for ordinal in 0..input.selection().len() {
-            let row = input
-                .selection()
-                .row(ordinal)
-                .ok_or_else(|| invalid("NDV selected ordinal is out of bounds"))?;
-            let address = argument.value_row(ordinal, row);
-            let present = core::hll_value_is_present(array, address)
-                .map_err(|_| internal("validated NDV argument address is out of bounds"))?;
-            work.step()?;
-            if present {
-                required = true;
-                break;
-            }
-        }
-        work.flush()?;
-        if !required {
-            return Ok(prepared);
-        }
-        let allocator = HostAggregateAllocator::try_new(
-            allocator.ok_or_else(|| invalid("NDV invocation Data requires its host allocator"))?,
-        )?;
-        let diagnostic = HostDiagnostic::prepare(&allocator, &mut work, |writer| {
-            write!(
-                writer,
-                "{}",
-                crate::aggregate_format::AggregateFailureStage::Update
-                    .message(&core::HllInputFailure::Unsupported(array.data_type()))
-            )
-        })?;
-        prepared.diagnostic = Some(InvocationData::prepare_aggregate(
-            &allocator,
-            self.contract.clone(),
-            AggregateInvocationPhase::Update,
-            input.selection(),
-            mapping,
-            diagnostic,
-            &mut work,
-        )?);
-        work.finish()?;
-        Ok(prepared)
     }
     fn update_row<'a>(
         &self,
@@ -268,24 +190,12 @@ impl PreparedAggregateKernel for NdvKernel {
                 argument.array(),
                 address,
                 &mut work,
-                |failure| match failure {
-                    core::HllInputFailure::Unsupported(_) => prepared
-                        .diagnostic
-                        .as_ref()
-                        .cloned()
-                        .map(EvaluationFailure::InvocationData)
-                        .unwrap_or_else(|| {
-                            internal("NDV required diagnostic is absent from exact prepared input")
-                                .into()
-                        }),
-                    _ => internal("validated NDV carrier violated its exact reader shape").into(),
-                },
-                |cause| EvaluationFailure::Kernel(kernel_hash_failure(cause)),
+                |failure| EvaluationFailure::Kernel(failure.into_kernel()),
+                |cause| EvaluationFailure::Kernel(cause),
             )?;
             if let Some(hash) = hash {
                 state.core.has_value = true;
-                core::update_state_register_from_hash(&mut state.core, hash, &mut work)
-                    .map_err(kernel_hash_failure)?;
+                core::update_state_register_from_hash(&mut state.core, hash, &mut work)?;
             }
             Ok(())
         });
@@ -364,13 +274,14 @@ impl PreparedAggregateKernel for NdvKernel {
                 crate::aggregate_format::AggregateFailureStage::Merge.message(failure.message())
             )
         })?;
-        let data = InvocationData::prepare_aggregate(
+        let data = InvocationData::prepare_aggregate_with_reason(
             &allocator,
             self.contract.clone(),
             AggregateInvocationPhase::Merge,
             input.selection(),
             mapping,
             diagnostic,
+            crate::DataFailureReason::InvalidEncoding,
             &mut work,
         )?;
         prepared.diagnostic = Some((failure, data));
@@ -428,7 +339,7 @@ impl PreparedAggregateKernel for NdvKernel {
                         )
                         .into(),
                     },
-                    |cause| EvaluationFailure::Kernel(kernel_hash_failure(cause)),
+                    |cause| EvaluationFailure::Kernel(cause),
                 )?;
             }
             Ok(())
@@ -460,8 +371,8 @@ impl PreparedAggregateKernel for NdvKernel {
                     return Err(KernelFailure::InstanceFailed);
                 }
                 work.step()?;
-                let payload = core::serialize_hll_state(&state.core, &mut HllWork::new(Some(work)))
-                    .map_err(kernel_hash_failure)?;
+                let payload =
+                    core::serialize_hll_state(&state.core, &mut HllWork::new(Some(work)))?;
                 match payload {
                     Some(payload) => {
                         work.flush()?;
@@ -505,10 +416,10 @@ impl PreparedAggregateKernel for NdvKernel {
                     return Err(KernelFailure::InstanceFailed);
                 }
                 work.step()?;
-                values.push(
-                    core::estimate_cardinality(&state.core, &mut HllWork::new(Some(work)))
-                        .map_err(kernel_hash_failure)?,
-                );
+                values.push(core::estimate_cardinality(
+                    &state.core,
+                    &mut HllWork::new(Some(work)),
+                )?);
             }
             if values.len() != expected {
                 return Err(internal("NDV state iterator shortened its extent"));

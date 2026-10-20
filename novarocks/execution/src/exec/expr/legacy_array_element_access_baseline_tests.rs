@@ -34,7 +34,10 @@ fn list(values: ArrayRef, offsets: Vec<i32>, valid: Option<Vec<bool>>) -> ArrayR
         valid.map(NullBuffer::from),
     ))
 }
-fn raw(columns: Vec<ArrayRef>, target: Option<DataType>) -> Result<ArrayRef, String> {
+fn raw(
+    columns: Vec<ArrayRef>,
+    target: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let slots = (0..columns.len())
         .map(|i| SlotId::new(i as u32 + 1))
         .collect::<Vec<_>>();
@@ -120,7 +123,7 @@ fn original_array_access_raw_strict_flags_use_exact_old_errors_and_nulls_skip_ch
     );
     let flags: ArrayRef = Arc::new(BooleanArray::from(vec![true, true, true]));
     assert_eq!(
-        raw(
+        (raw(
             vec![
                 a.clone(),
                 Arc::new(Int32Array::from(vec![0, 1, 1])),
@@ -128,11 +131,12 @@ fn original_array_access_raw_strict_flags_use_exact_old_errors_and_nulls_skip_ch
             ],
             None
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "Array subscript start at 1"
     );
     assert_eq!(
-        raw(
+        (raw(
             vec![
                 a.clone(),
                 Arc::new(Int32Array::from(vec![1, 2, 1])),
@@ -140,7 +144,8 @@ fn original_array_access_raw_strict_flags_use_exact_old_errors_and_nulls_skip_ch
             ],
             None
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "Array subscript must be less than or equal to array length: 2 > 1"
     );
     assert_eq!(
@@ -196,7 +201,7 @@ fn original_array_access_utf8_unquotes_only_simple_wrapped_content() {
 #[test]
 fn original_array_access_list_check_precedes_index_cast_and_flag_check() {
     assert_eq!(
-        raw(
+        (raw(
             vec![
                 Arc::new(Int32Array::from(vec![1])),
                 Arc::new(StringArray::from(vec!["bad"])),
@@ -204,12 +209,13 @@ fn original_array_access_list_check_precedes_index_cast_and_flag_check() {
             ],
             None
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "element_at expects ListArray, got Int32"
     );
     let a = list(Arc::new(Int32Array::from(vec![1])), vec![0, 1], None);
     assert_eq!(
-        raw(
+        (raw(
             vec![
                 a,
                 Arc::new(Int32Array::from(vec![1])),
@@ -217,7 +223,8 @@ fn original_array_access_list_check_precedes_index_cast_and_flag_check() {
             ],
             None
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "element_at check flag must be BOOLEAN"
     );
 }

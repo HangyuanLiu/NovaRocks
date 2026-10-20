@@ -136,7 +136,7 @@ fn integral_decimal128_original_full_carrier_multiply_overflow_and_all_nulls() {
         for (policy, allow) in modes() {
             let out = actual(input.clone(), DataType::Decimal128(38, 38), policy, allow);
             if policy == DecimalOverflowPolicy::ReportError {
-                assert_eq!(out.unwrap_err(), OVERFLOW);
+                assert_eq!((out.unwrap_err()).to_string(), OVERFLOW);
             } else {
                 assert_eq!(values(&out.unwrap()), vec![None, None, None]);
             }
@@ -152,7 +152,7 @@ fn integral_decimal128_original_allow_throw_does_not_override_integral_outputnul
     for (policy, allow) in modes() {
         let out = actual(input.clone(), DataType::Decimal128(3, 0), policy, allow);
         if policy == DecimalOverflowPolicy::ReportError {
-            assert_eq!(out.unwrap_err(), OVERFLOW);
+            assert_eq!((out.unwrap_err()).to_string(), OVERFLOW);
         } else {
             assert_eq!(
                 values(&out.unwrap()),
@@ -186,7 +186,7 @@ fn integral_decimal128_original_types_nineteen_digit_window_and_arena_precision_
     for (policy, allow) in modes() {
         let out = actual(input.clone(), DataType::Decimal128(19, 1), policy, allow);
         if policy == DecimalOverflowPolicy::ReportError {
-            assert_eq!(out.unwrap_err(), OVERFLOW);
+            assert_eq!((out.unwrap_err()).to_string(), OVERFLOW);
         } else {
             assert_eq!(values(&out.unwrap()), vec![None, None, None]);
         }
@@ -202,55 +202,46 @@ fn integral_decimal128_original_types_nineteen_digit_window_and_arena_precision_
     );
 }
 #[test]
-fn integral_decimal128_original_factor_data_error_precedes_null_and_empty_row_scan() {
-    for scale in [-39, 39] {
-        let target = DataType::Decimal128(38, scale);
-        let expected = format!(
-            "CAST failed: from Int64 to {:?}: decimal scale overflow while casting integral",
-            target
-        );
-        for input in [
-            integral_input(&DataType::Int64, vec![]),
-            integral_input(&DataType::Int64, vec![None]),
-            integral_input(&DataType::Int64, vec![Some(1)]),
-        ] {
-            for (policy, allow) in modes() {
-                assert_eq!(
-                    actual(input.clone(), target.clone(), policy, allow).unwrap_err(),
-                    expected
-                );
-            }
-        }
-    }
-}
-#[test]
-fn integral_decimal128_original_i8_negative_scale_minimum_preserves_host_panic_or_release_data() {
-    let target = DataType::Decimal128(38, i8::MIN);
+fn integral_decimal128_legal_downscale_and_invalid_frozen_scale_are_separate() {
     for input in [
         integral_input(&DataType::Int64, vec![]),
         integral_input(&DataType::Int64, vec![None]),
+        integral_input(
+            &DataType::Int64,
+            vec![Some(i64::MIN), Some(1), Some(i64::MAX), None],
+        ),
     ] {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            actual(
-                input.clone(),
-                target.clone(),
-                DecimalOverflowPolicy::OutputNull,
-                false,
-            )
-        }));
-        if cfg!(debug_assertions) {
-            assert!(result.is_err());
-        } else {
-            assert_eq!(
-                result.unwrap().unwrap_err(),
-                format!(
-                    "CAST failed: from Int64 to {:?}: decimal scale overflow while casting integral",
-                    target
-                )
-            );
+        let expected = (0..input.len())
+            .map(|row| (!input.is_null(row)).then_some(0))
+            .collect::<Vec<_>>();
+        success(input.clone(), DataType::Decimal128(38, -39), &expected);
+        for (policy, allow) in modes() {
+            let failure =
+                actual(input.clone(), DataType::Decimal128(38, 39), policy, allow).unwrap_err();
+            use novarocks_failure_contract::{FailureClass, FailureProjection};
+            assert_eq!(failure.failure_fact().class(), FailureClass::Invariant);
+            assert_eq!(failure.failure_fact().reason().code(), 221);
         }
     }
 }
+
+#[test]
+fn integral_decimal128_minimum_scale_has_exact_zero_without_negating_i8_minimum() {
+    for input in [
+        integral_input(&DataType::Int64, vec![]),
+        integral_input(&DataType::Int64, vec![None]),
+        integral_input(
+            &DataType::Int64,
+            vec![Some(i64::MIN), Some(i64::MAX), Some(0), None],
+        ),
+    ] {
+        let expected = (0..input.len())
+            .map(|row| (!input.is_null(row)).then_some(0))
+            .collect::<Vec<_>>();
+        success(input, DataType::Decimal128(38, i8::MIN), &expected);
+    }
+}
+
 #[test]
 fn integral_decimal128_original_sliced_null_bitmap_and_empty_success_keep_exact_metadata() {
     let input = integral_input(

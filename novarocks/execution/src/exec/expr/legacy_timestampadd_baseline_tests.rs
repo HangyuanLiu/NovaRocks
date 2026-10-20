@@ -27,6 +27,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use novarocks_failure_contract::{FailureClass, FailureProjection};
 use novarocks_types::SlotId;
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -47,7 +48,11 @@ fn chunk(columns: Vec<ArrayRef>) -> Chunk {
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slots).unwrap();
     Chunk::new_with_chunk_schema(batch, schema)
 }
-fn eval(name: &'static str, columns: Vec<ArrayRef>, result: DataType) -> Result<ArrayRef, String> {
+fn eval(
+    name: &'static str,
+    columns: Vec<ArrayRef>,
+    result: DataType,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let mut arena = ExprArena::default();
     let args = columns
         .iter()
@@ -197,64 +202,62 @@ fn original_timestampadd_full_errors_and_requested_type_in_microsecond_carrier_a
     let interval = ints(vec![Some(1)]);
     let source = text(vec![Some("1970-01-01")]);
     assert_eq!(
-        eval(
+        (eval(
             "timestampadd",
             vec![interval.clone(), interval.clone(), source.clone()],
             ts()
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "timestampadd expects unit string"
     );
     assert_eq!(
-        eval(
+        (eval(
             "timestampadd",
             vec![units.clone(), units.clone(), source.clone()],
             ts()
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "timestampadd expects int interval"
     );
     let wrong: ArrayRef = Arc::new(BooleanArray::from(vec![true]));
     assert_eq!(
-        eval(
+        (eval(
             "timestampadd",
             vec![units.clone(), interval.clone(), wrong],
             ts()
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "unsupported datetime input type: Boolean"
     );
-    for target in [DataType::Date32, DataType::Utf8] {
-        assert_eq!(
-            values(
-                eval(
-                    "timestampadd",
-                    vec![units.clone(), interval.clone(), source.clone()],
-                    target
-                )
-                .unwrap()
-            ),
-            vec![None]
-        );
-    }
-    for (unit, expected) in [
-        (TimeUnit::Second, 86400),
-        (TimeUnit::Millisecond, 86400000),
-        (TimeUnit::Microsecond, 86400000000),
-        (TimeUnit::Nanosecond, 86400000000000),
+    for target in [
+        DataType::Date32,
+        DataType::Utf8,
+        DataType::Timestamp(TimeUnit::Second, None),
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
     ] {
+        let error = eval(
+            "timestampadd",
+            vec![units.clone(), interval.clone(), source.clone()],
+            target,
+        )
+        .unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
         assert_eq!(
-            values(
-                eval(
-                    "timestampadd",
-                    vec![units.clone(), interval.clone(), source.clone()],
-                    DataType::Timestamp(unit, None)
-                )
-                .unwrap()
-            ),
-            vec![Some(expected)]
+            error.failure_fact().reason(),
+            novarocks_failure_contract::FailureReason::new(
+                novarocks_failure_contract::domain::KERNEL,
+                std::num::NonZeroU16::new(274).unwrap()
+            )
         );
     }
+    assert_eq!(
+        values(eval("timestampadd", vec![units, interval, source], ts()).unwrap()),
+        vec![Some(86_400_000_000)]
+    );
 }
 #[test]
 fn original_timestampadd_null_invalid_date_masks_overflow_and_i64_month_narrowing_is_frozen() {
@@ -341,15 +344,22 @@ fn original_timestampadd_duration_datetime_and_wrong_declared_arity_panics_remai
             vec![Some(micros("2023-01-31 00:00:00"))]
         );
     }
-    assert!(
-        catch_unwind(AssertUnwindSafe(|| eval(
-            "timestampadd",
-            vec![
-                Arc::new(TimestampMicrosecondArray::from(vec![Some(0)])),
-                ints(vec![Some(1)])
-            ],
-            ts()
-        )))
-        .is_err()
+    let error = eval(
+        "timestampadd",
+        vec![
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(0)])),
+            ints(vec![Some(1)]),
+        ],
+        ts(),
+    )
+    .unwrap_err();
+    assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    assert_eq!(
+        error.failure_fact().reason(),
+        novarocks_failure_contract::FailureReason::new(
+            novarocks_failure_contract::domain::KERNEL,
+            std::num::NonZeroU16::new(274).unwrap()
+        )
     );
+    assert_eq!(error.detail(), "timestampadd requires three arguments");
 }

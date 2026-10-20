@@ -663,8 +663,10 @@ mod tests {
                 (Duration::from_secs(5), b"}".to_vec()),
             ])),
         ));
+        // Construct the role-local client before the caller's request grant.
+        let client = test_client(Duration::from_secs(10));
         let context = RequestContext::with_deadline(Instant::now() + Duration::from_millis(300));
-        let (_, body) = test_client(Duration::from_secs(10))
+        let (_, body) = client
             .send_once(get(format!("{}/table", server.url())), &[200], &context)
             .await;
         let started = std::time::Instant::now();
@@ -681,9 +683,11 @@ mod tests {
             "/table",
             Reply::status(200).with_delay(Duration::from_secs(2)),
         ));
+        // Construct the role-local client before the caller's request grant.
+        let client = test_client(Duration::from_secs(10));
         let context = RequestContext::with_deadline(Instant::now() + Duration::from_millis(100));
         let started = std::time::Instant::now();
-        let (stage, body) = test_client(Duration::from_secs(10))
+        let (stage, body) = client
             .send_once(get(format!("{}/table", server.url())), &[200], &context)
             .await;
         assert_eq!(
@@ -711,8 +715,10 @@ mod tests {
                     ])),
             ),
         );
+        // Construct the role-local client before the caller's request grant.
+        let client = test_client(Duration::from_secs(2));
         let context = RequestContext::with_deadline(Instant::now() + Duration::from_millis(250));
-        let (stage, body) = test_client(Duration::from_secs(2))
+        let (stage, body) = client
             .send_once(get(format!("{}/table", server.url())), &[200], &context)
             .await;
         assert!(matches!(stage, DispatchStage::Status { code: 200, .. }));

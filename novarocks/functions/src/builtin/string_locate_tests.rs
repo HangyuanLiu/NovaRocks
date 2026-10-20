@@ -71,7 +71,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -408,7 +408,7 @@ fn string_locate_empty_selection_wrong_carrier_and_child_errors_preserve_failed_
     ];
     assert!(matches!(
         kernel.evaluate(Selection::all(1), &wrong, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let after = Control::default();
     assert_eq!(
@@ -432,7 +432,7 @@ fn string_locate_empty_selection_wrong_carrier_and_child_errors_preserve_failed_
     let mut kernel = instance("instr", 2);
     assert!(matches!(
         kernel.evaluate(Selection::all(1), &args, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
 }
 
@@ -748,7 +748,7 @@ fn string_locate_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stal
 }
 
 #[test]
-fn string_locate_compile_success_and_ordinary_tail_preserve_all_callback_causes() {
+fn string_locate_compile_success_and_pre_error_callbacks_preserve_all_causes() {
     for ty in [source(true), FunctionValueType::new(DataType::Binary, true)] {
         let good = CompileControl::default();
         let success = ty.data_type() == &DataType::Utf8;
@@ -769,10 +769,13 @@ fn string_locate_compile_success_and_ordinary_tail_preserve_all_callback_causes(
                 CompileControlError::Cancelled,
                 CompileControlError::DeadlineExceeded,
                 CompileControlError::ResourceExhausted,
+                CompileControlError::from_domain(
+                    novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+                ),
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let actual = prepared_for_test_with_control(
                     "locate",
@@ -884,4 +887,275 @@ fn string_locate_constant_null_prepares_and_empty_invocation_does_not_search() {
     );
     assert_eq!(constant.ordinal(), 1);
     assert!(Arc::ptr_eq(constant.pool().array(), constants.array()));
+}
+
+/// The original production registry and owner factory, not a second resolver
+/// or a testing implementation of the compile contract.
+struct LocateCompileFixture {
+    owner: super::super::string_locate_owner::StringLocateOwner,
+    arguments: Vec<FunctionArgument>,
+    selected: Arc<crate::FunctionBindingSelection>,
+    parameters: SemanticParameters,
+    uses: Vec<Option<ExpressionUseId>>,
+}
+impl LocateCompileFixture {
+    fn new(name: &str, arity: usize) -> Self {
+        let owner = owner_for_test(name);
+        let arguments = sources(arity)
+            .into_iter()
+            .map(|value_type| FunctionArgument::Value {
+                value_type,
+                constant: None,
+            })
+            .collect::<Vec<_>>();
+        let request = FunctionBindingRequest {
+            arguments: &arguments,
+            logical_argument_count: arity,
+            expected_result_type: None,
+        };
+        let selected = Arc::new(
+            owner
+                .resolve(request, crate::binding_test_control())
+                .unwrap(),
+        );
+        Self {
+            owner,
+            arguments,
+            selected,
+            parameters: SemanticParameters::try_new([]).unwrap(),
+            uses: (0..arity)
+                .map(|at| Some(ExpressionUseId::new(42 + at as u32)))
+                .collect(),
+        }
+    }
+    fn input(&self) -> crate::CallEffectInput<'_> {
+        let context = ExpressionEffectContext {
+            use_id: ExpressionUseId::new(41),
+            domain: EvaluationDomainId::new(7),
+            demand: EvaluationDemand::Value,
+        };
+        crate::CallEffectInput {
+            context,
+            argument_uses: crate::CallArgumentUses::SelectedChannels(&self.uses),
+            function_id: self.owner.binding_declaration().function_id(),
+            kind: crate::FunctionKind::Scalar,
+            selected: &self.selected,
+            request: FunctionBindingRequest {
+                arguments: &self.arguments,
+                logical_argument_count: self.arguments.len(),
+                expected_result_type: None,
+            },
+            environment: &[],
+            parameters: &self.parameters,
+            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+            proof_scope: CallProofScope::Domain(context.domain),
+        }
+    }
+    fn canonical(&self) -> Arc<crate::ScalarCallContract> {
+        let input = self.input();
+        let actual = specialize_scalar(
+            &self.owner,
+            input,
+            self.selected.clone(),
+            ScopedExpressionEffects::pure_value(input.context),
+            crate::binding_test_control(),
+        )
+        .unwrap();
+        actual.prepared().contract().clone()
+    }
+}
+fn locate_compile_causes() -> [CompileControlError; 4] {
+    [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+        CompileControlError::from_domain(
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+        ),
+    ]
+}
+
+#[test]
+fn string_locate_actual_refiner_keeps_identity_and_scope_refusals_before_late_control() {
+    use crate::{FunctionBindingError, FunctionEffectOwner, FunctionEffectOwnerError};
+    for (name, arity) in [("locate", 2), ("locate", 3), ("instr", 2)] {
+        let fixture = LocateCompileFixture::new(name, arity);
+        let foreign = crate::FunctionId::try_new("fixture/foreign/string-owner").unwrap();
+        let environment = [novarocks_type_contract::SemanticParameterRef {
+            id: novarocks_type_contract::SemanticParameterId::new(0),
+            expected_key: novarocks_type_contract::SemanticParameterKey::StatementStartUtc,
+        }];
+        for field in 0..3 {
+            let mut wrong = fixture.input();
+            match field {
+                0 => wrong.function_id = &foreign,
+                1 => wrong.proof_scope = CallProofScope::Domain(EvaluationDomainId::new(99)),
+                _ => wrong.environment = &environment,
+            }
+            let before = Arc::strong_count(&fixture.selected);
+            let baseline = CompileControl::default();
+            let original = fixture
+                .owner
+                .validate_and_refine(wrong, &baseline)
+                .unwrap_err();
+            if field == 0 {
+                assert!(matches!(
+                    original,
+                    FunctionEffectOwnerError::Owner(FunctionBindingError::UnknownFunction)
+                ));
+            } else {
+                assert!(matches!(
+                    original,
+                    FunctionEffectOwnerError::Owner(FunctionBindingError::InvalidBinding(_))
+                ));
+            }
+            let trace = baseline.trace.lock().unwrap().clone();
+            assert_eq!(trace, [(CompilePhase::FunctionSpecialization, 0)]);
+            for cause in locate_compile_causes() {
+                let earlier = CompileControl {
+                    trace: Mutex::default(),
+                    refusal: Some((0, cause.clone())),
+                };
+                assert!(matches!(fixture.owner.validate_and_refine(wrong, &earlier),
+                    Err(FunctionEffectOwnerError::Control(actual)) if actual == cause));
+                assert_eq!(*earlier.trace.lock().unwrap(), trace);
+                let late = CompileControl {
+                    trace: Mutex::default(),
+                    refusal: Some((1, cause)),
+                };
+                let actual = fixture.owner.validate_and_refine(wrong, &late).unwrap_err();
+                if field == 0 {
+                    assert!(matches!(
+                        actual,
+                        FunctionEffectOwnerError::Owner(FunctionBindingError::UnknownFunction)
+                    ));
+                } else {
+                    assert!(matches!(
+                        actual,
+                        FunctionEffectOwnerError::Owner(FunctionBindingError::InvalidBinding(_))
+                    ));
+                }
+                assert_eq!(
+                    *late.trace.lock().unwrap(),
+                    trace,
+                    "the actual owner refused before this armed completion callback"
+                );
+                assert_eq!(Arc::strong_count(&fixture.selected), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn string_locate_actual_prepare_keeps_stale_contract_refusal_and_releases_original_arc() {
+    for (name, arity) in [("locate", 2), ("locate", 3), ("instr", 2)] {
+        let fixture = LocateCompileFixture::new(name, arity);
+        let canonical = fixture.canonical();
+        let foreign = crate::FunctionId::try_new("fixture/foreign/string-owner").unwrap();
+        let copied_selected = fixture.selected.as_ref().clone();
+        for field in 0..5 {
+            let mut wrong = fixture.input();
+            match field {
+                0 => wrong.function_id = &foreign,
+                1 => wrong.context.use_id = ExpressionUseId::new(999),
+                2 => wrong.selected = &copied_selected,
+                3 => wrong.decimal_overflow_policy = DecimalOverflowPolicy::OutputNull,
+                _ => wrong.proof_scope = CallProofScope::Unconditional,
+            }
+            let original_arcs = Arc::strong_count(&canonical);
+            let selected_arcs = Arc::strong_count(&fixture.selected);
+            let baseline = CompileControl::default();
+            let original = fixture
+                .owner
+                .prepare_scalar(wrong, canonical.clone(), &baseline)
+                .unwrap_err();
+            assert!(matches!(&original, KernelFailure::InvalidProgram(_)));
+            let trace = baseline.trace.lock().unwrap().clone();
+            assert_eq!(trace, [(CompilePhase::FunctionSpecialization, 0)]);
+            assert_eq!(Arc::strong_count(&canonical), original_arcs);
+            for cause in locate_compile_causes() {
+                let earlier = CompileControl {
+                    trace: Mutex::default(),
+                    refusal: Some((0, cause.clone())),
+                };
+                assert!(
+                    matches!(fixture.owner.prepare_scalar(wrong, canonical.clone(), &earlier),
+                    Err(KernelFailure::CompileControl(actual)) if actual == cause)
+                );
+                assert_eq!(*earlier.trace.lock().unwrap(), trace);
+                let late = CompileControl {
+                    trace: Mutex::default(),
+                    refusal: Some((1, cause)),
+                };
+                assert_eq!(
+                    fixture
+                        .owner
+                        .prepare_scalar(wrong, canonical.clone(), &late)
+                        .unwrap_err(),
+                    original
+                );
+                assert_eq!(*late.trace.lock().unwrap(), trace);
+                assert_eq!(Arc::strong_count(&canonical), original_arcs);
+                assert_eq!(Arc::strong_count(&fixture.selected), selected_arcs);
+            }
+        }
+    }
+}
+
+#[test]
+fn string_locate_actual_success_keeps_refine_prepare_tails_sources_and_prepared_owner_drop() {
+    use crate::{FunctionEffectOwner, FunctionEffectOwnerError};
+    for (name, arity) in [("locate", 2), ("locate", 3), ("instr", 2)] {
+        let fixture = LocateCompileFixture::new(name, arity);
+        let input = fixture.input();
+        let baseline = CompileControl::default();
+        fixture.owner.validate_and_refine(input, &baseline).unwrap();
+        let refine_trace = baseline.trace.lock().unwrap().clone();
+        assert!(refine_trace.len() >= 2);
+        assert!(refine_trace.iter().any(|(_, units)| *units > 0));
+        for at in 0..refine_trace.len() {
+            for cause in locate_compile_causes() {
+                let control = CompileControl {
+                    trace: Mutex::default(),
+                    refusal: Some((at, cause.clone())),
+                };
+                assert!(matches!(fixture.owner.validate_and_refine(input, &control),
+                    Err(FunctionEffectOwnerError::Control(actual)) if actual == cause));
+                assert_eq!(*control.trace.lock().unwrap(), refine_trace[..=at]);
+            }
+        }
+        let canonical = fixture.canonical();
+        let original_arcs = Arc::strong_count(&canonical);
+        let baseline = CompileControl::default();
+        let prepared = fixture
+            .owner
+            .prepare_scalar(input, canonical.clone(), &baseline)
+            .unwrap();
+        assert!(Arc::ptr_eq(prepared.contract(), &canonical));
+        assert_eq!(Arc::strong_count(&canonical), original_arcs + 1);
+        let prepared_weak = Arc::downgrade(&prepared);
+        drop(prepared);
+        assert!(prepared_weak.upgrade().is_none());
+        drop(prepared_weak);
+        assert_eq!(Arc::strong_count(&canonical), original_arcs);
+        let prepare_trace = baseline.trace.lock().unwrap().clone();
+        assert!(prepare_trace.len() >= 2);
+        assert!(prepare_trace.iter().any(|(_, units)| *units > 0));
+        for at in 0..prepare_trace.len() {
+            for cause in locate_compile_causes() {
+                let control = CompileControl {
+                    trace: Mutex::default(),
+                    refusal: Some((at, cause.clone())),
+                };
+                assert!(
+                    matches!(fixture.owner.prepare_scalar(input, canonical.clone(), &control),
+                    Err(KernelFailure::CompileControl(actual)) if actual == cause)
+                );
+                assert_eq!(*control.trace.lock().unwrap(), prepare_trace[..=at]);
+                // A late successful-body footer can reject after constructing
+                // PreparedStringLocate. Its real contract Arc must still drop.
+                assert_eq!(Arc::strong_count(&canonical), original_arcs);
+            }
+        }
+    }
 }

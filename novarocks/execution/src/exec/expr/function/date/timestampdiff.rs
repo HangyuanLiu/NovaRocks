@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 use novarocks_functions::builtin::calendar_extended_shared::{
@@ -24,21 +24,25 @@ use novarocks_functions::builtin::calendar_extended_shared::{
 
 pub fn eval_timestampdiff<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
-    _expr: ExprId,
+    expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    super::common::require_frozen_type(arena.arena(), expr, &DataType::Int64)?;
     let unit = arena.eval(args[0], chunk)?;
     let start = arena.eval(args[1], chunk)?;
     let end = arena.eval(args[2], chunk)?;
-    unit.as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "timestampdiff expects unit string".to_string())?;
+    unit.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        novarocks_functions::builtin::calendar_parts_shared::part_contract(
+            "timestampdiff expects unit string",
+        )
+    })?;
     let rows = start.len();
-    Ok((evaluate_legacy_calendar(
+    evaluate_legacy_calendar(
         CalendarOperation::TimestampDiff,
         &[unit, start, end],
         &DataType::Int64,
         rows,
-    ))?)
+    )
+    .map_err(Into::into)
 }

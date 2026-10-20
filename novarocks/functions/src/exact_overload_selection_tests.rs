@@ -43,7 +43,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "no callback after first refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -114,15 +114,30 @@ fn select(
 }
 fn prefixes(call: impl Fn(&Control) -> Result<(), FunctionBindingError>, success: bool) {
     let baseline = Control::default();
-    assert_eq!(call(&baseline).is_ok(), success);
+    let original = call(&baseline);
+    assert_eq!(original.is_ok(), success);
     let trace = baseline.trace.lock().unwrap().clone();
     assert_eq!(trace.first(), Some(&0));
-    assert!(trace.len() >= 2);
+    if success {
+        assert!(trace.len() >= 2);
+        assert!(trace.iter().any(|units| *units > 0));
+    } else {
+        // A semantic refusal can precede the first flush. Do not manufacture
+        // an outer footer; an armed later callback must not replace the cause.
+        for cause in CAUSES {
+            let control = Control {
+                trace: Mutex::new(vec![]),
+                refusal: Some((trace.len(), cause)),
+            };
+            assert_eq!(call(&control).unwrap_err(), *original.as_ref().unwrap_err());
+            assert_eq!(*control.trace.lock().unwrap(), trace);
+        }
+    }
     for stop in 0..trace.len() {
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::new(vec![]),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             assert!(
                 matches!(call(&control), Err(FunctionBindingError::Control(actual)) if actual == cause)
@@ -472,7 +487,7 @@ fn exact_overload_wide_invalid_result_observes_real_type_walk_without_new_lower_
         for cause in CAUSES {
             let control = Control {
                 trace: Mutex::new(vec![]),
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
             };
             assert!(
                 matches!(select(&catalog,&bound,request,&control),Err(FunctionBindingError::Control(actual)) if actual==cause)

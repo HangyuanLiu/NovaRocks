@@ -52,6 +52,7 @@ pub enum ErrorPhase {
     Validate,
     Analyze,
     Admit,
+    Execution,
 }
 
 /// Whether retrying the same user operation may be useful.

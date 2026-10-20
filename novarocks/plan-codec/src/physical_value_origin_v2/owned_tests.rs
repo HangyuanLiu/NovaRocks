@@ -162,7 +162,7 @@ fn origin_admitted_all_four_axes_and_parent_refusal_precede_actual_payload_promo
     for cause in CAUSES {
         assert!(
             matches!(decode_admitted(&raw, &decoded, SOURCE, limits(), &mut |facts| {
-            if facts.allocation_requests_upper_bound != 0 { Err(cause) } else { Ok(()) }
+            if facts.allocation_requests_upper_bound != 0 { Err(cause.clone()) } else { Ok(()) }
         }, &mut work), Err(Error::Control(actual)) if actual == cause)
         );
         assert!(payload.payload().is_unique());
@@ -197,7 +197,7 @@ impl PureCompileControl for ArmedControl {
     fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
         *self.callbacks.lock().unwrap() += 1;
-        match *self.armed.lock().unwrap() {
+        match self.armed.lock().unwrap().clone() {
             Some(cause) => Err(cause),
             None => Ok(()),
         }
@@ -219,7 +219,7 @@ fn origin_admitted_known_work_and_parent_gate_win_before_pending_255_callback() 
                     work.step().unwrap();
                 }
                 let callbacks = *control.callbacks.lock().unwrap();
-                *control.armed.lock().unwrap() = Some(cause);
+                *control.armed.lock().unwrap() = Some(cause.clone());
                 let mut limit = limits();
                 if !parent_refusal {
                     limit.max_work = 0;
@@ -368,7 +368,7 @@ fn origin_admitted_original_320_source_walk_uses_caller_quantum_and_sparse_max_i
     assert_eq!(positive[at].0, CompilePhase::LowerProgram);
     for cause in CAUSES {
         let control = Control {
-            stop: Some((at, cause)),
+            stop: Some((at, cause.clone())),
             ..Control::default()
         };
         let namespace =

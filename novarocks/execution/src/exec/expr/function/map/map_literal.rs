@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
+use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules, expression_contract};
 use arrow::array::{ArrayRef, MapArray, StructArray, make_array, new_empty_array};
 use arrow::datatypes::{DataType, Field, Fields};
 use arrow_buffer::OffsetBuffer;
@@ -27,13 +27,12 @@ pub fn eval_map_literal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     if !args.len().is_multiple_of(2) {
-        return Err((format!(
+        return Err(expression_contract(format_args!(
             "map literal expects an even number of key/value arguments, got {}",
             args.len()
-        ))
-        .into());
+        )));
     }
 
     let num_rows = chunk.len();
@@ -62,14 +61,21 @@ pub fn eval_map_literal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let (map_field, ordered) =
         super::common::output_map_field(arena.data_type(expr), &key_hint, &value_hint, "map")?;
     let DataType::Struct(fields) = map_field.data_type() else {
-        return Err(("map literal map entries type must be Struct".to_string()).into());
+        return Err(expression_contract(
+            "map literal map entries type must be Struct",
+        ));
     };
     if fields.len() != 2 {
-        return Err(("map literal map entries type must have 2 fields".to_string()).into());
+        return Err(expression_contract(
+            "map literal map entries type must have 2 fields",
+        ));
     }
 
     let key_field = fields[0].clone();
     let value_field = fields[1].clone();
+    // Validate exact product before constructing either child output.
+    let total = pair_count as u128 * num_rows as u128;
+    novarocks_functions::aggregate_scalar::checked_map_output_offset_u128(0, total)?;
     let keys = build_values_array(raw_keys, key_field.data_type(), num_rows, pair_count, "key")?;
     let values = build_values_array(
         raw_values,
@@ -79,15 +85,20 @@ pub fn eval_map_literal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         "value",
     )?;
 
-    // Design: ADR-0183 (docs/adr/ADR-0183-map-keys-are-non-null-and-unique.md)
-    // These assembled keys contain exactly this invocation's rows and pairs.
-    // NULL values remain valid, but a NULL key cannot widen the frozen Map
-    // contract. Check after the original child evaluation and coercion order.
+    // These keys contain exactly this invocation's rows and pairs. Check after
+    // child evaluation and coercion, preserving the frozen non-null key field.
     if keys.logical_null_count() > 0 {
-        return Err(super::common::MAP_KEY_NULL_MESSAGE.to_string().into());
+        return Err(super::common::null_key());
     }
     let entries_fields = entry_fields_for_arrays(fields, &values);
-    let entries = StructArray::new(entries_fields.clone(), vec![keys, values], None);
+    let entries = StructArray::try_new(entries_fields.clone(), vec![keys, values], None).map_err(
+        |source| {
+            crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+                "map_literal StructArray",
+                source,
+            )
+        },
+    )?;
     let map_field = Arc::new(Field::new(
         map_field.name(),
         DataType::Struct(entries_fields),
@@ -98,20 +109,26 @@ pub fn eval_map_literal<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     offsets.push(0_i32);
     let mut current: i64 = 0;
     for _ in 0..num_rows {
-        current += pair_count as i64;
-        if current > i32::MAX as i64 {
-            return Err(("map literal offset overflow".to_string()).into());
-        }
+        current = novarocks_functions::aggregate_scalar::checked_map_output_offset(
+            current as i32,
+            pair_count,
+        )? as i64;
         offsets.push(current as i32);
     }
 
-    let map = MapArray::new(
+    let map = MapArray::try_new(
         map_field,
         OffsetBuffer::new(offsets.into()),
         entries,
         None,
         ordered,
-    );
+    )
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "map_literal MapArray",
+            source,
+        )
+    })?;
     Ok(Arc::new(map) as ArrayRef)
 }
 
@@ -120,17 +137,17 @@ fn validate_child_len(
     index: usize,
     array: &ArrayRef,
     num_rows: usize,
-) -> Result<(), String> {
+) -> crate::runtime::fragment::ExecutionResult<()> {
     if array.len() == num_rows || array.len() == 1 || (num_rows == 0 && array.is_empty()) {
         return Ok(());
     }
-    Err(format!(
+    Err(expression_contract(format_args!(
         "map literal {} argument {} length mismatch: expected {} rows, got {}",
         role,
         index,
         num_rows,
         array.len()
-    ))
+    )))
 }
 
 fn build_values_array(
@@ -139,7 +156,7 @@ fn build_values_array(
     num_rows: usize,
     pair_count: usize,
     role: &str,
-) -> Result<ArrayRef, String> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     if pair_count == 0 {
         return Ok(new_empty_array(target_type));
     }
@@ -149,15 +166,7 @@ fn build_values_array(
         let array = if array.data_type() == target_type {
             array
         } else {
-            cast_with_special_rules(&array, target_type).map_err(|e| {
-                format!(
-                    "map literal failed to cast {} from {:?} to {:?}: {}",
-                    role,
-                    array.data_type(),
-                    target_type,
-                    e
-                )
-            })?
+            cast_with_special_rules(&array, target_type)?
         };
         validate_child_len(role, casted.len(), &array, num_rows)?;
         casted.push(array);
@@ -202,6 +211,7 @@ mod tests {
     use arrow::array::{Array, Int32Array, MapArray};
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_failure_contract::FailureProjection;
     use novarocks_types::SlotId;
     use std::sync::Arc;
 
@@ -264,7 +274,10 @@ mod tests {
         let error = arena
             .eval(expr, &chunk)
             .expect_err("map key must be present");
-        assert_eq!(error, "map key must not be NULL");
+        assert_eq!(
+            error.failure_fact(),
+            super::super::common::null_key().failure_fact()
+        );
     }
     #[test]
     fn map_literal_rejects_null_keys_produced_by_output_coercion() {
@@ -284,8 +297,8 @@ mod tests {
         );
 
         assert_eq!(
-            arena.eval(expr, &chunk).unwrap_err(),
-            "map key must not be NULL"
+            arena.eval(expr, &chunk).unwrap_err().failure_fact(),
+            super::super::common::null_key().failure_fact()
         );
     }
 
@@ -308,5 +321,33 @@ mod tests {
         assert!(!output.keys().is_null(0));
         assert!(output.values().is_null(0));
         assert_eq!(output.data_type(), &map_type());
+    }
+}
+
+#[cfg(test)]
+mod cast_source_properties {
+    use super::*;
+    use arrow::array::Int64Array;
+    #[test]
+    fn original_child_cast_refusal_keeps_sdk_source_and_releases_its_array() {
+        let input: ArrayRef = Arc::new(StructArray::new(
+            vec![Arc::new(Field::new("x", DataType::Int64, false))].into(),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+            None,
+        ));
+        let expected = arrow::compute::cast(&input, &DataType::Int64)
+            .unwrap_err()
+            .to_string();
+        let weak = Arc::downgrade(&input);
+        let error = build_values_array(vec![input], &DataType::Int64, 1, 1, "key").unwrap_err();
+        let mut source: &(dyn std::error::Error + 'static) = &error;
+        loop {
+            if let Some(arrow) = source.downcast_ref::<arrow::error::ArrowError>() {
+                assert_eq!(arrow.to_string(), expected);
+                break;
+            }
+            source = source.source().expect("actual Arrow cast error retained");
+        }
+        assert!(weak.upgrade().is_none());
     }
 }

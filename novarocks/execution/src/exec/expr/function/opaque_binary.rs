@@ -34,8 +34,8 @@ pub(in crate::exec::expr) fn eval_percentile_to_binary<
     expression: ExprId,
     arguments: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_same_structure_keep(
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_same_structure_keep(
         arena,
         expression,
         arguments,
@@ -49,7 +49,7 @@ pub(in crate::exec::expr) fn eval_percentile_to_binary<
             "opaque Binary conversion input differs from its complete declared carrier",
             "opaque Binary conversion received NULL in a required source",
         ],
-    ))?)
+    )
 }
 
 pub(in crate::exec::expr) fn eval_json_to_text<
@@ -59,8 +59,8 @@ pub(in crate::exec::expr) fn eval_json_to_text<
     expression: ExprId,
     arguments: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_same_structure_keep(
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_same_structure_keep(
         arena,
         expression,
         arguments,
@@ -74,7 +74,7 @@ pub(in crate::exec::expr) fn eval_json_to_text<
             "JSON text conversion input differs from its complete declared carrier",
             "JSON text conversion received NULL in a required source",
         ],
-    ))?)
+    )
 }
 
 fn eval_same_structure_keep<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -87,14 +87,18 @@ fn eval_same_structure_keep<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         &novarocks_type_contract::FunctionValueType,
     ) -> bool,
     errors: [&'static str; 6],
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     let [child] = arguments else {
-        return Err(errors[0].into());
+        return Err(crate::exec::expr::expression_contract(errors[0]));
     };
-    let source = arena.value_type(*child).ok_or(errors[1])?;
-    let target = arena.value_type(expression).ok_or(errors[2])?;
+    let source = arena
+        .value_type(*child)
+        .ok_or_else(|| crate::exec::expr::expression_contract(errors[1]))?;
+    let target = arena
+        .value_type(expression)
+        .ok_or_else(|| crate::exec::expr::expression_contract(errors[2]))?;
     if !supported(source, target) {
-        return Err(errors[3].into());
+        return Err(crate::exec::expr::expression_contract(errors[3]));
     }
     // The original arena evaluates this sole child eagerly and propagates its
     // error. Both existing CAST operations share precisely that array,
@@ -111,10 +115,10 @@ fn eval_same_structure_keep<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
         )
         .is_err()
     {
-        return Err(errors[4].into());
+        return Err(crate::exec::expr::expression_contract(errors[4]));
     }
     if !source.nullable() && value.null_count() != 0 {
-        return Err(errors[5].into());
+        return Err(crate::exec::expr::expression_contract(errors[5]));
     }
     Ok(share_same_structure_keep(&value))
 }

@@ -17,75 +17,45 @@
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::function::date::common::{extract_datetime_array, naive_to_date32};
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{
     Array, ArrayRef, Date32Array, Int64Array, ListArray, StringArray, TimestampMicrosecondArray,
 };
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
-use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime};
+use chrono::NaiveDateTime;
+use novarocks_functions::array_generate::{
+    ArrayGenerateFailure, ArrayGenerateUnit, check_list_extent, integer_range_count,
+};
+fn contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(ArrayGenerateFailure::contract(detail))
+}
+fn conversion(source: arrow::error::ArrowError) -> ExecutionFailure {
+    ExecutionFailure::from_domain(ArrayGenerateFailure::Arrow(source))
+}
 use std::sync::Arc;
 
-fn cast_to_i64(array: ArrayRef, arg_name: &str) -> Result<ArrayRef, String> {
+fn cast_to_i64(array: ArrayRef, _arg_name: &str) -> ExecutionResult<ArrayRef> {
     if array.data_type() == &DataType::Int64 {
         return Ok(array);
     }
-    cast(&array, &DataType::Int64).map_err(|e| {
-        format!(
-            "array_generate failed to cast {} to BIGINT: {}",
-            arg_name, e
+    // LARGEINT is admitted by the frozen numeric range domain. Its binary
+    // carrier needs the same exact numeric cast as other scalar consumers.
+    if novarocks_type_contract::is_largeint_data_type(array.data_type()) {
+        return novarocks_types::arrow_cast::cast_scalar_with_special_rules(
+            &array,
+            &DataType::Int64,
         )
-    })
-}
-
-fn last_day_of_month(year: i32, month: u32) -> Option<u32> {
-    // Do not construct the following month: December in Chrono's maximum
-    // year is valid even though January in the following year is not.
-    (28..=31)
-        .rev()
-        .find(|day| NaiveDate::from_ymd_opt(year, month, *day).is_some())
-}
-
-fn add_months_to_datetime(dt: NaiveDateTime, months: i32) -> Option<NaiveDateTime> {
-    let date = dt.date();
-    let month_offset = (date.month() as i32 - 1).checked_add(months)?;
-    let year = date.year().checked_add(month_offset.div_euclid(12))?;
-    let month = (month_offset.rem_euclid(12) + 1) as u32;
-    let day = date.day().min(last_day_of_month(year, month)?);
-    NaiveDate::from_ymd_opt(year, month, day).map(|d| d.and_time(dt.time()))
-}
-
-fn add_datetime_unit(dt: NaiveDateTime, step: i64, unit: &str) -> Result<NaiveDateTime, String> {
-    let next = match unit {
-        "year" => i32::try_from(step)
-            .ok()
-            .and_then(|step| step.checked_mul(12))
-            .and_then(|months| add_months_to_datetime(dt, months)),
-        "quarter" => i32::try_from(step)
-            .ok()
-            .and_then(|step| step.checked_mul(3))
-            .and_then(|months| add_months_to_datetime(dt, months)),
-        "month" => i32::try_from(step)
-            .ok()
-            .and_then(|months| add_months_to_datetime(dt, months)),
-        "week" => Duration::try_weeks(step).and_then(|d| dt.checked_add_signed(d)),
-        "day" => Duration::try_days(step).and_then(|d| dt.checked_add_signed(d)),
-        "hour" => Duration::try_hours(step).and_then(|d| dt.checked_add_signed(d)),
-        "minute" => Duration::try_minutes(step).and_then(|d| dt.checked_add_signed(d)),
-        "second" => Duration::try_seconds(step).and_then(|d| dt.checked_add_signed(d)),
-        "millisecond" => Duration::try_milliseconds(step).and_then(|d| dt.checked_add_signed(d)),
-        // Chrono's microsecond constructor is infallible for every i64;
-        // the bounded datetime addition still returns None out of range.
-        "microsecond" => dt.checked_add_signed(Duration::microseconds(step)),
-        _ => return Err(format!("array_generate unsupported time unit: {unit}")),
-    };
-    next.ok_or_else(|| format!("array_generate temporal step is out of range for {unit}"))
+        .map_err(ExecutionFailure::from_domain);
+    }
+    cast(&array, &DataType::Int64).map_err(conversion)
 }
 
 fn build_datetime_values_array(
     values: Vec<NaiveDateTime>,
     target_type: &DataType,
-) -> Result<ArrayRef, String> {
+) -> ExecutionResult<ArrayRef> {
     match target_type {
         DataType::Date32 => {
             let out = values
@@ -103,20 +73,12 @@ fn build_datetime_values_array(
             if arr.data_type() == target_type {
                 Ok(arr)
             } else {
-                cast(&arr, target_type).map_err(|e| {
-                    format!(
-                        "array_generate failed to cast datetime output {:?} -> {:?}: {}",
-                        arr.data_type(),
-                        target_type,
-                        e
-                    )
-                })
+                cast(&arr, target_type).map_err(conversion)
             }
         }
-        other => Err(format!(
-            "array_generate date mode unsupported output element type: {:?}",
-            other
-        )),
+        other => Err(contract(format_args!(
+            "array_generate date mode unsupported output element type: {other:?}"
+        ))),
     }
 }
 
@@ -126,7 +88,7 @@ fn eval_array_generate_numeric<__Eval: crate::exec::expr::ExprEvaluation + ?Size
     target_item_type: DataType,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let stop_arr = if args.len() == 1 {
         cast_to_i64(arena.eval(args[0], chunk)?, "stop")?
     } else {
@@ -135,7 +97,7 @@ fn eval_array_generate_numeric<__Eval: crate::exec::expr::ExprEvaluation + ?Size
     let stop = stop_arr
         .as_any()
         .downcast_ref::<Int64Array>()
-        .ok_or_else(|| "array_generate internal stop downcast failure".to_string())?;
+        .ok_or_else(|| contract("array_generate internal stop downcast failure"))?;
 
     let start_arr = if args.len() == 1 {
         None
@@ -147,7 +109,7 @@ fn eval_array_generate_numeric<__Eval: crate::exec::expr::ExprEvaluation + ?Size
         .map(|arr| {
             arr.as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "array_generate internal start downcast failure".to_string())
+                .ok_or_else(|| contract("array_generate internal start downcast failure"))
         })
         .transpose()?;
 
@@ -161,7 +123,7 @@ fn eval_array_generate_numeric<__Eval: crate::exec::expr::ExprEvaluation + ?Size
         .map(|arr| {
             arr.as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "array_generate internal step downcast failure".to_string())
+                .ok_or_else(|| contract("array_generate internal step downcast failure"))
         })
         .transpose()?;
 
@@ -212,14 +174,14 @@ fn eval_array_generate_numeric<__Eval: crate::exec::expr::ExprEvaluation + ?Size
             continue;
         }
 
+        let row_values = integer_range_count(start_v, stop_v, step_v);
+        check_list_extent(current_offset as u128 + row_values, row_values, row)
+            .map_err(ExecutionFailure::from_domain)?;
         if step_v > 0 && start_v <= stop_v {
             let mut cur = start_v;
             while cur <= stop_v {
                 values.push(cur);
                 current_offset += 1;
-                if current_offset > i32::MAX as i64 {
-                    return Err(("array_generate offset overflow".to_string()).into());
-                }
                 let Some(next) = cur.checked_add(step_v) else {
                     break;
                 };
@@ -230,9 +192,6 @@ fn eval_array_generate_numeric<__Eval: crate::exec::expr::ExprEvaluation + ?Size
             while cur >= stop_v {
                 values.push(cur);
                 current_offset += 1;
-                if current_offset > i32::MAX as i64 {
-                    return Err(("array_generate offset overflow".to_string()).into());
-                }
                 let Some(next) = cur.checked_add(step_v) else {
                     break;
                 };
@@ -246,12 +205,7 @@ fn eval_array_generate_numeric<__Eval: crate::exec::expr::ExprEvaluation + ?Size
 
     let mut values_array = Arc::new(Int64Array::from(values)) as ArrayRef;
     if values_array.data_type() != &target_item_type {
-        values_array = cast(&values_array, &target_item_type).map_err(|e| {
-            format!(
-                "array_generate failed to cast output values to {:?}: {}",
-                target_item_type, e
-            )
-        })?;
+        values_array = cast(&values_array, &target_item_type).map_err(conversion)?;
     }
 
     let out = ListArray::new(
@@ -269,7 +223,7 @@ fn eval_array_generate_datetime<__Eval: crate::exec::expr::ExprEvaluation + ?Siz
     target_item_type: DataType,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     let start_arr = arena.eval(args[0], chunk)?;
     let stop_arr = arena.eval(args[1], chunk)?;
     let start_values = extract_datetime_array(&start_arr)?;
@@ -285,7 +239,7 @@ fn eval_array_generate_datetime<__Eval: crate::exec::expr::ExprEvaluation + ?Siz
         .map(|arr| {
             arr.as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "array_generate internal step downcast failure".to_string())
+                .ok_or_else(|| contract("array_generate internal step downcast failure"))
         })
         .transpose()?;
 
@@ -294,13 +248,9 @@ fn eval_array_generate_datetime<__Eval: crate::exec::expr::ExprEvaluation + ?Siz
         if unit.data_type() == &DataType::Utf8 {
             unit
         } else {
-            cast(&unit, &DataType::Utf8).map_err(|e| {
-                format!(
-                    "array_generate failed to cast unit {:?} -> VARCHAR: {}",
-                    unit.data_type(),
-                    e
-                )
-            })?
+            return Err(contract(
+                "array_generate unit differs from its frozen Utf8 carrier",
+            ));
         }
     } else {
         Arc::new(StringArray::from(vec!["day"])) as ArrayRef
@@ -308,7 +258,7 @@ fn eval_array_generate_datetime<__Eval: crate::exec::expr::ExprEvaluation + ?Siz
     let units = unit_arr
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "array_generate internal unit downcast failure".to_string())?;
+        .ok_or_else(|| contract("array_generate internal unit downcast failure"))?;
 
     let mut values = Vec::<NaiveDateTime>::new();
     let mut offsets = Vec::with_capacity(chunk.len() + 1);
@@ -333,20 +283,18 @@ fn eval_array_generate_datetime<__Eval: crate::exec::expr::ExprEvaluation + ?Siz
         let step_v = if let Some(steps) = step_values {
             let step_row = super::common::row_index(row, steps.len());
             if steps.is_null(step_row) {
-                return Err(
-                    ("array_generate requires step parameter must be a constant integer"
-                        .to_string())
-                    .into(),
-                );
+                return Err(ExecutionFailure::from_domain(
+                    ArrayGenerateFailure::NullStep,
+                ));
             }
             steps.value(step_row)
         } else {
             1_i64
         };
         if step_v < 0 {
-            return Err(
-                ("array_generate requires step parameter must be non-negative.".to_string()).into(),
-            );
+            return Err(ExecutionFailure::from_domain(
+                ArrayGenerateFailure::NegativeStep,
+            ));
         }
 
         let unit_row = super::common::row_index(row, units.len());
@@ -355,28 +303,23 @@ fn eval_array_generate_datetime<__Eval: crate::exec::expr::ExprEvaluation + ?Siz
             offsets.push(current_offset as i32);
             continue;
         }
-        let unit = units.value(unit_row).trim().to_ascii_lowercase();
-        if target_item_type == DataType::Date32
-            && step_v != 0
-            && matches!(
-                unit.as_str(),
-                "hour" | "minute" | "second" | "millisecond" | "microsecond"
-            )
-        {
-            return Err(
-                ("array_generate DATE subday range requires frozen DATETIME bounds".to_string())
-                    .into(),
-            );
-        }
         if step_v == 0 {
             null_builder.append_non_null();
             offsets.push(current_offset as i32);
             continue;
         }
+        let unit = ArrayGenerateUnit::parse(units.value(unit_row))
+            .map_err(ExecutionFailure::from_domain)?;
+        if target_item_type == DataType::Date32 && unit.is_subday() {
+            return Err(contract(
+                "array_generate DATE subday range requires frozen DATETIME bounds",
+            ));
+        }
 
         let forward = start <= stop;
         let actual_step = if forward { step_v } else { -step_v };
         let mut current = start;
+        let row_begin = current_offset;
         loop {
             if forward {
                 if current > stop {
@@ -385,12 +328,17 @@ fn eval_array_generate_datetime<__Eval: crate::exec::expr::ExprEvaluation + ?Siz
             } else if current < stop {
                 break;
             }
+            check_list_extent(
+                current_offset as u128 + 1,
+                (current_offset - row_begin) as u128 + 1,
+                row,
+            )
+            .map_err(ExecutionFailure::from_domain)?;
             values.push(current);
             current_offset += 1;
-            if current_offset > i32::MAX as i64 {
-                return Err(("array_generate offset overflow".to_string()).into());
-            }
-            let next = add_datetime_unit(current, actual_step, unit.as_str())?;
+            let next = unit
+                .advance(current, actual_step)
+                .map_err(ExecutionFailure::from_domain)?;
             if next == current {
                 break;
             }
@@ -416,14 +364,18 @@ pub fn eval_array_generate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
     if args.is_empty() || args.len() > 4 {
-        return Err(("array_generate expects 1 to 4 arguments".to_string()).into());
+        return Err(contract("array_generate expects 1 to 4 arguments"));
     }
 
     let output_field = match arena.data_type(expr) {
         Some(DataType::List(field)) => field.clone(),
-        _ => return Err(("array_generate requires a frozen List output type".to_string()).into()),
+        _ => {
+            return Err(contract(
+                "array_generate requires a frozen List output type",
+            ));
+        }
     };
     let target_item_type = output_field.data_type().clone();
     let argument_types = args
@@ -432,15 +384,15 @@ pub fn eval_array_generate<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             arena
                 .data_type(*arg)
                 .cloned()
-                .ok_or_else(|| "array_generate requires frozen argument types".to_string())
+                .ok_or_else(|| contract("array_generate requires frozen argument types"))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let expected = novarocks_type_contract::array_generate_item_type(&argument_types)
-        .ok_or_else(|| "array_generate requires normalized frozen bounds".to_string())?;
+        .ok_or_else(|| contract("array_generate requires normalized frozen bounds"))?;
     if expected != target_item_type {
-        return Err(
-            ("array_generate frozen output differs from its bound domain".to_string()).into(),
-        );
+        return Err(contract(
+            "array_generate frozen output differs from its bound domain",
+        ));
     }
     let is_date_mode = matches!(
         target_item_type,
@@ -487,6 +439,27 @@ mod tests {
                 DataType::Int64,
             )
         }
+    }
+
+    #[test]
+    fn array_generate_wide_numeric_row_refuses_before_expansion_with_exact_facts() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, RepresentationBoundary};
+        let chunk = common::chunk_len_1();
+        let mut arena = ExprArena::default();
+        let start = common::literal_i64(&mut arena, 0);
+        let stop = common::literal_i64(&mut arena, i32::MAX as i64);
+        let expr = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Null),
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
+        );
+        let failure = eval_array_generate(&arena, expr, &[start, stop], &chunk).unwrap_err();
+        let fact = failure.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Representation);
+        let extent = fact.representation().unwrap();
+        assert_eq!(extent.boundary, RepresentationBoundary::MinimumUnit);
+        assert_eq!(extent.required, Some(i32::MAX as u64 + 1));
+        assert_eq!(extent.extent_limit, Some(i32::MAX as u64));
+        assert_eq!(extent.representable_prefix, Some(0));
     }
 
     #[test]
@@ -595,6 +568,7 @@ mod tests {
         assert!(
             eval_array_function("array_generate", &arena, out, &[text, text], &chunk)
                 .unwrap_err()
+                .to_string()
                 .contains("normalized frozen bounds")
         );
         let wrong = common::typed_null(
@@ -604,12 +578,14 @@ mod tests {
         assert!(
             eval_array_function("array_generate", &arena, wrong, &[stop, stop], &chunk)
                 .unwrap_err()
+                .to_string()
                 .contains("differs from its bound domain")
         );
         let no_type = common::typed_null(&mut arena, DataType::Null);
         assert!(
             eval_array_function("array_generate", &arena, no_type, &[stop, stop], &chunk)
                 .unwrap_err()
+                .to_string()
                 .contains("frozen List")
         );
     }
@@ -682,6 +658,7 @@ mod tests {
             prepared
                 .eval(error, &chunk)
                 .unwrap_err()
+                .to_string()
                 .contains("non-negative")
         );
     }
@@ -719,58 +696,8 @@ mod tests {
                 &chunk
             )
             .unwrap_err()
+            .to_string()
             .contains("requires frozen DATETIME bounds")
-        );
-    }
-
-    #[test]
-    fn array_generate_checked_helpers_cover_extreme_units_and_calendar_limits() {
-        let start = NaiveDate::from_ymd_opt(2025, 10, 1)
-            .unwrap()
-            .and_hms_opt(14, 28, 31)
-            .unwrap();
-        for unit in [
-            "year",
-            "quarter",
-            "month",
-            "week",
-            "day",
-            "hour",
-            "minute",
-            "second",
-            "millisecond",
-            "microsecond",
-        ] {
-            for step in [i64::MAX, i64::MIN] {
-                let error = add_datetime_unit(start, step, unit).unwrap_err();
-                assert!(
-                    error.contains("temporal step is out of range"),
-                    "{unit}: {error}"
-                );
-            }
-        }
-        assert!(add_months_to_datetime(start, i32::MAX).is_none());
-        assert!(add_months_to_datetime(start, i32::MIN).is_none());
-        assert_eq!(last_day_of_month(NaiveDate::MAX.year(), 12), Some(31));
-        assert_eq!(last_day_of_month(NaiveDate::MIN.year(), 1), Some(31));
-        assert_eq!(last_day_of_month(i32::MAX, 12), None);
-        assert_eq!(last_day_of_month(2025, 13), None);
-        let max_november = NaiveDate::from_ymd_opt(NaiveDate::MAX.year(), 11, 30)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap();
-        let max_december = add_months_to_datetime(max_november, 1).unwrap();
-        assert_eq!(max_december.date().month(), 12);
-        assert_eq!(max_december.date().day(), 30);
-        assert!(
-            add_datetime_unit(max_december, 1, "month")
-                .unwrap_err()
-                .contains("out of range")
-        );
-        assert!(
-            add_datetime_unit(start, 1, "unknown")
-                .unwrap_err()
-                .contains("unsupported time unit")
         );
     }
 
@@ -866,6 +793,7 @@ mod tests {
                 prepared
                     .eval(expr, &chunk)
                     .unwrap_err()
+                    .to_string()
                     .contains("temporal step is out of range")
             );
         }

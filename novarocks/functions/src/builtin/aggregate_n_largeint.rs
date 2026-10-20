@@ -22,7 +22,7 @@ use super::aggregate_n_largeint_resources::{
     BoundNCodecResources, BoundNSortResources, add, operation_prefix_bytes,
 };
 use crate::aggregate_host_allocator::HostAggregateAllocator;
-use crate::aggregate_scalar::{ScalarStateError, ScalarWork, TrackedAggScalarValue};
+use crate::aggregate_scalar::{ScalarWork, TrackedAggScalarValue};
 use crate::kernel_control::{compile_failure, internal, invalid};
 use crate::opaque_memory::OpaqueRetainedCharge;
 use crate::*;
@@ -58,7 +58,7 @@ impl NLargeIntState {
         &self,
         core: &CoreNState<HostAggregateAllocator>,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), KernelFailure> {
         let vector = core
             .values
             .capacity()
@@ -112,8 +112,8 @@ impl NEmissionAccess for NLargeIntState {
     }
     fn with_core(
         &self,
-        operation: impl FnOnce(&CoreNState<HostAggregateAllocator>) -> Result<(), ScalarStateError>,
-    ) -> Result<(), ScalarStateError> {
+        operation: impl FnOnce(&CoreNState<HostAggregateAllocator>) -> Result<(), KernelFailure>,
+    ) -> Result<(), KernelFailure> {
         if self.failed.get() {
             return Err(KernelFailure::InstanceFailed.into());
         }
@@ -212,7 +212,7 @@ fn mapping_copy(
     target: &mut HostVec<usize, HostAggregateAllocator>,
     allocator: &HostAggregateAllocator,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<usize, ScalarStateError> {
+) -> Result<usize, KernelFailure> {
     if mapping.len() != selection.len() {
         return Err(invalid("min_n/max_n mapping differs from its selected domain").into());
     }

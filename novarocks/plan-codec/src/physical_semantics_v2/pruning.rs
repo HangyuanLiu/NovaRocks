@@ -819,7 +819,7 @@ mod tests {
                     Stop::Tail => units > 0 && units < 256,
                 }
             {
-                Err(self.error)
+                Err(self.error.clone())
             } else {
                 Ok(())
             }
@@ -837,7 +837,7 @@ mod tests {
                 for stop in [Stop::Entry, Stop::Quantum, Stop::Tail] {
                     let control = Refuse {
                         phase,
-                        error,
+                        error: error.clone(),
                         stop,
                         calls: Mutex::new(vec![]),
                     };
@@ -879,7 +879,7 @@ mod tests {
         ] {
             let control = Refuse {
                 phase: CompilePhase::Validate,
-                error,
+                error: error.clone(),
                 stop: Stop::Entry,
                 calls: Mutex::new(vec![]),
             };

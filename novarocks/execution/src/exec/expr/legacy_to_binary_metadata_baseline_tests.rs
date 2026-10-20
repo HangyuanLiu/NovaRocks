@@ -49,7 +49,10 @@ pub(crate) fn setup(arrays: Vec<ArrayRef>) -> (ExprArena, Vec<ExprId>, Chunk) {
         .collect();
     (arena, args, chunk)
 }
-pub(crate) fn raw(arrays: Vec<ArrayRef>, target: DataType) -> Result<ArrayRef, String> {
+pub(crate) fn raw(
+    arrays: Vec<ArrayRef>,
+    target: DataType,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let (mut arena, args, chunk) = setup(arrays);
     let expr = arena.push_typed(
         ExprNode::FunctionCall {
@@ -153,45 +156,50 @@ fn legacy_to_binary_exact_arity_admission_and_eager_format_errors() {
         DataType::Binary,
     );
     assert_eq!(
-        eval_to_binary(&arena, expr, &[], &chunk).unwrap_err(),
+        (eval_to_binary(&arena, expr, &[], &chunk).unwrap_err()).to_string(),
         "to_binary expects 1 or 2 arguments"
     );
     assert_eq!(
-        eval_to_binary(&arena, expr, &[args[0], args[0], args[0]], &chunk).unwrap_err(),
+        (eval_to_binary(&arena, expr, &[args[0], args[0], args[0]], &chunk).unwrap_err())
+            .to_string(),
         "to_binary expects 1 or 2 arguments"
     );
     assert_eq!(
-        eval_to_binary(&arena, expr, &[args[0], ExprId(usize::MAX)], &chunk).unwrap_err(),
+        (eval_to_binary(&arena, expr, &[args[0], ExprId(usize::MAX)], &chunk).unwrap_err())
+            .to_string(),
         "invalid ExprId"
     );
     assert_eq!(
-        raw(
+        (raw(
             vec![
                 strings(vec![None]),
                 Arc::new(Int64Array::from(vec![Some(1)]))
             ],
             DataType::Binary
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "to_binary expects VARCHAR format argument"
     );
     assert_eq!(
-        raw(
+        (raw(
             vec![
                 Arc::new(Int64Array::from(vec![Some(1)])),
                 strings(vec![None])
             ],
             DataType::Binary
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "to_binary expects VARCHAR as first argument"
     );
     assert_eq!(
-        raw(
+        (raw(
             vec![Arc::new(LargeStringArray::from(vec![Some("00")]))],
             DataType::Binary
         )
-        .unwrap_err(),
+        .unwrap_err())
+        .to_string(),
         "to_binary expects VARCHAR as first argument"
     );
 }

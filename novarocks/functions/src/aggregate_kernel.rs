@@ -426,7 +426,7 @@ pub(crate) fn specialize_aggregate_once<O: PureAggregateImplementation + ?Sized>
             )
         },
         |contract| {
-            prepare(owner, input, contract, control).map_err(FunctionSpecializationFailure::Kernel)
+            prepare(owner, input, contract, control).map_err(FunctionSpecializationFailure::from)
         },
     )
 }
@@ -491,9 +491,7 @@ pub(crate) fn specialize_aggregate_once_checked_with_preparation<
         |contract| {
             prepare(contract).map_err(|error| match error {
                 crate::CheckedOwnerFailure::Original(error) => {
-                    crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::Kernel(
-                        error,
-                    ))
+                    crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::from(error))
                 }
                 crate::CheckedOwnerFailure::UnconvertedOwner => {
                     crate::CheckedOwnerFailure::UnconvertedOwner
@@ -570,11 +568,10 @@ fn specialize_aggregate_once_core<
         }
     })();
     let aligned = match aligned {
-        Err(
-            error @ (KernelFailure::Cancelled
-            | KernelFailure::DeadlineExceeded
-            | KernelFailure::ResourceExhausted),
-        ) => {
+        Err(KernelFailure::CompileControl(cause)) => {
+            return Err(FunctionSpecializationFailure::Control(cause).into());
+        }
+        Err(error) if error.is_interruption() => {
             return Err(match error {
                 KernelFailure::Cancelled => FunctionSpecializationFailure::Control(
                     novarocks_type_contract::CompileControlError::Cancelled,
@@ -589,16 +586,19 @@ fn specialize_aggregate_once_core<
             }
             .into());
         }
+        Err(error) if error.is_interruption() => {
+            return Err(FunctionSpecializationFailure::from(error).into());
+        }
         result => {
             work.finish()
                 .map_err(FunctionSpecializationFailure::Control)?;
-            result.map_err(FunctionSpecializationFailure::Kernel)?
+            result.map_err(FunctionSpecializationFailure::from)?
         }
     };
     let (receipt, effects) = refine(arguments)?;
     let call = Arc::new(
         FunctionCallContract::from_refined(input, &receipt, selected, control)
-            .map_err(FunctionSpecializationFailure::Kernel)?,
+            .map_err(FunctionSpecializationFailure::from)?,
     );
     let contract = Arc::new(
         AggregateCallContract::try_new_refined(
@@ -611,7 +611,7 @@ fn specialize_aggregate_once_core<
             receipt.aggregate_merge_state(),
             control,
         )
-        .map_err(FunctionSpecializationFailure::Kernel)?,
+        .map_err(FunctionSpecializationFailure::from)?,
     );
     let prepared = prepare(contract.clone())?;
     if !Arc::ptr_eq(prepared.contract(), &contract) {
@@ -620,7 +620,7 @@ fn specialize_aggregate_once_core<
         ))
         .into());
     }
-    state_retained_bound(prepared.as_ref()).map_err(FunctionSpecializationFailure::Kernel)?;
+    state_retained_bound(prepared.as_ref()).map_err(FunctionSpecializationFailure::from)?;
     control
         .checkpoint(CompilePhase::FunctionSpecialization, 0)
         .map_err(FunctionSpecializationFailure::Control)?;
@@ -801,8 +801,8 @@ impl<'batch, K: PreparedAggregateKernel> AggregateUpdateInvocation<'batch, K> {
                 ordinal,
                 control,
             );
-            // Observe retained growth even on error exits. Control/resources
-            // remain the primary failure; no post-check grants allocation.
+            // Successful mutation must obey the retained contract. An outer
+            // failure remains primary; its owner still destroys the state.
             crate::evaluation_failure::finish_evaluation_lifecycle(result, || {
                 validate_state_retained(self.kernel, state)
             })
@@ -924,8 +924,9 @@ impl<'batch, K: PreparedAggregateKernel> AggregateMergeInvocation<'batch, K> {
     }
 }
 
-/// Only a declaration-proven Kernel-only caller uses this projection. A Data
-/// result here violates the owner's declaration; real Data owners cannot enter.
+/// Only a declaration-proven kernel-channel caller uses this projection.
+/// An InvocationData capsule violates that transport declaration. Source-owned
+/// unmaskable Data facts inside KernelFailure remain valid whole-state failures.
 pub(crate) fn kernel_only_result<T>(
     result: Result<T, crate::EvaluationFailure>,
 ) -> Result<T, KernelFailure> {
@@ -935,24 +936,6 @@ pub(crate) fn kernel_only_result<T>(
         Err(crate::EvaluationFailure::InvocationData(_)) => Err(internal(
             "aggregate contradicted its Kernel-only failure declaration",
         )),
-    }
-}
-
-pub(crate) fn finish_lifecycle<T>(
-    result: Result<T, KernelFailure>,
-    post: Result<(), KernelFailure>,
-) -> Result<T, KernelFailure> {
-    match result {
-        Ok(value) => post.map(|()| value),
-        Err(
-            primary @ (KernelFailure::Cancelled
-            | KernelFailure::DeadlineExceeded
-            | KernelFailure::ResourceExhausted),
-        ) => Err(primary),
-        Err(primary) => match post {
-            Err(violation @ KernelFailure::Internal(_)) => Err(violation),
-            _ => Err(primary),
-        },
     }
 }
 
@@ -1097,26 +1080,9 @@ where
         (true, None) => kernel.build_final_evaluation(states.clone(), control),
         (false, None) => kernel.build_intermediate_evaluation(states.clone(), control),
     };
-    // Lossless owners publish an atomic originating Data or Kernel failure.
-    // In particular a host refusal need not have passed through control.
-    if kernel.has_invocation_data() && result.is_err() {
-        return result;
-    }
-    // Interrupted output is terminal. The host still owns reconciliation and
-    // destruction; another observed state traversal cannot complete this call.
-    if matches!(
-        &result,
-        Err(crate::EvaluationFailure::InvocationData(_)
-            | crate::EvaluationFailure::Kernel(
-                KernelFailure::Cancelled
-                    | KernelFailure::DeadlineExceeded
-                    | KernelFailure::ResourceExhausted
-            ))
-    ) {
-        return result;
-    }
-    // &State may contain interior mutable storage. Both successful and failed
-    // emissions are checked, without changing a primary control/resource error.
+    // Successful output must satisfy the retained contract, including
+    // interior mutation. Failed output starts no new fallible traversal;
+    // actual resource settlement and destruction remain with their owners.
     let output = crate::evaluation_failure::finish_evaluation_lifecycle(result, || {
         validate_emission_states(kernel, states, control)
     })?;

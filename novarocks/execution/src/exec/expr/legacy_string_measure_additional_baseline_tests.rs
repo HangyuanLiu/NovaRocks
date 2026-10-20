@@ -28,7 +28,11 @@ use arrow::{
 };
 use novarocks_types::SlotId;
 use std::sync::Arc;
-fn raw(name: &'static str, input: ArrayRef, target: Option<DataType>) -> Result<ArrayRef, String> {
+fn raw(
+    name: &'static str,
+    input: ArrayRef,
+    target: Option<DataType>,
+) -> Result<ArrayRef, crate::runtime::fragment::ExecutionFailure> {
     let slot = SlotId::new(1);
     let ty = input.data_type().clone();
     let batch = RecordBatch::try_new(
@@ -123,11 +127,11 @@ fn legacy_measure_length_original_int_bigint_missing_and_wrong_target_messages()
         }
         for input in [input.clone(), strings(vec![None]), strings(vec![])] {
             assert_eq!(
-                raw(name, input.clone(), None).unwrap_err(),
+                (raw(name, input.clone(), None).unwrap_err()).to_string(),
                 "length return type is missing"
             );
             assert_eq!(
-                raw(name, input, Some(DataType::Boolean)).unwrap_err(),
+                (raw(name, input, Some(DataType::Boolean)).unwrap_err()).to_string(),
                 "length return type must be INT/BIGINT, got Boolean"
             );
         }
@@ -146,9 +150,12 @@ fn legacy_measure_uncoerced_static_reader_error_precedes_missing_target_and_null
             } else {
                 "length expects string"
             };
-            assert_eq!(raw(name, input.clone(), None).unwrap_err(), expected);
             assert_eq!(
-                raw(name, input, Some(DataType::Boolean)).unwrap_err(),
+                (raw(name, input.clone(), None).unwrap_err()).to_string(),
+                expected
+            );
+            assert_eq!(
+                (raw(name, input, Some(DataType::Boolean)).unwrap_err()).to_string(),
                 expected
             );
         }

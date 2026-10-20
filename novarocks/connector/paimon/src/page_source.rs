@@ -226,7 +226,14 @@ impl ConnectorPageStream for PaimonPageStream {
         });
         Box::pin(async move {
             let exited = match exited {
-                Some(exited) => exited.await,
+                Some(exited) => match exited.await {
+                    novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Exited => {
+                        Ok(())
+                    }
+                    novarocks_spi::connector::read_stack::ConnectorSourceExitProof::Unresolved => {
+                        futures::future::pending().await
+                    }
+                },
                 None => Ok(()),
             };
             closed?;

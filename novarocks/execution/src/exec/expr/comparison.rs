@@ -18,6 +18,7 @@ use crate::exec::chunk::Chunk;
 use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use crate::exec::expr::cast::cast_with_special_rules;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Builder, ListArray, MapArray, StringArray, StructArray,
     TimestampMicrosecondBuilder,
@@ -30,22 +31,126 @@ use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-fn parse_date32_value(value: &str) -> Result<i32, String> {
-    const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
-    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-        return Ok(date.num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET);
+#[derive(Debug)]
+struct ComparisonLiteralFailure {
+    kind: &'static str,
+    source: chrono::ParseError,
+}
+impl std::fmt::Display for ComparisonLiteralFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid {} comparison literal: {}",
+            self.kind, self.source
+        )
     }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
-        return Ok(dt.date().num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET);
+}
+impl std::error::Error for ComparisonLiteralFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
-    Err(format!("invalid date literal '{}'", value))
+}
+impl novarocks_failure_contract::FailureProjection for ComparisonLiteralFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_functions::DataFailureReason::InvalidValue.failure_fact()
+    }
+}
+fn comparison_literal_failure(kind: &'static str, source: chrono::ParseError) -> ExecutionFailure {
+    ExecutionFailure::from_domain(ComparisonLiteralFailure { kind, source })
+}
+#[derive(Debug)]
+struct ComparisonUnsupported(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for ComparisonUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for ComparisonUnsupported {}
+impl novarocks_failure_contract::FailureProjection for ComparisonUnsupported {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Data,
+            crate::runtime::fragment::ExecutionReason::ComparisonUnsupported.reason(),
+        )
+    }
+}
+fn comparison_unsupported(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(ComparisonUnsupported(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+#[derive(Debug)]
+struct ComparisonArrowFailure(arrow::error::ArrowError);
+impl std::fmt::Display for ComparisonArrowFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "comparison kernel: {}", self.0)
+    }
+}
+impl std::error::Error for ComparisonArrowFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+impl novarocks_failure_contract::FailureProjection for ComparisonArrowFailure {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        use crate::runtime::fragment::ExecutionReason;
+        use arrow::error::ArrowError;
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, RepresentationBoundary, RepresentationFacts,
+            RepresentationLayout, domain,
+        };
+        let (class, reason) = match self.0 {
+            ArrowError::MemoryError(_) => (
+                FailureClass::Resource,
+                ExecutionReason::ComparisonAllocation,
+            ),
+            ArrowError::OffsetOverflowError(_) => (
+                FailureClass::Representation,
+                ExecutionReason::ComparisonOffset,
+            ),
+            ArrowError::IoError(..) => (
+                FailureClass::Unexpected,
+                ExecutionReason::ComparisonUnexpected,
+            ),
+            _ => (FailureClass::Invariant, ExecutionReason::ComparisonContract),
+        };
+        let fact = FailureFact::new(class, reason.reason());
+        if matches!(self.0, ArrowError::OffsetOverflowError(_)) {
+            fact.with_representation(RepresentationFacts {
+                boundary: RepresentationBoundary::SingleOutput,
+                layout: RepresentationLayout {
+                    domain: domain::EXECUTION,
+                    code: std::num::NonZeroU16::new(33).unwrap(),
+                },
+                required: None,
+                extent_limit: None,
+                representable_prefix: None,
+            })
+        } else {
+            fact
+        }
+    }
+}
+fn comparison_arrow_failure(cause: arrow::error::ArrowError) -> ExecutionFailure {
+    ExecutionFailure::from_domain(ComparisonArrowFailure(cause))
 }
 
-fn cast_utf8_to_date32(array: &ArrayRef) -> Result<ArrayRef, String> {
+fn parse_date32_value(value: &str) -> Result<i32, ExecutionFailure> {
+    const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
+    let date = match NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        Ok(date) => date,
+        Err(_) => NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+            .map_err(|source| comparison_literal_failure("date", source))?
+            .date(),
+    };
+    Ok(date.num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET)
+}
+
+fn cast_utf8_to_date32(array: &ArrayRef) -> Result<ArrayRef, ExecutionFailure> {
     let arr = array
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+        .ok_or_else(|| super::expression_contract("failed to downcast to StringArray"))?;
     let mut builder = Date32Builder::new();
     for i in 0..arr.len() {
         if arr.is_null(i) {
@@ -58,24 +163,21 @@ fn cast_utf8_to_date32(array: &ArrayRef) -> Result<ArrayRef, String> {
     Ok(Arc::new(builder.finish()))
 }
 
-fn parse_timestamp_micro_value(value: &str) -> Result<i64, String> {
-    if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f") {
-        return Ok(dt.and_utc().timestamp_micros());
-    }
-    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
-        let dt = date
-            .and_hms_opt(0, 0, 0)
-            .ok_or_else(|| format!("invalid timestamp literal '{}'", value))?;
-        return Ok(dt.and_utc().timestamp_micros());
-    }
-    Err(format!("invalid timestamp literal '{}'", value))
+fn parse_timestamp_micro_value(value: &str) -> Result<i64, ExecutionFailure> {
+    let dt = match NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f") {
+        Ok(dt) => dt,
+        Err(_) => NaiveDate::parse_from_str(value, "%Y-%m-%d")
+            .map_err(|source| comparison_literal_failure("timestamp", source))?
+            .and_time(chrono::NaiveTime::MIN),
+    };
+    Ok(dt.and_utc().timestamp_micros())
 }
 
-fn cast_utf8_to_timestamp_micro(array: &ArrayRef) -> Result<ArrayRef, String> {
+fn cast_utf8_to_timestamp_micro(array: &ArrayRef) -> Result<ArrayRef, ExecutionFailure> {
     let arr = array
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+        .ok_or_else(|| super::expression_contract("failed to downcast to StringArray"))?;
     let mut builder = TimestampMicrosecondBuilder::new();
     for i in 0..arr.len() {
         if arr.is_null(i) {
@@ -88,13 +190,21 @@ fn cast_utf8_to_timestamp_micro(array: &ArrayRef) -> Result<ArrayRef, String> {
     Ok(Arc::new(builder.finish()))
 }
 
-fn cast_utf8_to_timestamp(array: &ArrayRef, target: &DataType) -> Result<ArrayRef, String> {
+fn cast_utf8_to_timestamp(
+    array: &ArrayRef,
+    target: &DataType,
+) -> Result<ArrayRef, ExecutionFailure> {
     match target {
         DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None) => {
             cast_utf8_to_timestamp_micro(array)
         }
-        DataType::Timestamp(_, _) => cast(array, target).map_err(|e| e.to_string()),
-        other => Err(format!("unsupported timestamp target type: {:?}", other)),
+        DataType::Timestamp(_, _) => {
+            cast(array, target).map_err(crate::exec::expr::cast::cast_arrow_failure)
+        }
+        other => Err(comparison_unsupported(format_args!(
+            "unsupported timestamp target type: {:?}",
+            other
+        ))),
     }
 }
 
@@ -103,79 +213,103 @@ fn compare_scalar_non_null(
     left_idx: usize,
     right: &ArrayRef,
     right_idx: usize,
-) -> Result<Ordering, String> {
+) -> Result<Ordering, ExecutionFailure> {
     if !comparison_data_types_match(left.data_type(), right.data_type()) {
-        return Err(format!(
+        return Err(super::expression_contract(format_args!(
             "list scalar compare type mismatch: {:?} vs {:?}",
             left.data_type(),
             right.data_type()
-        ));
+        )));
     }
     match left.data_type() {
         DataType::Boolean => {
             let l = left
                 .as_any()
                 .downcast_ref::<arrow::array::BooleanArray>()
-                .ok_or_else(|| "failed to downcast left to BooleanArray".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast left to BooleanArray")
+                })?;
             let r = right
                 .as_any()
                 .downcast_ref::<arrow::array::BooleanArray>()
-                .ok_or_else(|| "failed to downcast right to BooleanArray".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast right to BooleanArray")
+                })?;
             Ok(l.value(left_idx).cmp(&r.value(right_idx)))
         }
         DataType::Int8 => {
             let l = left
                 .as_any()
                 .downcast_ref::<arrow::array::Int8Array>()
-                .ok_or_else(|| "failed to downcast left to Int8Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast left to Int8Array")
+                })?;
             let r = right
                 .as_any()
                 .downcast_ref::<arrow::array::Int8Array>()
-                .ok_or_else(|| "failed to downcast right to Int8Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast right to Int8Array")
+                })?;
             Ok(l.value(left_idx).cmp(&r.value(right_idx)))
         }
         DataType::Int16 => {
             let l = left
                 .as_any()
                 .downcast_ref::<arrow::array::Int16Array>()
-                .ok_or_else(|| "failed to downcast left to Int16Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast left to Int16Array")
+                })?;
             let r = right
                 .as_any()
                 .downcast_ref::<arrow::array::Int16Array>()
-                .ok_or_else(|| "failed to downcast right to Int16Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast right to Int16Array")
+                })?;
             Ok(l.value(left_idx).cmp(&r.value(right_idx)))
         }
         DataType::Int32 => {
             let l = left
                 .as_any()
                 .downcast_ref::<arrow::array::Int32Array>()
-                .ok_or_else(|| "failed to downcast left to Int32Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast left to Int32Array")
+                })?;
             let r = right
                 .as_any()
                 .downcast_ref::<arrow::array::Int32Array>()
-                .ok_or_else(|| "failed to downcast right to Int32Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast right to Int32Array")
+                })?;
             Ok(l.value(left_idx).cmp(&r.value(right_idx)))
         }
         DataType::Int64 => {
             let l = left
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| "failed to downcast left to Int64Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast left to Int64Array")
+                })?;
             let r = right
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| "failed to downcast right to Int64Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast right to Int64Array")
+                })?;
             Ok(l.value(left_idx).cmp(&r.value(right_idx)))
         }
         DataType::Float32 => {
             let l = left
                 .as_any()
                 .downcast_ref::<arrow::array::Float32Array>()
-                .ok_or_else(|| "failed to downcast left to Float32Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast left to Float32Array")
+                })?;
             let r = right
                 .as_any()
                 .downcast_ref::<arrow::array::Float32Array>()
-                .ok_or_else(|| "failed to downcast right to Float32Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast right to Float32Array")
+                })?;
             Ok(l.value(left_idx)
                 .partial_cmp(&r.value(right_idx))
                 .unwrap_or(Ordering::Equal))
@@ -184,11 +318,15 @@ fn compare_scalar_non_null(
             let l = left
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| "failed to downcast left to Float64Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast left to Float64Array")
+                })?;
             let r = right
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| "failed to downcast right to Float64Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast right to Float64Array")
+                })?;
             Ok(l.value(left_idx)
                 .partial_cmp(&r.value(right_idx))
                 .unwrap_or(Ordering::Equal))
@@ -197,33 +335,45 @@ fn compare_scalar_non_null(
             let l = left
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
-                .ok_or_else(|| "failed to downcast left to StringArray".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast left to StringArray")
+                })?;
             let r = right
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
-                .ok_or_else(|| "failed to downcast right to StringArray".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast right to StringArray")
+                })?;
             Ok(l.value(left_idx).cmp(r.value(right_idx)))
         }
         DataType::Date32 => {
             let l = left
                 .as_any()
                 .downcast_ref::<arrow::array::Date32Array>()
-                .ok_or_else(|| "failed to downcast left to Date32Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast left to Date32Array")
+                })?;
             let r = right
                 .as_any()
                 .downcast_ref::<arrow::array::Date32Array>()
-                .ok_or_else(|| "failed to downcast right to Date32Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast right to Date32Array")
+                })?;
             Ok(l.value(left_idx).cmp(&r.value(right_idx)))
         }
         DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None) => {
             let l = left
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampSecondArray>()
-                .ok_or_else(|| "failed to downcast left to TimestampSecondArray".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast left to TimestampSecondArray")
+                })?;
             let r = right
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampSecondArray>()
-                .ok_or_else(|| "failed to downcast right to TimestampSecondArray".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast right to TimestampSecondArray")
+                })?;
             Ok(l.value(left_idx).cmp(&r.value(right_idx)))
         }
         DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None) => {
@@ -231,13 +381,17 @@ fn compare_scalar_non_null(
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampMillisecondArray>()
                 .ok_or_else(|| {
-                    "failed to downcast left to TimestampMillisecondArray".to_string()
+                    super::expression_contract(
+                        "failed to downcast left to TimestampMillisecondArray",
+                    )
                 })?;
             let r = right
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampMillisecondArray>()
                 .ok_or_else(|| {
-                    "failed to downcast right to TimestampMillisecondArray".to_string()
+                    super::expression_contract(
+                        "failed to downcast right to TimestampMillisecondArray",
+                    )
                 })?;
             Ok(l.value(left_idx).cmp(&r.value(right_idx)))
         }
@@ -246,13 +400,17 @@ fn compare_scalar_non_null(
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
                 .ok_or_else(|| {
-                    "failed to downcast left to TimestampMicrosecondArray".to_string()
+                    super::expression_contract(
+                        "failed to downcast left to TimestampMicrosecondArray",
+                    )
                 })?;
             let r = right
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
                 .ok_or_else(|| {
-                    "failed to downcast right to TimestampMicrosecondArray".to_string()
+                    super::expression_contract(
+                        "failed to downcast right to TimestampMicrosecondArray",
+                    )
                 })?;
             Ok(l.value(left_idx).cmp(&r.value(right_idx)))
         }
@@ -260,12 +418,18 @@ fn compare_scalar_non_null(
             let l = left
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampNanosecondArray>()
-                .ok_or_else(|| "failed to downcast left to TimestampNanosecondArray".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract(
+                        "failed to downcast left to TimestampNanosecondArray",
+                    )
+                })?;
             let r = right
                 .as_any()
                 .downcast_ref::<arrow::array::TimestampNanosecondArray>()
                 .ok_or_else(|| {
-                    "failed to downcast right to TimestampNanosecondArray".to_string()
+                    super::expression_contract(
+                        "failed to downcast right to TimestampNanosecondArray",
+                    )
                 })?;
             Ok(l.value(left_idx).cmp(&r.value(right_idx)))
         }
@@ -273,14 +437,21 @@ fn compare_scalar_non_null(
             let l = left
                 .as_any()
                 .downcast_ref::<arrow::array::Decimal128Array>()
-                .ok_or_else(|| "failed to downcast left to Decimal128Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast left to Decimal128Array")
+                })?;
             let r = right
                 .as_any()
                 .downcast_ref::<arrow::array::Decimal128Array>()
-                .ok_or_else(|| "failed to downcast right to Decimal128Array".to_string())?;
+                .ok_or_else(|| {
+                    super::expression_contract("failed to downcast right to Decimal128Array")
+                })?;
             Ok(l.value(left_idx).cmp(&r.value(right_idx)))
         }
-        other => Err(format!("list scalar compare unsupported type: {:?}", other)),
+        other => Err(comparison_unsupported(format_args!(
+            "list scalar compare unsupported type: {:?}",
+            other
+        ))),
     }
 }
 
@@ -289,13 +460,13 @@ fn compare_value_recursive(
     left_idx: usize,
     right: &ArrayRef,
     right_idx: usize,
-) -> Result<Option<Ordering>, String> {
+) -> Result<Option<Ordering>, ExecutionFailure> {
     if !comparison_data_types_match(left.data_type(), right.data_type()) {
-        return Err(format!(
+        return Err(super::expression_contract(format_args!(
             "list compare type mismatch: {:?} vs {:?}",
             left.data_type(),
             right.data_type()
-        ));
+        )));
     }
     if left.is_null(left_idx) || right.is_null(right_idx) {
         return Ok(None);
@@ -304,33 +475,33 @@ fn compare_value_recursive(
         let l = left
             .as_any()
             .downcast_ref::<ListArray>()
-            .ok_or_else(|| "failed to downcast left to ListArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast left to ListArray"))?;
         let r = right
             .as_any()
             .downcast_ref::<ListArray>()
-            .ok_or_else(|| "failed to downcast right to ListArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast right to ListArray"))?;
         return compare_list_rows(l, left_idx, r, right_idx);
     }
     if matches!(left.data_type(), DataType::Struct(_)) {
         let l = left
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| "failed to downcast left to StructArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast left to StructArray"))?;
         let r = right
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| "failed to downcast right to StructArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast right to StructArray"))?;
         return compare_struct_rows(l, left_idx, r, right_idx);
     }
     if matches!(left.data_type(), DataType::Map(_, _)) {
         let l = left
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| "failed to downcast left to MapArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast left to MapArray"))?;
         let r = right
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| "failed to downcast right to MapArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast right to MapArray"))?;
         return compare_map_rows(l, left_idx, r, right_idx);
     }
     compare_scalar_non_null(left, left_idx, right, right_idx).map(Some)
@@ -341,13 +512,13 @@ fn compare_value_recursive_in_list(
     left_idx: usize,
     right: &ArrayRef,
     right_idx: usize,
-) -> Result<Ordering, String> {
+) -> Result<Ordering, ExecutionFailure> {
     if !comparison_data_types_match(left.data_type(), right.data_type()) {
-        return Err(format!(
+        return Err(super::expression_contract(format_args!(
             "list compare type mismatch: {:?} vs {:?}",
             left.data_type(),
             right.data_type()
-        ));
+        )));
     }
     let left_is_null = left.is_null(left_idx);
     let right_is_null = right.is_null(right_idx);
@@ -361,33 +532,33 @@ fn compare_value_recursive_in_list(
         let l = left
             .as_any()
             .downcast_ref::<ListArray>()
-            .ok_or_else(|| "failed to downcast left to ListArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast left to ListArray"))?;
         let r = right
             .as_any()
             .downcast_ref::<ListArray>()
-            .ok_or_else(|| "failed to downcast right to ListArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast right to ListArray"))?;
         return compare_list_rows_non_null(l, left_idx, r, right_idx);
     }
     if matches!(left.data_type(), DataType::Struct(_)) {
         let l = left
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| "failed to downcast left to StructArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast left to StructArray"))?;
         let r = right
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| "failed to downcast right to StructArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast right to StructArray"))?;
         return compare_struct_rows_non_null(l, left_idx, r, right_idx);
     }
     if matches!(left.data_type(), DataType::Map(_, _)) {
         let l = left
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| "failed to downcast left to MapArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast left to MapArray"))?;
         let r = right
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| "failed to downcast right to MapArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast right to MapArray"))?;
         return compare_map_rows_non_null(l, left_idx, r, right_idx);
     }
     compare_scalar_non_null(left, left_idx, right, right_idx)
@@ -398,7 +569,7 @@ fn compare_list_rows_non_null(
     left_row: usize,
     right: &ListArray,
     right_row: usize,
-) -> Result<Ordering, String> {
+) -> Result<Ordering, ExecutionFailure> {
     let left_offsets = left.value_offsets();
     let right_offsets = right.value_offsets();
     let left_start = left_offsets[left_row] as usize;
@@ -427,7 +598,7 @@ fn compare_list_rows(
     left_row: usize,
     right: &ListArray,
     right_row: usize,
-) -> Result<Option<Ordering>, String> {
+) -> Result<Option<Ordering>, ExecutionFailure> {
     if left.is_null(left_row) || right.is_null(right_row) {
         return Ok(None);
     }
@@ -439,16 +610,16 @@ fn compare_struct_rows(
     left_row: usize,
     right: &StructArray,
     right_row: usize,
-) -> Result<Option<Ordering>, String> {
+) -> Result<Option<Ordering>, ExecutionFailure> {
     if left.is_null(left_row) || right.is_null(right_row) {
         return Ok(None);
     }
     if left.columns().len() != right.columns().len() {
-        return Err(format!(
+        return Err(super::expression_contract(format_args!(
             "struct compare field count mismatch: {} vs {}",
             left.columns().len(),
             right.columns().len()
-        ));
+        )));
     }
 
     let mut has_unknown = false;
@@ -472,13 +643,13 @@ fn compare_struct_rows_non_null(
     left_row: usize,
     right: &StructArray,
     right_row: usize,
-) -> Result<Ordering, String> {
+) -> Result<Ordering, ExecutionFailure> {
     if left.columns().len() != right.columns().len() {
-        return Err(format!(
+        return Err(super::expression_contract(format_args!(
             "struct compare field count mismatch: {} vs {}",
             left.columns().len(),
             right.columns().len()
-        ));
+        )));
     }
 
     for (left_col, right_col) in left.columns().iter().zip(right.columns()) {
@@ -496,7 +667,7 @@ fn compare_map_rows_non_null(
     left_row: usize,
     right: &MapArray,
     right_row: usize,
-) -> Result<Ordering, String> {
+) -> Result<Ordering, ExecutionFailure> {
     let left_offsets = left.value_offsets();
     let right_offsets = right.value_offsets();
     let left_start = left_offsets[left_row] as usize;
@@ -533,7 +704,7 @@ fn compare_map_rows(
     left_row: usize,
     right: &MapArray,
     right_row: usize,
-) -> Result<Option<Ordering>, String> {
+) -> Result<Option<Ordering>, ExecutionFailure> {
     if left.is_null(left_row) || right.is_null(right_row) {
         return Ok(None);
     }
@@ -560,13 +731,13 @@ fn eq_value_recursive(
     left_idx: usize,
     right: &ArrayRef,
     right_idx: usize,
-) -> Result<Option<bool>, String> {
+) -> Result<Option<bool>, ExecutionFailure> {
     if !comparison_data_types_match(left.data_type(), right.data_type()) {
-        return Err(format!(
+        return Err(super::expression_contract(format_args!(
             "eq type mismatch: {:?} vs {:?}",
             left.data_type(),
             right.data_type()
-        ));
+        )));
     }
     if left.is_null(left_idx) || right.is_null(right_idx) {
         return Ok(None);
@@ -575,33 +746,33 @@ fn eq_value_recursive(
         let l = left
             .as_any()
             .downcast_ref::<ListArray>()
-            .ok_or_else(|| "failed to downcast left to ListArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast left to ListArray"))?;
         let r = right
             .as_any()
             .downcast_ref::<ListArray>()
-            .ok_or_else(|| "failed to downcast right to ListArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast right to ListArray"))?;
         return eq_list_rows(l, left_idx, r, right_idx);
     }
     if matches!(left.data_type(), DataType::Struct(_)) {
         let l = left
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| "failed to downcast left to StructArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast left to StructArray"))?;
         let r = right
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| "failed to downcast right to StructArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast right to StructArray"))?;
         return eq_struct_rows(l, left_idx, r, right_idx);
     }
     if matches!(left.data_type(), DataType::Map(_, _)) {
         let l = left
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| "failed to downcast left to MapArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast left to MapArray"))?;
         let r = right
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| "failed to downcast right to MapArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast right to MapArray"))?;
         return eq_map_rows(l, left_idx, r, right_idx);
     }
     Ok(Some(
@@ -614,13 +785,13 @@ fn eq_value_recursive_nested(
     left_idx: usize,
     right: &ArrayRef,
     right_idx: usize,
-) -> Result<NestedEq, String> {
+) -> Result<NestedEq, ExecutionFailure> {
     if !comparison_data_types_match(left.data_type(), right.data_type()) {
-        return Err(format!(
+        return Err(super::expression_contract(format_args!(
             "nested eq type mismatch: {:?} vs {:?}",
             left.data_type(),
             right.data_type()
-        ));
+        )));
     }
     let left_is_null = left.is_null(left_idx);
     let right_is_null = right.is_null(right_idx);
@@ -634,11 +805,11 @@ fn eq_value_recursive_nested(
         let l = left
             .as_any()
             .downcast_ref::<ListArray>()
-            .ok_or_else(|| "failed to downcast left to ListArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast left to ListArray"))?;
         let r = right
             .as_any()
             .downcast_ref::<ListArray>()
-            .ok_or_else(|| "failed to downcast right to ListArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast right to ListArray"))?;
         return Ok(option_eq_to_nested(eq_list_rows(
             l, left_idx, r, right_idx,
         )?));
@@ -647,11 +818,11 @@ fn eq_value_recursive_nested(
         let l = left
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| "failed to downcast left to StructArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast left to StructArray"))?;
         let r = right
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| "failed to downcast right to StructArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast right to StructArray"))?;
         return Ok(option_eq_to_nested(eq_struct_rows(
             l, left_idx, r, right_idx,
         )?));
@@ -660,11 +831,11 @@ fn eq_value_recursive_nested(
         let l = left
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| "failed to downcast left to MapArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast left to MapArray"))?;
         let r = right
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| "failed to downcast right to MapArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast right to MapArray"))?;
         return Ok(option_eq_to_nested(eq_map_rows(l, left_idx, r, right_idx)?));
     }
     Ok(
@@ -681,7 +852,7 @@ fn eq_list_rows(
     left_row: usize,
     right: &ListArray,
     right_row: usize,
-) -> Result<Option<bool>, String> {
+) -> Result<Option<bool>, ExecutionFailure> {
     if left.is_null(left_row) || right.is_null(right_row) {
         return Ok(None);
     }
@@ -719,16 +890,16 @@ fn eq_struct_rows(
     left_row: usize,
     right: &StructArray,
     right_row: usize,
-) -> Result<Option<bool>, String> {
+) -> Result<Option<bool>, ExecutionFailure> {
     if left.is_null(left_row) || right.is_null(right_row) {
         return Ok(None);
     }
     if left.columns().len() != right.columns().len() {
-        return Err(format!(
+        return Err(super::expression_contract(format_args!(
             "eq struct field count mismatch: {} vs {}",
             left.columns().len(),
             right.columns().len()
-        ));
+        )));
     }
 
     let mut has_unknown = false;
@@ -748,7 +919,7 @@ fn eq_map_rows(
     left_row: usize,
     right: &MapArray,
     right_row: usize,
-) -> Result<Option<bool>, String> {
+) -> Result<Option<bool>, ExecutionFailure> {
     if left.is_null(left_row) || right.is_null(right_row) {
         return Ok(None);
     }
@@ -793,13 +964,13 @@ fn eq_value_recursive_null_safe(
     left_idx: usize,
     right: &ArrayRef,
     right_idx: usize,
-) -> Result<bool, String> {
+) -> Result<bool, ExecutionFailure> {
     if !comparison_data_types_match(left.data_type(), right.data_type()) {
-        return Err(format!(
+        return Err(super::expression_contract(format_args!(
             "null-safe eq type mismatch: {:?} vs {:?}",
             left.data_type(),
             right.data_type()
-        ));
+        )));
     }
     let left_is_null = left.is_null(left_idx);
     let right_is_null = right.is_null(right_idx);
@@ -810,33 +981,33 @@ fn eq_value_recursive_null_safe(
         let l = left
             .as_any()
             .downcast_ref::<ListArray>()
-            .ok_or_else(|| "failed to downcast left to ListArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast left to ListArray"))?;
         let r = right
             .as_any()
             .downcast_ref::<ListArray>()
-            .ok_or_else(|| "failed to downcast right to ListArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast right to ListArray"))?;
         return eq_list_rows_null_safe(l, left_idx, r, right_idx);
     }
     if matches!(left.data_type(), DataType::Struct(_)) {
         let l = left
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| "failed to downcast left to StructArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast left to StructArray"))?;
         let r = right
             .as_any()
             .downcast_ref::<StructArray>()
-            .ok_or_else(|| "failed to downcast right to StructArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast right to StructArray"))?;
         return eq_struct_rows_null_safe(l, left_idx, r, right_idx);
     }
     if matches!(left.data_type(), DataType::Map(_, _)) {
         let l = left
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| "failed to downcast left to MapArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast left to MapArray"))?;
         let r = right
             .as_any()
             .downcast_ref::<MapArray>()
-            .ok_or_else(|| "failed to downcast right to MapArray".to_string())?;
+            .ok_or_else(|| super::expression_contract("failed to downcast right to MapArray"))?;
         return eq_map_rows_null_safe(l, left_idx, r, right_idx);
     }
     Ok(compare_scalar_non_null(left, left_idx, right, right_idx)? == Ordering::Equal)
@@ -847,7 +1018,7 @@ fn eq_list_rows_null_safe(
     left_row: usize,
     right: &ListArray,
     right_row: usize,
-) -> Result<bool, String> {
+) -> Result<bool, ExecutionFailure> {
     let left_is_null = left.is_null(left_row);
     let right_is_null = right.is_null(right_row);
     if left_is_null || right_is_null {
@@ -883,18 +1054,18 @@ fn eq_struct_rows_null_safe(
     left_row: usize,
     right: &StructArray,
     right_row: usize,
-) -> Result<bool, String> {
+) -> Result<bool, ExecutionFailure> {
     let left_is_null = left.is_null(left_row);
     let right_is_null = right.is_null(right_row);
     if left_is_null || right_is_null {
         return Ok(left_is_null && right_is_null);
     }
     if left.columns().len() != right.columns().len() {
-        return Err(format!(
+        return Err(super::expression_contract(format_args!(
             "null-safe eq struct field count mismatch: {} vs {}",
             left.columns().len(),
             right.columns().len()
-        ));
+        )));
     }
 
     for (left_col, right_col) in left.columns().iter().zip(right.columns()) {
@@ -910,7 +1081,7 @@ fn eq_map_rows_null_safe(
     left_row: usize,
     right: &MapArray,
     right_row: usize,
-) -> Result<bool, String> {
+) -> Result<bool, ExecutionFailure> {
     let left_is_null = left.is_null(left_row);
     let right_is_null = right.is_null(right_row);
     if left_is_null || right_is_null {
@@ -946,13 +1117,13 @@ fn eq_map_rows_null_safe(
     Ok(true)
 }
 
-fn eval_null_safe_eq(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String> {
+fn eval_null_safe_eq(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, ExecutionFailure> {
     if !comparison_data_types_match(left.data_type(), right.data_type()) {
-        return Err(format!(
+        return Err(super::expression_contract(format_args!(
             "null-safe eq type mismatch: {:?} vs {:?}",
             left.data_type(),
             right.data_type()
-        ));
+        )));
     }
     let out_len = left.len().max(right.len());
     if out_len == 0 {
@@ -964,12 +1135,12 @@ fn eval_null_safe_eq(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, Stri
         let left_row = if left.len() == 1 { 0 } else { row };
         let right_row = if right.len() == 1 { 0 } else { row };
         if left_row >= left.len() || right_row >= right.len() {
-            return Err(format!(
+            return Err(super::expression_contract(format_args!(
                 "null-safe eq row out of bounds: left_len={} right_len={} row={}",
                 left.len(),
                 right.len(),
                 row
-            ));
+            )));
         }
         let equals = eq_value_recursive_null_safe(left, left_row, right, right_row)?;
         builder.append_value(equals);
@@ -981,16 +1152,16 @@ fn eval_nested_compare<F>(
     left: &ArrayRef,
     right: &ArrayRef,
     predicate: F,
-) -> Result<ArrayRef, String>
+) -> Result<ArrayRef, ExecutionFailure>
 where
     F: Fn(Ordering) -> bool,
 {
     if !comparison_data_types_match(left.data_type(), right.data_type()) {
-        return Err(format!(
+        return Err(super::expression_contract(format_args!(
             "nested compare type mismatch: {:?} vs {:?}",
             left.data_type(),
             right.data_type()
-        ));
+        )));
     }
     let out_len = left.len().max(right.len());
     if out_len == 0 {
@@ -1003,12 +1174,12 @@ where
         let left_row = if left.len() == 1 { 0 } else { row };
         let right_row = if right.len() == 1 { 0 } else { row };
         if left_row >= left.len() || right_row >= right.len() {
-            return Err(format!(
+            return Err(super::expression_contract(format_args!(
                 "nested compare row out of bounds: left_len={} right_len={} row={}",
                 left.len(),
                 right.len(),
                 row
-            ));
+            )));
         }
         match compare_value_recursive(left, left_row, right, right_row)? {
             Some(ord) => builder.append_value(predicate(ord)),
@@ -1018,13 +1189,13 @@ where
     Ok(Arc::new(builder.finish()))
 }
 
-fn eval_nested_eq(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String> {
+fn eval_nested_eq(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, ExecutionFailure> {
     if !comparison_data_types_match(left.data_type(), right.data_type()) {
-        return Err(format!(
+        return Err(super::expression_contract(format_args!(
             "nested eq type mismatch: {:?} vs {:?}",
             left.data_type(),
             right.data_type()
-        ));
+        )));
     }
     let out_len = left.len().max(right.len());
     if out_len == 0 {
@@ -1036,12 +1207,12 @@ fn eval_nested_eq(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String>
         let left_row = if left.len() == 1 { 0 } else { row };
         let right_row = if right.len() == 1 { 0 } else { row };
         if left_row >= left.len() || right_row >= right.len() {
-            return Err(format!(
+            return Err(super::expression_contract(format_args!(
                 "nested eq row out of bounds: left_len={} right_len={} row={}",
                 left.len(),
                 right.len(),
                 row
-            ));
+            )));
         }
         match eq_value_recursive(left, left_row, right, right_row)? {
             Some(value) => builder.append_value(value),
@@ -1051,13 +1222,13 @@ fn eval_nested_eq(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String>
     Ok(Arc::new(builder.finish()))
 }
 
-fn eval_nested_ne(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String> {
+fn eval_nested_ne(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, ExecutionFailure> {
     if !comparison_data_types_match(left.data_type(), right.data_type()) {
-        return Err(format!(
+        return Err(super::expression_contract(format_args!(
             "nested ne type mismatch: {:?} vs {:?}",
             left.data_type(),
             right.data_type()
-        ));
+        )));
     }
     let out_len = left.len().max(right.len());
     if out_len == 0 {
@@ -1069,12 +1240,12 @@ fn eval_nested_ne(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String>
         let left_row = if left.len() == 1 { 0 } else { row };
         let right_row = if right.len() == 1 { 0 } else { row };
         if left_row >= left.len() || right_row >= right.len() {
-            return Err(format!(
+            return Err(super::expression_contract(format_args!(
                 "nested ne row out of bounds: left_len={} right_len={} row={}",
                 left.len(),
                 right.len(),
                 row
-            ));
+            )));
         }
         match eq_value_recursive(left, left_row, right, right_row)? {
             Some(value) => builder.append_value(!value),
@@ -1088,7 +1259,7 @@ fn eval_nested_ne(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String>
 fn normalize_comparison_types(
     left: ArrayRef,
     right: ArrayRef,
-) -> Result<(ArrayRef, ArrayRef), String> {
+) -> Result<(ArrayRef, ArrayRef), ExecutionFailure> {
     let left_type = left.data_type();
     let right_type = right.data_type();
 
@@ -1132,7 +1303,9 @@ fn normalize_comparison_types(
     // Numeric / decimal: delegate the type decision to the single authority,
     // then materialize the cast on both arrays. String / temporal pairs were
     // already handled above; everything else is incompatible.
-    match novarocks_types::comparison_common_type(left_type, right_type)? {
+    match novarocks_types::comparison_common_type(left_type, right_type)
+        .map_err(ExecutionFailure::from_domain)?
+    {
         Some(target) => {
             let left_cast = if left_type == &target {
                 left
@@ -1146,10 +1319,10 @@ fn normalize_comparison_types(
             };
             Ok((left_cast, right_cast))
         }
-        None => Err(format!(
+        None => Err(super::expression_contract(format_args!(
             "Cannot compare incompatible types: {:?} vs {:?}",
             left_type, right_type
-        )),
+        ))),
     }
 }
 
@@ -1195,7 +1368,7 @@ fn comparison_fields_match(
 fn normalize_nested_metadata_only_types(
     left: ArrayRef,
     right: ArrayRef,
-) -> Result<Option<(ArrayRef, ArrayRef)>, String> {
+) -> Result<Option<(ArrayRef, ArrayRef)>, ExecutionFailure> {
     if !matches!(
         left.data_type(),
         DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
@@ -1206,13 +1379,15 @@ fn normalize_nested_metadata_only_types(
         return Ok(None);
     }
     if check_exact(left.data_type(), right.data_type()).is_ok() {
-        let right = retag_column(&right, left.data_type()).map_err(|m| format!("{m:?}"))?;
-        let left = retag_column(&left, right.data_type()).map_err(|m| format!("{m:?}"))?;
+        let right =
+            retag_column(&right, left.data_type()).map_err(ExecutionFailure::from_domain)?;
+        let left = retag_column(&left, right.data_type()).map_err(ExecutionFailure::from_domain)?;
         return Ok(Some((left, right)));
     }
     if check_exact(right.data_type(), left.data_type()).is_ok() {
-        let left = retag_column(&left, right.data_type()).map_err(|m| format!("{m:?}"))?;
-        let right = retag_column(&right, left.data_type()).map_err(|m| format!("{m:?}"))?;
+        let left = retag_column(&left, right.data_type()).map_err(ExecutionFailure::from_domain)?;
+        let right =
+            retag_column(&right, left.data_type()).map_err(ExecutionFailure::from_domain)?;
         return Ok(Some((left, right)));
     }
     Ok(None)
@@ -1227,7 +1402,7 @@ fn same_nested_kind(left: &DataType, right: &DataType) -> bool {
     )
 }
 
-fn nested_comparison_field(left: &Field, right: &Field) -> Result<Option<Field>, String> {
+fn nested_comparison_field(left: &Field, right: &Field) -> Result<Option<Field>, ExecutionFailure> {
     let Some(data_type) = nested_comparison_target_type(left.data_type(), right.data_type())?
     else {
         return Ok(None);
@@ -1245,12 +1420,13 @@ fn nested_comparison_field(left: &Field, right: &Field) -> Result<Option<Field>,
 fn nested_comparison_target_type(
     left: &DataType,
     right: &DataType,
-) -> Result<Option<DataType>, String> {
+) -> Result<Option<DataType>, ExecutionFailure> {
     if left == right {
         return Ok(Some(left.clone()));
     }
     if !same_nested_kind(left, right) {
-        return novarocks_types::comparison_common_type(left, right);
+        return novarocks_types::comparison_common_type(left, right)
+            .map_err(ExecutionFailure::from_domain);
     }
     match (left, right) {
         (DataType::List(left_field), DataType::List(right_field)) => {
@@ -1285,7 +1461,7 @@ fn nested_comparison_target_type(
 fn normalize_nested_comparison_types(
     left: ArrayRef,
     right: ArrayRef,
-) -> Result<Option<(ArrayRef, ArrayRef)>, String> {
+) -> Result<Option<(ArrayRef, ArrayRef)>, ExecutionFailure> {
     if !same_nested_kind(left.data_type(), right.data_type()) {
         return Ok(None);
     }
@@ -1328,7 +1504,7 @@ fn c1_dictionary_string_value_type(data_type: &DataType) -> Option<DataType> {
 fn normalize_dictionary_comparison_types(
     left: ArrayRef,
     right: ArrayRef,
-) -> Result<Option<(ArrayRef, ArrayRef)>, String> {
+) -> Result<Option<(ArrayRef, ArrayRef)>, ExecutionFailure> {
     let left_value_type = c1_dictionary_string_value_type(left.data_type());
     let right_value_type = c1_dictionary_string_value_type(right.data_type());
     match (left_value_type, right_value_type) {
@@ -1340,7 +1516,7 @@ fn normalize_dictionary_comparison_types(
             let right = if right.data_type() == &value_type {
                 right
             } else {
-                cast(&right, &value_type).map_err(|e| e.to_string())?
+                cast(&right, &value_type).map_err(crate::exec::expr::cast::cast_arrow_failure)?
             };
             Ok(Some((left, right)))
         }
@@ -1351,16 +1527,16 @@ fn normalize_dictionary_comparison_types(
             let left = if left.data_type() == &value_type {
                 left
             } else {
-                cast(&left, &value_type).map_err(|e| e.to_string())?
+                cast(&left, &value_type).map_err(crate::exec::expr::cast::cast_arrow_failure)?
             };
             Ok(Some((left, right)))
         }
         (Some(left_value_type), Some(right_value_type)) => {
             if left_value_type != right_value_type {
-                return Err(format!(
+                return Err(super::expression_contract(format_args!(
                     "Cannot compare dictionary arrays with different value types: {:?} vs {:?}",
                     left_value_type, right_value_type
-                ));
+                )));
             }
             Ok(Some((left, right)))
         }
@@ -1373,7 +1549,7 @@ pub fn eval_eq<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
@@ -1383,7 +1559,7 @@ pub fn eval_eq<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     ) {
         return Ok((eval_nested_eq(&l_norm, &r_norm))?);
     }
-    let result = eq(&l_norm, &r_norm).map_err(|e| e.to_string())?;
+    let result = eq(&l_norm, &r_norm).map_err(comparison_arrow_failure)?;
     Ok(Arc::new(result))
 }
 
@@ -1392,7 +1568,7 @@ pub fn eval_eq_for_null<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
@@ -1404,7 +1580,7 @@ pub fn eval_ne<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
@@ -1414,7 +1590,7 @@ pub fn eval_ne<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     ) {
         return Ok((eval_nested_ne(&l_norm, &r_norm))?);
     }
-    let result = neq(&l_norm, &r_norm).map_err(|e| e.to_string())?;
+    let result = neq(&l_norm, &r_norm).map_err(comparison_arrow_failure)?;
     Ok(Arc::new(result))
 }
 
@@ -1423,7 +1599,7 @@ pub fn eval_lt<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
@@ -1433,7 +1609,7 @@ pub fn eval_lt<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     ) {
         return Ok((eval_nested_compare(&l_norm, &r_norm, |ord| ord == Ordering::Less))?);
     }
-    let result = lt(&l_norm, &r_norm).map_err(|e| e.to_string())?;
+    let result = lt(&l_norm, &r_norm).map_err(comparison_arrow_failure)?;
     Ok(Arc::new(result))
 }
 
@@ -1442,7 +1618,7 @@ pub fn eval_le<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
@@ -1454,7 +1630,7 @@ pub fn eval_le<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             ord == Ordering::Less || ord == Ordering::Equal
         }))?);
     }
-    let result = lt_eq(&l_norm, &r_norm).map_err(|e| e.to_string())?;
+    let result = lt_eq(&l_norm, &r_norm).map_err(comparison_arrow_failure)?;
     Ok(Arc::new(result))
 }
 
@@ -1463,7 +1639,7 @@ pub fn eval_gt<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
@@ -1473,7 +1649,7 @@ pub fn eval_gt<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     ) {
         return Ok((eval_nested_compare(&l_norm, &r_norm, |ord| ord == Ordering::Greater))?);
     }
-    let result = gt(&l_norm, &r_norm).map_err(|e| e.to_string())?;
+    let result = gt(&l_norm, &r_norm).map_err(comparison_arrow_failure)?;
     Ok(Arc::new(result))
 }
 
@@ -1482,7 +1658,7 @@ pub fn eval_ge<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
@@ -1494,7 +1670,7 @@ pub fn eval_ge<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             ord == Ordering::Greater || ord == Ordering::Equal
         }))?);
     }
-    let result = gt_eq(&l_norm, &r_norm).map_err(|e| e.to_string())?;
+    let result = gt_eq(&l_norm, &r_norm).map_err(comparison_arrow_failure)?;
     Ok(Arc::new(result))
 }
 
@@ -1503,17 +1679,17 @@ pub fn eval_and<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let l_bool = l
         .as_any()
         .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| "AND left operand must be boolean".to_string())?;
+        .ok_or_else(|| super::expression_contract("AND left operand must be boolean"))?;
     let r_bool = r
         .as_any()
         .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| "AND right operand must be boolean".to_string())?;
+        .ok_or_else(|| super::expression_contract("AND right operand must be boolean"))?;
     // Arrow's boolean kernels treat NULLs as "propagate NULL" in some cases, which does not match
     // SQL three-valued logic (3VL). In SQL:
     //   FALSE AND NULL = FALSE
@@ -1553,17 +1729,17 @@ pub fn eval_or<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let l_bool = l
         .as_any()
         .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| "OR left operand must be boolean".to_string())?;
+        .ok_or_else(|| super::expression_contract("OR left operand must be boolean"))?;
     let r_bool = r
         .as_any()
         .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| "OR right operand must be boolean".to_string())?;
+        .ok_or_else(|| super::expression_contract("OR right operand must be boolean"))?;
     // SQL three-valued logic (3VL):
     //   TRUE  OR NULL = TRUE
     //   FALSE OR NULL = NULL
@@ -1600,11 +1776,11 @@ pub fn eval_not<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     arena: &__Eval,
     child: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let v = arena.eval(child, chunk)?;
 
     if let Some(b) = v.as_any().downcast_ref::<BooleanArray>() {
-        let result = not(b).map_err(|e| e.to_string())?;
+        let result = not(b).map_err(comparison_arrow_failure)?;
         return Ok(Arc::new(result));
     }
 
@@ -1614,7 +1790,7 @@ pub fn eval_not<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let a = v
                 .as_any()
                 .downcast_ref::<arrow::array::Int8Array>()
-                .ok_or_else(|| "NOT operand type mismatch".to_string())?;
+                .ok_or_else(|| super::expression_contract("NOT operand type mismatch"))?;
             for i in 0..a.len() {
                 if a.is_null(i) {
                     builder.append_null();
@@ -1627,7 +1803,7 @@ pub fn eval_not<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let a = v
                 .as_any()
                 .downcast_ref::<arrow::array::Int16Array>()
-                .ok_or_else(|| "NOT operand type mismatch".to_string())?;
+                .ok_or_else(|| super::expression_contract("NOT operand type mismatch"))?;
             for i in 0..a.len() {
                 if a.is_null(i) {
                     builder.append_null();
@@ -1640,7 +1816,7 @@ pub fn eval_not<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let a = v
                 .as_any()
                 .downcast_ref::<arrow::array::Int32Array>()
-                .ok_or_else(|| "NOT operand type mismatch".to_string())?;
+                .ok_or_else(|| super::expression_contract("NOT operand type mismatch"))?;
             for i in 0..a.len() {
                 if a.is_null(i) {
                     builder.append_null();
@@ -1653,7 +1829,7 @@ pub fn eval_not<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let a = v
                 .as_any()
                 .downcast_ref::<arrow::array::Int64Array>()
-                .ok_or_else(|| "NOT operand type mismatch".to_string())?;
+                .ok_or_else(|| super::expression_contract("NOT operand type mismatch"))?;
             for i in 0..a.len() {
                 if a.is_null(i) {
                     builder.append_null();
@@ -1666,7 +1842,7 @@ pub fn eval_not<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let a = v
                 .as_any()
                 .downcast_ref::<arrow::array::Float32Array>()
-                .ok_or_else(|| "NOT operand type mismatch".to_string())?;
+                .ok_or_else(|| super::expression_contract("NOT operand type mismatch"))?;
             for i in 0..a.len() {
                 if a.is_null(i) {
                     builder.append_null();
@@ -1679,7 +1855,7 @@ pub fn eval_not<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let a = v
                 .as_any()
                 .downcast_ref::<arrow::array::Float64Array>()
-                .ok_or_else(|| "NOT operand type mismatch".to_string())?;
+                .ok_or_else(|| super::expression_contract("NOT operand type mismatch"))?;
             for i in 0..a.len() {
                 if a.is_null(i) {
                     builder.append_null();
@@ -1692,7 +1868,7 @@ pub fn eval_not<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             let a = v
                 .as_any()
                 .downcast_ref::<arrow::array::Decimal128Array>()
-                .ok_or_else(|| "NOT operand type mismatch".to_string())?;
+                .ok_or_else(|| super::expression_contract("NOT operand type mismatch"))?;
             for i in 0..a.len() {
                 if a.is_null(i) {
                     builder.append_null();
@@ -1702,9 +1878,10 @@ pub fn eval_not<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             }
         }
         other => {
-            return Err(
-                (format!("NOT operand must be boolean or numeric, got {:?}", other)).into(),
-            );
+            return Err(super::expression_contract(format_args!(
+                "NOT operand must be boolean or numeric, got {:?}",
+                other
+            )));
         }
     }
     Ok(Arc::new(builder.finish()))
@@ -1712,6 +1889,34 @@ pub fn eval_not<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn comparison_literal_retains_real_parser_error_without_text_owner() {
+        use novarocks_failure_contract::FailureProjection;
+        use std::error::Error;
+        let input = Arc::new(String::from("invalid date"));
+        let weak = Arc::downgrade(&input);
+        let error = parse_date32_value(input.as_str()).unwrap_err();
+        drop(input);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(
+            error.failure_fact(),
+            novarocks_functions::DataFailureReason::InvalidValue.failure_fact()
+        );
+        let literal = error
+            .source()
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<ComparisonLiteralFailure>()
+            .unwrap();
+        assert!(literal.source().unwrap().is::<chrono::ParseError>());
+        assert_eq!(parse_date32_value("1970-01-01").unwrap(), 0);
+        assert_eq!(
+            parse_timestamp_micro_value("1969-12-31 23:59:59.999999").unwrap(),
+            -1
+        );
+    }
+
     use super::*;
     use crate::exec::expr::{ExprNode, LiteralValue};
     use arrow::array::{
@@ -2265,7 +2470,7 @@ mod tests {
             .expect_err("numeric literal should not match C1 path");
 
         assert!(
-            err.contains("Cannot compare incompatible types"),
+            err.detail().contains("Cannot compare incompatible types"),
             "unexpected error: {err}"
         );
     }
@@ -2286,7 +2491,7 @@ mod tests {
             .expect_err("non-Int32 dictionary key should fall back");
 
         assert!(
-            err.contains("Cannot compare incompatible types"),
+            err.detail().contains("Cannot compare incompatible types"),
             "unexpected error: {err}"
         );
     }
@@ -2304,7 +2509,7 @@ mod tests {
             .expect_err("non-string dictionary should fall back");
 
         assert!(
-            err.contains("Cannot compare incompatible types"),
+            err.detail().contains("Cannot compare incompatible types"),
             "unexpected error: {err}"
         );
     }

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::ExprId;
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_functions::builtin::calendar_extended_shared::{
@@ -28,18 +28,19 @@ fn eval_date_trunc_inner<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    let output_type = super::common::frozen_type(arena.arena(), expr)?.clone();
     let unit = arena.eval(args[0], chunk)?;
-    unit.as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "date_trunc expects string unit".to_string())?;
+    unit.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        novarocks_functions::builtin::calendar_parts_shared::part_contract(
+            "date_trunc expects string unit",
+        )
+    })?;
     let date = arena.eval(args[1], chunk)?;
     let rows = date.len();
-    let output_type = arena
-        .data_type(expr)
-        .cloned()
-        .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
-    Ok((evaluate_legacy_calendar(CalendarOperation::Trunc, &[unit, date], &output_type, rows))?)
+
+    evaluate_legacy_calendar(CalendarOperation::Trunc, &[unit, date], &output_type, rows)
+        .map_err(Into::into)
 }
 
 pub fn eval_date_trunc<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -47,8 +48,8 @@ pub fn eval_date_trunc<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_date_trunc_inner(arena, expr, args, chunk))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_date_trunc_inner(arena, expr, args, chunk)
 }
 
 pub fn eval_date_floor<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -56,8 +57,8 @@ pub fn eval_date_floor<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
-    Ok((eval_date_trunc_inner(arena, expr, args, chunk))?)
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
+    eval_date_trunc_inner(arena, expr, args, chunk)
 }
 
 pub fn eval_alignment_timestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -65,9 +66,14 @@ pub fn eval_alignment_timestamp<__Eval: crate::exec::expr::ExprEvaluation + ?Siz
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     if args.len() != 2 {
-        return Err(("alignment_timestamp expects 2 args".to_string()).into());
+        return Err(
+            novarocks_functions::builtin::calendar_parts_shared::part_contract(
+                "alignment_timestamp expects 2 args",
+            )
+            .into(),
+        );
     }
-    Ok((eval_date_trunc_inner(arena, expr, args, chunk))?)
+    eval_date_trunc_inner(arena, expr, args, chunk)
 }

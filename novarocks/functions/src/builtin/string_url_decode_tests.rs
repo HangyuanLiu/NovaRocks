@@ -87,7 +87,7 @@ impl PureCompileControl for CompileControl {
             assert!(at <= stop, "compile callback after first cause");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if at == stop => Err(cause),
             _ => Ok(()),
         }
@@ -371,7 +371,7 @@ fn string_url_decode_child_error_is_refused_before_the_ordinary_body() {
     let mut kernel = instance("url_decode", true);
     assert!(matches!(
         kernel.evaluate(selection, &arguments, &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     let after = Control::default();
     assert_eq!(
@@ -384,19 +384,17 @@ fn string_url_decode_child_error_is_refused_before_the_ordinary_body() {
 #[test]
 fn string_url_decode_output_layout_refuses_before_requests() {
     assert_eq!(
-        output_capacity(usize::MAX, 0, 0),
+        output_layout(usize::MAX, 0, 0),
         Err(KernelFailure::ResourceExhausted)
     );
-    assert_eq!(
-        output_capacity(1, i32::MAX as usize + 1, 0),
-        Err(KernelFailure::ResourceExhausted)
-    );
-    assert_eq!(
-        output_capacity(1, 0, usize::MAX),
-        Err(KernelFailure::ResourceExhausted)
-    );
-    assert!(output_capacity(0, 0, 0).is_ok());
-    assert!(output_capacity(3, 12, 2).is_ok());
+    // Per-value/whole-output checks belong to the actual output tally.
+    assert!(output_layout(1, i32::MAX as usize + 1, 0).is_ok());
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let layout = output_layout(1, 0, usize::MAX).unwrap_err();
+    assert_eq!(layout.failure_fact().class(), FailureClass::Resource);
+    assert_eq!(layout.failure_fact().reason().code(), 355);
+    assert!(output_layout(0, 0, 0).is_ok());
+    assert!(output_layout(3, 12, 2).is_ok());
 }
 
 #[test]
@@ -876,7 +874,7 @@ fn string_url_decode_compile_success_and_ordinary_tail_preserve_all_callback_cau
             ] {
                 let control = CompileControl {
                     trace: Mutex::new(vec![]),
-                    refusal: Some((at, cause)),
+                    refusal: Some((at, cause.clone())),
                 };
                 let actual = prepared_for_test_with_control(
                     "url_decode",
@@ -903,4 +901,64 @@ fn string_url_decode_compile_success_and_ordinary_tail_preserve_all_callback_cau
             }
         }
     }
+}
+
+#[test]
+fn required_decode_uses_original_oracles_and_retains_small_utf8_source_with_global_index() {
+    use novarocks_failure_contract::FailureProjection;
+    use std::error::Error;
+    for (input, expected) in ORACLES {
+        let source: ArrayRef = Arc::new(StringArray::from(vec![input]));
+        let output = evaluate_required(&source, 3).unwrap();
+        assert_eq!(
+            output
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![Some(expected); 3]
+        );
+    }
+    let invalid = "a".repeat(300) + "%FF";
+    let source: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("%41"),
+        None,
+        Some(&invalid),
+        Some("%GG"),
+    ]));
+    let weak = Arc::downgrade(&source);
+    let failure = evaluate_required(&source, 4).unwrap_err();
+    drop(source);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(
+        failure.failure_fact(),
+        crate::DataFailureReason::InvalidEncoding.failure_fact()
+    );
+    assert_eq!(
+        failure.to_string(),
+        "url_decode utf8 decode failed: invalid utf-8 sequence of 1 bytes from index 300"
+    );
+    let required = failure
+        .source()
+        .unwrap()
+        .source()
+        .unwrap()
+        .downcast_ref::<RequiredDecodeFailure>()
+        .unwrap();
+    assert_eq!(required.ordinal, 2);
+    let actual = required
+        .source()
+        .unwrap()
+        .source()
+        .unwrap()
+        .downcast_ref::<std::str::Utf8Error>()
+        .unwrap();
+    assert_eq!(actual.valid_up_to(), 44);
+    assert_eq!(actual.error_len(), Some(1));
+    let source: ArrayRef = Arc::new(StringArray::from(vec!["%FF%GG"]));
+    assert_eq!(
+        evaluate_required(&source, 1).unwrap_err().to_string(),
+        "decode string contains illegal hex chars: GG"
+    );
 }

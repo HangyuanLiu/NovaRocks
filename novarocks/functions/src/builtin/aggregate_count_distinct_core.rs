@@ -17,8 +17,7 @@
 //! The COUNT DISTINCT family codec and allocation shape from the original v1.
 //! Numeric DISTINCT sum/avg use a different, fixed-width codec.
 use crate::aggregate_scalar::{
-    self as scalar, AggScalarValue, ScalarStateAllocator, ScalarStateError, ScalarWork,
-    TrackedAggScalarValue,
+    self as scalar, AggScalarValue, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue,
 };
 use allocator_api2::vec::Vec as StateVec;
 use arrow_array::*;
@@ -26,6 +25,8 @@ use arrow_buffer::i256;
 use arrow_schema::{DataType, TimeUnit};
 use hashbrown::{Equivalent, HashSet, hash_map::DefaultHashBuilder};
 use std::hash::{Hash, Hasher};
+#[path = "aggregate_count_distinct_source_failure.rs"]
+mod source_failure;
 
 // allocator-api2 Vec hashes its complete slice but does not implement
 // Borrow<[u8]>. This query uses that same hash without allocating a stored key.
@@ -70,7 +71,7 @@ impl<A: ScalarStateAllocator> CountDistinctState<A> {
         &mut self,
         value: &[u8],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         // Observe the library lookup at its boundaries; this does not observe
         // hashing or collision comparisons inside the hash table.
         work.flush()?;
@@ -81,19 +82,18 @@ impl<A: ScalarStateAllocator> CountDistinctState<A> {
         }
         // Preserve the original reservation order, including table capacity
         // left behind if the subsequent key allocation is refused.
-        self.values.try_reserve(1).map_err(|_| {
+        self.values.try_reserve(1).map_err(|source| {
             self.values
                 .allocator()
-                .scalar_allocation_error("reserve distinct hash set")
+                .scalar_allocation_error("reserve distinct hash set", source)
         })?;
         let key = scalar::scalar_bytes(self.allocator.clone(), value, work)?;
         self.values.insert(key);
         work.flush()?;
         Ok(())
     }
-    pub fn insert(&mut self, value: Vec<u8>) -> Result<(), String> {
+    pub fn insert(&mut self, value: Vec<u8>) -> Result<(), crate::KernelFailure> {
         self.insert_with_work(&value, &mut ScalarWork::new(None))
-            .map_err(|error| error.to_string())
     }
     pub fn clear(&mut self) {
         // Dropping the table releases its capacity, unlike HashSet::clear.
@@ -112,13 +112,13 @@ pub trait CountBuffer<'array> {
         &mut self,
         bytes: &[u8],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError>;
+    ) -> Result<(), crate::KernelFailure>;
     fn bytes(&self) -> &[u8];
     fn raw_borrowed(
         self,
         bytes: &'array [u8],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self, ScalarStateError>
+    ) -> Result<Self, crate::KernelFailure>
     where
         Self: Sized,
     {
@@ -128,7 +128,7 @@ pub trait CountBuffer<'array> {
         mut self,
         bytes: &[u8],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self, ScalarStateError>
+    ) -> Result<Self, crate::KernelFailure>
     where
         Self: Sized,
     {
@@ -141,7 +141,7 @@ impl<'array> CountBuffer<'array> for Vec<u8> {
         &mut self,
         bytes: &[u8],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         self.extend_from_slice(bytes);
         work.flush()
     }
@@ -152,7 +152,7 @@ impl<'array> CountBuffer<'array> for Vec<u8> {
         self,
         bytes: &[u8],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self, ScalarStateError> {
+    ) -> Result<Self, crate::KernelFailure> {
         let key = bytes.to_vec();
         work.flush()?;
         Ok(key)
@@ -163,11 +163,11 @@ impl<'array, A: ScalarStateAllocator> CountBuffer<'array> for StateVec<u8, A> {
         &mut self,
         bytes: &[u8],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         work.flush()?;
-        self.try_reserve(bytes.len()).map_err(|_| {
+        self.try_reserve(bytes.len()).map_err(|source| {
             self.allocator()
-                .scalar_allocation_error("reserve distinct key scratch")
+                .scalar_allocation_error("reserve distinct key scratch", source)
         })?;
         for byte in bytes {
             self.push(*byte);
@@ -268,7 +268,7 @@ fn append_scalar_body<'buffer, V: CountScalarValue, B: CountBuffer<'buffer>>(
     value: &V,
     out: &mut B,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), crate::KernelFailure> {
     let tag = value.tag();
     out.append(&[tag], work)?;
     if let Some((bytes, len)) = value.fixed_bytes() {
@@ -276,7 +276,7 @@ fn append_scalar_body<'buffer, V: CountScalarValue, B: CountBuffer<'buffer>>(
     }
     if let Some(bytes) = value.variable_bytes() {
         out.append(
-            &u32::try_from(bytes.len()).unwrap_or(u32::MAX).to_le_bytes(),
+            &source_failure::encoded_len(source_failure::Length::Bytes, bytes.len())?.to_le_bytes(),
             work,
         )?;
         return out.append(bytes, work);
@@ -285,14 +285,14 @@ fn append_scalar_body<'buffer, V: CountScalarValue, B: CountBuffer<'buffer>>(
         // The recursive v1 tag uses decimal text, unlike direct Decimal256.
         let text = v.to_string();
         out.append(
-            &u32::try_from(text.len()).unwrap_or(u32::MAX).to_le_bytes(),
+            &source_failure::encoded_len(source_failure::Length::DecimalText, text.len())?
+                .to_le_bytes(),
             work,
         )?;
         return out.append(text.as_bytes(), work);
     }
     out.append(
-        &u32::try_from(value.children())
-            .unwrap_or(u32::MAX)
+        &source_failure::encoded_len(source_failure::Length::Children, value.children())?
             .to_le_bytes(),
         work,
     )?;
@@ -308,7 +308,7 @@ pub fn append_optional<'buffer, V: CountScalarValue, B: CountBuffer<'buffer>>(
     value: Option<&V>,
     out: &mut B,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), crate::KernelFailure> {
     match value {
         Some(value) => {
             out.append(&[1], work)?;
@@ -324,17 +324,17 @@ pub trait CountScalarReader {
         array: &ArrayRef,
         row: usize,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Option<Self::Value>, ScalarStateError>;
+    ) -> Result<Option<Self::Value>, crate::KernelFailure>;
 }
-pub struct LegacyCountReader;
-impl CountScalarReader for LegacyCountReader {
+pub struct OwnedCountReader;
+impl CountScalarReader for OwnedCountReader {
     type Value = AggScalarValue;
     fn read(
         &self,
         array: &ArrayRef,
         row: usize,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Option<Self::Value>, ScalarStateError> {
+    ) -> Result<Option<Self::Value>, crate::KernelFailure> {
         work.flush()?;
         scalar::scalar_from_array(array, row, work)
     }
@@ -347,7 +347,7 @@ impl<A: ScalarStateAllocator> CountScalarReader for TrackedCountReader<'_, A> {
         array: &ArrayRef,
         row: usize,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Option<Self::Value>, ScalarStateError> {
+    ) -> Result<Option<Self::Value>, crate::KernelFailure> {
         scalar::tracked_scalar_from_array(array, row, self.0, work)
     }
 }
@@ -358,13 +358,13 @@ pub fn encode_row<'array, R: CountScalarReader, B: CountBuffer<'array>>(
     reader: &R,
     mut out: B,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Option<B>, ScalarStateError> {
+) -> Result<Option<B>, crate::KernelFailure> {
     macro_rules! primitive {
         ($array:ty,$bytes:expr,$error:literal) => {{
             let arr = array
                 .as_any()
                 .downcast_ref::<$array>()
-                .ok_or_else(|| $error.to_string())?;
+                .ok_or_else(|| source_failure::contract($error))?;
             if arr.is_null(row) {
                 return Ok(None);
             }
@@ -447,7 +447,7 @@ pub fn encode_row<'array, R: CountScalarReader, B: CountBuffer<'array>>(
             let arr = array
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+                .ok_or_else(|| source_failure::contract("failed to downcast to StringArray"))?;
             if arr.is_null(row) {
                 return Ok(None);
             }
@@ -457,7 +457,7 @@ pub fn encode_row<'array, R: CountScalarReader, B: CountBuffer<'array>>(
             let arr = array
                 .as_any()
                 .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+                .ok_or_else(|| source_failure::contract("failed to downcast to BinaryArray"))?;
             if arr.is_null(row) {
                 return Ok(None);
             }
@@ -482,7 +482,10 @@ pub fn encode_row<'array, R: CountScalarReader, B: CountBuffer<'array>>(
             append_optional(Some(&value), &mut out, work)?;
             Ok(Some(out))
         }
-        other => Err(format!("unsupported count_distinct input type: {:?}", other).into()),
+        other => Err(source_failure::contract(format_args!(
+            "unsupported count_distinct input type: {:?}",
+            other
+        ))),
     }
 }
 /// Variadic logical channels are the original packed Struct fields. All fields
@@ -492,7 +495,7 @@ pub fn encode_tuple<'buffer, A: ScalarStateAllocator, B: CountBuffer<'buffer>>(
     allocator: &A,
     mut out: B,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Option<B>, ScalarStateError> {
+) -> Result<Option<B>, crate::KernelFailure> {
     let mut values = scalar::aggregate_vec_with_capacity(
         allocator,
         arguments.len(),
@@ -519,11 +522,19 @@ pub fn serialize_set<'buffer, A: ScalarStateAllocator, B: CountBuffer<'buffer>>(
     set: &CountDistinctState<A>,
     mut out: B,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<B, ScalarStateError> {
-    // Deliberately keep v1's u32 casts and iteration order.
-    out.append(&(set.len() as u32).to_le_bytes(), work)?;
+) -> Result<B, crate::KernelFailure> {
+    // Preserve v1 iteration order and length words; reject a nonrepresentable
+    // extent before emitting its fixed-width header.
+    out.append(
+        &source_failure::encoded_len(source_failure::Length::SetCount, set.len())?.to_le_bytes(),
+        work,
+    )?;
     for value in set.iter() {
-        out.append(&(value.len() as u32).to_le_bytes(), work)?;
+        out.append(
+            &source_failure::encoded_len(source_failure::Length::KeyBytes, value.len())?
+                .to_le_bytes(),
+            work,
+        )?;
         out.append(value, work)?;
     }
     Ok(out)
@@ -533,19 +544,19 @@ pub trait CountDecodedKeys {
         &mut self,
         count: usize,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError>;
+    ) -> Result<(), crate::KernelFailure>;
     fn push_key(
         &mut self,
         bytes: &[u8],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError>;
+    ) -> Result<(), crate::KernelFailure>;
 }
 impl CountDecodedKeys for Vec<Vec<u8>> {
     fn begin(
         &mut self,
         count: usize,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         *self = Vec::with_capacity(count);
         work.flush()
     }
@@ -553,7 +564,7 @@ impl CountDecodedKeys for Vec<Vec<u8>> {
         &mut self,
         bytes: &[u8],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         self.push(bytes.to_vec());
         work.flush()
     }
@@ -563,11 +574,11 @@ impl<A: ScalarStateAllocator> CountDecodedKeys for StateVec<StateVec<u8, A>, A> 
         &mut self,
         count: usize,
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         work.flush()?;
-        self.try_reserve_exact(count).map_err(|_| {
+        self.try_reserve_exact(count).map_err(|source| {
             self.allocator()
-                .scalar_allocation_error("reserve distinct decoded keys")
+                .scalar_allocation_error("reserve distinct decoded keys", source)
         })?;
         work.flush()
     }
@@ -575,7 +586,7 @@ impl<A: ScalarStateAllocator> CountDecodedKeys for StateVec<StateVec<u8, A>, A> 
         &mut self,
         bytes: &[u8],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         let value = scalar::scalar_bytes(self.allocator().clone(), bytes, work)?;
         self.push(value);
         work.step()
@@ -585,21 +596,24 @@ pub fn deserialize_set<C: CountDecodedKeys>(
     bytes: &[u8],
     mut output: C,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<C, ScalarStateError> {
-    let invalid = || ScalarStateError::Legacy("invalid distinct set encoding".to_string());
+) -> Result<C, crate::KernelFailure> {
+    let invalid = || source_failure::malformed();
     if bytes.len() < 4 {
         return Err(invalid());
     }
     let count = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-    let mut pos = 4;
+    let mut pos = 4usize;
+    if count > bytes.len().saturating_sub(4) / 4 {
+        return Err(invalid());
+    }
     output.begin(count, work)?;
     for _ in 0..count {
-        if pos + 4 > bytes.len() {
+        if pos.checked_add(4).is_none_or(|end| end > bytes.len()) {
             return Err(invalid());
         }
         let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
-        if pos + len > bytes.len() {
+        if pos.checked_add(len).is_none_or(|end| end > bytes.len()) {
             return Err(invalid());
         }
         output.push_key(&bytes[pos..pos + len], work)?;
@@ -612,17 +626,19 @@ pub fn merge_decoded<A: ScalarStateAllocator>(
     state: &mut CountDistinctState<A>,
     values: impl IntoIterator<Item = impl AsRef<[u8]>>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), crate::KernelFailure> {
     for value in values {
         state.insert_with_work(value.as_ref(), work)?;
     }
     Ok(())
 }
-pub fn finalize_count<A: ScalarStateAllocator>(set: &CountDistinctState<A>) -> i64 {
-    set.len() as i64
+pub fn finalize_count<A: ScalarStateAllocator>(
+    set: &CountDistinctState<A>,
+) -> Result<i64, crate::KernelFailure> {
+    source_failure::cardinality(set.len())
 }
 
-pub fn validate_legacy_source_type(ty: &DataType) -> Result<(), String> {
+pub fn validate_source_type(ty: &DataType) -> Result<(), crate::KernelFailure> {
     match ty {
         DataType::Null
         | DataType::Int8
@@ -640,23 +656,23 @@ pub fn validate_legacy_source_type(ty: &DataType) -> Result<(), String> {
         | DataType::Decimal256(..)
         | DataType::List(_)
         | DataType::Struct(_) => Ok(()),
-        other => Err(format!(
+        other => Err(source_failure::contract(format_args!(
             "unsupported count_distinct input type: {:?}",
             other
-        )),
+        ))),
     }
 }
 
 /// Original top-level dispatch checks concrete primitive carriers before rows.
 /// Nested readers only downcast when a nonnull row is actually read.
-pub fn validate_legacy_array(array: &ArrayRef) -> Result<(), String> {
+pub fn validate_source_array(array: &ArrayRef) -> Result<(), crate::KernelFailure> {
     macro_rules! carrier {
         ($ty:ty,$message:literal) => {
             array
                 .as_any()
                 .downcast_ref::<$ty>()
                 .map(|_| ())
-                .ok_or_else(|| $message.to_string())
+                .ok_or_else(|| source_failure::contract($message))
         };
     }
     match array.data_type() {
@@ -692,7 +708,7 @@ pub fn validate_legacy_array(array: &ArrayRef) -> Result<(), String> {
             TimestampNanosecondArray,
             "failed to downcast to TimestampNanosecondArray"
         ),
-        ty => validate_legacy_source_type(ty),
+        ty => validate_source_type(ty),
     }
 }
 
@@ -717,11 +733,11 @@ impl<'array, A: ScalarStateAllocator> CountBuffer<'array> for SelectedCountKey<'
         &mut self,
         bytes: &[u8],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<(), ScalarStateError> {
+    ) -> Result<(), crate::KernelFailure> {
         match self {
             Self::Owned(out) => CountBuffer::append(out, bytes, work),
-            _ => Err(ScalarStateError::Legacy(
-                "COUNT DISTINCT raw key cannot be extended".to_string(),
+            _ => Err(source_failure::contract(
+                "COUNT DISTINCT raw key cannot be extended",
             )),
         }
     }
@@ -736,11 +752,12 @@ impl<'array, A: ScalarStateAllocator> CountBuffer<'array> for SelectedCountKey<'
         self,
         source: &[u8],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self, ScalarStateError> {
-        assert!(
-            source.len() <= 32,
-            "native COUNT DISTINCT numeric key is at most 32 bytes"
-        );
+    ) -> Result<Self, crate::KernelFailure> {
+        if source.len() > 32 {
+            return Err(source_failure::contract(
+                "native COUNT DISTINCT numeric key is at most 32 bytes",
+            ));
+        }
         let mut bytes = [0; 32];
         bytes[..source.len()].copy_from_slice(source);
         work.step()?;
@@ -753,7 +770,7 @@ impl<'array, A: ScalarStateAllocator> CountBuffer<'array> for SelectedCountKey<'
         self,
         bytes: &'array [u8],
         work: &mut ScalarWork<'_, '_>,
-    ) -> Result<Self, ScalarStateError> {
+    ) -> Result<Self, crate::KernelFailure> {
         work.step()?;
         Ok(Self::Borrowed(bytes))
     }

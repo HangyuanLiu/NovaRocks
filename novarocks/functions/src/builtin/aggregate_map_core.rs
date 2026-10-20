@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Original MAP_AGG computation, parameterized only by its actual state allocator.
+use super::aggregate_map_source_failure as failure;
+use crate::KernelFailure;
+use crate::aggregate_scalar::checked_map_output_offset;
 use crate::aggregate_scalar::{
-    AggScalarValue, ScalarStateAllocator, ScalarStateError, ScalarWork, TrackedAggScalarValue,
-    build_scalar_array, tracked_scalar_from_array, tracked_scalar_to_output,
+    AggScalarValue, ScalarStateAllocator, ScalarWork, TrackedAggScalarValue, build_scalar_array,
+    tracked_scalar_from_array, tracked_scalar_to_output,
 };
 use crate::aggregate_scalar_fingerprint::tracked_key_fingerprint;
 use allocator_api2::vec::Vec as ScalarVec;
@@ -49,7 +52,7 @@ pub fn append_entry<A: ScalarStateAllocator>(
     key: TrackedAggScalarValue<A>,
     value: Option<TrackedAggScalarValue<A>>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), KernelFailure> {
     append_entry_observed(state, key, value, work, &mut |_| Ok(()))
 }
 pub fn append_entry_observed<A: ScalarStateAllocator>(
@@ -57,8 +60,8 @@ pub fn append_entry_observed<A: ScalarStateAllocator>(
     key: TrackedAggScalarValue<A>,
     value: Option<TrackedAggScalarValue<A>>,
     work: &mut ScalarWork<'_, '_>,
-    inserted_key: &mut dyn FnMut(usize) -> Result<(), ScalarStateError>,
-) -> Result<(), ScalarStateError> {
+    inserted_key: &mut dyn FnMut(usize) -> Result<(), KernelFailure>,
+) -> Result<(), KernelFailure> {
     let key_fp = tracked_key_fingerprint(&key, &state.allocator, work)?;
     work.flush()?;
     let duplicate = state.seen_keys.contains(&key_fp);
@@ -67,16 +70,16 @@ pub fn append_entry_observed<A: ScalarStateAllocator>(
         return Ok(());
     }
     work.flush()?;
-    state.seen_keys.try_reserve(1).map_err(|_| {
+    state.seen_keys.try_reserve(1).map_err(|source| {
         state
             .allocator
-            .scalar_allocation_error("reserve map_agg key set")
+            .scalar_allocation_error("reserve map_agg key set", source)
     })?;
     work.flush()?;
-    state.entries.try_reserve(1).map_err(|_| {
+    state.entries.try_reserve(1).map_err(|source| {
         state
             .allocator
-            .scalar_allocation_error("reserve map_agg entries")
+            .scalar_allocation_error("reserve map_agg entries", source)
     })?;
     work.flush()?;
     let key_capacity = key_fp.capacity();
@@ -92,13 +95,13 @@ pub struct MapUpdateInput {
     pub keys: ArrayRef,
     pub values: ArrayRef,
 }
-pub fn update_input(array: &ArrayRef) -> Result<MapUpdateInput, ScalarStateError> {
+pub fn update_input(array: &ArrayRef) -> Result<MapUpdateInput, KernelFailure> {
     let struct_arr = array
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| "map_agg expects struct input".to_string())?;
+        .ok_or_else(|| failure::contract("map_agg expects struct input"))?;
     if struct_arr.num_columns() != 2 {
-        return Err("map_agg expects 2 arguments".to_string().into());
+        return Err(failure::contract("map_agg expects 2 arguments"));
     }
     Ok(MapUpdateInput {
         keys: struct_arr.column(0).clone(),
@@ -111,7 +114,7 @@ pub fn update_row<A: ScalarStateAllocator>(
     input: &MapUpdateInput,
     row: usize,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), KernelFailure> {
     update_from_arrays_observed(
         state,
         &input.keys,
@@ -130,8 +133,8 @@ pub fn update_from_arrays_observed<A: ScalarStateAllocator>(
     values: &ArrayRef,
     value_row: usize,
     work: &mut ScalarWork<'_, '_>,
-    inserted_key: &mut dyn FnMut(usize) -> Result<(), ScalarStateError>,
-) -> Result<(), ScalarStateError> {
+    inserted_key: &mut dyn FnMut(usize) -> Result<(), KernelFailure>,
+) -> Result<(), KernelFailure> {
     work.step()?;
     let Some(key) = tracked_scalar_from_array(keys, key_row, &state.allocator, work)? else {
         return Ok(());
@@ -144,11 +147,11 @@ pub struct MapMergeInput<'a> {
     keys: ArrayRef,
     values: ArrayRef,
 }
-pub fn merge_input(array: &ArrayRef) -> Result<MapMergeInput<'_>, ScalarStateError> {
+pub fn merge_input(array: &ArrayRef) -> Result<MapMergeInput<'_>, KernelFailure> {
     let map = array
         .as_any()
         .downcast_ref::<MapArray>()
-        .ok_or_else(|| "map_agg merge input must be MapArray".to_string())?;
+        .ok_or_else(|| failure::contract("map_agg merge input must be MapArray"))?;
     Ok(MapMergeInput {
         map,
         keys: map.keys().clone(),
@@ -160,7 +163,7 @@ pub fn merge_row<A: ScalarStateAllocator>(
     input: &MapMergeInput<'_>,
     row: usize,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<(), ScalarStateError> {
+) -> Result<(), KernelFailure> {
     merge_row_observed(state, input, row, work, &mut |_| Ok(()))
 }
 pub fn merge_row_observed<A: ScalarStateAllocator>(
@@ -168,8 +171,8 @@ pub fn merge_row_observed<A: ScalarStateAllocator>(
     input: &MapMergeInput<'_>,
     row: usize,
     work: &mut ScalarWork<'_, '_>,
-    inserted_key: &mut dyn FnMut(usize) -> Result<(), ScalarStateError>,
-) -> Result<(), ScalarStateError> {
+    inserted_key: &mut dyn FnMut(usize) -> Result<(), KernelFailure>,
+) -> Result<(), KernelFailure> {
     work.step()?;
     if input.map.is_null(row) {
         return Ok(());
@@ -191,7 +194,7 @@ pub fn build_array<'state, A: ScalarStateAllocator, I>(
     target_type: &DataType,
     group_states: I,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ArrayRef, ScalarStateError>
+) -> Result<ArrayRef, KernelFailure>
 where
     I: ExactSizeIterator<Item = &'state MapAggState<A>>,
     A: 'state,
@@ -202,9 +205,9 @@ pub fn build_array_checked_states<'state, A: ScalarStateAllocator, I>(
     target_type: &DataType,
     group_states: I,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<ArrayRef, ScalarStateError>
+) -> Result<ArrayRef, KernelFailure>
 where
-    I: ExactSizeIterator<Item = Result<&'state MapAggState<A>, ScalarStateError>>,
+    I: ExactSizeIterator<Item = Result<&'state MapAggState<A>, KernelFailure>>,
     A: 'state,
 {
     let (map_field, field_defs, ordered) = parse_map_type(target_type)?;
@@ -216,10 +219,11 @@ where
     let mut offsets = Vec::with_capacity(group_states.len() + 1);
     work.flush()?;
     offsets.push(0_i32);
-    let mut current: i64 = 0;
+    let mut current: i32 = 0;
     for state in group_states {
         let state = state?;
         work.step()?;
+        let next = checked_map_output_offset(current, state.entries.len())?;
         for (key, value) in &state.entries {
             work.step()?;
             key_values.push(Some(tracked_scalar_to_output(key, work)?));
@@ -229,29 +233,25 @@ where
                     .map(|value| tracked_scalar_to_output(value, work))
                     .transpose()?,
             );
-            current += 1;
-            if current > i32::MAX as i64 {
-                return Err("map_agg offset overflow".to_string().into());
-            }
         }
-        offsets.push(current as i32);
+        current = next;
+        offsets.push(current);
     }
     let mut out_keys = build_scalar_array(key_type, key_values, work)?;
     let mut out_values = build_scalar_array(value_type, value_values, work)?;
     if out_keys.data_type() != field_defs[0].data_type() {
         work.flush()?;
-        out_keys = cast(&out_keys, field_defs[0].data_type())
-            .map_err(|e| format!("map_agg failed to cast output key: {}", e))?;
+        out_keys = cast(&out_keys, field_defs[0].data_type()).map_err(failure::constructor)?;
         work.flush()?;
     }
     if out_values.data_type() != field_defs[1].data_type() {
         work.flush()?;
-        out_values = cast(&out_values, field_defs[1].data_type())
-            .map_err(|e| format!("map_agg failed to cast output value: {}", e))?;
+        out_values = cast(&out_values, field_defs[1].data_type()).map_err(failure::constructor)?;
         work.flush()?;
     }
     work.flush()?;
-    let entries = StructArray::new(field_defs, vec![out_keys, out_values], None);
+    let entries = StructArray::try_new(field_defs, vec![out_keys, out_values], None)
+        .map_err(failure::constructor)?;
     let out = MapArray::try_new(
         map_field,
         OffsetBuffer::new(offsets.into()),
@@ -259,21 +259,24 @@ where
         None,
         ordered,
     )
-    .map_err(|e| format!("map_agg: {}", e))?;
+    .map_err(failure::constructor)?;
     work.flush()?;
     Ok(Arc::new(out))
 }
-pub fn parse_map_type(ty: &DataType) -> Result<(Arc<Field>, Fields, bool), ScalarStateError> {
+pub fn parse_map_type(ty: &DataType) -> Result<(Arc<Field>, Fields, bool), KernelFailure> {
     let DataType::Map(field, ordered) = ty else {
-        return Err(format!("map_agg output type must be MAP, got {:?}", ty).into());
+        return Err(failure::contract(format_args!(
+            "map_agg output type must be MAP, got {:?}",
+            ty
+        )));
     };
     let DataType::Struct(fields) = field.data_type().clone() else {
-        return Err("map_agg map entries type must be STRUCT".to_string().into());
+        return Err(failure::contract("map_agg map entries type must be STRUCT"));
     };
     if fields.len() != 2 {
-        return Err("map_agg map entries type must have 2 fields"
-            .to_string()
-            .into());
+        return Err(failure::contract(
+            "map_agg map entries type must have 2 fields",
+        ));
     }
     Ok((field.clone(), fields, *ordered))
 }

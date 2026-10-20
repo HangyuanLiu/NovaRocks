@@ -56,7 +56,7 @@ pub(crate) struct Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
-        let (active, stop) = *self.state.lock().unwrap();
+        let (active, stop) = self.state.lock().unwrap().clone();
         if !active {
             return Ok(());
         }
@@ -899,7 +899,8 @@ fn unpivot_original_control_every_small_success_and_ordinary_prefix_and_real_qua
             assert!(trace.last().is_some_and(|(_, units)| *units > 0));
             for at in 0..trace.len() {
                 for cause in CAUSES {
-                    let (result, actual) = control_case(decode, ordinary, Some((at, cause)));
+                    let (result, actual) =
+                        control_case(decode, ordinary, Some((at, cause.clone())));
                     assert!(matches!(result,Err(Error::Control(actual))if actual==cause));
                     assert_eq!(actual, trace[..=at]);
                 }
@@ -911,7 +912,7 @@ fn unpivot_original_control_every_small_success_and_ordinary_prefix_and_real_qua
     fixture.with_tokens(&c,|values,expressions,read|{
         let mut node=source();spec_mut(&mut node).mappings[0].constants=vec![p::UnpivotConstant::Scalar(p::ExprId::new(0));320].into_boxed_slice();
         c.arm(None);let(wire,_)=encode_unpivot_node(&node,values,expressions,SOURCE,limits()).unwrap();let trace=c.trace();let at=trace.iter().position(|(_,units)|*units==256).expect("actual source kind loop quantum");
-        for cause in CAUSES{c.arm(Some((at,cause)));assert!(matches!(encode_unpivot_node(&node,values,expressions,SOURCE,limits()),Err(Error::Control(actual))if actual==cause));assert_eq!(c.trace(),trace[..=at]);}
+        for cause in CAUSES{c.arm(Some((at,cause.clone())));assert!(matches!(encode_unpivot_node(&node,values,expressions,SOURCE,limits()),Err(Error::Control(actual))if actual==cause));assert_eq!(c.trace(),trace[..=at]);}
         c.arm(None);decode_unpivot_node(&wire,read,SOURCE,limits()).unwrap();assert!(c.trace().iter().any(|(_,units)|*units==256));
     });
 }

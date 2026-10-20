@@ -49,6 +49,7 @@ use super::native_compatibility::{
     raw_acquire_admission_ticket, raw_apply_task_operations_until, raw_establish,
     raw_operation_envelope, raw_unary, raw_unary_response, raw_unary_until,
 };
+use super::query_lifecycle::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use super::query_lifecycle::{
     NID2_FENCE_QUERY, arm_on_every_backend, assert_two_sleep_rows, await_backend_exit,
     await_fresh_task_create, await_resource_convergence, await_terminal_snapshot,
@@ -79,7 +80,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(FrozenReplayAndMembership::default()),
         Box::new(CreationPayloadLifetime),
-        Box::new(FixedPlanRecovery),
+        Box::new(FixedPlanRecovery::default()),
         Box::new(NormalCloseCapacity {
             byte_limited: false,
         }),
@@ -166,15 +167,15 @@ impl Scenario for FrozenReplayAndMembership {
         let first = RawCreate::values(&session, 1);
         let accepted = session.apply(first.operation(), "first CreateTask")?;
         ensure!(
-            outcome(&accepted) == proto::TaskOperationOutcome::Accepted,
+            outcome(&accepted)? == proto::TaskOperationOutcome::Accepted,
             "the first legal create must win, got {accepted:?}"
         );
-        let original = accepted
+        let original = receipt_verdict(&accepted)?
             .ack
             .clone()
             .context("the winning create returned no acknowledgement")?;
         ensure!(
-            matches!(original, proto::task_operation_receipt::Ack::CreateTask(_)),
+            matches!(original, proto::task_operation_verdict::Ack::CreateTask(_)),
             "the winning create acknowledged something other than a task: {original:?}"
         );
         await_count(context, "the winner's create marker", 1, applied)?;
@@ -192,11 +193,11 @@ impl Scenario for FrozenReplayAndMembership {
         let changed = session.apply(variant.operation(), "changed-body CreateTask replay")?;
         for (label, replay) in [("exact", &exact), ("changed-body", &changed)] {
             ensure!(
-                outcome(replay) == proto::TaskOperationOutcome::Idempotent,
+                outcome(replay)? == proto::TaskOperationOutcome::Idempotent,
                 "an {label} replay of a created identity must be idempotent, got {replay:?}"
             );
             ensure!(
-                replay
+                receipt_verdict(replay)?
                     .ack
                     .as_ref()
                     .is_some_and(|ack| same_create_entity(&original, ack)),
@@ -232,12 +233,12 @@ impl Scenario for FrozenReplayAndMembership {
         ] {
             request.max_wait_millis = 50;
             let receipt = session.apply(request.operation(), label)?;
-            let verdict = outcome(&receipt);
+            let verdict = outcome(&receipt)?;
             ensure!(
                 !matches!(
                     verdict,
                     proto::TaskOperationOutcome::Accepted | proto::TaskOperationOutcome::Idempotent
-                ) && receipt.ack.is_none(),
+                ) && receipt_verdict(&receipt)?.ack.is_none(),
                 "a create under {label} read or created a task: {receipt:?}"
             );
             scope_outcomes.push(format!("{label}={verdict:?}"));
@@ -264,7 +265,7 @@ impl Scenario for FrozenReplayAndMembership {
         }];
         let refusal = session.apply(refused.operation(), "CreateTask naming an unfrozen edge")?;
         ensure!(
-            outcome(&refusal) == proto::TaskOperationOutcome::Accepted,
+            outcome(&refusal)? == proto::TaskOperationOutcome::Accepted,
             "the task is accepted before its initial domain is interpreted, got {refusal:?}"
         );
         await_count(
@@ -279,13 +280,11 @@ impl Scenario for FrozenReplayAndMembership {
             legal.operation(),
             "legal body replay after failed preparation",
         )?;
+        let refusal_ack = receipt_verdict(&refusal)?.ack.as_ref();
         ensure!(
-            outcome(&won) == proto::TaskOperationOutcome::Idempotent
-                && won.ack.as_ref().is_some_and(|ack| {
-                    refusal
-                        .ack
-                        .as_ref()
-                        .is_some_and(|first| same_create_entity(first, ack))
+            outcome(&won)? == proto::TaskOperationOutcome::Idempotent
+                && receipt_verdict(&won)?.ack.as_ref().is_some_and(|ack| {
+                    refusal_ack.is_some_and(|first| same_create_entity(first, ack))
                 }),
             "a failed accepted identity cannot be replaced by another body, got {won:?}"
         );
@@ -300,14 +299,14 @@ impl Scenario for FrozenReplayAndMembership {
         // After release nothing is created again.
         let released = session.release_when_ready(context)?;
         let after = session.apply(first.operation(), "CreateTask replay after release")?;
-        let verdict = outcome(&after);
+        let verdict = outcome(&after)?;
         ensure!(
             verdict != proto::TaskOperationOutcome::Accepted,
             "a replay after release created a task again: {after:?}"
         );
         if verdict == proto::TaskOperationOutcome::Idempotent {
             ensure!(
-                after
+                receipt_verdict(&after)?
                     .ack
                     .as_ref()
                     .is_some_and(|ack| same_create_entity(&original, ack)),
@@ -434,13 +433,10 @@ impl RawBackendSession {
             raw_acquire_admission_ticket(query_context.clone(), compatibility, admission_epoch),
             "admission ticket acquisition",
         )?;
-        let Some(proto::task_operation_receipt::Ack::QueryContextAdmissionTicket(ticket)) =
-            acquisition.ack
+        let Some(proto::task_operation_verdict::Ack::QueryContextAdmissionTicket(ticket)) =
+            receipt_verdict(&acquisition)?.ack.clone()
         else {
-            bail!(
-                "admission acquisition was not granted: {:?}",
-                acquisition.outcome
-            );
+            bail!("admission acquisition was not granted: {:?}", acquisition);
         };
         let ticket = ticket
             .ticket_id
@@ -449,7 +445,7 @@ impl RawBackendSession {
         let establish = session.apply(establish_request.clone(), "Establish")?;
         session.establish_request = Some(establish_request);
         ensure!(
-            outcome(&establish) == proto::TaskOperationOutcome::Accepted,
+            outcome(&establish)? == proto::TaskOperationOutcome::Accepted,
             "the raw Establish must be accepted, got {establish:?}"
         );
         Ok(session)
@@ -524,7 +520,8 @@ impl RawBackendSession {
             self.original_deadline,
         )?;
         let receipt = only_successful_receipt(quiesce, "QuiesceQueryContext")?;
-        let Some(proto::task_operation_receipt::Ack::QuiesceQueryContext(fence)) = receipt.ack
+        let Some(proto::task_operation_verdict::Ack::QuiesceQueryContext(fence)) =
+            receipt_verdict(&receipt)?.ack.clone()
         else {
             bail!("normal context fence returned no Quiesce acknowledgement: {receipt:?}");
         };
@@ -557,7 +554,8 @@ impl RawBackendSession {
                     self.original_deadline,
                 )?;
             let receipt = only_successful_receipt(response, "ReleaseQueryContext")?;
-            let Some(proto::task_operation_receipt::Ack::ReleaseQueryContext(ack)) = receipt.ack
+            let Some(proto::task_operation_verdict::Ack::ReleaseQueryContext(ack)) =
+                receipt_verdict(&receipt)?.ack.clone()
             else {
                 bail!("the release returned no release acknowledgement: {receipt:?}");
             };
@@ -971,18 +969,88 @@ impl RawCreate {
     }
 }
 
-pub(super) fn outcome(receipt: &proto::TaskOperationReceipt) -> proto::TaskOperationOutcome {
-    proto::TaskOperationOutcome::try_from(receipt.outcome)
-        .unwrap_or(proto::TaskOperationOutcome::Unspecified)
+/// ACKs and protocol outcomes belong only to the explicit Verdict branch.
+pub(super) fn receipt_verdict(
+    receipt: &proto::TaskOperationReceipt,
+) -> Result<&proto::TaskOperationVerdict> {
+    novarocks_task_codec::operation::decode_receipt_header(
+        receipt,
+        novarocks_proto_codec::FieldPath::root("scenario_receipt"),
+    )?;
+    match receipt
+        .result
+        .as_ref()
+        .context("receipt omitted its mandatory result")?
+    {
+        proto::task_operation_receipt::Result::Verdict(verdict) => Ok(verdict),
+        proto::task_operation_receipt::Result::DomainFailure(failure) => {
+            bail!(
+                "expected a protocol verdict, got the producer's domain failure without an ACK: {failure:?}"
+            )
+        }
+    }
+}
+
+pub(super) fn outcome(
+    receipt: &proto::TaskOperationReceipt,
+) -> Result<proto::TaskOperationOutcome> {
+    Ok(proto::TaskOperationOutcome::try_from(
+        receipt_verdict(receipt)?.outcome,
+    )?)
+}
+
+/// This capacity author rejects with a domain failure; it is not a Task conclusion.
+fn normal_close_outcome(
+    receipt: &proto::TaskOperationReceipt,
+) -> Result<proto::TaskOperationOutcome> {
+    let header = novarocks_task_codec::operation::decode_receipt_header(
+        receipt,
+        novarocks_proto_codec::FieldPath::root("normal_close_capacity_receipt"),
+    )?;
+    match receipt
+        .result
+        .as_ref()
+        .context("capacity receipt omitted its result")?
+    {
+        proto::task_operation_receipt::Result::Verdict(_) => {
+            let outcome = outcome(receipt)?;
+            ensure!(
+                outcome != proto::TaskOperationOutcome::ResourceExhausted,
+                "normal-close capacity must retain its producer's domain failure: {receipt:?}"
+            );
+            Ok(outcome)
+        }
+        proto::task_operation_receipt::Result::DomainFailure(failure) => {
+            let novarocks_execution_contract::operation::OperationResult::DomainFailure {
+                failure: original,
+                ..
+            } = header.result()
+            else {
+                bail!("capacity decoder lost the producer's domain failure: {receipt:?}");
+            };
+            ensure!(
+                original.fact().class()
+                    == novarocks_execution_contract::failure::FailureClass::Resource
+                    && original.fact().resource().is_some(),
+                "normal-close capacity lost the producer's resource facts: {failure:?}"
+            );
+            let outcome = proto::TaskOperationOutcome::try_from(failure.outcome)?;
+            ensure!(
+                outcome == proto::TaskOperationOutcome::ResourceExhausted,
+                "normal-close capacity returned another domain failure: {failure:?}"
+            );
+            Ok(outcome)
+        }
+    }
 }
 
 fn same_create_entity(
-    original: &proto::task_operation_receipt::Ack,
-    replay: &proto::task_operation_receipt::Ack,
+    original: &proto::task_operation_verdict::Ack,
+    replay: &proto::task_operation_verdict::Ack,
 ) -> bool {
     let (
-        proto::task_operation_receipt::Ack::CreateTask(original),
-        proto::task_operation_receipt::Ack::CreateTask(replay),
+        proto::task_operation_verdict::Ack::CreateTask(original),
+        proto::task_operation_verdict::Ack::CreateTask(replay),
     ) = (original, replay)
     else {
         return false;
@@ -1334,7 +1402,10 @@ impl PendingRead {
 /// completes on replacement attempt 2 through the real actor authorization
 /// and recovery path, and the frontend freezes exactly as many static plans
 /// for it as for the clean run: the recovery attempt encoded none of its own.
-struct FixedPlanRecovery;
+#[derive(Default)]
+struct FixedPlanRecovery {
+    intent: SqlIntentOwner,
+}
 
 impl Scenario for FixedPlanRecovery {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
@@ -1350,17 +1421,66 @@ impl Scenario for FixedPlanRecovery {
         "native-creation/fixed-plan-recovery"
     }
 
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &std::path::Path,
+        cluster_size: usize,
+        binary: &std::path::Path,
+        deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let clean = StatementSpec {
+            sql: NID2_FENCE_QUERY.into(),
+            faults: Vec::new(),
+            observations: (0..cluster_size)
+                .map(|index| (index, "grpc-fragment", Some(1)))
+                .collect(),
+        };
+        let recovery = StatementSpec {
+            sql: NID2_FENCE_QUERY.into(),
+            faults: Vec::new(),
+            observations: (0..cluster_size)
+                .flat_map(|index| {
+                    [1, 2].map(move |attempt| (index, "grpc-fragment", Some(attempt)))
+                })
+                .collect(),
+        };
+        Ok(Some(self.intent.freeze(
+            vec![clean, recovery],
+            &[0, 1, 2],
+            cluster_size,
+            binary,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_snapshot(context)?;
         let idle = FrontendCreationGauges::scrape(context)?;
 
         // The reference: how many static plans one clean run freezes.
-        let before_clean = latest_execution_id(context)?;
-        let pending = PendingRead::start(context, NID2_FENCE_QUERY)?;
-        let rows = pending.finish(context)?;
+        let mut clean = mysql_actor::connect_until(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.deadline(),
+        )?;
+        let clean_observation =
+            self.intent
+                .take(0)?
+                .arm(context, clean.connection_id(), NID2_FENCE_QUERY)?;
+        let rows: Vec<i64> = clean
+            .query(NID2_FENCE_QUERY)
+            .context("the clean delayed read failed")?;
         ensure!(rows.len() == 2, "the clean read returned {rows:?}");
-        let clean_terminal = await_terminal_snapshot(context, before_clean.as_deref())?;
+        let deadline = context.deadline();
+        let clean_terminal = context
+            .handle()
+            .await_query_lifecycle_statement_observation(&clean_observation, true, deadline)?;
+        context
+            .handle()
+            .drain_query_lifecycle_statement_observation(&clean_observation)?;
+        clean.finish()?;
         ensure!(
             clean_terminal.attempt_id == 1,
             "the clean read unexpectedly ran attempt {}",
@@ -1379,17 +1499,20 @@ impl Scenario for FixedPlanRecovery {
 
         // The recovery: kill the backend that admitted a task before any row
         // is read, so the statement must complete on a replacement attempt.
-        let before_recovery = latest_execution_id(context)?;
         let frozen_before = FrontendCreationGauges::scrape(context)?;
         let created_before = (0..context.handle().be_count())
             .map(|index| context.handle().be_log_count(index, CREATE_APPLIED))
             .collect::<Result<Vec<_>>>()?;
-        let mut stream = MysqlStream::query(
+        let mut stream = MysqlStream::connect(
             context.mysql_user(),
             context.mysql_port(),
-            NID2_FENCE_QUERY,
             context.remaining("open the recovered read")?,
         )?;
+        let recovery_observation =
+            self.intent
+                .take(1)?
+                .arm(context, stream.connection_id()?, NID2_FENCE_QUERY)?;
+        stream.send_query(NID2_FENCE_QUERY)?;
         let target = await_fresh_task_create(context, &created_before)?;
         context
             .handle()
@@ -1397,7 +1520,14 @@ impl Scenario for FixedPlanRecovery {
             .with_context(|| format!("kill admitted BE[{target}]"))?;
         await_backend_exit(context, target)?;
         assert_two_sleep_rows(&mut stream)?;
-        let terminal = await_terminal_snapshot(context, before_recovery.as_deref())?;
+        let deadline = context.deadline();
+        let terminal = context
+            .handle()
+            .await_query_lifecycle_statement_observation(&recovery_observation, true, deadline)?;
+        context
+            .handle()
+            .drain_query_lifecycle_statement_observation(&recovery_observation)?;
+        stream.shutdown()?;
         ensure!(
             terminal.attempt_id == 2,
             "the read must complete on replacement attempt 2, got attempt {}",
@@ -1486,7 +1616,7 @@ impl Scenario for NormalCloseCapacity {
         let refused = loop {
             let create = receiver(&live, active.len() as u32 + 1);
             let receipt = live.apply(create.operation(), "fill normal-close capacity")?;
-            match outcome(&receipt) {
+            match normal_close_outcome(&receipt)? {
                 proto::TaskOperationOutcome::Accepted => {
                     await_installed(context, &live, &create)?;
                     active.push(create);
@@ -1558,7 +1688,7 @@ impl Scenario for NormalCloseCapacity {
                 recovered_create.operation(),
                 "admission after normal-close horizon",
             )?;
-            match outcome(&receipt) {
+            match normal_close_outcome(&receipt)? {
                 proto::TaskOperationOutcome::Accepted => break,
                 proto::TaskOperationOutcome::ResourceExhausted => {
                     thread::sleep(
@@ -1589,7 +1719,7 @@ impl Scenario for NormalCloseCapacity {
 pub(super) fn ensure_accepted(session: &RawBackendSession, create: &RawCreate) -> Result<()> {
     let receipt = session.apply(create.operation(), "accept the capacity receiver")?;
     ensure!(
-        outcome(&receipt) == proto::TaskOperationOutcome::Accepted,
+        outcome(&receipt)? == proto::TaskOperationOutcome::Accepted,
         "receiver Create was not accepted: {receipt:?}"
     );
     Ok(())
@@ -1601,8 +1731,10 @@ fn ensure_capacity_refused(session: &RawBackendSession, create: &RawCreate) -> R
         "refuse admission at occupied normal-close capacity",
     )?;
     ensure!(
-        outcome(&receipt) == proto::TaskOperationOutcome::ResourceExhausted
-            && receipt.ack.is_none(),
+        matches!(
+            receipt.result.as_ref(),
+            Some(proto::task_operation_receipt::Result::DomainFailure(_))
+        ) && normal_close_outcome(&receipt)? == proto::TaskOperationOutcome::ResourceExhausted,
         "occupied normal-close capacity must reject before Accepted: {receipt:?}"
     );
     Ok(())
@@ -1615,7 +1747,9 @@ pub(super) fn await_installed(
 ) -> Result<()> {
     loop {
         let receipt = session.apply(create.operation(), "observe exact receiver installation")?;
-        let Some(proto::task_operation_receipt::Ack::CreateTask(ack)) = receipt.ack else {
+        let Some(proto::task_operation_verdict::Ack::CreateTask(ack)) =
+            receipt_verdict(&receipt)?.ack.clone()
+        else {
             bail!("accepted receiver replay omitted its Create acknowledgement: {receipt:?}");
         };
         let status = ack
@@ -1737,7 +1871,9 @@ impl Scenario for AcceptedPreparationControlRaces {
         loop {
             let receipt =
                 session.apply(failed.operation(), "observe retained preparation failure")?;
-            let Some(proto::task_operation_receipt::Ack::CreateTask(ack)) = receipt.ack else {
+            let Some(proto::task_operation_verdict::Ack::CreateTask(ack)) =
+                receipt_verdict(&receipt)?.ack.clone()
+            else {
                 bail!("failed accepted identity lost its Create acknowledgement: {receipt:?}");
             };
             let status = ack
@@ -1764,7 +1900,7 @@ impl Scenario for AcceptedPreparationControlRaces {
             "legal replay of failed accepted identity",
         )?;
         ensure!(
-            outcome(&replay) == proto::TaskOperationOutcome::Idempotent,
+            outcome(&replay)? == proto::TaskOperationOutcome::Idempotent,
             "a failed accepted identity was replaced: {replay:?}"
         );
         context.action("an invalid initial domain was Accepted, then retained an explicit preparation failure; a later legal body replay was Idempotent for the spent identity");
@@ -1787,7 +1923,7 @@ impl Scenario for AcceptedPreparationControlRaces {
         )?;
         ensure!(
             matches!(
-                outcome(&cancel),
+                outcome(&cancel)?,
                 proto::TaskOperationOutcome::Accepted | proto::TaskOperationOutcome::Idempotent
             ),
             "normal Cancel of the installed receiver was not accepted: {cancel:?}"
@@ -1818,8 +1954,8 @@ impl Scenario for AcceptedPreparationControlRaces {
         let late = receiver(4);
         let rejected = session.apply(late.operation(), "late Create after Quiesce")?;
         ensure!(
-            outcome(&rejected) == proto::TaskOperationOutcome::ContextTerminalReceipt
-                && rejected.ack.is_none(),
+            outcome(&rejected)? == proto::TaskOperationOutcome::ContextTerminalReceipt
+                && receipt_verdict(&rejected)?.ack.is_none(),
             "Quiesce admitted a late identity: {rejected:?}"
         );
         for _ in 0..2 {
@@ -1832,12 +1968,14 @@ impl Scenario for AcceptedPreparationControlRaces {
             )?;
             ensure!(
                 !matches!(
-                    outcome(&duplicate),
+                    outcome(&duplicate)?,
                     proto::TaskOperationOutcome::Accepted | proto::TaskOperationOutcome::NotReady
                 ),
                 "duplicate Establish reopened admission: {duplicate:?}"
             );
-            if let Some(proto::task_operation_receipt::Ack::QueryContext(ack)) = duplicate.ack {
+            if let Some(proto::task_operation_verdict::Ack::QueryContext(ack)) =
+                receipt_verdict(&duplicate)?.ack.clone()
+            {
                 ensure!(
                     ack.state != proto::QueryContextState::Active as i32
                         && ack.state != proto::QueryContextState::Establishing as i32,
@@ -1847,8 +1985,8 @@ impl Scenario for AcceptedPreparationControlRaces {
             let rejected =
                 session.apply(late.operation(), "late Create after duplicate Establish")?;
             ensure!(
-                outcome(&rejected) == proto::TaskOperationOutcome::ContextTerminalReceipt
-                    && rejected.ack.is_none(),
+                outcome(&rejected)? == proto::TaskOperationOutcome::ContextTerminalReceipt
+                    && receipt_verdict(&rejected)?.ack.is_none(),
                 "duplicate Establish revived late Create: {rejected:?}"
             );
         }
@@ -1868,13 +2006,13 @@ impl Scenario for AcceptedPreparationControlRaces {
             "original Establish after normal Release",
         )?;
         ensure!(
-            outcome(&late_establish) == proto::TaskOperationOutcome::ContextTerminalReceipt,
+            outcome(&late_establish)? == proto::TaskOperationOutcome::ContextTerminalReceipt,
             "late Establish revived a released Context: {late_establish:?}"
         );
         let late_create = session.apply(late.operation(), "late Create after normal Release")?;
         ensure!(
-            outcome(&late_create) == proto::TaskOperationOutcome::ContextTerminalReceipt
-                && late_create.ack.is_none(),
+            outcome(&late_create)? == proto::TaskOperationOutcome::ContextTerminalReceipt
+                && receipt_verdict(&late_create)?.ack.is_none(),
             "late Create revived a released Context: {late_create:?}"
         );
         let after_release = quiesce_session(&session)?;
@@ -1929,7 +2067,9 @@ pub(super) fn quiesce_session(
             },
         ),
     )?;
-    let Some(proto::task_operation_receipt::Ack::QuiesceQueryContext(ack)) = receipt.ack else {
+    let Some(proto::task_operation_verdict::Ack::QuiesceQueryContext(ack)) =
+        receipt_verdict(&receipt)?.ack.clone()
+    else {
         bail!("Quiesce omitted the exact fence acknowledgement: {receipt:?}");
     };
     Ok(ack)

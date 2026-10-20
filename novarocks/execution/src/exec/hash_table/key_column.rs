@@ -39,6 +39,75 @@ use super::key_builder::{
     encode_group_key_row_tracked,
 };
 
+use super::key_builder::{
+    GroupKeyOutputKind, GroupKeyOutputTally, group_key_decode_arrow, group_key_decode_utf8,
+    group_key_decoding_contract, group_key_request_arithmetic,
+};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionReason};
+
+#[derive(Debug)]
+struct KeyColumnContract(novarocks_failure_contract::BoundedDetail);
+impl std::fmt::Display for KeyColumnContract {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+impl std::error::Error for KeyColumnContract {}
+impl novarocks_failure_contract::FailureProjection for KeyColumnContract {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            ExecutionReason::KeyColumnContract.reason(),
+        )
+    }
+}
+fn key_column_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
+    ExecutionFailure::from_domain(KeyColumnContract(
+        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
+    ))
+}
+#[derive(Debug)]
+struct KeyColumnNarrowing<E> {
+    source: E,
+    value: i64,
+    target: novarocks_failure_contract::BoundedDetail,
+}
+impl<E: std::error::Error> std::fmt::Display for KeyColumnNarrowing<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stored group key {} cannot fit frozen {}: {}",
+            self.value,
+            self.target.as_str(),
+            self.source
+        )
+    }
+}
+impl<E: std::error::Error + 'static> std::error::Error for KeyColumnNarrowing<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl<E> novarocks_failure_contract::FailureProjection for KeyColumnNarrowing<E> {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        novarocks_failure_contract::FailureFact::new(
+            novarocks_failure_contract::FailureClass::Invariant,
+            ExecutionReason::KeyColumnNarrowing.reason(),
+        )
+    }
+}
+fn key_column_narrowing<E: std::error::Error + Send + Sync + 'static>(
+    source: E,
+    value: i64,
+    target: &str,
+) -> ExecutionFailure {
+    ExecutionFailure::from_domain(KeyColumnNarrowing {
+        source,
+        value,
+        target: novarocks_failure_contract::BoundedDetail::truncating(target),
+    })
+}
+
 fn float32_key_equal(left: f32, right: f32) -> bool {
     (left.is_nan() && right.is_nan()) || left == right
 }
@@ -73,7 +142,7 @@ impl<T> RetainedVec<T> {
             .saturating_add(nested_retained_bytes);
     }
 
-    fn try_reserve_one(&mut self, operation: &str) -> Result<(), String> {
+    fn try_reserve_one(&mut self, operation: &str) -> Result<(), ExecutionFailure> {
         reserve_one(&mut self.values, operation)
     }
 
@@ -202,7 +271,7 @@ impl KeyColumn {
         &mut self,
         view: &GroupKeyArrayView<'_>,
         row: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExecutionFailure> {
         match self {
             KeyColumn::Int8 { values, nulls } => reserve_value_and_null(values, nulls, "int8"),
             KeyColumn::Int16 { values, nulls } => reserve_value_and_null(values, nulls, "int16"),
@@ -265,18 +334,19 @@ impl KeyColumn {
         nulls: &mut AggregateVec<u8>,
         value: Option<i64>,
         type_name: &str,
-    ) -> Result<(), String>
+    ) -> Result<(), ExecutionFailure>
     where
         T: TryFrom<i64>,
+        T::Error: std::error::Error + Send + Sync + 'static,
     {
         if let Some(value) = value {
             let casted = T::try_from(value)
-                .map_err(|_| format!("group key {} overflow: {}", type_name, value))?;
+                .map_err(|source| key_column_narrowing(source, value, type_name))?;
             values.push(casted);
             nulls.push(1);
         } else {
             let zero =
-                T::try_from(0i64).map_err(|_| format!("group key {} zero overflow", type_name))?;
+                T::try_from(0i64).map_err(|source| key_column_narrowing(source, 0, type_name))?;
             values.push(zero);
             nulls.push(0);
         }
@@ -289,41 +359,50 @@ impl KeyColumn {
         group_id: usize,
         value: Option<i64>,
         type_name: &str,
-    ) -> Result<bool, String>
+    ) -> Result<bool, ExecutionFailure>
     where
         T: TryFrom<i64> + PartialEq,
+        T::Error: std::error::Error + Send + Sync + 'static,
     {
         let stored = values
             .get(group_id)
-            .ok_or_else(|| "group key index out of bounds".to_string())?;
+            .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
         let valid = *nulls
             .get(group_id)
-            .ok_or_else(|| "group key index out of bounds".to_string())?
+            .ok_or_else(|| key_column_contract("group key index out of bounds"))?
             != 0;
         match value {
             Some(value) => {
                 let casted = T::try_from(value)
-                    .map_err(|_| format!("group key {} overflow: {}", type_name, value))?;
+                    .map_err(|source| key_column_narrowing(source, value, type_name))?;
                 Ok(valid && *stored == casted)
             }
             None => Ok(!valid),
         }
     }
 
-    fn largeint_value_at(arr: &FixedSizeBinaryArray, row: usize) -> Result<Option<i128>, String> {
+    fn largeint_value_at(
+        arr: &FixedSizeBinaryArray,
+        row: usize,
+    ) -> Result<Option<i128>, ExecutionFailure> {
         if arr.is_null(row) {
             return Ok(None);
         }
-        largeint::i128_from_be_bytes(arr.value(row))
-            .map(Some)
-            .map_err(|e| format!("group key LARGEINT decode failed at row {}: {}", row, e))
+        if arr.value_length() != largeint::LARGEINT_BYTE_WIDTH {
+            return Err(key_column_contract(
+                "stored LARGEINT physical width differs from frozen width",
+            ));
+        }
+        Ok(Some(i128::from_be_bytes(
+            arr.value(row).try_into().expect("validated LARGEINT width"),
+        )))
     }
 
     pub fn push_value_from_view(
         &mut self,
         view: &GroupKeyArrayView<'_>,
         row: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExecutionFailure> {
         match (self, view) {
             (KeyColumn::Int8 { values, nulls }, GroupKeyArrayView::Int(view)) => {
                 Self::push_int_value(values, nulls, view.value_at(row), "int8")
@@ -512,7 +591,9 @@ impl KeyColumn {
                 let mut items = AggregateVec::new_in(allocator.clone());
                 items
                     .try_reserve_exact(end.saturating_sub(start))
-                    .map_err(|_| allocator.allocation_error("reserve list-utf8 group-key items"))?;
+                    .map_err(|source| {
+                        allocator.allocation_error("reserve list-utf8 group-key items", source)
+                    })?;
                 for index in start..end {
                     if values.is_null(index) {
                         items.push(None);
@@ -551,8 +632,8 @@ impl KeyColumn {
                 let mut items = AggregateVec::new_in(allocator.clone());
                 items
                     .try_reserve_exact(end.saturating_sub(start))
-                    .map_err(|_| {
-                        allocator.allocation_error("reserve list-int32 group-key items")
+                    .map_err(|source| {
+                        allocator.allocation_error("reserve list-int32 group-key items", source)
                     })?;
                 for index in start..end {
                     items.push((!values.is_null(index)).then(|| values.value(index)));
@@ -569,7 +650,7 @@ impl KeyColumn {
                 keys.push(encoded, retained_bytes);
                 Ok(())
             }
-            _ => Err("group by key type mismatch".to_string()),
+            _ => Err(key_column_contract("group by key type mismatch")),
         }
     }
 
@@ -578,7 +659,7 @@ impl KeyColumn {
         group_id: usize,
         view: &GroupKeyArrayView<'_>,
         row: usize,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, ExecutionFailure> {
         match (self, view) {
             (KeyColumn::Int8 { values, nulls }, GroupKeyArrayView::Int(view)) => {
                 Self::int_value_equals(values, nulls, group_id, view.value_at(row), "int8")
@@ -595,10 +676,10 @@ impl KeyColumn {
             (KeyColumn::Float32 { values, nulls }, GroupKeyArrayView::Float(view)) => {
                 let stored = values
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 let valid = *nulls
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?
                     != 0;
                 match view.value_at(row) {
                     Some(value) => Ok(valid && float32_key_equal(*stored, value as f32)),
@@ -608,10 +689,10 @@ impl KeyColumn {
             (KeyColumn::Float64 { values, nulls }, GroupKeyArrayView::Float(view)) => {
                 let stored = values
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 let valid = *nulls
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?
                     != 0;
                 match view.value_at(row) {
                     Some(value) => Ok(valid && float64_key_equal(*stored, value)),
@@ -621,10 +702,10 @@ impl KeyColumn {
             (KeyColumn::Boolean { values, nulls }, GroupKeyArrayView::Boolean(arr)) => {
                 let stored = values
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 let valid = *nulls
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?
                     != 0;
                 let value = (!arr.is_null(row)).then(|| arr.value(row));
                 match value {
@@ -642,7 +723,7 @@ impl KeyColumn {
             ) => {
                 let valid = *nulls
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?
                     != 0;
                 let value = (!arr.is_null(row)).then(|| arr.value(row));
                 match value {
@@ -652,10 +733,10 @@ impl KeyColumn {
                         }
                         let start = *offsets
                             .get(group_id)
-                            .ok_or_else(|| "group key index out of bounds".to_string())?;
+                            .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                         let end = *offsets
                             .get(group_id + 1)
-                            .ok_or_else(|| "group key index out of bounds".to_string())?;
+                            .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                         Ok(data
                             .get(start..end)
                             .is_some_and(|bytes| bytes == value.as_bytes()))
@@ -673,7 +754,7 @@ impl KeyColumn {
             ) => {
                 let valid = *nulls
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?
                     != 0;
                 let Some(code) = dict.code_at(row)? else {
                     return Ok(!valid);
@@ -683,20 +764,20 @@ impl KeyColumn {
                 }
                 let start = *offsets
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 let end = *offsets
                     .get(group_id + 1)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 let current = dict.value_bytes_for_code(code)?;
                 Ok(data.get(start..end).is_some_and(|bytes| bytes == current))
             }
             (KeyColumn::Date32 { values, nulls }, GroupKeyArrayView::Date32(arr)) => {
                 let stored = values
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 let valid = *nulls
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?
                     != 0;
                 let value = (!arr.is_null(row)).then(|| arr.value(row));
                 match value {
@@ -710,10 +791,10 @@ impl KeyColumn {
             ) => {
                 let stored = values
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 let valid = *nulls
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?
                     != 0;
                 let value = (!arr.is_null(row)).then(|| arr.value(row));
                 match value {
@@ -727,10 +808,10 @@ impl KeyColumn {
             ) => {
                 let stored = values
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 let valid = *nulls
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?
                     != 0;
                 let value = (!arr.is_null(row)).then(|| arr.value(row));
                 match value {
@@ -744,10 +825,10 @@ impl KeyColumn {
             ) => {
                 let stored = values
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 let valid = *nulls
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?
                     != 0;
                 let value = (!arr.is_null(row)).then(|| arr.value(row));
                 match value {
@@ -761,10 +842,10 @@ impl KeyColumn {
             ) => {
                 let stored = values
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 let valid = *nulls
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?
                     != 0;
                 let value = (!arr.is_null(row)).then(|| arr.value(row));
                 match value {
@@ -775,10 +856,10 @@ impl KeyColumn {
             (KeyColumn::Decimal128 { values, nulls, .. }, GroupKeyArrayView::Decimal128(arr)) => {
                 let stored = values
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 let valid = *nulls
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?
                     != 0;
                 let value = (!arr.is_null(row)).then(|| arr.value(row));
                 match value {
@@ -789,10 +870,10 @@ impl KeyColumn {
             (KeyColumn::Decimal256 { values, nulls, .. }, GroupKeyArrayView::Decimal256(arr)) => {
                 let stored = values
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 let valid = *nulls
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?
                     != 0;
                 let value = (!arr.is_null(row)).then(|| arr.value(row));
                 match value {
@@ -806,10 +887,10 @@ impl KeyColumn {
             ) => {
                 let stored = values
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 let valid = *nulls
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?
                     != 0;
                 match Self::largeint_value_at(arr, row)? {
                     Some(value) => Ok(valid && *stored == value),
@@ -822,7 +903,7 @@ impl KeyColumn {
             ) => {
                 let saved = stored
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 if list.is_null(row) {
                     return Ok(saved.is_none());
                 }
@@ -852,7 +933,7 @@ impl KeyColumn {
             ) => {
                 let saved = stored
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 if list.is_null(row) {
                     return Ok(saved.is_none());
                 }
@@ -876,18 +957,18 @@ impl KeyColumn {
             (KeyColumn::Complex { keys, .. }, GroupKeyArrayView::Complex(array)) => {
                 let saved = keys
                     .get(group_id)
-                    .ok_or_else(|| "group key index out of bounds".to_string())?;
+                    .ok_or_else(|| key_column_contract("group key index out of bounds"))?;
                 match (saved, array.is_null(row)) {
                     (None, true) => Ok(true),
                     (None, false) | (Some(_), true) => Ok(false),
                     (Some(saved), false) => canonical_group_key_equals(array, row, saved),
                 }
             }
-            _ => Err("group by key type mismatch".to_string()),
+            _ => Err(key_column_contract("group by key type mismatch")),
         }
     }
 
-    pub fn to_array(&self) -> Result<ArrayRef, String> {
+    pub fn to_array(&self) -> Result<ArrayRef, ExecutionFailure> {
         match self {
             KeyColumn::Int8 { values, nulls } => {
                 let mut builder = Int8Builder::new();
@@ -971,10 +1052,24 @@ impl KeyColumn {
                 data,
                 nulls,
             } => {
-                let mut builder = StringBuilder::new();
-                if offsets.len() < nulls.len() + 1 {
-                    return Err("group key offsets out of bounds".to_string());
+                if offsets.len() <= nulls.len() {
+                    return Err(key_column_contract("group key offsets out of bounds"));
                 }
+                let mut extent = GroupKeyOutputTally::default();
+                for idx in 0..nulls.len() {
+                    if nulls[idx] != 0 {
+                        let length =
+                            offsets[idx + 1].checked_sub(offsets[idx]).ok_or_else(|| {
+                                key_column_contract("stored UTF8 offsets are not monotone")
+                            })?;
+                        if offsets[idx + 1] > data.len() {
+                            return Err(key_column_contract("stored UTF8 offset exceeds backing"));
+                        }
+                        extent.add(length)?;
+                    }
+                }
+                extent.finish(GroupKeyOutputKind::Utf8)?;
+                let mut builder = StringBuilder::new();
                 for idx in 0..nulls.len() {
                     if nulls[idx] == 0 {
                         builder.append_null();
@@ -984,8 +1079,8 @@ impl KeyColumn {
                     let end = offsets[idx + 1];
                     let bytes = data
                         .get(start..end)
-                        .ok_or_else(|| "group key utf8 slice out of bounds".to_string())?;
-                    let value = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+                        .ok_or_else(|| key_column_contract("group key utf8 slice out of bounds"))?;
+                    let value = std::str::from_utf8(bytes).map_err(group_key_decode_utf8)?;
                     builder.append_value(value);
                 }
                 Ok(Arc::new(builder.finish()))
@@ -1067,7 +1162,7 @@ impl KeyColumn {
                 }
                 let array = Decimal128Array::from(out)
                     .with_precision_and_scale(*precision, *scale)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(group_key_decode_arrow)?;
                 Ok(Arc::new(array))
             }
             KeyColumn::Decimal256 {
@@ -1086,7 +1181,7 @@ impl KeyColumn {
                 }
                 let array = Decimal256Array::from(out)
                     .with_precision_and_scale(*precision, *scale)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(group_key_decode_arrow)?;
                 Ok(Arc::new(array))
             }
             KeyColumn::LargeIntBinary { values, nulls } => {
@@ -1098,9 +1193,26 @@ impl KeyColumn {
                         out.push(None);
                     }
                 }
-                largeint::array_from_i128(&out)
+                Ok(
+                    novarocks_functions::largeint::array_from_i128_observed(&out, &mut |_| {
+                        Ok::<_, std::convert::Infallible>(())
+                    })
+                    .unwrap_or_else(|never| match never {}),
+                )
             }
             KeyColumn::ListUtf8 { values } => {
+                let mut extent = GroupKeyOutputTally::default();
+                for items in values.iter().flatten() {
+                    extent.add(items.len())?;
+                }
+                extent.finish(GroupKeyOutputKind::List)?;
+                let mut bytes_extent = GroupKeyOutputTally::default();
+                for items in values.iter().flatten() {
+                    for bytes in items.iter().flatten() {
+                        bytes_extent.add(bytes.len())?;
+                    }
+                }
+                bytes_extent.finish(GroupKeyOutputKind::Utf8)?;
                 let mut flat = Vec::<Option<String>>::new();
                 let mut offsets = Vec::with_capacity(values.len() + 1);
                 offsets.push(0_i32);
@@ -1113,21 +1225,14 @@ impl KeyColumn {
                             offsets.push(current as i32);
                         }
                         Some(items) => {
-                            current = current
-                                .checked_add(items.len() as i64)
-                                .ok_or_else(|| "group key list offset overflow".to_string())?;
-                            if current > i32::MAX as i64 {
-                                return Err("group key list offset overflow".to_string());
-                            }
+                            current += items.len() as i64;
                             for item in items {
                                 flat.push(
                                     item.as_ref()
                                         .map(|bytes| {
-                                            String::from_utf8(bytes.to_vec()).map_err(|error| {
-                                                format!(
-                                                    "stored list-utf8 group key is invalid: {error}"
-                                                )
-                                            })
+                                            std::str::from_utf8(bytes)
+                                                .map(str::to_owned)
+                                                .map_err(group_key_decode_utf8)
                                         })
                                         .transpose()?,
                                 );
@@ -1139,15 +1244,21 @@ impl KeyColumn {
                 }
                 let item_array = Arc::new(StringArray::from(flat)) as ArrayRef;
                 let field = Arc::new(Field::new("item", DataType::Utf8, true));
-                let array = ListArray::new(
+                let array = ListArray::try_new(
                     field,
                     OffsetBuffer::new(offsets.into()),
                     item_array,
                     nulls.finish(),
-                );
+                )
+                .map_err(group_key_decode_arrow)?;
                 Ok(Arc::new(array))
             }
             KeyColumn::ListInt32 { values } => {
+                let mut extent = GroupKeyOutputTally::default();
+                for items in values.iter().flatten() {
+                    extent.add(items.len())?;
+                }
+                extent.finish(GroupKeyOutputKind::List)?;
                 let mut flat = Vec::<Option<i32>>::new();
                 let mut offsets = Vec::with_capacity(values.len() + 1);
                 offsets.push(0_i32);
@@ -1160,12 +1271,7 @@ impl KeyColumn {
                             offsets.push(current as i32);
                         }
                         Some(items) => {
-                            current = current
-                                .checked_add(items.len() as i64)
-                                .ok_or_else(|| "group key list offset overflow".to_string())?;
-                            if current > i32::MAX as i64 {
-                                return Err("group key list offset overflow".to_string());
-                            }
+                            current += items.len() as i64;
                             flat.extend(items.iter().copied());
                             nulls.append_non_null();
                             offsets.push(current as i32);
@@ -1174,12 +1280,13 @@ impl KeyColumn {
                 }
                 let item_array = Arc::new(Int32Array::from(flat)) as ArrayRef;
                 let field = Arc::new(Field::new("item", DataType::Int32, true));
-                let array = ListArray::new(
+                let array = ListArray::try_new(
                     field,
                     OffsetBuffer::new(offsets.into()),
                     item_array,
                     nulls.finish(),
-                );
+                )
+                .map_err(group_key_decode_arrow)?;
                 Ok(Arc::new(array))
             }
             KeyColumn::Complex { data_type, keys } => {
@@ -1281,7 +1388,7 @@ impl KeyColumn {
     }
 }
 
-fn reserve_one<T>(values: &mut AggregateVec<T>, operation: &str) -> Result<(), String> {
+fn reserve_one<T>(values: &mut AggregateVec<T>, operation: &str) -> Result<(), ExecutionFailure> {
     reserve_additional(values, 1, operation)
 }
 
@@ -1289,18 +1396,18 @@ fn reserve_additional<T>(
     values: &mut AggregateVec<T>,
     additional: usize,
     operation: &str,
-) -> Result<(), String> {
+) -> Result<(), ExecutionFailure> {
     let allocator = values.allocator().clone();
     values
         .try_reserve(additional)
-        .map_err(|_| allocator.allocation_error(operation))
+        .map_err(|source| ExecutionFailure::from(allocator.allocation_error(operation, source)))
 }
 
 fn reserve_value_and_null<T>(
     values: &mut AggregateVec<T>,
     nulls: &mut AggregateVec<u8>,
     type_name: &str,
-) -> Result<(), String> {
+) -> Result<(), ExecutionFailure> {
     reserve_one(values, &format!("reserve {type_name} group-key values"))?;
     reserve_one(nulls, &format!("reserve {type_name} group-key nulls"))
 }
@@ -1324,7 +1431,7 @@ fn tracked_test_vec<T>(values: Vec<T>, allocator: AggregateAllocator) -> Aggrega
 }
 
 #[cfg(test)]
-pub(crate) fn key_column_from_type(data_type: &DataType) -> Result<KeyColumn, String> {
+pub(crate) fn key_column_from_type(data_type: &DataType) -> Result<KeyColumn, ExecutionFailure> {
     key_column_from_type_in(
         data_type,
         AggregateAllocator::new(MemTracker::new_child(
@@ -1337,7 +1444,7 @@ pub(crate) fn key_column_from_type(data_type: &DataType) -> Result<KeyColumn, St
 pub(crate) fn key_column_from_type_in(
     data_type: &DataType,
     allocator: AggregateAllocator,
-) -> Result<KeyColumn, String> {
+) -> Result<KeyColumn, ExecutionFailure> {
     match data_type {
         DataType::Int8 => Ok(KeyColumn::Int8 {
             values: AggregateVec::new_in(allocator.clone()),
@@ -1369,9 +1476,9 @@ pub(crate) fn key_column_from_type_in(
         }),
         DataType::Utf8 => {
             let mut offsets = AggregateVec::new_in(allocator.clone());
-            offsets
-                .try_reserve_exact(1)
-                .map_err(|_| allocator.allocation_error("initialize group-key offsets"))?;
+            offsets.try_reserve_exact(1).map_err(|source| {
+                allocator.allocation_error("initialize group-key offsets", source)
+            })?;
             offsets.push(0);
             Ok(KeyColumn::Utf8 {
                 offsets,
@@ -1417,7 +1524,7 @@ pub(crate) fn key_column_from_type_in(
                 values: RetainedVec::new_in(allocator.clone()),
             })
         }
-        DataType::Null => Err("group by type is null".to_string()),
+        DataType::Null => Err(key_column_contract("group by type is null")),
         other => Ok(KeyColumn::Complex {
             data_type: other.clone(),
             keys: RetainedVec::new_in(allocator),
@@ -1729,19 +1836,7 @@ impl AggregateOutputCreation {
                             CopyConstructionError::Resource(cause) => {
                                 ConstructionFailure::Resource(cause).into()
                             }
-                            CopyConstructionError::Copy(CopyError::Control(cause)) => cause.into(),
-                            CopyConstructionError::Copy(CopyError::Extent) => {
-                                novarocks_functions::KernelFailure::ResourceExhausted.into()
-                            }
-                            CopyConstructionError::Copy(CopyError::Invalid(message)) => {
-                                ConstructionFailure::InvalidSource(message.into()).into()
-                            }
-                            CopyConstructionError::Copy(CopyError::Unsupported(ty)) => {
-                                ConstructionFailure::InvalidSource(format!(
-                                    "aggregate empty output does not support {ty:?}"
-                                ))
-                                .into()
-                            }
+                            CopyConstructionError::Copy(cause) => cause.into_kernel().into(),
                         }
                     },
                 )?;
@@ -1777,16 +1872,16 @@ pub(crate) fn build_output_schema_from_kernels(
     output_intermediate: bool,
     output_chunk_schema: &ChunkSchemaRef,
     group_key_nullable: Option<&[bool]>,
-) -> Result<SchemaRef, String> {
+) -> Result<SchemaRef, ExecutionFailure> {
     let output_slots = output_chunk_schema.slot_ids();
     let mut fields: Vec<Field> = Vec::with_capacity(key_columns.len() + kernels.len());
     let mut chunk_slots = Vec::with_capacity(key_columns.len() + kernels.len());
     for (idx, col) in key_columns.iter().enumerate() {
         let slot_id = output_slots.get(idx).copied().ok_or_else(|| {
-            format!(
+            key_column_contract(format_args!(
                 "aggregate output slot count mismatch: missing group slot at index {}",
                 idx
-            )
+            ))
         })?;
         let slot_schema = output_chunk_schema.slot(slot_id);
         let runtime_nullable = group_key_nullable
@@ -1809,10 +1904,10 @@ pub(crate) fn build_output_schema_from_kernels(
     for (idx, kernel) in kernels.iter().enumerate() {
         let slot_idx = key_columns.len() + idx;
         let slot_id = output_slots.get(slot_idx).copied().ok_or_else(|| {
-            format!(
+            key_column_contract(format_args!(
                 "aggregate output slot count mismatch: missing agg slot at index {}",
                 slot_idx
-            )
+            ))
         })?;
         let slot_schema = output_chunk_schema.slot(slot_id);
         let field = slot_schema
@@ -1842,11 +1937,11 @@ pub(crate) fn build_output_schema_from_kernels(
     // passthrough slots) that are not part of the final operator output schema we construct here.
     // We only require that the provided output_slots cover the columns we actually output.
     if !output_slots.is_empty() && output_slots.len() < fields.len() {
-        return Err(format!(
+        return Err(key_column_contract(format_args!(
             "aggregate output slot count mismatch: slots={} columns={}",
             output_slots.len(),
             fields.len()
-        ));
+        )));
     }
     let _chunk_schema = ChunkSchema::try_new(chunk_slots)?;
     Ok(Arc::new(Schema::new(fields)))
@@ -2257,6 +2352,61 @@ mod typed_output_owner_tests {
         drop(arena);
         drop(factory);
         drop(errors);
+        assert_eq!(tracker.current(), 0);
+    }
+}
+
+#[cfg(test)]
+mod typed_key_column_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    #[test]
+    fn malformed_stored_utf8_preserves_source_without_extending_the_state_owner() {
+        let tracker = MemTracker::new_root("typed-key-column-source");
+        let weak = Arc::downgrade(&tracker);
+        let allocator = AggregateAllocator::new(tracker.clone());
+        let mut column = key_column_from_type_in(&DataType::Utf8, allocator.clone()).unwrap();
+        let array = StringArray::from(vec!["a"]);
+        let view = GroupKeyArrayView::Utf8(&array);
+        column.try_reserve_value_from_view(&view, 0).unwrap();
+        column.push_value_from_view(&view, 0).unwrap();
+        let KeyColumn::Utf8 { data, .. } = &mut column else {
+            unreachable!()
+        };
+        data[0] = 255;
+        let error = column.to_array().unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            error.failure_fact().reason(),
+            ExecutionReason::GroupKeyDecodeUtf8.reason()
+        );
+        drop(column);
+        assert_eq!(tracker.current(), 0);
+        drop(allocator);
+        drop(tracker);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    }
+    #[test]
+    fn internal_integer_narrowing_keeps_original_error_without_partial_push() {
+        let tracker = MemTracker::new_root("typed-key-column-narrowing");
+        let allocator = AggregateAllocator::new(tracker.clone());
+        let mut values = AggregateVec::<i8>::new_in(allocator.clone());
+        let mut nulls = AggregateVec::<u8>::new_in(allocator);
+        values.try_reserve_exact(2).unwrap();
+        nulls.try_reserve_exact(2).unwrap();
+        KeyColumn::push_int_value(&mut values, &mut nulls, Some(127), "Int8").unwrap();
+        let error =
+            KeyColumn::push_int_value(&mut values, &mut nulls, Some(128), "Int8").unwrap_err();
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+        assert_eq!(
+            error.failure_fact().reason(),
+            ExecutionReason::KeyColumnNarrowing.reason()
+        );
+        assert_eq!(values.as_slice(), &[127]);
+        assert_eq!(nulls.as_slice(), &[1]);
+        drop(values);
+        drop(nulls);
         assert_eq!(tracker.current(), 0);
     }
 }

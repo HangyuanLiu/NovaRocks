@@ -121,9 +121,7 @@ impl Drop for TrackedArcCharge {
 }
 fn metadata_request<T>(tracker: &Arc<MemTracker>) -> Result<TrackedArcCharge, ConstructionFailure> {
     let layout = novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<T>())
-        .map_err(|error| {
-        ConstructionFailure::InvalidSource(format!("runtime input metadata request: {error:?}"))
-    })?;
+        .map_err(|error| ConstructionFailure::from(error))?;
     let bytes = i64::try_from(layout.size()).map_err(|_| {
         ConstructionFailure::Control(
             novarocks_type_contract::CompileControlError::ResourceExhausted,
@@ -257,7 +255,10 @@ mod tests {
     }
     fn source() -> Chunk {
         let storage = ValueTypeStorageLifetime::pure();
-        Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+        Chunk::try_new_typed_with_columns_owned_observed::<
+            crate::runtime::fragment::ExecutionFailure,
+            _,
+        >(
             Arc::new(ChunkSchema::try_new_typed(vec![], storage.clone()).unwrap()),
             vec![],
             1,

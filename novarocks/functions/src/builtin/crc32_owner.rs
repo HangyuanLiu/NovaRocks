@@ -697,7 +697,7 @@ mod tests {
     impl PureCompileControl for FailCompile {
         fn checkpoint(&self, _: CompilePhase, work: u32) -> Result<(), CompileControlError> {
             if !self.positive || work > 0 {
-                Err(self.error)
+                Err(self.error.clone())
             } else {
                 Ok(())
             }
@@ -732,7 +732,10 @@ mod tests {
             CompileControlError::ResourceExhausted,
         ] {
             for positive in [false, true] {
-                let control = FailCompile { error, positive };
+                let control = FailCompile {
+                    error: error.clone(),
+                    positive,
+                };
                 assert!(
                     matches!(owner.resolve(request(&arguments), &control), Err(FunctionBindingError::Control(actual)) if actual == error)
                 );
@@ -745,11 +748,7 @@ mod tests {
                 assert!(
                     matches!(specialize_frozen_scalar(&owner, exact, selected.clone(), &facts, ScopedExpressionEffects::pure_value(context()), &control), Err(FunctionSpecializationFailure::Control(actual)) if actual == error)
                 );
-                let expected = match error {
-                    CompileControlError::Cancelled => KernelFailure::Cancelled,
-                    CompileControlError::DeadlineExceeded => KernelFailure::DeadlineExceeded,
-                    CompileControlError::ResourceExhausted => KernelFailure::ResourceExhausted,
-                };
+                let expected = KernelFailure::CompileControl(error.clone());
                 assert!(
                     matches!(owner.prepare_scalar(exact, fresh.prepared().contract().clone(), &control), Err(actual) if std::mem::discriminant(&actual) == std::mem::discriminant(&expected))
                 );

@@ -16,6 +16,7 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::ExecutionFailure;
 use arrow::array::{
     Array, ArrayRef, Decimal128Array, Decimal256Array, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array,
@@ -31,19 +32,13 @@ pub fn eval_abs<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     value_expr: ExprId,
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> Result<ArrayRef, ExecutionFailure> {
     let value = arena.eval(value_expr, chunk)?;
     let output = arena
         .data_type(expr)
-        .ok_or_else(|| "abs: missing output type".to_string())?;
-    Ok(
-        (novarocks_functions::builtin::abs_core::evaluate_abs_core(
-            value,
-            output,
-            &mut |_| Ok(()),
-        )
-        .map_err(|error| error.to_string()))?,
-    )
+        .ok_or_else(|| crate::exec::expr::expression_contract("abs: missing output type"))?;
+    novarocks_functions::builtin::abs_core::evaluate_abs_core(value, output, &mut |_| Ok(()))
+        .map_err(ExecutionFailure::from)
 }
 #[cfg(test)]
 mod tests {
@@ -55,7 +50,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use novarocks_types::SlotId;
 
-    fn prepared_abs(input: ArrayRef, output: DataType) -> Result<ArrayRef, String> {
+    fn prepared_abs(input: ArrayRef, output: DataType) -> Result<ArrayRef, ExecutionFailure> {
         let input_type = input.data_type().clone();
         let schema = Arc::new(Schema::new(vec![Field::new("v", input_type.clone(), true)]));
         let batch = RecordBatch::try_new(schema, vec![input]).unwrap();
@@ -251,7 +246,7 @@ mod tests {
         ] {
             let error = prepared_abs(input, output)
                 .expect_err("an invalid narrow plan must fail checked ABS");
-            assert!(error.contains("abs overflow"), "{error}");
+            assert!(error.detail().contains("abs overflow"), "{error}");
         }
     }
 

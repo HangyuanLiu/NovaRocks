@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
+#[cfg(test)]
+use crate::exec::expr::ExprArena;
+use crate::exec::expr::ExprId;
 use arrow::array::ArrayRef;
 use novarocks_functions::builtin::xx_hash3_128;
 pub fn eval_xx_hash3_128<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
@@ -23,7 +25,7 @@ pub fn eval_xx_hash3_128<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> crate::runtime::fragment::ExecutionResult<ArrayRef> {
     // Preserve interleaved evaluation and admission, including the original
     // first unsupported argument before any later child is evaluated.
     let mut inputs = Vec::with_capacity(args.len());
@@ -33,7 +35,7 @@ pub fn eval_xx_hash3_128<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
             idx,
         )?);
     }
-    Ok((xx_hash3_128::evaluate_legacy(&inputs, chunk.len(), arena.data_type(expr)))?)
+    xx_hash3_128::evaluate_legacy(&inputs, chunk.len(), arena.data_type(expr)).map_err(Into::into)
 }
 #[cfg(test)]
 #[path = "legacy_xx_hash3_128_baseline_tests.rs"]

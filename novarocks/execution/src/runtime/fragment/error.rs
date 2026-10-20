@@ -73,17 +73,10 @@ pub struct FragmentLaunchError {
     stage: FragmentLaunchStage,
     kind: FragmentLaunchErrorKind,
     cause: super::ExecutionFailure,
-    cleanup_diagnostics: Vec<String>,
+    cleanup_diagnostics: Vec<super::ExecutionFailure>,
 }
 
 impl FragmentLaunchError {
-    pub fn new(
-        stage: FragmentLaunchStage,
-        kind: FragmentLaunchErrorKind,
-        detail: impl Into<String>,
-    ) -> Self {
-        Self::from_failure(stage, kind, detail.into().into())
-    }
     pub fn from_failure(
         stage: FragmentLaunchStage,
         kind: FragmentLaunchErrorKind,
@@ -108,10 +101,10 @@ impl FragmentLaunchError {
     pub const fn cause(&self) -> &super::ExecutionFailure {
         &self.cause
     }
-    pub fn cleanup_diagnostics(&self) -> &[String] {
+    pub fn cleanup_diagnostics(&self) -> &[super::ExecutionFailure] {
         &self.cleanup_diagnostics
     }
-    pub fn with_cleanup_diagnostics(mut self, diagnostics: Vec<String>) -> Self {
+    pub fn with_cleanup_diagnostics(mut self, diagnostics: Vec<super::ExecutionFailure>) -> Self {
         self.cleanup_diagnostics.extend(diagnostics);
         self
     }
@@ -124,15 +117,23 @@ impl fmt::Display for FragmentLaunchError {
             self.stage, self.kind, self.cause
         )?;
         if !self.cleanup_diagnostics.is_empty() {
-            write!(
-                f,
-                "; cleanup diagnostics: {}",
-                self.cleanup_diagnostics.join("; ")
-            )?;
+            f.write_str("; cleanup diagnostics: ")?;
+            for (index, cause) in self.cleanup_diagnostics.iter().enumerate() {
+                if index != 0 {
+                    f.write_str("; ")?;
+                }
+                cause.fmt(f)?;
+            }
         }
         Ok(())
     }
 }
+impl novarocks_failure_contract::FailureProjection for FragmentLaunchError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        self.cause.failure_fact()
+    }
+}
+
 impl Error for FragmentLaunchError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(&self.cause)
@@ -169,10 +170,6 @@ pub struct FragmentExecutionError {
 }
 
 impl FragmentExecutionError {
-    pub fn new(kind: FragmentExecutionErrorKind, detail: impl Into<String>) -> Self {
-        Self::from_failure(kind, detail.into().into())
-    }
-
     pub fn from_failure(kind: FragmentExecutionErrorKind, cause: super::ExecutionFailure) -> Self {
         Self { kind, cause }
     }
@@ -198,6 +195,12 @@ impl fmt::Display for FragmentExecutionError {
     }
 }
 
+impl novarocks_failure_contract::FailureProjection for FragmentExecutionError {
+    fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+        self.cause.failure_fact()
+    }
+}
+
 impl Error for FragmentExecutionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(&self.cause)
@@ -210,32 +213,98 @@ mod tests {
 
     #[test]
     fn launch_error_keeps_stage_kind_and_detail() {
-        let error = FragmentLaunchError::new(
+        let error = FragmentLaunchError::from_failure(
             FragmentLaunchStage::Rollback,
             FragmentLaunchErrorKind::Rollback,
-            "exchange registration cleanup failed",
+            novarocks_functions::KernelFailure::Internal(
+                novarocks_functions::KernelDiagnostic::new("exchange registration cleanup failed"),
+            )
+            .into(),
         );
         assert_eq!(error.stage(), FragmentLaunchStage::Rollback);
         assert_eq!(error.kind(), FragmentLaunchErrorKind::Rollback);
         assert_eq!(error.detail(), "exchange registration cleanup failed");
         assert_eq!(
             error.to_string(),
-            "fragment launch error during rollback (rollback): exchange registration cleanup failed"
+            "fragment launch error during rollback (rollback): kernel internal failure: exchange registration cleanup failed"
         );
     }
 
     #[test]
-    fn execution_cancelled_is_a_typed_terminal_outcome() {
-        let error = FragmentExecutionError::new(
+    fn execution_envelope_keeps_the_original_control_cause() {
+        let cause: super::super::ExecutionFailure =
+            novarocks_functions::KernelFailure::Cancelled.into();
+        let error = FragmentExecutionError::from_failure(
             FragmentExecutionErrorKind::Cancelled,
-            "query cancelled by coordinator",
+            cause.clone(),
         );
+        assert!(error.cause().same_occurrence(&cause));
         assert_eq!(error.kind(), FragmentExecutionErrorKind::Cancelled);
-        assert_eq!(error.detail(), "query cancelled by coordinator");
+        assert_eq!(error.detail(), "kernel evaluation was cancelled");
         assert_eq!(
             error.to_string(),
-            "fragment execution error (cancelled): query cancelled by coordinator"
+            "fragment execution error (cancelled): kernel evaluation was cancelled"
         );
+    }
+
+    #[test]
+    fn envelopes_forward_the_primary_fact_and_source_independent_of_stage_kind_or_cleanup() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        for (cause, class) in [
+            (
+                novarocks_functions::KernelFailure::ResourceExhausted,
+                FailureClass::Resource,
+            ),
+            (
+                novarocks_functions::KernelFailure::Cancelled,
+                FailureClass::Control,
+            ),
+            (
+                novarocks_functions::KernelFailure::InvalidProgram(
+                    novarocks_functions::KernelDiagnostic::new("ResourceExhausted"),
+                ),
+                FailureClass::Invariant,
+            ),
+            (
+                novarocks_functions::KernelFailure::Operational(
+                    novarocks_functions::KernelDiagnostic::new("numeric overflow"),
+                ),
+                FailureClass::Unexpected,
+            ),
+        ] {
+            let original: super::super::ExecutionFailure = cause.into();
+            let fact = original.failure_fact();
+            assert_eq!(fact.class(), class);
+            let launch = FragmentLaunchError::from_failure(
+                FragmentLaunchStage::Rollback,
+                FragmentLaunchErrorKind::ResourceUnavailable,
+                original.clone(),
+            )
+            .with_cleanup_diagnostics(vec![
+                novarocks_functions::KernelFailure::Internal(
+                    novarocks_functions::KernelDiagnostic::new("cleanup"),
+                )
+                .into(),
+            ]);
+            assert_eq!(launch.failure_fact(), fact);
+            let source = launch
+                .source()
+                .unwrap()
+                .downcast_ref::<super::super::ExecutionFailure>()
+                .unwrap();
+            assert!(source.same_occurrence(&original));
+            let execution = FragmentExecutionError::from_failure(
+                FragmentExecutionErrorKind::Panic,
+                original.clone(),
+            );
+            assert_eq!(execution.failure_fact(), fact);
+            let source = execution
+                .source()
+                .unwrap()
+                .downcast_ref::<super::super::ExecutionFailure>()
+                .unwrap();
+            assert!(source.same_occurrence(&original));
+        }
     }
 
     #[test]

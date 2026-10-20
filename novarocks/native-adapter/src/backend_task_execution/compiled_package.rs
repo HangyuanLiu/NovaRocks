@@ -25,6 +25,7 @@
 
 // Design: ADR-0185 (docs/adr/ADR-0185-compiled-packages-are-the-sole-static-plan-path.md)
 
+use novarocks_execution_contract::failure::{FailureProjection, SharedFailureCause};
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -76,11 +77,11 @@ pub enum CompiledPackageError {
     Construction(NativeTypeConstructionError),
     /// The original receiver cause, including its source/resource model.
     Decode(PackageDecodeError),
-    /// The package is not receivable, its providers refuse it, or the
-    /// compiler refuses one of its shapes.
-    Refused(String),
-    /// A valid package needs an explicitly unavailable compiler/provider capability.
-    Unsupported(String),
+    RuntimeFilter(crate::compiled_runtime_filter::CompiledRuntimeFilterBindingError),
+    Provider(SharedFailureCause),
+    /// This gate observed an explicitly unavailable provider capability.
+    Unsupported(CompiledCapabilityRefusal),
+    Compile(novarocks_local_compiler::FragmentCompileError),
     TypeMaterialization(TypeMaterializationRefusal),
     ProjectMetadata(PreparationMemoryRefusal),
     ProjectMetadataRequest(MetadataRequestError),
@@ -92,7 +93,10 @@ impl fmt::Display for CompiledPackageError {
             Self::Control(cause) => cause.fmt(f),
             Self::Construction(cause) => cause.fmt(f),
             Self::Decode(cause) => cause.fmt(f),
-            Self::Refused(detail) | Self::Unsupported(detail) => f.write_str(detail),
+            Self::RuntimeFilter(source) => source.fmt(f),
+            Self::Provider(source) => source.fmt(f),
+            Self::Unsupported(source) => source.fmt(f),
+            Self::Compile(source) => source.fmt(f),
             Self::TypeMaterialization(cause) => cause.fmt(f),
             Self::ProjectMetadata(cause) => cause.fmt(f),
             Self::ProjectMetadataRequest(cause) => cause.fmt(f),
@@ -106,7 +110,10 @@ impl Error for CompiledPackageError {
             Self::Control(cause) => Some(cause),
             Self::Construction(cause) => Some(cause),
             Self::Decode(cause) => Some(cause),
-            Self::Refused(_) | Self::Unsupported(_) => None,
+            Self::RuntimeFilter(source) => Some(source),
+            Self::Provider(source) => Some(source),
+            Self::Unsupported(source) => Some(source),
+            Self::Compile(source) => Some(source),
             Self::TypeMaterialization(cause) => Some(cause),
             Self::ProjectMetadata(cause) => Some(cause),
             Self::ProjectMetadataRequest(cause) => Some(cause),
@@ -114,27 +121,86 @@ impl Error for CompiledPackageError {
     }
 }
 
-fn local_compile_failure(
-    error: novarocks_local_compiler::FragmentCompileError,
-) -> CompiledPackageError {
-    if let novarocks_local_compiler::FragmentCompileError::Control(cause) = error {
-        return CompiledPackageError::Control(cause);
-    }
-    let detail = format!("package does not compile: {error}");
-    if error.is_unsupported() {
-        CompiledPackageError::Unsupported(detail)
-    } else {
-        CompiledPackageError::Refused(detail)
+impl FailureProjection for CompiledPackageError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        match self {
+            Self::Control(source) => source.failure_fact(),
+            Self::Construction(source) => source.failure_fact(),
+            Self::Decode(source) => source.failure_fact(),
+            Self::RuntimeFilter(source) => source.failure_fact(),
+            Self::Provider(source) => source.failure_fact(),
+            Self::Unsupported(source) => source.failure_fact(),
+            Self::Compile(source) => source.failure_fact(),
+            Self::TypeMaterialization(source) => source.failure_fact(),
+            Self::ProjectMetadata(source) => source.failure_fact(),
+            Self::ProjectMetadataRequest(source) => source.failure_fact(),
+        }
     }
 }
 
-fn provider_preparation_failure<E: Error + 'static>(
-    error: ProviderPreparationError<E>,
-) -> CompiledPackageError {
+/// A capability refusal authored by this gate, retaining the original provider cause.
+/// This does not change the generic Connector error's own projection.
+#[derive(Debug)]
+pub struct CompiledCapabilityRefusal {
+    source: SharedFailureCause,
+}
+impl fmt::Display for CompiledCapabilityRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(f)
+    }
+}
+impl Error for CompiledCapabilityRefusal {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+impl FailureProjection for CompiledCapabilityRefusal {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, domain,
+        };
+        FailureFact::new(
+            FailureClass::Unsupported,
+            FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(9880).unwrap()),
+        )
+    }
+}
+
+fn provider_capability_refusal<E: Error + 'static>(error: &ProviderPreparationError<E>) -> bool {
     use novarocks_connector_contract::{
         ConnectorError, ConnectorErrorKind, PureProviderCatalogError, PureProviderProgramError,
     };
     use novarocks_spi::connector::{ConnectorCodecError, ConnectorCodecErrorKind};
+    let (ProviderPreparationError::Read { error: cause, .. }
+    | ProviderPreparationError::Write { error: cause, .. }) = error
+    else {
+        return false;
+    };
+    match cause {
+        PureProviderProgramError::Catalog(
+            PureProviderCatalogError::ReadUnavailable(_)
+            | PureProviderCatalogError::WriteUnavailable(_),
+        ) => true,
+        PureProviderProgramError::Contract(cause) => {
+            cause.kind() == ConnectorErrorKind::Unsupported
+        }
+        PureProviderProgramError::Provider(cause) => {
+            let cause = cause as &(dyn Error + 'static);
+            cause
+                .downcast_ref::<ConnectorCodecError>()
+                .is_some_and(|cause| *cause.kind() == ConnectorCodecErrorKind::Unsupported)
+                || cause
+                    .downcast_ref::<ConnectorError>()
+                    .is_some_and(|cause| cause.kind() == ConnectorErrorKind::Unsupported)
+        }
+        _ => false,
+    }
+}
+
+fn provider_preparation_failure<E: Error + FailureProjection + Send + Sync + 'static>(
+    error: ProviderPreparationError<E>,
+) -> CompiledPackageError {
+    use novarocks_connector_contract::PureProviderProgramError;
     if let ProviderPreparationError::Control(cause) = error {
         return CompiledPackageError::Control(cause);
     }
@@ -144,34 +210,14 @@ fn provider_preparation_failure<E: Error + 'static>(
         unreachable!("control cause handled above");
     };
     if let PureProviderProgramError::Control(cause) = cause {
-        return CompiledPackageError::Control(*cause);
+        return CompiledPackageError::Control(cause.clone());
     }
-    let unsupported = match cause {
-        PureProviderProgramError::Catalog(
-            PureProviderCatalogError::ReadUnavailable(_)
-            | PureProviderCatalogError::WriteUnavailable(_),
-        ) => true,
-        PureProviderProgramError::Contract(cause) => {
-            cause.kind() == ConnectorErrorKind::Unsupported
-        }
-        PureProviderProgramError::Provider(cause) => {
-            // The production provider error is the SPI codec vocabulary. Other
-            // generic owners must supply an equally explicit typed capability.
-            let cause = cause as &(dyn Error + 'static);
-            cause
-                .downcast_ref::<ConnectorCodecError>()
-                .is_some_and(|cause| cause.kind() == ConnectorCodecErrorKind::Unsupported)
-                || cause
-                    .downcast_ref::<ConnectorError>()
-                    .is_some_and(|cause| cause.kind() == ConnectorErrorKind::Unsupported)
-        }
-        _ => false,
-    };
-    let detail = format!("package providers refuse it: {error}");
+    let unsupported = provider_capability_refusal(&error);
+    let source = SharedFailureCause::new(error);
     if unsupported {
-        CompiledPackageError::Unsupported(detail)
+        CompiledPackageError::Unsupported(CompiledCapabilityRefusal { source })
     } else {
-        CompiledPackageError::Refused(detail)
+        CompiledPackageError::Provider(source)
     }
 }
 
@@ -393,7 +439,8 @@ impl<E: Error + Send + Sync + 'static> CompiledPackageInterpreter<E> {
     }
 }
 
-impl<E: Error + Send + Sync + 'static> CompiledPackageCompiler for CompiledPackageInterpreter<E>
+impl<E: Error + FailureProjection + Send + Sync + 'static> CompiledPackageCompiler
+    for CompiledPackageInterpreter<E>
 where
     PureProviderProgramCatalog<E>: Send + Sync,
 {
@@ -428,7 +475,7 @@ where
         )
     }
 }
-impl<E: Error + Send + Sync + 'static> CompiledPackageInterpreter<E> {
+impl<E: Error + FailureProjection + Send + Sync + 'static> CompiledPackageInterpreter<E> {
     fn compile_body(
         &self,
         package: &[u8],
@@ -460,12 +507,8 @@ impl<E: Error + Send + Sync + 'static> CompiledPackageInterpreter<E> {
             ),
         }
         .map_err(package_decode_failure)?;
-        let runtime_filters =
-            CompiledRuntimeFilterEndpoints::from_package(&package).map_err(|error| {
-                CompiledPackageError::Refused(format!(
-                    "package runtime-filter bindings are not resolvable: {error}"
-                ))
-            })?;
+        let runtime_filters = CompiledRuntimeFilterEndpoints::from_package(&package)
+            .map_err(CompiledPackageError::RuntimeFilter)?;
         // The compiled RootResult algorithm gathers its terminal pipeline to
         // one driver; this width is independent of the task pipeline DOP.
         let root_sink_dop = matches!(
@@ -513,18 +556,7 @@ impl<E: Error + Send + Sync + 'static> CompiledPackageInterpreter<E> {
             FragmentCreationError::Resource(cause) => {
                 CompiledPackageError::Construction(NativeTypeConstructionError::Resource(cause))
             }
-            FragmentCreationError::Compile(
-                novarocks_local_compiler::FragmentCompileError::ProjectMetadataRequest(cause),
-            ) => CompiledPackageError::ProjectMetadataRequest(cause),
-            FragmentCreationError::Compile(
-                novarocks_local_compiler::FragmentCompileError::ProjectMetadataHost { error },
-            ) => match error.downcast::<PreparationMemoryRefusal>() {
-                Ok(cause) => CompiledPackageError::ProjectMetadata(*cause),
-                Err(error) => {
-                    CompiledPackageError::Refused(format!("package does not compile: {error}"))
-                }
-            },
-            FragmentCreationError::Compile(other) => local_compile_failure(other),
+            FragmentCreationError::Compile(source) => CompiledPackageError::Compile(source),
         })?;
         Ok(if native {
             CompiledTaskProgram::native(program, runtime_filters)
@@ -634,18 +666,18 @@ fn package_decode_failure(
     }
 }
 
-/// Compile control for one task's preparation: a stop of the task refuses the
-/// next checkpoint, so decode, provider validation and compile all end with
-/// the task's own cancellation as their primary cause.
+/// Caller control for one exact Task preparation. Its accepted originating
+/// failure or control observation crosses decode, provider validation and
+/// compilation unchanged; an observation never creates a cancellation intent.
 pub(crate) struct TaskPreparationControl {
     stop: ConnectorStopView,
-    original: novarocks_worker::TaskPreparationStopView,
+    original: novarocks_worker::TaskPreparationView,
 }
 
 impl TaskPreparationControl {
     pub(crate) fn new(
         stop: ConnectorStopView,
-        original: novarocks_worker::TaskPreparationStopView,
+        original: novarocks_worker::TaskPreparationView,
     ) -> Self {
         Self { stop, original }
     }
@@ -653,15 +685,14 @@ impl TaskPreparationControl {
 
 impl PureCompileControl for TaskPreparationControl {
     fn checkpoint(&self, _phase: CompilePhase, _units: u32) -> Result<(), CompileControlError> {
-        match self.original.stop_cause() {
-            Some(novarocks_worker::TaskPreparationStopCause::LeaseExpired) => {
-                return Err(CompileControlError::DeadlineExceeded);
-            }
-            Some(novarocks_worker::TaskPreparationStopCause::Cancelled) => {
-                return Err(CompileControlError::Cancelled);
-            }
-            None => {}
-        }
+        self.original
+            .borrow_control()
+            .checkpoint()
+            .map_err(|error| {
+                CompileControlError::Source(
+                    novarocks_execution::runtime::fragment::SharedDomainFailure::new(error),
+                )
+            })?;
         if self.stop.is_stopped() {
             return Err(CompileControlError::Cancelled);
         }
@@ -726,7 +757,7 @@ mod capability_tests {
             provider(PureProviderProgramError::Catalog(
                 PureProviderCatalogError::MissingProvider(id)
             )),
-            CompiledPackageError::Refused(_)
+            CompiledPackageError::Provider(_)
         ));
         for kind in [
             ConnectorErrorKind::Unsupported,
@@ -750,17 +781,24 @@ mod capability_tests {
                 "unsupported capability",
             )),
         };
-        assert!(matches!(
-            provider_preparation_failure(opaque),
-            CompiledPackageError::Refused(_)
-        ));
+        // The actual gate predicate also accepts opaque errors for inspection;
+        // owning projection is reserved for a source with its own domain fact.
+        assert!(!provider_capability_refusal(&opaque));
+        assert!(
+            opaque
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .is::<std::io::Error>()
+        );
         for cause in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
             assert!(
-                matches!(provider_preparation_failure::<ConnectorCodecError>(ProviderPreparationError::Control(cause)),
+                matches!(provider_preparation_failure::<ConnectorCodecError>(ProviderPreparationError::Control(cause.clone())),
                 CompiledPackageError::Control(actual) if actual == cause)
             );
         }
@@ -768,15 +806,79 @@ mod capability_tests {
 
     #[test]
     fn invalid_compiler_content_is_not_a_capability_refusal() {
+        use novarocks_execution_contract::failure::FailureClass;
         use novarocks_local_compiler::FragmentCompileError;
-        assert!(
-            matches!(local_compile_failure(FragmentCompileError::Unsupported {
-            node: Some(NodeId::new(7)), feature: "FULL OUTER hash join"
-        }), CompiledPackageError::Unsupported(detail) if detail.contains("FULL OUTER hash join"))
+        let unsupported = CompiledPackageError::Compile(FragmentCompileError::Unsupported {
+            node: Some(NodeId::new(7)),
+            feature: "FULL OUTER hash join",
+        });
+        assert_eq!(
+            unsupported.failure_fact().class(),
+            FailureClass::Unsupported
         );
+        assert_eq!(
+            unsupported.failure_fact().reason().domain(),
+            novarocks_execution_contract::failure::domain::LOCAL_COMPILER.get()
+        );
+        assert_eq!(unsupported.failure_fact().reason().code(), 1);
+        assert!(
+            matches!(unsupported.source().unwrap().downcast_ref::<FragmentCompileError>(),
+            Some(FragmentCompileError::Unsupported { node: Some(node), feature: "FULL OUTER hash join" }) if *node == NodeId::new(7))
+        );
+        let invalid =
+            CompiledPackageError::Compile(FragmentCompileError::Invalid("unsupported diagnostic"));
+        assert_eq!(invalid.failure_fact().class(), FailureClass::Invariant);
         assert!(matches!(
-            local_compile_failure(FragmentCompileError::Invalid("unsupported diagnostic")),
-            CompiledPackageError::Refused(_)
+            invalid
+                .source()
+                .unwrap()
+                .downcast_ref::<FragmentCompileError>(),
+            Some(FragmentCompileError::Invalid("unsupported diagnostic"))
         ));
+    }
+
+    #[test]
+    fn capability_gate_keeps_original_source_and_noncapability_facts() {
+        use novarocks_execution_contract::failure::{FailureClass, domain};
+        for kind in [
+            ConnectorCodecErrorKind::Unsupported,
+            ConnectorCodecErrorKind::Capacity,
+            ConnectorCodecErrorKind::InvalidValue,
+            ConnectorCodecErrorKind::VersionMismatch,
+        ] {
+            let source = ConnectorCodecError::new(
+                ConnectorFieldPath::root("scan"),
+                kind,
+                "unsupported text cannot classify a failure",
+            );
+            let original_fact = source.failure_fact();
+            let error = provider(PureProviderProgramError::Provider(source));
+            let retained = match &error {
+                CompiledPackageError::Unsupported(refusal) => {
+                    assert_eq!(error.failure_fact().class(), FailureClass::Unsupported);
+                    assert_eq!(error.failure_fact().reason().domain(), domain::NATIVE.get());
+                    assert_eq!(error.failure_fact().reason().code(), 9880);
+                    &refusal.source
+                }
+                CompiledPackageError::Provider(source) => {
+                    assert_eq!(error.failure_fact(), original_fact);
+                    source
+                }
+                _ => panic!("provider cause must remain available"),
+            };
+            let original = retained
+                .downcast_ref::<ProviderPreparationError<ConnectorCodecError>>()
+                .expect("original preparation source");
+            let ProviderPreparationError::Read {
+                node,
+                error: PureProviderProgramError::Provider(codec),
+            } = original
+            else {
+                panic!("original read source");
+            };
+            assert_eq!(*node, NodeId::new(1));
+            assert_eq!(*codec.kind(), kind);
+            assert_eq!(retained.failure_fact(), original_fact);
+        }
     }
 }

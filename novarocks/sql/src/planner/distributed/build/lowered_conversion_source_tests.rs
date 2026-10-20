@@ -51,7 +51,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after original refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -454,7 +454,7 @@ fn conversion_journal_foreign_missing_and_each_loan_callback_preserve_original_c
                 CompileControlError::ResourceExhausted,
             ] {
                 let control = Control {
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert!(
@@ -495,7 +495,7 @@ fn conversion_emission_capture_and_record_stop_at_every_actual_control_refusal()
             CompileControlError::ResourceExhausted,
         ] {
             let control = Control {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..Control::default()
             };
             assert!(

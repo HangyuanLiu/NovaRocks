@@ -449,7 +449,7 @@ fn scalar_broadcast_is_explicit_for_either_argument_and_not_for_one_row_columns(
         ];
         assert!(matches!(
             kernel.evaluate(Selection::all(2), &args, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
     }
     let mut not = instance("bitnot", &[ty(DataType::Int8, false)]);
@@ -601,7 +601,7 @@ fn selected_null_cannot_mask_wrong_carrier_cardinality_or_contradictory_nullabil
         ];
         assert!(matches!(
             kernel.evaluate(Selection::all(2), &args, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
         assert_eq!(
             kernel
@@ -617,7 +617,7 @@ fn selected_null_cannot_mask_wrong_carrier_cardinality_or_contradictory_nullabil
             &[EvaluatedArgument::Column(&left)],
             &Control::default()
         ),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
 }
 
@@ -645,7 +645,7 @@ fn controller_poison_and_foreign_compact_selection_remain_outer_errors() {
         ];
         assert!(matches!(
             kernel.evaluate(selection, &args, &Control::default()),
-            Err(KernelFailure::InvalidProgram(_))
+            Err(ref cause) if crate::kernel_control::test_contract::input(cause)
         ));
     }
     let mut not = instance("bitnot", &[ty(DataType::Int8, true)]);
@@ -655,13 +655,13 @@ fn controller_poison_and_foreign_compact_selection_remain_outer_errors() {
             &[EvaluatedArgument::SelectedColumn(&poisoned)],
             &Control::default()
         ),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
     assert!(Selection::try_sparse(1, &[1]).is_err());
     let mut not = instance("bitnot", &[ty(DataType::Int8, true)]);
     assert!(matches!(
         not.evaluate(Selection::all(1), &[], &Control::default()),
-        Err(KernelFailure::InvalidProgram(_))
+        Err(ref cause) if crate::kernel_control::test_contract::input(cause)
     ));
 }
 

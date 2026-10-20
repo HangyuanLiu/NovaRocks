@@ -43,7 +43,7 @@ impl PureCompileControl for Control {
             assert!(ordinal <= stop, "callback after the original refusal");
         }
         trace.push((phase, units));
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == ordinal => Err(cause),
             _ => Ok(()),
         }
@@ -589,6 +589,10 @@ fn installed_merge_options_cannot_replace_phase_or_full_actual_state_type() {
 fn merge_refiner_success_and_ordinary_failure_preserve_every_control_prefix() {
     let data = StaticInput::new(2, ty(false));
     let wrong = FunctionValueType::new(DataType::Utf8, false);
+    let mut control_causes = causes().to_vec();
+    control_causes.push(CompileControlError::from_domain(
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic,
+    ));
     for ordinary in [false, true] {
         let mut input = data.input();
         if ordinary {
@@ -599,26 +603,37 @@ fn merge_refiner_success_and_ordinary_failure_preserve_every_control_prefix() {
             };
         }
         let baseline = Control::default();
+        let refiner = Refiner::new();
+        let result = refine_call_effects(&refiner, input, &baseline);
+        assert_eq!(result.is_err(), ordinary);
+        if ordinary {
+            assert!(matches!(
+                result,
+                Err(CallEffectRefinementError::InvalidInput(_))
+            ));
+        } else {
+            result.unwrap();
+        }
         assert_eq!(
-            refine_call_effects(&Refiner::new(), input, &baseline).is_err(),
-            ordinary
+            refiner.calls.load(Ordering::SeqCst),
+            if ordinary { 0 } else { 1 }
         );
         let expected = baseline.trace.lock().unwrap().clone();
         assert_eq!(
             expected.first(),
             Some(&(CompilePhase::FunctionSpecialization, 0))
         );
-        assert!(expected.iter().any(|(_, units)| *units > 0));
         if ordinary {
-            assert!(
-                expected.last().unwrap().1 > 0,
-                "completed domain mismatch has an ordinary tail"
-            );
+            // The actual UTF-8/Int64 state-domain author refuses before any
+            // flush or refiner delegation. Pending steps are not a callback.
+            assert_eq!(expected, [(CompilePhase::FunctionSpecialization, 0)]);
+        } else {
+            assert!(expected.iter().any(|(_, units)| *units > 0));
         }
         for stop in 0..expected.len() {
-            for cause in causes() {
+            for cause in control_causes.iter().cloned() {
                 let control = Control {
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                     ..Control::default()
                 };
                 assert!(
@@ -626,6 +641,23 @@ fn merge_refiner_success_and_ordinary_failure_preserve_every_control_prefix() {
                 );
                 assert_eq!(*control.trace.lock().unwrap(), expected[..=stop]);
             }
+        }
+        if ordinary {
+            let late = Control {
+                refusal: Some((expected.len(), CompileControlError::Cancelled)),
+                ..Control::default()
+            };
+            let refiner = Refiner::new();
+            assert!(matches!(
+                refine_call_effects(&refiner, input, &late),
+                Err(CallEffectRefinementError::InvalidInput(_))
+            ));
+            assert_eq!(refiner.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                *late.trace.lock().unwrap(),
+                expected,
+                "a late cancellation must not follow the real state-domain refusal"
+            );
         }
     }
     let fixture = CountFixture::new(0);
@@ -635,9 +667,9 @@ fn merge_refiner_success_and_ordinary_failure_preserve_every_control_prefix() {
         .unwrap();
     let expected = baseline.trace.lock().unwrap().clone();
     for stop in 0..expected.len() {
-        for cause in causes() {
+        for cause in control_causes.iter().cloned() {
             let control = Control {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..Control::default()
             };
             let result = fixture.prepare(AggregateKernelPhase::Final, &control);
@@ -684,7 +716,7 @@ fn merge_wide_nested_state_uses_real_type_walk_quantum_and_exact_metadata() {
     for stop in [0, quantum, expected.len() - 1] {
         for cause in causes() {
             let control = Control {
-                refusal: Some((stop, cause)),
+                refusal: Some((stop, cause.clone())),
                 ..Control::default()
             };
             assert!(

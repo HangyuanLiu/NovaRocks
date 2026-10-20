@@ -228,7 +228,7 @@ impl Consumer {
     }
     fn with_fixture(mode: Bind, mut fixture: Fixture) -> Self {
         let tracker = MemTracker::new_root("compiled-ordered-scan-real-owner");
-        fixture.input.try_transfer_to_typed(&tracker).unwrap();
+        fixture.input.try_transfer_to(&tracker).unwrap();
         let state = state(tracker.clone());
         let creation = construction(&tracker, &state);
         let producer = session(&fixture);

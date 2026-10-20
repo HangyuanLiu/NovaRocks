@@ -71,7 +71,7 @@ struct Control {
 impl PureCompileControl for Control {
     fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
         assert!(units <= 256);
-        let (active, stop) = *self.state.lock().unwrap();
+        let (active, stop) = self.state.lock().unwrap().clone();
         if !active {
             return Ok(());
         }
@@ -784,7 +784,7 @@ fn dispatcher_every_actual_success_and_ordinary_callback_preserves_caller_first_
                 assert!(!trace.is_empty());
                 for at in 0..trace.len() {
                     for cause in CAUSES {
-                        c.arm(Some((at, cause)));
+                        c.arm(Some((at, cause.clone())));
                         assert!(matches!(invoke(), Err(NodeCodecError::Control(actual)) if actual == cause));
                         assert_eq!(c.trace(), trace[..=at]);
                     }

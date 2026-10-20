@@ -399,7 +399,7 @@ fn test_vector_math_empty_array_rejected() {
     let empty = arena.push_typed(ExprNode::ArrayExpr { elements: vec![] }, list_type.clone());
 
     let err = eval_math_function("l2_distance", &arena, expr, &[empty, empty], &chunk).unwrap_err();
-    assert!(err.contains("requires non-empty arrays"));
+    assert!(err.to_string().contains("requires non-empty arrays"));
 }
 
 // ---------------------------------------------------------------------------
@@ -482,7 +482,7 @@ fn test_equiwidth_bucket_invalid_range() {
         &common::chunk_len_1(),
     )
     .unwrap_err();
-    assert!(err.contains("min < max"));
+    assert!(err.to_string().contains("min < max"));
 }
 
 #[test]
@@ -500,7 +500,7 @@ fn test_equiwidth_bucket_out_of_bounds() {
         &common::chunk_len_1(),
     )
     .unwrap_err();
-    assert!(err.contains("size <= max"));
+    assert!(err.to_string().contains("size <= max"));
 }
 
 // ---------------------------------------------------------------------------
@@ -728,7 +728,7 @@ fn test_abs_int64_min() {
     let err = arena
         .eval(abs, &chunk)
         .expect_err("int64 overflow should fail");
-    assert!(err.contains("abs overflow"));
+    assert!(err.to_string().contains("abs overflow"));
 }
 
 #[test]

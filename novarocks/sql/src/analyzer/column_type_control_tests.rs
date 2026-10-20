@@ -47,7 +47,7 @@ impl PureCompileControl for Control {
         let mut calls = self.calls.lock().unwrap();
         let index = calls.len();
         calls.push((phase, units));
-        if let Some((at, cause)) = self.fail_at
+        if let Some((at, cause)) = self.fail_at.clone()
             && at == index
         {
             return Err(cause);
@@ -80,7 +80,7 @@ fn check_prefixes<T>(trace: &Trace, operation: impl Fn(&Control) -> Result<T, An
             CompileControlError::ResourceExhausted,
         ] {
             let control = Control {
-                fail_at: Some((at, cause)),
+                fail_at: Some((at, cause.clone())),
                 ..Control::default()
             };
             let error = operation(&control)

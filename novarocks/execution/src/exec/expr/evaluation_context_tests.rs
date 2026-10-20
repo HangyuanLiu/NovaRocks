@@ -154,7 +154,7 @@ fn typed_input(columns: Vec<ArrayRef>) -> Chunk {
         })
         .collect();
     let schema = Arc::new(ChunkSchema::try_new_typed(slots, storage.clone()).unwrap());
-    Chunk::try_new_typed_with_columns_owned_observed::<String, _>(
+    Chunk::try_new_typed_with_columns_owned_observed::<ExecutionFailure, _>(
         schema,
         columns,
         rows,
@@ -449,10 +449,11 @@ fn reference_evaluation_has_no_authority_to_create_typed_constant_view() {
     let src = slot(&mut a, 1, input.columns()[0].data_type().clone());
     let two = literal(&mut a, 2);
     let root = call(&mut a, "array_contains", vec![src, two]);
-    assert_eq!(
-        a.eval(root, &input).unwrap_err(),
-        ConstructionFailure::MissingOwner.to_string()
-    );
+    let failure = a.eval(root, &input).unwrap_err();
+    assert!(matches!(
+        failure.cause(),
+        ExecutionFailureCause::Construction(ConstructionFailure::MissingOwner)
+    ));
 }
 
 #[test]
@@ -467,8 +468,10 @@ fn array_map_probe_preserves_original_pipeline_failure_and_operator_context() {
         .eval(root, &input)
         .unwrap();
     let checkpoints = control.calls() - start;
-    let original = ExecutionFailure::from("original fragment pipeline failure")
-        .at_operator(37, PipelineOperation::Push);
+    let original = ExecutionFailure::from(KernelFailure::Operational(KernelDiagnostic::new(
+        "original fragment pipeline failure",
+    )))
+    .at_operator(37, PipelineOperation::Push);
     for stop in 0..checkpoints {
         let control = Arc::new(Control::default());
         let host = Arc::new(Host::default());
@@ -491,14 +494,21 @@ fn real_runtime_control_preserves_first_failure_for_checkpoint_and_wait() {
     use crate::runtime::fragment::PipelineOperation;
     use crate::runtime::runtime_state::RuntimeErrorState;
     let mut originals: Vec<ExecutionFailure> = causes().into_iter().map(Into::into).collect();
-    originals.push(ExecutionFailure::from("cancelled").at_operator(17, PipelineOperation::Pull));
+    originals.push(
+        ExecutionFailure::from(KernelFailure::Operational(KernelDiagnostic::new(
+            "cancelled",
+        )))
+        .at_operator(17, PipelineOperation::Pull),
+    );
     for original in originals {
         let state = Arc::new(RuntimeErrorState::default());
         let control = RuntimeKernelControl::new(state.clone());
         assert!(ExprEvaluationControl::checkpoint(&control).is_ok());
         assert!(ExprEvaluationControl::wait(&control, Duration::ZERO).is_ok());
         state.set_error(original.clone());
-        state.set_error("later error must not replace the first cause");
+        state.set_error(KernelFailure::Internal(KernelDiagnostic::new(
+            "later error must not replace the first cause",
+        )));
         assert_eq!(
             ExprEvaluationControl::checkpoint(&control).unwrap_err(),
             original

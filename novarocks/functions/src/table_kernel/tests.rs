@@ -45,7 +45,7 @@ use std::{
 struct CompileControl(Option<CompileControlError>);
 impl PureCompileControl for CompileControl {
     fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
-        self.0.map_or(Ok(()), Err)
+        self.0.clone().map_or(Ok(()), Err)
     }
 }
 struct RuntimeControl {
@@ -986,6 +986,7 @@ fn retained_growth_and_bound_drift_cover_initialization_next_and_finish_error_ex
             for failure in [
                 None,
                 Some(operational()),
+                Some(actual_lifecycle_source()),
                 Some(KernelFailure::Cancelled),
                 Some(KernelFailure::DeadlineExceeded),
                 Some(KernelFailure::ResourceExhausted),
@@ -1014,17 +1015,19 @@ fn retained_growth_and_bound_drift_cover_initialization_next_and_finish_error_ex
                 } else {
                     cursor.next(capacity(1, 1, 1), &runtime).map(|_| ())
                 };
-                if let Some(
-                    error @ (KernelFailure::Cancelled
-                    | KernelFailure::DeadlineExceeded
-                    | KernelFailure::ResourceExhausted),
-                ) = failure
-                {
+                if let Some(error) = failure {
+                    // Accepted first-cause migration: actual source identity,
+                    // including an ordinary outer refusal, wins over late drift.
                     assert_eq!(result, Err(error));
                 } else {
                     assert!(matches!(result, Err(KernelFailure::Internal(_))));
                 }
                 assert_eq!(cursor.finish(&runtime), Err(KernelFailure::InstanceFailed));
+                assert_eq!(owner.counts.next.load(Ordering::Relaxed), 1);
+                assert_eq!(
+                    owner.counts.finish.load(Ordering::Relaxed),
+                    usize::from(finish)
+                );
                 drop(cursor);
                 assert_eq!(owner.counts.drop.load(Ordering::Relaxed), 1);
                 assert_eq!(owner.counts.drop_live.load(Ordering::Relaxed), 1);
@@ -1273,7 +1276,7 @@ fn compile_entry_errors_remain_typed_before_owner_refinement_or_preparation() {
                     owner.selected.clone(),
                     &owner.frozen(),
                     arguments,
-                    &CompileControl(Some(failure)),
+                    &CompileControl(Some(failure.clone())),
                 )
             } else {
                 specialize_table(
@@ -1281,7 +1284,7 @@ fn compile_entry_errors_remain_typed_before_owner_refinement_or_preparation() {
                     input,
                     owner.selected.clone(),
                     arguments,
-                    &CompileControl(Some(failure)),
+                    &CompileControl(Some(failure.clone())),
                 )
             };
             assert!(
@@ -1292,4 +1295,21 @@ fn compile_entry_errors_remain_typed_before_owner_refinement_or_preparation() {
             assert_eq!(owner.counts.begin.load(Ordering::Relaxed), 0);
         }
     }
+}
+
+fn actual_lifecycle_source() -> KernelFailure {
+    let source = crate::aggregate_scalar::build_scalar_array(
+        &DataType::Boolean,
+        vec![Some(crate::aggregate_scalar::AggScalarValue::Int64(1))],
+        &mut crate::aggregate_scalar::ScalarWork::new(None),
+    )
+    .unwrap_err();
+    let fact = novarocks_failure_contract::FailureProjection::failure_fact(&source);
+    assert_eq!(
+        fact.class(),
+        novarocks_failure_contract::FailureClass::Invariant
+    );
+    assert_eq!(fact.reason().code(), 315);
+    assert!(matches!(&source, KernelFailure::Source(_)));
+    source
 }

@@ -48,7 +48,7 @@ impl PureCompileControl for Control {
             assert!(at <= stop, "callback after refusal");
         }
         trace.push(units);
-        match self.refusal {
+        match self.refusal.clone() {
             Some((stop, cause)) if stop == at => Err(cause),
             _ => Ok(()),
         }
@@ -548,7 +548,7 @@ fn each_actual_small_fragment_type_variant_callback_keeps_caller_cause() {
             for stop in 0..trace.len() {
                 let control = Control {
                     trace: Mutex::new(Vec::new()),
-                    refusal: Some((stop, cause)),
+                    refusal: Some((stop, cause.clone())),
                 };
                 let error = run_fragment(&fragment, source, &control).unwrap_err();
                 assert!(matches!(error, ControlResourceError::Control(actual) if actual == cause));

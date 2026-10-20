@@ -17,7 +17,9 @@
 //! ONE original analytic gathering, regrouping and output splitting.
 //! Scope ownership is supplied by the caller. Observing a source or a Layout
 //! grants no capacity; the legacy adapter supplies only its original lifetime.
+use super::analytic_failure;
 use super::{ArrayRef, Chunk, ChunkSchemaRef, Ordering, UInt32Builder, compare_at, take};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow::compute::concat;
 use arrow::datatypes::SchemaRef;
@@ -55,21 +57,20 @@ impl AnalyticInputSource<'_> {
     }
 }
 
-/// Preserve the original ArrowError until its original stage formatter. The
-/// tracked adapter supplies already-owned original text under its scope grant.
+/// Preserve the original Arrow or domain error across the actual copy occurrence.
 pub(crate) enum AnalyticCopyFailure<E> {
     OriginalArrow(ArrowError),
-    OriginalText(String),
+    Source(ExecutionFailure),
     Control(E),
 }
 
-/// Keep the original constructor String distinct from a typed Work refusal.
-/// The original stage remains the sole author of its diagnostic prefix.
-pub(crate) type AnalyticChunkConstruction<E> = Result<Chunk, Result<String, E>>;
+/// Keep a constructor failure distinct from a Work refusal. Each retains its
+/// own domain facts; the stage adds only operation context.
+pub(crate) type AnalyticChunkConstruction<E> = Result<Chunk, Result<ExecutionFailure, E>>;
 
 /// Admission precedes the original stage's allocation. A tracked adapter must
 /// return its real host lease, not an observation token. Success and original
-/// whole-stage Data retain the scope until their owned payload is dropped.
+/// operation failure retain the scope until their owned payload is dropped.
 /// These stages have no window function ordinal.
 pub(crate) trait AnalyticInputWork {
     type Failure;
@@ -126,7 +127,8 @@ pub(crate) trait AnalyticInputWork {
         batch: RecordBatch,
         schema: ChunkSchemaRef,
     ) -> AnalyticChunkConstruction<Self::Failure> {
-        Chunk::try_new_with_chunk_schema(batch, schema).map_err(Ok)
+        Chunk::try_new_with_chunk_schema(batch, schema)
+            .map_err(|source| Ok(ExecutionFailure::from(source)))
     }
 
     /// ONE original actual-column construction, including reconciliation/retag.
@@ -136,7 +138,8 @@ pub(crate) trait AnalyticInputWork {
         schema: ChunkSchemaRef,
         columns: Vec<ArrayRef>,
     ) -> AnalyticChunkConstruction<Self::Failure> {
-        Chunk::try_new_with_columns(schema, columns).map_err(Ok)
+        Chunk::try_new_with_columns(schema, columns)
+            .map_err(|source| Ok(ExecutionFailure::from(source)))
     }
 }
 #[derive(Debug)]
@@ -152,9 +155,9 @@ pub(crate) enum AnalyticStageFailure<S, E> {
         stage: AnalyticInputStage,
         cause: E,
     },
-    OriginalData {
+    Operation {
         stage: AnalyticInputStage,
-        message: String,
+        cause: ExecutionFailure,
         scope: S,
     },
 }
@@ -162,8 +165,8 @@ fn controlled<S, E>(stage: AnalyticInputStage, cause: E) -> AnalyticStageFailure
     AnalyticStageFailure::Control { stage, cause }
 }
 
-pub(crate) struct LegacyWork;
-impl AnalyticInputWork for LegacyWork {
+pub(crate) struct UnscopedWork;
+impl AnalyticInputWork for UnscopedWork {
     type Failure = Infallible;
     type Scope = ();
     fn admit(&mut self, _: AnalyticInputSource<'_>) -> Result<(), Infallible> {
@@ -176,12 +179,12 @@ impl AnalyticInputWork for LegacyWork {
         Ok(())
     }
 }
-pub(crate) fn legacy<T>(
+pub(crate) fn unscoped<T>(
     result: Result<AnalyticStageResult<T, ()>, AnalyticStageFailure<(), Infallible>>,
-) -> Result<T, String> {
+) -> ExecutionResult<T> {
     match result {
         Ok(result) => Ok(result.value),
-        Err(AnalyticStageFailure::OriginalData { message, .. }) => Err(message),
+        Err(AnalyticStageFailure::Operation { cause, .. }) => Err(cause),
         Err(AnalyticStageFailure::Control { cause, .. }) => match cause {},
     }
 }
@@ -238,17 +241,21 @@ pub(crate) fn gather<W: AnalyticInputWork>(
         work.boundary().map_err(|e| controlled(stage, e))?;
         match original_concat_batches(&input_schema, &batches, input, &mut scope, work) {
             Err(AnalyticCopyFailure::Control(cause)) => return Err(controlled(stage, cause)),
-            Err(AnalyticCopyFailure::OriginalArrow(error)) => {
-                Err(format!("concat_batches: {}", error))
-            }
-            Err(AnalyticCopyFailure::OriginalText(error)) => {
-                Err(format!("concat_batches: {}", error))
+            Err(AnalyticCopyFailure::OriginalArrow(error)) => Err(analytic_failure::stage(
+                "concat_batches",
+                analytic_failure::arrow(error),
+            )),
+            Err(AnalyticCopyFailure::Source(error)) => {
+                Err(analytic_failure::stage("concat_batches", error))
             }
             Ok(batch) => {
                 work.boundary().map_err(|e| controlled(stage, e))?;
                 match work.construct_batch_chunk(&mut scope, batch, input[0].chunk_schema_ref()) {
                     Ok(value) => Ok(value),
-                    Err(Ok(error)) => Err(format!("build analytic concat chunk: {error}")),
+                    Err(Ok(error)) => Err(analytic_failure::stage(
+                        "build analytic concat chunk",
+                        error,
+                    )),
                     Err(Err(cause)) => return Err(controlled(stage, cause)),
                 }
             }
@@ -263,9 +270,9 @@ pub(crate) fn gather<W: AnalyticInputWork>(
                 scope,
             })
         }
-        Err(message) => Err(AnalyticStageFailure::OriginalData {
+        Err(cause) => Err(AnalyticStageFailure::Operation {
             stage,
-            message,
+            cause,
             scope,
         }),
     }
@@ -278,7 +285,7 @@ pub(crate) fn compare_keys<W: AnalyticInputWork>(
     left: usize,
     right: usize,
     work: &mut W,
-) -> Result<Ordering, Result<String, W::Failure>> {
+) -> Result<Ordering, Result<ExecutionFailure, W::Failure>> {
     for array in keys {
         work.step().map_err(Err)?;
         match (array.is_null(left), array.is_null(right)) {
@@ -297,12 +304,12 @@ pub(crate) fn compare_keys<W: AnalyticInputWork>(
     }
     Ok(Ordering::Equal)
 }
-pub(crate) fn legacy_compare(
+pub(crate) fn unscoped_compare(
     keys: &[ArrayRef],
     left: usize,
     right: usize,
-) -> Result<Ordering, String> {
-    match compare_keys(keys, left, right, &mut LegacyWork) {
+) -> ExecutionResult<Ordering> {
+    match compare_keys(keys, left, right, &mut UnscopedWork) {
         Ok(order) => Ok(order),
         Err(Ok(message)) => Err(message),
         Err(Err(cause)) => match cause {},
@@ -333,7 +340,7 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
         work.step().map_err(|e| controlled(stage, e))?;
         perm.push(row);
     }
-    let mut sort_error: Option<Result<String, W::Failure>> = None;
+    let mut sort_error: Option<Result<ExecutionFailure, W::Failure>> = None;
     work.boundary().map_err(|e| controlled(stage, e))?;
     perm.sort_by(|left, right| {
         if sort_error.is_some() {
@@ -355,9 +362,9 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
     });
     if let Some(error) = sort_error {
         return Err(match error {
-            Ok(message) => AnalyticStageFailure::OriginalData {
+            Ok(cause) => AnalyticStageFailure::Operation {
                 stage,
-                message,
+                cause,
                 scope,
             },
             Err(cause) => controlled(stage, cause),
@@ -384,8 +391,17 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
     let mut indices = UInt32Builder::with_capacity(rows);
     for row in perm {
         work.step().map_err(|e| controlled(stage, e))?;
-        // Preserve the original unchecked UInt32 conversion.
-        indices.append_value(row as u32);
+        let index = match analytic_failure::row_index(row) {
+            Ok(index) => index,
+            Err(cause) => {
+                return Err(AnalyticStageFailure::Operation {
+                    stage,
+                    cause,
+                    scope,
+                });
+            }
+        };
+        indices.append_value(index);
     }
     work.boundary().map_err(|e| controlled(stage, e))?;
     let indices = Arc::new(indices.finish());
@@ -397,16 +413,16 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
             Ok(value) => value,
             Err(AnalyticCopyFailure::Control(cause)) => return Err(controlled(stage, cause)),
             Err(AnalyticCopyFailure::OriginalArrow(error)) => {
-                return Err(AnalyticStageFailure::OriginalData {
+                return Err(AnalyticStageFailure::Operation {
                     stage,
-                    message: error.to_string(),
+                    cause: analytic_failure::arrow(error),
                     scope,
                 });
             }
-            Err(AnalyticCopyFailure::OriginalText(message)) => {
-                return Err(AnalyticStageFailure::OriginalData {
+            Err(AnalyticCopyFailure::Source(cause)) => {
+                return Err(AnalyticStageFailure::Operation {
                     stage,
-                    message,
+                    cause,
                     scope,
                 });
             }
@@ -424,9 +440,9 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
                 scope,
             })
         }
-        Err(Ok(error)) => Err(AnalyticStageFailure::OriginalData {
+        Err(Ok(error)) => Err(AnalyticStageFailure::Operation {
             stage,
-            message: format!("build reordered analytic batch: {}", error),
+            cause: analytic_failure::stage("build reordered analytic batch", error),
             scope,
         }),
         Err(Err(cause)) => Err(controlled(stage, cause)),
@@ -475,9 +491,9 @@ pub(crate) fn split<W: AnalyticInputWork>(
                 value.push_back(chunk);
             }
             Err(Ok(error)) => {
-                return Err(AnalyticStageFailure::OriginalData {
+                return Err(AnalyticStageFailure::Operation {
                     stage,
-                    message: format!("build analytic output batch: {}", error),
+                    cause: analytic_failure::stage("build analytic output batch", error),
                     scope,
                 });
             }

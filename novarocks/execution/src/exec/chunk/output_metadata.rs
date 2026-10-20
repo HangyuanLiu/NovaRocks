@@ -97,7 +97,11 @@ impl OutputColumnMetadata {
 }
 
 fn column_capacity_layout(capacity: usize) -> Result<Layout, KernelFailure> {
-    Layout::array::<ArrayRef>(capacity).map_err(|_| KernelFailure::ResourceExhausted)
+    Layout::array::<ArrayRef>(capacity).map_err(|source| {
+        KernelFailure::from_domain(super::construction_failure::SchemaArrayRequest::new::<
+            ArrayRef,
+        >(capacity, source))
+    })
 }
 
 fn retain_capacity_under_reservation(

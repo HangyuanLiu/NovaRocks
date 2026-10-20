@@ -22,6 +22,7 @@
 use super::*;
 use crate::exec::operators::compiled_expression::RuntimeKernelControl;
 use crate::exec::pipeline::operator::InputConstructionFactory;
+use crate::exec::pipeline::test_driver::TestDriver;
 use crate::runtime_filter as rf;
 use novarocks_functions::KernelFailure;
 use novarocks_physical_plan::*;
@@ -292,7 +293,7 @@ fn session_for(program: &LocalProgram, producer: ProgramNodeId) -> Arc<Session> 
     })
 }
 fn state(tracker: Arc<MemTracker>) -> RuntimeState {
-    RuntimeState::new(
+    RuntimeState::for_local_execution(
         None,
         None,
         None,
@@ -338,14 +339,14 @@ fn slice(
         )
         .unwrap()
 }
-fn drain(operator: &mut dyn ProcessorOperator, state: &RuntimeState) -> Vec<Chunk> {
-    operator.set_finishing(state).unwrap();
-    let mut out = vec![];
-    while let Some(chunk) = operator.pull_chunk(state).unwrap() {
-        out.push(chunk);
-    }
-    assert!(operator.pull_chunk(state).unwrap().is_none());
-    out
+fn drain<O: Operator + ?Sized>(
+    operator: &mut TestDriver<'_, O>,
+    _state: &RuntimeState,
+) -> Vec<Chunk> {
+    operator.signal_eos().unwrap();
+    let output = operator.collect_until_finished().unwrap();
+    assert!(operator.drive().unwrap().output.is_none());
+    output
 }
 
 #[test]
@@ -376,13 +377,13 @@ fn compiled_ordered_partial_uses_checked_scan_and_preserves_all_group_contributi
     for driver in 0..2 {
         let mut operator = factory.create(2, driver);
         initialize(operator.as_mut(), &tracker, &creation, &state);
-        let processor = operator.as_processor_mut().unwrap();
+        let mut processor = TestDriver::new(operator.as_mut(), &state);
         for (offset, rows) in [(0, 3), (3, 3), (6, 2)] {
             processor
-                .push_chunk(&state, slice(&f.input, offset, rows, creation.as_ref()))
+                .input_without_output(slice(&f.input, offset, rows, creation.as_ref()))
                 .unwrap();
         }
-        let output = drain(processor, &state);
+        let output = drain(&mut processor, &state);
         assert_eq!(
             output.iter().map(Chunk::len).sum::<usize>(),
             5,
@@ -447,10 +448,11 @@ fn compiled_ordered_partial_uses_checked_scan_and_preserves_all_group_contributi
         state.error_state(),
     )
     .unwrap();
-    let mut grouped = grouped_factory.processor();
-    initialize(&mut grouped, &tracker, &creation, &state);
+    let mut grouped_operator = grouped_factory.processor();
+    initialize(&mut grouped_operator, &tracker, &creation, &state);
+    let mut grouped = TestDriver::new(&mut grouped_operator, &state);
     for chunk in partials {
-        grouped.push_chunk(&state, chunk).unwrap();
+        grouped.input_without_output(chunk).unwrap();
     }
     let intermediate = drain(&mut grouped, &state);
     let final_factory = CompiledAggregateProcessorFactory::try_new(
@@ -461,11 +463,11 @@ fn compiled_ordered_partial_uses_checked_scan_and_preserves_all_group_contributi
     .unwrap();
     let mut final_operator = final_factory.create(1, 0);
     initialize(final_operator.as_mut(), &tracker, &creation, &state);
-    let final_processor = final_operator.as_processor_mut().unwrap();
+    let mut final_processor = TestDriver::new(final_operator.as_mut(), &state);
     for chunk in intermediate {
-        final_processor.push_chunk(&state, chunk).unwrap();
+        final_processor.input_without_output(chunk).unwrap();
     }
-    let output = drain(final_processor, &state);
+    let output = drain(&mut final_processor, &state);
     let mut actual = vec![];
     for chunk in &output {
         let keys = chunk.columns()[0]
@@ -495,6 +497,7 @@ fn compiled_ordered_partial_uses_checked_scan_and_preserves_all_group_contributi
     drop(final_operator);
     drop(final_factory);
     drop(grouped);
+    drop(grouped_operator);
     drop(grouped_factory);
     drop(factory);
     drop(session);
@@ -530,14 +533,14 @@ fn compiled_ordered_partial_keeps_the_first_failure_and_releases_actual_groups()
     .unwrap();
     let mut operator = factory.create(2, 0);
     initialize(operator.as_mut(), &tracker, &creation, &state);
-    let processor = operator.as_processor_mut().unwrap();
+    let mut processor = TestDriver::new(operator.as_mut(), &state);
     processor
-        .push_chunk(&state, slice(&f.input, 0, 3, creation.as_ref()))
+        .input_without_output(slice(&f.input, 0, 3, creation.as_ref()))
         .unwrap();
     state.error_state().set_error(KernelFailure::Cancelled);
     // Create no new storage after cancellation: the independently retained
     // complete input is moved directly into the actual failed processor.
-    let first = processor.push_chunk(&state, f.input.clone()).unwrap_err();
+    let first = processor.input_without_output(f.input.clone()).unwrap_err();
     assert_eq!(
         first.cause(),
         &ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
@@ -545,28 +548,27 @@ fn compiled_ordered_partial_keeps_the_first_failure_and_releases_actual_groups()
     state
         .error_state()
         .set_error(KernelFailure::DeadlineExceeded);
+    assert_eq!(processor.signal_eos().unwrap_err().cause(), first.cause());
     assert_eq!(
-        processor.set_finishing(&state).unwrap_err().cause(),
+        processor.advance_to_boundary().unwrap_err().cause(),
         first.cause()
     );
-    assert_eq!(
-        processor.pull_chunk(&state).unwrap_err().cause(),
-        first.cause()
-    );
-    assert_eq!(
+    let failure_notifications = {
         session
             .recorder
             .events
             .lock()
             .unwrap()
             .iter()
-            .filter(|e| matches!(
-                e,
-                Event::Fail(rf::RuntimeFilterProducerFailure::ExecutionFailed)
-            ))
-            .count(),
-        1
-    );
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::Fail(rf::RuntimeFilterProducerFailure::ExecutionFailed)
+                )
+            })
+            .count()
+    };
+    assert_eq!(failure_notifications, 1);
     drop(operator);
     drop(factory);
     drop(session);

@@ -60,7 +60,7 @@ impl PureCompileControl for Control {
             assert!(index <= stop, "callback after first control refusal");
         }
         events.push(Event::Control(units));
-        match self.stop {
+        match self.stop.clone() {
             Some((stop, cause)) if stop == index => Err(cause),
             _ => Ok(()),
         }
@@ -582,7 +582,7 @@ fn abs_checked_registered_every_original_control_failure_has_exact_primary_prefi
         ] {
             let control = Control {
                 trace: Arc::new(Trace::default()),
-                stop: Some((stop, cause)),
+                stop: Some((stop, cause.clone())),
             };
             let mut scope = Scope::new(&control);
             assert_eq!(

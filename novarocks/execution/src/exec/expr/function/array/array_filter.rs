@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::expression_contract;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use arrow::array::{Array, ArrayRef, BooleanArray, ListArray, make_array, new_null_array};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
@@ -28,7 +30,12 @@ pub fn eval_array_filter<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-) -> Result<ArrayRef, __Eval::Error> {
+) -> ExecutionResult<ArrayRef> {
+    if args.len() != 2 {
+        return Err(expression_contract(
+            "array_filter requires exactly 2 prepared argument(s)",
+        ));
+    }
     let src_arr = arena.eval(args[0], chunk)?;
     let filter_arr = arena.eval(args[1], chunk)?;
     if src_arr.data_type() == &DataType::Null || filter_arr.data_type() == &DataType::Null {
@@ -39,36 +46,42 @@ pub fn eval_array_filter<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 DataType::List(field) => Some(DataType::List(field.clone())),
                 _ => None,
             })
-            .ok_or_else(|| "array_filter output type must be List".to_string())?;
+            .ok_or_else(|| expression_contract("array_filter output type must be List"))?;
         return Ok(new_null_array(&output_type, chunk.len()));
     }
     let src = src_arr
         .as_any()
         .downcast_ref::<ListArray>()
         .ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "array_filter expects ListArray src, got {:?}",
                 src_arr.data_type()
-            )
+            ))
         })?;
     let filter = filter_arr
         .as_any()
         .downcast_ref::<ListArray>()
         .ok_or_else(|| {
-            format!(
+            expression_contract(format_args!(
                 "array_filter expects ListArray filter, got {:?}",
                 filter_arr.data_type()
-            )
+            ))
         })?;
 
     let output_field = match arena.data_type(expr) {
         Some(DataType::List(field)) => field.clone(),
-        _ => match src.data_type() {
+        Some(other) => {
+            return Err(expression_contract(format_args!(
+                "array_filter output must be List, got {other:?}"
+            )));
+        }
+        None => match src.data_type() {
             DataType::List(field) => field.clone(),
             other => {
-                return Err(
-                    (format!("array_filter output type must be List, got {:?}", other)).into(),
-                );
+                return Err(expression_contract(format_args!(
+                    "array_filter output type must be List, got {:?}",
+                    other
+                )));
             }
         },
     };
@@ -76,32 +89,24 @@ pub fn eval_array_filter<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
 
     let mut src_values = src.values().clone();
     if src_values.data_type() != &target_item_type {
-        src_values = cast(&src_values, &target_item_type).map_err(|e| {
-            format!(
-                "array_filter failed to cast src element {:?} -> {:?}: {}",
-                src_values.data_type(),
-                target_item_type,
-                e
-            )
-        })?;
+        src_values = cast(&src_values, &target_item_type)
+            .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
 
     let mut filter_values = filter.values().clone();
     if filter_values.data_type() != &DataType::Boolean {
-        filter_values = cast(&filter_values, &DataType::Boolean).map_err(|e| {
-            format!(
-                "array_filter failed to cast filter element to BOOLEAN: {}",
-                e
-            )
-        })?;
+        filter_values = cast(&filter_values, &DataType::Boolean)
+            .map_err(crate::exec::expr::cast::cast_arrow_failure)?;
     }
     let filter_values = filter_values
         .as_any()
         .downcast_ref::<BooleanArray>()
         .ok_or_else(|| {
-            "array_filter failed to downcast filter values to BooleanArray".to_string()
+            expression_contract("array_filter failed to downcast filter values to BooleanArray")
         })?;
 
+    super::common::validate_rows(src.len(), chunk.len(), "array_filter source")?;
+    super::common::validate_rows(filter.len(), chunk.len(), "array_filter predicate")?;
     let src_values_data = src_values.to_data();
     let mut mutable = MutableArrayData::new(vec![&src_values_data], false, 0);
 
@@ -109,7 +114,7 @@ pub fn eval_array_filter<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
     let filter_offsets = filter.value_offsets();
     let mut out_offsets = Vec::with_capacity(chunk.len() + 1);
     out_offsets.push(0_i32);
-    let mut current: i64 = 0;
+    let mut current = 0i32;
     let mut null_builder = NullBufferBuilder::new(chunk.len());
 
     for row in 0..chunk.len() {
@@ -137,25 +142,31 @@ pub fn eval_array_filter<__Eval: crate::exec::expr::ExprEvaluation + ?Sized>(
                 let f_idx = filter_start + pos;
                 if !filter_values.is_null(f_idx) && filter_values.value(f_idx) {
                     let src_idx = src_start + pos;
+                    let next = novarocks_functions::aggregate_scalar::checked_list_output_offset(
+                        current, 1,
+                    )?;
                     mutable.extend(0, src_idx, src_idx + 1);
-                    current += 1;
+                    current = next;
                 }
             }
         }
 
-        if current > i32::MAX as i64 {
-            return Err(("array_filter offset overflow".to_string()).into());
-        }
         out_offsets.push(current as i32);
         null_builder.append_non_null();
     }
 
     let out_values = make_array(mutable.freeze());
-    let out = ListArray::new(
+    let out = ListArray::try_new(
         output_field,
         OffsetBuffer::new(out_offsets.into()),
         out_values,
         null_builder.finish(),
-    );
+    )
+    .map_err(|source| {
+        crate::exec::expr::function::arrow_operation::arrow_contract_failure(
+            "array_filter constructor",
+            source,
+        )
+    })?;
     Ok(Arc::new(out) as ArrayRef)
 }
