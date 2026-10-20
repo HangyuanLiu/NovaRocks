@@ -548,7 +548,7 @@ run_fail_fast_stage() {
     [ "$CI_SELECTED_STAGE" = "$name" ] || return 0
     CI_STAGE_EXECUTED=true
     ci_stage_native_command "$name" "$@"
-    return $?
+    exit $?
   fi
   local log_path="$CI_RUN_DIR/$log_name"
   local start
@@ -1223,7 +1223,7 @@ EOF
 
 # Development selection delegates to the same native stage commands. This
 # dispatcher executes one declared stage and creates no parallel command map.
-ci_execute_selected_stage() {
+ci_execute_selected_stage() (
   CI_SELECTED_STAGE="$1"
   NOVA_CI_ARTIFACT_RECEIPT="$2"
   CI_RUN_DIR="$3"
@@ -1244,7 +1244,7 @@ ci_execute_selected_stage() {
     *) run_cargo_gates ;;
   esac
   [ "$CI_STAGE_EXECUTED" = true ] || { echo "error: stage has no native command: $CI_SELECTED_STAGE" >&2; return 2; }
-}
+)
 
 main() {
   if [ "${1:-}" = --describe-stage ]; then

@@ -72,6 +72,18 @@ run_fail_fast_stage 'CI build inputs' stage.log ci_validate_build_inputs dev
         self.assertIn('source',expected)
         self.assertTrue(actual['inputs_stable'])
 
+    def test_selected_middle_stage_preserves_native_failure_and_runs_no_other_commands(self):
+        marker=self.root/'cargo-args';bin_dir=self.root/'bin';bin_dir.mkdir()
+        cargo=bin_dir/'cargo'
+        cargo.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >>"$STAGE_EXECUTION_MARKER"\nexit 23\n')
+        cargo.chmod(0o755)
+        env=dict(os.environ,PATH=str(bin_dir)+os.pathsep+os.environ['PATH'],STAGE_EXECUTION_MARKER=str(marker))
+        result=subprocess.run(['bash',str(REPO/'tools/ci/local-full-ci.sh'),'--run-stage','Cargo dependency policy',
+            str(self.root/'unused-receipt'),str(self.root/'output')],cwd=REPO,env=env,text=True,capture_output=True)
+        self.assertEqual(marker.read_text().splitlines(),['deny --locked check advisories bans licenses sources'])
+        self.assertEqual(result.returncode,23,result.stderr)
+        self.assertEqual(result.stderr,'')
+
     def test_native_script_and_config_facts_survive_wrapper_and_output_changes(self):
         script=self.root/'native';script.write_text('#!/bin/sh\nexit 0\n');script.chmod(0o755)
         config=self.root/'config';config.write_text('config-one')
