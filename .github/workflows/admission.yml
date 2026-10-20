@@ -35,6 +35,8 @@ jobs:
       CARGO_BUILD_JOBS: "4"
       NOVA_CI_CARGO_PROFILE: dev
       NOVA_ADMISSION_RUNNER_LABEL: ubuntu-24.04
+      NOVA_CI_CARGO_DENY_VERSION: "0.20.2"
+      NOVA_CI_NEXTEST_VERSION: "0.9.148"
     steps: &admission_steps
       - name: Check out repository
         uses: actions/checkout@v4
@@ -47,11 +49,65 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
 
+      - name: Restore Cargo downloads
+        id: cargo_downloads
+        uses: actions/cache/restore@v4
+        with:
+          path: &cargo_download_paths |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-downloads-v1-${{ hashFiles('**/Cargo.lock') }}-deny-${{ env.NOVA_CI_CARGO_DENY_VERSION }}-nextest-${{ env.NOVA_CI_NEXTEST_VERSION }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-downloads-v1-
+
+      - name: Add pinned tools to PATH
+        run: echo "$RUNNER_TEMP/admission-tools/bin" >> "$GITHUB_PATH"
+
+      - name: Restore pinned Cargo tools
+        id: cargo_tools
+        uses: actions/cache/restore@v4
+        with:
+          path: &cargo_tool_path ${{ runner.temp }}/admission-tools
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ env.NOVA_ADMISSION_RUNNER_LABEL }}-cargo-tools-v1-${{ hashFiles('rust-toolchain.toml') }}-deny-${{ env.NOVA_CI_CARGO_DENY_VERSION }}-nextest-${{ env.NOVA_CI_NEXTEST_VERSION }}
+
       - name: Install pinned cargo-deny
-        run: cargo install cargo-deny --version 0.20.2 --locked
+        if: steps.cargo_tools.outputs.cache-hit != 'true'
+        run: cargo install cargo-deny --version "$NOVA_CI_CARGO_DENY_VERSION" --locked --root "$RUNNER_TEMP/admission-tools"
 
       - name: Install pinned nextest
-        run: cargo install cargo-nextest --version 0.9.148 --locked
+        if: steps.cargo_tools.outputs.cache-hit != 'true'
+        run: cargo install cargo-nextest --version "$NOVA_CI_NEXTEST_VERSION" --locked --root "$RUNNER_TEMP/admission-tools"
+
+      - name: Verify pinned Cargo tools
+        run: |
+          deny_version="$(cargo deny --version)"
+          nextest_version="$(cargo nextest --version)"
+          echo "$deny_version"
+          echo "$nextest_version"
+          [[ "$deny_version" == "cargo-deny $NOVA_CI_CARGO_DENY_VERSION" ]]
+          [[ "$nextest_version" == "cargo-nextest $NOVA_CI_NEXTEST_VERSION" || "$nextest_version" == "cargo-nextest $NOVA_CI_NEXTEST_VERSION "* ]]
+
+      - name: Save pinned Cargo tools
+        if: steps.cargo_tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: *cargo_tool_path
+          key: ${{ steps.cargo_tools.outputs.cache-primary-key }}
+
+      - name: Fetch locked workspace dependencies
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          test -n "$host"
+          cargo fetch --locked --target "$host"
+
+      # Save before native validation so later test failures cannot prevent it.
+      - name: Save Cargo downloads
+        if: steps.cargo_downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: *cargo_download_paths
+          key: ${{ steps.cargo_downloads.outputs.cache-primary-key }}
 
       - name: Run admission
         # Leave time for the always-run material upload after a native timeout.
