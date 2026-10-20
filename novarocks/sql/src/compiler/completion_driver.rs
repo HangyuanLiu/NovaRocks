@@ -796,6 +796,7 @@ fn optimize_to_physical(
         constant_evaluator,
         Arc::clone(&function_catalog),
         decimal_overflow_policy,
+        root_allow_throw_exception,
         control,
     )
     .with_fold_dependency_observer(control.fold_dependency_observer().cloned());

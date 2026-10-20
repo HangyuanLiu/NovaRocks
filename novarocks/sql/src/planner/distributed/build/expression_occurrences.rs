@@ -715,39 +715,7 @@ impl Author<'_> {
     }
 }
 
-// Only the installed owner supplies this enum. Case arity follows the same
-// ordered operand/WHEN/THEN/ELSE vocabulary checked by the control graph.
-pub(super) fn scalar_shape(control: ArgumentControl, count: usize) -> Option<ControlShape> {
-    Some(match control {
-        ArgumentControl::Eager => ControlShape::Eager,
-        ArgumentControl::TypeOnly => ControlShape::TypeOnly,
-        ArgumentControl::NoArguments => ControlShape::NoArguments,
-        ArgumentControl::If => ControlShape::If,
-        ArgumentControl::Coalesce => ControlShape::Coalesce,
-        ArgumentControl::SimpleCase | ArgumentControl::SearchedCase => {
-            let simple = control == ArgumentControl::SimpleCase;
-            let tail = count.checked_sub(usize::from(simple))?;
-            ControlShape::Case {
-                simple,
-                arms: u32::try_from(tail / 2).ok()?,
-                has_else: tail % 2 == 1,
-            }
-        }
-        ArgumentControl::HigherOrder {
-            body_ordinal,
-            body_demand,
-        } => ControlShape::HigherOrder {
-            body_ordinal,
-            body_demand,
-        },
-        ArgumentControl::TemporalSource(_)
-        | ArgumentControl::Aggregate
-        | ArgumentControl::Window
-        | ArgumentControl::Table => {
-            return None;
-        }
-    })
-}
+pub(super) use crate::compiler::selected_scalar_call::scalar_shape;
 
 #[cfg(test)]
 #[path = "expression_occurrences_tests.rs"]

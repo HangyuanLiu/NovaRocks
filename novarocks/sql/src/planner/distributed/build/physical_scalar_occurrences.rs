@@ -19,10 +19,7 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use novarocks_functions::{
-    CallEffectInput, PureCallPreparation, PureCallSpecialization, PureKernelAbi,
-    ScopedExpressionEffects,
-};
+use novarocks_functions::{PureCallSpecialization, PureKernelAbi, ScopedExpressionEffects};
 use novarocks_physical_plan::{ExprId, ExprKind, ExprNode, FrozenPhysicalCall, PhysicalCallSite};
 use novarocks_type_contract::{
     CallProofScope, CompileCheckpoints, CompileControlError, ControlShape, DecimalOverflowPolicy,
@@ -127,16 +124,16 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
         ));
     }
     work.flush()?;
-    let declaration = functions
-        .pure_overload_declaration_observed(
-            &function.function_id,
-            function.kind,
-            &input.request.selected().overload,
-            work.control(),
-        )
-        .map_err(ExpressionOccurrenceError::function)?;
+    let (abi, selected_control) = crate::compiler::selected_scalar_call::selected_scalar_control(
+        functions,
+        &function.function_id,
+        function.kind,
+        input.request.selected(),
+        input.request.request().logical_argument_count,
+        work.control(),
+    )
+    .map_err(ExpressionOccurrenceError::function)?;
     work.flush()?;
-    let abi = declaration.implementation().abi;
     if !matches!(
         abi,
         PureKernelAbi::ScalarV1
@@ -145,18 +142,6 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
     ) {
         return Err(PhysicalScalarOccurrenceError::UnsupportedAbi(abi));
     }
-    let selected_control = if abi == PureKernelAbi::ScalarInvocationV1 {
-        declaration
-            .selected_argument_control_observed(
-                &function.function_id,
-                input.request.selected().as_ref(),
-                input.request.request().logical_argument_count,
-                work.control(),
-            )
-            .map_err(|error| ExpressionOccurrenceError::function(error.into()))?
-    } else {
-        declaration.effects().argument_control
-    };
     let shape = match selected_control {
         novarocks_type_contract::ArgumentControl::TemporalSource(kind) => {
             let source =
@@ -287,60 +272,49 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
         }
         work.step()?;
     }
-    let options = match abi {
-        PureKernelAbi::ScalarV1 | PureKernelAbi::ScalarInvocationV1 => {
-            PureCallPreparation::Scalar {
-                arguments: children,
-            }
+    use crate::compiler::selected_scalar_call::{
+        EmittedScalarArgumentSource, scalar_argument_source, source_argument_ordinal,
+    };
+    let source_ordinal = source_argument_ordinal(&function.function_id, args.len())
+        .map_err(PhysicalScalarOccurrenceError::InvalidSource)?;
+    let argument_source = if let Some(ordinal) = source_ordinal {
+        let definitions = input
+            .definitions
+            .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
+                "source-sensitive scalar requires the original emitted definition arena",
+            ))?;
+        let definition =
+            definitions
+                .get(args[ordinal])
+                .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
+                    "source-sensitive scalar argument definition is absent",
+                ))?;
+        work.step()?;
+        Some(EmittedScalarArgumentSource {
+            value_type: &definition.ty,
+            unchecked_literal: matches!(definition.kind, ExprKind::Literal(_)),
+            checked_constant_reference:
+                novarocks_physical_plan::native_v1_emitted_constant_reference(&definition.kind)
+                    .is_some(),
+            immediate_function: match &definition.kind {
+                ExprKind::FunctionCall { function, .. } => Some(&function.function_id),
+                _ => None,
+            },
+        })
+    } else {
+        None
+    };
+    let argument_source =
+        scalar_argument_source(&function.function_id, args.len(), argument_source)
+            .map_err(PhysicalScalarOccurrenceError::InvalidSource)?;
+    let (regexp_count_pattern_source, to_base64_byte_source) = match argument_source {
+        crate::compiler::FrozenFoldArgumentSource::Selected => (None, None),
+        crate::compiler::FrozenFoldArgumentSource::RegexpCountPattern(source) => {
+            (Some(source), None)
         }
-        PureKernelAbi::ControlIntrinsicV1 => PureCallPreparation::ControlIntrinsic {
-            arguments: children,
-        },
-        _ => unreachable!("only the two admitted installed ABIs reach preparation"),
+        crate::compiler::FrozenFoldArgumentSource::ToBase64Bytes(source) => (None, Some(source)),
     };
-    let regexp_count_pattern_source = if function.function_id.as_str()
-        == "builtin.scalar/regexp_count/v1"
-    {
-        let definitions = input
-            .definitions
-            .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
-                "regexp_count requires the original emitted definition arena",
-            ))?;
-        Some(
-            novarocks_physical_plan::regexp_count_pattern_source_observed(definitions, args, work)
-                .map_err(|error| match error {
-                    novarocks_physical_plan::TemporalSourceProjectionError::Control(cause) => {
-                        PhysicalScalarOccurrenceError::Control(cause)
-                    }
-                    novarocks_physical_plan::TemporalSourceProjectionError::Invalid(message) => {
-                        PhysicalScalarOccurrenceError::InvalidSource(message)
-                    }
-                })?,
-        )
-    } else {
-        None
-    };
-    let to_base64_byte_source = if function.function_id.as_str() == "builtin.scalar/to_base64/v1" {
-        let definitions = input
-            .definitions
-            .ok_or(PhysicalScalarOccurrenceError::InvalidSource(
-                "to_base64 requires the original emitted definition arena",
-            ))?;
-        Some(
-            novarocks_physical_plan::to_base64_byte_source_observed(definitions, args, work)
-                .map_err(|error| match error {
-                    novarocks_physical_plan::TemporalSourceProjectionError::Control(cause) => {
-                        PhysicalScalarOccurrenceError::Control(cause)
-                    }
-                    novarocks_physical_plan::TemporalSourceProjectionError::Invalid(message) => {
-                        PhysicalScalarOccurrenceError::InvalidSource(message)
-                    }
-                })?,
-        )
-    } else {
-        None
-    };
-    let call = CallEffectInput {
+    let call = crate::compiler::selected_scalar_call::SelectedScalarCallInput {
         context: invocation.context,
         argument_uses: match input.temporal_source {
             Some(source) => novarocks_functions::CallArgumentUses::TemporalSources {
@@ -363,7 +337,6 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
         },
         function_id: &function.function_id,
         kind: function.kind,
-        selected: input.request.selected().as_ref(),
         request: input.request.request(),
         environment: input.environment,
         parameters: input.parameters,
@@ -371,14 +344,15 @@ pub(crate) fn prepare_physical_scalar_occurrence_observed(
         proof_scope: input.proof_scope,
     };
     work.flush()?;
-    let preparation = functions
-        .prepare_fresh_selected(
-            call,
-            Arc::clone(input.request.selected()),
-            options,
-            work.control(),
-        )
-        .map_err(ExpressionOccurrenceError::function)?;
+    let preparation = crate::compiler::selected_scalar_call::prepare_selected_scalar_call_observed(
+        functions,
+        call,
+        Arc::clone(input.request.selected()),
+        abi,
+        children,
+        work.control(),
+    )
+    .map_err(ExpressionOccurrenceError::function)?;
     work.flush()?;
     let frozen = FrozenPhysicalCall {
         materialized_writer_input: None,

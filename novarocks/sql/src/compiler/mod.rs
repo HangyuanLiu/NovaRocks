@@ -527,18 +527,12 @@ pub use fold_observation::{
 };
 pub(crate) use fold_observation::{SqlFoldEvaluatorLoan, evaluate_fold_dependency_observed};
 
-/// One scalar node shape the optimizer may ask a constant evaluator to fold.
-///
-/// The vocabulary is deliberately SQL-owned: it never names an execution
-/// expression node, kernel, or arena handle. Growing it is a compiler-boundary
-/// decision, not an execution-layer one.
-#[derive(Clone, Debug, PartialEq)]
-pub enum FoldNodeKind {
-    BinaryOp(BinOp, novarocks_type_contract::DecimalOverflowPolicy),
-    UnaryOp(UnOp),
-    Cast(novarocks_type_contract::DecimalOverflowPolicy),
-    Function { name: String },
-}
+mod fold_node;
+pub use fold_node::{
+    CarrierStep, ConversionPlan, FrozenFoldArgumentSource, FrozenFoldCall, FrozenFoldIntrinsic,
+    FrozenFoldNode,
+};
+pub(crate) mod selected_scalar_call;
 
 /// One already-folded argument of a fold request.
 #[derive(Clone, Debug)]
@@ -556,10 +550,10 @@ pub struct FoldArg {
 /// per-node calculator with no traversal knowledge.
 #[derive(Clone, Debug)]
 pub struct FoldRequest {
-    /// Existing emitted-pattern error policy, authored by SQL after its
-    /// children really folded; absence preserves raw reference evaluation.
-    pub regexp_count_pattern_source: Option<novarocks_type_contract::RegexpCountPatternSource>,
-    pub kind: FoldNodeKind,
+    /// Exact selected call or intrinsic facts authored by SQL lowering.
+    pub kind: FrozenFoldNode,
+    /// Original admitted sources for observation. A selected call separately
+    /// retains canonical runtime arguments through FrozenFoldCall::arguments.
     pub args: Vec<FoldArg>,
     /// Explicit host-admitted policy for the newly evaluated backing.
     pub constant_policy: novarocks_functions::ConstantPolicy,
@@ -1894,6 +1888,7 @@ impl SqlCompiler {
                     constant_evaluator,
                     Arc::clone(&function_catalog),
                     decimal_overflow_policy,
+                    root_allow_throw_exception,
                     &control,
                 )
                 .with_fold_dependency_observer(control.fold_dependency_observer().cloned()),
@@ -1909,6 +1904,7 @@ impl SqlCompiler {
                     constant_evaluator,
                     Arc::clone(&function_catalog),
                     decimal_overflow_policy,
+                    root_allow_throw_exception,
                     &control,
                 )
                 .with_fold_dependency_observer(control.fold_dependency_observer().cloned()),
@@ -3512,11 +3508,8 @@ mod tests {
             }
         }
         let request = FoldRequest {
-            regexp_count_pattern_source: None,
             constant_policy: crate::constant::test_constant_policy(),
-            kind: FoldNodeKind::Function {
-                name: "fixture/no-op".into(),
-            },
+            kind: FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Not),
             args: Vec::new(),
             result_type: novarocks_type_contract::FunctionValueType::new(
                 arrow::datatypes::DataType::Int64,
@@ -3744,11 +3737,10 @@ mod tests {
                 .unwrap()
                 .eval_scalar(
                     &FoldRequest {
-                        regexp_count_pattern_source: None,
                         constant_policy: crate::constant::test_constant_policy(),
-                        kind: FoldNodeKind::Cast(
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                        ),
+                        kind: FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Cast {
+                            plan: ConversionPlan::Identity,
+                        }),
                         args: Vec::new(),
                         result_type: novarocks_type_contract::FunctionValueType::new(
                             arrow::datatypes::DataType::Decimal128(3, 0),

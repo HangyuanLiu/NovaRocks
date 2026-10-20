@@ -37,7 +37,8 @@ use std::collections::HashMap;
 use arrow::datatypes::DataType;
 
 use crate::compiler::{
-    FoldArg, FoldNodeKind, FoldRequest, SqlConstantEvaluationError, SqlConstantEvaluator,
+    FoldArg, FoldRequest, FrozenFoldIntrinsic, FrozenFoldNode, SqlConstantEvaluationError,
+    SqlConstantEvaluator,
 };
 use crate::functions::FunctionVolatility;
 use crate::optimizer::operator::Operator;
@@ -140,13 +141,9 @@ fn is_environment_sensitive_function(name: &str) -> bool {
 
 /// Output types a folded literal is allowed to have.
 ///
-/// Hard constraint, not an optimization heuristic: a folded literal has to
-/// survive the FE -> BE plan encoding. The authoritative decode arms live in
-/// `novarocks/native-adapter/src/fragment_expression/literal.rs` (`lower_literal_at`
-/// / `lower_int_literal` / `lower_decimal_literal`) — the wire literal message
-/// has no timestamp variant and no composite variant, so folding an expression
-/// whose output type is `Timestamp(..)`, a list, a struct, a map, or any other
-/// composite would produce a literal that cannot be sent to a backend.
+/// Keep the existing folding coverage stable during evaluator migration.
+/// The compiled constant contract supports more carriers; extending this policy
+/// changes optimizer plans and belongs to a separately accepted change.
 fn is_wire_encodable_literal_type(data_type: &DataType) -> bool {
     matches!(
         data_type,
@@ -207,7 +204,12 @@ impl LogicalRewriteRule for FoldConstant {
                 .with_catalog(ctx.function_catalog());
         let changed = {
             let mut arena = arena.borrow_mut();
-            let mut folder = ConstantFolder::new(&mut arena, &evaluator, work);
+            let services = FoldServices {
+                calculator: &evaluator,
+                functions: ctx.function_catalog(),
+                allow_throw_exception: ctx.root_allow_throw_exception(),
+            };
+            let mut folder = ConstantFolder::new(&mut arena, services, work);
             let changed = folder.fold_operator(&mut op)?;
             folder.work.finish()?;
             changed
@@ -230,6 +232,18 @@ impl LogicalRewriteRule for FoldConstant {
 // Scalar folding
 // ---------------------------------------------------------------------------
 
+struct FoldServices<'a> {
+    calculator: &'a dyn SqlConstantEvaluator,
+    functions: &'a dyn crate::compiler::SqlFunctionCatalog,
+    allow_throw_exception: bool,
+}
+impl<'a> std::ops::Deref for FoldServices<'a> {
+    type Target = dyn SqlConstantEvaluator + 'a;
+    fn deref(&self) -> &Self::Target {
+        self.calculator
+    }
+}
+
 /// Bottom-up constant folder over one `ScalarArena`.
 ///
 /// `memo` maps an original `ScalarId` to its folded replacement so a shared
@@ -238,7 +252,7 @@ impl LogicalRewriteRule for FoldConstant {
 /// the arena, memo values or rewritten output.
 struct ConstantFolder<'a, 'control> {
     arena: &'a mut ScalarArena,
-    evaluator: &'control dyn SqlConstantEvaluator,
+    evaluator: FoldServices<'control>,
     memo: HashMap<ScalarId, ScalarId>,
     work: CompileCheckpoints<'control>,
 }
@@ -246,7 +260,7 @@ struct ConstantFolder<'a, 'control> {
 impl<'a, 'control> ConstantFolder<'a, 'control> {
     fn new(
         arena: &'a mut ScalarArena,
-        evaluator: &'control dyn SqlConstantEvaluator,
+        evaluator: FoldServices<'control>,
         work: CompileCheckpoints<'control>,
     ) -> Self {
         Self {
@@ -262,7 +276,7 @@ impl<'a, 'control> ConstantFolder<'a, 'control> {
             match fold_scalar(
                 self.arena,
                 *slot,
-                self.evaluator,
+                &self.evaluator,
                 &mut self.memo,
                 &mut self.work,
             )? {
@@ -536,7 +550,7 @@ fn operator_has_scalars(op: &Operator) -> bool {
 fn fold_scalar(
     arena: &mut ScalarArena,
     id: ScalarId,
-    evaluator: &dyn SqlConstantEvaluator,
+    evaluator: &FoldServices<'_>,
     memo: &mut HashMap<ScalarId, ScalarId>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Option<ScalarId>, SqlCompileError> {
@@ -547,7 +561,7 @@ fn fold_scalar(
 fn fold_scalar_id(
     arena: &mut ScalarArena,
     id: ScalarId,
-    evaluator: &dyn SqlConstantEvaluator,
+    evaluator: &FoldServices<'_>,
     memo: &mut HashMap<ScalarId, ScalarId>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ScalarId, SqlCompileError> {
@@ -563,7 +577,7 @@ fn fold_scalar_id(
 fn fold_scalar_uncached(
     arena: &mut ScalarArena,
     id: ScalarId,
-    evaluator: &dyn SqlConstantEvaluator,
+    evaluator: &FoldServices<'_>,
     memo: &mut HashMap<ScalarId, ScalarId>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ScalarId, SqlCompileError> {
@@ -694,7 +708,7 @@ fn fold_scalar_uncached(
     // metadata. `intern` may canonicalize commutative operand order, so the
     // fold step below reads the children back out of the arena.
     let rebuilt = arena.intern_observed(node, value_type, work.control())?;
-    Ok(try_fold_node(arena, rebuilt, evaluator, work)?.unwrap_or(rebuilt))
+    Ok(try_fold_node_with_services(arena, rebuilt, evaluator, work)?.unwrap_or(rebuilt))
 }
 
 fn has_sec_to_time_source(
@@ -718,7 +732,7 @@ fn has_sec_to_time_source(
 fn fold_sec_to_time_source(
     arena: &mut ScalarArena,
     id: ScalarId,
-    evaluator: &dyn SqlConstantEvaluator,
+    evaluator: &FoldServices<'_>,
     memo: &mut HashMap<ScalarId, ScalarId>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ScalarId, SqlCompileError> {
@@ -742,10 +756,10 @@ fn fold_sec_to_time_source(
 ///
 /// Returns `Ok(None)` when a safety gate fails or the legacy evaluator declines
 /// or reports an evaluation error. Caller control failures remain typed errors.
-fn try_fold_node(
+fn try_fold_node_with_services(
     arena: &mut ScalarArena,
     id: ScalarId,
-    evaluator: &dyn SqlConstantEvaluator,
+    evaluator: &FoldServices<'_>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<Option<ScalarId>, SqlCompileError> {
     work.step()?;
@@ -771,17 +785,8 @@ fn try_fold_node(
 
     // Gate 2: a volatile or DISTINCT function is never a constant.
     // Gate 3: an environment-sensitive function must stay on the backend.
-    let kind = match &node {
-        ScalarNode::BinaryOp {
-            op,
-            decimal_overflow_policy,
-            ..
-        } => FoldNodeKind::BinaryOp(*op, *decimal_overflow_policy),
-        ScalarNode::UnaryOp { op, .. } => FoldNodeKind::UnaryOp(*op),
-        ScalarNode::Cast {
-            decimal_overflow_policy,
-            ..
-        } => FoldNodeKind::Cast(*decimal_overflow_policy),
+    match &node {
+        ScalarNode::BinaryOp { .. } | ScalarNode::UnaryOp { .. } | ScalarNode::Cast { .. } => {}
         ScalarNode::FunctionCall {
             name,
             distinct,
@@ -794,14 +799,13 @@ fn try_fold_node(
             if is_environment_sensitive_function(name) || is_byte_carrying_string_function(name) {
                 return Ok(None);
             }
-            FoldNodeKind::Function { name: name.clone() }
         }
-        // Every other node shape stays unfolded in v1; its children were
+        // Every other node shape stays unfolded under the existing policy; its children were
         // already folded above.
         _ => return Ok(None),
     };
 
-    // Gate 4: the folded literal has to survive the FE -> BE plan encoding.
+    // Gate 4: retain the existing literal-type folding coverage boundary.
     if !is_wire_encodable_literal_type(&out_type) {
         return Ok(None);
     }
@@ -838,28 +842,92 @@ fn try_fold_node(
         });
     }
 
-    // All arguments at this point are admitted literals/folded constants.
-    // The exact binding, rather than its spelling or CV payload, identifies
-    // the emitted-source contract that the real runtime will consume.
-    let regexp_count_pattern_source = match &node {
-        ScalarNode::FunctionCall { binding, .. }
-            if binding.function_id.as_str() == "builtin.scalar/regexp_count/v1" =>
-        {
-            let [_, pattern] = args.as_slice() else {
-                return Err("regexp_count fold source requires two arguments".into());
-            };
-            Some(
-                novarocks_type_contract::RegexpCountPatternSource::from_native_v1_emitted_shape(
-                    &pattern.value_type,
-                    true,
-                )
-                .map_err(str::to_owned)?,
+    // Preparation shares the exact call/transition authors with package lowering.
+    // Its failure stays fatal; only evaluator row errors use fail-open below.
+    use crate::compiler::selected_scalar_call as selected;
+    let intrinsic = |kind| FrozenFoldNode::Intrinsic(kind);
+    let conversion =
+        |arg: &FoldArg, target: &novarocks_type_contract::FunctionValueType, policy| {
+            selected::freeze_conversion(
+                evaluator.functions,
+                arg,
+                target,
+                policy,
+                evaluator.allow_throw_exception,
+                arena.constant_policy(),
+                work.control(),
             )
+        };
+    let kind = match &node {
+        ScalarNode::FunctionCall { binding, .. } => {
+            let Some(call) = selected::freeze_fold_call(
+                evaluator.functions,
+                binding,
+                &mut args,
+                arena.constant_policy(),
+                true,
+                work.control(),
+            )?
+            else {
+                return Ok(None);
+            };
+            FrozenFoldNode::Call(call)
         }
-        _ => None,
+        ScalarNode::Cast {
+            decimal_overflow_policy,
+            ..
+        } => intrinsic(FrozenFoldIntrinsic::Cast {
+            plan: conversion(&args[0], arena.value_type(id), *decimal_overflow_policy)?,
+        }),
+        ScalarNode::UnaryOp { op, .. } => intrinsic(match op {
+            crate::common::UnOp::Not => FrozenFoldIntrinsic::Not,
+            crate::common::UnOp::Negate => FrozenFoldIntrinsic::Negate,
+            crate::common::UnOp::BitwiseNot => FrozenFoldIntrinsic::BitNot,
+        }),
+        ScalarNode::BinaryOp {
+            op,
+            decimal_overflow_policy,
+            ..
+        } => {
+            if let Some(operator) = selected::arithmetic_operator(*op) {
+                intrinsic(FrozenFoldIntrinsic::Arithmetic {
+                    operator,
+                    decimal_overflow_policy: *decimal_overflow_policy,
+                    allow_throw_exception: evaluator.allow_throw_exception,
+                })
+            } else if matches!(op, crate::common::BinOp::And | crate::common::BinOp::Or) {
+                intrinsic(if *op == crate::common::BinOp::And {
+                    FrozenFoldIntrinsic::Conjunction
+                } else {
+                    FrozenFoldIntrinsic::Disjunction
+                })
+            } else {
+                let compared = selected::comparison_type(&args[0].value_type, &args[1].value_type)
+                    .map_err(SqlCompileError::InvalidRequest)?;
+                let left = conversion(
+                    &args[0],
+                    &selected::comparison_target(&compared, &args[0].value_type),
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                )?;
+                let right = conversion(
+                    &args[1],
+                    &selected::comparison_target(&compared, &args[1].value_type),
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                )?;
+                intrinsic(if let Some(operator) = selected::comparison_operator(*op) {
+                    FrozenFoldIntrinsic::Comparison {
+                        operator,
+                        left,
+                        right,
+                    }
+                } else {
+                    FrozenFoldIntrinsic::NullSafeEq { left, right }
+                })
+            }
+        }
+        _ => unreachable!("foldability gates checked the node"),
     };
     let request = FoldRequest {
-        regexp_count_pattern_source,
         kind,
         args,
         result_type: arena.value_type(id).clone(),
@@ -868,21 +936,13 @@ fn try_fold_node(
 
     work.step()?;
     work.flush()?;
-    let source = match &node {
-        ScalarNode::FunctionCall { binding, .. } => {
-            crate::compiler::SqlFoldDependencySource::Function(binding)
-        }
-        ScalarNode::BinaryOp { .. } | ScalarNode::UnaryOp { .. } | ScalarNode::Cast { .. } => {
-            crate::compiler::SqlFoldDependencySource::Intrinsic
-        }
-        _ => unreachable!("original foldability gate checked the node shape"),
-    };
+    let source = crate::compiler::SqlFoldDependencySource::from_node(&request.kind);
     let input = crate::compiler::SqlFoldDependencyInput {
         source,
         request: &request,
     };
     let evaluated = match crate::compiler::evaluate_fold_dependency_observed(
-        evaluator,
+        evaluator.calculator,
         input,
         work.control(),
     ) {
@@ -917,6 +977,22 @@ fn try_fold_node(
         // cannot silently become a missed optimization.
         Err(_) => None,
     })
+}
+
+#[cfg(test)]
+fn try_fold_node(
+    arena: &mut ScalarArena,
+    id: ScalarId,
+    evaluator: &dyn SqlConstantEvaluator,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<ScalarId>, SqlCompileError> {
+    let catalog = crate::functions::builtin_sql_function_catalog();
+    let services = FoldServices {
+        calculator: evaluator,
+        functions: catalog,
+        allow_throw_exception: false,
+    };
+    try_fold_node_with_services(arena, id, &services, work)
 }
 
 #[cfg(test)]
@@ -1013,7 +1089,12 @@ mod tests {
                 FakeMode::Fold => {}
             }
             match &request.kind {
-                FoldNodeKind::BinaryOp(op @ (BinOp::Add | BinOp::Mul), _) => {
+                FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Arithmetic {
+                    operator:
+                        op @ (novarocks_type_contract::ArithmeticOperator::Add
+                        | novarocks_type_contract::ArithmeticOperator::Multiply),
+                    ..
+                }) => {
                     let mut values = Vec::new();
                     for arg in &request.args {
                         let Some(value) = arg.value.signed_integer_observed(
@@ -1029,12 +1110,12 @@ mod tests {
                         return Ok(None);
                     }
                     let folded = match op {
-                        BinOp::Add => values[0] + values[1],
+                        novarocks_type_contract::ArithmeticOperator::Add => values[0] + values[1],
                         _ => values[0] * values[1],
                     };
                     test_fold_value(request, LiteralValue::Int(folded), control)
                 }
-                FoldNodeKind::Function { .. } => test_fold_value(
+                FrozenFoldNode::Call(_) => test_fold_value(
                     request,
                     if *request.result_type.data_type() == DataType::Utf8 {
                         LiteralValue::String(FUNCTION_MARKER.to_string())
@@ -1117,14 +1198,37 @@ mod tests {
             data_type: DataType,
             nullable: bool,
         ) -> ScalarId {
-            let binding = crate::optimizer::scalar::test_function_binding(
-                &self.arena.borrow(),
-                name,
-                &args,
-                data_type.clone(),
-                nullable,
-                volatility,
-            );
+            let binding = if matches!(name, "abs" | "sec_to_time" | "time_to_sec") {
+                let arguments = args
+                    .iter()
+                    .map(|id| novarocks_functions::FunctionArgument::Value {
+                        value_type: self.arena.borrow().value_type(*id).clone(),
+                        constant: None,
+                    })
+                    .collect::<Vec<_>>();
+                let resolved = crate::functions::builtin_sql_function_catalog()
+                    .resolve_scalar_binding(
+                        name,
+                        &arguments,
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .expect("eligible fold fixture has an installed owner");
+                crate::binding::SqlFunctionBinding::new(
+                    resolved,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                )
+            } else {
+                // Gated calls intentionally have no installed fixture owner: the
+                // syntax gates must reject before preparation or evaluation.
+                crate::optimizer::scalar::test_function_binding(
+                    &self.arena.borrow(),
+                    name,
+                    &args,
+                    data_type.clone(),
+                    nullable,
+                    volatility,
+                )
+            };
             self.intern(
                 ScalarNode::FunctionCall {
                     binding,
@@ -1696,7 +1800,12 @@ mod tests {
         );
         let mut arena = fixture.arena.borrow_mut();
         let mut memo = HashMap::new();
-        let evaluator = fixture.evaluator.unwrap();
+        let services = FoldServices {
+            calculator: fixture.evaluator.unwrap(),
+            functions: crate::functions::builtin_sql_function_catalog(),
+            allow_throw_exception: false,
+        };
+        let evaluator = &services;
         let mut work = CompileCheckpoints::try_new(
             crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             CompilePhase::Validate,
@@ -2171,6 +2280,20 @@ mod overflow_policy_tests {
     use super::*;
     use crate::common::{BinOp, LiteralValue};
     use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+    fn request_policy(
+        request: &FoldRequest,
+    ) -> Option<novarocks_type_contract::DecimalOverflowPolicy> {
+        match &request.kind {
+            FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Arithmetic {
+                decimal_overflow_policy,
+                ..
+            }) => Some(*decimal_overflow_policy),
+            FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Cast {
+                plan: crate::compiler::ConversionPlan::Carrier(step),
+            }) => Some(step.decimal_overflow_policy()),
+            _ => None,
+        }
+    }
     struct CheckedEvaluator;
     impl SqlConstantEvaluator for CheckedEvaluator {
         fn eval_scalar(
@@ -2179,12 +2302,9 @@ mod overflow_policy_tests {
             control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
         {
-            match request.kind {
-                FoldNodeKind::BinaryOp(BinOp::Add, ReportError)
-                | FoldNodeKind::Cast(ReportError) => Err("checked overflow".to_string().into()),
-                FoldNodeKind::BinaryOp(BinOp::Add, OutputNull) | FoldNodeKind::Cast(OutputNull) => {
-                    test_fold_value(request, LiteralValue::Null, control)
-                }
+            match request_policy(request) {
+                Some(ReportError) => Err("checked overflow".to_string().into()),
+                Some(OutputNull) => test_fold_value(request, LiteralValue::Null, control),
                 _ => Ok(None),
             }
         }
@@ -2267,11 +2387,8 @@ mod overflow_policy_tests {
                 control: &dyn novarocks_type_contract::PureCompileControl,
             ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
             {
-                match request.kind {
-                    FoldNodeKind::BinaryOp(BinOp::Mul, OutputNull)
-                    | FoldNodeKind::Cast(OutputNull) => {
-                        test_fold_value(request, LiteralValue::Null, control)
-                    }
+                match request_policy(request) {
+                    Some(OutputNull) => test_fold_value(request, LiteralValue::Null, control),
                     _ => Ok(None),
                 }
             }

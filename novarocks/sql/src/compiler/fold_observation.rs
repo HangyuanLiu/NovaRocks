@@ -31,6 +31,15 @@ pub enum SqlFoldDependencySource<'a> {
     Intrinsic,
 }
 
+impl<'a> SqlFoldDependencySource<'a> {
+    pub(crate) fn from_node(node: &'a super::FrozenFoldNode) -> Self {
+        match node {
+            super::FrozenFoldNode::Call(call) => Self::Function(call.binding()),
+            super::FrozenFoldNode::Intrinsic(_) => Self::Intrinsic,
+        }
+    }
+}
+
 /// One synchronous loan of the exact original binding and already-admitted CVs.
 /// Function selection is borrowed before the original node can be replaced.
 #[derive(Clone, Copy, Debug)]

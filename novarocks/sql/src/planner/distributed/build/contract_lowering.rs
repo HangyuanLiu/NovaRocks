@@ -8881,16 +8881,10 @@ impl<'a> ContractLoweringVisitor<'a> {
                 } else {
                     (lowered_left, lowered_right)
                 };
+                let allow_throw_exception =
+                    crate::compiler::selected_scalar_call::arithmetic_allows_throw(*op)
+                        .then(|| self.root_allow_throw_reference());
                 let op = lower_binary_operator(*op);
-                let allow_throw_exception = matches!(
-                    op,
-                    BinaryOperator::Add
-                        | BinaryOperator::Subtract
-                        | BinaryOperator::Multiply
-                        | BinaryOperator::Divide
-                        | BinaryOperator::Modulo
-                )
-                .then(|| self.root_allow_throw_reference());
                 ContractExprKind::Binary {
                     allow_throw_exception,
                     left: lowered_left,
@@ -9388,29 +9382,23 @@ impl<'a> ContractLoweringVisitor<'a> {
         arguments: &[novarocks_functions::FunctionArgument],
         constraint: Option<&novarocks_functions::FunctionValueType>,
     ) -> Result<Arc<novarocks_functions::FunctionBindingSelection>, ContractLoweringError> {
-        let original = binding.resolved();
         self.work.flush()?;
-        let selection = self
-            .functions
-            .select_exact_overload_observed(
-                &original.function_id,
-                original.kind,
-                &original.selected.overload,
-                novarocks_functions::FunctionBindingRequest {
-                    arguments,
-                    logical_argument_count,
-                    expected_result_type: constraint,
-                },
-                self.control,
-            )
-            .map_err(|error| match error {
-                novarocks_functions::FunctionBindingError::Control(cause) => {
-                    ContractLoweringError::Control(cause)
-                }
-                error => ContractLoweringError::InvalidFunctionBinding {
-                    detail: format!("canonical call selection: {error}"),
-                },
-            });
+        let selection = crate::compiler::selected_scalar_call::canonical_scalar_request_observed(
+            self.functions,
+            binding,
+            logical_argument_count,
+            arguments,
+            constraint,
+            self.control,
+        )
+        .map_err(|error| match error {
+            novarocks_functions::FunctionBindingError::Control(cause) => {
+                ContractLoweringError::Control(cause)
+            }
+            error => ContractLoweringError::InvalidFunctionBinding {
+                detail: format!("canonical call selection: {error}"),
+            },
+        });
         self.completed_specialization_result(selection)
     }
 
@@ -9688,17 +9676,12 @@ impl<'a> ContractLoweringVisitor<'a> {
     ) -> Result<LoweredOperationalChannel, ContractLoweringError> {
         // Preserve the original binding's canonical bare-NULL conversion.
         // The retained original request still says what analysis authored.
-        if let FunctionArgumentType::Value(expected) = expected
-            && *expected.data_type() != DataType::Null
-            && *argument.value_type.data_type() == DataType::Null
-        {
-            let (expression, value) = self.author_literal_expression_with_source(
-                owner,
-                &LiteralValue::Null,
-                (expected.clone())
-                    .with_nullable(true)
-                    .expect("validated root NULL contract"),
-            )?;
+        if let Some(target) = crate::compiler::selected_scalar_call::canonical_null_target(
+            &argument.value_type,
+            expected,
+        ) {
+            let (expression, value) =
+                self.author_literal_expression_with_source(owner, &LiteralValue::Null, target)?;
             let channel = LoweredOperationalChannel {
                 expression,
                 role: SqlOperationalChannelRole::CanonicalNull { value },
@@ -10018,75 +10001,33 @@ impl<'a> ContractLoweringVisitor<'a> {
         policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> Result<ExprId, ContractLoweringError> {
         let source = self.expression_value_type(expression)?;
-        if source == *target {
-            return Ok(expression);
-        }
-        self.control.checkpoint(CompilePhase::Validate, 0)?;
-        let intermediate =
-            if novarocks_type_contract::is_default_json_structure_cast(&source, target) {
-                // The original JSON parser CAST owns this shape change and its
-                // complete declared children. Do not resolve a same-shape call.
-                Ok(None)
-            } else {
-                novarocks_functions::builtin::value_conversion::conversion_intermediate_type(
-                    &source, target,
-                )
-            };
-        self.control.checkpoint(CompilePhase::Validate, 0)?;
-        let intermediate =
-            intermediate.map_err(|error| ContractLoweringError::InvalidFunctionBinding {
-                detail: format!(
-                    "{error} (assignment fragment={:?}, owner={owner:?}, expression={expression:?}, source-domain={:?}, target-domain={:?}, source-carrier={:?}, target-carrier={:?}; source={source:?}, target={target:?})",
-                    self.current_fragment,
-                    source.logical_type(),
-                    target.logical_type(),
-                    source.data_type(),
-                    target.data_type(),
-                ),
-            })?;
-        let expression = if let Some(intermediate) = intermediate {
+        let plan = crate::compiler::selected_scalar_call::plan_conversion(
+            self.functions,
+            &source,
+            target,
+            policy,
+            self.root_allow_throw_exception,
+            self.control,
+        )
+        .map_err(|error| match error {
+            novarocks_functions::FunctionBindingError::Control(cause) => {
+                ContractLoweringError::Control(cause)
+            }
+            other => ContractLoweringError::InvalidFunctionBinding {
+                detail: format!("{other} (value conversion source={source:?}, target={target:?})"),
+            },
+        })?;
+        use crate::compiler::selected_scalar_call::PlannedConversion;
+        let (conversion, carrier) = match plan {
+            PlannedConversion::Identity => return Ok(expression),
+            PlannedConversion::Carrier(step) => (None, Some(step)),
+            PlannedConversion::ValueConversion { binding, tail } => (Some(binding), tail),
+        };
+        let expression = if let Some(binding) = conversion {
             let argument = novarocks_functions::FunctionArgument::Value {
                 value_type: source.clone(),
                 constant: None,
             };
-            let binding = self.functions.resolve_value_conversion_binding(
-                &argument,
-                &intermediate,
-                self.control,
-            );
-            let binding = binding.map_err(|error| match error {
-                novarocks_functions::FunctionBindingError::Control(error) => {
-                    ContractLoweringError::Control(error)
-                }
-                other => ContractLoweringError::InvalidFunctionBinding {
-                    detail: format!(
-                        "{other} (value conversion source={source:?}, target={intermediate:?})"
-                    ),
-                },
-            })?;
-            self.control.checkpoint(CompilePhase::Validate, 0)?;
-            let novarocks_functions::FunctionResultType::Scalar(result) =
-                &binding.selected.result_type
-            else {
-                return Err(ContractLoweringError::InvalidFunctionBinding {
-                    detail: "value conversion owner selected a relation result".into(),
-                });
-            };
-            if result != &intermediate
-                || binding.selected.argument_types.as_ref() != [FunctionArgumentType::Value(source)]
-            {
-                return Err(ContractLoweringError::InvalidFunctionBinding {
-                    detail: "value conversion binding differs from its source and explicit target"
-                        .into(),
-                });
-            }
-            self.work.flush()?;
-            let binding = SqlFunctionBinding::new_with_conversion_constraint(
-                binding,
-                policy,
-                intermediate,
-                target.clone(),
-            );
             self.work.step()?;
             self.work.flush()?;
             let mut arguments = Vec::new();
@@ -10166,18 +10107,18 @@ impl<'a> ContractLoweringVisitor<'a> {
         } else {
             expression
         };
-        if self.expression_value_type(expression)? == *target {
+        let Some(carrier) = carrier else {
             return Ok(expression);
-        }
+        };
         let allow_throw_exception = self.root_allow_throw_reference();
         self.add_scoped_expression(
             owner,
-            target.clone(),
+            carrier.target().clone(),
             ContractExprKind::Cast {
                 allow_throw_exception,
                 expr: expression,
-                target: target.data_type().clone(),
-                decimal_overflow_policy: policy,
+                target: carrier.target().data_type().clone(),
+                decimal_overflow_policy: carrier.decimal_overflow_policy(),
             },
         )
     }
@@ -10188,7 +10129,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         right: &ValueType,
     ) -> Result<ValueType, ContractLoweringError> {
         self.work.step()?;
-        let result = novarocks_type_contract::wider_comparison_value_type(left, right);
+        let result = crate::compiler::selected_scalar_call::comparison_type(left, right);
         self.control.checkpoint(CompilePhase::Validate, 0)?;
         result.map_err(ContractLoweringError::ComparisonCoercion)
     }
@@ -10200,9 +10141,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         target: &ValueType,
     ) -> Result<ExprId, ContractLoweringError> {
         let current = self.expression_value_type(expr)?;
-        let target = (target.clone())
-            .with_nullable(current.nullable())
-            .expect("validated root NULL contract");
+        let target = crate::compiler::selected_scalar_call::comparison_target(target, &current);
         // This port retains the existing late comparison OutputNull policy.
         // Request-owned policy freezing is a separate pending semantic gate.
         self.convert_expression_to(
@@ -12112,22 +12051,32 @@ const fn is_comparison_operator(op: BinOp) -> bool {
 }
 
 fn lower_binary_operator(operator: BinOp) -> BinaryOperator {
+    use novarocks_type_contract::{ArithmeticOperator as A, ComparisonOperator as C};
+    if let Some(op) = crate::compiler::selected_scalar_call::arithmetic_operator(operator) {
+        return match op {
+            A::Add => BinaryOperator::Add,
+            A::Subtract => BinaryOperator::Subtract,
+            A::Multiply => BinaryOperator::Multiply,
+            A::Divide => BinaryOperator::Divide,
+            A::Modulo => BinaryOperator::Modulo,
+        };
+    }
+    if let Some(op) = crate::compiler::selected_scalar_call::comparison_operator(operator) {
+        return match op {
+            C::Eq => BinaryOperator::Eq,
+            C::Ne => BinaryOperator::NotEq,
+            C::Lt => BinaryOperator::Lt,
+            C::Le => BinaryOperator::LtEq,
+            C::Gt => BinaryOperator::Gt,
+            C::Ge => BinaryOperator::GtEq,
+        };
+    }
     match operator {
+        BinOp::EqForNull => BinaryOperator::EqForNull,
         BinOp::And | BinOp::Or => {
             unreachable!("boolean connectives lower to n-ary Conjunction/Disjunction")
         }
-        BinOp::Add => BinaryOperator::Add,
-        BinOp::Sub => BinaryOperator::Subtract,
-        BinOp::Mul => BinaryOperator::Multiply,
-        BinOp::Div => BinaryOperator::Divide,
-        BinOp::Mod => BinaryOperator::Modulo,
-        BinOp::Eq => BinaryOperator::Eq,
-        BinOp::Ne => BinaryOperator::NotEq,
-        BinOp::Lt => BinaryOperator::Lt,
-        BinOp::Le => BinaryOperator::LtEq,
-        BinOp::Gt => BinaryOperator::Gt,
-        BinOp::Ge => BinaryOperator::GtEq,
-        BinOp::EqForNull => BinaryOperator::EqForNull,
+        _ => unreachable!("neutral binary operator projection is exhaustive"),
     }
 }
 
