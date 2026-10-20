@@ -240,6 +240,27 @@ class Admission(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "source changed"):
                     compose_attempt(root, root / "attempt", root / "missing", {"head_sha": "a" * 40}, root / "out", "formal-admission", declarations=[])
 
+    def test_failed_native_before_batch_reports_without_building_and_retains_raw_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            put(root / "tools/ci/baselines/dispositions.json", {"schema": 1, "known_failures": [], "quarantine": []})
+            key = "stage:Cargo dependency policy"
+            path = put(root / "attempt/invocations/0001.json", {"schema": 1, "kind": "stage", "seq": 1,
+                "units": [key], "exit": {"code": 1}, "ended_at": "now", "inputs_start": IDENTITY,
+                "inputs_end": IDENTITY, "inputs_stable": True, "cleanup": {"summary": "ok"}})
+            raw = path.read_bytes()
+            with mock.patch.object(run, "prepare", side_effect=AssertionError("failure reporting must not build")) as preparation, mock.patch.object(run, "json_command", return_value={"stages": [{"name": "Cargo dependency policy", "tier": "admission"}]}):
+                value = compose_attempt(root, root / "attempt", root / "missing", {}, root / "output", native_exit=1)
+            preparation.assert_not_called()
+            self.assertFalse(value["layer_ok"])
+            self.assertEqual(value["enumeration_errors"], ["native Rust batch was not reached"])
+            self.assertEqual({item["kind"] for item in value["admission_gaps"]["unenumerated"]},
+                             {"rust-test", "rust-doctest", "sql-suite", "system-scenario"})
+            self.assertEqual(value["scopes"][0]["verdict"], "failed")
+            self.assertEqual(value["scopes"][0]["observations"][0]["result"], "fail")
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertTrue((root / "output/composition.json").is_file())
+
     def test_failed_preparation_and_runner_listing_still_save_blocking_native_observations(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

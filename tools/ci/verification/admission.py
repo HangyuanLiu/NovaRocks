@@ -123,12 +123,14 @@ def load_enablement(path, declarations=None):
 
 
 def compose_attempt(repo, attempt_dir, declaration_path, run_identity, output_dir,
-                    evidence_class="local-rehearsal", *, declarations=None):
+                    evidence_class="local-rehearsal", *, declarations=None, native_exit=None):
     """Compose one native attempt, retaining a blocking report on enumeration failure.
 
     ``declarations`` is an injection point for owner-local synthetic tests. Normal
-    admission always obtains a fresh native preparation and listing. Rehearsal
-    uses admission membership without granting its attempt formal authority.
+    admission obtains a fresh native preparation and listing unless a failed
+    native invocation never reached the Rust batch. That case retains stage
+    facts and explicit enumeration gaps without building merely to report failure.
+    Rehearsal uses admission membership without granting formal authority.
     """
     from . import run
     from .compose import compose
@@ -142,6 +144,9 @@ def compose_attempt(repo, attempt_dir, declaration_path, run_identity, output_di
     unavailable, enumeration_errors = [], []
     if declarations is None:
         try:
+            if (native_exit is not None and native_exit != 0
+                    and not (Path(attempt_dir) / "rust/execution-index.json").is_file()):
+                raise ValueError("native Rust batch was not reached")
             inputs = run.prepare(repo, output_dir)
             native = run.inventory(repo, inputs)
             chosen = {"rust_filterset": None, "doctest": True, "sql_suites": [], "system_scenarios": [], "stages": []}

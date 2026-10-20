@@ -183,7 +183,7 @@ def run_admission(output, repo=REPO, environment=None):
         attempt = created[0]
         entry["attempt_root"] = str(attempt)
         record = compose_attempt(repo, attempt, declaration, run_identity, output,
-                                 evidence_class=evidence_class)
+                                 evidence_class=evidence_class, native_exit=native_exit)
         code = 0 if record["layer_ok"] else 1
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
         entry["error"] = str(error)
