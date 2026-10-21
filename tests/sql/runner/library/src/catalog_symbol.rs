@@ -296,6 +296,25 @@ impl CatalogSymbols {
     }
     /// This adapter is for typed catalog controls, never arbitrary shell values.
     pub fn rewrite_meta(&self, meta: &mut crate::types::QueryMeta, sql: &str) -> Result<()> {
+        if let Some(database) = &mut meta.db {
+            // This field is submitted as USE before the step SQL. Parsing its
+            // actual command preserves quoted database identifiers and leaves
+            // unqualified/external/invalid controls under their original owner.
+            let command = format!("USE {database}");
+            if let Ok(statements) = novarocks_parser::parse(&command) {
+                if let [Statement::Session(SessionStatement::Use(context))] = statements.as_slice()
+                {
+                    if let Some(catalog) = &context.catalog {
+                        if let Some(mapped) = self.lookup(&catalog.value) {
+                            database.replace_range(
+                                catalog.span.start() - 4..catalog.span.end() - 4,
+                                &quoted(&command, catalog.span, mapped),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let output = catalog_output_plan(sql);
         for (column, value) in meta
             .result_rows_where
@@ -779,6 +798,41 @@ mod tests {
             "owned".into(),
             "nc_1792540800000_0123456789abcdef0123456789abcdef_0000".into(),
         )]))
+    }
+    #[test]
+    fn qualified_database_control_maps_only_its_typed_catalog_span() {
+        let symbols = symbols();
+        let mapped = symbols.lookup("owned").unwrap();
+        for (database, expected) in [
+            ("owned.ns", format!("{mapped}.ns")),
+            (
+                "`owned`.`namespace.with.dot`",
+                format!("`{mapped}`.`namespace.with.dot`"),
+            ),
+            (
+                "  `owned` . `namespace`  ",
+                format!("  `{mapped}` . `namespace`  "),
+            ),
+            ("namespace", "namespace".into()),
+            ("external.namespace", "external.namespace".into()),
+            ("`owned.namespace`", "`owned.namespace`".into()),
+            ("'owned.namespace'", "'owned.namespace'".into()),
+        ] {
+            let mut meta = crate::types::QueryMeta {
+                db: Some(database.into()),
+                result_contains: vec!["owned.ns".into()],
+                ..Default::default()
+            };
+            symbols
+                .rewrite_meta(&mut meta, "SELECT 'owned.ns' AS data")
+                .unwrap();
+            assert_eq!(meta.db.as_deref(), Some(expected.as_str()));
+            assert_eq!(meta.result_contains, vec!["owned.ns"]);
+            symbols
+                .rewrite_meta(&mut meta, "SELECT 'owned.ns' AS data")
+                .unwrap();
+            assert_eq!(meta.db.as_deref(), Some(expected.as_str()));
+        }
     }
     #[test]
     fn names_are_lossless_bounded_deterministic_and_run_disjoint() {
