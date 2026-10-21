@@ -21,10 +21,8 @@ novarocks-type-contract.workspace = true
 allocator-api2.workspace = true
 hashbrown.workspace = true
 anyhow.workspace = true
-apache-avro.workspace = true
 async-trait.workspace = true
 arrow.workspace = true
-arrow-buffer.workspace = true
 parquet = { workspace = true, features = ["arrow"] }
 once_cell.workspace = true
 prometheus.workspace = true
@@ -63,7 +61,6 @@ novarocks-sql.workspace = true
 novarocks-task-codec.workspace = true
 novarocks-types.workspace = true
 novarocks-user-error.workspace = true
-novarocks-version.workspace = true
 novarocks-workload-control.workspace = true
 prost.workspace = true
 regex.workspace = true
@@ -78,14 +75,12 @@ toml.workspace = true
 uuid = { workspace = true, features = ["v7", "serde"] }
 
 [dev-dependencies]
-novarocks-connector-iceberg-functions.workspace = true
 novarocks-connector-paimon.workspace = true
 novarocks-local-compiler.workspace = true
 novarocks-local-program.workspace = true
 novarocks-plan-codec = { workspace = true }
 novarocks-mv-application = { workspace = true }
 novarocks-catalog-application = { workspace = true }
-novarocks-connector-starrocks.workspace = true
 novarocks-query-application = { workspace = true }
 novarocks-result-render.workspace = true
 novarocks-secret.workspace = true

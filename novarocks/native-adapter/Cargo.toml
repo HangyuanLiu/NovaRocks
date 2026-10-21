@@ -32,7 +32,6 @@ novarocks-spi.workspace = true
 novarocks-secret = { workspace = true }
 novarocks-task-codec.workspace = true
 novarocks-types.workspace = true
-novarocks-version.workspace = true
 novarocks-worker.workspace = true
 arrow.workspace = true
 arrow-buffer.workspace = true
@@ -70,3 +69,11 @@ sha2.workspace = true
 [package.metadata.novarocks.test]
 runtime-inputs = []
 env-inputs = []
+
+[package.metadata.cargo-machete]
+ignored = [
+    # build.rs locates protoc for native transport stub generation.
+    "protoc-bin-vendored",
+    # build.rs generates the native transport stubs.
+    "tonic-build",
+]

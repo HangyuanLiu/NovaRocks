@@ -8,7 +8,6 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-novarocks-arrow-ipc-frame.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-connector-iceberg.workspace = true
 novarocks-connector-paimon.workspace = true
@@ -43,7 +42,6 @@ anyhow.workspace = true
 bytes.workspace = true
 atty = "0.2"
 chrono.workspace = true
-futures.workspace = true
 hex.workspace = true
 libc.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -52,7 +50,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "signal", "sync", "ti
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "time"] }
-uuid.workspace = true
 # The process allocator; see `src/memory_observation.rs`.
 tikv-jemalloc-ctl = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true }
@@ -111,8 +108,6 @@ arrow-schema.workspace = true
 # MySQL; `state_store_app_config` asserts config/composition by direct call.
 # Domain behaviour belongs to its owner crate, the SQL suites or the system
 # scenarios — not to this package.
-mysql.workspace = true
-novarocks-test-support.workspace = true
 tempfile.workspace = true
 
 [package.metadata.novarocks.test]

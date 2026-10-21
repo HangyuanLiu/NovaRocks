@@ -21,7 +21,6 @@ set -euo pipefail
 REPO_ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 LEGACY_PATTERN='[sS][tT][aA][rR][uU][sS][tT]'
 EXCLUDED_PATHS=(
-  ':(exclude)baselines/**'
   ':(exclude)docs/workflow/archive/**'
 )
 
@@ -40,7 +39,7 @@ fi
 path_matches=()
 while IFS= read -r path; do
   case "$path" in
-    baselines/*|docs/workflow/archive/*)
+    docs/workflow/archive/*)
       continue
       ;;
   esac

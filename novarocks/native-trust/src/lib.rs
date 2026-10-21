@@ -21,6 +21,8 @@
 //! protocol ownership. The Server supplies already-resolved inputs and role
 //! applications own their listeners, channels, retries, and observability.
 
+#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
+
 mod adapter;
 mod auth;
 mod deployment;

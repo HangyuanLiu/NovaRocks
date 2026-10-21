@@ -41,7 +41,6 @@ opendal = { workspace = true, features = ["services-oss", "services-fs", "servic
 arrow = { workspace = true, features = ["prettyprint", "ipc", "ipc_compression"] }
 async-trait.workspace = true
 bytes.workspace = true
-chrono.workspace = true
 crc32fast = "1"
 futures.workspace = true
 ordered-float = "4"
@@ -99,4 +98,15 @@ ignored = [
   { filter = "test(=commit::staging::interop_tests::iru13b_java_rest_view_replacement_keeps_dialects_unless_allowed)", class = "heavy", requires = ["fixture:iceberg-rest", "fixture:minio", "toolchain:java"], reason = "requires pinned Java REST and MinIO fixture publication" },
   { filter = "test(=minio_strict_and_noop_two_process_fencing)", class = "heavy", requires = ["fixture:minio"], reason = "requires the shared MinIO fixture" },
   { filter = "test(=hadoop_fencing_child_process_entry)", class = "helper", reason = "internal helper invoked exactly by the two-process fencing tests" },
+]
+
+[package.metadata.cargo-machete]
+ignored = [
+    # The test module includes the vendored HMS table_projection.rs via #[path].
+    "faststr",
+    "hive_metastore",
+    # build.rs generates the private Iceberg connector protobuf DTOs.
+    "prost-build",
+    # build.rs locates protoc for Iceberg connector DTO generation.
+    "protoc-bin-vendored",
 ]

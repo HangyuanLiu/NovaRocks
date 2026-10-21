@@ -1,0 +1,84 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+disallowed-methods = [
+  # The Server resolves configuration sources before injecting trust material.
+  { path = "std::env::var", reason = "native trust receives Server-resolved material" },
+  { path = "std::env::var_os", reason = "native trust receives Server-resolved material" },
+  { path = "std::env::vars", reason = "native trust receives Server-resolved material" },
+  { path = "std::env::vars_os", reason = "native trust receives Server-resolved material" },
+  { path = "std::env::args", reason = "native trust receives Server-resolved material" },
+  { path = "std::env::args_os", reason = "native trust receives Server-resolved material" },
+  { path = "std::env::set_var", reason = "native trust receives Server-resolved material" },
+  { path = "std::env::remove_var", reason = "native trust receives Server-resolved material" },
+  { path = "std::env::current_dir", reason = "native trust receives Server-resolved material" },
+  { path = "std::env::set_current_dir", reason = "native trust receives Server-resolved material" },
+  { path = "std::env::current_exe", reason = "native trust receives Server-resolved material" },
+  { path = "std::env::temp_dir", reason = "native trust receives Server-resolved material" },
+  { path = "std::env::home_dir", reason = "native trust receives Server-resolved material" },
+  # Native trust owns no filesystem input or output.
+  { path = "std::fs::canonicalize", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::copy", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::create_dir", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::create_dir_all", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::exists", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::hard_link", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::metadata", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::read", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::read_dir", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::read_link", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::read_to_string", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::remove_dir", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::remove_dir_all", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::remove_file", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::rename", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::set_permissions", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::symlink_metadata", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::write", reason = "native trust owns no filesystem input or output" },
+  # Tokio filesystem APIs are feature/platform gated; resolved calls stay denied.
+  { path = "tokio::fs::canonicalize", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::copy", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::create_dir", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::create_dir_all", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::hard_link", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::metadata", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::read", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::read_dir", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::read_link", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::read_to_string", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::remove_dir", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::remove_dir_all", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::remove_file", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::rename", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::set_permissions", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::symlink", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::symlink_dir", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::symlink_file", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::symlink_metadata", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::try_exists", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::write", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  # NativeEndpointConnector owns connection establishment and trust policy.
+  { path = "tonic::transport::Endpoint::connect", reason = "use NativeEndpointConnector" },
+  { path = "tonic::transport::Endpoint::connect_lazy", reason = "use NativeEndpointConnector" },
+]
+
+disallowed-types = [
+  { path = "std::fs::File", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::OpenOptions", reason = "native trust owns no filesystem input or output" },
+  { path = "tokio::fs::File", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::OpenOptions", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+]

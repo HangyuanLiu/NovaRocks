@@ -1,8 +1,8 @@
 # StateStore crate boundary
 
 The StateStore provider domain is split across three kinds of crate. This page
-says which one a new type, trait, or test helper belongs in, and what the CI
-guard actually enforces.
+says which one a new type, trait, or test helper belongs in, and how to review
+dependency direction.
 
 ## The three layers
 
@@ -48,36 +48,30 @@ anyone writing a line of code to ask for it.
 
 A separate crate consumed as a `dev-dependency` does not have that failure
 mode: Cargo tracks dev edges separately and never propagates them into a
-normal dependency closure. The boundary is enforced by the build graph rather
-than by review discipline.
+normal dependency closure. Review must preserve those dependency kinds: adding
+a normal edge to the testkit would make the fake reachable in production.
 
-## What CI enforces
+## Reviewing dependency direction
 
-`tools/ci/check-state-store-dependency-boundary.py` reads the resolved
-dependency graph and checks that:
+Review the declared dependency tables, including disabled optional and
+target-specific entries, together with the transitive normal closure:
 
-- the API crate and every provider have a normal dependency closure free of
-  columnar runtimes (Arrow, Parquet), the Connector contract, and any
-  application or execution crate;
-- the same capability check runs against the *declared* dependency table, not
-  only the resolved graph. `cargo metadata` resolves default features, so an
-  optional dependency behind a non-default feature is invisible to the resolve
-  graph; declaring one is still a break;
-- no `novarocks-*` crate other than the contract itself and a short neutral
-  allow-list appears in a production closure, even when no named capability
-  covers it;
-- no package anywhere in the workspace reaches the testkit through a normal
-  dependency edge;
-- the API crate does not depend on the testkit in any dependency kind.
+- the API crate and providers remain independent of columnar runtimes (Arrow,
+  Parquet), Connector contracts, applications and execution owners;
+- additional `novarocks-*` dependencies must have a neutral role appropriate to
+  the byte-oriented storage contract;
+- the testkit is consumed only through dev-dependencies; the API crate never
+  depends on the testkit in any dependency kind.
 
-It reports normal, dev, and build closures separately, so a test-only
-dependency on Tokio reads as what it is rather than as production coupling.
+Keep normal, dev and build edges distinct. A test-only Tokio dependency grants
+no production runtime; any newly enabled feature needs the same ownership
+review as a direct dependency.
 
-The guard deliberately checks **direction and capability**, not an exact list
-of allowed dependency names. A frozen list breaks on every harmless addition
-and teaches people to edit the guard instead of thinking about the boundary.
-Adding a neutral utility crate to the API is a review question; adding Arrow to
-it is a build failure.
+These are review rules, with crate structure expressing the selected edges.
+CI does not run dependency-boundary checks. A neutral utility can still be an
+unnecessary addition, and a type no consumer needs can still be misplaced in
+the API; use the ownership questions above to judge both. See
+[ADR-0190](../../adr/ADR-0190-dependency-direction-by-structure-and-review.md).
 
 ## Attempts, and what an outcome is worth
 
@@ -116,9 +110,3 @@ nothing, so an unwired host means the mechanism never runs.
 
 A provider that is not ready to release yet says so without it counting as a
 fault, so an ordinary sweep on a busy instance is quiet.
-
-## What the guard cannot tell you
-
-It cannot tell you whether a type belongs in the contract at all. A contract
-that grows types no consumer needs still passes every dependency check. That
-judgment stays with the reviewer, and the questions above are the ones to ask.
