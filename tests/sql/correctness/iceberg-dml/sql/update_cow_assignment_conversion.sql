@@ -71,7 +71,7 @@ SELECT d, n FROM ${case_db}.t_cow_assignment_conversion WHERE id = 2;
 -- query 8
 SELECT CAST(NULL AS STRING) AS required_text;
 -- query 9
--- @expect_error=signed COW required field contains NULL
+-- @expect_error=[query.execution.invalid_data] statement execution failed in its coordinator
 UPDATE ${case_db}.t_cow_assignment_conversion SET required_text = NULL WHERE id = 1;
 -- query 10
 SELECT id, required_text FROM ${case_db}.t_cow_assignment_conversion ORDER BY id;
@@ -119,19 +119,19 @@ FROM ${case_db}.t_cow_assignment_nonfinite ORDER BY id;
 
 -- Each failed assignment must leave both required values and the other rows intact.
 -- query 15
--- @expect_error=signed COW required field contains NULL
+-- @expect_error=[query.execution.invalid_data] statement execution failed in its coordinator
 UPDATE ${case_db}.t_cow_assignment_nonfinite
 SET required_float = token WHERE id = 1;
 -- query 16
--- @expect_error=signed COW required field contains NULL
+-- @expect_error=[query.execution.invalid_data] statement execution failed in its coordinator
 UPDATE ${case_db}.t_cow_assignment_nonfinite
 SET required_double = token WHERE id = 2;
 -- query 17
--- @expect_error=signed COW required field contains NULL
+-- @expect_error=[query.execution.invalid_data] statement execution failed in its coordinator
 UPDATE ${case_db}.t_cow_assignment_nonfinite
 SET required_float = token WHERE id = 3;
 -- query 18
--- @expect_error=signed COW required field contains NULL
+-- @expect_error=[query.execution.invalid_data] statement execution failed in its coordinator
 UPDATE ${case_db}.t_cow_assignment_nonfinite
 SET required_double = token WHERE id = 4;
 -- query 19

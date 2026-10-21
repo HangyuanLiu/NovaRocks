@@ -1381,6 +1381,19 @@ mod compile_control_tests {
                 panic!("a source error is final")
             };
             assert_eq!(service.execution_failure().unwrap().fact(), expected);
+            let (code, message) = match expected.class() {
+                FailureClass::Unsupported => (
+                    "UnsupportedCompiledShape",
+                    "[UnsupportedCompiledShape] pure compilation failed in its source domain",
+                ),
+                FailureClass::Invariant => (
+                    "query.execution.invariant",
+                    "[query.execution.invariant] pure compilation failed in its source domain",
+                ),
+                other => panic!("unexpected author class: {other:?}"),
+            };
+            assert_eq!(service.user_error().unwrap().code().as_str(), code);
+            assert_eq!(service.message(), message);
         }
     }
 
@@ -1455,10 +1468,12 @@ mod compile_control_tests {
             let original_source = SharedFailureCause::new(original.clone());
             let expected = original_source.failure_fact();
             assert_eq!(expected.class(), class);
-            let encoded =
-                novarocks_plan_codec::PhysicalEncodeError::from(PackageFreezeError::Semantics(
-                    PackageSemanticsError::Source(original_source.clone()),
-                ));
+            let encoded = novarocks_plan_codec::PhysicalEncodeError::from(
+                PackageFreezeError::Semantics(PackageSemanticsError::PrimitiveSource {
+                    source: original_source.clone(),
+                    cast: None,
+                }),
+            );
             let error = FrontendQueryCompilerError::from_encode(encoded);
             let FrontendQueryCompilerError::Source(retained) = &error else {
                 panic!("the encoded source must remain typed");
@@ -1469,8 +1484,10 @@ mod compile_control_tests {
             else {
                 panic!("retain the actual physical encode source");
             };
-            let Some(PackageFreezeError::Semantics(PackageSemanticsError::Source(actual))) =
-                freeze_source.downcast_ref::<PackageFreezeError>()
+            let Some(PackageFreezeError::Semantics(PackageSemanticsError::PrimitiveSource {
+                source: actual,
+                cast: None,
+            })) = freeze_source.downcast_ref::<PackageFreezeError>()
             else {
                 panic!("retain the exact comparison source below its wrappers");
             };

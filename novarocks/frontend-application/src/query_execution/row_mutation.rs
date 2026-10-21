@@ -676,23 +676,17 @@ impl CowMatchRootConsumer {
         Ok(consumer)
     }
 
-    pub(crate) fn push_body(&mut self, body: &[u8]) -> Result<(), String> {
-        self.collector
-            .push_body(body)
-            .map_err(|error| error.to_string())
+    pub(crate) fn push_body(&mut self, body: &[u8]) -> Result<(), ConnectorError> {
+        self.collector.push_body(body)
     }
 
-    pub(crate) fn check_end(&self, output_rows: u64) -> Result<(), String> {
-        self.collector
-            .check_end(output_rows)
-            .map_err(|error| error.to_string())
+    pub(crate) fn check_end(&self, output_rows: u64) -> Result<(), ConnectorError> {
+        self.collector.check_end(output_rows)
     }
 
-    pub(crate) fn finish(mut self) -> Result<ConnectorRowMutationSelection, String> {
-        let selection = self.collector.finish().map_err(|error| error.to_string())?;
-        self.validator
-            .validate_selection(&selection)
-            .map_err(|error| error.to_string())?;
+    pub(crate) fn finish(mut self) -> Result<ConnectorRowMutationSelection, ConnectorError> {
+        let selection = self.collector.finish()?;
+        self.validator.validate_selection(&selection)?;
         Ok(selection)
     }
 }
@@ -1217,9 +1211,52 @@ mod tests {
         let stop = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
         let mut collector =
             RelayedCowSelectionCollector::try_new(context(stop, 1 << 20), None, signed).unwrap();
-        let error = collector.push_body(&relayed_stream(&[input])).unwrap_err();
+        let error = collector
+            .push_body(&relayed_stream(&[input.clone()]))
+            .unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert!(error.to_string().contains("required field contains NULL"));
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let expected = error.failure_fact();
+        assert_eq!(expected.class(), FailureClass::Data);
+        // Use the real four-column mutation contract at the RootConsumer boundary.
+        let signed = selection_schema();
+        let mut input_fields = signed
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        input_fields[0] = input_fields[0].clone().with_nullable(true);
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(input_fields)),
+            vec![
+                Arc::new(Int32Array::from(vec![None::<i32>])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(Int32Array::from(vec![Some(11)])),
+                Arc::new(Int8Array::from(vec![REPLACE_EFFECT_TAG])),
+            ],
+        )
+        .unwrap();
+        let mut consumer = CowMatchRootConsumer::try_new(
+            context(
+                Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                1 << 20,
+            ),
+            signed,
+            contract(),
+            ConnectorRowMutationIntent::Merge {
+                effects: vec![ConnectorRowMutationEffect::Replace],
+            },
+        )
+        .unwrap();
+        let error = consumer.push_body(&relayed_stream(&[input])).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(error.failure_fact(), expected);
+        assert!(
+            error
+                .to_string()
+                .contains("signed COW required field contains NULL")
+        );
     }
 
     #[test]
@@ -1562,7 +1599,13 @@ mod tests {
             ])]))
             .unwrap();
         duplicate.check_end(2).unwrap();
-        assert!(duplicate.finish().unwrap_err().contains("more than once"));
+        assert!(
+            duplicate
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("more than once")
+        );
 
         let mut partial = make();
         partial.push_body(&stream[..stream.len() - 1]).unwrap();

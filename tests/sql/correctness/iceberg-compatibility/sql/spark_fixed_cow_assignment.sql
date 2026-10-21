@@ -28,22 +28,38 @@ trap 'rm -f "$tmp_scala"' EXIT
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/generate.scala" > "$tmp_scala"
 cat >> "$tmp_scala" <<'SCALA'
 try {
-  VariantFixture.initialize(spark,"nr_compat_${suite_uuid0}","spark_fixed_cow_${uuid0}")
+  val session = org.apache.spark.sql.SparkSession.active
+  VariantFixture.initialize(session,"nr_compat_${suite_uuid0}","spark_fixed_cow_${uuid0}")
   val fixedSchema = new Schema(
     Types.NestedField.required(1,"id",Types.IntegerType.get()),
     Types.NestedField.required(2,"raw",Types.FixedType.ofLength(16)),
-    Types.NestedField.optional(3,"st",Types.StructType.of(Types.NestedField.required(4,"f",Types.FixedType.ofLength(4)))),
-    Types.NestedField.required(5,"n",Types.IntegerType.get()))
+    Types.NestedField.optional(3,"st",Types.StructType.of(Types.NestedField.required(5,"f",Types.FixedType.ofLength(4)))),
+    Types.NestedField.required(4,"n",Types.IntegerType.get()))
   VariantFixture.create(fixedSchema,properties=Map("write.update.mode"->"copy-on-write","write.row-lineage"->"true"))
-  spark.sql("INSERT INTO ice_rest.nr_compat_${suite_uuid0}.spark_fixed_cow_${uuid0} VALUES (1,unhex('00112233445566778899AABBCCDDEEFF'),named_struct('f',unhex('01020304')),10),(2,unhex('FFEEDDCCBBAA99887766554433221100'),NULL,20)")
+  session.sql("INSERT INTO ice_rest.nr_compat_${suite_uuid0}.spark_fixed_cow_${uuid0} VALUES (1,unhex('00112233445566778899AABBCCDDEEFF'),named_struct('f',unhex('01020304')),10),(2,unhex('FFEEDDCCBBAA99887766554433221100'),NULL,20)")
   require(VariantFixture.load().schema().asStruct()==fixedSchema.asStruct(),"Spark changed the fixed declaration")
-  val initial=spark.sql("SELECT id,hex(raw),hex(st.f),n FROM ice_rest.nr_compat_${suite_uuid0}.spark_fixed_cow_${uuid0} ORDER BY id").collect().toVector
+  val initial=session.sql("SELECT id,hex(raw),hex(st.f),n FROM ice_rest.nr_compat_${suite_uuid0}.spark_fixed_cow_${uuid0} ORDER BY id").collect().toVector
   require(initial.size==2 && initial(0).getString(1)=="00112233445566778899AABBCCDDEEFF" && initial(0).getString(2)=="01020304" && initial(1).getString(1)=="FFEEDDCCBBAA99887766554433221100" && initial(1).isNullAt(2),"Spark fixture payload differs")
   println("F3_FIXED_SPARK_CREATED")
 } catch { case failure:Throwable => failure.printStackTrace(); System.exit(1) }
 SCALA
-spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)" || { printf '%s\n' "$spark_out"; exit 1; }
-printf '%s\n' "$spark_out" | grep -Fx 'F3_FIXED_SPARK_CREATED'
+# Retain both actual process streams privately on either failure path.
+umask 077
+spark_diag_dir="$(mktemp -d "${TMPDIR:-/tmp}/novarocks-f3-fixed-create-diagnostics-XXXXXX")"
+spark_status=0
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" \
+  > "$spark_diag_dir/stdout" 2> "$spark_diag_dir/stderr" || spark_status=$?
+printf '%s\n' "$spark_status" > "$spark_diag_dir/exit-status"
+if [ "$spark_status" -ne 0 ]; then
+  printf 'Spark create failed (exit=%s); original stdout/stderr and exit-status retained at %s\n' "$spark_status" "$spark_diag_dir" >&2
+  exit "$spark_status"
+fi
+if ! grep -Fx 'F3_FIXED_SPARK_CREATED' "$spark_diag_dir/stdout"; then
+  printf 'Spark create sentinel missing (exit=%s); original stdout/stderr and exit-status retained at %s\n' "$spark_status" "$spark_diag_dir" >&2
+  exit 1
+fi
+rm -f "$spark_diag_dir/stdout" "$spark_diag_dir/stderr" "$spark_diag_dir/exit-status"
+rmdir "$spark_diag_dir"
 
 -- query 2
 SELECT id,hex(CAST(raw AS VARBINARY)) AS raw_hex,hex(CAST(st.f AS VARBINARY)) AS nested_hex,n
@@ -69,16 +85,32 @@ trap 'rm -f "$tmp_scala"' EXIT
 cat "${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/generate.scala" > "$tmp_scala"
 cat >> "$tmp_scala" <<'SCALA'
 try {
-  VariantFixture.initialize(spark,"nr_compat_${suite_uuid0}","spark_fixed_cow_${uuid0}")
+  val session = org.apache.spark.sql.SparkSession.active
+  VariantFixture.initialize(session,"nr_compat_${suite_uuid0}","spark_fixed_cow_${uuid0}")
   val table=VariantFixture.load()
   require(table.schema().findType("raw")==Types.FixedType.ofLength(16) && table.schema().findType("st.f")==Types.FixedType.ofLength(4),"COW changed the exact fixed widths")
-  val rows=spark.sql("SELECT id,hex(raw),hex(st.f),n FROM ice_rest.nr_compat_${suite_uuid0}.spark_fixed_cow_${uuid0} ORDER BY id").collect().toVector
+  val rows=session.sql("SELECT id,hex(raw),hex(st.f),n FROM ice_rest.nr_compat_${suite_uuid0}.spark_fixed_cow_${uuid0} ORDER BY id").collect().toVector
   require(rows.size==2 && rows(0).getInt(0)==1 && rows(0).getString(1)=="00112233445566778899AABBCCDDEEFF" && rows(0).getString(2)=="01020304" && rows(0).getInt(3)==11 && rows(1).getInt(0)==2 && rows(1).getString(1)=="FFEEDDCCBBAA99887766554433221100" && rows(1).isNullAt(2) && rows(1).getInt(3)==21,"COW changed Spark fixed payloads or row values")
   println("F3_FIXED_SPARK_VERIFIED")
 } catch { case failure:Throwable => failure.printStackTrace(); System.exit(1) }
 SCALA
-spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" 2>&1)" || { printf '%s\n' "$spark_out"; exit 1; }
-printf '%s\n' "$spark_out" | grep -Fx 'F3_FIXED_SPARK_VERIFIED'
+# Retain both actual process streams privately on either failure path.
+umask 077
+spark_diag_dir="$(mktemp -d "${TMPDIR:-/tmp}/novarocks-f3-fixed-verify-diagnostics-XXXXXX")"
+spark_status=0
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh" "$tmp_scala" \
+  > "$spark_diag_dir/stdout" 2> "$spark_diag_dir/stderr" || spark_status=$?
+printf '%s\n' "$spark_status" > "$spark_diag_dir/exit-status"
+if [ "$spark_status" -ne 0 ]; then
+  printf 'Spark verify failed (exit=%s); original stdout/stderr and exit-status retained at %s\n' "$spark_status" "$spark_diag_dir" >&2
+  exit "$spark_status"
+fi
+if ! grep -Fx 'F3_FIXED_SPARK_VERIFIED' "$spark_diag_dir/stdout"; then
+  printf 'Spark verify sentinel missing (exit=%s); original stdout/stderr and exit-status retained at %s\n' "$spark_status" "$spark_diag_dir" >&2
+  exit 1
+fi
+rm -f "$spark_diag_dir/stdout" "$spark_diag_dir/stderr" "$spark_diag_dir/exit-status"
+rmdir "$spark_diag_dir"
 
 -- query 7
 DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_fixed_cow_${uuid0} FORCE;

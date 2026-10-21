@@ -661,12 +661,6 @@ impl OperatorFactory for ProfiledCompiledFactory {
     fn is_edge_gated(&self) -> bool {
         self.inner.is_edge_gated()
     }
-    #[cfg(test)]
-    fn native_aggregate_topn_producers(
-        &self,
-    ) -> &[crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding] {
-        self.inner.native_aggregate_topn_producers()
-    }
 }
 
 fn build_node(
