@@ -196,7 +196,7 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
                   "iceberg_object_store_credential_generation": "v1", "benchmark_shared_root": config["benchmark"]["shared_root"], "fixture_env_file": str(publication / "env.sh")}
         if "rest-mv" in record["images"]:
             values.update(iceberg_rest_mv_uri=endpoint["rest_mv_uri"], iceberg_rest_mv_warehouse=warehouse["rest_mv_client"])
-        text_file(staging, "sql-test.toml", '[cluster]\nhost = "127.0.0.1"\nport = ' + json_string(ports["mysql"]) + '\nuser = "root"\npassword = ""\n\n[env]\n' + ''.join(f'{key} = {json_string(value)}\n' for key, value in values.items()))
+        text_file(staging, "sql-test.toml", '[cluster]\nhost = "127.0.0.1"\nport = ' + json_string(ports["mysql"]) + '\nuser = "root"\npassword = ""\n\n[env]\n' + ''.join(f'{key} = {json_string(value)}\n' for key, value in sorted(values.items())))
         sql_values = {"type": "iceberg", "iceberg.catalog.type": "rest", "uri": endpoint["rest_uri"], "warehouse": rest,
                       "aws.s3.endpoint": endpoint["minio_endpoint"],
                       "aws.s3.region": "us-east-1", "aws.s3.enable_path_style_access": "true"}
@@ -205,7 +205,7 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
             sql_values.update({prefix + "consumer-role": role, prefix + "mode": "static",
                                prefix + "name": "iceberg-test-data", prefix + "generation": "v1"})
         sql_quote = lambda value: "'" + str(value).replace("\\", "\\\\").replace("'", "''") + "'"
-        text_file(staging, "ice-rest-catalog.sql", "CREATE EXTERNAL CATALOG ice_rest PROPERTIES (\n" + ',\n'.join(f'  {sql_quote(k)} = {sql_quote(v)}' for k, v in sql_values.items()) + "\n);\n")
+        text_file(staging, "ice-rest-catalog.sql", "CREATE EXTERNAL CATALOG ice_rest PROPERTIES (\n" + ',\n'.join(f'  {sql_quote(k)} = {sql_quote(v)}' for k, v in sorted(sql_values.items())) + "\n);\n")
         spark = {"spark.master": "local[*]", "spark.app.name": "NovaRocksIcebergSpark", "spark.ui.bindAddress": "0.0.0.0", "spark.driver.bindAddress": "0.0.0.0",
             "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions", "spark.sql.catalog.ice_rest": "org.apache.iceberg.spark.SparkCatalog",
             "spark.sql.catalog.ice_rest.type": "rest", "spark.sql.catalog.ice_rest.uri": endpoint["container_rest_uri"], "spark.sql.catalog.ice_rest.warehouse": rest,
@@ -219,7 +219,7 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
                           for key, value in spark.items() if key.startswith("spark.sql.catalog.ice_rest")})
             spark.update({"spark.sql.catalog.ice_rest_mv.uri": endpoint["container_rest_mv_uri"],
                           "spark.sql.catalog.ice_rest_mv.warehouse": warehouse["rest_mv_client"]})
-        text_file(staging, "spark-defaults.conf", ''.join(f'{key} {value}\n' for key, value in spark.items()))
+        text_file(staging, "spark-defaults.conf", ''.join(f'{key} {value}\n' for key, value in sorted(spark.items())))
         smoke_sql = "CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_v3;\n\nDROP TABLE IF EXISTS ice_rest.nr_v3.spark_v3_smoke;\n\nCREATE TABLE ice_rest.nr_v3.spark_v3_smoke (\n  id BIGINT,\n  data STRING,\n  category STRING,\n  ts TIMESTAMP\n) USING iceberg\nTBLPROPERTIES (\n  'format-version' = '3',\n  'write.row-lineage' = 'true',\n  'write.format.default' = 'parquet'\n);\n\nINSERT INTO ice_rest.nr_v3.spark_v3_smoke VALUES\n  (1, 'spark-v3-a', 'alpha', TIMESTAMP '2026-05-07 00:00:00'),\n  (2, 'spark-v3-b', 'beta', TIMESTAMP '2026-05-07 00:01:00'),\n  (3, 'spark-v3-c', 'alpha', TIMESTAMP '2026-05-07 00:02:00');\n\nSELECT * FROM ice_rest.nr_v3.spark_v3_smoke ORDER BY id;\n"
         if machine_record:
             # Run identity belongs to the caller, never to this stable publication.
@@ -230,8 +230,8 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
             smoke_sql = "-- novarocks-generated-shared-spark-v3-smoke-v1\n" + smoke_sql
             smoke_sql += "\nDROP TABLE ice_rest.__NOVA_SMOKE_NAMESPACE__.spark_v3_smoke PURGE;\nDROP NAMESPACE ice_rest.__NOVA_SMOKE_NAMESPACE__;\n"
         text_file(staging, "spark-iceberg-v3-smoke.sql", smoke_sql)
-    text_file(staging, "env.sh", '# Generated fixture publication.\nunset ' + ' '.join(MANAGED) + '\n' + ''.join(f'export {key}={shlex.quote(str(value))}\n' for key, value in exports.items()))
-    text_file(staging, "manifest.json", json.dumps(manifest, indent=2) + '\n')
+    text_file(staging, "env.sh", '# Generated fixture publication.\nunset ' + ' '.join(MANAGED) + '\n' + ''.join(f'export {key}={shlex.quote(str(value))}\n' for key, value in sorted(exports.items())))
+    text_file(staging, "manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + '\n')
     text_file(staging, "README.md", f'# NovaRocks fixture {env_id}\n\nReady: {str(ready).lower()}\n\nPublication: `{publication}`\n\nStable runtime data: `{stable}`\n\n' + (f'REST: {manifest["iceberg_rest"]["uri"]}\n\nObject store: {manifest["minio"]["endpoint"]}\n' if ready else 'Run `docker/iceberg-rest/up.sh` to bind this worktree.\n'))
     return list(FILES)
 

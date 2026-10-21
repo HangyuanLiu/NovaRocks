@@ -18,6 +18,7 @@
 """Immutable entry, real shell boundaries and unchanged private lifecycle contracts."""
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
@@ -62,6 +63,10 @@ class RendererCase(unittest.TestCase):
 
 
 class RendererTests(RendererCase):
+    def publication_hashes(self, directory):
+        return {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
+                for name in runtime.ENTRY_FILES}
+
     def test_full_snapshot_without_owner_facade_and_stable_runtime_data(self):
         first = self.bind()
         directory = Path(first['published_dir'])
@@ -89,6 +94,47 @@ class RendererTests(RendererCase):
         self.assertEqual(first['published_dir'], second['published_dir'])
         self.assertEqual(before, (self.entry / 'env.sh').read_bytes())
         self.assertEqual(self.backend.events, ['ensure'])
+
+    def test_sorted_json_roundtrip_reuses_every_publication_byte(self):
+        first = self.bind()
+        directory = Path(first['published_dir'])
+        before = self.publication_hashes(directory)
+        # A new invocation reads dictionaries from sorted atomic JSON instead
+        # of retaining the first request's in-memory insertion order.
+        self.config = json.loads(json.dumps(self.config, sort_keys=True))
+        self.owner = machine.MachineOwner(self.root / 'machine', backend=self.backend,
+                                          sweeper_factory=Sweeper)
+        second = self.bind()
+        self.assertEqual(first['published_dir'], second['published_dir'])
+        self.assertEqual(before, self.publication_hashes(directory))
+        self.assertEqual(self.backend.events, ['ensure'])
+
+    def test_renderer_revision_switch_preserves_old_schema_two_publication(self):
+        first = self.bind()
+        old_metadata = copy.deepcopy(first)
+        old_metadata.pop('published_dir')
+        old_metadata.pop('renderer_revision', None)
+        old_directory = self.entry / 'publications' / runtime.digest(old_metadata)
+        context = {**old_metadata, 'env_id': old_metadata['worktree'],
+                   'publication_dir': str(old_directory), 'stable_runtime_dir': str(self.entry)}
+        old_directory.mkdir()
+        entry.render_entry(context, old_directory)
+        runtime.atomic_json(old_directory / 'entry.json', old_metadata)
+        old_hashes = self.publication_hashes(old_directory)
+        runtime.atomic_json(old_directory / 'files.json', old_hashes)
+        (self.entry / 'published').unlink()
+        (self.entry / 'published').symlink_to(Path('publications') / old_directory.name)
+        self.assertNotIn('renderer_revision', publication.read(self.entry))
+        def interrupted(point):
+            if point == 'publication.before_swap':
+                raise RuntimeError('interrupted renderer revision switch')
+        with self.assertRaisesRegex(RuntimeError, 'interrupted renderer revision switch'):
+            publication.publish(self.entry, old_metadata, entry.render_entry, hook=interrupted)
+        self.assertEqual(publication.read(self.entry)['published_dir'], str(old_directory))
+        final = self.bind()
+        self.assertEqual(final['renderer_revision'], publication.RENDERER_REVISION)
+        self.assertNotEqual(final['published_dir'], str(old_directory))
+        self.assertEqual(old_hashes, self.publication_hashes(old_directory))
 
     def test_new_activation_changes_identity_and_old_snapshot_remains_immutable(self):
         first = self.bind()

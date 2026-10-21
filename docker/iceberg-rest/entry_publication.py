@@ -28,6 +28,9 @@ import uuid
 import fixture_runtime as runtime
 
 SCHEMA = 2
+# Presentation changes get a fresh immutable identity without rewriting files
+# still pinned by an existing consumer. Readers verify older schema-2 records.
+RENDERER_REVISION = 1
 
 
 def _hash(path):
@@ -64,7 +67,7 @@ def publish(entry: Path, metadata, renderer, *, hook=lambda name: None):
     entry = entry.resolve()
     value = copy.deepcopy(metadata)
     value.pop("published_dir", None)
-    value.update(schema=SCHEMA, entry_root=str(entry))
+    value.update(schema=SCHEMA, entry_root=str(entry), renderer_revision=RENDERER_REVISION)
     config = value['config']
     if config.get('update_current'):
         current = Path(config['current_link'])
