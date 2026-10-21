@@ -16,6 +16,7 @@ binary, socket, network, image store, or daemon.
 """
 import errno
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve()
 sys.path.insert(0, str(HERE.parents[1]))
@@ -50,8 +52,8 @@ def save(value):
     path=root/('container-'+str(os.getpid())+'.tmp')
     path.write_text(json.dumps(value));path.replace(state)
 if args[0]=='_plugin':
-    event('plugin.entered',group=os.getpgrp())
     signal.signal(signal.SIGTERM,signal.SIG_IGN if config.get('plugin_ignore_term') else lambda *_:event('plugin.term'))
+    event('plugin.entered',group=os.getpgrp())
     while not (root/'plugin-release').exists():
         with (root/'plugin-writes').open('a') as out:out.write('x')
         time.sleep(0.01)
@@ -197,7 +199,24 @@ def run_owner(root):
         with owner.maintenance_lock():
             (root / "owner-locked").write_text(str(owner.base / "maintenance.lock"))
             if options.get("operation") == "control":
-                output = owner.backend.command(options.get("control_args", ["volume", "create", "fixture-test-volume"]))
+                arguments = options.get("control_args", ["volume", "create", "fixture-test-volume"])
+                if options.get("gate_plugin_deadline"):
+                    original_popen = machine.subprocess.Popen
+                    expected = [sys.executable, str(HERE.parents[1] / "machine_operation.py")]
+                    def clocked_monitor(argv, **kwargs):
+                        # Redirect only this owner process's exact production
+                        # supervisor launch. FD/stdIO/env/session kwargs stay intact;
+                        # no liveness writer or extra descriptor crosses exec.
+                        if (len(argv) != 9 or argv[:2] != expected or
+                                argv[3::2] != ["--control-fd", "--lock-fd", "--timeout"]):
+                            raise AssertionError("unexpected production supervisor launch")
+                        redirected = [sys.executable, str(HERE), "--fixture-clocked-monitor",
+                                      str(root), *argv[2:]]
+                        return original_popen(redirected, **kwargs)
+                    with patch.object(machine.subprocess, "Popen", side_effect=clocked_monitor):
+                        output = owner.backend.command(arguments)
+                else:
+                    output = owner.backend.command(arguments)
             else:
                 output = owner.backend.run_mc(record, "echo fixture-command", binary=options.get("binary", False))
             if isinstance(output, bytes):
@@ -209,6 +228,53 @@ def run_owner(root):
         result.update(exit=1, error=getattr(error, "code", type(error).__name__))
     (root / "owner-result.json").write_text(json.dumps(result))
     return result["exit"]
+
+
+def run_clocked_monitor(root, arguments):
+    """Exercise entered-plugin expiry, not Python startup's wall-clock budget."""
+    import machine_operation
+
+    options = json.loads((root / "fake-config.json").read_text())
+    if not (options.get("gate_plugin_deadline") and options.get("plugin")
+            and options.get("plugin_ignore_term") and options.get("operation") == "control"):
+        raise AssertionError("clock helper is exclusive to the entered-plugin timeout case")
+    journal = Path(arguments[0])
+    if not journal.resolve().is_relative_to((root / "state").resolve()):
+        raise AssertionError("clock helper journal is outside this test owner")
+    request_path = journal.with_suffix(".request")
+    original_request = request_path.read_bytes()
+    request = json.loads(original_request)
+    deadline = request["deadline_monotonic"]
+    real_monotonic = time.monotonic
+    resumed_at = None
+
+    def controlled_monotonic():
+        nonlocal resumed_at
+        if resumed_at is None:
+            if not (root / "plugin-deadline-release").exists():
+                return deadline - options["timeout"]
+            # One existence gate, one real anchor. Never reread a timestamp,
+            # extend the original deadline, or freeze the TERM/KILL interval.
+            resumed_at = real_monotonic()
+            runtime.atomic_json(root / "plugin-clock-expired.json", {
+                "original_deadline_monotonic": deadline,
+                "real_anchor_monotonic": resumed_at,
+                "original_request_sha256": hashlib.sha256(original_request).hexdigest(),
+            })
+        return deadline + real_monotonic() - resumed_at
+
+    # Replace only this helper process's module-local clock view; all other
+    # time owners and OS signals/wait/flock/native group observations are real.
+    clock = SimpleNamespace(monotonic=controlled_monotonic, sleep=time.sleep)
+    original_argv = sys.argv
+    try:
+        sys.argv = [str(HERE.parents[1] / "machine_operation.py"), *arguments]
+        with patch.object(machine_operation, "time", clock):
+            return machine_operation.main()
+    finally:
+        sys.argv = original_argv
+        if request_path.read_bytes() != original_request:
+            raise AssertionError("clock helper changed the original persisted request")
 
 
 class MachineOperationTests(unittest.TestCase):
@@ -296,7 +362,10 @@ class MachineOperationTests(unittest.TestCase):
 
     def finish(self):
         # Every gate belongs to this test's fake CLI; release before reaping.
-        for name in ("create-release", "start-release", "rm-release", "late-release", "control-release", "plugin-release"):
+        # A failed setup must not leave a clock-frozen creating=True monitor
+        # retaining its inherited flock after this test's owner is killed.
+        for name in ("plugin-deadline-release", "create-release", "start-release", "rm-release",
+                     "late-release", "control-release", "plugin-release"):
             self.release(name)
         if self.owner_process is not None and self.owner_process.poll() is None:
             self.owner_process.kill()
@@ -522,9 +591,25 @@ class MachineOperationTests(unittest.TestCase):
         self.assertTrue(self.control_fact()["interrupted"])
 
     def test_timed_out_term_ignoring_plugin_is_killed_before_lock_release(self):
-        self.start_owner(operation="control", plugin=True, plugin_ignore_term=True, timeout=0.3)
+        self.start_owner(operation="control", plugin=True, plugin_ignore_term=True, timeout=0.3,
+                         gate_plugin_deadline=True)
         entered = self.until(lambda: self.event("plugin.entered"), "TERM-ignoring plugin")
-        self.until(lambda: self.event("control.exit"), "CLI leader exit")
+        leader = self.until(lambda: self.event("control.exit"), "CLI leader exit")
+        self.assertEqual(entered["group"], leader["pid"])
+        self.until(lambda: subprocess.check_output(
+            ["/bin/ps", "-o", "stat=", "-p", str(leader["pid"])], text=True).strip().startswith("Z"),
+            "original leader remains unreaped while plugin runs")
+        self.until(lambda: (self.root / "plugin-writes").exists()
+                   and (self.root / "plugin-writes").stat().st_size > 0, "actual plugin writes")
+        self.assertTrue(self.lock_held())
+        self.assertIsNone(self.owner_process.poll())
+        journals = list((self.root / "state").glob("*/operations/control-*.request"))
+        self.assertEqual(len(journals), 1)
+        original_request = journals[0].read_bytes()
+        # Establish the real TERM-ignoring descendant and exited leader first.
+        # The unchanged deadline is then crossed once, followed by real time.
+        self.release("plugin-deadline-release")
+        self.until(lambda: (self.root / "plugin-clock-expired.json").exists(), "original deadline crossing")
         time.sleep(0.4)
         self.assertTrue(self.lock_held(), "expiry is not proof of group exit")
         self.wait_owner(1)
@@ -533,6 +618,13 @@ class MachineOperationTests(unittest.TestCase):
         self.assertTrue(fact["timed_out"])
         self.assertTrue(fact["group_exit_observed"])
         self.assertTrue(fact["leader_waited"])
+        self.assertFalse(fact["interrupted"])
+        clock = json.loads((self.root / "plugin-clock-expired.json").read_text())
+        self.assertEqual(clock["original_deadline_monotonic"],
+                         json.loads(original_request)["deadline_monotonic"])
+        self.assertEqual(clock["original_request_sha256"],
+                         hashlib.sha256(original_request).hexdigest())
+        self.assertEqual(journals[0].read_bytes(), original_request)
         self.assertFalse(self.lock_held())
         size = (self.root / "plugin-writes").stat().st_size
         time.sleep(0.05)
@@ -644,4 +736,6 @@ class MachineOperationTests(unittest.TestCase):
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--fixture-owner":
         raise SystemExit(run_owner(Path(sys.argv[2])))
+    if len(sys.argv) == 10 and sys.argv[1] == "--fixture-clocked-monitor":
+        raise SystemExit(run_clocked_monitor(Path(sys.argv[2]), sys.argv[3:]))
     unittest.main()
