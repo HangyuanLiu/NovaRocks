@@ -105,12 +105,7 @@ def verify_package(package, workspace_ids):
     if internal:
         if package["id"] not in workspace_ids or package["source"] is not None:
             violations.append(f"{name} is not the workspace-owned pure package")
-        if name == FAILURE_CONTRACT and package["dependencies"]:
-            violations.append(f"{name} must remain dependency-free")
-        if name == "novarocks-result-contract" and any(
-                d["name"] != FAILURE_CONTRACT or d["kind"] is not None
-                for d in package["dependencies"]):
-            violations.append(f"{name} may depend only on neutral FailureContract through a normal edge")
+        violations.extend(metadata_support().verify_failure_fact_surface(package))
         # A feature/target variant of a repository-owned contract requires a new
         # audit. Optional dependencies cannot hide outside the selected tree.
         allowed_features = {"test-support"} if name == "novarocks-functions" else set()

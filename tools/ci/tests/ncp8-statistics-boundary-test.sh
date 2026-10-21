@@ -357,22 +357,23 @@ printf 'novarocks-connector-iceberg = { path = "../connector/iceberg" }\n' \
   >>"$constant_contract_provider/novarocks/constant-contract/Cargo.toml"
 assert_rejected "$constant_contract_provider" "internal normal closure must be exactly"
 
-# Result may forward only FailureContract, including edge kinds omitted by a
-# normal resolved graph. FailureContract itself must remain dependency-free.
+# Use a non-NovaRocks helper to prove that Result admits only the neutral failure
+# edge and Failure stays a pure leaf, including unresolved declaration kinds.
 for dependency_kind in dependencies build-dependencies dev-dependencies; do
   result_dependency="$fixture_root/result-$dependency_kind"
   cp -R "$valid" "$result_dependency"
   write_package "$result_dependency" "helper" "result-helper"
-  if [ "$dependency_kind" != dependencies ]; then
-    printf '\n[%s]\n' "$dependency_kind" >>"$result_dependency/novarocks/result-contract/Cargo.toml"
+  if [[ "$dependency_kind" == dependencies ]]; then
+    printf 'result-helper = { path = "../../helper" }\n' \
+      >>"$result_dependency/novarocks/result-contract/Cargo.toml"
+  else
+    printf '\n[%s]\nresult-helper = { path = "../../helper" }\n' "$dependency_kind" \
+      >>"$result_dependency/novarocks/result-contract/Cargo.toml"
   fi
-  printf 'result-helper = { path = "../../helper" }\n' \
-    >>"$result_dependency/novarocks/result-contract/Cargo.toml"
-  assert_rejected "$result_dependency" "novarocks-result-contract may declare only the required normal novarocks-failure-contract"
-
+  assert_rejected "$result_dependency" "novarocks-result-contract must declare only novarocks-failure-contract"
   failure_dependency="$fixture_root/failure-$dependency_kind"
   cp -R "$valid" "$failure_dependency"
-  write_package "$failure_dependency" helper failure-helper
+  write_package "$failure_dependency" "helper" "failure-helper"
   printf '\n[%s]\nfailure-helper = { path = "../../helper" }\n' "$dependency_kind" \
     >>"$failure_dependency/novarocks/failure-contract/Cargo.toml"
   assert_rejected "$failure_dependency" "novarocks-failure-contract must not declare dependencies"
@@ -386,11 +387,11 @@ cat >>"$result_optional/novarocks/result-contract/Cargo.toml" <<'EOF'
 [target.'cfg(target_os = "none")'.dependencies]
 result-helper = { path = "../../helper", optional = true }
 EOF
-assert_rejected "$result_optional" "novarocks-result-contract may declare only the required normal novarocks-failure-contract"
+assert_rejected "$result_optional" "novarocks-result-contract must declare only novarocks-failure-contract"
 
 failure_optional="$fixture_root/failure-optional"
 cp -R "$valid" "$failure_optional"
-write_package "$failure_optional" helper failure-helper
+write_package "$failure_optional" "helper" "failure-helper"
 cat >>"$failure_optional/novarocks/failure-contract/Cargo.toml" <<'EOF'
 
 [target.'cfg(target_os = "none")'.dependencies]
@@ -398,25 +399,94 @@ failure-helper = { path = "../../helper", optional = true }
 EOF
 assert_rejected "$failure_optional" "novarocks-failure-contract must not declare dependencies"
 
-for mutation in missing optional target; do
-  result_fact="$fixture_root/result-fact-$mutation"
-  cp -R "$valid" "$result_fact"
-  case "$mutation" in
-    missing)
-      replace_once "$result_fact/novarocks/result-contract/Cargo.toml" \
-        $'novarocks-failure-contract = { path = "../failure-contract" }\n' ''
-      expected="may declare only the required normal novarocks-failure-contract" ;;
-    optional)
-      replace_once "$result_fact/novarocks/result-contract/Cargo.toml" \
-        'path = "../failure-contract"' 'path = "../failure-contract", optional = true'
-      expected="novarocks-failure-contract must not be optional" ;;
-    target)
-      replace_once "$result_fact/novarocks/result-contract/Cargo.toml" \
-        '[dependencies]' "[target.'cfg(target_os = \"none\")'.dependencies]"
-      expected="novarocks-failure-contract must not be target-specific" ;;
-  esac
-  assert_rejected "$result_fact" "$expected"
+failure_optional_normal="$fixture_root/failure-optional-normal"
+cp -R "$valid" "$failure_optional_normal"
+write_package "$failure_optional_normal" "helper" "failure-helper"
+cat >>"$failure_optional_normal/novarocks/failure-contract/Cargo.toml" <<'EOF'
+
+[dependencies]
+failure-helper = { path = "../../helper", optional = true }
+EOF
+assert_rejected "$failure_optional_normal" "novarocks-failure-contract must not declare dependencies"
+
+failure_target="$fixture_root/failure-target"
+cp -R "$valid" "$failure_target"
+write_package "$failure_target" "helper" "failure-helper"
+cat >>"$failure_target/novarocks/failure-contract/Cargo.toml" <<'EOF'
+
+[target.'cfg(target_os = "none")'.dependencies]
+failure-helper = { path = "../../helper" }
+EOF
+assert_rejected "$failure_target" "novarocks-failure-contract must not declare dependencies"
+
+result_missing="$fixture_root/result-missing-failure"
+cp -R "$valid" "$result_missing"
+replace_once "$result_missing/novarocks/result-contract/Cargo.toml" \
+  'novarocks-failure-contract = { path = "../failure-contract" }' ''
+assert_rejected "$result_missing" "novarocks-result-contract must declare only novarocks-failure-contract"
+
+for dependency_kind in dev build; do
+  result_failure_kind="$fixture_root/result-failure-$dependency_kind"
+  cp -R "$valid" "$result_failure_kind"
+  replace_once "$result_failure_kind/novarocks/result-contract/Cargo.toml" \
+    '[dependencies]' "[$dependency_kind-dependencies]"
+  assert_rejected "$result_failure_kind" \
+    "novarocks-result-contract novarocks-failure-contract dependency kind must be normal, got $dependency_kind"
 done
+
+for failure_policy in optional renamed target duplicate; do
+  result_failure_policy="$fixture_root/result-failure-$failure_policy"
+  cp -R "$valid" "$result_failure_policy"
+  case "$failure_policy" in
+    optional)
+      replacement='novarocks-failure-contract = { path = "../failure-contract", optional = true }'
+      expected='novarocks-result-contract novarocks-failure-contract must not be optional'
+      ;;
+    renamed)
+      replacement='failure = { package = "novarocks-failure-contract", path = "../failure-contract" }'
+      expected='novarocks-result-contract must not rename novarocks-failure-contract'
+      ;;
+    target)
+      replace_once "$result_failure_policy/novarocks/result-contract/Cargo.toml" \
+        '[dependencies]' "[target.'cfg(target_os = \"none\")'.dependencies]"
+      assert_rejected "$result_failure_policy" 'must be an unconditional workspace path dependency'
+      continue
+      ;;
+    duplicate)
+      cat >>"$result_failure_policy/novarocks/result-contract/Cargo.toml" <<'EOF'
+
+[target.'cfg(target_os = "none")'.dependencies]
+novarocks-failure-contract = { path = "../failure-contract" }
+EOF
+      assert_rejected "$result_failure_policy" 'novarocks-result-contract must declare only novarocks-failure-contract'
+      continue
+      ;;
+  esac
+  replace_once "$result_failure_policy/novarocks/result-contract/Cargo.toml" \
+    'novarocks-failure-contract = { path = "../failure-contract" }' "$replacement"
+  assert_rejected "$result_failure_policy" "$expected"
+done
+
+# A same-named dependency outside the owned vocabulary path is not the admitted
+# workspace edge, even if its own manifest remains dependency-free.
+result_external="$fixture_root/result-failure-external"
+cp -R "$valid" "$result_external"
+mv "$result_external/novarocks/failure-contract" "$result_external/failure-contract"
+replace_once "$result_external/Cargo.toml" \
+  '  "novarocks/failure-contract",' '  "failure-contract",'
+replace_once "$result_external/novarocks/result-contract/Cargo.toml" \
+  'novarocks-failure-contract = { path = "../failure-contract" }' \
+  'novarocks-failure-contract = { path = "../../failure-contract" }'
+assert_rejected "$result_external" 'must be an unconditional workspace path dependency'
+
+result_failure_features="$fixture_root/result-failure-features"
+cp -R "$valid" "$result_failure_features"
+printf '\n[features]\nextra = []\n' >>"$result_failure_features/novarocks/failure-contract/Cargo.toml"
+replace_once "$result_failure_features/novarocks/result-contract/Cargo.toml" \
+  'novarocks-failure-contract = { path = "../failure-contract" }' \
+  'novarocks-failure-contract = { path = "../failure-contract", features = ["extra"] }'
+assert_rejected "$result_failure_features" \
+  'novarocks-result-contract novarocks-failure-contract features must be exactly []'
 
 execution_normal="$fixture_root/execution-normal"
 cp -R "$valid" "$execution_normal"

@@ -59,7 +59,6 @@ EOF
 [dependencies]
 novarocks-fs = { path = "../novarocks-fs" }
 novarocks-spi = { path = "../novarocks-spi" }
-novarocks-failure-contract = { path = "../novarocks-failure-contract" }
 EOF
   cat >>"$root/novarocks-server/Cargo.toml" <<'EOF'
 
@@ -88,16 +87,81 @@ valid="$tmpdir/valid"
 write_fixture "$valid"
 "$CHECKER" --manifest-path "$valid/Cargo.toml"
 
-# The shared failure vocabulary cannot hide a normal/build execution owner.
-# Cargo does not activate a dependency's own dev dependencies for its consumer.
-for kind in dependencies build-dependencies; do
-  failure_owner="$tmpdir/failure-owner-$kind"
-  cp -R "$valid" "$failure_owner"
-  write_package "$failure_owner" novarocks-execution
-  printf '\n[%s]\nnovarocks-execution = { path = "../novarocks-execution" }\n' "$kind" \
-    >>"$failure_owner/novarocks-failure-contract/Cargo.toml"
-  assert_rejected "$failure_owner" \
-    "provider closure contains forbidden packages: novarocks-execution"
+# FailureProjection is neutral vocabulary. Admit the same declaration kinds as
+# the existing neutral owners, without altering closure or target policy.
+for kind in dependencies build-dependencies dev-dependencies; do
+  fixture="$tmpdir/failure-direct-$kind"
+  cp -R "$valid" "$fixture"
+  if [[ "$kind" != dependencies ]]; then
+    printf '\n[%s]\n' "$kind" >>"$fixture/novarocks-connector-iceberg/Cargo.toml"
+  fi
+  printf 'novarocks-failure-contract = { path = "../novarocks-failure-contract" }\n' \
+    >>"$fixture/novarocks-connector-iceberg/Cargo.toml"
+  "$CHECKER" --manifest-path "$fixture/Cargo.toml"
+done
+
+failure_transitive="$tmpdir/failure-transitive"
+cp -R "$valid" "$failure_transitive"
+cat >>"$failure_transitive/novarocks-spi/Cargo.toml" <<'EOF'
+
+[dependencies]
+novarocks-failure-contract = { path = "../novarocks-failure-contract" }
+EOF
+"$CHECKER" --manifest-path "$failure_transitive/Cargo.toml"
+
+for policy in optional target; do
+  fixture="$tmpdir/failure-$policy"
+  cp -R "$valid" "$fixture"
+  if [[ "$policy" == optional ]]; then
+    printf 'novarocks-failure-contract = { path = "../novarocks-failure-contract", optional = true }\n' \
+      >>"$fixture/novarocks-connector-iceberg/Cargo.toml"
+  else
+    cat >>"$fixture/novarocks-connector-iceberg/Cargo.toml" <<'EOF'
+
+[target.'cfg(target_os = "none")'.dependencies]
+novarocks-failure-contract = { path = "../novarocks-failure-contract" }
+EOF
+  fi
+  "$CHECKER" --manifest-path "$fixture/Cargo.toml"
+done
+
+# An allowed fact owner cannot bridge the provider to an already forbidden
+# runtime or concrete owner. Exercise the original closure rule independently
+# from the direct declaration allowlist, including a build dependency bridge.
+for forbidden_owner in novarocks-execution novarocks-state-store-sqlite novarocks-connector-starrocks; do
+  for kind in dependencies build-dependencies; do
+    fixture="$tmpdir/failure-bridge-$forbidden_owner-$kind"
+    cp -R "$valid" "$fixture"
+    if [[ "$forbidden_owner" != novarocks-state-store-sqlite ]]; then
+      write_package "$fixture" "$forbidden_owner"
+    fi
+    printf 'novarocks-failure-contract = { path = "../novarocks-failure-contract" }\n' \
+      >>"$fixture/novarocks-connector-iceberg/Cargo.toml"
+    printf '\n[%s]\n%s = { path = "../%s" }\n' "$kind" "$forbidden_owner" "$forbidden_owner" \
+      >>"$fixture/novarocks-failure-contract/Cargo.toml"
+    assert_rejected "$fixture" "provider closure contains forbidden packages: $forbidden_owner"
+  done
+done
+
+# Optional and non-host target declarations still face the existing direct
+# internal-owner allowlist even when the default graph omits their edges.
+for policy in normal optional target; do
+  fixture="$tmpdir/unknown-direct-$policy"
+  cp -R "$valid" "$fixture"
+  write_package "$fixture" novarocks-unexpected-owner
+  case "$policy" in
+    normal) dependency='novarocks-unexpected-owner = { path = "../novarocks-unexpected-owner" }' ;;
+    optional) dependency='novarocks-unexpected-owner = { path = "../novarocks-unexpected-owner", optional = true }' ;;
+    target)
+      cat >>"$fixture/novarocks-connector-iceberg/Cargo.toml" <<'EOF'
+
+[target.'cfg(target_os = "none")'.dependencies]
+EOF
+      dependency='novarocks-unexpected-owner = { path = "../novarocks-unexpected-owner" }'
+      ;;
+  esac
+  printf '%s\n' "$dependency" >>"$fixture/novarocks-connector-iceberg/Cargo.toml"
+  assert_rejected "$fixture" 'provider declares forbidden internal dependencies: novarocks-unexpected-owner'
 done
 
 forbidden="$tmpdir/forbidden"

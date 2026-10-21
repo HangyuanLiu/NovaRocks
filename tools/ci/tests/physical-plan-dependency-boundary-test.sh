@@ -51,7 +51,7 @@ write_fixture() {
   cat >"$fixture_root/Cargo.toml" <<'EOF'
 [workspace]
 resolver = "2"
-exclude = ["crates/arrow-schema-v2", "crates/bytes-v2"]
+exclude = ["crates/arrow-schema-v2", "crates/bytes-v2", "crates/failure-contract-v2"]
 members = [
   "crates/arrow-array",
   "crates/connector-contract",
@@ -59,8 +59,8 @@ members = [
   "crates/fixture-pins",
   "crates/function-contract",
   "crates/execution",
-  "crates/feature-user",
   "crates/failure-contract",
+  "crates/feature-user",
   "crates/hyper",
   "crates/physical-plan",
   "crates/proto-models",
@@ -84,9 +84,9 @@ EOF
   write_package "$fixture_root" constant-contract novarocks-constant-contract
   write_package "$fixture_root" fixture-pins fixture-pins
   write_package "$fixture_root" function-contract novarocks-function-contract
-  write_package "$fixture_root" failure-contract novarocks-failure-contract
   write_package "$fixture_root" connector-contract novarocks-connector-contract
   write_package "$fixture_root" execution novarocks-execution
+  write_package "$fixture_root" failure-contract novarocks-failure-contract
   write_package "$fixture_root" feature-user feature-user
   write_package "$fixture_root" hyper hyper
   write_package "$fixture_root" physical-plan novarocks-physical-plan
@@ -96,6 +96,13 @@ EOF
   write_package "$fixture_root" sql novarocks-sql
   write_package "$fixture_root" tonic tonic
   write_package "$fixture_root" type-contract novarocks-type-contract
+
+  # Every existing neutral owner may project dependency-free failure facts.
+  local owner
+  for owner in physical-plan type-contract connector-contract constant-contract function-contract result-contract; do
+    append_dependency "$fixture_root" "$owner" \
+      'novarocks-failure-contract = { path = "../failure-contract" }'
+  done
 
   append_dependency "$fixture_root" physical-plan \
     "arrow-schema = \"=${ARROW_SCHEMA_VERSION}\""
@@ -120,14 +127,6 @@ EOF
   for arrow_package in arrow-array arrow-buffer arrow-data arrow-schema; do
     append_dependency "$fixture_root" constant-contract "$arrow_package = \"=${ARROW_SCHEMA_VERSION}\""
   done
-  # ADR-0187's domain failure facts are shared by these exact neutral owners.
-  # The failure vocabulary itself has no dependencies or executable authority.
-  local failure_owner
-  for failure_owner in physical-plan connector-contract type-contract result-contract constant-contract function-contract; do
-    append_dependency "$fixture_root" "$failure_owner" \
-      'novarocks-failure-contract = { path = "../failure-contract" }'
-  done
-
   # Lock the independently selected real registry closure without activating
   # unrelated fixture-pins features in physical-plan's own Cargo tree.
   python3 - "$CHECKER" "$fixture_root/crates/fixture-pins/Cargo.toml" "$REPO_ROOT/Cargo.lock" <<'PY_PINS'
@@ -375,6 +374,7 @@ failure_optional_root="$(new_mutation failure-optional-wire)"
 append_dependency "$failure_optional_root" failure-contract \
   'wire = { package = "tonic", path = "../tonic", optional = true }'
 assert_rejected "$failure_optional_root" \
+  "novarocks-failure-contract must remain dependency-free" \
   "novarocks-failure-contract declares optional normal dependencies" \
   "novarocks-failure-contract declares normal dependencies outside its exact owner allow-list"
 
@@ -386,13 +386,6 @@ assert_rejected "$failure_target_root" \
   "novarocks-failure-contract declares target-specific normal dependencies" \
   "novarocks-execution"
 
-failure_build_root="$(new_mutation failure-build)"
-append_dependency_section "$failure_build_root" failure-contract build-dependencies \
-  "bytes = \"=${BYTES_VERSION}\""
-assert_rejected "$failure_build_root" \
-  "novarocks-failure-contract declares build dependencies" \
-  "bytes"
-
 failure_dev_root="$(new_mutation failure-dev)"
 append_dependency_section "$failure_dev_root" failure-contract dev-dependencies \
   'novarocks-execution = { path = "../execution" }'
@@ -401,31 +394,12 @@ assert_rejected "$failure_dev_root" \
   "novarocks-failure-contract declares dev dependencies" \
   "novarocks-execution"
 
-failure_build_target_root="$(new_mutation failure-build-target)"
-: >"$failure_build_target_root/crates/failure-contract/build.rs"
-assert_rejected "$failure_build_target_root" \
-  "novarocks-failure-contract declares a custom build target"
-
-failure_macro_root="$(new_mutation failure-proc-macro)"
-append_dependency_section "$failure_macro_root" failure-contract lib 'proc-macro = true'
-assert_rejected "$failure_macro_root" \
-  "novarocks-failure-contract declares a proc-macro target"
-
-failure_feature_root="$(new_mutation failure-feature)"
-append_dependency_section "$failure_feature_root" failure-contract features 'alternate = []'
-assert_rejected "$failure_feature_root" \
-  "novarocks-failure-contract declares Cargo features" \
-  "alternate"
-
 # A same-name local package outside the audited workspace authority must not
 # gain admission just because the new neutral vocabulary name is permitted.
 failure_identity_root="$(new_mutation failure-foreign-identity)"
 write_package "$failure_identity_root" failure-contract-v2 novarocks-failure-contract
 replace_text "$failure_identity_root/crates/failure-contract-v2/Cargo.toml" \
   'version = "0.1.0"' 'version = "0.2.0"'
-replace_text "$failure_identity_root/Cargo.toml" \
-  'exclude = ["crates/arrow-schema-v2", "crates/bytes-v2"]' \
-  'exclude = ["crates/arrow-schema-v2", "crates/bytes-v2", "crates/failure-contract-v2"]'
 replace_text "$failure_identity_root/crates/physical-plan/Cargo.toml" \
   'novarocks-failure-contract = { path = "../failure-contract" }' \
   'novarocks-failure-contract = { path = "../failure-contract-v2" }'
@@ -457,6 +431,90 @@ assert_rejected "$result_runtime_root" \
   "novarocks-result-contract declares normal dependencies outside its exact owner allow-list" \
   "resolved normal/build dependency closure contains forbidden wire/RPC capability" \
   "tonic"
+
+result_missing_root="$(new_mutation result-missing-failure-fact)"
+replace_text "$result_missing_root/crates/result-contract/Cargo.toml" \
+  'novarocks-failure-contract = { path = "../failure-contract" }' ''
+assert_rejected "$result_missing_root" \
+  "novarocks-result-contract requires exactly one normal dependency on novarocks-failure-contract"
+
+# Pure names do not confer any dependency authority on the failure leaf or
+# permit additional result-projection edges, including build and test edges.
+for owner in failure-contract result-contract; do
+  for section in dependencies build-dependencies dev-dependencies; do
+    fact_edge_root="$(new_mutation "$owner-$section")"
+    if [ "$section" = dependencies ]; then
+      append_dependency "$fact_edge_root" "$owner" \
+        "arrow-schema = \"=${ARROW_SCHEMA_VERSION}\""
+    else
+      append_dependency_section "$fact_edge_root" "$owner" "$section" \
+        "arrow-schema = \"=${ARROW_SCHEMA_VERSION}\""
+    fi
+    if [ "$owner" = failure-contract ]; then
+      assert_rejected "$fact_edge_root" "novarocks-failure-contract must remain dependency-free"
+    else
+      assert_rejected "$fact_edge_root" \
+        "novarocks-result-contract requires exactly one normal dependency on novarocks-failure-contract"
+    fi
+  done
+
+  fact_features_root="$(new_mutation "$owner-features")"
+  append_dependency_section "$fact_features_root" "$owner" features 'hidden = []'
+  assert_rejected "$fact_features_root" "novarocks-$owner declares Cargo features"
+
+  fact_build_root="$(new_mutation "$owner-build-script")"
+  printf 'fn main() {}\n' >"$fact_build_root/crates/$owner/build.rs"
+  assert_rejected "$fact_build_root" "novarocks-$owner declares a custom build target"
+
+  fact_macro_root="$(new_mutation "$owner-proc-macro")"
+  append_dependency_section "$fact_macro_root" "$owner" lib 'proc-macro = true'
+  assert_rejected "$fact_macro_root" "novarocks-$owner declares a proc-macro target"
+done
+
+failure_runtime_root="$(new_mutation failure-runtime)"
+append_dependency "$failure_runtime_root" failure-contract 'tonic = { path = "../tonic" }'
+assert_rejected "$failure_runtime_root" \
+  "novarocks-failure-contract must remain dependency-free" \
+  "resolved normal/build dependency closure contains forbidden wire/RPC capability"
+
+failure_target_root="$(new_mutation failure-inactive-target-runtime)"
+append_dependency_section "$failure_target_root" failure-contract \
+  'target.'"'"'cfg(target_os="none")'"'"'.dependencies' 'tonic = { path = "../tonic" }'
+assert_rejected "$failure_target_root" \
+  "novarocks-failure-contract must remain dependency-free" \
+  "novarocks-failure-contract declares target-specific normal dependencies"
+
+result_optional_root="$(new_mutation result-optional-failure-fact)"
+replace_text "$result_optional_root/crates/result-contract/Cargo.toml" \
+  'novarocks-failure-contract = { path = "../failure-contract" }' \
+  'novarocks-failure-contract = { path = "../failure-contract", optional = true }'
+assert_rejected "$result_optional_root" "novarocks-result-contract declares optional normal dependencies"
+
+result_target_root="$(new_mutation result-target-specific-failure-fact)"
+replace_text "$result_target_root/crates/result-contract/Cargo.toml" \
+  'novarocks-failure-contract = { path = "../failure-contract" }' ''
+append_dependency_section "$result_target_root" result-contract \
+  'target.'"'"'cfg(target_os="none")'"'"'.dependencies' \
+  'novarocks-failure-contract = { path = "../failure-contract" }'
+assert_rejected "$result_target_root" "novarocks-result-contract declares target-specific normal dependencies"
+
+result_defaults_root="$(new_mutation result-failure-default-feature-policy)"
+replace_text "$result_defaults_root/crates/result-contract/Cargo.toml" \
+  'novarocks-failure-contract = { path = "../failure-contract" }' \
+  'novarocks-failure-contract = { path = "../failure-contract", default-features = false }'
+assert_rejected "$result_defaults_root" "novarocks-result-contract disables dependency default features"
+
+foreign_failure_root="$(new_mutation foreign-failure-fact-owner)"
+write_package "$foreign_failure_root" failure-contract-v2 novarocks-failure-contract
+replace_text "$foreign_failure_root/crates/failure-contract-v2/Cargo.toml" \
+  'version = "0.1.0"' 'version = "0.2.0"'
+replace_text "$foreign_failure_root/crates/result-contract/Cargo.toml" \
+  'novarocks-failure-contract = { path = "../failure-contract" }' \
+  'novarocks-failure-contract = { path = "../failure-contract-v2" }'
+assert_rejected "$foreign_failure_root" \
+  "resolved normal/build dependency closure contains package identities outside the exact audited allow-list" \
+  "novarocks-failure-contract v0.2.0" \
+  "crates/failure-contract-v2/Cargo.toml"
 
 # The foundational type vocabulary cannot depend upward on Connector identity.
 reverse_contract_root="$(new_mutation reverse-contract-direction)"

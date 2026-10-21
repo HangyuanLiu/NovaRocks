@@ -56,8 +56,8 @@ write_fixture() {
   # own the columnar vocabulary. Tokio is deliberately absent: the
   # state-store-conformance owner that used to justify it is gone.
   for dependency in arrow arrow-schema async-trait bytes novarocks-connector-contract \
-      novarocks-execution novarocks-frontend-application novarocks-memory \
-      novarocks-result-contract novarocks-failure-contract novarocks-secret novarocks-state-store-api \
+      novarocks-execution novarocks-failure-contract novarocks-frontend-application novarocks-memory \
+      novarocks-result-contract novarocks-secret novarocks-state-store-api \
       novarocks-type-contract novarocks-types serde sha2 tokio tracing url uuid; do
     write_dependency_package "$fixture_root" "$dependency"
   done
@@ -141,6 +141,8 @@ append_dependency "$neutral_contract_root/Cargo.toml" \
   'novarocks-type-contract = { path = "deps/novarocks-type-contract" }'
 append_dependency "$neutral_contract_root/deps/novarocks-type-contract/Cargo.toml" \
   'novarocks-result-contract = { path = "../novarocks-result-contract" }'
+append_dependency "$neutral_contract_root/deps/novarocks-result-contract/Cargo.toml" \
+  'novarocks-failure-contract = { path = "../novarocks-failure-contract" }'
 assert_accepted "$neutral_contract_root"
 
 # Allow-list membership cannot hide a runtime or application owner downstream.
@@ -159,6 +161,11 @@ assert_rejected "$neutral_application_root" \
   "novarocks-spi normal dependency closure contains a forbidden application/execution owner: novarocks-frontend-application"
 
 # --- accept: neutral internal roles, without requiring the whole set ------
+direct_failure_root="$(new_mutation direct-failure-contract)"
+append_dependency "$direct_failure_root/Cargo.toml" \
+  'novarocks-failure-contract = { path = "deps/novarocks-failure-contract" }'
+assert_accepted "$direct_failure_root"
+
 direct_result_root="$(new_mutation direct-result-contract)"
 append_dependency "$direct_result_root/Cargo.toml" \
   'novarocks-result-contract = { path = "deps/novarocks-result-contract" }'
@@ -180,6 +187,8 @@ append_dependency "$connector_chain_root/deps/novarocks-connector-contract/Cargo
   'novarocks-type-contract = { path = "../novarocks-type-contract" }'
 append_dependency "$connector_chain_root/deps/novarocks-type-contract/Cargo.toml" \
   'novarocks-result-contract = { path = "../novarocks-result-contract" }'
+append_dependency "$connector_chain_root/deps/novarocks-result-contract/Cargo.toml" \
+  'novarocks-failure-contract = { path = "../novarocks-failure-contract" }'
 assert_accepted "$connector_chain_root"
 
 for neutral in novarocks-type-contract novarocks-result-contract novarocks-failure-contract; do
@@ -279,7 +288,7 @@ for owner in novarocks-state-store-api novarocks-frontend-application \
 done
 
 # --- reject: neutral roles cannot conceal a forbidden transitive edge -----
-for neutral in novarocks-type-contract novarocks-result-contract; do
+for neutral in novarocks-type-contract novarocks-result-contract novarocks-failure-contract; do
   for owner in tokio novarocks-state-store-api novarocks-frontend-application \
       novarocks-execution novarocks-memory novarocks-types; do
     transitive_neutral_root="$(new_mutation "$neutral-to-$owner")"

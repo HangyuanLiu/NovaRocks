@@ -59,14 +59,14 @@ TYPE_CONTRACT = "novarocks-type-contract"
 CONNECTOR_CONTRACT = "novarocks-connector-contract"
 CONSTANT_CONTRACT = "novarocks-constant-contract"
 RESULT_CONTRACT = "novarocks-result-contract"
-FUNCTION_CONTRACT = "novarocks-function-contract"
 FAILURE_CONTRACT = "novarocks-failure-contract"
+FUNCTION_CONTRACT = "novarocks-function-contract"
 
 # These are allowed direct internal dependencies, not required dependencies.
 # Removing one as the contract gets smaller remains legal.
-DIRECT_INTERNAL_ALLOW_LIST = frozenset({TYPE_CONTRACT, CONNECTOR_CONTRACT, CONSTANT_CONTRACT, RESULT_CONTRACT, FUNCTION_CONTRACT, FAILURE_CONTRACT})
+DIRECT_INTERNAL_ALLOW_LIST = frozenset({TYPE_CONTRACT, CONNECTOR_CONTRACT, CONSTANT_CONTRACT, RESULT_CONTRACT, FAILURE_CONTRACT, FUNCTION_CONTRACT})
 DIRECT_PACKAGE_ALLOW_LIST = frozenset(
-    {"arrow-schema", TYPE_CONTRACT, CONNECTOR_CONTRACT, CONSTANT_CONTRACT, RESULT_CONTRACT, FUNCTION_CONTRACT, FAILURE_CONTRACT}
+    {"arrow-schema", TYPE_CONTRACT, CONNECTOR_CONTRACT, CONSTANT_CONTRACT, RESULT_CONTRACT, FAILURE_CONTRACT, FUNCTION_CONTRACT}
 )
 
 # Dependency direction is part of the architecture. The type contract is the
@@ -594,12 +594,25 @@ def verify_external_authority(package, names=EXTERNAL_PACKAGE_NAMES,
     return violations
 
 
+def verify_failure_fact_surface(package):
+    """Failure facts are a leaf; result projection has one ordinary fact edge."""
+    name, dependencies = package["name"], package["dependencies"]
+    if name == FAILURE_CONTRACT and dependencies:
+        return [f"{name} must remain dependency-free"]
+    if name == RESULT_CONTRACT and (len(dependencies) != 1
+            or dependencies[0]["name"] != FAILURE_CONTRACT
+            or dependencies[0]["kind"] is not NORMAL):
+        return [f"{name} requires exactly one normal dependency on {FAILURE_CONTRACT}"]
+    return []
+
+
 def verify_internal_contract_surface(graph):
     """Keep repository-owned neutral contracts invariant across configurations."""
 
     violations = []
     for name in sorted(DIRECT_INTERNAL_ALLOW_LIST):
         package = graph.workspace_package(name)
+        violations.extend(verify_failure_fact_surface(package))
         dependencies, unknown_kinds = declared_dependencies_by_kind(package)
         normal_dependencies = dependencies[NORMAL]
         owner_allow_list = INTERNAL_CONTRACT_NORMAL_ALLOW_LISTS[name]

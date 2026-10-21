@@ -34,20 +34,21 @@ spec.loader.exec_module(guard)
 class BoundaryTests(unittest.TestCase):
     def fixture(self, root_dependency="", types_dependency="", extra="", build_script=False,
                 result_dependency=None, functions_dependency="", functions_build=None,
-                functions_extra="", failure_dependency=""):
-        if result_dependency is None:
-            result_dependency = 'novarocks-failure-contract = { path = "../failure" }\n'
+                functions_extra="", failure_dependency="", failure_extra="", result_extra="",
+                owner_builds=()):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         (root / "Cargo.toml").write_text(
             '[workspace]\nresolver = "2"\nmembers = ["program", "types", "runtime", "result", "functions", "failure"]\n')
+        if result_dependency is None:
+            result_dependency = 'novarocks-failure-contract = { path = "../failure" }\n'
         for directory, name, dependencies in (
                 ("program", "novarocks-local-program", root_dependency),
                 ("types", "novarocks-types", types_dependency),
                 ("result", "novarocks-result-contract", result_dependency),
-                ("failure", "novarocks-failure-contract", failure_dependency),
                 ("runtime", "tokio", ""),
+                ("failure", "novarocks-failure-contract", failure_dependency),
                 ("functions", "novarocks-functions", functions_dependency)):
             package = root / directory
             (package / "src").mkdir(parents=True)
@@ -56,9 +57,13 @@ class BoundaryTests(unittest.TestCase):
                 f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2024"\n'
                 + "[dependencies]\n" + dependencies
                 + (extra if directory == "program" else "")
+                + (failure_extra if directory == "failure" else "")
+                + (result_extra if directory == "result" else "")
                 + (functions_extra if directory == "functions" else ""))
         if build_script:
             (root / "program/build.rs").write_text("fn main() {}\n")
+        for owner in owner_builds:
+            (root / owner / "build.rs").write_text("fn main() {}\n")
         if functions_build is not None:
             (root / "functions" / functions_build).write_text("fn main() {}\n")
             manifest = root / "functions/Cargo.toml"
@@ -77,20 +82,103 @@ class BoundaryTests(unittest.TestCase):
         result = self.fixture('novarocks-types = { path = "../types" }\n')
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_result_contract_with_only_neutral_failure_facts_is_allowed(self):
+    def test_result_projection_over_failure_fact_leaf_is_allowed(self):
         result = self.fixture('novarocks-result-contract = { path = "../result" }\n')
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_failure_fact_leaf_is_allowed_directly(self):
+        result = self.fixture('novarocks-failure-contract = { path = "../failure" }\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_result_projection_requires_its_failure_fact_dependency(self):
+        self.assert_rejected(self.fixture('novarocks-result-contract = { path = "../result" }\n',
+                                          result_dependency=""),
+                             "requires exactly one normal dependency on novarocks-failure-contract")
 
     def test_result_contract_cannot_acquire_runtime_even_through_a_pure_root(self):
         result = self.fixture('novarocks-result-contract = { path = "../result" }\n',
                               result_dependency='tokio = { path = "../runtime" }\n')
-        self.assert_rejected(result, "novarocks-result-contract declares unaudited normal edges")
+        self.assert_rejected(result, "requires exactly one normal dependency on novarocks-failure-contract")
         self.assertIn("runtime/wire/provider/storage capability: tokio", result.stderr)
 
     def test_result_contract_cannot_add_an_otherwise_pure_dependency(self):
         result = self.fixture('novarocks-result-contract = { path = "../result" }\n',
                               result_dependency='novarocks-types = { path = "../types" }\n')
-        self.assert_rejected(result, "novarocks-result-contract declares unaudited normal edges")
+        self.assert_rejected(result, "requires exactly one normal dependency on novarocks-failure-contract")
+
+    def test_result_projection_cannot_add_edges_of_any_kind(self):
+        root_dependency = 'novarocks-result-contract = { path = "../result" }\n'
+        for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+            with self.subTest(section=section):
+                if section == "dependencies":
+                    result = self.fixture(root_dependency, result_dependency=(
+                        'novarocks-failure-contract = { path = "../failure" }\n'
+                        'novarocks-types = { path = "../types" }\n'))
+                else:
+                    result = self.fixture(root_dependency, result_extra=(
+                        f'[{section}]\nnovarocks-types = {{ path = "../types" }}\n'))
+                self.assert_rejected(result, "requires exactly one normal dependency on novarocks-failure-contract")
+
+    def test_failure_fact_leaf_cannot_acquire_even_a_pure_dependency(self):
+        root_dependency = 'novarocks-failure-contract = { path = "../failure" }\n'
+        for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+            with self.subTest(section=section):
+                dependency = 'novarocks-types = { path = "../types" }\n'
+                kwargs = {"failure_dependency": dependency} if section == "dependencies" else {
+                    "failure_extra": f'[{section}]\n' + dependency}
+                self.assert_rejected(self.fixture(root_dependency, **kwargs),
+                                     "novarocks-failure-contract must remain dependency-free")
+
+    def test_failure_fact_cannot_transitively_import_runtime(self):
+        self.assert_rejected(self.fixture(
+            'novarocks-result-contract = { path = "../result" }\n',
+            failure_dependency='tokio = { path = "../runtime" }\n'),
+            "runtime/wire/provider/storage capability: tokio")
+
+    def test_failure_and_result_cannot_hide_feature_target_or_macro_authority(self):
+        for owner in ("failure", "result"):
+            root_dependency = f'novarocks-{owner}-contract = {{ path = "../{owner}" }}\n'
+            variants = [
+                ("features", '[features]\nhidden = []\n', "unaudited Cargo feature variants"),
+                ("target", '[target.\'cfg(target_os = "none")\'.dependencies]\n'
+                 'novarocks-types = { path = "../types" }\n',
+                 "must remain dependency-free" if owner == "failure" else "requires exactly one normal dependency"),
+                ("macro", '[lib]\nproc-macro = true\n', "executes a proc-macro target"),
+            ]
+            for variant, extra, diagnostic in variants:
+                with self.subTest(owner=owner, variant=variant):
+                    self.assert_rejected(self.fixture(root_dependency, **{owner + "_extra": extra}), diagnostic)
+
+    def test_result_failure_edge_cannot_be_optional_or_target_specific(self):
+        root_dependency = 'novarocks-result-contract = { path = "../result" }\n'
+        variants = [
+            'novarocks-failure-contract = { path = "../failure", optional = true }\n',
+            '[target.\'cfg(target_os = "none")\'.dependencies]\n'
+            'novarocks-failure-contract = { path = "../failure" }\n',
+        ]
+        for dependency in variants:
+            with self.subTest(dependency=dependency):
+                self.assert_rejected(self.fixture(root_dependency, result_dependency=dependency),
+                                     "hides a normal edge behind a feature/target")
+
+    def test_failure_and_result_cannot_execute_build_scripts(self):
+        for owner in ("failure", "result"):
+            with self.subTest(owner=owner):
+                self.assert_rejected(self.fixture(
+                    f'novarocks-{owner}-contract = {{ path = "../{owner}" }}\n',
+                    owner_builds=(owner,)), "executes a custom build script")
+
+    def test_result_failure_edge_preserves_dependency_feature_policy(self):
+        self.assert_rejected(self.fixture(
+            'novarocks-result-contract = { path = "../result" }\n',
+            result_dependency='novarocks-failure-contract = { path = "../failure", default-features = false }\n'),
+            "novarocks-result-contract disables dependency default features")
+
+    def test_failure_fact_cannot_hide_optional_runtime(self):
+        self.assert_rejected(self.fixture(
+            'novarocks-failure-contract = { path = "../failure" }\n',
+            failure_dependency='runtime = { package = "tokio", path = "../runtime", optional = true }\n'),
+            "novarocks-failure-contract must remain dependency-free")
 
     def test_transitive_runtime_is_rejected(self):
         result = self.fixture('novarocks-types = { path = "../types" }\n',
@@ -167,7 +255,7 @@ class BoundaryTests(unittest.TestCase):
             self.assertEqual(guard.verify_package(self.external(name, version), set()), [])
 
     def test_same_named_pure_contract_replacement_is_rejected(self):
-        for name in ("novarocks-types", "novarocks-functions", guard.FAILURE_CONTRACT):
+        for name in ("novarocks-types", "novarocks-functions", "novarocks-failure-contract"):
             package = self.external(name)
             self.assertIn("not the workspace-owned pure package", " ".join(
                 guard.verify_package(package, set())))
@@ -293,7 +381,7 @@ class ActualMetadataTests(unittest.TestCase):
                 edge = self.failure_edge()
                 edge["kind"] = kind
                 self.package(data, "novarocks-result-contract")["dependencies"].append(edge)
-                self.assertIn("may depend only on neutral FailureContract through a normal edge",
+                self.assertIn("requires exactly one normal dependency on novarocks-failure-contract",
                               self.violations(data))
 
     def test_actual_failure_leaf_rejects_all_declared_edge_kinds(self):

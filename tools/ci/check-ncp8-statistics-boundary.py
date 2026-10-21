@@ -217,21 +217,30 @@ def verify_dependency_boundary(metadata, repo_root):
     iceberg_functions = package_by_name(metadata, ICEBERG_FUNCTIONS)
     functions = package_by_name(metadata, FUNCTIONS)
     result_contract = package_by_name(metadata, RESULT_CONTRACT)
-
-    # Result facts forward only the neutral domain failure vocabulary. The
-    # leaf stays dependency-free, including inactive and non-normal edges.
     failure_contract = package_by_name(metadata, FAILURE_CONTRACT)
+
+    # FailureProjection is neutral vocabulary shared by result error values.
+    # Permit only that exact normal workspace edge; all other dependency kinds
+    # and target/optional edges remain forbidden even outside resolved closure.
+    if (len(result_contract["dependencies"]) != 1
+            or result_contract["dependencies"][0]["name"] != FAILURE_CONTRACT):
+        fail(f"{RESULT_CONTRACT} must declare only {FAILURE_CONTRACT}")
+    require_exact_dependency(result_contract, FAILURE_CONTRACT, kind=None,
+                             features=set(), disable_default_features=False)
+    failure_dependency = result_contract["dependencies"][0]
+    failure_path = repo_root / "novarocks/failure-contract"
+    if (failure_dependency.get("target") is not None
+            or failure_dependency.get("source") is not None
+            or failure_dependency.get("path") != str(failure_path)
+            or failure_contract.get("source") is not None
+            or Path(failure_contract["manifest_path"]).resolve() != failure_path / "Cargo.toml"):
+        fail(f"{RESULT_CONTRACT} {FAILURE_CONTRACT} must be an unconditional workspace path dependency")
+    # The admitted failure vocabulary stays a dependency-free pure leaf,
+    # including build/dev/optional/target declarations omitted by normal closure.
     if failure_contract["dependencies"]:
         fail(f"{FAILURE_CONTRACT} must not declare dependencies")
     if normal_closure(metadata, FAILURE_CONTRACT) != {FAILURE_CONTRACT}:
         fail(f"{FAILURE_CONTRACT} normal closure must be dependency-free")
-    dependencies = result_contract["dependencies"]
-    if len(dependencies) != 1 or dependencies[0]["name"] != FAILURE_CONTRACT:
-        fail(f"{RESULT_CONTRACT} may declare only the required normal {FAILURE_CONTRACT}")
-    require_exact_dependency(result_contract, FAILURE_CONTRACT, kind=None,
-                             features=set(), disable_default_features=False)
-    if dependencies[0].get("target") is not None:
-        fail(f"{RESULT_CONTRACT} {FAILURE_CONTRACT} must not be target-specific")
     if normal_closure(metadata, RESULT_CONTRACT) != {RESULT_CONTRACT, FAILURE_CONTRACT}:
         fail(f"{RESULT_CONTRACT} normal closure must contain only {FAILURE_CONTRACT}")
 
@@ -270,8 +279,8 @@ def verify_dependency_boundary(metadata, repo_root):
         for name in normal_closure(metadata, ICEBERG_FUNCTIONS)
         if name.startswith("novarocks-")
     }
-    # Shared computation uses only these neutral function, constant, type and
-    # result contracts. The provider contribution adds only its own package.
+    # Shared computation uses only these neutral function, constant, type,
+    # result and failure contracts. The provider adds only its own package.
     # The forbidden set still fences execution, role and provider capabilities.
     expected_internal = FUNCTIONS_INTERNAL_CLOSURE | {ICEBERG_FUNCTIONS}
     if iceberg_internal != expected_internal:

@@ -315,8 +315,43 @@ cannot establish aggregate success. Development's deferred aggregate is unchange
 Internal prepare/error-manifest/final-prepare records supply the registered
 preparation, error manifest and build-info stage observations.
 
-The workflow runs `admission` for merge groups and dispatches, skips it on PRs,
-and runs a separate non-required PR precheck. Required-check/merge-queue settings
+The workflow runs `admission` for merge groups and dispatches and skips that job
+on PRs. On `pull_request`, the independent `pr-validation` check runs the same
+cargo-only entry, pinned tools, environment, summary publication and raw-material
+upload through shared YAML anchors. Default checkout tests the PR merge SHA;
+its evidence is `diagnostic`, even when every enabled scope passes. A separate
+`precheck` supplies fast repository feedback. Each PR check has its own
+PR-number concurrency group that cancels superseded runs without cancelling
+merge-group or main-dispatch admission.
+
+`pr-validation` is intentionally non-required: its real pending, running,
+success, failure or cancelled state appears in the PR Checks box. No job or
+step ignores a failure. Keep it out of required-check settings so its failure
+does not itself block merging. This early feedback costs an additional complete
+cargo-only run per PR update, alongside any later formal admission. See
+[ADR-0188](../../docs/adr/ADR-0188-optional-pr-validation-and-formal-admission.md).
+
+Shared admission/PR preparation restores two separate caches. Cargo download
+paths are limited to `~/.cargo/registry/index`, `registry/cache` and `git/db`;
+their key includes OS/architecture, lockfiles and pinned tool versions, with an
+OS/architecture prefix fallback to reuse existing packages after dependency
+changes. Tools are installed under `$RUNNER_TEMP/admission-tools`, including
+their Cargo installation metadata. That cache requires an exact match for
+OS/architecture, runner image label, Rust toolchain configuration and both tool
+versions; restored tool versions are checked before use. The separate tool
+directory is added to PATH without caching rustup shims or credentials.
+
+The workflow explicitly saves successfully prepared tools immediately after
+version verification, then fetches locked workspace dependencies for the actual
+Rust host and saves their download cache before running admission. Later test
+failures do not prevent these saves. Exact cache hits are not saved again;
+misses use normal installation/fetching. GitHub cache scope and eviction still
+apply: PRs can restore base-branch caches, but their own saved caches are scoped
+to that PR merge ref. There is no project `target/` or verification-result cache;
+native validation runs on every invocation. Cache hit rates and speedups require
+observation across actual runs.
+
+Required-check/merge-queue settings
 need explicit rollout authorization after a successful formal main baseline.
 Real successful, rejected and repaired/re-enqueued PRs are required activation
 evidence; local validation alone does not mean the gate is active.

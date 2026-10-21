@@ -323,7 +323,8 @@ def verify_result_contract(metadata):
     if direct != {FAILURE_CONTRACT}:
         fail(
             f"{RESULT_CONTRACT} normal dependencies must be exactly: {FAILURE_CONTRACT}"
-            + " (actual: " + ", ".join(sorted(direct)) + ")"
+            + " (missing: " + ", ".join(sorted({FAILURE_CONTRACT} - direct))
+            + "; unexpected: " + ", ".join(sorted(direct - {FAILURE_CONTRACT})) + ")"
         )
     if FAILURE_CONTRACT not in normal_dependency_names(result, include_optional=False):
         fail(
@@ -333,7 +334,8 @@ def verify_result_contract(metadata):
     if reachable != {FAILURE_CONTRACT}:
         fail(
             f"{RESULT_CONTRACT} normal dependency closure must be exactly: {FAILURE_CONTRACT}"
-            + " (actual: " + ", ".join(sorted(reachable)) + ")"
+            + " (missing: " + ", ".join(sorted({FAILURE_CONTRACT} - reachable))
+            + "; unexpected: " + ", ".join(sorted(reachable - {FAILURE_CONTRACT})) + ")"
         )
 
 
