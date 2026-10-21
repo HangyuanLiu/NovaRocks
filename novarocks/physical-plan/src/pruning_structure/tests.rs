@@ -22,8 +22,8 @@ use novarocks_connector_contract::{
     CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
     ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorProviderId, ConnectorReadBinding, ConnectorReadRelationKind,
-    ConnectorReadRelationPayload, ConnectorReadRelationRecipeDraft, ConnectorReadWorkSource,
-    ConnectorValue, ConnectorValueType, Domain, FrozenConnectorScan, StaticScanAssignment,
+    ConnectorReadRelationPayload, ConnectorReadRelationRecipeDraft, ConnectorValue,
+    ConnectorValueType, Domain, FrozenConnectorScan, StaticScanAssignment,
 };
 use novarocks_type_contract::{
     ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
@@ -119,7 +119,7 @@ fn append_scan(builder: &mut FragmentBuilder, residual: bool) -> (NodeId, ValueI
                 encoded(&binding, ConnectorCodecCategory::ReadView, 2),
             ),
         },
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
+
         selection_digest: [8; 32],
         schema: Box::from([RelationField {
             column: column.clone(),
@@ -395,7 +395,6 @@ fn package(builder: FragmentBuilder, root: NodeId, scan: NodeId) -> FragmentPack
         vec![],
         NonZeroU64::new(budget().max_batch_rows).unwrap(),
         NonZeroU64::new(budget().max_batch_bytes).unwrap(),
-        relation.work_source(),
     )
     .unwrap();
     let read = public_read(&fragment, scan, frozen).unwrap();

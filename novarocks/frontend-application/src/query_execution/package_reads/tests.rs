@@ -622,10 +622,7 @@ fn a_paimon_scan_freezes_a_compiled_package_the_provider_and_local_compilers_acc
                 Some("0")
             );
             assert!(field.is_nullable());
-            assert_eq!(
-                read.scan().work_source(),
-                novarocks_connector_contract::ConnectorReadWorkSource::RuntimeSplits
-            );
+
             assert!(read.public_facts().metadata_kind().is_none());
         } else {
             assert!(decoded.scans().is_empty(), "fragment {id} reads nothing");

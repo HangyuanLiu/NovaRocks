@@ -21,11 +21,11 @@ use novarocks_spi::connector::{
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMutationOperationId,
     ConnectorProviderId, ConnectorRefAction, ConnectorRefreshPublicationGuard,
     ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle,
-    ConnectorTableObjectId, ExternalMutationEvidence, LakePublicationId,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_COLUMNS,
-    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
-    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES, ProviderBindingEpoch, StatisticsDataVersion,
-    StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricRequest,
+    ExternalMutationEvidence, LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_STATISTICS_COLUMNS, MAX_CONNECTOR_STATISTICS_METRICS,
+    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    ProviderBindingEpoch, StatisticsDataVersion, StatisticsEvidenceRevision, StatisticsMetric,
+    StatisticsMetricRequest,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};

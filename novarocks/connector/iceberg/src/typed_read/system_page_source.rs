@@ -17,8 +17,8 @@
 
 //! The worker-side reader for Iceberg system relations.
 //!
-//! Five relations -- `$entries`, `$snapshots`, `$history`, `$refs` and
-//! `$manifests` -- run on exactly one selected backend with no split at all.
+//! Files and entries read one manifest per work unit. Snapshots, history,
+//! refs and manifests each read one indivisible relation work unit.
 //! The reader opens the frozen metadata file, proves it is the file planning
 //! froze through [`IcebergSystemTableReference::verify_loaded_metadata`], and
 //! produces pages straight from it. It never re-resolves the table through the
@@ -62,7 +62,7 @@ use bytes::Bytes;
 use novarocks_connector_contract::PureProviderCompileError;
 use novarocks_fs::{FileReadContext, FileReadRange};
 use novarocks_spi::connector::read_stack::{
-    ConnectorPollBudget, ConnectorSession, OwnedConnectorPageStream, PageSourceMetrics, SourcePage,
+    ConnectorPollBudget, OwnedConnectorPageStream, PageSourceMetrics, SourcePage,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 use novarocks_type_contract::{
@@ -80,8 +80,8 @@ use crate::iceberg::spec::{
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, type_to_json, unsupported};
 use super::page_source::{MaterializedPageStream, MaterializedPages, SplitOperations};
 use super::system_table::{
-    FilesTableSplit, IcebergSystemTableExecution, IcebergSystemTableReference,
-    IcebergSystemTableType, TrinoManifestFile,
+    IcebergSystemTableReference, IcebergSystemTableType, SystemManifestSplit, SystemRelationSplit,
+    TrinoManifestFile,
 };
 
 /// The Arrow rendering of `TIMESTAMP WITH TIME ZONE`.
@@ -599,8 +599,15 @@ pub fn system_relation_schema_with_metadata(
 pub fn files_relation_schema_json_with_metadata(
     metadata: &TableMetadata,
 ) -> Result<String, ConnectorError> {
+    system_relation_schema_json_with_metadata(IcebergSystemTableType::Files, metadata)
+}
+
+pub fn system_relation_schema_json_with_metadata(
+    kind: IcebergSystemTableType,
+    metadata: &TableMetadata,
+) -> Result<String, ConnectorError> {
     type_to_json(&metadata_relation_row(
-        &system_relation_schema_with_metadata(IcebergSystemTableType::Files, metadata)?,
+        &system_relation_schema_with_metadata(kind, metadata)?,
     )?)
 }
 
@@ -2852,16 +2859,36 @@ impl IcebergSystemTableProvider {
         }
     }
 
+    /// Dispatch one metadata work unit after matching its exact frozen scan reference.
+    pub fn create_page_stream(
+        &self,
+        reference: &IcebergSystemTableReference,
+        split: &super::IcebergReadSplit,
+        columns: &[IcebergColumnHandle],
+        budget: &ConnectorPollBudget,
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        match split {
+            super::IcebergReadSplit::SystemManifest(split) if split.reference() == reference => {
+                self.create_manifest_page_stream(split, columns, budget)
+            }
+            super::IcebergReadSplit::SystemRelation(split) if split.reference() == reference => {
+                self.create_relation_page_stream(split, columns, budget)
+            }
+            _ => Err(invalid(
+                "iceberg system work unit differs from its frozen scan reference or relation kind",
+            )),
+        }
+    }
+
     /// The `$files` page stream for one manifest of the pinned snapshot,
     /// polled with `budget`. Creating it reads nothing; its first poll reads
     /// the manifest through the stream's own operations.
     ///
-    /// `$files` is the one distributed system relation, so it arrives as a
-    /// split rather than through the direct whole-relation provider path,
-    /// whose contract has no split at all.
-    pub fn create_files_page_stream(
+    /// Files and entries share this manifest-unit read. Their frozen relation
+    /// kind chooses whether deleted entries are retained and how rows render.
+    fn create_manifest_page_stream(
         &self,
-        split: &FilesTableSplit,
+        split: &SystemManifestSplit,
         columns: &[IcebergColumnHandle],
         budget: &ConnectorPollBudget,
     ) -> Result<OwnedConnectorPageStream, ConnectorError> {
@@ -2899,12 +2926,13 @@ impl IcebergSystemTableProvider {
     /// frozen metadata file, as a page stream polled with `budget`. Creating
     /// it reads nothing; its first poll reads the relation through the
     /// stream's own operations.
-    fn create_single_backend_page_stream(
+    fn create_relation_page_stream(
         &self,
-        reference: &IcebergSystemTableReference,
+        split: &SystemRelationSplit,
         columns: &[IcebergColumnHandle],
         budget: &ConnectorPollBudget,
     ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        let reference = split.reference();
         let StreamRead {
             binding,
             context,
@@ -2954,6 +2982,7 @@ struct StreamRead {
 
 /// One `$files` split's frozen shape; deciding it reads nothing.
 struct FilesSplitRelation {
+    kind: IcebergSystemTableType,
     table_has_variant_history: bool,
     manifest: TrinoManifestFile,
     spec: PartitionSpec,
@@ -2964,7 +2993,7 @@ struct FilesSplitRelation {
 
 impl FilesSplitRelation {
     fn of(
-        split: &FilesTableSplit,
+        split: &SystemManifestSplit,
         columns: &[IcebergColumnHandle],
     ) -> Result<Self, ConnectorError> {
         let table_schema: Schema = serde_json::from_str(split.table_schema_json())
@@ -3032,7 +3061,17 @@ impl FilesSplitRelation {
                 "frozen files partition declaration differs from its spec fields",
             ));
         }
-        let schema = Arc::new(ArrowSchema::new(files_fields(partition.as_ref(), None)));
+        let kind = split.reference().system_table_type();
+        let fields = match kind {
+            IcebergSystemTableType::Files => files_fields(partition.as_ref(), None),
+            IcebergSystemTableType::Entries => entries_fields(partition.as_ref()),
+            _ => {
+                return Err(invalid(
+                    "iceberg manifest work unit requires files or entries",
+                ));
+            }
+        };
+        let schema = Arc::new(ArrowSchema::new(fields));
         let declared = super::column_handle::parse_type(
             split.metadata_table_schema_json(),
             "metadata_table_schema_json",
@@ -3044,6 +3083,7 @@ impl FilesSplitRelation {
         }
         let projection = project_system_relation_columns(&schema, columns)?;
         Ok(Self {
+            kind,
             table_has_variant_history: split.table_has_variant_history(),
             manifest: split.manifest().clone(),
             spec,
@@ -3063,9 +3103,29 @@ impl FilesSplitRelation {
             &self.manifest,
             manifest,
             &self.spec,
-            EntryStatusRule::SkipDeleted,
+            match self.kind {
+                IcebergSystemTableType::Files => EntryStatusRule::SkipDeleted,
+                IcebergSystemTableType::Entries => EntryStatusRule::KeepDeleted,
+                _ => {
+                    return Err(invalid(
+                        "iceberg manifest work unit requires files or entries",
+                    ));
+                }
+            },
         )?;
-        let relation_columns = files_columns(&self.schema, &rows, &self.table_schema)?;
+        let relation_columns = match self.kind {
+            IcebergSystemTableType::Files => {
+                files_columns(&self.schema, &rows, &self.table_schema)?
+            }
+            IcebergSystemTableType::Entries => {
+                entries_columns(&self.schema, &rows, &self.table_schema)?
+            }
+            _ => {
+                return Err(invalid(
+                    "iceberg manifest work unit requires files or entries",
+                ));
+            }
+        };
         IcebergSystemPageSource::new(
             &self.schema,
             relation_columns,
@@ -3106,7 +3166,6 @@ enum MetadataRelation {
 
 #[derive(Clone, Copy, Debug)]
 enum FileRowsRelation {
-    Entries,
     Partitions,
 }
 
@@ -3126,13 +3185,10 @@ impl SingleBackendRelation {
         let schema = system_relation_schema_with_metadata(reference.system_table_type(), metadata)?;
         let projection = project_system_relation_columns(&schema, columns)?;
         let kind = match reference.system_table_type() {
-            IcebergSystemTableType::Files => {
+            IcebergSystemTableType::Files | IcebergSystemTableType::Entries => {
                 return Err(invalid(
                     "iceberg $files is a distributed relation and arrives as a split",
                 ));
-            }
-            IcebergSystemTableType::Entries => {
-                SingleBackendKind::FileRows(FileRowsRelation::Entries)
             }
             IcebergSystemTableType::Partitions => {
                 SingleBackendKind::FileRows(FileRowsRelation::Partitions)
@@ -3194,13 +3250,6 @@ impl SingleBackendRelation {
         })
     }
 
-    fn render_entries(&self, rows: &[FileRow]) -> Result<RenderedRelation, ConnectorError> {
-        Ok(RenderedRelation {
-            columns: entries_columns(&self.schema, rows, &self.table_schema)?,
-            row_count: rows.len(),
-        })
-    }
-
     fn into_page_source(
         self,
         rendered: RenderedRelation,
@@ -3235,17 +3284,6 @@ async fn read_single_backend(
         SingleBackendKind::Manifests => {
             let manifests = read_snapshot_manifests(reader, reference, &metadata, budget).await?;
             relation.render_manifests(&metadata, &manifests)?
-        }
-        SingleBackendKind::FileRows(FileRowsRelation::Entries) => {
-            let rows = read_snapshot_file_rows(
-                reader,
-                &metadata,
-                reference,
-                EntryStatusRule::KeepDeleted,
-                budget,
-            )
-            .await?;
-            relation.render_entries(&rows)?
         }
         SingleBackendKind::FileRows(FileRowsRelation::Partitions) => {
             let aggregates = read_snapshot_partitions(reader, reference, &metadata, budget).await?;
@@ -3398,55 +3436,6 @@ fn manifest_spec(
         .clone())
 }
 
-impl<P> novarocks_spi::connector::read_stack::adapter::ProviderReadSystemTableProvider<P>
-    for IcebergSystemTableProvider
-where
-    P: novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime<
-            Table = crate::typed_read::IcebergRuntimeRelation,
-            Column = IcebergColumnHandle,
-            Transaction = crate::typed_read::HiveTransactionHandle,
-            Split = crate::typed_read::IcebergReadSplit,
-        >,
-{
-    fn create_system_page_stream(
-        &self,
-        _session: &ConnectorSession,
-        table: &crate::typed_read::IcebergRuntimeRelation,
-        columns: &[novarocks_spi::connector::read_stack::Assignment<IcebergColumnHandle>],
-        budget: &ConnectorPollBudget,
-    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
-        let reference = direct_system_reference(table)?;
-        self.create_single_backend_page_stream(reference, &assigned_columns(columns), budget)
-    }
-}
-
-/// The single-backend reference a direct system read names.
-fn direct_system_reference(
-    table: &crate::typed_read::IcebergRuntimeRelation,
-) -> Result<&IcebergSystemTableReference, ConnectorError> {
-    let crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) = table else {
-        return Err(invalid(
-            "an iceberg system page source reads a system relation, not another relation",
-        ));
-    };
-    match reference.system_table_type().execution() {
-        IcebergSystemTableExecution::SingleBackendDirectPageSource => Ok(reference),
-        IcebergSystemTableExecution::DistributedSplits => Err(invalid(format!(
-            "iceberg {} is scheduled through a split source, not the direct system page source",
-            reference.system_table_type().suffix()
-        ))),
-    }
-}
-
-fn assigned_columns(
-    columns: &[novarocks_spi::connector::read_stack::Assignment<IcebergColumnHandle>],
-) -> Vec<IcebergColumnHandle> {
-    columns
-        .iter()
-        .map(|assignment| assignment.column().clone())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -3467,7 +3456,7 @@ mod tests {
         Summary, TableMetadataBuilder, Transform,
     };
     use crate::typed_read::system_table::{
-        FilesTableSplitParams, IcebergSystemTableReferenceParams, TrinoManifestFileParams,
+        IcebergSystemTableReferenceParams, SystemManifestSplitParams, TrinoManifestFileParams,
     };
     use crate::typed_read::test_spawners::{GatedTaskSpawner, route_reads_through};
     use crate::typed_read::test_streams::DrivenStream;
@@ -4199,7 +4188,7 @@ mod tests {
         Ok(pages)
     }
 
-    /// A single-backend relation read to its end through its page stream.
+    /// Read singleton work units, or each independent entries manifest unit.
     fn single_backend_pages(
         runtime: &tokio::runtime::Runtime,
         provider: &IcebergSystemTableProvider,
@@ -4207,19 +4196,115 @@ mod tests {
         columns: &[IcebergColumnHandle],
     ) -> Result<Vec<Vec<ArrayRef>>, ConnectorError> {
         let budget = ConnectorPollBudget::new();
-        let stream = provider.create_single_backend_page_stream(reference, columns, &budget)?;
+        if reference.system_table_type() == IcebergSystemTableType::Entries {
+            let mut pages = Vec::new();
+            for split in manifest_splits(runtime, provider, reference)? {
+                let stream = provider.create_page_stream(
+                    reference,
+                    &super::super::IcebergReadSplit::SystemManifest(split),
+                    columns,
+                    &budget,
+                )?;
+                pages.extend(drain_driven(DrivenStream::new(
+                    runtime,
+                    stream,
+                    budget.clone(),
+                ))?);
+            }
+            // Preserve the pre-existing relation-wide value assertions after
+            // independently reading every manifest through the unit channel.
+            if pages.len() > 1 {
+                let columns = (0..pages[0].len())
+                    .map(|ordinal| {
+                        let arrays = pages
+                            .iter()
+                            .map(|page| page[ordinal].as_ref())
+                            .collect::<Vec<_>>();
+                        arrow::compute::concat(&arrays).map_err(|error| invalid(error.to_string()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(vec![columns]);
+            }
+            return Ok(pages);
+        }
+        let split = super::super::IcebergReadSplit::SystemRelation(SystemRelationSplit::try_new(
+            reference.clone(),
+        )?);
+        let stream = provider.create_page_stream(reference, &split, columns, &budget)?;
         drain_driven(DrivenStream::new(runtime, stream, budget))
+    }
+
+    fn manifest_splits(
+        runtime: &tokio::runtime::Runtime,
+        provider: &IcebergSystemTableProvider,
+        reference: &IcebergSystemTableReference,
+    ) -> Result<Vec<SystemManifestSplit>, ConnectorError> {
+        if reference.snapshot_id().is_none() {
+            return Ok(Vec::new());
+        }
+        let mut reader = FrozenMetadataReader::new(&provider.binding, &provider.context);
+        let metadata = runtime.block_on(reader.load_metadata(reference))?;
+        let manifests = runtime
+            .block_on(read_snapshot_manifests(
+                &mut reader,
+                reference,
+                &metadata,
+                &unbounded_budget(),
+            ))?
+            .files;
+        let schema = metadata.current_schema();
+        let specs = metadata
+            .partition_specs_iter()
+            .map(|spec| {
+                Ok((
+                    spec.spec_id(),
+                    serde_json::to_string(spec.as_ref())
+                        .map_err(|error| invalid(error.to_string()))?,
+                ))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, ConnectorError>>()?;
+        let partition = partition_row_type_with_metadata(&metadata)?
+            .as_ref()
+            .map(derived_row_type_json)
+            .transpose()?;
+        manifests
+            .into_iter()
+            .map(|manifest| {
+                SystemManifestSplit::try_new(SystemManifestSplitParams {
+                    reference: reference.clone(),
+                    table_has_variant_history: crate::manifest::table_has_variant_history(
+                        &metadata,
+                    ),
+                    manifest,
+                    table_schema_json: serde_json::to_string(schema.as_ref())
+                        .map_err(|error| invalid(error.to_string()))?,
+                    metadata_table_schema_json: system_relation_schema_json_with_metadata(
+                        reference.system_table_type(),
+                        &metadata,
+                    )?,
+                    partition_spec_jsons: specs.clone(),
+                    partition_column_type_json: partition.clone(),
+                    bounds_column_type_json: None,
+                    encryption_key_id: None,
+                })
+            })
+            .collect()
     }
 
     /// A `$files` split read to its end through its page stream.
     fn files_pages(
         runtime: &tokio::runtime::Runtime,
         provider: &IcebergSystemTableProvider,
-        split: &FilesTableSplit,
+        split: &SystemManifestSplit,
         columns: &[IcebergColumnHandle],
     ) -> Result<Vec<Vec<ArrayRef>>, ConnectorError> {
         let budget = ConnectorPollBudget::new();
-        let stream = provider.create_files_page_stream(split, columns, &budget)?;
+        let stream = provider.create_page_stream(
+            split.reference(),
+            &super::super::IcebergReadSplit::SystemManifest(split.clone()),
+            columns,
+            &budget,
+        )?;
         drain_driven(DrivenStream::new(runtime, stream, budget))
     }
 
@@ -4427,6 +4512,83 @@ mod tests {
     }
 
     #[test]
+    fn entries_reads_each_manifest_once_and_keeps_deleted_rows() {
+        let (runtime, binding, context) = runtime_and_binding();
+        let dir = tempfile::tempdir().unwrap();
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
+        let provider = provider(&binding, &context);
+        let reference = reference(
+            &warehouse,
+            IcebergSystemTableType::Entries,
+            Some(SNAPSHOT_ID),
+        );
+        let splits = manifest_splits(&runtime, &provider, &reference).unwrap();
+        assert_eq!(splits.len(), 2);
+        let schema = system_relation_schema_with_metadata(
+            IcebergSystemTableType::Entries,
+            &warehouse.metadata,
+        )
+        .unwrap();
+        let columns = all_columns(&schema);
+        let mut statuses = Vec::new();
+        let mut paths = Vec::new();
+        for split in splits {
+            assert_eq!(split.reference(), &reference);
+            let pages = files_pages(&runtime, &provider, &split, &columns).unwrap();
+            for page in pages {
+                statuses.extend(int_column(&page, 0));
+                let values = page[5].as_any().downcast_ref::<StringArray>().unwrap();
+                paths.extend((0..values.len()).map(|i| values.value(i).to_owned()));
+            }
+        }
+        assert_eq!(statuses, vec![Some(1), Some(1), Some(2)]);
+        assert_eq!(
+            paths,
+            vec!["data/a.parquet", "data/b.parquet", "data/c.parquet"]
+        );
+    }
+
+    #[test]
+    fn system_work_units_refuse_foreign_scan_references_before_reading() {
+        let (runtime, binding, context) = runtime_and_binding();
+        let dir = tempfile::tempdir().unwrap();
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
+        let provider = provider(&binding, &context);
+        let original = reference(
+            &warehouse,
+            IcebergSystemTableType::Snapshots,
+            Some(SNAPSHOT_ID),
+        );
+        let foreign = reference(
+            &warehouse,
+            IcebergSystemTableType::History,
+            Some(SNAPSHOT_ID),
+        );
+        let split = super::super::IcebergReadSplit::SystemRelation(
+            SystemRelationSplit::try_new(original.clone()).unwrap(),
+        );
+        let error = provider
+            .create_page_stream(&foreign, &split, &[], &ConnectorPollBudget::new())
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        let manifest_reference = reference(
+            &warehouse,
+            IcebergSystemTableType::Entries,
+            Some(SNAPSHOT_ID),
+        );
+        let manifest = manifest_splits(&runtime, &provider, &manifest_reference)
+            .unwrap()
+            .remove(0);
+        let split = super::super::IcebergReadSplit::SystemManifest(manifest);
+        let error = provider
+            .create_page_stream(&original, &split, &[], &ConnectorPollBudget::new())
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
     fn files_skips_deleted_entries_while_entries_keeps_them() {
         let (runtime, binding, context) = runtime_and_binding();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4532,7 +4694,8 @@ mod tests {
             .partition_specs_iter()
             .map(|spec| spec.as_ref().clone())
             .collect();
-        let split = FilesTableSplit::try_new(FilesTableSplitParams {
+        let split = SystemManifestSplit::try_new(SystemManifestSplitParams {
+            reference: files_reference.clone(),
             table_has_variant_history: false,
             manifest: manifests[0].clone(),
             table_schema_json: serde_json::to_string(&schema).expect("schema json"),
@@ -4894,7 +5057,7 @@ mod tests {
         binding: &IcebergReadBinding,
         context: &FileReadContext,
         warehouse: &Warehouse,
-    ) -> (FilesTableSplit, Vec<IcebergColumnHandle>) {
+    ) -> (SystemManifestSplit, Vec<IcebergColumnHandle>) {
         let mut reader = FrozenMetadataReader::new(binding, context);
         let files_reference =
             reference(warehouse, IcebergSystemTableType::Files, Some(SNAPSHOT_ID));
@@ -4916,7 +5079,8 @@ mod tests {
             .partition_specs_iter()
             .map(|spec| spec.as_ref().clone())
             .collect();
-        let split = FilesTableSplit::try_new(FilesTableSplitParams {
+        let split = SystemManifestSplit::try_new(SystemManifestSplitParams {
+            reference: files_reference.clone(),
             table_has_variant_history: false,
             manifest: manifests[0].clone(),
             table_schema_json: serde_json::to_string(&schema).expect("schema json"),
@@ -5509,7 +5673,8 @@ mod tests {
                 .unwrap(),
             ),
         ] {
-            let changed = FilesTableSplit::try_new(FilesTableSplitParams {
+            let changed = SystemManifestSplit::try_new(SystemManifestSplitParams {
+                reference: split.reference().clone(),
                 table_has_variant_history: split.table_has_variant_history(),
                 manifest: split.manifest().clone(),
                 table_schema_json: split.table_schema_json().to_owned(),
@@ -5549,8 +5714,12 @@ mod tests {
         }
     }
 
-    fn split_with_variant_history(split: &FilesTableSplit, history: bool) -> FilesTableSplit {
-        FilesTableSplit::try_new(FilesTableSplitParams {
+    fn split_with_variant_history(
+        split: &SystemManifestSplit,
+        history: bool,
+    ) -> SystemManifestSplit {
+        SystemManifestSplit::try_new(SystemManifestSplitParams {
+            reference: split.reference().clone(),
             table_has_variant_history: history,
             manifest: split.manifest().clone(),
             table_schema_json: split.table_schema_json().to_owned(),
@@ -5567,7 +5736,7 @@ mod tests {
         runtime: &tokio::runtime::Runtime,
         binding: &IcebergReadBinding,
         context: &FileReadContext,
-        split: &FilesTableSplit,
+        split: &SystemManifestSplit,
         columns: &[IcebergColumnHandle],
         original: &ConnectorError,
     ) {
@@ -5577,7 +5746,7 @@ mod tests {
             let split = split_with_variant_history(split, history);
             let budget = ConnectorPollBudget::new();
             let stream = provider(binding, context)
-                .create_files_page_stream(&split, columns, &budget)
+                .create_manifest_page_stream(&split, columns, &budget)
                 .expect("manifest page stream");
             let mut stream = DrivenStream::new(runtime, stream, budget);
             let actual = match stream.next_page() {
@@ -5715,7 +5884,6 @@ mod tests {
             .map(|spec| spec.as_ref().clone())
             .collect::<Vec<_>>();
         for relation in [
-            IcebergSystemTableType::Entries,
             IcebergSystemTableType::Partitions,
             IcebergSystemTableType::Snapshots,
             IcebergSystemTableType::History,
@@ -5732,7 +5900,14 @@ mod tests {
             let budget = ConnectorPollBudget::new();
             budget.refill(1);
             let mut stream = provider
-                .create_single_backend_page_stream(&reference, &columns, &budget)
+                .create_page_stream(
+                    &reference,
+                    &super::super::IcebergReadSplit::SystemRelation(
+                        SystemRelationSplit::try_new(reference.clone()).unwrap(),
+                    ),
+                    &columns,
+                    &budget,
+                )
                 .expect("page stream");
             let streamed = drain_stream(&runtime, &mut stream);
             runtime
@@ -5744,7 +5919,6 @@ mod tests {
             // validates the three original entries under the host poll budget;
             // page delivery spends its own independent units.
             let walked = match relation {
-                IcebergSystemTableType::Entries => 2,
                 IcebergSystemTableType::Partitions => 2 + 3,
                 _ => 0,
             };
@@ -5767,7 +5941,7 @@ mod tests {
             route_reads_through(&mut context, spawner.clone(), runtime.handle().clone());
         let budget = ConnectorPollBudget::new();
         let mut stream = provider(&binding, &context)
-            .create_files_page_stream(&split, &columns, &budget)
+            .create_manifest_page_stream(&split, &columns, &budget)
             .expect("page stream");
         assert_eq!(spawner.started(), 0, "creating the stream reads nothing");
         spawner.release(64);

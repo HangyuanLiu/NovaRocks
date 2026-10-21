@@ -1088,6 +1088,232 @@ mod tests {
         }
     }
 
+    #[test]
+    fn one_provider_unit_is_delivered_once_and_all_three_tasks_receive_eos() {
+        use crate::query_execution::connector_domain::TaskUpdateRequest;
+        use crate::query_execution::split_assignment::{
+            AcceptedPlanNode, TaskUpdateOutcome, TaskUpdateTicket, TaskUpdateTransportError,
+        };
+        use novarocks_spi::connector as spi;
+        use spi::ConnectorReadWireEncoder;
+        use spi::read_stack::adapter::{ProviderReadRuntime, ReadRuntimeAdapter};
+        use spi::read_stack::{ColumnHandle, ConnectorSplit};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+        struct Column;
+        impl ColumnHandle for Column {}
+        #[derive(Debug)]
+        struct Unit;
+        impl ConnectorSplit for Unit {
+            fn retained_size_in_bytes(&self) -> u64 {
+                0
+            }
+        }
+        struct Provider {
+            descriptor: spi::ConnectorInstanceDescriptor,
+            catalog: spi::CatalogHandle,
+        }
+        impl ProviderReadRuntime for Provider {
+            type Table = ();
+            type Column = Column;
+            type Transaction = ();
+            type Split = Unit;
+            fn descriptor(&self) -> &spi::ConnectorInstanceDescriptor {
+                &self.descriptor
+            }
+            fn catalog_handle(&self) -> &spi::CatalogHandle {
+                &self.catalog
+            }
+            fn transaction(&self) -> Self::Transaction {}
+        }
+        struct UnitSource {
+            split: Option<ConnectorReadSplit>,
+            calls: Arc<AtomicUsize>,
+            closes: Arc<AtomicUsize>,
+        }
+        impl ConnectorReadSplitSource for UnitSource {
+            fn next_batch(
+                &mut self,
+                max_size: usize,
+                _: &ConnectorReadDynamicFilterSnapshot,
+            ) -> Result<ConnectorSplitBatch<ConnectorReadSplit>, ConnectorError> {
+                assert!(max_size > 0);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ConnectorSplitBatch::new(
+                    self.split.take().into_iter().collect(),
+                    true,
+                ))
+            }
+            fn is_finished(&self) -> bool {
+                self.split.is_none()
+            }
+            fn close(&mut self) -> Result<(), ConnectorError> {
+                self.closes.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        struct Encoder {
+            payload: spi::ConnectorEncodedPayload,
+        }
+        impl ConnectorReadWireEncoder for Encoder {
+            fn owner(&self) -> &str {
+                "single-unit-delivery-test"
+            }
+            fn encode_relation_payload(
+                &self,
+                value: &spi::read_stack::ConnectorReadRelation,
+            ) -> Result<spi::ConnectorReadRelationPayload, spi::ConnectorCodecError> {
+                CleanupTestEncoder.encode_relation_payload(value)
+            }
+            fn encode_column_payload(
+                &self,
+                value: &spi::read_stack::ConnectorReadColumnHandle,
+            ) -> Result<spi::ConnectorEncodedPayload, spi::ConnectorCodecError> {
+                CleanupTestEncoder.encode_column_payload(value)
+            }
+            fn encode_transaction_payload(
+                &self,
+                value: &spi::read_stack::ConnectorReadTransactionHandle,
+            ) -> Result<spi::ConnectorEncodedPayload, spi::ConnectorCodecError> {
+                CleanupTestEncoder.encode_transaction_payload(value)
+            }
+            fn encode_split_payload(
+                &self,
+                _: &ConnectorReadSplit,
+            ) -> Result<spi::ConnectorReadSplitPayload, spi::ConnectorCodecError> {
+                Ok(spi::ConnectorReadSplitPayload::new(
+                    spi::ConnectorReadSplitCategory::SystemRelation,
+                    self.payload.clone(),
+                ))
+            }
+        }
+        #[derive(Default)]
+        struct Transport {
+            requests: Mutex<Vec<(usize, usize, bool, u64, i32)>>,
+        }
+        impl TaskUpdateTransport for Transport {
+            fn begin(
+                &self,
+                _: QueryExecutionId,
+                target: &AssignmentTarget,
+                request: &TaskUpdateRequest,
+            ) -> Result<TaskUpdateTicket, TaskUpdateTransportError> {
+                assert_eq!(request.assignments().len(), 1);
+                let a = &request.assignments()[0];
+                let mut requests = self.requests.lock().unwrap();
+                requests.push((
+                    target.backend_idx,
+                    a.splits().len(),
+                    a.no_more_splits(),
+                    a.splits().last().map_or(0, |split| split.sequence_id()),
+                    a.plan_node_id(),
+                ));
+                Ok(TaskUpdateTicket((requests.len() - 1) as u64))
+            }
+            fn poll(
+                &self,
+                ticket: TaskUpdateTicket,
+                _: &RoundSplitAssignmentStop,
+            ) -> Option<Result<TaskUpdateOutcome, TaskUpdateTransportError>> {
+                let (_, _, eos, sequence, node) = self.requests.lock().unwrap()[ticket.0 as usize];
+                Some(Ok(TaskUpdateOutcome::Accepted(vec![AcceptedPlanNode {
+                    plan_node_id: node,
+                    accepted_through_sequence: sequence,
+                    no_more_splits: eos,
+                    queued_splits: 0,
+                }])))
+            }
+        }
+        let instance = spi::ConnectorInstanceId::parse("single.unit").unwrap();
+        let descriptor = spi::ConnectorInstanceDescriptor {
+            provider_id: spi::ConnectorProviderId::parse("single-unit-test").unwrap(),
+            instance_id: instance.clone(),
+        };
+        let catalog = spi::CatalogHandle::new(instance, spi::CatalogVersion::from_bytes([11; 32]));
+        let payload = spi::ConnectorEncodedPayload::new(
+            spi::ConnectorEnvelopeHeader::new(
+                descriptor.provider_id.clone(),
+                catalog.clone(),
+                spi::ConnectorCodecCategory::ReadSplit,
+                spi::ConnectorCodecRevision::try_new(1).unwrap(),
+            ),
+            vec![42u8].into(),
+        );
+        let adapter = ReadRuntimeAdapter::new(Arc::new(Provider {
+            descriptor,
+            catalog,
+        }));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let (closed_tx, _closed_rx) = mpsc::channel();
+        let mut source = cleanup_test_source(closed_tx);
+        let scan = source.scan;
+        source.source = SupervisedSplitSource::fixture(Box::new(UnitSource {
+            split: Some(adapter.wrap_split(Unit)),
+            calls: calls.clone(),
+            closes: closes.clone(),
+        }));
+        source.encoder = Arc::new(Encoder { payload });
+        let execution =
+            QueryExecutionId::new(QueryId::new(17, 19), AttemptId::new(1).unwrap()).unwrap();
+        let transport = Arc::new(Transport::default());
+        let targets = (0..3)
+            .map(|backend_idx| AssignmentTarget {
+                backend_idx,
+                fragment_instance_id: novarocks_types::UniqueId::new(17, 20 + backend_idx as i64),
+            })
+            .collect();
+        let mut round = RoundSplitAssignment::new(
+            execution,
+            transport.clone(),
+            BTreeMap::from([(scan, targets)]),
+            4,
+            vec![source],
+            TaskUpdateRetryPolicy::default(),
+            Duration::ZERO,
+        );
+        for _ in 0..4 {
+            match round.enumerate_once().unwrap() {
+                RoundSplitEnumeration::Ready(request) => {
+                    let result = RoundSplitAssignment::enumerate_source(request);
+                    if let Some((key, batch)) = round.adopt_enumeration(result).unwrap() {
+                        round.deliver(key, batch).unwrap();
+                        break;
+                    }
+                }
+                _ => panic!("fixed single unit must be ready"),
+            }
+        }
+        for _ in 0..32 {
+            if !round.delivery_in_progress() {
+                break;
+            }
+            round.drive_delivery().unwrap();
+        }
+        assert!(!round.delivery_in_progress());
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| r.0)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([0, 1, 2])
+        );
+        assert_eq!(requests.iter().map(|r| r.1).sum::<usize>(), 1);
+        assert_eq!(requests.iter().filter(|r| r.1 == 1).count(), 1);
+        assert!(requests.iter().all(|r| r.2));
+        drop(requests);
+        assert!(matches!(
+            round.enumerate_once().unwrap(),
+            RoundSplitEnumeration::Finished
+        ));
+        round.close_with_profile().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+
     struct ObservedSource {
         closes: Arc<std::sync::atomic::AtomicUsize>,
         drops: Arc<std::sync::atomic::AtomicUsize>,

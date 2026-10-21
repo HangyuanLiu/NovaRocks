@@ -65,7 +65,6 @@ struct Fixture {
     published_source: Option<novarocks_connector_contract::ConnectorSourceSchemaFacts>,
     published_bindings: Option<Vec<FunctionValueType>>,
     metadata: Option<ConnectorReadMetadataKind>,
-    work_source: ConnectorReadWorkSource,
 }
 
 fn source_for(relation: &IcebergRuntimeRelation) -> ConnectorReadStaticFacts<ScanColumnId> {
@@ -119,7 +118,6 @@ impl Fixture {
             relation,
             columns,
             metadata: None,
-            work_source: ConnectorReadWorkSource::RuntimeSplits,
         }
     }
     // This fixture authors separate source facts and complete values explicitly.
@@ -338,7 +336,6 @@ impl Fixture {
             vec![StaticScanDynamicFilter::new(901, Arc::from("output_0"))],
             NonZeroU64::new(1024).unwrap(),
             NonZeroU64::new(1024 * 1024).unwrap(),
-            self.work_source,
         )
         .unwrap();
         let public = ConnectorReadPublicFacts::try_new_typed(
@@ -461,11 +458,6 @@ fn system_fixture(kind: IcebergSystemTableType) -> Fixture {
         relation,
         columns,
         metadata: Some(ConnectorReadMetadataKind::try_new(kind.suffix()).unwrap()),
-        work_source: if kind.produces_splits() {
-            ConnectorReadWorkSource::RuntimeSplits
-        } else {
-            ConnectorReadWorkSource::WholeRelation
-        },
     }
 }
 fn window_fixture() -> Fixture {
@@ -509,7 +501,6 @@ fn window_fixture() -> Fixture {
         relation,
         columns,
         metadata: None,
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
     }
 }
 fn rewrite_fixture() -> Fixture {
@@ -551,7 +542,6 @@ fn rewrite_fixture() -> Fixture {
         relation,
         columns,
         metadata: None,
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
     }
 }
 
@@ -644,7 +634,6 @@ fn codec_legal_table_function_and_merge_remain_unsupported_as_complete_static_re
             published_source: None,
             published_bindings: None,
             metadata: None,
-            work_source: ConnectorReadWorkSource::RuntimeSplits,
         };
         assert!(!bytes.is_empty());
         use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
@@ -772,17 +761,10 @@ fn complete_source_version_selection_evidence_distribution_and_coverage_mutation
 }
 
 #[test]
-fn complete_metadata_kind_work_relation_kind_revision_and_private_bytes_refuse() {
+fn complete_metadata_kind_relation_kind_revision_and_private_bytes_refuse() {
     let fixture = system_fixture(IcebergSystemTableType::Snapshots);
     let mut wrong = fixture.clone();
     wrong.metadata = Some(ConnectorReadMetadataKind::try_new("$files").unwrap());
-    assert_provider(&wrong.build(), ConnectorCodecErrorKind::InconsistentFields);
-    wrong = fixture.clone();
-    wrong.work_source = ConnectorReadWorkSource::RuntimeSplits;
-    assert_provider(&wrong.build(), ConnectorCodecErrorKind::InconsistentFields);
-    let files = system_fixture(IcebergSystemTableType::Files);
-    wrong = files.clone();
-    wrong.work_source = ConnectorReadWorkSource::WholeRelation;
     assert_provider(&wrong.build(), ConnectorCodecErrorKind::InconsistentFields);
     let table = Fixture::table();
     assert_provider(
@@ -908,7 +890,6 @@ fn complete_narrow_integer_schema_uses_exact_field_domain_and_rejects_other_narr
         columns: vec![column],
         fields: vec![field],
         metadata: None,
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
     };
     assert_eq!(fixture.fields[0].data_type(), &DataType::Int8);
     assert_unchanged(&fixture.build());
@@ -963,7 +944,6 @@ fn complete_nested_path_and_source_field_identity_are_exact_not_name_guesses() {
         columns: vec![left],
         fields: vec![field],
         metadata: None,
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
     };
     assert_unchanged(&fixture.build());
     fixture.columns[0] = base.dereference(&[12]).unwrap();
@@ -1026,7 +1006,6 @@ fn wide_fixture() -> Fixture {
         fields: vec![column_field(&column)],
         columns: vec![column],
         metadata: None,
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
     }
 }
 
@@ -1390,7 +1369,6 @@ fn published_schema_carries_ids_defaults_and_nested_domains_and_passes_the_pure_
         relation,
         columns,
         metadata: None,
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
     };
     let frozen = published(&fixture).build();
     let recipe = iceberg_catalog()
@@ -1584,7 +1562,6 @@ fn frozen_provider_nominal_properties_and_native_nested_domains_survive_complete
         relation,
         columns,
         metadata: None,
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
     };
     let frozen = published(&fixture).build();
     assert_unchanged(&frozen);
@@ -1640,7 +1617,6 @@ fn complete_nominal_table_and_window_use_exact_declarations_and_refuse_old_revis
         columns: columns.clone(),
         fields: fields.clone(),
         metadata: None,
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
     };
     let fixture = published(&fixture);
     assert_unchanged(&fixture.build());
@@ -1718,7 +1694,6 @@ fn complete_nominal_table_and_window_use_exact_declarations_and_refuse_old_revis
         columns,
         fields,
         metadata: None,
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
     };
     assert_unchanged(&published(&window_fixture).build());
 }
@@ -1767,7 +1742,6 @@ fn recursive_nominal_table_window_and_projected_struct_field_keep_exact_frozen_d
         relation,
         columns: columns.clone(),
         metadata: None,
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
     };
     let fixture = published(&fixture);
     assert_unchanged(&fixture.build());

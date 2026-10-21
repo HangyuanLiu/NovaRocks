@@ -38,7 +38,6 @@ use novarocks_physical_plan::{
     ProviderReadOccurrenceId, WriteTargetOrdinal,
 };
 use novarocks_query_application::preparation::CompletedPlanWithAccess;
-use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 
 use crate::native::fragment_encoder::submission::freeze_completed_packages;
 use crate::query_execution::artifact::native_submission::{
@@ -519,7 +518,7 @@ fn completed_plan_scheduling_facts(
             scans.push(SchedulingScanFacts {
                 node_id: wire_node_id(node.id)?,
                 ranges: Vec::new(),
-                work_source: Some(encoding.work_source),
+                runtime_splits: Some(encoding.placement),
             });
         }
         fragments.insert(
@@ -1600,7 +1599,6 @@ mod tests {
                     fixture_payload(ConnectorCodecCategory::ReadView, 2),
                 ),
             },
-            work_source: novarocks_connector_contract::ConnectorReadWorkSource::RuntimeSplits,
             selection_digest: [8; 32],
             schema: Box::from([RelationField {
                 column: field.clone(),

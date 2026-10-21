@@ -628,7 +628,7 @@ fn actual_scan_relation_schema_and_ordered_runtime_filter_use_the_same_type_auth
         CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
         ConnectorEnvelopeHeader, ConnectorInstanceDescriptor, ConnectorInstanceId,
         ConnectorProviderId, ConnectorReadBinding, ConnectorReadRelationKind,
-        ConnectorReadRelationPayload, ConnectorReadWorkSource,
+        ConnectorReadRelationPayload,
     };
     use novarocks_type_contract::owned_resources::layout::{arc_layout, bytes_shared_upper};
     let provider = ConnectorProviderId::parse("iceberg").unwrap();
@@ -661,7 +661,7 @@ fn actual_scan_relation_schema_and_ordered_runtime_filter_use_the_same_type_auth
                 encoded(ConnectorCodecCategory::ReadView),
             ),
         },
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
+
         selection_digest: [1; 32],
         schema: Box::from([RelationField {
             column: ProviderColumnReference {

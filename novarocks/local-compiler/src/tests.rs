@@ -156,7 +156,7 @@ fn add_scan(
                         input_version: ExactInputVersion::try_new([9]).unwrap(),
                         relation: relation_payload.clone(),
                     },
-                    work_source: ConnectorReadWorkSource::RuntimeSplits,
+
                     selection_digest: [7; 32],
                     schema: (0..width)
                         .map(|_| RelationField {
@@ -200,7 +200,6 @@ fn add_scan(
         vec![],
         NonZeroU64::new(100).unwrap(),
         NonZeroU64::new(4096).unwrap(),
-        ConnectorReadWorkSource::RuntimeSplits,
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(
@@ -707,7 +706,6 @@ fn sparse_max_scan_retains_the_same_package_and_complete_public_scan_facts() {
         compiled.scan().enforced_predicate(),
         original.scan().enforced_predicate()
     );
-    assert_eq!(compiled.scan().work_source(), original.scan().work_source());
     assert_eq!(
         compiled
             .scan()

@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::ConnectorReadRelationKind;
 use crate::{
     CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
     ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorFunctionName,
@@ -103,7 +104,6 @@ fn input() -> ScanConstructionInput<ConnectorReadRelationRecipeDraft> {
         dynamic_filters: vec![],
         max_batch_rows: NonZeroU64::new(17).unwrap(),
         max_batch_bytes: NonZeroU64::new(101).unwrap(),
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
     }
 }
 fn variable() -> ConnectorExpression {
@@ -131,7 +131,6 @@ fn plain(
         i.dynamic_filters,
         i.max_batch_rows,
         i.max_batch_bytes,
-        i.work_source,
     )
 }
 fn observed(
@@ -324,7 +323,6 @@ fn malformed(case: usize) -> ScanConstructionInput<ConnectorReadRelationRecipeDr
             ]
         }
         9 => i.dynamic_filters = vec![StaticScanDynamicFilter::new(0, Arc::from("foreign"))],
-        10 => i.work_source = ConnectorReadWorkSource::WholeRelation,
         _ => panic!(),
     }
     i
@@ -342,7 +340,6 @@ fn scan_ordinary_errors_remain_original_typed_categories_and_order() {
         StaticConnectorScanError::ExpressionTypeMismatch,
         StaticConnectorScanError::DuplicateDynamicFilter,
         StaticConnectorScanError::UnknownDynamicFilterVariable,
-        StaticConnectorScanError::WholeRelationRequiresSystemTable,
     ];
     for (case, expected) in expected.into_iter().enumerate() {
         assert_eq!(plain(malformed(case)).unwrap_err(), expected);

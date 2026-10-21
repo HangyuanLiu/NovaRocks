@@ -129,7 +129,6 @@ fn finish_scan_with_budget(
     relation: Relation,
     read_budget: ScanReadBudget,
 ) -> Result<Fragment, ValidationErrors> {
-    let whole_relation = relation.work_source() == ConnectorReadWorkSource::WholeRelation;
     let column = relation.schema()[0].column.clone();
     let mut builder = FragmentBuilder::new(FragmentId::new(302));
     let scan = builder.reserve_node_id().unwrap();
@@ -162,16 +161,7 @@ fn finish_scan_with_budget(
             },
         })
         .unwrap();
-    let dop = if whole_relation {
-        PipelineDopDomain {
-            min: 1,
-            max: 1,
-            requires_power_of_two: false,
-        }
-    } else {
-        dop()
-    };
-    builder.finish_definition(scan, FragmentSink::Noop, dop)
+    builder.finish_definition(scan, FragmentSink::Noop, dop())
 }
 
 fn contains_error(result: Result<Fragment, ValidationErrors>, expected: &str) -> bool {
@@ -519,43 +509,17 @@ fn bucket_hash_and_dense_ordinal_domain_are_validated() {
 }
 
 #[test]
-fn whole_relation_is_explicit_and_limited_to_system_tables() {
+fn system_metadata_accepts_unconstrained_distribution_and_plan_dop() {
     let binding = connector_binding();
     let column = ProviderColumnReference {
         column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 31),
     };
-    let mut system = metadata_relation(&binding, column.clone());
-    if let Relation::Metadata(system_metadata) = &mut system {
-        system_metadata.work_source = ConnectorReadWorkSource::WholeRelation;
+    let mut system = metadata_relation(&binding, column);
+    if let Relation::Metadata(metadata) = &mut system {
+        metadata.provided_properties.distribution = Distribution::Unconstrained;
     }
-    assert!(contains_error(
-        finish_scan_with_budget(system.clone(), scan_budget()),
-        "whole-relation work requires singleton distribution and exactly one driver"
-    ));
-    if let Relation::Metadata(system_metadata) = &mut system {
-        system_metadata.provided_properties = PhysicalProperties {
-            distribution: Distribution::Singleton,
-            row_multiplicity: RowMultiplicity::SingleCopy,
-            ordering: Box::default(),
-        };
-    }
-    assert_eq!(system.work_source(), ConnectorReadWorkSource::WholeRelation);
-    finish_scan_with_budget(system, scan_budget()).unwrap();
-
-    let mut table = metadata_relation(&binding, column);
-    let Relation::Metadata(table_metadata) = &mut table else {
-        unreachable!();
-    };
-    table_metadata.work_source = ConnectorReadWorkSource::WholeRelation;
-    table_metadata.read.relation = ConnectorReadRelationPayload::new(
-        ConnectorReadRelationKind::Table,
-        encoded(&binding, ConnectorCodecCategory::ReadTable, 32),
-        encoded(&binding, ConnectorCodecCategory::ReadView, 33),
-    );
-    assert!(contains_error(
-        finish_scan_with_budget(table, scan_budget()),
-        "whole-relation work is valid only for a system-table relation"
-    ));
+    let fragment = finish_scan_with_budget(system, scan_budget()).unwrap();
+    assert_eq!(fragment.dop_domain(), dop());
 }
 
 #[test]

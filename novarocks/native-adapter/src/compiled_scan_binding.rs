@@ -62,7 +62,7 @@ use novarocks_spi::connector::read_stack::runtime::ConnectorReadAssignment;
 use novarocks_spi::connector::read_stack::{
     Assignment, CompleteAllDynamicFilter, ConnectorDataCacheOptions,
     ConnectorPageSourceProviderOptions, ConnectorReadColumnHandle, ConnectorReadDynamicFilter,
-    ConnectorReadWorkSource, ConnectorSourceOperations,
+    ConnectorSourceOperations,
 };
 use novarocks_spi::connector::{
     ConnectorRangeScope, ConnectorRequestContext, ConnectorStopView,
@@ -172,7 +172,6 @@ enum ScanBindingContractFailure {
     WrongNode(usize),
     MissingRecipe,
     UnsupportedRelation(ConnectorReadRelationKind),
-    WholeRelation,
     NegativeNode {
         node: i32,
         source: std::num::TryFromIntError,
@@ -210,9 +209,6 @@ impl fmt::Display for ScanBindingContractFailure {
                 f,
                 "provider relation {kind:?} is not read by a compiled scan"
             ),
-            Self::WholeRelation => {
-                f.write_str("a whole-relation compiled scan is not executable yet")
-            }
             Self::NegativeNode { node, .. } => write!(f, "compiled scan node {node} is negative"),
             Self::LayoutArity { slots, assignments } => write!(
                 f,
@@ -257,7 +253,6 @@ impl novarocks_execution_contract::failure::FailureProjection for ScanBindingCon
             Self::WrongNode(_) => 9702,
             Self::MissingRecipe => 9703,
             Self::UnsupportedRelation(_) => 9704,
-            Self::WholeRelation => 9705,
             Self::NegativeNode { .. } => 9706,
             Self::LayoutArity { .. } => 9707,
             Self::WrongBinding => 9708,
@@ -267,7 +262,7 @@ impl novarocks_execution_contract::failure::FailureProjection for ScanBindingCon
             Self::Observation(_) => 9712,
         };
         let class = match self {
-            Self::UnsupportedRelation(_) | Self::WholeRelation => FailureClass::Dependency,
+            Self::UnsupportedRelation(_) => FailureClass::Dependency,
             Self::Observation(_) => FailureClass::Unexpected,
             _ => FailureClass::Invariant,
         };
@@ -356,15 +351,6 @@ pub(crate) fn bind_compiled_scan(
             return Err(CompiledScanBindingError::at_domain(
                 scan_node,
                 ScanBindingContractFailure::UnsupportedRelation(kind),
-            ));
-        }
-    }
-    match scan.work_source() {
-        ConnectorReadWorkSource::RuntimeSplits => {}
-        ConnectorReadWorkSource::WholeRelation => {
-            return Err(CompiledScanBindingError::at_domain(
-                scan_node,
-                ScanBindingContractFailure::WholeRelation,
             ));
         }
     }

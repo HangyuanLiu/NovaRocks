@@ -64,7 +64,7 @@ pub use predicate::{
     MAX_TUPLE_DOMAIN_COLUMNS, MAX_VALUE_SET_DISCRETE_VALUES, MAX_VALUE_SET_RANGES, Range,
     TupleDomain, ValueSet,
 };
-pub use read::{ConnectorReadBinding, ConnectorReadRelationKind, ConnectorReadWorkSource};
+pub use read::{ConnectorReadBinding, ConnectorReadRelationKind};
 pub use read_facts::{
     ConnectorReadArtifactCoverage, ConnectorReadBucketLayout, ConnectorReadDistribution,
     ConnectorReadInputVersion, ConnectorReadMetadataKind, ConnectorReadMetadataRequest,

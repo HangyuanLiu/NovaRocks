@@ -36,7 +36,7 @@ use novarocks_proto_codec::connector_read::{
 };
 use novarocks_spi::connector::read_stack::{
     ConnectorSplit, ConnectorSplitBatch, ConnectorSplitSource, DynamicFilterSnapshot, HostAddress,
-    SchemaTableName, SplitWeight, SystemTableDistribution,
+    SchemaTableName, SplitWeight, SystemTableUnitHint,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
@@ -47,7 +47,7 @@ use crate::iceberg::spec::{
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, unsupported};
 use super::table_handle::MAX_PARTITION_SPECS;
 
-/// Maximum number of manifests one `$files` relation may enumerate.
+/// Maximum number of manifests one `$files` or `$entries` relation may enumerate.
 ///
 /// A pinned snapshot's manifest list is already bounded by the writer, but the
 /// reference arrives over a wire: a bound here keeps a malformed plan from
@@ -76,21 +76,6 @@ pub enum IcebergSystemTableType {
     /// reads as the un-aggregated relation, one row per data file instead of
     /// one row per partition.
     Partitions,
-}
-
-/// How one system relation actually runs.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum IcebergSystemTableExecution {
-    /// Enumerated by [`FilesTableSplitSource`] and spread over every admitted
-    /// backend.
-    DistributedSplits,
-    /// Run once, on exactly one selected backend, as a direct page source.
-    ///
-    /// Trino calls this `SINGLE_COORDINATOR`; Native selects one backend
-    /// instead of running the relation on the coordinator. Either way there is
-    /// no split: a synthetic one-row split would only invent a scheduling
-    /// object with no byte range and no work to divide.
-    SingleBackendDirectPageSource,
 }
 
 impl IcebergSystemTableType {
@@ -142,40 +127,13 @@ impl IcebergSystemTableType {
         }
     }
 
-    pub const fn execution(self) -> IcebergSystemTableExecution {
+    /// Placement hint only; every relation is enumerated through splits.
+    pub const fn unit_hint(self) -> SystemTableUnitHint {
         match self {
-            // One manifest is one independent unit of parseable bytes, so the
-            // relation divides cleanly across backends.
-            Self::Files => IcebergSystemTableExecution::DistributedSplits,
-            // These five read only the metadata file and its manifest list.
-            // There is nothing to divide, and dividing it would mean reading
-            // the same metadata file on every backend.
-            // `$partitions` joins them: it walks every manifest of the
-            // snapshot, but it must see all of them at once to aggregate, so
-            // there is nothing to divide either.
-            Self::Entries
-            | Self::Snapshots
-            | Self::History
-            | Self::Refs
-            | Self::Manifests
-            | Self::Partitions => IcebergSystemTableExecution::SingleBackendDirectPageSource,
-        }
-    }
-
-    pub const fn distribution(self) -> SystemTableDistribution {
-        match self.execution() {
-            IcebergSystemTableExecution::DistributedSplits => SystemTableDistribution::AllNodes,
-            IcebergSystemTableExecution::SingleBackendDirectPageSource => {
-                SystemTableDistribution::SingleCoordinator
+            Self::Files | Self::Entries => SystemTableUnitHint::ManyUnits,
+            Self::Snapshots | Self::History | Self::Refs | Self::Manifests | Self::Partitions => {
+                SystemTableUnitHint::SingleUnit
             }
-        }
-    }
-
-    /// Whether this relation is scheduled through a split source at all.
-    pub const fn produces_splits(self) -> bool {
-        match self.execution() {
-            IcebergSystemTableExecution::DistributedSplits => true,
-            IcebergSystemTableExecution::SingleBackendDirectPageSource => false,
         }
     }
 
@@ -259,16 +217,11 @@ impl IcebergSystemTableReference {
         // a scheduled task to learn a fact the frontend already had.
         let table_uuid = uuid::Uuid::parse_str(&table_uuid)
             .map_err(|error| invalid(format!("iceberg table uuid is invalid: {error}")))?;
-        if snapshot_id.is_none()
-            && matches!(
-                system_table_type,
-                IcebergSystemTableType::Files | IcebergSystemTableType::Partitions
-            )
+        if snapshot_id.is_none() && matches!(system_table_type, IcebergSystemTableType::Partitions)
         {
-            // `$files` reports the files of one snapshot, and `$partitions`
-            // aggregates those same files. Without a selected snapshot there is
-            // no manifest list to walk, and picking the current one on the
-            // backend is exactly the fallback this reference exists to forbid.
+            // The temporary provider-owned partitions relation aggregates a
+            // selected snapshot. Files and entries instead enumerate zero
+            // work units when no snapshot exists.
             return Err(invalid(format!(
                 "iceberg {} requires a selected snapshot id",
                 system_table_type.suffix()
@@ -656,9 +609,10 @@ impl TrinoManifestFile {
     }
 }
 
-/// The exact facts one `$files` split carries.
+/// The exact facts one files/entries manifest work unit carries.
 #[derive(Clone, Debug)]
-pub struct FilesTableSplitParams {
+pub struct SystemManifestSplitParams {
+    pub reference: IcebergSystemTableReference,
     pub table_has_variant_history: bool,
     pub manifest: TrinoManifestFile,
     pub table_schema_json: String,
@@ -678,14 +632,15 @@ pub struct FilesTableSplitParams {
     pub encryption_key_id: Option<String>,
 }
 
-/// One manifest of the pinned snapshot's `$files` relation.
+/// One manifest of the pinned snapshot's files or entries relation.
 ///
 /// One manifest produces exactly one split. A manifest is a single Avro file
 /// read start to finish; cutting it into byte ranges would make every range
 /// re-read the header, and merging manifests would make one split's failure
 /// retry another manifest's work.
 #[derive(Clone, Debug)]
-pub struct FilesTableSplit {
+pub struct SystemManifestSplit {
+    reference: IcebergSystemTableReference,
     table_has_variant_history: bool,
     manifest: TrinoManifestFile,
     table_schema_json: Arc<str>,
@@ -696,9 +651,10 @@ pub struct FilesTableSplit {
     retained_size_in_bytes: u64,
 }
 
-impl FilesTableSplit {
-    pub fn try_new(params: FilesTableSplitParams) -> Result<Self, ConnectorError> {
-        let FilesTableSplitParams {
+impl SystemManifestSplit {
+    pub fn try_new(params: SystemManifestSplitParams) -> Result<Self, ConnectorError> {
+        let SystemManifestSplitParams {
+            reference,
             table_has_variant_history,
             manifest,
             table_schema_json,
@@ -709,6 +665,15 @@ impl FilesTableSplit {
             encryption_key_id,
         } = params;
 
+        if !matches!(
+            reference.system_table_type(),
+            IcebergSystemTableType::Files | IcebergSystemTableType::Entries
+        ) || reference.snapshot_id().is_none()
+        {
+            return Err(invalid(
+                "iceberg manifest split requires a files or entries reference with a snapshot",
+            ));
+        }
         validate_shared_files_table_facts(
             &table_schema_json,
             &metadata_table_schema_json,
@@ -728,6 +693,7 @@ impl FilesTableSplit {
         }
 
         let mut split = Self {
+            reference,
             table_has_variant_history,
             manifest,
             table_schema_json: Arc::from(table_schema_json.as_str()),
@@ -759,6 +725,7 @@ impl FilesTableSplit {
             )));
         }
         let mut split = Self {
+            reference: self.reference.clone(),
             table_has_variant_history: self.table_has_variant_history,
             manifest,
             table_schema_json: Arc::clone(&self.table_schema_json),
@@ -770,6 +737,10 @@ impl FilesTableSplit {
         };
         split.retained_size_in_bytes = split.compute_retained_size_in_bytes();
         Ok(split)
+    }
+
+    pub const fn reference(&self) -> &IcebergSystemTableReference {
+        &self.reference
     }
 
     pub const fn manifest(&self) -> &TrinoManifestFile {
@@ -816,6 +787,9 @@ impl FilesTableSplit {
 
     fn compute_retained_size_in_bytes(&self) -> u64 {
         let mut retained = size_of::<Self>()
+            + self.reference.metadata_file_location().len()
+            + self.reference.schema_table_name().schema_name().len()
+            + self.reference.schema_table_name().table_name().len()
             + self.manifest.retained_size_in_bytes()
             + self.table_schema_json.len()
             + self.metadata_table_schema_json.len()
@@ -833,8 +807,9 @@ impl FilesTableSplit {
         retained as u64
     }
 
-    pub fn to_proto(&self) -> dto::FilesTableSplit {
-        dto::FilesTableSplit {
+    pub fn to_proto(&self) -> dto::SystemManifestSplit {
+        dto::SystemManifestSplit {
+            reference: Some(self.reference.to_proto()),
             table_has_variant_history: self.table_has_variant_history,
             manifest: Some(self.manifest.to_proto()),
             table_schema_json: self.table_schema_json.to_string(),
@@ -852,12 +827,17 @@ impl FilesTableSplit {
         }
     }
 
-    pub fn from_proto(raw: &dto::FilesTableSplit) -> Result<Self, ConnectorError> {
+    pub fn from_proto(raw: &dto::SystemManifestSplit) -> Result<Self, ConnectorError> {
         let manifest = raw
             .manifest
             .as_ref()
             .ok_or_else(|| invalid("iceberg $files split requires a manifest"))?;
-        Self::try_new(FilesTableSplitParams {
+        Self::try_new(SystemManifestSplitParams {
+            reference: IcebergSystemTableReference::from_proto(
+                raw.reference
+                    .as_ref()
+                    .ok_or_else(|| invalid("iceberg manifest split requires a frozen reference"))?,
+            )?,
             table_has_variant_history: raw.table_has_variant_history,
             manifest: TrinoManifestFile::from_proto(manifest)?,
             table_schema_json: raw.table_schema_json.clone(),
@@ -870,7 +850,7 @@ impl FilesTableSplit {
     }
 }
 
-impl ConnectorSplit for FilesTableSplit {
+impl ConnectorSplit for SystemManifestSplit {
     fn is_remotely_accessible(&self) -> bool {
         true
     }
@@ -894,9 +874,54 @@ impl ConnectorSplit for FilesTableSplit {
     }
 }
 
-/// The exact facts one `$files` split source is built from.
+/// One indivisible metadata-relation read, carrying the exact scan reference.
 #[derive(Clone, Debug)]
-pub struct FilesTableSplitSourceParams {
+pub struct SystemRelationSplit {
+    reference: IcebergSystemTableReference,
+}
+
+impl SystemRelationSplit {
+    pub fn try_new(reference: IcebergSystemTableReference) -> Result<Self, ConnectorError> {
+        if matches!(
+            reference.system_table_type(),
+            IcebergSystemTableType::Files | IcebergSystemTableType::Entries
+        ) {
+            return Err(invalid(
+                "iceberg files and entries require manifest work units",
+            ));
+        }
+        Ok(Self { reference })
+    }
+
+    pub const fn reference(&self) -> &IcebergSystemTableReference {
+        &self.reference
+    }
+}
+
+impl ConnectorSplit for SystemRelationSplit {
+    fn is_remotely_accessible(&self) -> bool {
+        true
+    }
+    fn addresses(&self) -> &[HostAddress] {
+        &[]
+    }
+    fn affinity_key(&self) -> Option<&str> {
+        None
+    }
+    fn split_weight(&self) -> SplitWeight {
+        SplitWeight::STANDARD
+    }
+    fn retained_size_in_bytes(&self) -> u64 {
+        (size_of::<Self>()
+            + self.reference.metadata_file_location().len()
+            + self.reference.schema_table_name().schema_name().len()
+            + self.reference.schema_table_name().table_name().len()) as u64
+    }
+}
+
+/// The exact facts one files/entries manifest source is built from.
+#[derive(Clone, Debug)]
+pub struct SystemManifestSplitSourceParams {
     pub table_has_variant_history: bool,
     pub reference: IcebergSystemTableReference,
     /// Every manifest of the pinned snapshot's manifest list, in list order.
@@ -911,20 +936,20 @@ pub struct FilesTableSplitSourceParams {
 
 /// A lazily advancing enumerator over one pinned snapshot's manifests.
 #[derive(Debug)]
-pub struct FilesTableSplitSource {
+pub struct SystemManifestSplitSource {
     /// The fully validated first split. Every later split is this one with
     /// another manifest. `None` only when the pinned snapshot lists no
     /// manifests at all, which is a legal empty relation.
-    template: Option<FilesTableSplit>,
+    template: Option<SystemManifestSplit>,
     template_emitted: bool,
     manifests: VecDeque<TrinoManifestFile>,
     closed: bool,
     exhausted: bool,
 }
 
-impl FilesTableSplitSource {
-    pub fn try_new(params: FilesTableSplitSourceParams) -> Result<Self, ConnectorError> {
-        let FilesTableSplitSourceParams {
+impl SystemManifestSplitSource {
+    pub fn try_new(params: SystemManifestSplitSourceParams) -> Result<Self, ConnectorError> {
+        let SystemManifestSplitSourceParams {
             table_has_variant_history,
             reference,
             manifests,
@@ -936,11 +961,18 @@ impl FilesTableSplitSource {
             encryption_key_id,
         } = params;
 
-        if reference.system_table_type() != IcebergSystemTableType::Files {
-            return Err(invalid(format!(
-                "iceberg {} runs as a direct page source and has no split source",
-                reference.system_table_type().suffix()
-            )));
+        if !matches!(
+            reference.system_table_type(),
+            IcebergSystemTableType::Files | IcebergSystemTableType::Entries
+        ) {
+            return Err(invalid(
+                "iceberg manifest source requires a files or entries reference",
+            ));
+        }
+        if reference.snapshot_id().is_none() && !manifests.is_empty() {
+            return Err(invalid(
+                "iceberg manifest source without a snapshot must have no manifests",
+            ));
         }
         if manifests.len() > MAX_FILES_TABLE_MANIFESTS {
             return Err(ConnectorError::new(
@@ -951,7 +983,8 @@ impl FilesTableSplitSource {
 
         let mut manifests = VecDeque::from(manifests);
         let template = match manifests.pop_front() {
-            Some(manifest) => Some(FilesTableSplit::try_new(FilesTableSplitParams {
+            Some(manifest) => Some(SystemManifestSplit::try_new(SystemManifestSplitParams {
+                reference,
                 table_has_variant_history,
                 manifest,
                 table_schema_json,
@@ -988,8 +1021,8 @@ impl FilesTableSplitSource {
     }
 }
 
-impl ConnectorSplitSource for FilesTableSplitSource {
-    type Split = FilesTableSplit;
+impl ConnectorSplitSource for SystemManifestSplitSource {
+    type Split = SystemManifestSplit;
     type Column = IcebergColumnHandle;
 
     fn next_batch(
@@ -1151,7 +1184,7 @@ mod tests {
         .expect("manifest")
     }
 
-    fn split_source_params(manifests: Vec<TrinoManifestFile>) -> FilesTableSplitSourceParams {
+    fn split_source_params(manifests: Vec<TrinoManifestFile>) -> SystemManifestSplitSourceParams {
         let schema = partitioned_schema();
         let spec = identity_partition_spec(&schema);
         let mut partition_spec_jsons = BTreeMap::new();
@@ -1159,7 +1192,7 @@ mod tests {
             spec.spec_id(),
             serde_json::to_string(&spec).expect("spec json"),
         );
-        FilesTableSplitSourceParams {
+        SystemManifestSplitSourceParams {
             table_has_variant_history: true,
             reference: reference(IcebergSystemTableType::Files),
             manifests,
@@ -1172,7 +1205,7 @@ mod tests {
         }
     }
 
-    fn drain(source: &mut FilesTableSplitSource) -> Vec<FilesTableSplit> {
+    fn drain(source: &mut SystemManifestSplitSource) -> Vec<SystemManifestSplit> {
         let snapshot = DynamicFilterSnapshot::<IcebergColumnHandle>::all_complete();
         let mut splits = Vec::new();
         loop {
@@ -1232,33 +1265,36 @@ mod tests {
     }
 
     #[test]
-    fn only_files_is_distributed_and_the_other_five_build_no_split() {
-        assert_eq!(
-            IcebergSystemTableType::Files.distribution(),
-            SystemTableDistribution::AllNodes
-        );
-        assert!(IcebergSystemTableType::Files.produces_splits());
-        for relation in [
+    fn manifest_relations_use_many_units_and_singleton_relations_use_one() {
+        for kind in [
+            IcebergSystemTableType::Files,
             IcebergSystemTableType::Entries,
+        ] {
+            assert_eq!(kind.unit_hint(), SystemTableUnitHint::ManyUnits);
+            let mut params = split_source_params(vec![manifest("m0.avro"), manifest("m1.avro")]);
+            params.reference = reference(kind);
+            let mut source = SystemManifestSplitSource::try_new(params).unwrap();
+            let splits = drain(&mut source);
+            assert_eq!(splits.len(), 2);
+            assert!(
+                splits
+                    .iter()
+                    .all(|split| split.reference() == &reference(kind))
+            );
+        }
+        for kind in [
             IcebergSystemTableType::Snapshots,
             IcebergSystemTableType::History,
             IcebergSystemTableType::Refs,
             IcebergSystemTableType::Manifests,
+            IcebergSystemTableType::Partitions,
         ] {
-            assert_eq!(
-                relation.distribution(),
-                SystemTableDistribution::SingleCoordinator
-            );
-            assert_eq!(
-                relation.execution(),
-                IcebergSystemTableExecution::SingleBackendDirectPageSource
-            );
-            assert!(!relation.produces_splits());
-            // A direct page source relation has no split source at all; asking
-            // for one is a planning error, not an empty enumeration.
+            assert_eq!(kind.unit_hint(), SystemTableUnitHint::SingleUnit);
+            let split = SystemRelationSplit::try_new(reference(kind)).unwrap();
+            assert_eq!(split.reference(), &reference(kind));
             let mut params = split_source_params(vec![manifest("m0.avro")]);
-            params.reference = reference(relation);
-            assert!(FilesTableSplitSource::try_new(params).is_err());
+            params.reference = reference(kind);
+            assert!(SystemManifestSplitSource::try_new(params).is_err());
         }
     }
 
@@ -1270,7 +1306,7 @@ mod tests {
             manifest("m2.avro"),
         ];
         let mut source =
-            FilesTableSplitSource::try_new(split_source_params(manifests)).expect("source");
+            SystemManifestSplitSource::try_new(split_source_params(manifests)).expect("source");
         let splits = drain(&mut source);
         assert_eq!(splits.len(), 3);
         let paths = splits
@@ -1291,9 +1327,26 @@ mod tests {
     }
 
     #[test]
+    fn files_and_entries_without_a_snapshot_are_valid_empty_sources() {
+        for kind in [
+            IcebergSystemTableType::Files,
+            IcebergSystemTableType::Entries,
+        ] {
+            let mut raw = reference(kind).to_proto();
+            raw.snapshot_id = None;
+            let reference = IcebergSystemTableReference::from_proto(&raw).unwrap();
+            let mut params = split_source_params(Vec::new());
+            params.reference = reference;
+            let mut source = SystemManifestSplitSource::try_new(params).unwrap();
+            assert!(source.is_finished());
+            assert!(drain(&mut source).is_empty());
+        }
+    }
+
+    #[test]
     fn a_snapshot_with_no_manifests_is_an_empty_relation_not_a_synthetic_split() {
         let mut source =
-            FilesTableSplitSource::try_new(split_source_params(Vec::new())).expect("source");
+            SystemManifestSplitSource::try_new(split_source_params(Vec::new())).expect("source");
         assert!(source.is_finished());
         assert!(drain(&mut source).is_empty());
     }
@@ -1356,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reference_rejects_a_malformed_identity_or_an_unpinned_files_relation() {
+    fn a_reference_rejects_malformed_identity_and_allows_snapshotless_manifest_relations() {
         let mut params = IcebergSystemTableReferenceParams {
             schema_table_name: SchemaTableName::try_new("db", "t").expect("name"),
             system_table_type: IcebergSystemTableType::Files,
@@ -1376,11 +1429,13 @@ mod tests {
         params.metadata_file_location =
             "s3://warehouse/db/t/metadata/00007-abc.metadata.json".to_string();
 
-        // `$files` reports one snapshot's files; without one there is nothing
-        // to walk and no legal fallback. `$partitions` aggregates those same
-        // files, so it needs one for the same reason.
+        // A snapshotless files/entries reference denotes zero manifest units;
+        // it does not select a later snapshot. The temporary provider-owned
+        // partitions relation still needs a snapshot until P06 removes it.
         params.snapshot_id = None;
-        assert!(IcebergSystemTableReference::try_new(params.clone()).is_err());
+        assert!(IcebergSystemTableReference::try_new(params.clone()).is_ok());
+        params.system_table_type = IcebergSystemTableType::Entries;
+        assert!(IcebergSystemTableReference::try_new(params.clone()).is_ok());
         params.system_table_type = IcebergSystemTableType::Partitions;
         assert!(IcebergSystemTableReference::try_new(params.clone()).is_err());
         params.system_table_type = IcebergSystemTableType::Refs;
@@ -1412,7 +1467,7 @@ mod tests {
         let mut params = split_source_params(vec![manifest("m0.avro")]);
         params.encryption_key_id = Some("key-1".to_string());
         assert_eq!(
-            FilesTableSplitSource::try_new(params)
+            SystemManifestSplitSource::try_new(params)
                 .expect_err("encrypted relation")
                 .kind(),
             ConnectorErrorKind::Unsupported
@@ -1435,13 +1490,14 @@ mod tests {
             assert_eq!(decoded, frozen);
         }
 
-        let mut source = FilesTableSplitSource::try_new(split_source_params(vec![
+        let mut source = SystemManifestSplitSource::try_new(split_source_params(vec![
             manifest("m0.avro"),
             manifest("m1.avro"),
         ]))
         .expect("source");
         for split in drain(&mut source) {
-            let decoded = FilesTableSplit::from_proto(&split.to_proto()).expect("decoded split");
+            let decoded =
+                SystemManifestSplit::from_proto(&split.to_proto()).expect("decoded split");
             assert_eq!(decoded.manifest(), split.manifest());
             assert!(decoded.table_has_variant_history());
             assert_eq!(decoded.table_schema_json(), split.table_schema_json());
@@ -1462,10 +1518,10 @@ mod tests {
     fn a_manifest_naming_an_unknown_partition_spec_fails_closed() {
         let mut params = split_source_params(vec![manifest("m0.avro")]);
         params.partition_spec_jsons.clear();
-        assert!(FilesTableSplitSource::try_new(params).is_err());
+        assert!(SystemManifestSplitSource::try_new(params).is_err());
 
         let mut source =
-            FilesTableSplitSource::try_new(split_source_params(vec![manifest("m0.avro")]))
+            SystemManifestSplitSource::try_new(split_source_params(vec![manifest("m0.avro")]))
                 .expect("source");
         let split = drain(&mut source).remove(0);
         let mut foreign = manifest("m1.avro");
@@ -1493,7 +1549,7 @@ mod tests {
     #[test]
     fn an_unsatisfiable_dynamic_filter_finishes_without_a_split() {
         let mut source =
-            FilesTableSplitSource::try_new(split_source_params(vec![manifest("m0.avro")]))
+            SystemManifestSplitSource::try_new(split_source_params(vec![manifest("m0.avro")]))
                 .expect("source");
         let snapshot = DynamicFilterSnapshot::<IcebergColumnHandle>::new(TupleDomain::none(), true);
         let batch = source.next_batch(16, &snapshot).expect("batch");

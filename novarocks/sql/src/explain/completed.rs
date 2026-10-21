@@ -2365,19 +2365,6 @@ fn join_side(side: novarocks_physical_plan::JoinSide) -> &'static str {
     }
 }
 
-fn connector_read_work_source(
-    source: novarocks_spi::connector::read_stack::ConnectorReadWorkSource,
-) -> &'static str {
-    match source {
-        novarocks_spi::connector::read_stack::ConnectorReadWorkSource::RuntimeSplits => {
-            "runtime-splits"
-        }
-        novarocks_spi::connector::read_stack::ConnectorReadWorkSource::WholeRelation => {
-            "whole-relation"
-        }
-    }
-}
-
 fn predicate_guarantee_kind(kind: novarocks_physical_plan::PredicateGuaranteeKind) -> &'static str {
     match kind {
         novarocks_physical_plan::PredicateGuaranteeKind::Exact => "exact",
@@ -2823,9 +2810,8 @@ fn render_node_contract(
                 }
             };
             lines.push(format_args!(
-                "{pad}  occurrence=pr{}, relation={relation_kind}, work-source={}, schema-fields={}, read-budget={{rows={}, bytes={}}}",
+                "{pad}  occurrence=pr{}, relation={relation_kind}, schema-fields={}, read-budget={{rows={}, bytes={}}}",
                 occurrence.get(),
-                connector_read_work_source(relation.work_source()),
                 relation.schema().len(),
                 read_budget.max_batch_rows,
                 read_budget.max_batch_bytes
@@ -3775,7 +3761,7 @@ mod tests {
         ExactInputVersion, PipelineDopDomain, PlanVersionId, PredicateGuaranteeKind,
         ProviderColumnReference, ProviderReadReference, ScanReadBudget,
     };
-    use novarocks_spi::connector::read_stack::{ConnectorReadBinding, ConnectorReadWorkSource};
+    use novarocks_spi::connector::read_stack::ConnectorReadBinding;
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
         ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
@@ -4085,7 +4071,6 @@ mod tests {
                 )
                 .expect("fixture metadata kind")
             }),
-            work_source: ConnectorReadWorkSource::RuntimeSplits,
             selection_digest: [8; 32],
             schema: need
                 .columns()

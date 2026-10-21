@@ -117,10 +117,10 @@ pub use system_page_source::{
     system_relation_schema_with_metadata,
 };
 pub use system_table::{
-    FilesTableSplit, FilesTableSplitParams, FilesTableSplitSource, FilesTableSplitSourceParams,
-    IcebergSystemTableExecution, IcebergSystemTableReference, IcebergSystemTableReferenceParams,
-    IcebergSystemTableType, MAX_FILES_TABLE_MANIFESTS, TrinoManifestContent, TrinoManifestFile,
-    TrinoManifestFileParams,
+    IcebergSystemTableReference, IcebergSystemTableReferenceParams, IcebergSystemTableType,
+    MAX_FILES_TABLE_MANIFESTS, SystemManifestSplit, SystemManifestSplitParams,
+    SystemManifestSplitSource, SystemManifestSplitSourceParams, SystemRelationSplit,
+    TrinoManifestContent, TrinoManifestFile, TrinoManifestFileParams,
 };
 pub use table_execute::{
     IcebergOptimizeHandle, IcebergProcedureExecution, IcebergProcedureId,

@@ -33,9 +33,8 @@ use crate::{
     },
     physical_type_v2::{self, DecodedTypeTable, EncodedTypeTable, TypeCodecError},
 };
-use novarocks_connector_contract::ConnectorReadWorkSource;
 use novarocks_physical_plan as p;
-use novarocks_proto_models::{connector_read::ScanWorkSource, physical_package_v2 as wire};
+use novarocks_proto_models::physical_package_v2 as wire;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
@@ -290,21 +289,6 @@ fn boxed<T>(v: Vec<T>, w: &mut CompileCheckpoints<'_>) -> Result<Box<[T]>, Error
 fn required(id: Option<u32>, w: &mut CompileCheckpoints<'_>) -> Result<u32, Error> {
     w.step()?;
     id.ok_or_else(|| invalid("relation required reference is absent"))
-}
-pub(crate) const fn encode_work_source(v: ConnectorReadWorkSource) -> ScanWorkSource {
-    match v {
-        ConnectorReadWorkSource::RuntimeSplits => ScanWorkSource::RuntimeSplits,
-        ConnectorReadWorkSource::WholeRelation => ScanWorkSource::WholeRelation,
-    }
-}
-pub(crate) fn decode_work_source(v: i32) -> Result<ConnectorReadWorkSource, Error> {
-    Ok(
-        match ScanWorkSource::try_from(v).map_err(|_| invalid("unknown relation work source"))? {
-            ScanWorkSource::RuntimeSplits => ConnectorReadWorkSource::RuntimeSplits,
-            ScanWorkSource::WholeRelation => ConnectorReadWorkSource::WholeRelation,
-            ScanWorkSource::Unspecified => return Err(invalid("unspecified relation work source")),
-        },
-    )
 }
 const fn encode_guarantee(v: p::PredicateGuaranteeKind) -> wire::PredicateGuaranteeKind {
     match v {
@@ -858,7 +842,6 @@ impl<'loan, 'wire, 'control> DecodedRelations<'loan, 'wire, 'control> {
 }
 struct Raw<'a> {
     read: Option<u32>,
-    work: i32,
     digest: &'a Vec<u8>,
     schema: &'a [wire::RelationField],
     schema_capacity: usize,
@@ -898,7 +881,6 @@ fn raw_source(d: &wire::RelationDefinition) -> Result<Raw<'_>, Error> {
     Ok(match k {
         wire::relation_definition::Kind::Data(v) => Raw {
             read: v.read_reference_id,
-            work: v.work_source,
             digest: &v.selection_digest,
             schema: &v.schema,
             schema_capacity: v.schema.capacity(),
@@ -909,7 +891,6 @@ fn raw_source(d: &wire::RelationDefinition) -> Result<Raw<'_>, Error> {
         },
         wire::relation_definition::Kind::Metadata(v) => Raw {
             read: v.read_reference_id,
-            work: v.work_source,
             digest: &v.selection_digest,
             schema: &v.schema,
             schema_capacity: v.schema.capacity(),
@@ -1182,11 +1163,10 @@ fn encode_core<'loan, 'source, 'control, 'admit>(
             w,
         )?;
         let digest = copy(&r.selection_digest(), w)?;
-        let work_source = encode_work_source(r.work_source()) as i32;
         let kind = match r {
             p::Relation::Data(_) => wire::relation_definition::Kind::Data(wire::DataRelation {
                 read_reference_id: Some(read_id),
-                work_source,
+
                 selection_digest: digest,
                 schema,
                 predicate_guarantees: guarantees,
@@ -1201,7 +1181,7 @@ fn encode_core<'loan, 'source, 'control, 'admit>(
                 wire::relation_definition::Kind::Metadata(wire::MetadataRelation {
                     kind,
                     read_reference_id: Some(read_id),
-                    work_source,
+
                     selection_digest: digest,
                     schema,
                     predicate_guarantees: guarantees,
@@ -1345,12 +1325,10 @@ fn preflight_decode_observed<'admit>(
             .read_observed(id, w)?
             .ok_or_else(|| invalid("relation read reference ID is unknown"))?;
         let valid = r.digest.len() == 32;
-        let work_source = decode_work_source(r.work);
         w.step()?;
         if !valid {
             return Err(invalid("relation selection digest is not exactly 32 bytes"));
         }
-        work_source?;
         for f in r.schema {
             let id = required(f.column_payload_id, w)?;
             let payload = reads
@@ -1453,7 +1431,6 @@ fn decode_core<'loan, 'wire, 'control, 'admit>(
         w.flush()?;
         let read = read.clone();
         w.flush()?;
-        let work_source = decode_work_source(r.work)?;
         let relation = if let Some((kind, cov)) = r.metadata {
             w.flush()?;
             let result = p::MetadataRelationKind::try_new(kind);
@@ -1462,7 +1439,7 @@ fn decode_core<'loan, 'wire, 'control, 'admit>(
             p::Relation::Metadata(p::MetadataRelation {
                 kind,
                 read,
-                work_source,
+
                 selection_digest: digest,
                 schema,
                 predicate_guarantees: guarantees,
@@ -1472,7 +1449,7 @@ fn decode_core<'loan, 'wire, 'control, 'admit>(
         } else {
             p::Relation::Data(p::DataRelation {
                 read,
-                work_source,
+
                 selection_digest: digest,
                 schema,
                 predicate_guarantees: guarantees,

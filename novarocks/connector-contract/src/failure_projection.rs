@@ -57,7 +57,6 @@ enum ContractReason {
     ScanExpressionType = 129,
     ScanDuplicateFilter = 130,
     ScanFilterVariable = 131,
-    ScanWholeRelation = 132,
     ScanBytes = 133,
 }
 fn fact(reason: ContractReason, class: FailureClass) -> FailureFact {
@@ -143,7 +142,6 @@ impl FailureProjection for StaticConnectorScanError {
             Self::ExpressionTypeMismatch => ContractReason::ScanExpressionType,
             Self::DuplicateDynamicFilter => ContractReason::ScanDuplicateFilter,
             Self::UnknownDynamicFilterVariable => ContractReason::ScanFilterVariable,
-            Self::WholeRelationRequiresSystemTable => ContractReason::ScanWholeRelation,
             Self::TooManyRetainedBytes => {
                 return bound(
                     ContractReason::ScanBytes,

@@ -92,8 +92,7 @@ pub use runtime::{
     ConnectorReadRelationKind, ConnectorReadRelationVersion, ConnectorReadRequestControl,
     ConnectorReadRequestControlFactory, ConnectorReadSplit, ConnectorReadSplitFacts,
     ConnectorReadSplitManager, ConnectorReadSplitSource, ConnectorReadSystemTablePlan,
-    ConnectorReadSystemTableProvider, ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle,
-    ConnectorReadTransactionHandle, ConnectorReadWorkSource,
+    ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle, ConnectorReadTransactionHandle,
 };
 pub use session::{ConnectorSession, MAX_SESSION_PROPERTIES, SessionPropertyValue};
 pub use split::{ConnectorSplit, HostAddress, STANDARD_SPLIT_WEIGHT_RAW, SplitWeight};
@@ -106,5 +105,5 @@ pub use static_facts::{
     ConnectorReadSortDirection, ConnectorReadStaticFacts, MAX_READ_COVERAGE_EVIDENCE_BYTES,
     MAX_READ_INPUT_VERSION_BYTES, MAX_READ_PROPERTY_KEYS,
 };
-pub use system_table::{SystemTableColumn, SystemTableDistribution};
+pub use system_table::{SystemTableColumn, SystemTableUnitHint};
 pub use value::{ConnectorValue, ConnectorValueType, MAX_CONNECTOR_DECIMAL_PRECISION};

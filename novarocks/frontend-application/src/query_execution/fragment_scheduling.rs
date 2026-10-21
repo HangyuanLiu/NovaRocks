@@ -27,13 +27,13 @@ use std::collections::BTreeMap;
 
 use crate::query_execution::artifact::FragmentId;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
+use novarocks_query_application::api::RuntimeSplitPlacement;
 use novarocks_query_application::api::{
     ExecutionSchedulingFacts, FragmentSchedulingFacts as QueryApplicationFragmentSchedulingFacts,
     NativeScanWork, PlanScanIdentity, PlanSeal, ScanSchedulingFacts,
     SchedulingEdgeFacts as QueryApplicationEdgeFacts,
     SchedulingStreamKind as QueryApplicationStreamKind,
 };
-use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 
 /// How rows move across one fragment boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,7 +58,7 @@ pub struct SchedulingScanFacts {
     /// Runtime splits can use every admitted task; a whole relation has no
     /// split and must run on exactly one backend. Losing the distinction here
     /// would duplicate a direct metadata read on every live backend.
-    pub work_source: Option<ConnectorReadWorkSource>,
+    pub runtime_splits: Option<RuntimeSplitPlacement>,
 }
 
 /// One fragment, as scheduling sees it.
@@ -168,18 +168,16 @@ impl FragmentSchedulingFacts {
 
 /// How much work one read starts with.
 ///
-/// A provider that hands out splits, or answers a whole relation at once,
-/// says so at freeze time and nothing has been enumerated yet. Otherwise the
-/// work is the pieces already known, which may legitimately be none -- a scan
+/// A provider freezes its placement hint before enumerating runtime splits.
+/// Otherwise work is the pieces already known, which may legitimately be none -- a scan
 /// that starts with nothing still has to be admitted so it can be told there
 /// is nothing.
 fn attempt_scan_work(
     fragment_id: FragmentId,
     scan: &SchedulingScanFacts,
 ) -> Result<NativeScanWork, String> {
-    Ok(match scan.work_source {
-        Some(ConnectorReadWorkSource::RuntimeSplits) => NativeScanWork::RuntimeSplits,
-        Some(ConnectorReadWorkSource::WholeRelation) => NativeScanWork::WholeRelation,
+    Ok(match scan.runtime_splits {
+        Some(placement) => NativeScanWork::RuntimeSplits { placement },
         None => match std::num::NonZeroUsize::new(scan.ranges.len()) {
             Some(count) => NativeScanWork::FrozenUnits { count },
             None => {

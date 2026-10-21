@@ -27,8 +27,7 @@ use crate::query_execution::fragment_scheduling::{FragmentSchedulingFacts, Sched
 #[cfg(test)]
 use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
-use novarocks_query_application::api::LiveBackendTarget;
-use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
+use novarocks_query_application::api::{LiveBackendTarget, RuntimeSplitPlacement};
 use novarocks_types::BackendProcessId;
 
 #[derive(Clone)]
@@ -250,7 +249,7 @@ impl FrontendFragmentScheduler {
                     fragment
                         .scans
                         .iter()
-                        .map(|scan| (scan.range_count(), scan.work_source)),
+                        .map(|scan| (scan.range_count(), scan.runtime_splits)),
                     backend_count,
                 )
             } else {
@@ -339,20 +338,17 @@ impl FrontendFragmentScheduler {
 
 /// Choose one fragment's scan fanout without enumerating connector splits.
 ///
-/// Runtime split sources can feed every admitted task. A whole-relation scan
-/// has no split at all, so any fragment containing one must have exactly one
-/// instance; otherwise each instance would read and return the complete
-/// relation. Other scans in the same fragment still run correctly on that one
-/// instance, although with intentionally reduced parallelism.
+/// A single-unit hint contributes one task without constraining other scans.
+/// Ignoring a hint may add empty tasks, but cannot duplicate provider work.
 fn scan_fragment_parallelism(
-    scans: impl IntoIterator<Item = (usize, Option<ConnectorReadWorkSource>)>,
+    scans: impl IntoIterator<Item = (usize, Option<RuntimeSplitPlacement>)>,
     backend_count: usize,
 ) -> usize {
     let mut parallelism = 1;
-    for (file_ranges, work_source) in scans {
-        match work_source {
-            Some(ConnectorReadWorkSource::WholeRelation) => return 1,
-            Some(ConnectorReadWorkSource::RuntimeSplits) => {
+    for (file_ranges, placement) in scans {
+        match placement {
+            Some(RuntimeSplitPlacement::SingleUnit) => {}
+            Some(RuntimeSplitPlacement::Spread) => {
                 parallelism = parallelism.max(backend_count);
             }
             None => {
@@ -372,28 +368,35 @@ mod tests {
     use super::{FrontendBackendSnapshot, scan_fragment_parallelism};
     use crate::query_execution::contract::DistributedQueryErrorKind;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
-    use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
+    use novarocks_query_application::api::RuntimeSplitPlacement;
     use novarocks_types::QueryId;
 
     #[test]
-    fn whole_relation_constrains_its_fragment_to_one_backend() {
+    fn placement_hints_do_not_constrain_other_scans() {
+        assert_eq!(
+            scan_fragment_parallelism([(0, Some(RuntimeSplitPlacement::SingleUnit))], 3),
+            1
+        );
         assert_eq!(
             scan_fragment_parallelism(
                 [
-                    (0, Some(ConnectorReadWorkSource::RuntimeSplits)),
-                    (0, Some(ConnectorReadWorkSource::WholeRelation)),
-                    (8, None),
+                    (0, Some(RuntimeSplitPlacement::SingleUnit)),
+                    (0, Some(RuntimeSplitPlacement::Spread))
                 ],
-                3,
+                3
             ),
-            1
+            3
+        );
+        assert_eq!(
+            scan_fragment_parallelism([(0, Some(RuntimeSplitPlacement::SingleUnit)), (8, None)], 3),
+            3
         );
     }
 
     #[test]
-    fn runtime_splits_retain_live_backend_fanout() {
+    fn ignoring_a_single_unit_hint_retains_all_live_backends() {
         assert_eq!(
-            scan_fragment_parallelism([(0, Some(ConnectorReadWorkSource::RuntimeSplits))], 3,),
+            scan_fragment_parallelism([(0, Some(RuntimeSplitPlacement::Spread))], 3),
             3
         );
     }

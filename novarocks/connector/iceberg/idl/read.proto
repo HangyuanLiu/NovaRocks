@@ -428,7 +428,8 @@ message TrinoManifestFile {
   bytes key_metadata = 15;
 }
 
-message FilesTableSplit {
+message SystemManifestSplit {
+  IcebergSystemTableReference reference = 9;
   bool table_has_variant_history = 8;
   TrinoManifestFile manifest = 1;
   string table_schema_json = 2;
@@ -437,6 +438,10 @@ message FilesTableSplit {
   optional string partition_column_type_json = 5;
   optional string bounds_column_type_json = 6;
   optional string encryption_key_id = 7;
+}
+
+message SystemRelationSplit {
+  IcebergSystemTableReference reference = 1;
 }
 
 message IcebergRewritePositionDeleteFilesSplit {
@@ -452,7 +457,8 @@ message IcebergReadSplitPayload {
     IcebergSplit data = 10;
     TableChangesSplit table_changes = 11;
     IcebergChangeSplit change_window = 12;
-    FilesTableSplit system_files = 13;
+    SystemManifestSplit system_manifest = 13;
+    SystemRelationSplit system_relation = 15;
     IcebergRewritePositionDeleteFilesSplit rewrite_position_delete_files = 14;
   }
 }

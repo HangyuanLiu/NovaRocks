@@ -22,7 +22,7 @@
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
     ConnectorReadArtifactCoverage, ConnectorReadDistribution, ConnectorReadInputVersion,
-    ConnectorReadProperties, ConnectorReadStaticFacts, SystemTableDistribution,
+    ConnectorReadProperties, ConnectorReadStaticFacts,
 };
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
@@ -159,15 +159,7 @@ fn project(
         }
         IcebergRuntimeRelation::SystemTable(reference) => {
             let frozen = work.opaque(|| reference.to_proto().encode_to_vec())?;
-            let properties = match reference.system_table_type().distribution() {
-                SystemTableDistribution::AllNodes => unconstrained_read_properties(work)?,
-                SystemTableDistribution::SingleCoordinator => work.opaque_source(|| {
-                    ConnectorReadProperties::try_new(
-                        ConnectorReadDistribution::Singleton,
-                        Vec::new(),
-                    )
-                })?,
-            };
+            let properties = unconstrained_read_properties(work)?;
             let input_digest =
                 static_digest(b"iceberg-final-static-system-table-v1", &frozen, work)?;
             let selection_digest =
@@ -463,21 +455,23 @@ mod tests {
         }
     }
     #[test]
-    fn metadata_distribution_coverage_and_rewrite_exact_artifact_are_preserved() {
-        for (kind, singleton) in [
-            (IcebergSystemTableType::Files, false),
-            (IcebergSystemTableType::Snapshots, true),
+    fn metadata_is_unconstrained_and_retains_coverage_and_rewrite_exact_artifact() {
+        for kind in [
+            IcebergSystemTableType::Files,
+            IcebergSystemTableType::Entries,
+            IcebergSystemTableType::Snapshots,
+            IcebergSystemTableType::History,
+            IcebergSystemTableType::Refs,
+            IcebergSystemTableType::Manifests,
+            IcebergSystemTableType::Partitions,
         ] {
             let relation = system(kind);
             let facts =
                 iceberg_final_static_facts_for_compile(&relation, &Control::default()).unwrap();
-            assert_eq!(
-                matches!(
-                    facts.properties().distribution(),
-                    ConnectorReadDistribution::Singleton
-                ),
-                singleton
-            );
+            assert!(matches!(
+                facts.properties().distribution(),
+                ConnectorReadDistribution::Unconstrained
+            ));
             let IcebergRuntimeRelation::SystemTable(reference) = relation else {
                 unreachable!()
             };

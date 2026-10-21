@@ -31,7 +31,7 @@ use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
     Assignment, ConnectorReadColumnHandle, ConnectorReadRelation, ConnectorReadSplit,
-    ConnectorReadTransactionHandle, ConnectorReadWorkSource, TupleDomain,
+    ConnectorReadTransactionHandle, TupleDomain,
 };
 use novarocks_spi::connector::{
     ConnectorCodecError, ConnectorCodecErrorKind, ConnectorReadRelationPayload,
@@ -284,8 +284,13 @@ where
                     provider_payload,
                 })
             }
-            ConnectorReadSplitCategory::SystemFiles => {
-                dto::connector_split::Category::SystemFiles(dto::SystemFilesSplitCategory {
+            ConnectorReadSplitCategory::SystemManifest => {
+                dto::connector_split::Category::SystemManifest(dto::SystemManifestSplitCategory {
+                    provider_payload,
+                })
+            }
+            ConnectorReadSplitCategory::SystemRelation => {
+                dto::connector_split::Category::SystemRelation(dto::SystemRelationSplitCategory {
                     provider_payload,
                 })
             }
@@ -476,7 +481,8 @@ where
             super::SplitCategory::Data => ConnectorReadSplitCategory::Data,
             super::SplitCategory::TableChanges => ConnectorReadSplitCategory::TableChanges,
             super::SplitCategory::ChangeWindow => ConnectorReadSplitCategory::ChangeWindow,
-            super::SplitCategory::SystemFiles => ConnectorReadSplitCategory::SystemFiles,
+            super::SplitCategory::SystemManifest => ConnectorReadSplitCategory::SystemManifest,
+            super::SplitCategory::SystemRelation => ConnectorReadSplitCategory::SystemRelation,
             super::SplitCategory::RewritePositionDeleteFiles => {
                 ConnectorReadSplitCategory::RewritePositionDeleteFiles
             }
@@ -617,7 +623,6 @@ pub struct DecodedConnectorReadScan {
     enforced_predicate: TupleDomain<ConnectorReadColumnHandle>,
     unenforced_predicate: TupleDomain<ConnectorReadColumnHandle>,
     remaining_expression: Option<novarocks_spi::connector::read_stack::ConnectorExpression>,
-    work_source: ConnectorReadWorkSource,
 }
 
 impl DecodedConnectorReadScan {
@@ -646,10 +651,6 @@ impl DecodedConnectorReadScan {
             unenforced_predicate: codec
                 .decode_validated_tuple_domain(source.unenforced_predicate())?,
             remaining_expression: source.remaining_expression().cloned(),
-            work_source: match source.work_source() {
-                super::ScanWorkSource::RuntimeSplits => ConnectorReadWorkSource::RuntimeSplits,
-                super::ScanWorkSource::WholeRelation => ConnectorReadWorkSource::WholeRelation,
-            },
         })
     }
 
@@ -673,10 +674,6 @@ impl DecodedConnectorReadScan {
         &self,
     ) -> Option<&novarocks_spi::connector::read_stack::ConnectorExpression> {
         self.remaining_expression.as_ref()
-    }
-
-    pub const fn work_source(&self) -> ConnectorReadWorkSource {
-        self.work_source
     }
 }
 

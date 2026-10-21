@@ -57,7 +57,7 @@ use novarocks_spi::connector::read_stack::{
     ConnectorReadStaticFacts, ConnectorReadTableHandle, ConnectorSession, ConnectorSplitBatch,
     ConnectorSplitSource, ConnectorTableHandle as _, ConnectorValue, ConnectorValueType,
     Constraint, Domain, DynamicFilterSnapshot, OrderedAssignments, Range, SchemaTableName,
-    SplitWeight, SystemTableDistribution, TupleDomain, ValueSet,
+    SplitWeight, SystemTableUnitHint, TupleDomain, ValueSet,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorOperationControl,
@@ -90,20 +90,19 @@ use crate::typed_read::publish_read_schema_with_metadata;
 use crate::typed_read::read_static_facts::decode_sha256_hex;
 use crate::typed_read::read_static_facts::iceberg_final_static_facts;
 use crate::typed_read::{
-    ALWAYS_BOUND_METADATA_COLUMNS, FilesTableSplit, FilesTableSplitSource,
-    FilesTableSplitSourceParams, HiveTransactionHandle, ICEBERG_CHANGE_OP_COLUMN,
+    ALWAYS_BOUND_METADATA_COLUMNS, HiveTransactionHandle, ICEBERG_CHANGE_OP_COLUMN,
     IcebergChangeSplit, IcebergChangeWindowEndpoints, IcebergChangeWindowHandle,
     IcebergChangeWindowHandleParams, IcebergChangeWindowSplitSource, IcebergColumnHandle,
     IcebergDeleteFile, IcebergDeleteFileContent, IcebergDeleteFileParams, IcebergFileFormat,
     IcebergMetadataColumn, IcebergPinnedDataFileSet, IcebergPlannedDataFile,
     IcebergRewriteArtifactContentId, IcebergRewritePositionDeleteFilesHandle,
     IcebergRewritePositionDeleteFilesSplit, IcebergRewritePositionDeleteFilesSplitParams,
-    IcebergSplit, IcebergSplitSource, IcebergSplitSourceOptions, IcebergSystemTableExecution,
-    IcebergSystemTableReference, IcebergTableExecuteHandle, IcebergTableExecuteHandleParams,
-    IcebergTableExecuteProcedureHandle, IcebergTableHandle, IcebergTableHandleParams,
-    REWRITE_POSITION_DELETE_OUTPUT_COLUMNS, ROW_LINEAGE_METADATA_COLUMNS, TrinoManifestFile,
-    bounds_row_type, change_op_column_handle, derived_row_type_json,
-    files_relation_schema_json_with_metadata, partition_row_type_with_metadata,
+    IcebergSplit, IcebergSplitSource, IcebergSplitSourceOptions, IcebergSystemTableReference,
+    IcebergTableExecuteHandle, IcebergTableExecuteHandleParams, IcebergTableExecuteProcedureHandle,
+    IcebergTableHandle, IcebergTableHandleParams, REWRITE_POSITION_DELETE_OUTPUT_COLUMNS,
+    ROW_LINEAGE_METADATA_COLUMNS, SystemManifestSplit, SystemManifestSplitSource,
+    SystemManifestSplitSourceParams, SystemRelationSplit, TrinoManifestFile, bounds_row_type,
+    change_op_column_handle, derived_row_type_json, partition_row_type_with_metadata,
     plan_change_window_splits, system_relation_columns_with_metadata,
 };
 #[cfg(test)]
@@ -157,36 +156,36 @@ impl IcebergSystemRelation {
         self,
     ) -> (
         crate::typed_read::IcebergSystemTableType,
-        SystemTableDistribution,
+        SystemTableUnitHint,
     ) {
         match self {
             Self::Files => (
                 crate::typed_read::IcebergSystemTableType::Files,
-                SystemTableDistribution::AllNodes,
+                SystemTableUnitHint::ManyUnits,
             ),
             Self::Entries => (
                 crate::typed_read::IcebergSystemTableType::Entries,
-                SystemTableDistribution::SingleCoordinator,
+                SystemTableUnitHint::ManyUnits,
             ),
             Self::Snapshots => (
                 crate::typed_read::IcebergSystemTableType::Snapshots,
-                SystemTableDistribution::SingleCoordinator,
+                SystemTableUnitHint::SingleUnit,
             ),
             Self::History => (
                 crate::typed_read::IcebergSystemTableType::History,
-                SystemTableDistribution::SingleCoordinator,
+                SystemTableUnitHint::SingleUnit,
             ),
             Self::Refs => (
                 crate::typed_read::IcebergSystemTableType::Refs,
-                SystemTableDistribution::SingleCoordinator,
+                SystemTableUnitHint::SingleUnit,
             ),
             Self::Manifests => (
                 crate::typed_read::IcebergSystemTableType::Manifests,
-                SystemTableDistribution::SingleCoordinator,
+                SystemTableUnitHint::SingleUnit,
             ),
             Self::Partitions => (
                 crate::typed_read::IcebergSystemTableType::Partitions,
-                SystemTableDistribution::SingleCoordinator,
+                SystemTableUnitHint::SingleUnit,
             ),
         }
     }
@@ -1839,28 +1838,44 @@ impl IntoIcebergRuntimeSplit for IcebergChangeSplit {
     }
 }
 
-impl IntoIcebergRuntimeSplit for FilesTableSplit {
+impl IntoIcebergRuntimeSplit for SystemManifestSplit {
     fn into_runtime_split(self) -> crate::typed_read::IcebergReadSplit {
-        crate::typed_read::IcebergReadSplit::SystemFiles(self)
+        crate::typed_read::IcebergReadSplit::SystemManifest(self)
     }
 }
 
-struct RuntimeUnsplitRelationSource;
+struct RuntimeSystemRelationSource {
+    split: Option<SystemRelationSplit>,
+}
 
-impl ProviderReadSplitSource<IcebergTypedBoundary> for RuntimeUnsplitRelationSource {
+impl ProviderReadSplitSource<IcebergTypedBoundary> for RuntimeSystemRelationSource {
     fn next_batch(
         &mut self,
-        _max_size: usize,
-        _dynamic_filter: &DynamicFilterSnapshot<IcebergColumnHandle>,
+        max_size: usize,
+        dynamic_filter: &DynamicFilterSnapshot<IcebergColumnHandle>,
     ) -> Result<ConnectorSplitBatch<crate::typed_read::IcebergReadSplit>, ConnectorError> {
-        Ok(ConnectorSplitBatch::finished())
+        if max_size == 0 {
+            return Err(invalid("connector split batch size must be positive"));
+        }
+        if dynamic_filter.current_predicate().is_none() {
+            self.split = None;
+        }
+        Ok(ConnectorSplitBatch::new(
+            self.split
+                .take()
+                .into_iter()
+                .map(crate::typed_read::IcebergReadSplit::SystemRelation)
+                .collect(),
+            true,
+        ))
     }
 
     fn is_finished(&self) -> bool {
-        true
+        self.split.is_none()
     }
 
     fn close(&mut self) -> Result<(), ConnectorError> {
+        self.split = None;
         Ok(())
     }
 }
@@ -1870,10 +1885,20 @@ impl IcebergTypedBoundary {
         &self,
         reference: &IcebergSystemTableReference,
     ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
-        if reference.system_table_type().execution()
-            != IcebergSystemTableExecution::DistributedSplits
-        {
-            return Ok(Box::new(RuntimeUnsplitRelationSource));
+        if matches!(
+            reference.system_table_type(),
+            crate::typed_read::IcebergSystemTableType::Snapshots
+                | crate::typed_read::IcebergSystemTableType::History
+                | crate::typed_read::IcebergSystemTableType::Refs
+                | crate::typed_read::IcebergSystemTableType::Manifests
+                | crate::typed_read::IcebergSystemTableType::Partitions
+        ) {
+            return Ok(Box::new(RuntimeSystemRelationSource {
+                split: Some(SystemRelationSplit::try_new(reference.clone())?),
+            }));
+        }
+        if reference.snapshot_id().is_none() {
+            return Ok(Box::new(RuntimeSystemRelationSource { split: None }));
         }
         let metadata = self.system_relation_metadata(reference)?;
         let specs = partition_specs_of(&metadata);
@@ -1889,13 +1914,17 @@ impl IcebergTypedBoundary {
                 })?,
             );
         }
-        let source = FilesTableSplitSource::try_new(FilesTableSplitSourceParams {
+        let source = SystemManifestSplitSource::try_new(SystemManifestSplitSourceParams {
             table_has_variant_history: crate::manifest::table_has_variant_history(&metadata),
             manifests: self.pinned_snapshot_manifests(reference)?,
             table_schema_json: serde_json::to_string(&table_schema).map_err(|error| {
                 corrupt(format!("iceberg table schema is not serializable: {error}"))
             })?,
-            metadata_table_schema_json: files_relation_schema_json_with_metadata(&metadata)?,
+            metadata_table_schema_json:
+                crate::typed_read::system_page_source::system_relation_schema_json_with_metadata(
+                    reference.system_table_type(),
+                    &metadata,
+                )?,
             partition_spec_jsons,
             partition_column_type_json: partition_row_type_with_metadata(&metadata)?
                 .as_ref()
@@ -3669,7 +3698,7 @@ pub(crate) mod final_static_facts_tests {
         assert_ne!(facts.selection_digest(), [0; 32]);
         assert!(matches!(
             facts.properties().distribution(),
-            ConnectorReadDistribution::Singleton
+            ConnectorReadDistribution::Unconstrained
         ));
     }
 
@@ -4580,6 +4609,90 @@ mod historical_window_schema_tests {
         assert_eq!(
             handle.to_read_domain().endpoint().schema().unwrap(),
             *admitted
+        );
+    }
+}
+
+#[cfg(test)]
+mod system_work_unit_tests {
+    use super::*;
+
+    fn reference(kind: crate::typed_read::IcebergSystemTableType) -> IcebergSystemTableReference {
+        IcebergSystemTableReference::try_new(crate::typed_read::IcebergSystemTableReferenceParams {
+            schema_table_name: SchemaTableName::try_new("db", "t").unwrap(),
+            system_table_type: kind,
+            metadata_file_location: "s3://warehouse/db/t/metadata/v1.json".into(),
+            table_uuid: "9d1f4c1e-6a1f-4a0b-9c3a-0f2b6d5e7a11".into(),
+            snapshot_id: Some(11),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn singleton_source_emits_exactly_one_frozen_unit_then_eos() {
+        use crate::typed_read::IcebergSystemTableType as Kind;
+        let filter = DynamicFilterSnapshot::all_complete();
+        for kind in [
+            Kind::Snapshots,
+            Kind::History,
+            Kind::Refs,
+            Kind::Manifests,
+            Kind::Partitions,
+        ] {
+            let reference = reference(kind);
+            let mut source = RuntimeSystemRelationSource {
+                split: Some(SystemRelationSplit::try_new(reference.clone()).unwrap()),
+            };
+            assert!(!source.is_finished());
+            assert!(source.next_batch(0, &filter).is_err());
+            let batch = source.next_batch(9, &filter).unwrap();
+            assert!(batch.no_more_splits());
+            let splits = batch.into_splits();
+            assert_eq!(splits.len(), 1);
+            let crate::typed_read::IcebergReadSplit::SystemRelation(split) = &splits[0] else {
+                panic!("relation unit")
+            };
+            assert_eq!(split.reference(), &reference);
+            assert!(source.is_finished());
+            assert!(
+                source
+                    .next_batch(1, &filter)
+                    .unwrap()
+                    .into_splits()
+                    .is_empty()
+            );
+            source.close().unwrap();
+            source.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn closed_singleton_and_empty_manifest_sources_emit_no_units() {
+        let filter = DynamicFilterSnapshot::all_complete();
+        let mut source = RuntimeSystemRelationSource {
+            split: Some(
+                SystemRelationSplit::try_new(reference(
+                    crate::typed_read::IcebergSystemTableType::Snapshots,
+                ))
+                .unwrap(),
+            ),
+        };
+        source.close().unwrap();
+        assert!(
+            source
+                .next_batch(1, &filter)
+                .unwrap()
+                .into_splits()
+                .is_empty()
+        );
+        let mut empty = RuntimeSystemRelationSource { split: None };
+        assert!(empty.is_finished());
+        assert!(
+            empty
+                .next_batch(1, &filter)
+                .unwrap()
+                .into_splits()
+                .is_empty()
         );
     }
 }

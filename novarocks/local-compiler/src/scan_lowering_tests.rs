@@ -118,7 +118,6 @@ struct Spec {
     residuals: usize,
     guarantee: Guarantee,
     metadata: bool,
-    whole_relation: bool,
     derived: bool,
     reordered: bool,
     filter: bool,
@@ -136,7 +135,6 @@ impl Spec {
             residuals: 1,
             guarantee: Guarantee::PruningOnly,
             metadata: false,
-            whole_relation: false,
             derived: false,
             reordered: false,
             filter: false,
@@ -269,11 +267,7 @@ struct Fixture {
 fn fixture(spec: Spec) -> Fixture {
     let binding = binding();
     let relation_payload = ConnectorReadRelationPayload::new(
-        if spec.metadata {
-            ConnectorReadRelationKind::SystemTable
-        } else {
-            spec.kind
-        },
+        spec.kind,
         payload(&binding, ConnectorCodecCategory::ReadTable, b"table"),
         payload(&binding, ConnectorCodecCategory::ReadView, b"view"),
     );
@@ -350,18 +344,8 @@ fn fixture(spec: Spec) -> Fixture {
         derived_values.push(value);
         output.push(value);
     }
-    let work_source = if spec.whole_relation {
-        ConnectorReadWorkSource::WholeRelation
-    } else {
-        ConnectorReadWorkSource::RuntimeSplits
-    };
     let properties = PhysicalProperties {
-        // A whole-relation read is opened by one executor.
-        distribution: if spec.whole_relation {
-            Distribution::Singleton
-        } else {
-            Distribution::Unconstrained
-        },
+        distribution: Distribution::Unconstrained,
         row_multiplicity: RowMultiplicity::SingleCopy,
         ordering: Box::default(),
     };
@@ -381,7 +365,7 @@ fn fixture(spec: Spec) -> Fixture {
         Relation::Metadata(MetadataRelation {
             kind: MetadataRelationKind::try_new("lake.entries").unwrap(),
             read,
-            work_source,
+
             selection_digest: [7; 32],
             schema,
             predicate_guarantees,
@@ -391,7 +375,7 @@ fn fixture(spec: Spec) -> Fixture {
     } else {
         Relation::Data(DataRelation {
             read,
-            work_source,
+
             selection_digest: [7; 32],
             schema,
             predicate_guarantees,
@@ -557,7 +541,7 @@ fn fixture(spec: Spec) -> Fixture {
                             input_version: ExactInputVersion::try_new([9]).unwrap(),
                             relation: relation_payload.clone(),
                         },
-                        work_source,
+
                         selection_digest: [7; 32],
                         schema: columns
                             .iter()
@@ -775,7 +759,6 @@ fn fixture(spec: Spec) -> Fixture {
         vec![],
         NonZeroU64::new(100).unwrap(),
         NonZeroU64::new(4096).unwrap(),
-        work_source,
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(
@@ -1329,23 +1312,53 @@ fn primitive_exact_provider_guarantee_preserves_its_validated_recipe() {
 }
 
 #[test]
+fn metadata_and_table_execute_reads_compile_as_work_unit_scans() {
+    for spec in [
+        Spec {
+            metadata: true,
+            kind: ConnectorReadRelationKind::SystemTable,
+            ..Spec::slice()
+        },
+        Spec {
+            kind: ConnectorReadRelationKind::TableExecute,
+            ..Spec::slice()
+        },
+    ] {
+        let program = compile(spec).expect("supported work-unit scan compiles");
+        assert_eq!(program.scan_inputs().len(), 1);
+    }
+}
+
+#[test]
+fn metadata_relation_with_a_non_system_kind_is_invalid() {
+    let fixture = fixture(Spec {
+        metadata: true,
+        kind: ConnectorReadRelationKind::SystemTable,
+        ..Spec::slice()
+    });
+    let mut node = fixture.package.fragment().nodes()[&SCAN].clone();
+    let NodeKind::Scan { relation, .. } = &mut node.kind else {
+        panic!("scan");
+    };
+    let Relation::Metadata(metadata) = relation.as_mut() else {
+        panic!("metadata");
+    };
+    metadata.read.relation = ConnectorReadRelationPayload::new(
+        ConnectorReadRelationKind::Table,
+        payload(&binding(), ConnectorCodecCategory::ReadTable, b"table"),
+        payload(&binding(), ConnectorCodecCategory::ReadView, b"view"),
+    );
+    let mut work = CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Validate).unwrap();
+    assert!(matches!(
+        crate::scan::admit_scan(&node, None, &mut work),
+        Err(FragmentCompileError::Invalid(
+            "metadata relation is not a system table"
+        ))
+    ));
+}
+
+#[test]
 fn unsupported_scan_shapes_are_refused_explicitly() {
-    refused(
-        Spec {
-            metadata: true,
-            ..Spec::slice()
-        },
-        "provider metadata or system-table relation",
-    );
-    // Whole-relation work exists only for a system-table relation.
-    refused(
-        Spec {
-            metadata: true,
-            whole_relation: true,
-            ..Spec::slice()
-        },
-        "whole-relation provider read",
-    );
     refused(
         Spec {
             derived: true,
@@ -1360,6 +1373,18 @@ fn unsupported_scan_shapes_are_refused_explicitly() {
         },
         "scan output differs from its ordered provider outputs",
     );
+    for kind in [
+        ConnectorReadRelationKind::TableFunction,
+        ConnectorReadRelationKind::MergeTable,
+    ] {
+        refused(
+            Spec {
+                kind,
+                ..Spec::slice()
+            },
+            "provider relation other than a table",
+        );
+    }
     refused(
         Spec {
             kind: ConnectorReadRelationKind::ChangeWindow,

@@ -908,7 +908,6 @@ pub(super) fn frozen_scan(fragment: &Fragment) -> FrozenConnectorRead {
         vec![],
         NonZeroU64::new(read_budget.max_batch_rows).unwrap(),
         NonZeroU64::new(read_budget.max_batch_bytes).unwrap(),
-        relation.work_source(),
     )
     .unwrap();
     public_read(fragment, fragment.root(), scan).unwrap()
@@ -1068,7 +1067,6 @@ fn explicit_empty_pruning_table_keeps_actual_scan_and_provider_domains() {
         vec![],
         scan.max_batch_rows(),
         scan.max_batch_bytes(),
-        scan.work_source(),
     )
     .unwrap();
     let read = public_read(&fragment, fragment.root(), frozen).unwrap();
@@ -1237,7 +1235,7 @@ fn package_refuses_exact_relation_and_batch_contract_drift() {
     let frozen = frozen_scan(&fragment);
     let scan = frozen.scan();
     let recipe = scan.recipe();
-    for mutation in 0..4 {
+    for mutation in 0..3 {
         let mut columns = recipe.columns().to_vec();
         if mutation == 0 {
             columns[0] = encoded(&binding, ConnectorCodecCategory::ReadColumn, 8);
@@ -1250,7 +1248,7 @@ fn package_refuses_exact_relation_and_batch_contract_drift() {
         .unwrap();
         let malformed = FrozenConnectorScan::try_new(
             draft,
-            if mutation == 3 {
+            if mutation == 2 {
                 vec![StaticScanAssignment::new(
                     Arc::from("v"),
                     ConnectorValueType::Varchar,
@@ -1268,15 +1266,10 @@ fn package_refuses_exact_relation_and_batch_contract_drift() {
                 scan.max_batch_rows()
             },
             scan.max_batch_bytes(),
-            if mutation == 2 {
-                ConnectorReadWorkSource::WholeRelation
-            } else {
-                scan.work_source()
-            },
         )
         .unwrap();
         let malformed = public_read(&fragment, fragment.root(), malformed);
-        if mutation == 3 {
+        if mutation == 2 {
             assert!(malformed.is_err());
             continue;
         }
@@ -1465,7 +1458,6 @@ fn duplicate_scan_payloads_keep_runtime_filter_assignment_occurrences() {
             )],
             NonZeroU64::new(read_budget.max_batch_rows).unwrap(),
             NonZeroU64::new(read_budget.max_batch_bytes).unwrap(),
-            relation.work_source(),
         )
         .unwrap();
         input

@@ -228,7 +228,6 @@ pub(super) fn frozen_reads_with_explicit_source_shape(
                     Vec::new(),
                     NonZeroU64::new(read_budget.max_batch_rows).unwrap(),
                     NonZeroU64::new(read_budget.max_batch_bytes).unwrap(),
-                    relation.work_source(),
                 )
                 .unwrap();
                 let facts = ConnectorReadStaticFacts::try_new(

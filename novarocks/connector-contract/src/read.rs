@@ -52,9 +52,3 @@ pub enum ConnectorReadRelationKind {
     TableExecute,
     MergeTable,
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorReadWorkSource {
-    RuntimeSplits,
-    WholeRelation,
-}
