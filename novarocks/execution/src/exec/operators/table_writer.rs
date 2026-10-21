@@ -4727,15 +4727,46 @@ pub(crate) mod tests {
             ));
             assert_eq!(*child.rows.lock().unwrap(), [7, 11]);
             operator.finish(ctx).unwrap();
-            loop {
+            let parked = loop {
                 let result = operator.drive(ctx).unwrap();
                 assert!(result.output.is_none());
                 if let NextStep::Wait(wait) = result.next {
-                    assert!(!wait.is_ready());
-                    break;
+                    let partial = operator
+                        .kernel_for_test()
+                        .partial_aggregate
+                        .as_ref()
+                        .unwrap();
+                    let child_wait = partial
+                        .wait()
+                        .expect("child finalization must remain blocked");
+                    assert!(Arc::ptr_eq(&child_wait.observable, &child.event));
+                    assert!(!child_wait.is_ready());
+                    assert!(!operator.kernel_for_test().writer_finish_requested);
+                    // Queue release can wake the parent while its child remains blocked.
+                    if !wait.is_ready() {
+                        break wait;
+                    }
+                    continue;
                 }
                 assert!(matches!(result.next, NextStep::Runnable));
-            }
+            };
+            // Exercise the writer subscription after parking without releasing the child.
+            operator
+                .kernel_for_test()
+                .writer
+                .observable()
+                .notify_observers();
+            assert!(parked.is_ready());
+            let result = operator.drive(ctx).unwrap();
+            assert!(result.output.is_none());
+            assert!(matches!(result.next, NextStep::Wait(_)));
+            let partial = operator
+                .kernel_for_test()
+                .partial_aggregate
+                .as_ref()
+                .unwrap();
+            assert!(!partial.wait().unwrap().is_ready());
+            assert!(!operator.kernel_for_test().writer_finish_requested);
         });
         assert!(poll_until(
             || stats.appended_rows.load(Ordering::Acquire) == 2,
