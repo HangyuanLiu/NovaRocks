@@ -245,7 +245,7 @@ SELECT CAST(CAST(12.345 AS DECIMAL(5,3)) AS DECIMAL(4,2)) AS checked_decimal_rou
 EXPLAIN VERBOSE SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
 
 -- @skip_result_check=true
--- @expect_error=numeric type cast involving decimal overflows
+-- @expect_sql_code=query.execution.numeric_out_of_range
 SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
 
 SET disable_optimizer_rules = 'FoldConstant';
@@ -258,7 +258,7 @@ SELECT CAST(CAST(12.345 AS DECIMAL(5,3)) AS DECIMAL(4,2)) AS checked_decimal_rou
 EXPLAIN VERBOSE SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
 
 -- @skip_result_check=true
--- @expect_error=numeric type cast involving decimal overflows
+-- @expect_sql_code=query.execution.numeric_out_of_range
 SELECT CAST(1000 AS DECIMAL(3,0)) AS checked_decimal_overflow;
 
 SET sql_mode = 32;
