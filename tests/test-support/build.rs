@@ -31,6 +31,7 @@ fn main() {
         "build.rs",
         "src/monitor/main.rs",
         "src/unix/mod.rs",
+        "src/unix/process_group.rs",
         "src/run_retention.rs",
     ] {
         println!("cargo:rerun-if-changed={path}");

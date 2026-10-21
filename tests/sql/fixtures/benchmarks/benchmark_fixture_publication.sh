@@ -42,6 +42,11 @@ fixture_publication_make_curl_config() {
   chmod 600 "$config"
   {
     printf 'silent\nshow-error\nfail-with-body\nrequest = "%s"\n' "$method"
+    if [[ -n "${NOVA_FIXTURE_RUN_CONTEXT:-}" && "$NOVA_FIXTURE_RUN_CONTEXT" != null ]]; then
+      local remaining
+      remaining="$(python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" remaining --env-file "$ENV_FILE")" || return
+      printf 'max-time = %s\nconnect-timeout = %s\n' "$remaining" "$remaining"
+    fi
     printf 'url = "%s%s"\n' "$(fixture_publication_s3_url "$uri")" "$query"
     printf 'aws-sigv4 = "aws:amz:%s:s3"\n' "${AWS_REGION:-us-east-1}"
     # curl config keeps this credential out of argv and out of command logs.

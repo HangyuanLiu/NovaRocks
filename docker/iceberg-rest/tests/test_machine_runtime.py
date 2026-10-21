@@ -1,0 +1,617 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+"""Machine authority tests; Docker effects are observed independently."""
+import copy
+import json
+from pathlib import Path
+import sys
+import tempfile
+import socket
+import threading
+import time
+import unittest
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import fixture_runtime as runtime
+import machine_runtime as machine
+
+
+def bom():
+    return {"lock_sha256": "locked-inputs", "images": {
+        n: {"alias": n, "manifest_digest": "sha256:" + n, "platform": "linux/arm64"}
+        for n in ("minio", "minio-mc", "iceberg-rest")}, "derived_images": {
+        n: {"alias": n + ":current", "image_id": "sha256:" + n,
+            "definition_sha256": "definition-" + n, "platform": "linux/arm64"}
+        for n in ("iceberg-spark", "rest-mv")}}
+
+
+class Backend:
+    def __init__(self, root=None):
+        self.events, self.version, self.online = [], None, False
+        self.occupied, self.failure, self.counter = False, None, 0
+        self.volumes = {}
+
+    labels = staticmethod(machine.MachineDocker.labels)
+    minio_volume_identity = machine.MachineDocker.minio_volume_identity
+    validate_minio_volume = machine.MachineDocker.validate_minio_volume
+    ensure_minio_volume = machine.MachineDocker.ensure_minio_volume
+    prepare_minio_volume = machine.MachineDocker.prepare_minio_volume
+    ensure_authority_volume = machine.MachineDocker.ensure_authority_volume
+
+    def inspect(self, kind, name, **kwargs):
+        assert kind == "volume"
+        return copy.deepcopy(self.volumes.get(name))
+
+    def command(self, args):
+        assert args[:2] == ["volume", "create"]
+        labels = dict(value.split("=", 1) for index, value in enumerate(args)
+                      if index > 0 and args[index - 1] == "--label")
+        self.volumes.setdefault(args[-1], dict(Name=args[-1], CreatedAt="2026-10-21T01:00:00Z",
+            Driver="local", Scope="local", Options=None, Labels=labels))
+        return args[-1]
+
+    def daemon_id(self):
+        return "local-daemon"
+
+    def unsettled_operations(self, base):
+        return []
+
+    def settle_operations(self, base):
+        pass
+
+    def image_id(self, reference):
+        return reference if reference.startswith("sha256:") else "sha256:" + reference
+
+    def healthy(self, record):
+        return self.online and self.version == record["version"] and self.failure != "health"
+
+    def validate_absent(self, record):
+        if self.occupied:
+            raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "fixed project exists")
+
+    def ensure_machine(self, record, previous=None):
+        self.validate_minio_volume(record)
+        self.events.append("ensure")
+        if self.failure == "ensure":
+            raise runtime.RuntimeFailure("PortUnavailable", "occupied port")
+        self.occupied = self.online = True
+        self.version = record["version"]
+        self.counter += 1
+        record["containers"] = {s: f"container-{s}-{self.counter}" for s in record["required_services"]}
+        record["network_id"] = "fixed-network-id"
+
+    def stop_writers(self, record):
+        self.events.append("stop-writers")
+
+    def rotate_root(self, record, previous):
+        self.events.append("rotate-root")
+        assert self.online
+
+    def assert_old_root_revoked(self, previous):
+        self.events.append("verify-fence")
+        if self.failure == "fence":
+            raise runtime.RuntimeFailure("CredentialFenceUnconfirmed", "old access still works")
+
+    def remove_rest_state(self, record):
+        self.events.append("remove-rest-state")
+
+    def validate_resources(self, record):
+        self.events.append("validate")
+
+    def connect(self, record, container, alias):
+        self.events.append(("connect", container, alias))
+
+    def own_network(self, record):
+        return {"Id": "fixed-network-id"}
+
+    def disconnect(self, record, container):
+        self.events.append(("disconnect", container))
+
+
+class TerminalPortRecoveryTests(unittest.TestCase):
+    def fixture(self, directory):
+        base = Path(directory) / "machine-test"
+        path = base / "operations/control-test.json"
+        fact = dict(schema=1, kind="control", phase="command-unknown", mutating=True,
+            command_dispatched=True, command_exit=1, timed_out=False, group_exit_observed=True,
+            control_root=directory, machine=base.name, maintenance_generation="activation-g", maintenance_version="v")
+        state = dict(phase="maintenance", generation="activation-g", version="v")
+        runtime.atomic_json(base / "state.json", state)
+        runtime.atomic_json(path, fact)
+        runtime.atomic_json(path.with_suffix(".request"), {"args": ["compose", "-f", "saved.yml", "up", "-d"]})
+        stderr = Path(str(path.with_suffix(".stdout")) + ".stderr")
+        stderr.write_text("Error response from daemon: failed to set up container networking: driver failed programming external connectivity on endpoint owned: Bind for 127.0.0.1:28000 failed: port is already allocated\n")
+        return machine.MachineDocker(), base, path, fact, state, stderr
+
+    def test_native_terminal_port_failure_allows_same_intent_retry_after_exact_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend, base, path, fact, state, _ = self.fixture(directory)
+            with mock.patch.object(backend, "activation_preflight") as preflight:
+                backend.settle_operations(base)
+                preflight.assert_called_once_with(state, None)
+            result = runtime.read_json(path)
+            self.assertEqual(result["phase"], "settled")
+            self.assertFalse(result["command_succeeded"])
+            self.assertEqual(result["terminal_failure"], "daemon-port-rejected")
+            self.assertEqual(runtime.read_json(base / "state.json")["phase"], "maintenance")
+
+    def test_timeout_transport_missing_group_or_different_intent_stays_unknown(self):
+        for mutation in ("timeout", "transport", "group", "intent"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                backend, base, path, fact, state, stderr = self.fixture(directory)
+                if mutation == "timeout": fact["timed_out"] = True
+                if mutation == "transport": stderr.write_text("Cannot connect to the Docker daemon; port is already allocated\n")
+                if mutation == "group": fact["group_exit_observed"] = False
+                if mutation == "intent": fact["maintenance_generation"] = "old-activation"
+                runtime.atomic_json(path, fact)
+                with mock.patch.object(backend, "activation_preflight") as preflight:
+                    with self.assertRaisesRegex(runtime.RuntimeFailure, "MachineOperationUnconfirmed"):
+                        backend.settle_operations(base)
+                    preflight.assert_not_called()
+                self.assertEqual(runtime.read_json(path)["phase"], "command-unknown")
+
+    def test_native_rejection_cannot_bypass_foreign_resource_preflight(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend, base, path, _, _, _ = self.fixture(directory)
+            with mock.patch.object(backend, "activation_preflight", side_effect=runtime.RuntimeFailure("RuntimeIdentityMismatch", "foreign service")):
+                with self.assertRaisesRegex(runtime.RuntimeFailure, "RuntimeIdentityMismatch"):
+                    backend.settle_operations(base)
+            self.assertEqual(runtime.read_json(path)["phase"], "command-unknown")
+
+
+class CredentialFenceTests(unittest.TestCase):
+    def probe(self, value, native_exit=1):
+        backend = machine.MachineDocker()
+        output = json.dumps(value, indent=2) + f"\nNOVA_FIXTURE_FENCE_EXIT={native_exit}\n"
+        with mock.patch.object(backend, "run_mc", return_value=output) as run:
+            backend.assert_old_root_revoked({"saved": "old private env"})
+            script = run.call_args.args[1]
+            self.assertNotIn("|| true", script)
+            self.assertIn("nr_fence_exit=$?", script)
+
+    def test_indented_native_access_rejection_proves_fence(self):
+        self.probe({"status": "error", "error": {"message": "stat failed", "cause": {
+            "error": {"Code": "InvalidAccessKeyId", "Message": "The access key does not exist"}}}})
+
+    def test_root_success_transport_failure_or_diagnostic_substring_is_not_a_fence(self):
+        cases = [
+            ({"status": "success"}, 0),
+            ({"status": "error", "error": {"cause": {"error": {"Code": "AccessDenied"}}}}, 0),
+            ({"status": "error", "error": {"message": "AccessDenied", "cause": {"error": {"Code": "ConnectionRefused"}}}}, 1),
+            ({"status": "error", "error": {"message": "SignatureDoesNotMatch"}}, 1),
+        ]
+        for value, native_exit in cases:
+            with self.subTest(value=value, native_exit=native_exit):
+                with self.assertRaisesRegex(runtime.RuntimeFailure, "CredentialFenceUnconfirmed"):
+                    self.probe(value, native_exit)
+
+
+class SnapshotDeadlineTests(unittest.TestCase):
+    def test_expired_admitted_clock_precedes_daemon_probe(self):
+        backend = Backend()
+        with tempfile.TemporaryDirectory() as directory:
+            owner = machine.MachineOwner(directory, backend=backend, daemon="local-daemon")
+            with mock.patch.object(backend, "daemon_id") as probe:
+                with self.assertRaisesRegex(runtime.RuntimeFailure, "RunBudgetExpired"):
+                    with owner.ready_snapshot({}, deadline=time.monotonic() - 1):
+                        self.fail("expired scope must not be entered")
+                probe.assert_not_called()
+            self.assertIsNone(backend.operation_deadline)
+
+    def test_slow_health_headers_cannot_renew_original_deadline(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(2)
+        stopped = threading.Event()
+        def serve():
+            try:
+                with listener.accept()[0] as connection:
+                    connection.recv(4096)
+                    for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n":
+                        connection.sendall(bytes([byte]))
+                        if stopped.wait(0.03):
+                            break
+            except OSError:
+                pass
+        worker = threading.Thread(target=serve)
+        worker.start()
+        backend = machine.MachineDocker()
+        backend.operation_deadline = time.monotonic() + 0.2
+        start = time.monotonic()
+        try:
+            self.assertFalse(backend.http_ready(f"http://127.0.0.1:{listener.getsockname()[1]}/v1/config"))
+            self.assertLess(time.monotonic() - start, 1.0)
+        finally:
+            stopped.set()
+            listener.close()
+            worker.join(timeout=3)
+        self.assertFalse(worker.is_alive())
+
+    def test_snapshot_deadline_covers_health_and_body_then_restores_outer_clock(self):
+        backend = Backend()
+        with tempfile.TemporaryDirectory() as directory:
+            owner = machine.MachineOwner(directory, backend=backend, daemon="local-daemon")
+            owner._save(dict(schema=machine.PROTOCOL, daemon_id=owner.daemon_id,
+                control_root=str(owner.root), phase="ready", version="v", generation="g"))
+            outer = time.monotonic() + 20
+            inner = time.monotonic() + 5
+            backend.operation_deadline = outer
+            def healthy(state):
+                self.assertEqual(backend.operation_deadline, inner)
+                return True
+            with mock.patch.object(backend, "healthy", side_effect=healthy), mock.patch.object(backend, "validate_minio_volume"):
+                with owner.ready_snapshot({"version": "v"}, deadline=inner):
+                    self.assertEqual(backend.operation_deadline, inner)
+            self.assertEqual(backend.operation_deadline, outer)
+            with mock.patch.object(backend, "healthy", side_effect=RuntimeError("probe failed")), mock.patch.object(backend, "validate_minio_volume"):
+                with self.assertRaisesRegex(RuntimeError, "probe failed"):
+                    with owner.ready_snapshot({"version": "v"}, deadline=inner):
+                        pass
+            self.assertEqual(backend.operation_deadline, outer)
+
+
+class Sweeper:
+    def __init__(self, record, backend):
+        self.backend = backend
+
+    def revoke_users(self):
+        self.backend.events.append("revoke-users")
+
+    def sweep(self, *, expired_only, deadline):
+        assert self.backend.online, "purge requires an online MinIO"
+        self.backend.events.append(("sweep", expired_only))
+        return {"complete": self.backend.failure != "purge", "removed": []}
+
+
+class MachineTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.backend = Backend()
+        self.owner = machine.MachineOwner(self.root / "state", backend=self.backend,
+                                          sweeper_factory=Sweeper, timeout=0.01)
+
+    def definition(self, **config):
+        return self.owner.required_definition(config, bom())
+
+    def start(self):
+        return self.owner.activate(self.definition())
+
+    def changed(self):
+        return self.definition(ports={"rest": 31002})
+
+    def assert_code(self, code, operation):
+        with self.assertRaises(runtime.RuntimeFailure) as caught:
+            operation()
+        self.assertEqual(caught.exception.code, code)
+
+    def attach(self, definition, generation=None):
+        with self.owner.ready_snapshot(definition, expected_generation=generation) as state:
+            return state
+
+    def test_repeated_explicit_start_preserves_fixed_resources_and_activation(self):
+        first = self.start()
+        self.assertEqual(first["phase"], "ready")
+        self.assertEqual(first["project"], "nr-fixture-machine")
+        self.assertEqual(first["network"], "nr-fixture-machine_iceberg_net")
+        self.assertEqual(self.start()["generation"], first["generation"])
+        self.assertEqual(self.backend.events, ["ensure"])
+
+    def test_initial_default_volume_with_foreign_owner_is_never_mounted(self):
+        name = machine.PROJECT + "_minio-data"
+        self.backend.volumes[name] = dict(Name=name, CreatedAt="2026-10-20T00:00:00Z",
+            Driver="local", Scope="local", Options=None, Labels={"novarocks.fixture.control-root": "/foreign"})
+        before = copy.deepcopy(self.backend.volumes[name])
+        self.assert_code("RuntimeIdentityMismatch", self.start)
+        self.assertEqual(self.backend.events, [])
+        self.assertEqual(self.backend.volumes[name], before)
+
+    def test_volume_facts_are_saved_before_first_writer_and_survive_retry(self):
+        def crash(record, previous=None):
+            saved = self.owner.read_saved_state()
+            self.assertEqual(saved["minio_volume_identity"], record["minio_volume_identity"])
+            self.assertTrue(saved["steps"]["activation_started"])
+            raise KeyboardInterrupt()
+        with mock.patch.object(self.backend, "ensure_machine", side_effect=crash):
+            with self.assertRaises(KeyboardInterrupt):
+                self.start()
+        identity = self.owner.read_saved_state()["minio_volume_identity"]
+        final = self.start()
+        self.assertEqual(final["minio_volume_identity"], identity)
+        self.assertEqual(self.backend.events, ["ensure"])
+
+    def test_default_volume_replacement_missing_or_foreign_fails_before_ready_recover_or_upgrade(self):
+        for mutation in ("CreatedAt", "foreign-label", "missing"):
+            for operation in ("attach", "start", "recover", "upgrade"):
+                with self.subTest(mutation=mutation, operation=operation):
+                    self.setUp()
+                    state = self.start()
+                    name = state["config"]["minio_volume"]
+                    if mutation == "missing":
+                        del self.backend.volumes[name]
+                    elif mutation == "foreign-label":
+                        self.backend.volumes[name]["Labels"]["novarocks.fixture.control-root"] = "/foreign"
+                    else:
+                        self.backend.volumes[name]["CreatedAt"] = "2026-10-21T02:00:00Z"
+                    self.backend.events.clear()
+                    if operation == "recover": self.backend.online = False
+                    call = (lambda: self.attach(self.definition())) if operation == "attach" else (
+                        lambda: self.owner.activate(self.changed(), upgrade=True)) if operation == "upgrade" else self.start
+                    self.assert_code("RuntimeIdentityMismatch", call)
+                    self.assertEqual(self.backend.events, [])
+                    self.assertEqual(self.owner.read_saved_state(), state)
+
+    def test_explicit_import_preserves_native_labels_and_rejects_same_name_replacement(self):
+        name = "migrated-minio"
+        initial = dict(Name=name, CreatedAt="2026-10-19T00:00:00Z", Driver="local", Scope="local",
+            Options={"type": "none", "device": "/data/minio", "o": "bind"}, Labels={"original.owner": "legacy"})
+        self.backend.volumes[name] = copy.deepcopy(initial)
+        definition = self.definition(minio_volume=name)
+        state = self.owner.activate(definition)
+        self.assertEqual(state["minio_volume_identity"], initial)
+        self.assertEqual(self.backend.volumes[name], initial)
+        self.backend.online = False
+        recovered = self.owner.activate(definition)
+        self.assertEqual(recovered["minio_volume_identity"], initial)
+        for field, changed in (("CreatedAt", "2026-10-21T00:00:00Z"), ("Driver", "other"),
+                ("Scope", "global"), ("Options", {}), ("Labels", {"new.owner": "foreign"})):
+            with self.subTest(field=field):
+                self.backend.volumes[name] = {**copy.deepcopy(initial), field: changed}
+                self.backend.events.clear()
+                self.assert_code("RuntimeIdentityMismatch", lambda: self.owner.activate(definition))
+                self.assertEqual(self.backend.events, [])
+        self.backend.volumes[name] = copy.deepcopy(initial)
+        self.assertEqual(self.owner.activate(definition), recovered)
+
+    def test_default_recovery_preserves_frozen_facts(self):
+        state = self.start()
+        self.backend.online = False
+        recovered = self.start()
+        self.assertEqual(recovered["minio_volume_identity"], state["minio_volume_identity"])
+        self.assertNotEqual(recovered["generation"], state["generation"])
+
+    def test_unstarted_create_crash_can_freeze_volume_but_started_missing_facts_cannot(self):
+        record = self.owner._record(self.definition())
+        self.owner._save(record)
+        self.backend.ensure_authority_volume(record)
+        identity = self.backend.ensure_minio_volume(record)
+        recovered = self.start()
+        self.assertEqual(recovered["minio_volume_identity"], identity)
+        recovered["phase"] = "maintenance"
+        recovered["steps"]["activation_started"] = True
+        recovered.pop("minio_volume_identity")
+        self.owner._save(recovered)
+        self.backend.events.clear()
+        self.assert_code("RuntimeIdentityMismatch", self.start)
+        self.assertEqual(self.backend.events, [])
+
+    def test_absent_attach_has_no_service_effect(self):
+        self.assert_code("MachineUnavailable", lambda: self.attach(self.definition()))
+        self.assertEqual(self.backend.events, [])
+
+    def test_attach_holds_maintenance_lock_until_publication_can_commit(self):
+        self.start()
+        with self.owner.ready_snapshot(self.definition()):
+            other = machine.MachineOwner(self.owner.root, backend=self.backend, timeout=0.001)
+            self.assert_code("MachineMaintaining", lambda: other.sweep(deadline=time.monotonic()))
+        self.assertEqual(self.backend.events, ["ensure"])
+
+    def test_startup_sweep_pins_version_and_activation_before_cleanup(self):
+        state = self.owner.activate(self.definition())
+        before = list(self.backend.events)
+        with self.assertRaisesRegex(runtime.RuntimeFailure, "MachineVersionMismatch"):
+            self.owner.sweep(expected_version="another", expected_generation=state["generation"])
+        with self.assertRaisesRegex(runtime.RuntimeFailure, "MachineUnavailable"):
+            self.owner.sweep(expected_version=state["version"], expected_generation="old-activation")
+        self.assertEqual(self.backend.events, before)
+        report = self.owner.sweep(expected_version=state["version"], expected_generation=state["generation"])
+        self.assertTrue(report["complete"])
+        self.assertIn(("sweep", True), self.backend.events)
+
+    def test_wrong_version_neither_attaches_nor_rebuilds_services(self):
+        first = self.start()
+        before = copy.deepcopy(self.backend.events)
+        self.assert_code("MachineVersionMismatch", lambda: self.owner.activate(self.changed()))
+        self.assert_code("MachineVersionMismatch", lambda: self.attach(self.changed()))
+        self.assertEqual(self.backend.events, before)
+        self.assertEqual(self.owner.read_saved_state(), first)
+
+    def test_same_lock_different_definition_or_actual_image_is_a_new_version(self):
+        first = self.definition()["version"]
+        for field in ("definition_sha256", "image_id"):
+            supplied = bom()
+            supplied["derived_images"]["rest-mv"][field] = "sha256:different"
+            self.assertNotEqual(first, self.owner.required_definition({}, supplied)["version"])
+        template = self.root / "model.yml"
+        template.write_text(self.owner.template.read_text() + "\n# changed model\n")
+        self.owner.template = template
+        self.assertNotEqual(first, self.definition()["version"])
+
+    def test_supply_timestamps_and_cache_paths_do_not_change_runtime_identity(self):
+        supplied = bom()
+        supplied["generated_at"] = "later"
+        supplied["derived_images"]["rest-mv"].update(created_at="later", cache_path="/another/cache")
+        self.assertEqual(self.definition()["version"], self.owner.required_definition({}, supplied)["version"])
+
+    def test_upgrade_fences_before_online_cleanup_and_preserves_minio_volume(self):
+        first = self.start()
+        self.backend.events.clear()
+        final = self.owner.activate(self.changed(), upgrade=True)
+        self.assertEqual(self.backend.events, ["stop-writers", "rotate-root", "verify-fence",
+            "revoke-users", ("sweep", False), "remove-rest-state", "ensure"])
+        self.assertNotEqual(first["credentials"], final["credentials"])
+        self.assertEqual(first["volumes"][0], final["volumes"][0])
+        self.assertNotEqual(first["generation"], final["generation"])
+        self.assertEqual(final["phase"], "ready")
+
+    def test_partial_cleanup_stays_unpublishable_and_reuses_saved_rotation(self):
+        self.start()
+        self.backend.failure = "purge"
+        self.assert_code("ScratchCleanupIncomplete", lambda: self.owner.activate(self.changed(), upgrade=True))
+        failed = self.owner.read_saved_state()
+        self.assertEqual(failed["phase"], "maintenance")
+        self.assert_code("MachineUnavailable", lambda: self.attach(self.changed()))
+        self.backend.failure = None
+        final = self.owner.activate(self.changed(), upgrade=True)
+        self.assertEqual(final["generation"], failed["generation"])
+        self.assertEqual(final["credentials"], failed["credentials"])
+        self.assertEqual(self.backend.events.count("rotate-root"), 1)
+
+    def test_unconfirmed_fence_never_purges_and_retries_without_another_rotation(self):
+        self.start()
+        self.backend.failure = "fence"
+        self.assert_code("CredentialFenceUnconfirmed", lambda: self.owner.activate(self.changed(), upgrade=True))
+        self.assertNotIn(("sweep", False), self.backend.events)
+        self.backend.failure = None
+        self.owner.activate(self.changed(), upgrade=True)
+        self.assertEqual(self.backend.events.count("rotate-root"), 1)
+
+    def test_port_and_health_failures_do_not_commit_ready(self):
+        for failure, code in (("ensure", "PortUnavailable"), ("health", "ReadinessTimeout")):
+            with self.subTest(failure=failure):
+                self.backend.failure = failure
+                self.assert_code(code, self.start)
+                self.assertEqual(self.owner.read_saved_state()["phase"], "maintenance")
+
+    def test_second_control_directory_cannot_create_a_second_machine_stack(self):
+        self.start()
+        other = machine.MachineOwner(self.root / "other", backend=self.backend)
+        self.assert_code("RuntimeIdentityMismatch", lambda: other.activate(other.required_definition({}, bom())))
+
+    def test_daemon_and_activation_identity_must_match(self):
+        state = self.start()
+        other = machine.MachineOwner(self.owner.root, daemon="other-daemon", backend=self.backend)
+        self.assert_code("RuntimeIdentityMismatch", lambda: other.activate(other.required_definition({}, bom())))
+        self.assert_code("MachineUnavailable", lambda: self.attach(self.definition(), "stale"))
+        self.owner.attach_consumer("exact-container", "hms", state["generation"])
+        self.assertEqual(self.backend.events[-1], ("connect", "exact-container", "hms"))
+
+    def test_credentials_remain_private_and_status_is_redacted(self):
+        state = self.start()
+        public = json.dumps(machine.public_snapshot(state))
+        for secret in state["credentials"].values():
+            self.assertNotIn(secret, public)
+        for path in (self.owner.base / "state.json", Path(state["compose_env"])):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_committed_state_is_configuration_authority_after_upgrade(self):
+        self.start()
+        runtime.atomic_json(self.owner.base / "config.json", {"ports": {"rest": 31009}})
+        self.assertEqual(self.owner.load_config()["ports"]["rest"], 28002)
+        self.owner.activate(self.changed(), upgrade=True)
+        self.assertEqual(self.owner.load_config()["ports"]["rest"], 31002)
+
+    def test_volatile_scratch_observations_do_not_change_attach_snapshot(self):
+        state = self.start()
+        self.assertEqual(self.owner.scratch_observation(state)["status"], "UNKNOWN")
+        report = dict(sampled_at_unix_ms=1800000000000, observed_counts={"s3-prefix": 3},
+            oldest_created_unix_ms=1799990000000, counts_are_pre_cleanup=True,
+            enumeration_complete=False, enumeration_scope=["s3-prefix"], unknown_counts={"user": 1})
+        self.owner._save_scratch_observation(state, report)
+        self.assertEqual(self.attach(self.definition()), state)
+        observed = self.owner.scratch_observation(state)
+        self.assertTrue(observed["sample_is_current_activation"])
+        self.assertFalse(observed["enumeration_complete"])
+        updated = self.owner.activate(self.changed(), upgrade=True)
+        self.assertFalse(self.owner.scratch_observation(updated)["sample_is_current_activation"])
+
+    def test_incomplete_input_or_unsafe_lifetime_policy_is_rejected(self):
+        supplied = bom()
+        del supplied["derived_images"]["rest-mv"]["definition_sha256"]
+        self.assert_code("FixturePrerequisiteMissing", lambda: self.owner.required_definition({}, supplied))
+        self.assert_code("InvalidConfiguration", lambda: self.definition(policy={"scratch_ttl_seconds": 100}))
+        self.assert_code("InvalidConfiguration", lambda: self.definition(ports={"rest": 28000}))
+        for timeout in (float("nan"), float("inf"), 0, -1, True):
+            self.assert_code("InvalidConfiguration", lambda: machine.MachineOwner(self.root, backend=self.backend, timeout=timeout))
+        for root in ("s3://novarocks/a/../b", "s3://novarocks", "s3://novarocks/a?query", "s3://novarocks/a b"):
+            self.assert_code("InvalidConfiguration", lambda: self.definition(benchmark_root=root))
+
+
+class DockerActivationTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        fake = Backend()
+        self.owner = machine.MachineOwner(Path(self.temporary.name), backend=fake, sweeper_factory=Sweeper)
+        self.source = self.owner.activate(self.owner.required_definition({}, bom()))
+        self.target = self.owner._record(self.owner.required_definition({"ports": {"rest": 31002}}, bom()))
+        self.target["minio_volume_identity"] = copy.deepcopy(self.source["minio_volume_identity"])
+        self.infos = {}
+        for service in self.source["images"]:
+            self.install(self.source, service)
+        outer = self
+        class Docker(machine.MachineDocker):
+            def command(self, args, **kwargs):
+                service = next((x.split("=", 2)[-1] for x in args if x.startswith("label=com.docker.compose.service=")), None)
+                return outer.infos[service]["Id"] if service in outer.infos else ""
+            def inspect(self, kind, identity, **kwargs):
+                if kind == "network":
+                    return {"Id": outer.source["network_id"], "Labels": self.labels(outer.source)}
+                if kind == "volume":
+                    return copy.deepcopy(fake.volumes.get(identity))
+                return next((info for info in outer.infos.values() if info["Id"] == identity), None)
+        self.docker = Docker()
+
+    def install(self, record, service, *, identity=None):
+        ports = record["service_ports"].get(service, {})
+        self.infos[service] = {"Id": identity or record.get("containers", {}).get(service, "new-" + service),
+            "Image": record["images"][service]["image_id"],
+            "Config": {"Labels": {**machine.MachineDocker.labels(record),
+                "novarocks.fixture.version": record["version"], "novarocks.fixture.activation": record["generation"]}},
+            "HostConfig": {"PortBindings": {key: [{"HostPort": str(value)}] for key, value in ports.items()}}}
+
+    def test_existing_minio_volume_with_active_consumer_is_never_adopted(self):
+        selected = self.target["config"]["minio_volume"]
+        def inspect(kind, identity, **kwargs):
+            return {"Labels": self.docker.labels(self.target)} if kind == "volume" and identity == selected else None
+        def command(args, **kwargs):
+            return "active-original-minio" if "volume=" + selected in args else ""
+        with mock.patch.object(self.docker, "inspect", side_effect=inspect), mock.patch.object(self.docker, "command", side_effect=command):
+            with self.assertRaisesRegex(runtime.RuntimeFailure, "active consumer"):
+                self.docker.validate_absent(self.target)
+
+    def test_daemon_authority_from_other_control_root_prevents_compose_activation(self):
+        marker = {"Labels": {**self.docker.labels(self.target), "novarocks.fixture.control-root": "/another-owner"}}
+        calls = []
+        with mock.patch.object(self.docker, "inspect", return_value=marker), mock.patch.object(self.docker, "command", side_effect=lambda args: calls.append(args)):
+            with self.assertRaisesRegex(runtime.RuntimeFailure, "another control directory"):
+                self.docker.ensure_machine(self.target)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ["volume", "create"])
+
+    def test_partial_activation_accepts_exact_source_and_target_mix(self):
+        self.install(self.target, "rest")
+        self.docker.activation_preflight(self.target, self.source)
+
+    def test_same_image_foreign_activation_is_rejected_before_compose(self):
+        self.install(self.target, "rest")
+        self.infos["rest"]["Config"]["Labels"]["novarocks.fixture.activation"] = "foreign"
+        with self.assertRaisesRegex(runtime.RuntimeFailure, "RuntimeIdentityMismatch"):
+            self.docker.activation_preflight(self.target, self.source)
+
+    def test_external_container_replacement_does_not_pass_saved_identity(self):
+        self.install(self.source, "rest", identity="unapproved-replacement")
+        with self.assertRaisesRegex(runtime.RuntimeFailure, "replaced outside maintenance"):
+            self.docker.container(self.source, "rest")
+
+
+if __name__ == "__main__":
+    unittest.main()

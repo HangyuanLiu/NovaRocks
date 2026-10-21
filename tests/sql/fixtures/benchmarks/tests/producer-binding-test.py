@@ -110,7 +110,8 @@ class ProducerBindingTest(unittest.TestCase):
         model = resolver.load_model(ROOT / "tests/sql/fixtures/benchmarks/benchmark_tools.toml")
         sources = set(model["fixture"]["producer_inputs"].values()) | {
             "tests/sql/fixtures/benchmarks/benchmark_tools.toml", "docker/fixture-inputs/lock.json",
-            "docker/fixture-inputs/fixture_inputs.py", "docker/iceberg-rest/runtime_entry.py", "docker/iceberg-rest/fixture_runtime.py"}
+            "docker/fixture-inputs/fixture_inputs.py", "docker/iceberg-rest/runtime_entry.py", "docker/iceberg-rest/fixture_runtime.py",
+            "docker/iceberg-rest/fixture_run.py", "docker/iceberg-rest/scratch.py"}
         for name in sources:
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -134,6 +135,17 @@ class ProducerBindingTest(unittest.TestCase):
         return subprocess.run(["bash", str(self.root / "tests/sql/fixtures/benchmarks/bootstrap_benchmark_data.sh"),
             "--suite", "ssb", "--scale", "1", "--resolved-dataset", str(self.resolved_path), mode],
             env=self.environment, capture_output=True, text=True, timeout=20)
+
+    def test_machine_snapshot_preserves_exact_producer_verification(self):
+        path = self.publication / "manifest.json"
+        manifest = json.loads(path.read_text())
+        manifest["runtime"]["machine"] = manifest["runtime"].pop("catalog")
+        path.write_text(json.dumps(manifest))
+        resolver.validate_producer(self.root, self.resolved, self.publication,
+                                   "sha256:spark-r2", "r2-exact-container")
+        with self.assertRaises(ValueError):
+            resolver.validate_producer(self.root, self.resolved, self.publication,
+                                       "sha256:wrong", "r2-exact-container")
 
     def test_ready_check_uses_published_input_without_bind_or_spark(self):
         self.environment["NOVA_ENV_REST_ENV_FILE"] = str(self.publication / "env.sh")

@@ -128,13 +128,30 @@ unset NOVA_ENV_SHARED_DOCKER NOVA_ENV_COMPOSE_PROJECT NOVA_ENV_REST_WAREHOUSE_UR
 unset AWS_S3_ACCESS_KEY_ID AWS_S3_SECRET_ACCESS_KEY
 # shellcheck source=/dev/null
 source "$runtime_env"
+NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$script_dir/../../../../docker/iceberg-rest/fixture_run.py" context --env-file "$runtime_env")"
+export NOVA_FIXTURE_RUN_CONTEXT
+trino_owner=(python3 "$script_dir/../../../../docker/iceberg-rest/trino_run.py" --env-file "$runtime_env")
+schema_location=""
+if [[ "$action" == create-parent ]]; then
+  python3 "$script_dir/../../../../docker/iceberg-rest/fixture_run.py" sweep-start --env-file "$runtime_env" >&2
+  schema_location="$(python3 - "$NOVA_FIXTURE_RUN_CONTEXT" "$namespace" "$script_dir" <<'PYCTX'
+import json,pathlib,sys
+sys.path.insert(0,str(pathlib.Path(sys.argv[3]).resolve().parents[3]/"docker/iceberg-rest"))
+from scratch import resource_run
+value=json.loads(sys.argv[1])
+if value is None or resource_run(sys.argv[2]) != value["identity"]["run_id"]:
+    raise SystemExit("shared Trino writer namespace must belong to the original scratch run")
+print(value["identity"]["scope_root"]+"/rest/"+sys.argv[2])
+PYCTX
+)"
+fi
 
 [[ "${NOVA_ENV_SHARED_DOCKER:-}" == true ]] || fail "a shared Iceberg REST fixture is not active"
 [[ -n "${NOVA_ENV_COMPOSE_PROJECT:-}" ]] || fail "generated Iceberg REST environment has no compose project"
 [[ -n "${NOVA_ENV_REST_WAREHOUSE_URI:-}" ]] || fail "generated Iceberg REST environment has no warehouse URI"
 [[ -n "${AWS_S3_ACCESS_KEY_ID:-}" ]] || fail "generated Iceberg REST environment has no S3 access key"
 [[ -n "${AWS_S3_SECRET_ACCESS_KEY:-}" ]] || fail "generated Iceberg REST environment has no S3 secret key"
-network="${NOVA_ENV_COMPOSE_PROJECT}_iceberg_net"
+network="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["runtime"]["machine"]["network"])' "$NOVA_ENV_MANIFEST")"
 docker network inspect "$network" >/dev/null 2>&1 || fail "missing Docker network $network; run docker/iceberg-rest/up.sh"
 
 if [[ -n "${NOVA_TRINO_IMAGE:-}" ]]; then
@@ -174,21 +191,21 @@ fi
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/novarocks-trino-rest-interop.XXXXXX")
 container_name="nr-trino483-${$}-$(date +%s)"
 cleanup() {
-  docker rm -f "$container_name" >/dev/null 2>&1 || true
-  rm -rf "$work_dir"
+  local primary=$? cleanup=0
+  trap - EXIT INT TERM
+  if [[ -n "${container_id:-}" ]]; then
+    "${trino_owner[@]}" stop --container "$container_id" || cleanup=$?
+  fi
+  rm -rf "$work_dir" || cleanup=$?
+  (( primary == 0 )) || exit "$primary"
+  exit "$cleanup"
 }
-trap cleanup EXIT INT TERM
-
-docker run --detach --rm \
-  --pull never \
-  --name "$container_name" \
-  --label org.novarocks.test=trino-rest-interop \
-  --network "$network" \
-  --env NOVA_TRINO_REST_WAREHOUSE="$NOVA_ENV_REST_WAREHOUSE_URI" \
-  --env NOVA_TRINO_S3_ACCESS_KEY="$AWS_S3_ACCESS_KEY_ID" \
-  --env NOVA_TRINO_S3_SECRET_KEY="$AWS_S3_SECRET_ACCESS_KEY" \
-  --mount "type=bind,src=$script_dir/rest-catalog,dst=/etc/trino,readonly" \
-  "$trino_image" >"$work_dir/container-id"
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+container_id="$("${trino_owner[@]}" start --image "$trino_image" --name "$container_name" --config-dir "$script_dir/rest-catalog")"
+container_name="$container_id"
+printf '%s\n' "$container_id" > "$work_dir/container-id"
 
 healthy=false
 for _ in $(seq 1 120); do
@@ -210,7 +227,7 @@ if [[ "$healthy" != true ]]; then
 fi
 
 trino() {
-  docker exec "$container_name" /usr/bin/trino --server http://localhost:8080 "$@"
+  "${trino_owner[@]}" exec --container "$container_name" -- /usr/bin/trino --server http://localhost:8080 "$@"
 }
 
 show_stats_ndv() {
@@ -242,10 +259,15 @@ actual_version=$(trino --output-format TSV --execute 'SELECT version()')
 qualified="iceberg.${namespace}.${table}"
 qualified_snapshots="iceberg.${namespace}.\"${table}\$snapshots\""
 if [[ "$action" == create-parent ]]; then
-  trino --execute "CREATE SCHEMA IF NOT EXISTS iceberg.${namespace}" >/dev/null
+  trino --execute "CREATE SCHEMA IF NOT EXISTS iceberg.${namespace} WITH (location = '$schema_location')" >/dev/null
   trino --execute "DROP TABLE IF EXISTS ${qualified}" >/dev/null
-  trino --execute "CREATE TABLE ${qualified} (id BIGINT, k BIGINT) WITH (format_version = 3)" >/dev/null
+  trino --execute "CREATE TABLE ${qualified} (id BIGINT, k BIGINT) WITH (format_version = 3, location = '$schema_location/$table')" >/dev/null
   trino --execute "INSERT INTO ${qualified} VALUES (1, 10), (2, 20)" >/dev/null
+  actual_files="$(trino --output-format TSV --execute "SELECT file_path FROM iceberg.${namespace}.\"${table}\$files\"")"
+  [[ -n "$actual_files" ]] || fail "Trino parent omitted actual data files"
+  while IFS= read -r actual_file; do
+    [[ "$actual_file" == "$schema_location/$table/"* ]] || fail "Trino parent data escaped its original scratch location"
+  done <<<"$actual_files"
   trino --execute "ANALYZE ${qualified}" >/dev/null
   source_facts=$(trino --output-format TSV --execute \
     "SELECT format('%s|%s|%s|%s', count(*), count(DISTINCT id), min(id), max(id)) FROM ${qualified}")

@@ -74,8 +74,11 @@ PY
 : "${AWS_S3_ACCESS_KEY_ID:?pinned S3 access key required}"
 : "${AWS_S3_SECRET_ACCESS_KEY:?pinned S3 secret required}"
 
-run_id=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
-export NR_IRU13B_INTEROP_NAMESPACE="iru13b_${run_id}"
+NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" context --env-file "$publication/env.sh")"
+export NOVA_FIXTURE_RUN_CONTEXT
+python3 "$repo_root/docker/iceberg-rest/fixture_run.py" sweep-start --env-file "$publication/env.sh" >&2
+run_id=$(python3 -c 'import json,sys,uuid; value=json.loads(sys.argv[1]);print(value["identity"]["run_id"] if value else uuid.uuid4().hex)' "$NOVA_FIXTURE_RUN_CONTEXT")
+export NR_IRU13B_INTEROP_NAMESPACE="${run_id}_i13b"
 export NR_IRU13B_INTEROP_ARTIFACT_DIR="$NOVA_ENV_RUNTIME_DIR/iru13b-java-rest-$run_id"
 mkdir "$NR_IRU13B_INTEROP_ARTIFACT_DIR"
 artifact="$NR_IRU13B_INTEROP_ARTIFACT_DIR/runner.log"

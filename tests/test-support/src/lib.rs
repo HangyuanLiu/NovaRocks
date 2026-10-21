@@ -36,7 +36,7 @@ pub use socket_deadline::SocketDeadlineOwner;
 pub use managed_process::{
     ManagedProcess, ManagedProcessLogSource, ManagedProcessLogTail, ReadyMarker,
 };
-pub use monitor_client::ManagedCommand;
+pub use monitor_client::{ManagedCommand, PayloadLifetimeExpired};
 pub use reserved_tcp_port::ReservedTcpPort;
 
 /// Establishes the ordinary nextest run lease before a nested runner is spawned.

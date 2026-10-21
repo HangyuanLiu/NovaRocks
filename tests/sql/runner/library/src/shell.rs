@@ -43,6 +43,15 @@ pub(crate) fn execute_shell_step_until(
     sql: &str,
     deadline: Option<Instant>,
 ) -> (bool, Option<QueryExecution>, String) {
+    execute_shell_step_in_context(sql, deadline, None, false)
+}
+
+pub(crate) fn execute_shell_step_in_context(
+    sql: &str,
+    deadline: Option<Instant>,
+    context: Option<&str>,
+    cleanup: bool,
+) -> (bool, Option<QueryExecution>, String) {
     let Some(deadline) = deadline else {
         return execute_shell_step(sql);
     };
@@ -72,6 +81,17 @@ pub(crate) fn execute_shell_step_until(
                 .expect("shell step")
                 .trim(),
         );
+        if let Some(context) = context {
+            command
+                .env(
+                    novarocks_cluster_harness::fixture_run::RUN_CONTEXT_ENV,
+                    context,
+                )
+                .env(
+                    "NOVA_FIXTURE_CLEANUP_MODE",
+                    if cleanup { "true" } else { "false" },
+                );
+        }
         let capture = (|| -> anyhow::Result<_> {
             use std::os::unix::fs::OpenOptionsExt;
             let stdout = std::fs::OpenOptions::new()
@@ -260,6 +280,21 @@ mod bounded_tests {
         );
         assert!(!signal.0);
         assert_eq!(signal.1.unwrap().text_output, "-1");
+    }
+    #[test]
+    fn nested_shell_receives_the_original_context_and_explicit_cleanup_mode() {
+        let original =
+            r#"{"schema":1,"deadline_unix_ms":1792541400000,"identity":{"run_id":"original"}}"#;
+        let sql =
+            "shell: printf '%s\\n%s' \"$NOVA_FIXTURE_RUN_CONTEXT\" \"$NOVA_FIXTURE_CLEANUP_MODE\"";
+        let (ok, result, error) = execute_shell_step_in_context(
+            sql,
+            Some(Instant::now() + Duration::from_secs(2)),
+            Some(original),
+            true,
+        );
+        assert!(ok, "{error}");
+        assert_eq!(result.unwrap().text_output, format!("0\n{original}\ntrue"));
     }
     #[test]
     fn expired_clock_never_spawns_and_timeout_stops_the_owned_group() {

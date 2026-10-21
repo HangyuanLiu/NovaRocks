@@ -95,6 +95,7 @@ require_value() {
 parse_args() {
   while (($#)); do
     case "$1" in
+      --fixture-budget-secs) require_value "$1" "${2:-}"; export NOVA_FIXTURE_BUDGET_SECS="$2"; shift 2 ;;
       --suite)
         require_value "$1" "${2:-}"
         suite="${2:-}"
@@ -486,7 +487,7 @@ patch_generator_source() {
 
 cleanup_spark_tmp_dir() {
   local tmp_dir="$1"
-  "${compose_args[@]}" exec -T spark /bin/bash -lc "rm -rf '$tmp_dir'" >/dev/null 2>&1 || true
+  python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" cleanup-dir --env-file "$ENV_FILE" --path "$tmp_dir"
 }
 
 tar_source_to_spark() {
@@ -568,12 +569,14 @@ verify_raw_files() {
 }
 
 generate_raw_files() {
-  local tmp_dir="/tmp/novarocks-$suite-generator-${NOVA_ENV_ID:-env}-$$"
+  local tmp_dir
+  tmp_dir="$(python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" temp-dir --env-file "$ENV_FILE")" || return
+  trap 'primary=$?; cleanup=0; cleanup_spark_tmp_dir '"$(printf '%q' "$tmp_dir")"' || cleanup=$?; if (( primary != 0 )); then exit "$primary"; fi; exit "$cleanup"' EXIT
   rm -rf "$raw_dir"
   mkdir -p "$raw_dir"
   log "Generating $suite raw files with $generator_name..."
 
-  "${compose_args[@]}" exec -T spark /bin/bash -lc "rm -rf '$tmp_dir' && mkdir -p '$tmp_dir/source' '$tmp_dir/raw'"
+  "${compose_args[@]}" exec -T spark /bin/bash -lc "mkdir -p '$tmp_dir/source' '$tmp_dir/raw'"
   if ! tar_source_to_spark "$tmp_dir"; then
     cleanup_spark_tmp_dir "$tmp_dir"
     return 1
@@ -592,7 +595,7 @@ generate_raw_files() {
     cleanup_spark_tmp_dir "$tmp_dir"
     return 1
   fi
-  cleanup_spark_tmp_dir "$tmp_dir"
+  cleanup_spark_tmp_dir "$tmp_dir" || return
   verify_raw_files
 }
 
@@ -606,29 +609,25 @@ upload_raw_files() {
   local target_path
   target_path="$(s3_to_mc_path "$raw_uri")"
   log "Uploading raw files to $raw_uri..."
-  "${compose_args[@]}" run --rm -T \
-    -e "MINIO_ROOT_USER=$AWS_S3_ACCESS_KEY_ID" \
-    -e "MINIO_ROOT_PASSWORD=$AWS_S3_SECRET_ACCESS_KEY" \
-    --volume "$raw_dir:/benchmark-raw:ro" \
-    --entrypoint /bin/sh mc -c "
-    set -eu
-    /usr/bin/mc alias set minio http://minio:9000 \"\$MINIO_ROOT_USER\" \"\$MINIO_ROOT_PASSWORD\" >/dev/null
-    # raw_uri is this writer's unique staging prefix, never a shared dataset key.
-    /usr/bin/mc rm --recursive --force '$target_path' >/dev/null 2>&1 || true
-    /usr/bin/mc cp --recursive /benchmark-raw/ '$target_path/'
-  "
+  local object relative status
+  while IFS= read -r -d '' object; do
+    relative="${object#"$raw_dir"/}"
+    status="$(fixture_publication_put_conditional "$raw_uri/$relative" "$object" absent)"
+    [[ "$status" == 200 || "$status" == 201 ]] || return 1
+  done < <(find "$raw_dir" -type f -print0)
 }
 
 run_spark_loader() {
   log "Writing $suite data to Iceberg with Spark..."
-  local loader_tmp_dir="/tmp/novarocks-benchmark-bootstrap-${NOVA_ENV_ID:-env}-$$"
+  local loader_tmp_dir
+  loader_tmp_dir="$(python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" temp-dir --env-file "$ENV_FILE")" || return
+  trap 'primary=$?; cleanup=0; cleanup_spark_tmp_dir '"$(printf '%q' "$loader_tmp_dir")"' || cleanup=$?; if (( primary != 0 )); then exit "$primary"; fi; exit "$cleanup"' EXIT
   local fixture_contract_in_spark="$loader_tmp_dir/fixture-contract.json"
   local schema_arg=""
   local spark_master="${NOVAROCKS_BENCHMARK_SPARK_MASTER:-local[2]}"
   local spark_memory="${NOVAROCKS_BENCHMARK_SPARK_MEMORY:-2g}"
   local spark_shuffle_partitions="${NOVAROCKS_BENCHMARK_SPARK_SHUFFLE_PARTITIONS:-8}"
   local spark_default_parallelism="${NOVAROCKS_BENCHMARK_SPARK_DEFAULT_PARALLELISM:-8}"
-  "${compose_args[@]}" exec -T spark /bin/bash -lc "rm -rf '$loader_tmp_dir' && mkdir -p '$loader_tmp_dir'"
   "${compose_args[@]}" cp "$spark_loader" "spark:$loader_tmp_dir/write_standard_benchmark.py"
   "${compose_args[@]}" cp "$fixture_contract_file" "spark:$fixture_contract_in_spark"
   if [[ -n "$schema_ddl_file" ]]; then
@@ -638,7 +637,6 @@ run_spark_loader() {
   fi
   "${compose_args[@]}" exec -T spark /bin/bash -lc "
     set -euo pipefail
-    trap 'rm -rf $loader_tmp_dir' EXIT
     spark_submit_bin=\"\${SPARK_SUBMIT_BIN:-}\"
     if [[ -z \"\$spark_submit_bin\" ]]; then
       spark_submit_bin=\"\$(command -v spark-submit || true)\"
@@ -690,7 +688,10 @@ PYBIND
 )" || return 1
   ENV_FILE="$publication/env.sh"
   source_env
-  compose_args=(python3 "$SOURCE_ROOT/docker/iceberg-rest/runtime_entry.py" compose
+  NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" context --env-file "$ENV_FILE")"
+  export NOVA_FIXTURE_RUN_CONTEXT
+  python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" sweep-start --env-file "$ENV_FILE" >&2 || return
+  compose_args=(python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" compose --env-file "$ENV_FILE" --
     --env-file "$NOVA_ENV_COMPOSE_ENV" -p "$NOVA_ENV_COMPOSE_PROJECT" -f "$NOVA_ENV_COMPOSE_FILE")
   spark_container="$("${compose_args[@]}" ps -q spark)" || return 1
   [[ -n "$spark_container" && "$spark_container" != *$'\n'* ]] || return 1
@@ -712,6 +713,12 @@ run_with_timeout() {
   local started deadline child_status
   deadline="${NOVA_ENV_BENCHMARK_BUILD_TIMEOUT_SECONDS:-7200}"
   [[ "$deadline" =~ ^[1-9][0-9]*$ ]] || return 64
+  if [[ -n "${NOVA_FIXTURE_RUN_CONTEXT:-}" && "$NOVA_FIXTURE_RUN_CONTEXT" != null ]]; then
+    local remaining
+    remaining="$(python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" remaining --env-file "$ENV_FILE")" || return
+    deadline="$(python3 -c 'import math,sys;print(max(0,min(int(sys.argv[1]),math.floor(float(sys.argv[2])))))' "$deadline" "$remaining")"
+    (( deadline > 0 )) || return 124
+  fi
   "$@" &
   owner_child_pid="$!"
   started="$SECONDS"
@@ -818,6 +825,8 @@ main() {
     # Consume exactly the caller's published environment and immutable READY.
     # A consumer never binds a runtime or starts Spark to inspect existing data.
     source_env
+    NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" context --env-file "$ENV_FILE")"
+    export NOVA_FIXTURE_RUN_CONTEXT
     if [[ "${NOVA_ENV_READY:-false}" != true ]]; then
       emit_error ready_invalid "fixture publication is unbound"
       exit 1

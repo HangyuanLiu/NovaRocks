@@ -33,84 +33,6 @@ sys.path.insert(0, str(MODULE.parent))
 import fixture_runtime as runtime
 
 
-def renderer(context, staging):
-    for name in runtime.ENTRY_FILES:
-        (staging / name).write_text(json.dumps({"ready": context["ready"],
-            "endpoints": context["endpoints"], "publication": context["publication_dir"]}))
-
-
-class Backend:
-    def __init__(self, root):
-        self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.calls = []
-        self.external = []
-        self.fail = None
-
-    def daemon_id(self):
-        return "test-daemon"
-
-    def image_id(self, reference):
-        return reference if reference.startswith("sha256:") else "sha256:" + reference
-
-    def healthy(self, record):
-        return (self.root / record["id"]).exists()
-
-    def ensure(self, record, parent=None):
-        self.calls.append(("ensure", record["id"], dict(record["ports"])))
-        if self.fail == "ensure":
-            raise runtime.RuntimeFailure("PortUnavailable", record["id"])
-        (self.root / record["id"]).touch()
-        with (self.root / (record["id"] + ".ensure")).open("a") as log:
-            log.write("created\n")
-
-    def reconnect(self, parent, catalogs):
-        self.calls.append(("reconnect", [item["id"] for item in catalogs]))
-
-    def external_connections(self, record, parent):
-        return self.external
-
-    def purge(self, record, prefixes):
-        self.calls.append(("purge", record["id"], prefixes))
-        if self.fail == "purge":
-            raise runtime.RuntimeFailure("DockerOperationFailed", "injected purge failure")
-
-    def stop(self, record):
-        self.calls.append(("stop", record["id"]))
-        (self.root / record["id"]).unlink(missing_ok=True)
-
-    def container(self, record, service):
-        return {"Id": record["id"] + "-" + service}
-
-    def disconnect(self, record, container):
-        self.calls.append(("disconnect", record["id"]))
-        self.external = []
-
-    def connect(self, record, container, alias):
-        self.external = [container]
-
-    def delete_resources(self, record):
-        self.calls.append(("delete", record["id"]))
-        if self.fail == "delete":
-            raise runtime.RuntimeFailure("DockerOperationFailed", "injected uncertain deletion")
-        (self.root / record["id"]).unlink(missing_ok=True)
-
-    def untag(self, record):
-        self.calls.append(("untag", record["id"]))
-
-
-def bom(spark="one", rest="rest", rest_mv="rest-mv"):
-    return {"lock_sha256": "lock", "images": {name: {"alias": alias} for name, alias in
-            (("minio", "minio"), ("minio-mc", "mc"), ("iceberg-rest", rest))},
-            "derived_images": {"iceberg-spark": {"image_id": "sha256:" + spark,
-              "definition_sha256": "definition-" + spark},
-              "rest-mv": {"image_id": "sha256:" + rest_mv, "definition_sha256": "definition-" + rest_mv}}}
-
-
-CONFIG = {"credentials": {"access_key": "access", "secret_key": "secret"},
-          "buckets": ["warehouse", "novarocks"]}
-
-
 class DockerServiceNetworkTests(unittest.TestCase):
     def fixture(self, service="minio", attached=False, aliases=None):
         record = {"id": "os-test", "kind": "os", "namespace": "test-owner", "key": "test-key",
@@ -187,7 +109,7 @@ class DockerServiceNetworkTests(unittest.TestCase):
         backend.http_ready = lambda url: True
         return backend, record, containers, network, calls
 
-    def test_failed_start_lost_endpoint_repairs_existing_minio_before_health(self):
+    def test_exact_endpoint_repair_preserves_minio_other_networks_and_health(self):
         backend, record, containers, network, calls = self.fixture()
         original = copy.deepcopy(containers["minio"])
         ports = copy.deepcopy(record["ports"])
@@ -196,10 +118,10 @@ class DockerServiceNetworkTests(unittest.TestCase):
         # cannot mask the running service's missing own network.
         self.assertFalse(backend.healthy(record))
         containers["mc-init"]["State"] = {"Running": True, "Status": "running"}
-        backend.ensure(record)
+        backend.repair_service_networks(record)
         self.assertTrue(backend.healthy(record))
         self.assertEqual(record["ports"], ports)
-        self.assertEqual(record["containers"]["minio"], original["Id"])
+        self.assertEqual(backend.container(record, "minio")["Id"], original["Id"])
         for name in ("catalog-a", "catalog-b"):
             self.assertEqual(containers["minio"]["NetworkSettings"]["Networks"][name],
                              original["NetworkSettings"]["Networks"][name])
@@ -224,359 +146,23 @@ class DockerServiceNetworkTests(unittest.TestCase):
         self.assertFalse(any(args[0] == "network" for args in calls))
 
 
-class ProtocolTests(unittest.TestCase):
+class DockerCommandTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        self.backend = Backend(self.root / "backend")
-        self.owner = self.make_owner()
-        self.entry = self.root / "worktree/runtime/test"
-
-    def make_owner(self, suffix="owner", hook=None):
-        return runtime.RuntimeOwner(self.root / suffix, daemon="test-daemon", backend=self.backend,
-            renderer=renderer, hook=hook or (lambda *a, **k: None), port_start=38000, port_end=38999)
-
-    def bind(self, images=None, entry=None, name="test"):
-        return self.owner.bind(name, entry or self.entry, CONFIG, images or bom())
-
-    def test_prepared_hms_port_is_reserved_before_it_listens(self):
-        runtime.atomic_json(self.owner.base / "hms" / "cat-prepared" / "manifest.json",
-                            {"ports": {"hms": self.owner.port_start}})
-        publication = self.bind()
-        ports = [port for record in publication["records"].values()
-                 for port in record["ports"].values()]
-        self.assertNotIn(self.owner.port_start, ports)
 
     def assert_code(self, code, callable):
         with self.assertRaises(runtime.RuntimeFailure) as caught:
             callable()
         self.assertEqual(caught.exception.code, code)
 
-    def test_version_keys_share_object_store_and_preserve_data(self):
-        first = self.bind()
-        second = self.bind(bom("two"))
-        self.assertEqual(first["binding"]["object_store"], second["binding"]["object_store"])
-        self.assertNotEqual(first["binding"]["catalog"], second["binding"]["catalog"])
-        self.assertEqual(len(self.owner.records()), 3)
-        self.assertEqual(len(second["data_locations"]), 1)
-        self.assertNotEqual(first["published_dir"], second["published_dir"])
-        self.assertTrue(Path(first["published_dir"]).is_dir())
-        self.assertEqual(second["producer_receipt"]["image_id"], "sha256:two")
-
-    def test_rest_changes_catalog_only_and_config_changes_object_store(self):
-        first = self.bind()
-        other = self.bind(bom(rest="rest2"))
-        self.assertEqual(first["binding"]["object_store"], other["binding"]["object_store"])
-        config = copy.deepcopy(CONFIG)
-        config["credentials"]["secret_key"] = "changed"
-        newest = self.owner.bind("test", self.entry, config, bom())
-        self.assertNotEqual(first["binding"]["object_store"], newest["binding"]["object_store"])
-        self.assertEqual(len(newest["data_locations"]), 2)
-
-    def test_mv_image_changes_catalog_only_and_has_dedicated_runtime_resources(self):
-        first = self.bind()
-        second = self.bind(bom(rest_mv="rest-mv-two"))
-        self.assertEqual(first["binding"]["object_store"], second["binding"]["object_store"])
-        self.assertNotEqual(first["binding"]["catalog"], second["binding"]["catalog"])
-        self.assertEqual(first["data_locations"], second["data_locations"])
-        record = second["records"]["catalog"]
-        self.assertEqual(record["images"]["rest-mv"]["image_id"], "sha256:rest-mv-two")
-        self.assertEqual(set(record["required_services"]), {"rest", "rest-mv", "spark"})
-        self.assertEqual(record["service_ports"]["rest-mv"], {"8181/tcp": record["ports"]["rest_mv"]})
-        self.assertNotEqual(record["ports"]["rest"], record["ports"]["rest_mv"])
-        self.assertEqual(set(record["volumes"]), {record["project"] + "_rest-catalog", record["project"] + "_rest-mv-catalog"})
-        self.assertEqual(set(record["health_urls"]), {
-            f"http://127.0.0.1:{record['ports']['rest']}/v1/config",
-            f"http://127.0.0.1:{record['ports']['rest_mv']}/v1/config"})
-        endpoints = self.owner.endpoints(second["records"])
-        self.assertEqual(endpoints["rest_mv_uri"], f"http://127.0.0.1:{record['ports']['rest_mv']}")
-        self.assertEqual(endpoints["container_rest_mv_uri"], "http://rest-mv:8181")
-        self.assertIn(f"NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI='s3://warehouse/{record['id']}/rest-mv'\n",
-                      Path(record["compose_env"]).read_text())
-
-    def test_derived_mv_receipt_is_required_and_inspected_by_exact_id(self):
-        inputs = bom()
-        inputs["derived_images"]["rest-mv"]["alias"] = "mutable:current"
-        with mock.patch.object(self.backend, "image_id", wraps=self.backend.image_id) as image_id:
-            self.owner.image_facts(inputs)
-        self.assertIn(mock.call("sha256:rest-mv"), image_id.call_args_list)
-        self.assertNotIn(mock.call("mutable:current"), image_id.call_args_list)
-        with mock.patch.object(self.backend, "image_id", side_effect=lambda ref: "sha256:wrong" if ref == "sha256:rest-mv" else ref):
-            self.assert_code("RuntimeIdentityMismatch", lambda: self.owner.image_facts(inputs))
-        del inputs["derived_images"]["rest-mv"]
-        self.assert_code("FixturePrerequisiteMissing", lambda: self.owner.image_facts(inputs))
-
-    def test_catalog_ensure_uses_saved_services(self):
-        first = self.bind()
-        record = first["records"]["catalog"]
-        backend = runtime.Docker()
-        with mock.patch.object(backend, "container", return_value={"Id": "saved-container"}), \
-             mock.patch.object(backend, "validate_resources"), mock.patch.object(backend, "tag"), \
-             mock.patch.object(backend, "repair_service_networks"), mock.patch.object(backend, "healthy", return_value=True), \
-             mock.patch.object(backend, "attach", return_value="saved-parent"), mock.patch.object(backend, "compose") as compose:
-            backend.ensure(record, first["records"]["object_store"])
-        self.assertEqual([call.args[1] for call in compose.call_args_list], [
-            ["create", *record["images"]], ["up", "-d", *record["images"]]])
-
-    def test_saved_catalog_without_mv_keeps_definition_and_can_stop_and_delete(self):
-        first = self.bind()
-        self.owner.unbind("test", self.entry)
-        record = copy.deepcopy(first["records"]["catalog"])
-        del record["images"]["rest-mv"], record["ports"]["rest_mv"], record["service_ports"]["rest-mv"]
-        record["required_services"] = ["rest", "spark"]
-        record["volumes"] = [record["project"] + "_rest-catalog"]
-        record["health_urls"] = [f"http://127.0.0.1:{record['ports']['rest']}/v1/config"]
-        record["template"] = "services:\n  rest:\n    image: ${REST_IMAGE}\n  spark:\n    image: ${SPARK_IMAGE}\n  mc:\n    image: ${MC_IMAGE}\n"
-        # Persist the historical compose.env layout independently of the new renderer.
-        values = {"NOVA_FIXTURE_OWNER": record["namespace"], "NOVA_FIXTURE_KEY": record["key"],
-                  "NOVA_FIXTURE_KIND": "cat", "NOVA_FIXTURE_PROJECT": record["project"],
-                  "MINIO_ROOT_USER": "access", "MINIO_ROOT_PASSWORD": "secret",
-                  "REST_IMAGE": record["images"]["rest"]["tag"], "SPARK_IMAGE": record["images"]["spark"]["tag"],
-                  "MC_IMAGE": record["images"]["mc"]["tag"], "NOVA_ENV_REST_PORT": record["ports"]["rest"],
-                  "NOVA_ENV_SPARK_PORT": record["ports"]["spark"], "NOVA_ENV_REST_SERVER_WAREHOUSE_URI": record["server_warehouse"]}
-        saved_env = ''.join(f"{key}='{value}'\n" for key, value in sorted(values.items())).encode()
-        Path(record["compose_env"]).write_bytes(saved_env)
-        Path(record["compose_file"]).write_text(record["template"])
-        self.owner.save_record(record)
-        self.owner.write_definition(record)
-        self.assertEqual(Path(record["compose_env"]).read_bytes(), saved_env)
-        self.assertNotIn("rest_mv_uri", self.owner.endpoints({"object_store": first["records"]["object_store"], "catalog": record}))
-        self.owner.manage(record["id"], "stop")
-        self.assertEqual(Path(record["compose_env"]).read_bytes(), saved_env)
-        self.owner.manage(record["id"], "delete")
-        self.assertIsNone(self.owner.record(record["id"]))
-        self.assertIn(("purge", first["binding"]["object_store"], [f"s3://warehouse/{record['id']}/"]), self.backend.calls)
-
-    def test_catalog_deletion_purges_parent_of_all_rest_warehouses(self):
-        first = self.bind()
-        self.owner.unbind("test", self.entry)
-        record = first["records"]["catalog"]
-        self.owner.manage(record["id"], "delete")
-        self.assertIn(("purge", first["binding"]["object_store"], [f"s3://warehouse/{record['id']}/"]), self.backend.calls)
-
-    def test_repeated_bind_never_reallocates_or_recreates_healthy_instances(self):
-        first = self.bind()
-        calls = len([call for call in self.backend.calls if call[0] == "ensure"])
-        second = self.bind()
-        self.assertEqual(first["binding"], second["binding"])
-        self.assertEqual(calls, len([call for call in self.backend.calls if call[0] == "ensure"]))
-        self.assertEqual(first["records"], second["records"])
-
-    def test_starting_retry_retains_ports(self):
-        self.backend.fail = "ensure"
-        self.assert_code("PortUnavailable", self.bind)
-        reserved = self.owner.records()[0]
-        self.assertEqual(reserved["state"], "starting")
-        self.backend.fail = None
-        recovered = self.bind()
-        self.assertEqual(recovered["records"]["object_store"]["ports"], reserved["ports"])
-
-    def test_renderer_failure_preserves_complete_old_publication(self):
-        first = self.bind()
-        def failed(context, staging):
-            (staging / "env.sh").write_text("partial")
-            raise ValueError("injected")
-        self.owner.renderer = failed
-        with self.assertRaises(ValueError):
-            self.bind(bom("two"))
-        self.assertEqual(runtime.current_publication(self.entry)["published_dir"], first["published_dir"])
-        self.assertEqual(json.loads((self.entry / "env.sh").read_text())["publication"], first["published_dir"])
-
-    def test_crash_before_and_after_publication_commit(self):
-        first = self.bind()
-        def failed(name, **facts):
-            if name == "publication.before_swap":
-                raise ValueError("before commit")
-        self.owner.hook = failed
-        with self.assertRaises(ValueError):
-            self.bind(bom("two"))
-        self.assertEqual(runtime.current_publication(self.entry)["binding"], first["binding"])
-        def after(name, **facts):
-            if name == "publication.after_swap":
-                raise ValueError("unknown result")
-        self.owner.hook = after
-        with self.assertRaises(ValueError):
-            self.bind(bom("two"))
-        self.assertNotEqual(runtime.current_publication(self.entry)["binding"], first["binding"])
-        self.owner.hook = lambda *a, **k: None
-        self.bind(bom("two"))
-
-    def test_unbind_preserves_data_and_fixed_lock(self):
-        first = self.bind()
-        inode = (self.entry / ".owner.lock").stat().st_ino
-        unbound = self.owner.unbind("test", self.entry)
-        self.assertIsNone(unbound["binding"])
-        self.assertEqual(first["data_locations"], unbound["data_locations"])
-        self.assertEqual(inode, (self.entry / ".owner.lock").stat().st_ino)
-        self.owner.manage(first["binding"]["catalog"], "delete")
-        self.assert_code("BindingsPresent", lambda: self.owner.manage(first["binding"]["object_store"], "delete", force=True))
-        self.owner.unbind("test", self.entry, purge=True)
-        self.owner.manage(first["binding"]["object_store"], "delete")
-        self.assertEqual(self.owner.records(), [])
-
-    def test_purge_failure_preserves_publication_and_all_references(self):
-        first = self.bind()
-        self.backend.fail = "purge"
-        self.assert_code("DockerOperationFailed", lambda: self.owner.unbind("test", self.entry, purge=True))
-        self.assertEqual(runtime.current_publication(self.entry), first)
-
-    def test_cross_owner_switch_requires_unbind_and_keeps_locations(self):
-        first = self.bind()
-        other = self.make_owner("other")
-        self.assert_code("OwnerMismatch", lambda: other.bind("test", self.entry, CONFIG, bom()))
-        self.owner.unbind("test", self.entry)
-        second = other.bind("test", self.entry, CONFIG, bom())
-        self.assertEqual(len(second["data_locations"]), 2)
-        self.assertIn(first["data_locations"][0], second["data_locations"])
-        second = other.unbind("test", self.entry, purge=True)
-        self.assertEqual(second["data_locations"], [])
-
-    def test_prepare_is_offline_and_does_not_claim_live_health(self):
-        first = self.bind()
-        self.backend.daemon_id = lambda: self.fail("Docker queried by prepare")
-        self.backend.healthy = lambda r: self.fail("health queried by prepare")
-        second = self.owner.prepare_entry("test", self.entry, CONFIG)
-        self.assertTrue(second["ready"])
-        self.assertEqual(first["binding"], second["binding"])
-        cat = self.owner.record(first["binding"]["catalog"])
-        cat["state"] = "starting"
-        self.owner.save_record(cat)
-        third = self.owner.prepare_entry("test", self.entry, CONFIG)
-        self.assertFalse(third["ready"])
-        self.assertEqual(third["data_locations"], first["data_locations"])
-
-    def test_first_prepare_does_not_resolve_daemon(self):
-        self.owner._daemon = None
-        self.backend.daemon_id = lambda: self.fail("Docker queried")
-        prepared = self.owner.prepare_entry("test", self.entry, CONFIG)
-        self.assertFalse(prepared["ready"])
-        self.assertIsNone(prepared["owner_locator"])
-
-    def test_current_is_only_a_locator_published_inside_owner(self):
-        config = {**CONFIG, "update_current": True,
-                  "current_link": str((self.entry.parent / "current").resolve())}
-        publication = self.owner.prepare_entry("test", self.entry, config)
-        current = self.entry.parent / "current"
-        self.assertEqual(current.resolve(), self.entry.resolve())
-        self.assertEqual(runtime.current_publication(current)["published_dir"], publication["published_dir"])
-        isolated = {**CONFIG, "update_current": False, "current_link": str(current)}
-        self.owner.prepare_entry("isolated", self.entry.parent / "isolated", isolated)
-        self.assertEqual(current.resolve(), self.entry.resolve())
-
-    def test_bad_index_fails_closed(self):
-        first = self.bind()
-        (self.entry / "published").unlink()
-        self.assert_code("RuntimeStateUnreadable", lambda: self.owner.manage(first["binding"]["object_store"], "delete", force=True))
-
-    def test_missing_pointer_never_reinitializes_old_data_references(self):
-        first = self.bind()
-        (self.entry / "published").unlink()
-        self.assert_code("RuntimeStateUnreadable", self.bind)
-        self.assert_code("RuntimeStateUnreadable", lambda: self.owner.prepare_entry("test", self.entry, CONFIG))
-        self.assertTrue(Path(first["published_dir"]).exists())
-
-    def test_force_delete_refuses_external_consumer_even_before_mark(self):
-        first = self.bind()
-        cat_id = first["binding"]["catalog"]
-        self.owner.consumer(cat_id, "external")
-        self.assert_code("ExternalAttachmentsPresent", lambda: self.owner.manage(cat_id, "delete", force=True))
-        self.assertEqual(self.owner.record(cat_id)["state"], "ready")
-        self.owner.consumer(cat_id, "external", disconnect=True)
-
-    def test_deletion_retry_uses_persisted_token_without_force(self):
-        first = self.bind()
-        cat_id = first["binding"]["catalog"]
-        self.backend.fail = "delete"
-        self.assert_code("DockerOperationFailed", lambda: self.owner.manage(cat_id, "delete", force=True))
-        deleting = self.owner.record(cat_id)
-        self.assertEqual(deleting["state"], "deleting")
-        self.assertIsNone(runtime.current_publication(self.entry)["binding"])
-        self.assert_code("RuntimeDeleting", self.bind)
-        self.backend.fail = None
-        seen = []
-        self.owner.hook = lambda name, **facts: seen.append(facts) if name == "delete.marked" else None
-        self.owner.manage(cat_id, "delete")
-        self.assertEqual(seen[0]["deletion_id"], deleting["deletion_id"])
-        self.assertIsNone(self.owner.record(cat_id))
-
-    def test_old_delete_cannot_unbind_rebuilt_record(self):
-        first = self.bind()
-        cat_id = first["binding"]["catalog"]
-        def replace(name, **facts):
-            if name == "delete.marked":
-                record = self.owner.record(cat_id)
-                record["state"] = "ready"
-                record.pop("deletion_id")
-                self.owner.save_record(record)
-        self.owner.hook = replace
-        self.owner.manage(cat_id, "delete", force=True)
-        self.assertEqual(runtime.current_publication(self.entry)["binding"], first["binding"])
-        self.assertEqual(self.owner.record(cat_id)["state"], "ready")
-
-    def test_delete_does_not_unbind_worktree_that_switched_catalog(self):
-        first = self.bind()
-        cat_id = first["binding"]["catalog"]
-        def switch(name, **facts):
-            if name == "delete.before_worktree_lock":
-                self.owner.hook = lambda *a, **k: None
-                self.bind(bom("two"))
-        self.owner.hook = switch
-        self.owner.manage(cat_id, "delete", force=True)
-        latest = runtime.current_publication(self.entry)
-        self.assertNotEqual(latest["binding"]["catalog"], cat_id)
-        self.assertEqual(latest["data_locations"], first["data_locations"])
-
-    def test_force_stop_preserves_record_and_reserved_ports(self):
-        first = self.bind()
-        os_id = first["binding"]["object_store"]
-        self.assert_code("BindingsPresent", lambda: self.owner.manage(os_id, "stop"))
-        self.owner.manage(os_id, "stop", force=True)
-        recovered = self.bind()
-        self.assertEqual(first["records"]["object_store"]["ports"], recovered["records"]["object_store"]["ports"])
-        self.assertIn(("reconnect", [first["binding"]["catalog"]]), self.backend.calls)
-
-    def test_object_store_recovery_cannot_skip_reconnect_after_crash(self):
-        first = self.bind()
-        second = self.bind(bom("two"), self.root / "other-entry", "other")
-        os_id = first["binding"]["object_store"]
-        self.owner.manage(os_id, "stop", force=True)
-        def interrupt(name, **facts):
-            if name == "object_store.before_reconnect":
-                raise ValueError("injected recovery crash")
-        self.owner.hook = interrupt
-        with self.assertRaises(ValueError):
-            self.bind()
-        self.assertEqual(self.owner.record(os_id)["state"], "starting")
-        self.owner.hook = lambda *a, **k: None
-        self.bind()
-        expected = {first["binding"]["catalog"], second["binding"]["catalog"]}
-        actual = [set(call[1]) for call in self.backend.calls if call[0] == "reconnect"]
-        self.assertEqual(actual[-1], expected)
 
     def test_docker_environment_discards_inherited_compose_overrides(self):
         env = runtime.controlled_environment({"PATH": "path", "COMPOSE_PROJECT_NAME": "foreign",
             "REST_IMAGE": "foreign", "DOCKER_CONTEXT": "desktop-linux"})
         self.assertEqual(env, {"PATH": "path", "DOCKER_CONTEXT": "desktop-linux"})
 
-    def test_live_container_identity_mismatch_is_not_replaced(self):
-        publication = self.bind()
-        record = publication["records"]["catalog"]
-        backend = runtime.Docker()
-        backend.command = lambda *a, **k: "container-id"
-        backend.inspect = lambda *a, **k: {"Image": "sha256:foreign", "Config": {"Labels": {}}}
-        self.assert_code("RuntimeIdentityMismatch", lambda: backend.ensure(record))
-        self.assertEqual(runtime.current_publication(self.entry), publication)
-
-    def test_foreign_volume_or_network_is_rejected_before_compose(self):
-        publication = self.bind()
-        record = publication["records"]["object_store"]
-        backend = runtime.Docker()
-        backend.container = lambda *a: None
-        backend.inspect = lambda *a, **k: {"Labels": {"foreign": "true"}}
-        backend.compose = lambda *a: self.fail("foreign resources touched by Compose")
-        self.assert_code("RuntimeIdentityMismatch", lambda: backend.ensure(record))
-        self.assert_code("RuntimeIdentityMismatch", lambda: backend.delete_resources(record))
 
     def fake_docker(self):
         executable = self.root / "bin/docker"
@@ -588,6 +174,7 @@ class ProtocolTests(unittest.TestCase):
         environment = {"PATH": str(executable.parent) + ":" + os.environ["PATH"]}
         return pidfile, environment
 
+
     def test_command_timeout_settles_child(self):
         pidfile, environment = self.fake_docker()
         backend = runtime.Docker(timeout=2, environment=environment)
@@ -596,12 +183,14 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
+
     def test_missing_docker_context_is_not_resource_absence(self):
         _, environment = self.fake_docker()
         executable = self.root / "bin/docker"
         executable.write_text("#!/bin/sh\nprintf '%s\\n' 'context foreign not found' >&2\nexit 1\n")
         backend = runtime.Docker(timeout=5, environment=environment)
         self.assert_code("DockerOperationFailed", lambda: backend.command(["network", "inspect", "network"], absent_ok=True))
+
 
     def test_sigterm_settles_child_before_releasing_owner_lock(self):
         pidfile, environment = self.fake_docker()
@@ -636,182 +225,6 @@ class ProtocolTests(unittest.TestCase):
                 process.kill()
                 process.join()
 
-    def test_delete_resumes_each_durable_phase(self):
-        for phase in ("delete.marked", "delete.after_conditional_unbind", "delete.stopped",
-                      "delete.purged", "delete.disconnected", "delete.resources_removed"):
-            with self.subTest(phase=phase):
-                first = self.bind()
-                cat_id = first["binding"]["catalog"]
-                def interrupt(name, **facts):
-                    if name == phase:
-                        raise ValueError("injected crash boundary")
-                self.owner.hook = interrupt
-                with self.assertRaises(ValueError):
-                    self.owner.manage(cat_id, "delete", force=True)
-                token = self.owner.record(cat_id)["deletion_id"]
-                self.owner.hook = lambda *a, **k: None
-                self.owner.manage(cat_id, "delete")
-                self.assertIsNone(self.owner.record(cat_id))
-                self.assertIsNone(runtime.current_publication(self.entry)["binding"])
-                self.assertTrue(token)
-
-    def test_distinct_catalogs_hold_shared_object_store_lock_concurrently(self):
-        first = self.bind()
-        context = mp.get_context("fork")
-        entered = [context.Event(), context.Event()]
-        release = context.Event()
-        results = context.Queue()
-        def bind_child(index):
-            def barrier(name, **facts):
-                if name == "bind.os_shared_ready":
-                    entered[index].set()
-                    if not release.wait(10):
-                        raise AssertionError("shared lock barrier timed out")
-            try:
-                result = self.make_owner(hook=barrier).bind("w" + str(index),
-                    self.root / ("w" + str(index)), CONFIG, bom("s" + str(index)))
-                results.put(result["binding"])
-            except Exception as error:
-                results.put(str(error))
-        children = [context.Process(target=bind_child, args=(index,)) for index in range(2)]
-        for child in children:
-            child.start()
-        try:
-            self.assertTrue(entered[0].wait(5))
-            self.assertTrue(entered[1].wait(5))
-        finally:
-            release.set()
-            for child in children:
-                child.join(10)
-                if child.is_alive():
-                    child.kill()
-                    child.join()
-        for child in children:
-            self.assertEqual(child.exitcode, 0)
-        bindings = [results.get(timeout=2) for _ in children]
-        for binding in bindings:
-            self.assertIsInstance(binding, dict)
-            self.assertEqual(binding["object_store"], first["binding"]["object_store"])
-        self.assertNotEqual(bindings[0]["catalog"], bindings[1]["catalog"])
-
-    def test_concurrent_same_key_creates_each_instance_once(self):
-        context = mp.get_context("fork")
-        reserved, release = context.Event(), context.Event()
-        results = context.Queue()
-        def child(index):
-            def barrier(name, **facts):
-                if index == 0 and name == "bind.ports_reserved" and facts["runtime"].startswith("os-"):
-                    reserved.set()
-                    if not release.wait(10):
-                        raise AssertionError("reservation barrier timed out")
-            try:
-                value = self.make_owner(hook=barrier).bind("w" + str(index),
-                    self.root / ("w" + str(index)), CONFIG, bom())
-                results.put(value["binding"])
-            except Exception as error:
-                results.put(str(error))
-        children = [context.Process(target=child, args=(index,)) for index in range(2)]
-        children[0].start()
-        try:
-            self.assertTrue(reserved.wait(5))
-            children[1].start()
-            self.assertEqual(len(self.owner.records()), 1)
-            self.assertEqual(self.owner.records()[0]["state"], "starting")
-        finally:
-            release.set()
-            for process in children:
-                if process.pid:
-                    process.join(10)
-                    if process.is_alive():
-                        process.kill()
-                        process.join()
-        bindings = [results.get(timeout=2) for _ in children]
-        self.assertEqual(bindings[0], bindings[1])
-        self.assertIsInstance(bindings[0], dict)
-        for identity in bindings[0].values():
-            self.assertEqual((self.backend.root / (identity + ".ensure")).read_text(), "created\n")
-
-    def test_consumer_disconnect_allowed_during_deleting(self):
-        first = self.bind()
-        cat_id = first["binding"]["catalog"]
-        record = self.owner.record(cat_id)
-        record.update(state="deleting", deletion_id="intent")
-        self.owner.save_record(record)
-        self.assert_code("RuntimeDeleting", lambda: self.owner.consumer(cat_id, "consumer"))
-        self.owner.consumer(cat_id, "consumer", disconnect=True)
-
-    def test_missing_saved_definition_reconstructed_for_deletion(self):
-        first = self.bind()
-        cat = first["records"]["catalog"]
-        Path(cat["compose_file"]).unlink()
-        self.owner.manage(cat["id"], "delete", force=True)
-        self.assertIsNone(self.owner.record(cat["id"]))
-
-    def test_crash_after_record_retirement_does_not_poison_same_key_rebuild(self):
-        first = self.bind()
-        cat_id = first["binding"]["catalog"]
-        def interrupt(name, **facts):
-            if name == "delete.record_retired":
-                raise ValueError("injected retirement crash")
-        self.owner.hook = interrupt
-        with self.assertRaises(ValueError):
-            self.owner.manage(cat_id, "delete", force=True)
-        self.assertIsNone(self.owner.record(cat_id))
-        self.owner.hook = lambda *a, **k: None
-        self.bind(bom("two"), self.root / "other-entry", "other")
-        rebuilt = self.bind()
-        self.assertEqual(rebuilt["binding"]["catalog"], cat_id)
-        self.assertNotEqual(first["records"]["catalog"]["ports"], rebuilt["records"]["catalog"]["ports"])
-
-    def test_two_owner_roots_serialize_on_fixed_worktree_lock(self):
-        context = mp.get_context("fork")
-        entered, release, attempted, finished = (context.Event() for _ in range(4))
-        results = context.Queue()
-        def first():
-            def barrier(name, **facts):
-                if name == "publication.before_swap":
-                    entered.set()
-                    if not release.wait(10):
-                        raise AssertionError("barrier timed out")
-            try:
-                self.make_owner(hook=barrier).bind("test", self.entry, CONFIG, bom())
-                results.put("first-ok")
-            except Exception as error:
-                results.put(str(error))
-        def second():
-            with (self.entry / ".owner.lock").open("a+b") as handle:
-                try:
-                    runtime.fcntl.flock(handle, runtime.fcntl.LOCK_EX | runtime.fcntl.LOCK_NB)
-                    results.put("lock-unexpectedly-free")
-                except BlockingIOError:
-                    results.put("lock-was-held")
-            attempted.set()
-            try:
-                self.make_owner("other").bind("test", self.entry, CONFIG, bom())
-                results.put("unexpected-success")
-            except runtime.RuntimeFailure as error:
-                results.put(error.code)
-            finally:
-                finished.set()
-        one, two = context.Process(target=first), context.Process(target=second)
-        one.start()
-        try:
-            self.assertTrue(entered.wait(5))
-            two.start()
-            self.assertTrue(attempted.wait(5))
-            self.assertEqual(results.get(timeout=2), "lock-was-held")
-        finally:
-            release.set()
-            one.join(10)
-            if two.pid:
-                two.join(10)
-            for process in (one, two):
-                if process.pid and process.is_alive():
-                    process.kill()
-                    process.join()
-        self.assertEqual(one.exitcode, 0)
-        self.assertEqual(two.exitcode, 0)
-        self.assertEqual({results.get(timeout=2), results.get(timeout=2)}, {"first-ok", "OwnerMismatch"})
 
 
 if __name__ == "__main__":

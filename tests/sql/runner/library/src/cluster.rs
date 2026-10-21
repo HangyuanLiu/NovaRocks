@@ -59,6 +59,7 @@ pub(crate) fn launch_server(
     runner_config: &RunnerConfig,
     launch_profile: LaunchProfile,
     test_sessions: Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>,
+    budget: &novarocks_cluster_harness::fixture_run::RunBudget,
 ) -> Result<Box<dyn ServerHandle>> {
     match mode {
         ClusterMode::AllInOne => Ok(Box::new(NoopServerHandle)),
@@ -69,7 +70,9 @@ pub(crate) fn launch_server(
                 be_binaries: Vec::new(),
                 expected_eligible_backend_count: None,
                 base_config_path: resolve_base_frontend_config_path(repo_root, runner_config)?,
-                runtime_root: repo_root.join("tests/sql/.runtime/cluster"),
+                runtime_root: repo_root
+                    .join("tests/sql/.runtime/cluster")
+                    .join(&budget.identity().run_id),
                 cluster_size,
                 launch_profile,
                 startup_timeout: startup_timeout(),
@@ -77,10 +80,17 @@ pub(crate) fn launch_server(
                 config_overlay: resolve_role_scoped_connector_overlay()?,
                 native_trust_fixture: Default::default(),
             };
-            Ok(Box::new(match test_sessions {
-                Some(plan) => CrossProcessServerHandle::launch_with_test_sessions(options, plan)?,
-                None => CrossProcessServerHandle::launch(options)?,
-            }))
+            Ok(Box::new(
+                CrossProcessServerHandle::launch_with_fixture_budget(
+                    options,
+                    test_sessions,
+                    Default::default(),
+                    None,
+                    None,
+                    None,
+                    budget.clone(),
+                )?,
+            ))
         }
     }
 }

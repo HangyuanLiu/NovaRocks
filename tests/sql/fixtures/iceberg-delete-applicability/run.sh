@@ -25,6 +25,7 @@ prefix=""
 output=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --fixture-budget-secs) export NOVA_FIXTURE_BUDGET_SECS="$2"; shift 2 ;;
     --mode) mode="$2"; shift 2 ;;
     --namespace) namespace="$2"; shift 2 ;;
     --prefix) prefix="$2"; shift 2 ;;
@@ -35,7 +36,13 @@ done
 [[ "$mode" == anomalies || "$mode" == positive || "$mode" == corpus || "$mode" == promotion ]] || { echo "Invalid mode: $mode" >&2; exit 2; }
 [[ -n "$output" ]] || { echo "--output is required" >&2; exit 2; }
 run_uuid="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
-namespace="${namespace:-uea4g_${run_uuid}}"
+NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$WORKSPACE_ROOT/docker/iceberg-rest/fixture_run.py" context --env-file "${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}")"
+export NOVA_FIXTURE_RUN_CONTEXT
+if [[ "$NOVA_FIXTURE_RUN_CONTEXT" != null ]]; then
+  namespace="${namespace:-$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["identity"]["run_id"])' "$NOVA_FIXTURE_RUN_CONTEXT")}"
+else
+  namespace="${namespace:-uea4g_${run_uuid}}"
+fi
 prefix="${prefix:-g02}"
 [[ "$namespace" =~ ^[a-zA-Z0-9_]+$ && "$prefix" =~ ^[a-zA-Z0-9_]+$ ]] || { echo "Invalid fixture identifier" >&2; exit 2; }
 NOVA_ENV_REST_ENV_FILE="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' \

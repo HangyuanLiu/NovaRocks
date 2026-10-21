@@ -157,9 +157,9 @@ ordinary one, and the runner says so rather than silently redirecting it.
 七项必需端点由同一 publication 投影：`iceberg_rest_uri`、`iceberg_rest_warehouse`、`iceberg_rest_mv_uri`、`iceberg_rest_mv_warehouse`、`oss_ak`、`oss_sk`、`oss_endpoint`。MV 两项同时导出为 `NOVAROCKS_ICEBERG_REST_MV_URI` 和 `NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE`，供受控子进程使用。`rest-mv` 保存 view version 的 `storage-table`，stock `rest` 保留为不支持该字段的对照；具体套件按自身契约选择端点。
 `mv-publication-v11` 在创建前从本机 provisioned base 构建 checked-in hook image，以 publication-hook profile 启动私有 REST，并发布 loopback control URI；不会在 stock 就绪后替换容器。hook 只修改 `rest`，同栈的 `rest-mv` 保持普通服务定义。runner 记录 profile、实际镜像身份与 control URI，结束后删除其私有项目。hook 镜像的供给快照统一仍属于后续工作。
 
-共享套件使用 publication 中的实际端点和 `[env].fixture_env_file`；stable runtime 目录只用于运行数据。共享 catalog 删除前先退出 HMS 等外部 endpoint；force 不豁免该检查。新对象存储需要显式准备共享数据集 READY，旧 REST/Hive 不自动迁移或删除。
+共享套件固定一次publication中的实际端点与 `[env].fixture_env_file`，先准入原run identity和完整预算，namespace及实际数据location位于原scratch root；stable runtime仅保存运行数据。默认预算3600秒，嵌套/重启不续期，清理使用原完整期限的reserve。机器维护由显式start/upgrade执行，普通up只附着，HMS/私有栈各由原owner退出。新对象存储需要输入owner显式供给准确READY，已有消费仍check-only；旧项目/卷不自动迁移或删除。
 
-引入 `rest-mv` 后，每台机器按新 lock provision 一次，各 worktree rebase 并重新 `up.sh`；旧 lock 在 verify 处 BLOCKED，旧绑定的 offline prepare 不补造 MV 端点。缺少 `iceberg_rest_mv_*` 时按 runner 提示重新 `up.sh`。CI 准备阶段运行 `python3 docker/iceberg-rest/rest-mv/probe.py contract --manifest "$NOVA_ENV_MANIFEST"`；失败为 VERIFY FAILED，且不会重启共享服务。完整切换、隔离生命周期检查与配方维护见 [fixture README](../../../docker/iceberg-rest/README.md) 和 [rest-mv README](../../../docker/iceberg-rest/rest-mv/README.md)。
+输入变化时维护者显式provision并升级机器，各worktree重新正常up；旧lock在verify处BLOCKED，offline prepare只发布unbound。缺少 `iceberg_rest_mv_*` 时按 runner 提示重新 `up.sh`。CI 准备阶段运行 `python3 docker/iceberg-rest/rest-mv/probe.py contract --manifest "$NOVA_ENV_MANIFEST"`；失败为 VERIFY FAILED，且不会重启共享服务。完整切换、隔离生命周期检查与配方维护见 [fixture README](../../../docker/iceberg-rest/README.md) 和 [rest-mv README](../../../docker/iceberg-rest/rest-mv/README.md)。
 
 ## Taxonomy
 

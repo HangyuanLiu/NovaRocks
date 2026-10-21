@@ -213,3 +213,5 @@ failure never skips joining the SQL actor. These are executable assertions;
 changing them does not constitute a same-SHA native acceptance receipt. Run
 each of the four explicit scenario names individually with `--only` and a
 fresh artifact root when collecting final evidence.
+
+共享 MinIO 模式须事先供给 fixture image，并设置 `UEA7_SKIP_BUILD=1`；运行期不构建或下载替代输入。它继承原 `NOVA_FIXTURE_RUN_CONTEXT`，按实际 image Config argv 启动容器内期限 guard，迟到启动拒绝，原期限到达后 PID 1 自主退出。共享数据只写原 scratch scope，artifact 记录实际 container image ID、原 context、machine version/generation；root 凭据只写临时 0600 env-file，启动成功即删除，失败 evidence 不复制它。默认 local-Hadoop 模式仍沿原独立 owner。

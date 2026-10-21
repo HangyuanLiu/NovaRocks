@@ -19,47 +19,50 @@ under the License.
 
 # Iceberg REST + MinIO + Spark Test Environment
 
-此目录提供开发与 CI 的 Iceberg REST Catalog、MinIO 和 Spark fixture。每个 catalog 实例同时运行 stock `rest` 与 `rest-mv`：后者保存 view version 的 `storage-table`，前者保留为不支持该字段的对照。共享模式按已验证输入生成运行实例：同输入附着同一实例，输入变化允许运行实例并存；一个对象存储实例可供多个 catalog 使用。输入供给只有一份当前 lock/BOM，不支持多个 lock 同机并存。旧 `nr-iceberg-rest` / `nr-iceberg-hive` 项目、数据和卷不会被自动接管、迁移或删除。
+本目录提供机器级共享 MinIO、stock REST、支持 MV `storage-table` 的 rest-mv、Spark 和 mc。每个 Docker daemon 只有一个固定项目 `nr-fixture-machine`、一个固定网络 `nr-fixture-machine_iceberg_net`；输入变化通过显式维护切换，普通 worktree 不创建并存共享栈。私有 stock/publication-hook catalog 和 HMS 各自保留原 owner。
 
-## 输入、实例与端点
+## 输入与机器维护
 
-输入供给按 [ADR-0155](../../docs/adr/ADR-0155-fixture-provisioning-and-offline-verification.md) 分离：
+[ADR-0155](../../docs/adr/ADR-0155-fixture-provisioning-and-offline-verification.md) 继续拥有输入供给。只有显式 provision 可以下载、pull/build；verify、机器运行层、普通测试只消费本机已验证的 lock/BOM、derived 定义和实际 image ID。
 
 ```bash
-docker/fixture-inputs/provision.sh   # Explicit acquisition and build; run when inputs change or are absent.
-docker/fixture-inputs/verify.sh
-docker/iceberg-rest/up.sh
+docker/fixture-inputs/provision.sh  # Only when acquisition/build is explicitly intended.
+docker/fixture-inputs/verify.sh --consumer iceberg-rest
+docker/iceberg-rest/fixture-runtime.sh start  # Explicit machine maintenance.
+docker/iceberg-rest/up.sh                     # Attach this worktree only.
 ```
 
-`NOVA_FIXTURE_STORE` 指定 BOM store。provision 可以下载、pull 和 build；verify、共享 runtime owner 和普通测试消费者只读取本机 BOM 与镜像。BOM 前置条件缺失/不一致返回 75；CI 归为 BLOCKED。端口不可用、身份不符、外部连接和其他 owner 失败归为 VERIFY FAILED，不进入 Cargo gates。
+普通 `up.sh` 要求机器已经 ready、健康且完整版本匹配，不启动、修复或升级服务。机器未就绪、维护中、输入缺失或版本不符返回 BLOCKED（75）。实际生命周期、身份或执行错误保留失败，准入后的期限耗尽不改称 BLOCKED。CI 仍 verify→attach→读取一次 publication，不自行 provision/upgrade。
 
-`docker/fixture-inputs/verify.sh` 默认核验全量 BOM；Iceberg runtime owner 使用封闭的 `iceberg-rest` consumer，核验其服务镜像及由 lock 声明推导的 Spark base/JAR、`rest-mv` 构建镜像、运行 base 与源码包闭包。两者都要求当前全局 READY/lock/BOM，且严格检查所需输入的定义、校验和、平台、标签与精确镜像 ID。独立 Paimon 输入的定义变化不会阻塞未消费它的 Iceberg runtime；所需输入失败仍返回 75，不自动供给或拉取。
+机器控制目录默认 `${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/fixture-machine`；管理命令支持子命令前的 `--root`，控制目录不是另一个资源命名空间。daemon 上的固定 authority 卷阻止换目录创建第二套。机器配置持久保存在 daemon 对应 machine 目录；公共 status 隐去凭证。
 
-供给阶段仍可能移动 daemon 全局 derived-image alias，私有 BOM store 本身不隔离 alias。owner 为实例保存独立标签和真实 image ID；benchmark bootstrap 先 bind，再读取本次 publication，并核对实际 Spark 容器 image ID 与 BOM producer。精确供给快照的竞态消除属于后续工作，不能把当前核验描述为已经消除竞态。
+```bash
+docker/iceberg-rest/fixture-runtime.sh status
+docker/iceberg-rest/fixture-runtime.sh upgrade
+docker/iceberg-rest/fixture-runtime.sh --timeout 5 sweep
+```
 
-控制目录默认 `${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/fixture-runtime`，`NOVA_FIXTURE_RUNTIME_DIR` 可覆盖。owner locator 是控制目录加本机 daemon ID；实例的资源命名也包含该所有权命名空间。对象存储与 catalog 分别拥有项目、记录和卷；catalog 使用持久数据库，并连接到其对象存储。MinIO 恢复会重新接入全部仍有记录的 catalog 网络。
+`start` 幂等恢复同一输入定义，版本不同要求显式 `upgrade`。首次维护可在 start 后传 `--config /absolute/machine.json`；JSON字段为 `ports`、`policy`、`benchmark_root`、`minio_volume`。端口是准确固定配置，默认 MinIO API/console=28000/28001、REST/rest-mv=28002/28003、Spark UI=28004、HMS接入槽=28005；冲突报错，不扫描替代端口。FE/BE listener 仍由 worktree/harness 分配。`shared.env` 属于 worktree/private 输入，不是机器端口、root凭证或维护状态的权威。
 
-共享 `up` 可分别通过 `NOVA_FIXTURE_OBJECT_STORE_TEMPLATE` 和 `NOVA_FIXTURE_CATALOG_TEMPLATE` 指定对象存储与 catalog 的 Compose 模板路径；未覆盖的一侧保留默认模板。模板内容仍进入原 owner 的模型 hash 和资源身份，变化会生成独立实例；此覆盖不改变 isolated 模式。
+完整 version 包含协议、验证后的有效 BOM/derived 定义、实际 image ID、机器模板和配置，不把时间、cache路径或可变tag当版本。generation标记一次实际激活。升级先持稳定维护锁并保存maintenance，再停止共享writer、持久化新材料并轮换旧root、撤销run IAM/STS；确认旧root被真实拒绝后，在准确MinIO在线时清理scratch。benchmark全部对象保留，随后只删除准确REST数据库卷、切换服务，核实资源/image/端点/健康后才提交ready。失败留maintenance；未知mutation不伪结算。明确的daemon端口终态失败也须在同一保存的维护意图下重新检查准确资源才可重试。
 
-`shared.env` 是声明输入：凭证、版本、benchmark root 和端口分配范围。`NOVA_ENV_CONFIG_FILE` 可指定其它声明文件；共享模式的服务端口由 owner 在 `NOVA_ENV_RUNTIME_PORT_START..NOVA_ENV_RUNTIME_PORT_END` 分配（默认 `28000..28999`），记录存在时恢复沿用预留。NovaRocks FE/BE listener 仍按 worktree 分配。不要以 `9000/8181/4040` 或旧 Compose 项目代替运行记录。
+已有 MinIO 卷只有维护者明确指定准确来源才可迁入，原卷和全部 benchmark 数据保留；不猜“最近一个”。历史版本化项目、旧 `nr-iceberg-rest` / `nr-iceberg-hive` 资源不自动认领、迁移或删除。首次切换须先记录资源/数据清单和维护窗口。
 
-## 单一 publication
-
-共享模式的布局：
+## Worktree publication
 
 ```text
-docker/iceberg-rest/runtime/current -> <env-id>
+runtime/current -> <env-id>
 runtime/<env-id>/
-  .owner.lock                 # Stable worktree lock.
-  published -> publications/<publication-id>
-  env.sh -> published/env.sh   # Discovery link; resolve once per consumer start.
-  publications/<publication-id>/
-    env.sh manifest.json README.md fe.toml be.toml sql-test.toml
+  .entry.lock
+  published -> publications/<content-id>
+  env.sh -> published/env.sh
+  publications/<content-id>/
+    entry.json env.sh manifest.json README.md fe.toml be.toml sql-test.toml
     ice-rest-catalog.sql spark-defaults.conf spark-iceberg-v3-smoke.sql
-  frontend-state.sqlite       # Stable runtime data, outside publications.
+  frontend-state.sqlite
 ```
 
-`published` 是绑定事实和配置的唯一原子提交点。owner 在固定 worktree 锁内完整写入、落盘 publication，再替换指针；shell 返回后不补写或删除共享入口。current 只是定位器，不是第二份绑定权威。每个消费者启动时固定一次 publication：
+完整文件集合先落盘，再原子替换一次 `published`。重复附着同配置复用相同内容与env；version/generation改变会改变输入。锁序为worktree入口→机器维护锁，机器维护不反向拿worktree锁。消费者启动时解析一次：
 
 ```bash
 docker/iceberg-rest/up.sh
@@ -67,100 +70,65 @@ fixture_publication="$(python3 -c 'from pathlib import Path; print(Path("docker/
 source "$fixture_publication/env.sh"
 ```
 
-`NOVA_ENV_REST_ENV_FILE` 是该 publication 的不可变 env 路径；`NOVA_ENV_RUNTIME_DIR` 是稳定运行数据目录，不可拼接成 `NOVA_ENV_RUNTIME_DIR/env.sh`。runner 配置的 `[env].fixture_env_file` 同样固定到 publication。显式解绑或 force 可以使在线消费者失效；这里没有在线租约或自动退出协调。
+`NOVA_ENV_REST_ENV_FILE` 指向不可变env；`NOVA_ENV_RUNTIME_DIR` 只保存稳定SQLite等数据，不能在其下拼env.sh。正常attach失败会禁用发现入口；已固定的旧不可变publication仍保留，没有消费者租约或在线透明切换。
 
-输出包括：
+共享 manifest 的 `runtime.machine` 包含准确 machine ID、daemon、完整version、activation generation、image/container/network/volume facts和producer receipt。私有栈使用 `runtime.catalog`；vended额外携带共享MinIO machine事实。没有旧owner locator或多版本绑定协议。
 
-- `NOVA_ENV_OBJECT_STORE_RUNTIME`、`NOVA_ENV_CATALOG_RUNTIME`、`NOVA_ENV_OBJECT_STORE_CONTAINER`：精确实例及 MinIO 容器身份。
-- `NOVA_ENV_COMPOSE_PROJECT/FILE/ENV`：catalog 保存的项目与定义。
-- `AWS_S3_ENDPOINT`、`NOVAROCKS_ICEBERG_REST_URI`：实际 host 端点。
-- `NOVAROCKS_ICEBERG_REST_MV_URI`、`NOVA_ENV_REST_MV_PORT`：`rest-mv` 的实际 host 端点与端口。
-- `NOVA_ENV_REST_SERVER_WAREHOUSE_URI`：catalog 服务端 warehouse；`NOVA_ENV_REST_WAREHOUSE_URI` / `NOVAROCKS_ICEBERG_REST_WAREHOUSE` 是客户端 warehouse，不能混用。
-- `NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI`：`rest-mv` 服务端 warehouse；`NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE` 是 worktree 的客户端 warehouse（`s3://warehouse/<env-id>/rest-mv`）。两种服务分别使用自己的 SQLite 卷和 warehouse。
-- `manifest.json.iceberg_rest_mv`：`uri`、`warehouse`、`server_default_warehouse`；runner 的 `[env].iceberg_rest_mv_uri` 与 `[env].iceberg_rest_mv_warehouse` 使用相同端点。
-- `NOVAROCKS_FE_CONFIG/BE_CONFIG/SQL_TEST_CONFIG`、`NOVAROCKS_SPARK_DEFAULTS`：同 publication 的配置。
-- `manifest.json.runtime`：两个运行记录、owner locator、producer receipt、profile、control URI、template model hash、publication/entry 路径。
-
-FE 配置使用稳定 SQLite StateStore、worktree cluster ID 及正常 BE announce/heartbeat，不包含持久 backend membership。重新发布配置不迁移或删除 SQLite。不要以删 publication 当作清除本地 StateStore。
-
-## Offline prepare
+env导出 `NOVA_FIXTURE_MACHINE_ID/DAEMON/VERSION/GENERATION/ROOT`、TTL/max-run/cleanup policy，以及原有FE/BE/SQL/Spark配置和物理端点。`NOVA_ENV_OBJECT_STORE_RUNTIME` 与 `NOVA_ENV_CATALOG_RUNTIME` 在共享模式投影同一machine ID，不是旧管理API。host使用保存的实际端口；容器内协议别名仍为 `minio:9000`、`rest:8181`、`rest-mv:8181`。客户端warehouse不能当作REST服务端实际数据位置。
 
 ```bash
 docker/iceberg-rest/up.sh --prepare-only
-source docker/iceberg-rest/runtime/current/env.sh
 ```
 
-这是 Codex setup 路径，不调用 Docker，也不验证 BOM。它沿用保存的 owner locator；保存的两个记录为 ready 时可以发布配置，但 `ready=true` 不证明当前服务健康。首次或记录缺失/deleting 时发布 unbound，`env.sh` 可 source 且 `NOVA_ENV_READY=false`，没有占位端点/镜像。正常 up 才验证、恢复与附着。只做 prepare 的 fresh worktree 仍可由 benchmark bootstrap 完成 bind，不能要求它预先具有端点。
+离线prepare不调用Docker、不验证BOM或健康，只发布unbound并清除端点/镜像变量。它不能给测试启动提供ready证明；后续正常up才真正附着。
 
-切换前的 catalog 记录没有 `rest-mv`，offline prepare 仍可恢复其原有端点，但不会发布 MV 端点；runner 会报告缺少必需的 `iceberg_rest_mv_*` 配置。运行正常 `up.sh` 后才会绑定包含 `rest-mv` 的实例。
+## Scratch、累计预算与消费者
 
-## 启动消费者
+每次共享运行在首次scratch副作用前准入完整预算，SQL/System参数为 `--fixture-budget-secs`（默认3600）；Spark/直接producer使用同名参数或 `NOVA_FIXTURE_BUDGET_SECS`。机器默认 max-run86400、清理预留300、TTL604800秒。嵌套shell、重试、重启继承同一 `NOVA_FIXTURE_RUN_CONTEXT` 与原绝对期限，不能重新计时。超上限在副作用前BLOCKED，已准入超时为FAIL。
 
-已 source 上述同一次 publication 后：
+run名称为 `nr_scratch_<13digit epoch_ms>_<32lowerhex>`，资源suffix最多5字符。对象位于 `<worktree-prefix>/scratch/<run-id>/...`；REST namespace/table和临时目录携带同一身份。SQL保留原CREATE及oracle，再在首个表/view写入前设置并GET核实原run namespace location，并检查实际table location。Hadoop可变warehouse绑定run root；已有只读READY保持准确原warehouse。
+
+实际写入入口在首次副作用前执行一次显式启动清扫，固定原publication与原预算，最多使用5秒或原工作剩余期限。只清过期scratch；确认完成退出的清扫超时保留pending供后续继续，I/O/权限/清理错误仍失败。通用context准入和READY `--check`保持只读。
+
+运行结束精确清理本run，失败保留登记和原始退出。显式sweep有总期限，以原生时间/名称/准确scope分类TTL遗留；无法确认的资源不删除。自定义benchmark root、祖先/后代及所有对象（包括staging）先保护。TTL不代替正常teardown。status显示最近一次scratch观察的采样时间、count/oldest、部分枚举和activation适用范围；未观察为UNKNOWN。
 
 ```bash
-NO_PROXY=127.0.0.1,localhost \
-cargo run -p novarocks-server -- standalone --role all-in-one \
-  --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG"
-
-NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_REST_ENV_FILE" \
-  docker/iceberg-rest/spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
-
-cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
-  --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg,iceberg-rest,iceberg-compatibility \
-  --mode verify --cluster-mode cross-process --cluster-size 3
+export NOVA_FIXTURE_RUN_CONTEXT="$(python3 docker/iceberg-rest/fixture_run.py context --env-file "$NOVA_ENV_REST_ENV_FILE" --fixture-budget-secs 3600)"
+docker/iceberg-rest/spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
 ```
 
-后台启动 server 时，首个连接必须等待该进程日志中的 `NOVAROCKS_READY`，不能只 probe MySQL port。all-in-one 是 smoke 便利形态，产品验收为 1FE+3BE。
+共享Spark wrapper固定实际container ID，并由容器内原进程owner管理准确run进程组；杀宿主Docker客户端不等于JVM退出。工作期到后TERM/KILL，保留未reap leader直至真实组退出；逾期清理保持失败，不能把完整期限到当成退出。另一运行及共享Spark容器不因此停止。
 
-Spark 使用生成的 Docker 网络端点（`rest:8181`、`rest-mv:8181` 与 `minio:9000`）；host 消费者使用生成的 host 端点。生成的 `ice_rest_mv` catalog 使用 `NOVAROCKS_SPARK_REST_MV_URI=http://rest-mv:8181`，默认 catalog 仍为 `ice_rest`。`spark-shell.sh`、Paimon prepare、Trino interop 和 benchmark bootstrap 接收明确的 `NOVA_ENV_REST_ENV_FILE`。benchmark 是 `s3://novarocks/shared/benchmarks` 下的不可变 READY fixture；worktree purge 不删除它。新的对象存储为空，第一次 ensure 需要重建数据，--check 不负责补建。
+```bash
+cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg,iceberg-rest,iceberg-compatibility \
+  --mode verify --cluster-mode cross-process --cluster-size 3 --fixture-budget-secs 3600
+```
 
-HMS 由 `docker/iceberg-hive/` 的 owner 管理，按精确 catalog 接网；它的数据库与容器不归 REST owner。HMS 活着时，普通和 force catalog 删除均以 `ExternalAttachmentsPresent` 拒绝。先用 HMS down 撤销精确连接、退出自己的项目，再删除 catalog。不要以 REST owner 停止别人的 HMS 项目。
+产品验收使用原生1FE+3BE，all-in-one仅smoke。每个prepared cluster拥有独立deployment ID，同cluster重启沿用；角色进程从启动到执行/重启均受原预算监护。
 
-## MV 合约检查与切换
+## 私有栈、HMS、数据集与解绑
 
-加载上述 publication 后，可以运行轻量合约探针：
+私有stock/publication-hook保持唯一项目、独立REST/rest-mv/SQLite和原创建/退出合同，`NOVA_ENV_UPDATE_CURRENT=false`。hook在创建前选择，不能替换已ready的stock。vended测试只共享准确MinIO，在原run root创建真实两套IAM/STS，私有REST/Spark使用原命令argv的容器期限guard；先确认私有writer退出才清IAM/对象，失败不伪成功。
+
+HMS只接入准确machine网络，使用机器预留HMS端口；其Derby卷和项目由HMS入口自己管理，不计为核心栈。机器换activation后先显式退出旧HMS记录再附着，不由REST owner递归删除。
+
+共享benchmark默认 `s3://novarocks/shared/benchmarks`，显式输入owner按BOM producer供给；已有消费者只check准确READY，不bind/up/ensure或改写warehouse。见 [ADR-0173](../../docs/adr/ADR-0173-prepared-dataset-consumption-is-check-only.md)。
+
+```bash
+docker/iceberg-rest/down.sh --runtime-only
+docker/iceberg-rest/down.sh --runtime-only --purge
+```
+
+共享down发布unbound并保留锁、SQLite及不可变publication。`--purge`不获得整个worktree S3根的删除权；原run cleanup与TTL负责scratch。共享 `--docker/--volumes` 拒绝；私有stack仍走准确项目/卷确认的原teardown。没有多版本stop/delete管理命令。
+
+MV轻量合约探针仍可运行：
 
 ```bash
 python3 docker/iceberg-rest/rest-mv/probe.py contract --manifest "$NOVA_ENV_MANIFEST"
 ```
 
-探针创建独立 namespace，检查 `rest-mv` 保存字段、只改指针产生不同版本、显式 null，以及 stock `rest` 丢弃字段的对照和普通 view/table 行为；退出时清理本次对象，不重启共享服务。CI 每轮在记录运行端点后、Cargo 阶段前运行它；合约或环境错误归为准备阶段的 VERIFY FAILED。重建容器的 `lifecycle` 检查仅接受私有隔离栈。配方、维护工具及三种探针模式见 [rest-mv README](rest-mv/README.md)。
-
-Paimon 产品测试已暂停，等待详细 connector 设计；CI 不准备 Paimon fixture，BOM 验证只消费 `iceberg-rest` 的依赖闭包。Paimon SQL suite 及 13 个依赖 Paimon 的 system 场景（六个 connector、五个 mixed catalog-planning、两个 scan-readiness）均明确拒绝选择。手工 fixture prepare/verify 配方、原始 SQL/oracle 和生产 provider 保留；cleanup 仍可清理匹配身份的既有私有 fixture，暂停不代表验收通过。
-
-引入 `rest-mv` 的 lock 采用一次 0/1 切换：合入后每台机器按新 lock 执行一次 `docker/fixture-inputs/provision.sh`，各 worktree rebase 后重新运行 `docker/iceberg-rest/up.sh` 并加载新 publication。旧 lock 的 worktree 会在 verify 时 BLOCKED（75）；已运行的旧 catalog 可以继续存在。新 catalog key 包含 `rest-mv`，对象存储输入与 benchmark contract ID 不变，因此复用同一 owner 下的对象存储和已有标准数据。
-
-全部 derived image 构建成功后才更新别名、BOM 与 READY；构建失败保持原状。提交段仍非原子，提交中断可能使 verify BLOCKED，需要重跑 provision。旧 catalog 不自动迁移或删除；确认其 worktree 与外部 endpoint 已退出后，按下一节的 owner locator 和精确 ID 执行 `fixture-runtime.sh delete <catalog-id>`。
-
-## 显式解绑与实例管理
-
-```bash
-docker/iceberg-rest/down.sh --runtime-only          # Unbind; retain data references.
-docker/iceberg-rest/down.sh --runtime-only --purge  # Purge every recorded private data location, then unbind.
-```
-
-解绑发布 unbound，回收旧输出并保留固定入口、锁及稳定运行数据。没有 `--purge` 时保留全部 `data_locations`，包括旧 owner/对象存储位置。purge 全部成功才清空引用；任意位置失败保留原 publication 和引用供重试。坏指针/索引不能被当作无引用。标准 READY 数据不属于这些私有前缀。
-
-实例管理使用精确 ID 与 manifest 中的 owner locator；全局选项放在子命令之前。以下示例从当前 ready publication 取所有权：
-
-```bash
-fixture_root="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["owner_locator"]["control_root"])' "$NOVA_ENV_MANIFEST")"
-fixture_daemon="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["owner_locator"]["daemon_id"])' "$NOVA_ENV_MANIFEST")"
-docker/iceberg-rest/fixture-runtime.sh --root "$fixture_root" --daemon "$fixture_daemon" list
-docker/iceberg-rest/fixture-runtime.sh --root "$fixture_root" --daemon "$fixture_daemon" status "$NOVA_ENV_CATALOG_RUNTIME"
-```
-
-在记录中确认目标 ID 后，使用相同全局选项执行 `stop <id>` 或 `delete <id>`；`--force` 在 ID 之后。
-
-- catalog 有绑定时普通 stop/delete 拒绝；force-stop 可中断消费者。force-delete 仅条件解绑仍指向目标的 worktree，保留全部数据引用；不能误解绑已经切到另一版本的入口。
-- 对象存储有 catalog 或数据引用时普通 stop 与任何 delete 均拒绝；force-stop 可以中断消费者，但保留记录、卷和端口以供恢复。`--force` 不能豁免对象存储 delete 的引用保护。
-- 外部 endpoint 尚在时普通/force catalog delete 都在进入 deleting、停止或清理前拒绝。先退出各消费者，再按精确记录操作。
-- 删除持久化 `deleting + deletion_id`；重试复核同一操作身份，逐步核验资源与标签消失后退休记录。旧删除者不能删除同 key 重建后的新资源。
-
-共享模式的 `down.sh --docker/--volumes` 被拒绝，使用上面的显式 manager。隔离 harness 设置 `NOVA_ENV_SHARED_DOCKER=false`、唯一 `nr-isolated-rest-*` 项目和 `NOVA_ENV_UPDATE_CURRENT=false`，不改共享 current；它同时运行 `rest` 与 `rest-mv`，保留精确项目/卷确认的私有 teardown。publication-hook profile 在创建前选定，只修改 `rest`；`rest-mv` 沿用普通镜像、端口与存储。
-
-旧 REST/Hive 退出是独立的用户操作：确认旧消费者已退出、数据已保存且无其它 worktree 使用后再安排。新 owner 不扫描或删除它们。运行实例所有权规则见 [ADR-0165](../../docs/adr/ADR-0165-versioned-fixture-runtime-ownership.md)。
+共享contract检查不重启服务；重建容器的lifecycle模式只接受私有隔离栈。Paimon产品测试及五项mixed catalog-planning维持原暂停范围，runtime适配单测不能被记作产品恢复。当前所有权规则见 [ADR-0191](../../docs/adr/ADR-0191-machine-shared-fixture-and-bounded-scratch.md)。
 
 ## External-Engine MV Read Interop
 

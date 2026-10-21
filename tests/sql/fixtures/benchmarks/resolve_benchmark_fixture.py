@@ -124,7 +124,7 @@ def validate_producer(workspace_root, resolved, publication, actual_image, actua
     runtime = manifest["runtime"]
     if not manifest.get("ready") or Path(runtime["publication_dir"]).resolve() != publication.resolve():
         raise ValueError("ProducerIdentityMismatch: publication is not ready or has moved")
-    catalog = runtime["catalog"]
+    catalog = runtime["machine"] if manifest.get("shared_docker", "catalog" not in runtime) else runtime["catalog"]
     saved = catalog["images"]["spark"]
     receipt = runtime["producer_receipt"]
     bom = json.loads(Path(manifest["fixture_inputs"]["bom"]).read_text())

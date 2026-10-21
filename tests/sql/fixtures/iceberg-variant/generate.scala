@@ -30,17 +30,27 @@ object VariantFixture {
   var spark: org.apache.spark.sql.SparkSession = _
   var namespace = ""
   var tableName = ""
-  def initialize(session: org.apache.spark.sql.SparkSession, ns: String, name: String): Unit = {
+  def initialize(session: org.apache.spark.sql.SparkSession, ns: String, name: String, readOnly: Boolean = false): Unit = {
     require(ns.matches("[a-zA-Z0-9_]+") && name.matches("[a-zA-Z0-9_]+"))
     require(IcebergBuild.version() == "1.11.0", "IRU-9 fixture requires pinned Iceberg 1.11.0")
     spark = session; namespace = ns; tableName = name
-    spark.sql(s"CREATE NAMESPACE IF NOT EXISTS ice_rest.$ns")
+    if (!readOnly) {
+      val scope = spark.conf.getOption("spark.novarocks.fixture.scopeRoot")
+      val run = spark.conf.getOption("spark.novarocks.fixture.runId")
+      require(run.forall(id => ns == id || ns.startsWith(id + "_")), "namespace is outside the original scratch run")
+      val location = scope.map(root => s" LOCATION '$root/rest/$ns'").getOrElse("")
+      spark.sql(s"CREATE NAMESPACE IF NOT EXISTS ice_rest.$ns$location")
+    }
   }
   def load(): Table = Spark3Util.loadIcebergCatalog(spark,"ice_rest").loadTable(TableIdentifier.of(namespace,tableName))
-  def create(schema: Schema, spec: PartitionSpec = PartitionSpec.unpartitioned(), properties: Map[String,String] = Map.empty): Table =
-    Spark3Util.loadIcebergCatalog(spark,"ice_rest").createTable(
+  def create(schema: Schema, spec: PartitionSpec = PartitionSpec.unpartitioned(), properties: Map[String,String] = Map.empty): Table = {
+    val table = Spark3Util.loadIcebergCatalog(spark,"ice_rest").createTable(
       TableIdentifier.of(namespace,tableName),schema,spec,
       (Map("format-version"->"3","write.metadata.metrics.default"->"full") ++ properties).asJava)
+    require(spark.conf.getOption("spark.novarocks.fixture.scopeRoot").forall(root => table.location().startsWith(root + "/")),
+      "actual REST table location is outside the original run scratch root")
+    table
+  }
   def row(schema: Schema, values: Seq[Any]): Record = {
     val record = GenericRecord.create(schema)
     values.zipWithIndex.foreach{case (value,index) => record.set(index,value.asInstanceOf[AnyRef])};record

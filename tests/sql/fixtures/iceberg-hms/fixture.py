@@ -31,6 +31,8 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import signal
+import sys
 import urllib.parse
 import urllib.request
 import uuid
@@ -40,6 +42,7 @@ import xml.etree.ElementTree as ET
 SPARK_PROGRAM = r'''
 import json
 import sys
+import time
 from pyspark.sql import SparkSession
 
 spark = SparkSession.builder.getOrCreate()
@@ -68,7 +71,13 @@ if action == 'prepare':
     spark.sql("ALTER TABLE " + prefix + ".v2 SET TBLPROPERTIES ('write.delete.mode'='copy-on-write')")
     spark.sql('ALTER TABLE ' + prefix + '.v2 CREATE BRANCH kept_branch')
     spark.sql('ALTER TABLE ' + prefix + '.v2 CREATE TAG kept_tag')
-    result = {'prepared': ns}
+    locations = {}
+    for version in [1, 2, 3]:
+        actual = spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(spark._jsparkSession, prefix + '.v' + str(version)).location()
+        if actual != root + '/v' + str(version):
+            raise RuntimeError('actual HMS location differs from this run scratch root: ' + actual)
+        locations['v' + str(version)] = actual
+    result = {'prepared': ns, 'actual_locations': locations}
 elif action == 'snapshot':
     namespaces = sorted(row[0] for row in spark.sql('SHOW NAMESPACES IN hms_catalog').collect() if row[0] in [ns, ns + '_new'])
     result = {'namespaces': namespaces, 'tables': {}, 'views': {}, 'metadata_location': {}}
@@ -109,13 +118,16 @@ def run_spark(workspace, action, namespace):
     for key in required:
         if not os.environ.get(key):
             raise RuntimeError('source the exact REST and HMS publications: missing ' + key)
-    compose = ['python3', str(workspace / 'docker/iceberg-rest/runtime_entry.py'),
-               'compose', '--env-file', os.environ['NOVA_ENV_COMPOSE_ENV'],
+    compose = ['python3', str(workspace / 'docker/iceberg-rest/fixture_run.py'),
+               'compose', '--env-file', os.environ['NOVA_ENV_REST_ENV_FILE'], '--',
+               '--env-file', os.environ['NOVA_ENV_COMPOSE_ENV'],
                '-p', os.environ['NOVA_ENV_COMPOSE_PROJECT'],
                '-f', os.environ['NOVA_ENV_COMPOSE_FILE'], 'exec', '-T', 'spark']
-    folder = '/tmp/iru7-hms-' + uuid.uuid4().hex
+    helper = [sys.executable, str(workspace / 'docker/iceberg-rest/fixture_run.py')]
+    folder = subprocess.check_output([*helper, 'temp-dir', '--env-file', os.environ['NOVA_ENV_REST_ENV_FILE']], text=True).strip()
     defaults = '\n'.join(Path(os.environ[key]).read_text() for key in
                          ['NOVAROCKS_SPARK_DEFAULTS', 'NOVAROCKS_SPARK_HMS_DEFAULTS'])
+    defaults += "\nspark.sql.catalog.hms_catalog.warehouse " + os.environ['NOVAROCKS_ICEBERG_HMS_WAREHOUSE'] + "\n"
     subprocess.run(compose + ['/bin/mkdir', '-p', folder], check=True)
     try:
         for name, content in [('fixture.py', SPARK_PROGRAM), ('spark-defaults.conf', defaults)]:
@@ -134,7 +146,13 @@ def run_spark(workspace, action, namespace):
             raise RuntimeError('Spark did not publish exactly one facts record')
         return json.loads(facts[0])
     finally:
-        subprocess.run(compose + ['/bin/rm', '-rf', folder], check=True)
+        alarm = signal.setitimer(signal.ITIMER_REAL, 0)
+        cleanup_started = time.monotonic()
+        try:
+            subprocess.run([*helper, 'cleanup-dir', '--env-file', os.environ['NOVA_ENV_REST_ENV_FILE'], '--path', folder], check=True)
+        finally:
+            if alarm[0]:
+                signal.setitimer(signal.ITIMER_REAL, max(0.001, alarm[0] - (time.monotonic() - cleanup_started)), alarm[1])
 
 
 def s3_request(bucket, parameters, method="GET", key=""):
@@ -182,27 +200,35 @@ def inventory(namespace):
     prefixes = [base + '/iru7/' + namespace + '/', base + '/' + namespace + '/',
                 base + '/' + namespace + '_new/', base + '/' + namespace + '.db/',
                 base + '/' + namespace + '_new.db/']
+    prefixes = [(warehouse.netloc, prefix) for prefix in prefixes]
+    original = os.environ.get('NOVA_FIXTURE_HMS_ORIGINAL_WAREHOUSE')
+    if original:
+        original = urllib.parse.urlsplit(original)
+        original_base = original.path.strip('/')
+        prefixes += [(original.netloc, original_base + '/' + namespace + suffix) for suffix in
+                     ['/', '_new/', '.db/', '_new.db/']]
     objects = {}
     pages = 0
     xml_ns = {'s': 'http://s3.amazonaws.com/doc/2006-03-01/'}
-    for prefix in prefixes:
+    for bucket, prefix in dict.fromkeys(prefixes):
         continuation = None
         seen_tokens = set()
         while True:
             parameters = {'list-type': '2', 'prefix': prefix, 'max-keys': '2'}
             if continuation is not None:
                 parameters['continuation-token'] = continuation
-            root = s3_request(warehouse.netloc, parameters)
+            root = s3_request(bucket, parameters)
             pages += 1
             for node in root.findall('s:Contents', xml_ns):
                 key = node.findtext('s:Key', namespaces=xml_ns)
-                if not key or not key.startswith(prefix) or key in objects:
+                object_uri = 's3://' + bucket + '/' + (key or '')
+                if not key or not key.startswith(prefix) or object_uri in objects:
                     raise RuntimeError('invalid or duplicate key in paginated inventory')
                 etag = node.findtext('s:ETag', namespaces=xml_ns)
                 size = node.findtext('s:Size', namespaces=xml_ns)
                 if not etag or size is None:
                     raise RuntimeError('S3 inventory omitted etag or size')
-                objects[key] = {'etag': etag, 'size': int(size)}
+                objects[object_uri] = {'etag': etag, 'size': int(size)}
             if root.findtext('s:IsTruncated', namespaces=xml_ns) == 'false':
                 break
             continuation = root.findtext('s:NextContinuationToken', namespaces=xml_ns)
@@ -216,10 +242,31 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['prepare', 'before', 'after', 'cleanup'])
     parser.add_argument('namespace')
+    parser.add_argument('--fixture-budget-secs', type=int, default=3600)
     arguments = parser.parse_args()
-    if not re.fullmatch(r'iru7_[a-z0-9_]+', arguments.namespace):
+    os.environ["NOVA_FIXTURE_BUDGET_SECS"] = str(arguments.fixture_budget_secs)
+    if not re.fullmatch(r'(?:iru7_[a-z0-9_]+|nr_scratch_[0-9]{13}_[0-9a-f]{32}(?:_[a-z0-9_]+)?)', arguments.namespace):
         parser.error('namespace must be an invocation-owned iru7_ identifier')
     workspace = Path(os.environ.get('NOVAROCKS_WORKSPACE_ROOT', Path(__file__).resolve().parents[4]))
+    sys.path.insert(0, str(workspace / 'docker/iceberg-rest'))
+    import fixture_run
+    from scratch import resource_run
+    env_file = Path(os.environ['NOVA_ENV_REST_ENV_FILE'])
+    if arguments.action == "cleanup" and os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") not in (None, "null"):
+        os.environ["NOVA_FIXTURE_CLEANUP_MODE"] = "true"
+    _, _, budget = fixture_run.admit(env_file)
+    if budget:
+        os.environ['NOVA_FIXTURE_RUN_CONTEXT'] = json.dumps(budget.as_dict(), sort_keys=True)
+        def expired(number, frame):
+            raise RuntimeError('original shared fixture deadline expired')
+        signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, max(0.001, budget.remaining_seconds(work=arguments.action != 'cleanup')))
+        if arguments.action == 'prepare' and resource_run(arguments.namespace) != budget.identity.run_id:
+            parser.error('shared HMS namespace must belong to the original scratch run')
+        os.environ['NOVA_FIXTURE_HMS_ORIGINAL_WAREHOUSE'] = os.environ['NOVAROCKS_ICEBERG_HMS_WAREHOUSE']
+        os.environ['NOVAROCKS_ICEBERG_HMS_WAREHOUSE'] = budget.identity.scope_root + '/hms'
+    if arguments.action == 'prepare' and budget:
+        fixture_run.startup_sweep(env_file, budget=budget)
     evidence = workspace / 'tests/sql/.runtime/hms-evidence' / arguments.namespace
     evidence.mkdir(parents=True, exist_ok=True)
     if arguments.action in ['before', 'after']:
@@ -242,9 +289,9 @@ def main():
             # Spark PURGE owns catalog teardown. Remove only remaining objects
             # in the exact random namespace prefixes, including directory markers.
             objects, _ = inventory(arguments.namespace)
-            bucket = urllib.parse.urlsplit(os.environ['NOVAROCKS_ICEBERG_HMS_WAREHOUSE']).netloc
-            for key in objects:
-                s3_request(bucket, {}, method='DELETE', key=key)
+            for uri in objects:
+                object_location = urllib.parse.urlsplit(uri)
+                s3_request(object_location.netloc, {}, method='DELETE', key=object_location.path.lstrip('/'))
             remaining, _ = inventory(arguments.namespace)
             if remaining:
                 raise RuntimeError('private HMS fixture objects remain after cleanup')

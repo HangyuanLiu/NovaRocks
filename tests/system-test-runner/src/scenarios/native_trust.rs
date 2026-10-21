@@ -404,8 +404,12 @@ impl Scenario for VendedCredentialTransportParity {
         true
     }
 
-    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
+    fn launch_config_with_fixture_run(
+        &self,
+        scenario_root: &std::path::Path,
+        budget: &novarocks_cluster_harness::fixture_run::RunBudget,
+    ) -> Result<ScenarioLaunchConfig> {
+        let mut rest = IsolatedIcebergRestFixture::start_with_shared_minio(scenario_root, budget)
             .context("start isolated REST fixture for vended transport parity")?;
         rest.provision_empty_table("vended_parity_db", "vended_parity_data")
             .context("provision isolated vended transport parity source table")?;

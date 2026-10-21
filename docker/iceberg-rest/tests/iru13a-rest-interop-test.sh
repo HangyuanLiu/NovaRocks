@@ -74,7 +74,10 @@ PY
 : "${AWS_S3_ACCESS_KEY_ID:?pinned S3 access key required}"
 : "${AWS_S3_SECRET_ACCESS_KEY:?pinned S3 secret required}"
 
-run_id=$(python3 -c 'import uuid; print(uuid.uuid4().hex)')
+NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" context --env-file "$publication/env.sh")"
+export NOVA_FIXTURE_RUN_CONTEXT
+python3 "$repo_root/docker/iceberg-rest/fixture_run.py" sweep-start --env-file "$publication/env.sh" >&2
+run_id=$(python3 -c 'import json,sys,uuid; value=json.loads(sys.argv[1]);print(value["identity"]["run_id"] if value else uuid.uuid4().hex)' "$NOVA_FIXTURE_RUN_CONTEXT")
 interop_root="${NR_IRU13A_INTEROP_ARTIFACT_DIR:-$NOVA_ENV_RUNTIME_DIR/iru13a-java-rest-$run_id}"
 mkdir "$interop_root"
 export NR_JAVA_REST_INTEROP_RUN_ROOT="$interop_root"
@@ -84,7 +87,7 @@ for family in IRU5 IRU13A IRU13B; do
     # Provider catalog names are normalized; the independent Java oracle must
     # address that same namespace rather than a differently cased identifier.
     family_slug=$(printf '%s' "$family" | tr '[:upper:]' '[:lower:]')
-    printf -v "$namespace_key" '%s' "java_rest_${run_id}_${family_slug}"
+    printf -v "$namespace_key" '%s' "${run_id}_${family_slug: -4}"
     printf -v "$artifact_key" '%s' "$interop_root/$family"
     export "$namespace_key" "$artifact_key"
     mkdir "${!artifact_key}"

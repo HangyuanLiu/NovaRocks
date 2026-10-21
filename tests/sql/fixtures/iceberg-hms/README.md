@@ -42,3 +42,10 @@ unique namespace prefixes and verifies that they are empty. Shared HMS services,
 other namespaces and other worktrees are retained. Provider entry tests cover
 operations that cannot be reached through SQL on an HMS-managed MV, as HMS
 cannot create that target.
+
+### 共享机器运行预算
+
+共享消费者通过本次不可变 publication 读取机器事实，继承
+`NOVA_FIXTURE_RUN_CONTEXT` 的 run 身份与原截止时间。嵌套 Spark 调用不会重置
+预算；容器内 owner 负责准确进程组的终止与实际 wait。正常清理失败会返回失败，
+不能以未来 TTL 清扫代替本次清理。私有 publication 保留其原有资源 owner。

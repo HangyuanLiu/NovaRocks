@@ -27,6 +27,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "${NOVAROCKS_WORKSPACE_ROOT:-$SCRIPT_DIR/../..}" && pwd)"
 # See spark-sql.sh: CI supplies its already-resolved generated environment so
 # this helper does not depend on the mutable interactive `current` link.
+input_file=""
+while (($#)); do
+  case "$1" in
+    --fixture-budget-secs) [[ $# -ge 2 ]] || { echo 'missing fixture budget' >&2; exit 2; }; export NOVA_FIXTURE_BUDGET_SECS="$2"; shift 2 ;;
+    --fixture-budget-secs=*) export NOVA_FIXTURE_BUDGET_SECS="${1#*=}"; shift ;;
+    --*) echo "unknown option: $1" >&2; exit 2 ;;
+    *) [[ -z "$input_file" ]] || { echo 'only one input file is accepted' >&2; exit 2; }; input_file="$1"; shift ;;
+  esac
+done
+set -- "$input_file"
 CURRENT_ENV="${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}"
 CURRENT_ENV="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CURRENT_ENV")"
 
@@ -39,6 +49,9 @@ fi
 # shellcheck disable=SC1090
 source "$CURRENT_ENV"
 [[ "${NOVA_ENV_READY:-false}" == "true" ]] || { echo "fixture is not ready; run docker/iceberg-rest/up.sh" >&2; exit 1; }
+NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$SCRIPT_DIR/fixture_run.py" context --env-file "$CURRENT_ENV")"
+export NOVA_FIXTURE_RUN_CONTEXT
+
 
 scala_file="${1:-}"
 if [[ -z "$scala_file" ]]; then
@@ -55,20 +68,38 @@ if [[ ! -f "$NOVAROCKS_SPARK_DEFAULTS" ]]; then
 fi
 
 compose_args=(
-  python3 "$SCRIPT_DIR/runtime_entry.py" compose
+  python3 "$SCRIPT_DIR/fixture_run.py" compose --env-file "$CURRENT_ENV" --
   --env-file "$NOVA_ENV_COMPOSE_ENV"
   -p "$NOVA_ENV_COMPOSE_PROJECT"
   -f "$NOVA_ENV_COMPOSE_FILE"
 )
 
-tmp_dir="/tmp/novarocks-spark-shell-${NOVA_ENV_ID:-env}-$$"
+python3 "$SCRIPT_DIR/fixture_run.py" sweep-start --env-file "$CURRENT_ENV" >&2
+
+tmp_dir="$(python3 "$SCRIPT_DIR/fixture_run.py" temp-dir --env-file "$CURRENT_ENV")"
 tmp_scala="$tmp_dir/query.scala"
 tmp_defaults="$tmp_dir/spark-defaults.conf"
-
+cleanup_local_run() {
+  local primary=$? cleanup=0
+  trap - EXIT INT TERM
+  python3 "$SCRIPT_DIR/fixture_run.py" cleanup-dir --env-file "$CURRENT_ENV" --path "$tmp_dir" || cleanup=$?
+  (( primary == 0 )) || exit "$primary"
+  exit "$cleanup"
+}
+trap cleanup_local_run EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 cd "$WORKSPACE_ROOT"
-"${compose_args[@]}" exec -T spark /bin/bash -lc "mkdir -p '$tmp_dir'"
 {
   cat "$NOVAROCKS_SPARK_DEFAULTS"
+  if [[ "$NOVA_FIXTURE_RUN_CONTEXT" != null ]]; then
+    python3 - "$NOVA_FIXTURE_RUN_CONTEXT" <<'PYRUN'
+import json,sys
+value=json.loads(sys.argv[1])
+print("\nspark.novarocks.fixture.scopeRoot " + value["identity"]["scope_root"])
+print("spark.novarocks.fixture.runId " + value["identity"]["run_id"])
+PYRUN
+  fi
   if [[ -n "${NOVAROCKS_SPARK_EXTRA_DEFAULTS:-}" ]]; then
     IFS=':' read -r -a extra_defaults_files <<< "$NOVAROCKS_SPARK_EXTRA_DEFAULTS"
     for defaults_file in "${extra_defaults_files[@]}"; do
@@ -84,7 +115,6 @@ cd "$WORKSPACE_ROOT"
 "${compose_args[@]}" exec -T spark /bin/bash -lc "cat > '$tmp_scala'" < "$scala_file"
 "${compose_args[@]}" exec -T spark /bin/bash -lc "
   set -euo pipefail
-  trap 'rm -rf $tmp_dir' EXIT
   spark_shell_bin=\"\${SPARK_SHELL_BIN:-}\"
   if [[ -z \"\$spark_shell_bin\" ]]; then
     spark_shell_bin=\"\$(command -v spark-shell || true)\"

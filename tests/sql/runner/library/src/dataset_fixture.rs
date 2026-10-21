@@ -79,9 +79,25 @@ pub fn bind_prepared_dataset(
     runner_config: &RunnerConfig,
     base_dir: &Path,
 ) -> Result<ReadyDatasetBinding> {
+    bind_prepared_dataset_impl(requirement, runner_config, base_dir, None)
+}
+pub(crate) fn bind_prepared_dataset_with_budget(
+    requirement: &PreparedDatasetRequirement,
+    runner_config: &RunnerConfig,
+    base_dir: &Path,
+    budget: &novarocks_cluster_harness::fixture_run::RunBudget,
+) -> Result<ReadyDatasetBinding> {
+    bind_prepared_dataset_impl(requirement, runner_config, base_dir, Some(budget))
+}
+fn bind_prepared_dataset_impl(
+    requirement: &PreparedDatasetRequirement,
+    runner_config: &RunnerConfig,
+    base_dir: &Path,
+    budget: Option<&novarocks_cluster_harness::fixture_run::RunBudget>,
+) -> Result<ReadyDatasetBinding> {
     let suite = requirement.dataset.as_str();
     let scale = &requirement.scale;
-    let resolved = resolve_dataset(runner_config, base_dir, suite, scale)?;
+    let resolved = resolve_dataset(runner_config, base_dir, suite, scale, budget)?;
     let mut resolved_file = NamedTempFile::new().context("create resolved dataset file")?;
     serde_json::to_writer(&mut resolved_file, &resolved).context("write resolved dataset")?;
     resolved_file
@@ -97,8 +113,7 @@ pub fn bind_prepared_dataset(
         command.env("NOVA_ENV_REST_ENV_FILE", env_file);
     }
     let preview = command_preview(&command);
-    let output = command
-        .output()
+    let output = bounded_output(command, budget)
         .with_context(|| format!("read prepared dataset: {preview}"))?;
     if output.stdout.is_empty() {
         bail!(
@@ -107,9 +122,53 @@ pub fn bind_prepared_dataset(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    validate_typed_check_output(runner_config, base_dir, suite, scale, &output)?;
+    validate_typed_check_output(runner_config, base_dir, suite, scale, &output, budget)?;
     parse_check_output(&output, &resolved, &preview)
         .with_context(|| format!("prepared dataset required for {suite}"))
+}
+
+fn bounded_output(
+    mut command: Command,
+    budget: Option<&novarocks_cluster_harness::fixture_run::RunBudget>,
+) -> Result<std::process::Output> {
+    let Some(budget) = budget else {
+        return command
+            .output()
+            .context("read prepared dataset command output");
+    };
+    budget.check_work()?;
+    let mut managed = novarocks_test_support::ManagedCommand::new(command.get_program());
+    managed.args(command.get_args());
+    if let Some(dir) = command.get_current_dir() {
+        managed.current_dir(dir);
+    }
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => {
+                managed.env(key, value);
+            }
+            None => {
+                managed.env_remove(key);
+            }
+        }
+    }
+    managed.env(
+        novarocks_cluster_harness::fixture_run::RUN_CONTEXT_ENV,
+        budget.to_json()?,
+    );
+    let outcome = novarocks_test_support::capture_command_until(
+        managed,
+        tempfile::tempfile()?,
+        tempfile::tempfile()?,
+        budget.work_deadline(),
+    )?;
+    anyhow::ensure!(
+        !outcome.timed_out && outcome.failures.is_empty(),
+        "prepared dataset original deadline or actual exit failed; diagnostics retained at {}",
+        outcome.diagnostic_root().display()
+    );
+    outcome.release_diagnostics()?;
+    Ok(outcome.output)
 }
 
 fn resolve_dataset(
@@ -117,6 +176,7 @@ fn resolve_dataset(
     base_dir: &Path,
     suite: &str,
     scale: &str,
+    budget: Option<&novarocks_cluster_harness::fixture_run::RunBudget>,
 ) -> Result<ResolvedDataset> {
     let resolver_path = fixture_resolver_path(runner_config, base_dir);
     let mut command = Command::new("python3");
@@ -132,8 +192,7 @@ fn resolve_dataset(
         command.arg("--shared-root").arg(shared_root);
     }
     let preview = command_preview(&command);
-    let output = command
-        .output()
+    let output = bounded_output(command, budget)
         .with_context(|| format!("failed to run dataset fixture resolver: {preview}"))?;
     if !output.status.success() {
         bail!(
@@ -180,6 +239,7 @@ fn validate_typed_check_output(
     suite: &str,
     scale: &str,
     output: &std::process::Output,
+    budget: Option<&novarocks_cluster_harness::fixture_run::RunBudget>,
 ) -> Result<()> {
     let mut output_file = NamedTempFile::new().context("create bootstrap result file")?;
     use std::io::Write;
@@ -210,8 +270,7 @@ fn validate_typed_check_output(
         command.arg("--shared-root").arg(shared_root);
     }
     let preview = command_preview(&command);
-    let validation = command
-        .output()
+    let validation = bounded_output(command, budget)
         .with_context(|| format!("failed to validate dataset fixture result: {preview}"))?;
     if validation.status.success() {
         return Ok(());

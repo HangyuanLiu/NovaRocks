@@ -98,3 +98,10 @@ the approved independent-read exception applies. No implicit host Maven jar or
 classpath override is used. Generation receipts depend on successful Java writes,
 actual writer metrics/bounds, and catalog publication; NovaRocks reads the fixed
 fixture values in the SQL cases.
+
+### 共享机器运行预算
+
+共享消费者通过本次不可变 publication 读取机器事实，继承
+`NOVA_FIXTURE_RUN_CONTEXT` 的 run 身份与原截止时间。嵌套 Spark 调用不会重置
+预算；容器内 owner 负责准确进程组的终止与实际 wait。正常清理失败会返回失败，
+不能以未来 TTL 清扫代替本次清理。私有 publication 保留其原有资源 owner。

@@ -41,6 +41,11 @@ pub fn run(build: build_information::BuildInformation) {
         } else {
             eprintln!("system scenario runner failed: {error:#}");
         }
-        std::process::exit(1);
+        let status = if runner::fixture_admission_rejected(&error) {
+            75
+        } else {
+            1
+        };
+        std::process::exit(status);
     }
 }

@@ -253,7 +253,6 @@ pub(super) fn for_module(
                 "DOCKER_CERT_PATH",
                 "DOCKER_CONFIG",
                 "NOVA_FIXTURE_STORE",
-                "NOVA_FIXTURE_RUNTIME_DIR",
                 "XDG_CONFIG_HOME",
                 "XDG_CACHE_HOME",
                 "XDG_STATE_HOME",

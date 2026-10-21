@@ -13,8 +13,11 @@ NOVA_ENV_REST_ENV_FILE=/absolute/path/to/resolved/env.sh \
 环境入口优先使用调用者传入的 `NOVA_ENV_REST_ENV_FILE`，否则解析工作树的
 `docker/iceberg-rest/runtime/current/env.sh`。脚本先固定其真实路径，再透传给
 `spark-shell.sh`；隔离 suite 的入口不会被 `runtime/current` 覆盖。环境须先由
-既有 fixture owner 准备。每次默认生成一个 UUID namespace；也可显式传入
-`--namespace`、`--prefix`，但该名称不得已存在。
+机器层显式准备。共享运行默认采用带创建时间的 `nr_scratch_*` namespace，
+嵌套调用继承 `NOVA_FIXTURE_RUN_CONTEXT` 的身份和原截止时间；显式 `--namespace`
+必须属于同一 run，实际 REST namespace location 位于该 run 的 scratch root。
+私有 publication 保持原 owner 与命名语义。原生 Spark/JVM 由容器内进程组 owner
+监护，超时和取消均确认实际退出，共享 Spark 服务保持运行。
 
 `--mode positive` 仅运行同次 `RowDelta.addRows + addDeletes` 的 position、
 equality、DV 正向控制，供 `spark_rest_delete_applicability.sql` 使用。

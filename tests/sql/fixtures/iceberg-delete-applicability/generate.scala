@@ -75,7 +75,11 @@ object DeleteApplicabilityFixture {
     require(ns.matches("[a-zA-Z0-9_]+") && namePrefix.matches("[a-zA-Z0-9_]+"))
     spark = session; namespace = ns; prefix = namePrefix
     require(IcebergBuild.version() == "1.11.0", "The oracle requires Iceberg 1.11.0")
-    spark.sql(s"CREATE NAMESPACE IF NOT EXISTS ice_rest.$namespace")
+    val scope = spark.conf.getOption("spark.novarocks.fixture.scopeRoot")
+    val run = spark.conf.getOption("spark.novarocks.fixture.runId")
+    require(run.forall(id => ns == id || ns.startsWith(id + "_")), "namespace is outside the original scratch run")
+    val location = scope.map(root => s" LOCATION '$root/rest/$namespace'").getOrElse("")
+    spark.sql(s"CREATE NAMESPACE IF NOT EXISTS ice_rest.$namespace$location")
     emit(obj("record" -> "runtime", "iceberg" -> IcebergBuild.fullVersion(),
       "spark" -> spark.version, "java" -> System.getProperty("java.version"),
       "requested_warehouse" -> spark.conf.get("spark.sql.catalog.ice_rest.warehouse", ""),
@@ -87,6 +91,8 @@ object DeleteApplicabilityFixture {
     spark.sql(s"CREATE TABLE $qualified (id BIGINT, p INT, value STRING) USING iceberg $partition " +
       s"TBLPROPERTIES ('format-version'='$version', 'write.metadata.metrics.default'='full')")
     val t = Spark3Util.loadIcebergTable(spark, qualified)
+    require(spark.conf.getOption("spark.novarocks.fixture.scopeRoot").forall(root => t.location().startsWith(root + "/")),
+      "actual REST table location is outside the original run scratch root")
     tables += ((qualified, t)); t
   }
   def partition(t: Table, p: Int): StructLike = {

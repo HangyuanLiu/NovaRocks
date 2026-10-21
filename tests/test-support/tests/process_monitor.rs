@@ -1080,3 +1080,183 @@ fn log_count_preserves_nonoverlapping_match_semantics() {
     assert_eq!(process.log_count("AA").unwrap(), 2);
     process.stop().unwrap();
 }
+
+#[test]
+fn admitted_lifetime_stops_writes_while_the_owner_remains_alive() {
+    let directory = Directory::new();
+    let writes = directory.0.join("writes");
+    let now = Instant::now();
+    let mut request = command(
+        "trap 'exit 0' TERM; printf 'READY\\n'; while :; do printf x >> \"$WRITES\"; sleep 0.02; done",
+    );
+    request
+        .env("WRITES", &writes)
+        .terminate_at(now + Duration::from_secs(2), now + Duration::from_secs(4));
+    let mut process = ManagedProcess::spawn(
+        "lifetime writes".into(),
+        request,
+        ReadyMarker::StdoutContains("READY".into()),
+        Duration::from_secs(2),
+        directory.0.join("locator"),
+    )
+    .unwrap();
+    let root = process.diagnostic_root().to_owned();
+    let error = process
+        .wait_for_successful_exit_until(now + Duration::from_secs(6))
+        .unwrap_err();
+    assert!(
+        error.is::<novarocks_test_support::PayloadLifetimeExpired>(),
+        "{error:#}"
+    );
+    let record = final_record(&root);
+    assert_eq!(record["lifetime_expired"], true);
+    assert_eq!(record["owner_lost"], false);
+    assert_eq!(record["group_exit_observed"], true);
+    assert_eq!(
+        record["status_raw"], 0,
+        "a cooperative native exit0 cannot erase expiration"
+    );
+    let size = fs::metadata(&writes).unwrap().len();
+    assert!(size > 0);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(fs::metadata(writes).unwrap().len(), size);
+    assert_pid_reaped(process.pid());
+}
+
+#[test]
+fn admitted_lifetime_escalates_term_ignoring_group_and_observes_descendants_exit() {
+    let directory = Directory::new();
+    let child_pid = directory.0.join("child.pid");
+    let writes = directory.0.join("descendant-writes");
+    let now = Instant::now();
+    let mut request = command(
+        "trap '' TERM; (trap '' TERM; while :; do printf x >> \"$WRITES\"; sleep 0.02; done) & printf '%s' $! > \"$CHILD_PID\"; printf 'READY\\n'; while :; do sleep 1; done",
+    );
+    request
+        .env("WRITES", &writes)
+        .env("CHILD_PID", &child_pid)
+        .terminate_at(now + Duration::from_secs(2), now + Duration::from_secs(5));
+    let mut process = ManagedProcess::spawn(
+        "lifetime descendants".into(),
+        request,
+        ReadyMarker::StdoutContains("READY".into()),
+        Duration::from_secs(2),
+        directory.0.join("locator"),
+    )
+    .unwrap();
+    let root = process.diagnostic_root().to_owned();
+    let error = process
+        .wait_for_successful_exit_until(now + Duration::from_secs(7))
+        .unwrap_err();
+    // Expiration is always a failure. If actual exit crosses the complete
+    // clock, retain the separate incomplete fact instead of waiving it.
+    assert!(
+        format!("{error:#}").contains("deadline expired")
+            || format!("{error:#}").contains("cleanup violation")
+    );
+    let text = fs::read_to_string(root.join("record.jsonl")).unwrap();
+    let record: serde_json::Value = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|r| r["event"] == "Final")
+        .unwrap();
+    assert_eq!(record["lifetime_expired"], true);
+    assert_eq!(record["owner_lost"], false);
+    assert_eq!(record["group_exit_observed"], true, "{record}");
+    let pending: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert!(
+        record["group_exit_observed_ns"].as_u64().unwrap()
+            < pending["lifetime_ns"][1].as_u64().unwrap()
+    );
+    assert_eq!(record["cleanup_complete"], true, "{record}");
+    let status = <std::process::ExitStatus as std::os::unix::process::ExitStatusExt>::from_raw(
+        record["status_raw"].as_i64().unwrap() as i32,
+    );
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(9)
+    );
+    let size = fs::metadata(&writes).unwrap().len();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(fs::metadata(writes).unwrap().len(), size);
+    let pid = fs::read_to_string(child_pid).unwrap();
+    let observed = Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", pid.trim()])
+        .output()
+        .unwrap();
+    let state = String::from_utf8(observed.stdout).unwrap();
+    assert!(
+        state.trim().is_empty() || state.trim().starts_with('Z'),
+        "descendant is still executing: {state}"
+    );
+    assert_pid_reaped(process.pid());
+}
+
+#[test]
+fn optional_lifetime_never_reinterprets_default_startup_clock_as_runtime_limit() {
+    let directory = Directory::new();
+    let mut process = ManagedProcess::spawn(
+        "startup only".into(),
+        command(SERVICE),
+        ReadyMarker::StdoutContains("READY".into()),
+        Duration::from_secs(1),
+        directory.0.join("locator"),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(1200));
+    assert!(process.is_running().unwrap());
+    process.stop().unwrap();
+    let record = final_record(process.diagnostic_root());
+    assert_eq!(record["lifetime_expired"], false);
+}
+
+#[test]
+fn repeated_lifetime_configuration_only_narrows_original_clocks() {
+    let directory = Directory::new();
+    let now = Instant::now();
+    let mut request = command(SERVICE);
+    request.terminate_at(now + Duration::from_secs(2), now + Duration::from_secs(4));
+    request.terminate_at(now + Duration::from_secs(30), now + Duration::from_secs(60));
+    let mut process = ManagedProcess::spawn(
+        "bounded lifetime".into(),
+        request,
+        ReadyMarker::StdoutContains("READY".into()),
+        Duration::from_secs(2),
+        directory.0.join("locator"),
+    )
+    .unwrap();
+    let error = process
+        .wait_for_successful_exit_until(now + Duration::from_secs(6))
+        .unwrap_err();
+    assert!(
+        error.is::<novarocks_test_support::PayloadLifetimeExpired>(),
+        "{error:#}"
+    );
+    assert!(Instant::now() < now + Duration::from_secs(6));
+    assert_eq!(
+        final_record(process.diagnostic_root())["lifetime_expired"],
+        true
+    );
+}
+
+#[test]
+fn already_expired_lifetime_refuses_payload_side_effects_before_spawn() {
+    let directory = Directory::new();
+    let written = directory.0.join("must-not-exist");
+    let mut request = command("printf forbidden > \"$WRITES\"; printf 'READY\\n'; sleep 10");
+    request.env("WRITES", &written).terminate_at(
+        Instant::now() - Duration::from_secs(1),
+        Instant::now() + Duration::from_secs(2),
+    );
+    assert!(
+        ManagedProcess::spawn(
+            "expired before spawn".into(),
+            request,
+            ReadyMarker::StdoutContains("READY".into()),
+            Duration::from_secs(2),
+            directory.0.join("locator")
+        )
+        .is_err()
+    );
+    assert!(!written.exists());
+}

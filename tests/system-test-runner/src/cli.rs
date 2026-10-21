@@ -17,6 +17,7 @@ pub struct Cli {
     pub artifact_root: Option<PathBuf>,
     pub cluster_size: usize,
     pub timeout_secs: u64,
+    pub fixture_budget_secs: u64,
     pub launch_profile: LaunchProfile,
     /// Exact private binding for the optional small HMS correctness preflight.
     pub hms_classification_binding: Option<PathBuf>,
@@ -49,6 +50,7 @@ impl Cli {
             artifact_root: None,
             cluster_size: 3,
             timeout_secs: 300,
+            fixture_budget_secs: 3600,
             launch_profile: LaunchProfile::FaultScenario,
             hms_classification_binding: None,
             hms_bulk_readonly_binding: None,
@@ -85,6 +87,12 @@ impl Cli {
                     cli.cluster_size = value("--cluster-size")?.parse().map_err(|_| {
                         anyhow::anyhow!("--cluster-size must be a positive integer")
                     })?;
+                }
+                "--fixture-budget-secs" => {
+                    cli.fixture_budget_secs =
+                        value("--fixture-budget-secs")?.parse().map_err(|_| {
+                            anyhow::anyhow!("--fixture-budget-secs must be a positive integer")
+                        })?;
                 }
                 "--timeout-secs" => {
                     cli.timeout_secs = value("--timeout-secs")?.parse().map_err(|_| {
@@ -229,7 +237,7 @@ impl Cli {
             "usage: novarocks-system-tests [--list | --list-default | --list-compatibility | --list-binary-requirements | --list-declarations] [--only <exact-name>]... ",
             "[--binary <path> [--compatible-binary <path>] ",
             "[--other-island-binary <path>] --config <path> ",
-            "--artifact-root <path>] [--cluster-size <N>] [--timeout-secs <N>] ",
+            "--artifact-root <path>] [--cluster-size <N>] [--timeout-secs <N>] [--fixture-budget-secs <N>] ",
             "[--launch-profile <fault-scenario|performance>] ",
             "[--hms-classification-binding <path>] [--hms-bulk-readonly-binding <path>] [--exact-mysql-execution-binding <path>] [--held-native-execution-binding <path>] [--held-live-collector-fences-v1]"
         )

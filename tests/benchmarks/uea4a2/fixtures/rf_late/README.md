@@ -18,7 +18,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 tests/benchmarks/uea4a2/fixtures/rf_late/publi
   --receipt tests/benchmarks/uea4a2/fixtures/rf_late/published.json
 ```
 
-发布器只创建任务私有 namespace `uea4a2_rf_late_20260923` 下的两张新表，上传已校验的文件并用 PyIceberg `add_files` 形成快照；已存在同名表时拒绝修改。若需在独立环境重新发布，显式选择新 namespace 和新 receipt，先运行 `publish`，再运行 `verify-published`，并登记新的实验版本。已发布和在线校验仍不代表原生 RF 到达时序已经验证。
+冻结收据保留历史 namespace `uea4a2_rf_late_20260923`。共享环境中的新发布只创建原 scratch run 的 `_rf` namespace 下的两张新表，上传已校验的文件并用 PyIceberg `add_files` 形成快照；已存在同名表时拒绝修改。若需在独立环境重新发布，显式选择新 namespace 和新 receipt，先运行 `publish`，再运行 `verify-published`，并登记新的实验版本。已发布和在线校验仍不代表原生 RF 到达时序已经验证。
 
 `probe_v1` 的 DataFile 包含 32 个 `split_offsets`，因而原生调度会把一份物理 Parquet 拆成 32 个 split。为同一 split 内的 RF 后到验证，`publish_whole.py` 在同一 namespace 另建 `probe_whole_v1`，上传与原 probe **完全同 SHA-256** 的文件，保留物理 32 行组，仅在新 Iceberg DataFile 中设 `split_offsets=null`。它不修改 `probe_v1` 或 `build_v1`。新 snapshot 为 `4264844081461962022`；`whole_published.json` 同时绑定原 snapshot `3873451287235817704`、READY、对象哈希与行组布局。离线顶层 `verify_manifest.py --verify` 对两份发布收据交叉核对；在线核验命令：
 
@@ -28,3 +28,5 @@ PYTHONDONTWRITEBYTECODE=1 python3 tests/benchmarks/uea4a2/fixtures/rf_late/publi
 ```
 
 行组布局只提供 RF 后到的物理条件。场景仍须在同一个 probe split 内观测第 0 行组已消费、RF subscription 到达，并控制 build 侧精确 Range 的释放时点；仅比较最终 join 行数不能证明 RF 后到或后续行组剪枝。
+
+新共享写入从准确 publication 准入原始 `NOVA_FIXTURE_RUN_CONTEXT`（默认完整预算 3600 秒，可用 `--fixture-budget-secs` 缩短），所有表显式设置原 scratch location；已有表仍拒绝修改。`publish_whole.py publish --source-receipt <本次 publish 的 receipt>` 恢复该收据保存的原 run、namespace 与绝对期限，过期拒绝继续，不创建替代身份。`verify-published` 始终按所给冻结 receipt 只读核验，不要求把历史 namespace 迁移成新 run。

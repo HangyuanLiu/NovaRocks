@@ -25,6 +25,7 @@ output=""
 namespace=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --fixture-budget-secs) export NOVA_FIXTURE_BUDGET_SECS="$2"; shift 2 ;;
     --manifest) manifest="$2"; shift 2 ;;
     --output) output="$2"; shift 2 ;;
     --namespace) namespace="$2"; shift 2 ;;
@@ -33,7 +34,13 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$manifest" && -n "$output" ]] || { echo "--manifest and --output are required" >&2; exit 2; }
 [[ -f "$manifest" && ! -e "$output" ]] || { echo "Manifest must exist and output must be new" >&2; exit 2; }
-namespace="${namespace:-uea4g_scale_$(python3 -c 'import uuid; print(uuid.uuid4().hex)')}"
+NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$WORKSPACE_ROOT/docker/iceberg-rest/fixture_run.py" context --env-file "${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}")"
+export NOVA_FIXTURE_RUN_CONTEXT
+if [[ "$NOVA_FIXTURE_RUN_CONTEXT" != null ]]; then
+  namespace="${namespace:-$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["identity"]["run_id"])' "$NOVA_FIXTURE_RUN_CONTEXT")}"
+else
+  namespace="${namespace:-uea4g_scale_$(python3 -c 'import uuid; print(uuid.uuid4().hex)')}"
+fi
 [[ "$namespace" =~ ^[a-zA-Z0-9_]+$ ]] || { echo "Invalid namespace" >&2; exit 2; }
 NOVA_ENV_REST_ENV_FILE="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' \
   "${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}")"

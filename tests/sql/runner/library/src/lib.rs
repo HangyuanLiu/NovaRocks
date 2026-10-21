@@ -24,8 +24,10 @@ mod dataset_fixture;
 mod extension_manifest;
 mod failure_artifacts;
 mod fault_injection;
+mod fixture_context;
 mod iceberg_orphan_fixture;
 mod mv_rest_document_graph;
+mod namespace_guard;
 mod parser;
 mod publication_catalog;
 mod publication_service;
@@ -47,10 +49,10 @@ mod engine_error_codes;
 
 use crate::cluster::{ClusterMode, ServerHandle, launch_server, validate_cluster_args};
 use crate::config::{
-    FixtureEndpoints, build_suite_configs, case_auto_db_name, env_optional, env_or_default,
-    list_sql_files, load_runner_config, placeholder_variables, project_fixture_value,
-    resolve_config_path, resolve_path, resolve_reference_port, resolve_repo_root,
-    resolve_target_port, suite_default_query_timeout,
+    FixtureEndpoints, build_suite_configs, env_optional, env_or_default, list_sql_files,
+    load_runner_config, placeholder_variables, project_fixture_value, resolve_config_path,
+    resolve_path, resolve_reference_port, resolve_repo_root, resolve_target_port,
+    suite_default_query_timeout,
 };
 use crate::failure_artifacts::{FailureArtifactContext, FailureArtifactRecorder};
 use crate::parser::load_suite_hook;
@@ -481,6 +483,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     query_timeout: Option<u64>,
 
+    /// Complete invocation budget, including fixture startup and cleanup reserve.
+    #[arg(long, default_value_t = 3600)]
+    fixture_budget_secs: u64,
+
     #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_verify")]
     verify: bool,
 
@@ -603,6 +609,8 @@ fn execute_target_session_sql_with<S>(
 
 /// Shared, read-only context for running cases within a suite.
 struct SuiteRunContext {
+    fixture_budget: novarocks_cluster_harness::fixture_run::RunBudget,
+    namespace_catalogs: namespace_guard::CatalogFacts,
     suite_name: String,
     controls: Option<Arc<control_plan::SqlControlExecution>>,
     mode: Mode,
@@ -630,6 +638,60 @@ struct SuiteRunContext {
     publication_catalog_control: Option<publication_catalog::FixtureControl>,
     publication_service_control: Option<publication_service::Control>,
     results: Option<Arc<results_record::SuiteRecorder>>,
+}
+
+impl SuiteRunContext {
+    fn work_deadline(&self) -> Instant {
+        self.controls
+            .as_ref()
+            .map_or(self.fixture_budget.work_deadline(), |c| {
+                c.deadline.min(self.fixture_budget.work_deadline())
+            })
+    }
+    fn cleanup_deadline(&self) -> Instant {
+        self.fixture_budget.deadline()
+    }
+    fn namespace_guard(
+        &self,
+        conn: &ConnectionConfig,
+        cleanup: bool,
+    ) -> namespace_guard::NamespaceGuard {
+        namespace_guard::NamespaceGuard::new(
+            self.fixture_budget.identity(),
+            self.namespace_catalogs.clone(),
+            conn,
+            if cleanup {
+                self.cleanup_deadline()
+            } else {
+                self.work_deadline()
+            },
+        )
+    }
+    fn execute_shell(
+        &self,
+        sql: &str,
+        deadline: Option<Instant>,
+        cleanup: bool,
+    ) -> (bool, Option<QueryExecution>, String) {
+        let limit = if cleanup {
+            self.cleanup_deadline()
+        } else {
+            self.work_deadline()
+        };
+        match self.fixture_budget.to_json() {
+            Ok(context) => shell::execute_shell_step_in_context(
+                sql,
+                Some(deadline.map_or(limit, |d| d.min(limit))),
+                Some(&context),
+                cleanup,
+            ),
+            Err(error) => (
+                false,
+                None,
+                format!("SQL run context serialization failed: {error:#}"),
+            ),
+        }
+    }
 }
 
 struct CaseOutcome {
@@ -814,7 +876,9 @@ fn execute_wait_alter(
                 max_retries,
                 interval.as_millis(),
             );
-            sleep(interval);
+            sleep(session.original_deadline().map_or(interval, |deadline| {
+                interval.min(deadline.saturating_duration_since(Instant::now()))
+            }));
         }
     }
     let _ = writeln!(
@@ -1678,6 +1742,7 @@ fn execute_target_query_with_selected_control(
 }
 
 struct InflightPublicationFrontendKill<'a> {
+    namespace_guard: namespace_guard::NamespaceGuard,
     meta: &'a QueryMeta,
     server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
     session_config: ConnectionConfig,
@@ -1692,6 +1757,8 @@ struct InflightPublicationFrontendKill<'a> {
 }
 
 struct InflightPublicationConcurrentShell<'a> {
+    namespace_guard: namespace_guard::NamespaceGuard,
+    run_context: String,
     meta: &'a QueryMeta,
     server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
     session_config: ConnectionConfig,
@@ -1706,6 +1773,8 @@ struct InflightPublicationConcurrentShell<'a> {
 }
 
 struct InflightPublicationServiceShell<'a> {
+    namespace_guard: namespace_guard::NamespaceGuard,
+    run_context: String,
     meta: &'a QueryMeta,
     server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
     session_config: ConnectionConfig,
@@ -1722,6 +1791,8 @@ fn execute_target_query_with_inflight_publication_service_shell(
     request: InflightPublicationServiceShell<'_>,
 ) -> (bool, Option<QueryExecution>, String) {
     let InflightPublicationServiceShell {
+        namespace_guard,
+        run_context,
         meta,
         server_handle,
         session_config,
@@ -1740,15 +1811,18 @@ fn execute_target_query_with_inflight_publication_service_shell(
     let thread_server = Arc::clone(server_handle);
     let query_thread = std::thread::spawn(move || {
         match MysqlSession::new_with_deadline(&session_config, Some(deadline)) {
-            Ok(mut session) => execute_target_query_with_fault(
-                &thread_meta,
-                &thread_server,
-                &mut session,
-                query_timeout,
-                &sql,
-                db.as_deref(),
-                Some(deadline),
-            ),
+            Ok(mut session) => {
+                session.set_namespace_guard(namespace_guard);
+                execute_target_query_with_fault(
+                    &thread_meta,
+                    &thread_server,
+                    &mut session,
+                    query_timeout,
+                    &sql,
+                    db.as_deref(),
+                    Some(deadline),
+                )
+            }
             Err(error) => (
                 false,
                 None,
@@ -1772,8 +1846,12 @@ fn execute_target_query_with_inflight_publication_service_shell(
         log,
         "    @publication_service_hold post-requirements boundary reached"
     );
-    let (companion_ok, _, companion_error) =
-        shell::execute_shell_step_until(&format!("shell: {shell}"), Some(deadline));
+    let (companion_ok, _, companion_error) = shell::execute_shell_step_in_context(
+        &format!("shell: {shell}"),
+        Some(deadline),
+        Some(&run_context),
+        false,
+    );
     if !companion_ok {
         let _ = hold.release();
         let _ = query_thread.join();
@@ -1828,6 +1906,8 @@ fn execute_target_query_while_publication_service_holds_shell(
     request: InflightPublicationServiceShell<'_>,
 ) -> (bool, Option<QueryExecution>, String) {
     let InflightPublicationServiceShell {
+        namespace_guard,
+        run_context,
         meta,
         server_handle,
         session_config,
@@ -1843,8 +1923,9 @@ fn execute_target_query_while_publication_service_holds_shell(
     let deadline =
         original_deadline.map_or(action_deadline, |original| original.min(action_deadline));
     let shell = format!("shell: {shell}");
-    let shell_thread =
-        std::thread::spawn(move || shell::execute_shell_step_until(&shell, Some(deadline)));
+    let shell_thread = std::thread::spawn(move || {
+        shell::execute_shell_step_in_context(&shell, Some(deadline), Some(&run_context), false)
+    });
     if let Err(error) = hold.wait_until_held(deadline) {
         let _ = hold.release();
         let _ = shell_thread.join();
@@ -1859,15 +1940,18 @@ fn execute_target_query_while_publication_service_holds_shell(
         "    @publication_service_hold external request reached post-requirements boundary"
     );
     let query_result = match MysqlSession::new_with_deadline(&session_config, Some(deadline)) {
-        Ok(mut session) => execute_target_query_with_fault(
-            meta,
-            server_handle,
-            &mut session,
-            query_timeout,
-            &sql,
-            db.as_deref(),
-            Some(deadline),
-        ),
+        Ok(mut session) => {
+            session.set_namespace_guard(namespace_guard);
+            execute_target_query_with_fault(
+                meta,
+                server_handle,
+                &mut session,
+                query_timeout,
+                &sql,
+                db.as_deref(),
+                Some(deadline),
+            )
+        }
         Err(error) => (
             false,
             None,
@@ -1925,6 +2009,8 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
     request: InflightPublicationConcurrentShell<'_>,
 ) -> (bool, Option<QueryExecution>, String) {
     let InflightPublicationConcurrentShell {
+        namespace_guard,
+        run_context,
         meta,
         server_handle,
         session_config,
@@ -1946,15 +2032,18 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
     let query_timeout = bounded_fault_query_timeout(query_timeout, Some(deadline));
     let query_thread = std::thread::spawn(move || {
         match MysqlSession::new_with_deadline(&session_config, Some(deadline)) {
-            Ok(mut session) => execute_target_query_with_fault(
-                &thread_meta,
-                &thread_server,
-                &mut session,
-                query_timeout,
-                &sql,
-                db.as_deref(),
-                Some(deadline),
-            ),
+            Ok(mut session) => {
+                session.set_namespace_guard(namespace_guard);
+                execute_target_query_with_fault(
+                    &thread_meta,
+                    &thread_server,
+                    &mut session,
+                    query_timeout,
+                    &sql,
+                    db.as_deref(),
+                    Some(deadline),
+                )
+            }
             Err(error) => (
                 false,
                 None,
@@ -1983,8 +2072,12 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
         "    @publication_catalog_fault before-dispatch hold reached"
     );
 
-    let (companion_ok, _, companion_error) =
-        shell::execute_shell_step_until(&format!("shell: {shell}"), Some(deadline));
+    let (companion_ok, _, companion_error) = shell::execute_shell_step_in_context(
+        &format!("shell: {shell}"),
+        Some(deadline),
+        Some(&run_context),
+        false,
+    );
     if !companion_ok {
         let _ = fault_guard.release();
         let _ = query_thread.join();
@@ -2025,6 +2118,7 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
     request: InflightPublicationFrontendKill<'_>,
 ) -> (bool, Option<QueryExecution>, String) {
     let InflightPublicationFrontendKill {
+        namespace_guard,
         meta,
         server_handle,
         session_config,
@@ -2065,15 +2159,18 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
     let query_timeout = bounded_fault_query_timeout(query_timeout, Some(deadline));
     let query_thread = std::thread::spawn(move || {
         match MysqlSession::new_with_deadline(&session_config, Some(deadline)) {
-            Ok(mut session) => execute_target_query_with_fault(
-                &thread_meta,
-                &thread_server,
-                &mut session,
-                query_timeout,
-                &sql,
-                db.as_deref(),
-                Some(deadline),
-            ),
+            Ok(mut session) => {
+                session.set_namespace_guard(namespace_guard);
+                execute_target_query_with_fault(
+                    &thread_meta,
+                    &thread_server,
+                    &mut session,
+                    query_timeout,
+                    &sql,
+                    db.as_deref(),
+                    Some(deadline),
+                )
+            }
             Err(error) => (
                 false,
                 None,
@@ -2435,7 +2532,21 @@ fn run_case_observed(
         if let Some(path) = case_path.as_ref().filter(|p| p.exists()) {
             match load_expected_results(path, multi_step, &ctx.marker_re, single_step_query_number)
             {
-                Some(results) => Some(results),
+                Some(mut results) => {
+                    for (query, result) in &mut results {
+                        if let Some(step) =
+                            case.steps.iter().find(|step| step.query_number == *query)
+                        {
+                            fixture_context::render_expected_result(
+                                &step.sql,
+                                result,
+                                &case.expected_variables,
+                                &case.namespace_rewrites,
+                            );
+                        }
+                    }
+                    Some(results)
+                }
                 None => {
                     let _ = writeln!(
                         log,
@@ -2494,7 +2605,7 @@ fn run_case_observed(
     let case_dbs: Vec<String> = if !case.case_dbs.is_empty() {
         case.case_dbs.clone()
     } else if ctx.auto_case_db {
-        vec![case_auto_db_name(&case.case_id)]
+        vec![case.auto_db.clone()]
     } else {
         vec![]
     };
@@ -2523,7 +2634,7 @@ fn run_case_observed(
                     ctx.query_timeout,
                     db,
                     role,
-                    ctx.controls.as_ref().map(|controls| controls.deadline),
+                    Some(ctx.cleanup_deadline()),
                 ) {
                     let _ = writeln!(
                         log,
@@ -2535,12 +2646,13 @@ fn run_case_observed(
     };
 
     for db_name in &case_dbs {
-        if let Err(exc) = session::reset_case_database_until(
+        if let Err(exc) = session::reset_case_database_scoped_until(
             &target_case_db_admin_conn,
             ctx.query_timeout,
             db_name,
             "target",
-            ctx.controls.as_ref().map(|controls| controls.deadline),
+            Some(ctx.work_deadline()),
+            Some(ctx.namespace_guard(&target_case_db_admin_conn, false)),
         ) {
             preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
             drop_all_case_dbs(ctx, &case_dbs, &mut log);
@@ -2561,12 +2673,13 @@ fn run_case_observed(
             };
         }
         if ctx.reference_required
-            && let Err(exc) = session::reset_case_database_until(
+            && let Err(exc) = session::reset_case_database_scoped_until(
                 &reference_case_db_admin_conn,
                 ctx.query_timeout,
                 db_name,
                 "reference",
-                ctx.controls.as_ref().map(|controls| controls.deadline),
+                Some(ctx.work_deadline()),
+                Some(ctx.namespace_guard(&reference_case_db_admin_conn, false)),
             )
         {
             preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
@@ -2603,37 +2716,33 @@ fn run_case_observed(
         ..ctx.reference_conn_base.clone()
     };
 
-    let mut target_session = match MysqlSession::new_with_deadline(
-        &case_target_conn,
-        ctx.controls.as_ref().map(|controls| controls.deadline),
-    ) {
-        Ok(s) => s,
-        Err(exc) => {
-            preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
-            drop_all_case_dbs(ctx, &case_dbs, &mut log);
-            let _ = writeln!(
-                log,
-                "    ❌ failed to create target mysql session: {:#}",
-                exc
-            );
-            if ctx.fail_fast {
-                abort.store(true, Ordering::Relaxed);
+    let mut target_session =
+        match MysqlSession::new_with_deadline(&case_target_conn, Some(ctx.work_deadline())) {
+            Ok(s) => s,
+            Err(exc) => {
+                preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
+                drop_all_case_dbs(ctx, &case_dbs, &mut log);
+                let _ = writeln!(
+                    log,
+                    "    ❌ failed to create target mysql session: {:#}",
+                    exc
+                );
+                if ctx.fail_fast {
+                    abort.store(true, Ordering::Relaxed);
+                }
+                preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
+                return CaseOutcome {
+                    case_id: case.case_id.clone(),
+                    status: CaseStatus::Fail,
+                    elapsed: case_elapsed,
+                    log,
+                };
             }
-            preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
-            return CaseOutcome {
-                case_id: case.case_id.clone(),
-                status: CaseStatus::Fail,
-                elapsed: case_elapsed,
-                log,
-            };
-        }
-    };
+        };
 
+    target_session.set_namespace_guard(ctx.namespace_guard(&case_target_conn, false));
     let mut reference_session = if ctx.reference_required {
-        match MysqlSession::new_with_deadline(
-            &case_reference_conn,
-            ctx.controls.as_ref().map(|controls| controls.deadline),
-        ) {
+        match MysqlSession::new_with_deadline(&case_reference_conn, Some(ctx.work_deadline())) {
             Ok(s) => Some(s),
             Err(exc) => {
                 preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
@@ -2659,6 +2768,9 @@ fn run_case_observed(
         None
     };
 
+    if let Some(reference) = &mut reference_session {
+        reference.set_namespace_guard(ctx.namespace_guard(&case_reference_conn, false));
+    }
     if let Err(error) = execute_target_session_sql_with(
         &mut target_session,
         &ctx.target_session_sql,
@@ -2691,8 +2803,44 @@ fn run_case_observed(
     let mut cleanup_only = false;
     let fault_cleanup_errors = fault_injection::FaultStepCleanupErrors::default();
 
+    let mut cleanup_transport = false;
     for step in &case.steps {
         if cleanup_only && !step.meta.cleanup {
+            continue;
+        }
+        let step_deadline = if step.meta.cleanup {
+            ctx.cleanup_deadline()
+        } else {
+            ctx.work_deadline()
+        };
+        if step.meta.cleanup && !cleanup_transport {
+            cleanup_transport = true;
+            for (role, result) in std::iter::once((
+                "target",
+                target_session.begin_cleanup(ctx.cleanup_deadline()),
+            ))
+            .chain(
+                reference_session
+                    .as_mut()
+                    .map(|session| ("reference", session.begin_cleanup(ctx.cleanup_deadline()))),
+            ) {
+                if let Err(error) = result {
+                    case_failed = true;
+                    let _ = writeln!(
+                        log,
+                        "    prior {role} socket settlement before cleanup: {error:#}"
+                    );
+                }
+            }
+        }
+        if !step.meta.cleanup && Instant::now() >= step_deadline {
+            case_failed = true;
+            cleanup_only = true;
+            let _ = writeln!(
+                log,
+                "    original fixture work deadline expired before step {}",
+                step.query_number
+            );
             continue;
         }
         evidence.begin_step(step.query_number, case_failed);
@@ -2708,7 +2856,10 @@ fn run_case_observed(
             step.query_number, order_sensitive, epsilon
         );
 
-        let be_log_deadline = be_log_directive::step_evidence_deadline(&step.meta);
+        let be_log_deadline = Some(
+            be_log_directive::step_evidence_deadline(&step.meta)
+                .map_or(step_deadline, |end| end.min(step_deadline)),
+        );
         let resource_baseline = if fault_injection::has_fault(&step.meta) {
             match ctx.server_handle.lock() {
                 Ok(mut server_handle)
@@ -2785,7 +2936,7 @@ fn run_case_observed(
                         selected_control
                             .and_then(|control| control.submissions.first())
                             .map(|target| target.run_token.as_str()),
-                        ctx.controls.as_ref().map(|controls| controls.deadline),
+                        Some(step_deadline),
                     )
                 });
             if let Err(exc) = fault_result {
@@ -2946,10 +3097,7 @@ fn run_case_observed(
                 for attempt in 0..retry_count {
                     evidence.begin_attempt();
                     let (ok, execution, err_msg) = if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step_until(
-                            &step.sql,
-                            ctx.controls.as_ref().map(|controls| controls.deadline),
-                        )
+                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
                     } else if let Some(hold) = publication_service_hold.as_mut() {
                         let Some(concurrent_shell) =
                             step.meta.publication_catalog_concurrent_shell.as_deref()
@@ -2957,13 +3105,16 @@ fn run_case_observed(
                             unreachable!("validated service hold requires a companion shell");
                         };
                         let request = InflightPublicationServiceShell {
+                            namespace_guard: ctx
+                                .namespace_guard(&case_target_conn, step.meta.cleanup),
+                            run_context: ctx
+                                .fixture_budget
+                                .to_json()
+                                .expect("admitted context serialization"),
                             meta: &step.meta,
                             server_handle: &ctx.server_handle,
                             session_config: case_target_conn.clone(),
-                            original_deadline: ctx
-                                .controls
-                                .as_ref()
-                                .map(|controls| controls.deadline),
+                            original_deadline: Some(step_deadline),
                             query_timeout: ctx.query_timeout,
                             sql: step.sql.clone(),
                             db: step.meta.db.clone(),
@@ -2996,13 +3147,16 @@ fn run_case_observed(
                         };
                         execute_target_query_with_inflight_publication_concurrent_shell(
                             InflightPublicationConcurrentShell {
+                                namespace_guard: ctx
+                                    .namespace_guard(&case_target_conn, step.meta.cleanup),
+                                run_context: ctx
+                                    .fixture_budget
+                                    .to_json()
+                                    .expect("admitted context serialization"),
                                 meta: &step.meta,
                                 server_handle: &ctx.server_handle,
                                 session_config: case_target_conn.clone(),
-                                original_deadline: ctx
-                                    .controls
-                                    .as_ref()
-                                    .map(|controls| controls.deadline),
+                                original_deadline: Some(step_deadline),
                                 query_timeout: ctx.query_timeout,
                                 sql: step.sql.clone(),
                                 db: step.meta.db.clone(),
@@ -3024,13 +3178,12 @@ fn run_case_observed(
                         };
                         execute_target_query_with_inflight_publication_frontend_kill(
                             InflightPublicationFrontendKill {
+                                namespace_guard: ctx
+                                    .namespace_guard(&case_target_conn, step.meta.cleanup),
                                 meta: &step.meta,
                                 server_handle: &ctx.server_handle,
                                 session_config: case_target_conn.clone(),
-                                original_deadline: ctx
-                                    .controls
-                                    .as_ref()
-                                    .map(|controls| controls.deadline),
+                                original_deadline: Some(step_deadline),
                                 session_to_reconnect: &mut target_session,
                                 query_timeout: ctx.query_timeout,
                                 sql: step.sql.clone(),
@@ -3199,7 +3352,12 @@ fn run_case_observed(
                             retry_interval.as_millis(),
                             last_failure
                         );
-                        sleep(retry_interval);
+                        sleep(
+                            retry_interval.min(
+                                ctx.work_deadline()
+                                    .saturating_duration_since(Instant::now()),
+                            ),
+                        );
                     }
                 }
 
@@ -3591,10 +3749,7 @@ fn run_case_observed(
                     evidence.begin_attempt();
                     let (ok, execution, err_msg) = if ctx.record_from == RecordFrom::Target {
                         if shell::is_shell_step(&step.sql) {
-                            shell::execute_shell_step_until(
-                                &step.sql,
-                                ctx.controls.as_ref().map(|controls| controls.deadline),
-                            )
+                            ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
                         } else {
                             execute_target_query_with_selected_control(
                                 &step.meta,
@@ -3611,10 +3766,7 @@ fn run_case_observed(
                             )
                         }
                     } else if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step_until(
-                            &step.sql,
-                            ctx.controls.as_ref().map(|controls| controls.deadline),
-                        )
+                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
                     } else {
                         reference_session
                             .as_mut()
@@ -3686,7 +3838,12 @@ fn run_case_observed(
                             retry_interval.as_millis(),
                             last_failure
                         );
-                        sleep(retry_interval);
+                        sleep(
+                            retry_interval.min(
+                                ctx.work_deadline()
+                                    .saturating_duration_since(Instant::now()),
+                            ),
+                        );
                     }
                 }
 
@@ -3859,10 +4016,7 @@ fn run_case_observed(
             Mode::Diff => {
                 if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
                     let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step_until(
-                            &step.sql,
-                            ctx.controls.as_ref().map(|controls| controls.deadline),
-                        )
+                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
                     } else {
                         execute_target_query_with_selected_control(
                             &step.meta,
@@ -3879,10 +4033,7 @@ fn run_case_observed(
                         )
                     };
                     let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step_until(
-                            &step.sql,
-                            ctx.controls.as_ref().map(|controls| controls.deadline),
-                        )
+                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
                     } else {
                         reference_session
                             .as_mut()
@@ -3925,10 +4076,7 @@ fn run_case_observed(
                     // required to emit NovaRocks-owned descriptors, so Diff
                     // validates this branch against the target only.
                     let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step_until(
-                            &step.sql,
-                            ctx.controls.as_ref().map(|controls| controls.deadline),
-                        )
+                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
                     } else {
                         execute_target_query_with_selected_control(
                             &step.meta,
@@ -3970,10 +4118,7 @@ fn run_case_observed(
                     }
                 } else if let Some(expected_error) = step.meta.expect_error.as_deref() {
                     let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step_until(
-                            &step.sql,
-                            ctx.controls.as_ref().map(|controls| controls.deadline),
-                        )
+                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
                     } else {
                         execute_target_query_with_selected_control(
                             &step.meta,
@@ -3990,10 +4135,7 @@ fn run_case_observed(
                         )
                     };
                     let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step_until(
-                            &step.sql,
-                            ctx.controls.as_ref().map(|controls| controls.deadline),
-                        )
+                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
                     } else {
                         reference_session
                             .as_mut()
@@ -4027,10 +4169,7 @@ fn run_case_observed(
                     }
                 } else {
                     let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step_until(
-                            &step.sql,
-                            ctx.controls.as_ref().map(|controls| controls.deadline),
-                        )
+                        ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
                     } else {
                         execute_target_query_with_selected_control(
                             &step.meta,
@@ -4063,10 +4202,7 @@ fn run_case_observed(
                             unreachable!("checked above");
                         };
                         let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
-                            shell::execute_shell_step_until(
-                                &step.sql,
-                                ctx.controls.as_ref().map(|controls| controls.deadline),
-                            )
+                            ctx.execute_shell(&step.sql, Some(step_deadline), step.meta.cleanup)
                         } else {
                             reference_session
                                 .as_mut()
@@ -4229,7 +4365,8 @@ fn run_case_observed(
         }
 
         if step.meta.query_lifecycle_structured_assertion.is_some() {
-            let assertion_deadline = Instant::now() + Duration::from_secs(ctx.query_timeout);
+            let assertion_deadline =
+                step_deadline.min(Instant::now() + Duration::from_secs(ctx.query_timeout));
             let assertion_result = structured_lifecycle_observation
                 .as_ref()
                 .context("exact statement lifecycle observation disappeared after the step")
@@ -4276,6 +4413,11 @@ fn run_case_observed(
             }
         }
 
+        if !step.meta.cleanup && Instant::now() >= step_deadline {
+            case_failed = true;
+            evidence.record_failure(serde_json::json!({"class":"error", "error":"original SQL invocation work deadline expired", "statement_index":step.query_number}));
+            let _ = writeln!(log, "    ❌ original SQL invocation work deadline expired");
+        }
         if case_failed && !cleanup_only {
             cleanup_only = true;
             let remaining_cleanup = case
@@ -4340,7 +4482,7 @@ fn run_case_observed(
             ctx.query_timeout,
             db_name,
             "target",
-            ctx.controls.as_ref().map(|controls| controls.deadline),
+            Some(ctx.cleanup_deadline()),
         ) {
             case_failed = true;
             evidence.record_case_cleanup_failure(
@@ -4359,7 +4501,7 @@ fn run_case_observed(
                 ctx.query_timeout,
                 db_name,
                 "reference",
-                ctx.controls.as_ref().map(|controls| controls.deadline),
+                Some(ctx.cleanup_deadline()),
             )
         {
             case_failed = true;
@@ -4457,13 +4599,23 @@ fn load_failure_outcomes(suite_name: &str, failures: &[CaseLoadFailure]) -> Vec<
 
 fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) -> SuiteOutcome {
     run_suite_with_hooks(ps, abort, stdout_lock, |conn, timeout, hook, label| {
-        session::execute_suite_hook_until(
+        let cleanup = ps
+            .cleanup_hook
+            .as_ref()
+            .is_some_and(|cleanup| cleanup.path == hook.path);
+        session::run_mysql_sql_scoped_until(
             conn,
             timeout,
-            hook,
-            label,
-            ps.ctx.controls.as_ref().map(|controls| controls.deadline),
+            &hook.sql,
+            Some(if cleanup {
+                ps.ctx.cleanup_deadline()
+            } else {
+                ps.ctx.work_deadline()
+            }),
+            Some(ps.ctx.namespace_guard(conn, cleanup)),
         )
+        .with_context(|| format!("{label} suite hook failed: {}", hook.path.display()))
+        .map(|_| ())
     })
 }
 
@@ -5240,7 +5392,15 @@ pub fn run_correctness(build: build_information::BuildInformation) -> Result<()>
         println!("{}", build_information::value(&build));
         return Ok(());
     }
-    let exit_code = run_cli(Cli::parse())?;
+    let exit_code = match run_cli(Cli::parse()) {
+        Err(error)
+            if error.is::<novarocks_cluster_harness::fixture_run::FixtureBudgetRejected>() =>
+        {
+            eprintln!("{error:#}");
+            75
+        }
+        result => result?,
+    };
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -5516,6 +5676,15 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         println!("❌ ERROR: {error}");
         return Ok(1);
     }
+    let fixture_budget =
+        fixture_context::admit(&runner_config, &base_dir, cli.fixture_budget_secs)?;
+    let naming_sources =
+        fixture_context::selected_sources(&cli, &base_dir, &suite_names, &suite_configs)?;
+    runner_config.fixture_names = Some(Arc::new(fixture_context::RunNames::prepare(
+        &fixture_budget,
+        &naming_sources,
+    )?));
+    fixture_context::startup_sweep(&runner_config, &base_dir, &fixture_budget)?;
     // Before the proxy: it forwards to whatever REST Catalog this run uses, and
     // an isolated one has to exist first.
     let results_writer =
@@ -5552,12 +5721,13 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         &results_writer,
         fixture_root.as_deref(),
         &resources_before,
-        || start_isolated_rest_catalog(&suite_names),
+        || start_isolated_rest_catalog(&suite_names, &fixture_budget),
     )?;
     let selection_written = AtomicBool::new(false);
     let server_recorded = AtomicBool::new(false);
     let totals = Mutex::new((0usize, 0usize, 0usize));
     let mut suite_facts = BTreeMap::new();
+    let namespace_catalogs = namespace_guard::CatalogFacts::default();
     let mut publication_catalog_fixture: Option<publication_catalog::FixtureHandle> = None;
     let fixture_primary = (|| -> Result<i32> {
         let fixture_endpoints = if let Some(fixture) = isolated_rest_catalog.as_ref() {
@@ -5573,8 +5743,12 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         let mut dataset_bindings = BTreeMap::new();
         for suite_name in &suite_names {
             if let Some(requirement) = &suite_configs[suite_name].manifest.prepared_dataset {
-                let binding =
-                    dataset_fixture::bind_prepared_dataset(requirement, &runner_config, &base_dir)?;
+                let binding = dataset_fixture::bind_prepared_dataset_with_budget(
+                    requirement,
+                    &runner_config,
+                    &base_dir,
+                    &fixture_budget,
+                )?;
                 failure_artifacts.record_provenance(
                     format!("dataset/{suite_name}"),
                     serde_json::to_value(&binding)?,
@@ -5677,7 +5851,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             snapshot_config.result_dir = result_dir.clone();
             snapshot_config.sql_glob = sql_glob.clone();
             let parse_start = results_record::suite_inputs(&snapshot_config)?;
-            let mut placeholder_vars = placeholder_variables(&runner_config, &suite.name);
+            let mut placeholder_vars = placeholder_variables(&runner_config, &suite.name)?;
             if let Some(binding) = dataset_bindings.get(suite_name) {
                 placeholder_vars.insert(
                     "dataset_iceberg_catalog_warehouse".to_string(),
@@ -6055,6 +6229,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 &binary,
                 &auto_case_db,
                 &cli.target_session_sql,
+                Some(fixture_budget.work_deadline()),
             )? {
                 Some((plan, execution)) => {
                     failure_artifacts.record_provenance("selected-control-intents".into(),serde_json::json!({
@@ -6076,6 +6251,14 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 .is_none_or(|controls| !controls.has_restarts || jobs == 1),
             "selected role restart/wipe controls require -j 1"
         );
+        let fixture_budget = controls.as_ref().map_or_else(
+            || fixture_budget.clone(),
+            |controls| {
+                fixture_budget
+                    .clone()
+                    .with_work_deadline_limit(controls.deadline)
+            },
+        );
         let server_handle = launch_server(
             launch_cluster_mode,
             launch_cluster_size,
@@ -6083,6 +6266,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             &runner_config,
             launch_profile,
             test_sessions,
+            &fixture_budget,
         )?;
         let launched_target_port = server_handle.target_port();
         let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
@@ -6304,6 +6488,8 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 }
 
                 let ctx = SuiteRunContext {
+                    fixture_budget: fixture_budget.clone(),
+                    namespace_catalogs: namespace_catalogs.clone(),
                     controls: controls.clone(),
                     suite_name: suite.name.clone(),
                     mode: cli.mode,
@@ -6498,7 +6684,10 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
 
             *totals.lock().unwrap() = (grand_passed, grand_failed, grand_skipped);
             results_writer.check()?;
-            if grand_failed > 0 || !all_cleanup_errors.is_empty() {
+            if grand_failed > 0
+                || !all_cleanup_errors.is_empty()
+                || Instant::now() >= fixture_budget.deadline()
+            {
                 return Ok(1);
             }
 
@@ -6612,6 +6801,7 @@ fn isolated_rest_catalog_suite(suite: &str) -> bool {
 /// Returning no fixture or control URI is the ordinary shared-runtime case.
 fn start_isolated_rest_catalog(
     selected_suites: &[String],
+    budget: &novarocks_cluster_harness::fixture_run::RunBudget,
 ) -> Result<(
     Option<novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture>,
     Option<String>,
@@ -6639,16 +6829,13 @@ fn start_isolated_rest_catalog(
         )
     })?;
     println!("→ starting an isolated Iceberg REST catalog for this run");
-    let (fixture, control_uri) = if selected_suites
-        .iter()
-        .any(|suite| suite == "mv-publication-v11")
-    {
-        let (fixture, control_uri) =
-            IsolatedIcebergRestFixture::start_with_publication_hook(&scenario_root)?;
-        (fixture, Some(control_uri))
-    } else {
-        (IsolatedIcebergRestFixture::start(&scenario_root)?, None)
-    };
+    let (fixture, control_uri) = IsolatedIcebergRestFixture::start_private_with_budget(
+        &scenario_root,
+        budget,
+        selected_suites
+            .iter()
+            .any(|suite| suite == "mv-publication-v11"),
+    )?;
     println!(
         "  isolated REST catalog {} (compose project {})",
         fixture.endpoints().rest_uri,
@@ -6832,6 +7019,9 @@ mod tests {
 
     fn test_case_with_meta(meta: QueryMeta) -> SqlCase {
         SqlCase {
+            expected_variables: Default::default(),
+            namespace_rewrites: Default::default(),
+            auto_db: String::new(),
             source_file: PathBuf::from("fault.sql"),
             case_id: "fault_case".to_string(),
             steps: vec![SqlStep {
@@ -6846,6 +7036,9 @@ mod tests {
 
     fn test_case_with_sql(sql: &str) -> SqlCase {
         SqlCase {
+            expected_variables: Default::default(),
+            namespace_rewrites: Default::default(),
+            auto_db: String::new(),
             source_file: PathBuf::from("dml.sql"),
             case_id: "dml_case".to_string(),
             steps: vec![SqlStep {
@@ -8095,6 +8288,11 @@ mod tests {
             },
         ));
         let ctx = super::SuiteRunContext {
+            namespace_catalogs: crate::namespace_guard::CatalogFacts::default(),
+            fixture_budget: novarocks_cluster_harness::fixture_run::RunBudget::from_environment(
+                3600,
+            )
+            .unwrap(),
             controls: None,
             suite_name: "test".into(),
             mode: Mode::Verify,
@@ -8132,6 +8330,9 @@ mod tests {
         let prepared = super::PreparedSuite {
             ctx,
             cases: vec![SqlCase {
+                expected_variables: Default::default(),
+                namespace_rewrites: Default::default(),
+                auto_db: String::new(),
                 source_file: temp.path().join("case.sql"),
                 case_id: "case".into(),
                 steps: vec![],
@@ -8696,7 +8897,7 @@ access_key_secret = "admin123"
             &path,
             &meta_re,
             &marker_re,
-            &std::collections::HashMap::new(),
+            &crate::fixture_context::test_variables(&[path.file_stem().unwrap().to_str().unwrap()]),
         )
         .expect("load sql case")
         .expect("case should be loaded");
@@ -8986,12 +9187,26 @@ oss_sk = "private-secret"
         );
     }
 
+    fn test_fixture_budget() -> novarocks_cluster_harness::fixture_run::RunBudget {
+        use novarocks_cluster_harness::fixture_run::{FixturePolicy, RunBudget, ScratchIdentity};
+        RunBudget::admit(
+            FixturePolicy::default(),
+            ScratchIdentity::create("s3://novarocks/sql-test").unwrap(),
+            600,
+            None,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn an_ordinary_suite_never_silently_gets_the_isolated_catalog() {
-        let result = super::start_isolated_rest_catalog(&[
-            "mv-storage-contract".to_string(),
-            "iceberg-compatibility".to_string(),
-        ]);
+        let result = super::start_isolated_rest_catalog(
+            &[
+                "mv-storage-contract".to_string(),
+                "iceberg-compatibility".to_string(),
+            ],
+            &test_fixture_budget(),
+        );
         let error = match result {
             Ok(_) => panic!("a shared-environment suite must not be redirected silently"),
             Err(error) => error,
@@ -9009,10 +9224,10 @@ oss_sk = "private-secret"
             "iceberg_rest_uri".to_string(),
             "http://127.0.0.1:8181".to_string(),
         );
-        let (fixture, control_uri) = super::start_isolated_rest_catalog(&[
-            "iceberg-compatibility".to_string(),
-            "join".to_string(),
-        ])
+        let (fixture, control_uri) = super::start_isolated_rest_catalog(
+            &["iceberg-compatibility".to_string(), "join".to_string()],
+            &test_fixture_budget(),
+        )
         .expect("an ordinary selection is not an error");
 
         assert!(fixture.is_none());

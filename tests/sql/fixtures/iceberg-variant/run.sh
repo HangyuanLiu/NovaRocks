@@ -15,6 +15,7 @@ WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 mode="" namespace="" table="" output=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --fixture-budget-secs) export NOVA_FIXTURE_BUDGET_SECS="$2"; shift 2 ;;
     --mode) mode="$2"; shift 2 ;;
     --namespace) namespace="$2"; shift 2 ;;
     --table) table="$2"; shift 2 ;;
@@ -33,7 +34,7 @@ source,dest,mode,namespace,table=sys.argv[1:]
 root=pathlib.Path(source)
 body=(root/'generate.scala').read_text()
 body+='\ntry {\n'
-body+=f'VariantFixture.initialize(org.apache.spark.sql.SparkSession.active,{json.dumps(namespace)},{json.dumps(table)})\n'
+body+=f'VariantFixture.initialize(org.apache.spark.sql.SparkSession.active,{json.dumps(namespace)},{json.dumps(table)},{str(mode in ("observe", "unchanged")).lower()})\n'
 body+=(root/(mode+'.scala')).read_text()
 body+='\nprintln("IRU9_FIXTURE_COMPLETE")\n} catch { case failure: Throwable => failure.printStackTrace(); System.exit(1) }\n'
 pathlib.Path(dest).write_text(body)

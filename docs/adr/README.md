@@ -536,9 +536,10 @@ statement family。边界层只能传递或编码 owner 的事实，测试只能
 而不是下载或普通测试失败。
 
 - ADR-0155 — fixture 输入为何以锁定 provision/BOM 供给、并在离线 verify 阶段消费（active）
-- ADR-0165 — fixture 运行实例为何按输入版本化、由唯一 owner 发布工作区绑定，并以显式引用保护删除（active；条9的已有READY消费范围由ADR-0173部分替代，显式供给及其余所有权规则仍有效）
+- [ADR-0191](ADR-0191-machine-shared-fixture-and-bounded-scratch.md) — 每个daemon为何只有一组共享fixture服务，维护显式、scratch有界、原owner确认实际writer退出（active；替代ADR-0165运行层，保留ADR-0155供给与ADR-0173 check-only消费）
 - [ADR-0173](ADR-0173-prepared-dataset-consumption-is-check-only.md) — 已有数据消费者为何仅check准确READY绑定，而实际producer核验与数据写入保留给显式供给（active；部分替代ADR-0165条9）
 
 #### 历史
 
+- ADR-0165 — fixture运行实例按输入版本化及显式绑定/删除的历史模型（superseded → ADR-0191；已有READY消费裁决继续由ADR-0173承载）
 - ADR-0141 — fixture 镜像为何只从本机镜像库按 digest 解析、不可变性校验为何移入显式预检（superseded → ADR-0155）

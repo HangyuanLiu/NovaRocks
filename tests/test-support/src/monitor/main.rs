@@ -134,6 +134,23 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
         .ok_or_else(|| unix::error("invalid payload deadline"))?
         .parse()
         .map_err(unix::error)?;
+    let work: u64 = next_arg(&mut args)?
+        .to_str()
+        .ok_or_else(|| unix::error("invalid payload work deadline"))?
+        .parse()
+        .map_err(unix::error)?;
+    let complete: u64 = next_arg(&mut args)?
+        .to_str()
+        .ok_or_else(|| unix::error("invalid payload complete deadline"))?
+        .parse()
+        .map_err(unix::error)?;
+    if (work == 0) != (complete == 0) || (work != 0 && work >= complete) {
+        return Err(unix::error("invalid payload lifetime clocks"));
+    }
+    // Reserve part of cleanup for observing the actual group exit after KILL;
+    // signaling exactly at the complete clock cannot prove timely settlement.
+    let lifetime_kill_at =
+        complete.saturating_sub((complete.saturating_sub(work) / 2).min(1_000_000_000));
     let root = PathBuf::from(next_arg(&mut args)?);
     if next_arg(&mut args)? != "--" {
         return Err(unix::error("missing payload argument boundary"));
@@ -157,6 +174,7 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
     };
     if !alive
         || unix::clock_ns()? >= deadline
+        || (work != 0 && unix::clock_ns()? >= work)
         || root.join("closing").exists()
         || root.join("Closed").exists()
     {
@@ -214,11 +232,26 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
     let mut killed = false;
     let mut incomplete = false;
     let mut observation_failed = false;
+    let mut lifetime_expired = false;
     loop {
         let now = unix::clock_ns().unwrap_or_else(|error| {
             failures.push(error.to_string());
             u64::MAX
         });
+        if work != 0 && now >= work && !lifetime_expired {
+            lifetime_expired = true;
+            if let Err(error) = event(&mut record, "\"event\":\"LifetimeExpired\"") {
+                failures.push(error.to_string());
+            }
+            if stopping.is_none() {
+                unix::signal_or_kill_original(&mut child, unix::TERM, &mut failures);
+                stopping = Some(now);
+                graceful_deadline = now.saturating_add(5_000_000_000).min(lifetime_kill_at);
+            }
+        }
+        if work != 0 && stopping.is_some() {
+            graceful_deadline = graceful_deadline.min(lifetime_kill_at);
+        }
         let operation = match control.read(&mut frame[received..]) {
             Ok(0) => {
                 if received != 0 {
@@ -353,6 +386,13 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
             }
         }
         if let Some(started) = stopping {
+            if work != 0 && now >= complete && !incomplete {
+                let _ = event(
+                    &mut record,
+                    "\"event\":\"CleanupIncomplete\",\"reason\":\"original complete lifetime deadline expired before child exit\"",
+                );
+                incomplete = true;
+            }
             let elapsed = now.saturating_sub(started);
             if now >= graceful_deadline && !killed {
                 unix::signal_or_kill_original(&mut child, unix::KILL, &mut failures);
@@ -371,6 +411,68 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
     // Keep the unreaped leader through the final group signal even when the
     // normal command exited by itself. Never signal this identity afterwards.
     unix::signal_or_kill_original(&mut child, unix::KILL, &mut failures);
+    let mut group_exit_observed = false;
+    let mut group_exit_observed_ns = 0;
+    let mut group_observation_failed = false;
+    if work != 0 {
+        // The unreaped leader pins the PGID through actual group observation.
+        // A late or unknown exit publishes incomplete, never cleanup success.
+        loop {
+            match unix::process_group_running(&child) {
+                Ok(false) => {
+                    group_exit_observed = true;
+                    match unix::clock_ns() {
+                        Ok(now) => {
+                            group_exit_observed_ns = now;
+                            if now >= complete {
+                                failures.push(
+                                    "original group exit observed after complete deadline".into(),
+                                );
+                                incomplete = true;
+                            }
+                        }
+                        Err(error) => {
+                            failures.push(format!("observe group exit clock: {error}"));
+                            incomplete = true;
+                        }
+                    }
+                    break;
+                }
+                Ok(true) => {
+                    let late = match unix::clock_ns() {
+                        Ok(now) => now >= complete,
+                        Err(error) => {
+                            if !group_observation_failed {
+                                failures.push(format!("observe group exit clock: {error}"));
+                                group_observation_failed = true;
+                            }
+                            true
+                        }
+                    };
+                    if late && !incomplete {
+                        let _ = event(
+                            &mut record,
+                            "\"event\":\"CleanupIncomplete\",\"reason\":\"original process group remains live at complete deadline\"",
+                        );
+                        incomplete = true;
+                    }
+                    std::thread::sleep(unix::POLL);
+                }
+                Err(error) => {
+                    if !group_observation_failed {
+                        failures.push(format!("observe original process group exit: {error}"));
+                        let _ = event(
+                            &mut record,
+                            "\"event\":\"CleanupIncomplete\",\"reason\":\"original process group exit is unobserved\"",
+                        );
+                        group_observation_failed = true;
+                    }
+                    incomplete = true;
+                    std::thread::sleep(unix::POLL);
+                }
+            }
+        }
+    }
     let status = child.wait()?;
     let errors = failures
         .iter()
@@ -381,7 +483,7 @@ fn payload(mut args: impl Iterator<Item = std::ffi::OsString>) -> io::Result<()>
     event(
         &mut record,
         &format!(
-            "\"event\":\"Final\",\"status_raw\":{},\"startup_error\":null,\"owner_lost\":{owner_lost},\"errors\":[{errors}],\"cleanup_complete\":{complete}",
+            "\"event\":\"Final\",\"status_raw\":{},\"startup_error\":null,\"owner_lost\":{owner_lost},\"lifetime_expired\":{lifetime_expired},\"group_exit_observed\":{group_exit_observed},\"group_exit_observed_ns\":{group_exit_observed_ns},\"errors\":[{errors}],\"cleanup_complete\":{complete}",
             status.into_raw()
         ),
     )?;

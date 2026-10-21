@@ -16,9 +16,9 @@
 // under the License.
 
 //! Frozen runner intent, derived once from selected parsed metadata.
+use crate::PreparedSqlInputs;
 use crate::statement_controls::{self, MvDocumentDemand, PlannedSubmission};
 use crate::types::*;
-use crate::{PreparedSqlInputs, case_auto_db_name};
 use anyhow::{Context, Result, bail, ensure};
 use novarocks_cluster_harness::test_sessions::{
     ClusterTestSessionPlan, RoleLaunchReference, RoleSlot,
@@ -447,6 +447,7 @@ pub(crate) fn build(
     binary: &Path,
     auto_case_db: &BTreeMap<String, bool>,
     session_sql: &[String],
+    absolute_limit: Option<Instant>,
 ) -> Result<Option<(ClusterTestSessionPlan, SqlControlExecution)>> {
     let needs = required(inputs);
     if !needs {
@@ -455,6 +456,11 @@ pub(crate) fn build(
     let deadline = Instant::now()
         .checked_add(budget(inputs, startup, cluster_size, session_sql.len())?)
         .context("SQL original absolute deadline exceeds the monotonic clock")?;
+    let deadline = absolute_limit.map_or(deadline, |limit| limit.min(deadline));
+    ensure!(
+        Instant::now() < deadline,
+        "original SQL fixture work deadline expired"
+    );
     let mut plan = ClusterTestSessionPlan::new(deadline)?;
     let transport = plan.reserve_transport("query-lifecycle-faults")?;
     let mut refs = BTreeMap::<(RoleSlot, usize), Launch>::new();
@@ -510,7 +516,7 @@ pub(crate) fn build(
                             .get(&input.suite_name)
                             .copied()
                             .unwrap_or(false)
-                            .then(|| case_auto_db_name(&case.case_id))
+                            .then(|| case.auto_db.clone())
                     })
                     .or_else(|| {
                         (!input.target_db_default.is_empty())
@@ -790,6 +796,9 @@ mod tests {
             verify_enabled: true,
             query_timeout: 30,
             cases: vec![SqlCase {
+                expected_variables: Default::default(),
+                namespace_rewrites: Default::default(),
+                auto_db: String::new(),
                 source_file: PathBuf::from("/selected.sql"),
                 case_id: "one".into(),
                 steps,
@@ -819,6 +828,7 @@ mod tests {
             file,
             &BTreeMap::new(),
             &[],
+            None,
         )?
         .context("expected selected controls")
     }
@@ -1037,7 +1047,8 @@ mod tests {
                 Duration::from_secs(5),
                 file.path(),
                 &BTreeMap::new(),
-                &[]
+                &[],
+                None,
             )
             .unwrap()
             .is_none()
@@ -1116,7 +1127,12 @@ mod tests {
                     path,
                     &meta_re,
                     &marker_re,
-                    &std::collections::HashMap::new(),
+                    &crate::fixture_context::test_variables(
+                        &files
+                            .iter()
+                            .map(|p| p.file_stem().unwrap().to_str().unwrap())
+                            .collect::<Vec<_>>(),
+                    ),
                 )
                 .unwrap()
                 .expect("registered recovery SQL has executable steps")

@@ -32,7 +32,7 @@ docker image inspect apache/hive:4.0.0
 docker build --pull=false -t novarocks/hive-metastore:4.0.0 docker/iceberg-hive
 ```
 
-Bind REST first, resolve its returned publication once, then start HMS:
+先由维护者显式启动ready机器，再附着REST publication并启动HMS：
 
 ```bash
 publication=$(docker/iceberg-rest/up.sh | python3 -c 'import json,sys; print(json.load(sys.stdin)["published_dir"])')
@@ -43,16 +43,9 @@ hms_dir=$(printf '%s' "$hms_manifest" | python3 -c 'import json,sys,pathlib; pri
 source "$hms_dir/env.sh"
 ```
 
-`up.sh --prepare-only` generates the catalog-scoped HMS files from a saved
-ready REST publication without calling Docker. It requires that REST binding;
-an unbound entry cannot invent an HMS dependency. Normal `up.sh` only uses local
-images and does not build or pull. Derby state survives container recreation.
-The instance directory is `<control-root>/<daemon>/hms/<catalog-id>/`, containing
-`manifest.json`, `env.sh`, saved Compose inputs, credential-specific
-`core-site.xml`, `ice-hms-catalog.sql`, and `spark-hms-defaults.conf`.
+HMS拥有自己的项目和Derby卷，只连接准确machine外部网络，不归REST核心栈计数。它使用机器配置的HMS端口（默认28005）；不再按旧catalog版本分配或扫描端口。普通up只使用本地镜像，不build/pull。`--prepare-only`只按已固定的ready publication生成文件，不调用Docker；REST未绑定时不能猜依赖。
 
-After sourcing both entries, the SQL runner reads the explicit HMS endpoint
-and warehouse. Spark helpers use `NOVAROCKS_SPARK_EXTRA_DEFAULTS`:
+保存目录为 `<machine-control-root>/<machine-id>/hms/<machine-id>/`，包含manifest、env、Compose、core-site、catalog SQL和Spark defaults。机器version/generation、网络ID及准确HMS容器共同约束连接。换activation前须通过HMS自身入口退出旧记录，不能由REST owner删除其Derby卷。
 
 ```bash
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
@@ -61,32 +54,15 @@ printf 'SHOW NAMESPACES IN hms_catalog;\n' > /tmp/hms-check.sql
 docker/iceberg-rest/spark-sql.sh /tmp/hms-check.sql
 ```
 
-`status.sh` prints the saved project, catalog dependency, endpoint and state.
-`down.sh --catalog-id <id>` disconnects the exact HMS container through the
-owner, then stops only its own project. Ordinary down retains the Derby volume,
-saved definition and fixed port for a later start. `--volumes` (or `--purge`)
-removes its Derby volume and verifies that its containers, network and volumes
-are absent before retiring the saved definition and releasing the port
-reservation. Stable owner lock files remain. A failed destructive cleanup keeps
-the deleting record and its reservation; `up` rejects it until `down` completes
-the cleanup. Repeating a completed destructive down is a no-op.
-HMS must exit before the dependent catalog can be deleted, including force.
+Spark使用显式 `NOVAROCKS_SPARK_EXTRA_DEFAULTS`。HMS产品永久只读合同继续由ADR-0169约束；供给工具自己的写入也要沿用原run identity、scratch root和预算。
 
-After switching a worktree to another catalog, explicitly select the old ID:
+`status.sh`显示保存的machine依赖、项目、端点与状态。普通down退出自身准确容器并撤销连接，保留Derby卷；`--volumes`或`--purge`确认自己的容器/卷消失后退休记录。固定machine网络是external，HMS绝不删除。清理失败保留deleting及原事实供重试。
 
 ```bash
-docker/iceberg-hive/down.sh --catalog-id "$old_catalog_id" --volumes
+docker/iceberg-hive/down.sh --machine-id "$NOVA_FIXTURE_MACHINE_ID" --volumes
+# If the original publication is unavailable, use its saved machine binding:
+docker/iceberg-hive/down.sh --root "$NOVA_FIXTURE_MACHINE_ROOT" \
+  --daemon "$NOVA_FIXTURE_MACHINE_DAEMON" --machine-id "$NOVA_FIXTURE_MACHINE_ID" --volumes
 ```
 
-If the original REST publication is no longer available, use its saved owner
-locator as well. These values are recorded in the HMS manifest:
-
-```bash
-docker/iceberg-hive/down.sh --root "$control_root" --daemon "$daemon_id" \
-  --catalog-id "$old_catalog_id" --volumes
-```
-
-HMS reserves ports in the owner's configured range; use `--port-start` and
-`--port-end` (or explicit `NOVA_ENV_RUNTIME_PORT_START/END`) for a task range.
-
-No command discovers resources from old fixed project names or ports.
+不按旧项目名或固定端口扫描认领历史资源。机器维护与数据保留见 [fixture README](../iceberg-rest/README.md) 和 [ADR-0191](../../docs/adr/ADR-0191-machine-shared-fixture-and-bounded-scratch.md)。

@@ -64,6 +64,7 @@ pub fn mysql_row_to_strings(row: MysqlRow) -> Vec<String> {
 }
 
 pub struct MysqlSession {
+    namespace_guard: Option<crate::namespace_guard::NamespaceGuard>,
     pub conn: MysqlConn,
     base_config: ConnectionConfig,
     // Field order keeps the watchdog alive during Conn's COM_QUIT/drop writes.
@@ -121,6 +122,7 @@ impl MysqlSession {
             })
             .transpose()?;
         let mut session = Self {
+            namespace_guard: None,
             conn: connection,
             base_config: conn.clone(),
             #[cfg(unix)]
@@ -129,6 +131,10 @@ impl MysqlSession {
 
         session.apply_base_context(conn)?;
         Ok(session)
+    }
+
+    pub(crate) fn set_namespace_guard(&mut self, guard: crate::namespace_guard::NamespaceGuard) {
+        self.namespace_guard = Some(guard);
     }
 
     pub fn apply_base_context(&mut self, conn: &ConnectionConfig) -> Result<()> {
@@ -170,6 +176,21 @@ impl MysqlSession {
         )?;
         #[cfg(not(unix))]
         let replacement = Self::new(&config)?;
+        let mut replacement = replacement;
+        replacement.namespace_guard = self.namespace_guard.clone();
+        let original = std::mem::replace(self, replacement);
+        original.finish()
+    }
+    pub(crate) fn begin_cleanup(&mut self, deadline: Instant) -> Result<()> {
+        let config = self.namespace_guard.as_ref().map_or_else(
+            || self.base_config.clone(),
+            |guard| guard.connection_context(&self.base_config),
+        );
+        let mut replacement = Self::create(&config, Some(deadline))?;
+        replacement.namespace_guard = self
+            .namespace_guard
+            .as_ref()
+            .map(|guard| guard.for_cleanup(deadline));
         let original = std::mem::replace(self, replacement);
         original.finish()
     }
@@ -202,6 +223,7 @@ impl MysqlSession {
         let Self {
             conn,
             base_config: _,
+            namespace_guard: _,
             #[cfg(unix)]
             mut deadline_owner,
         } = self;
@@ -262,6 +284,11 @@ impl MysqlSession {
                 );
             }
 
+            if let Some(db) = db_override {
+                if let Some(guard) = &mut self.namespace_guard {
+                    guard.set_database(db);
+                }
+            }
             if let Err(exc) = self
                 .conn
                 .query_drop(format!("SET query_timeout={}", query_timeout))
@@ -310,6 +337,15 @@ impl MysqlSession {
                             &format!("runner before-submit control failed: {error:#}"),
                         ),
                     );
+                }
+                if let Some(guard) = &self.namespace_guard {
+                    if let Err(error) = guard.before(statement) {
+                        failed = Some((
+                            statement_index,
+                            format!("fixture namespace write guard: {error:#}"),
+                        ));
+                        break;
+                    }
                 }
                 match self.conn.query_iter(statement) {
                     Ok(mut query_result) => {
@@ -371,6 +407,16 @@ impl MysqlSession {
                     }
                 }
 
+                if failed.is_none() {
+                    if let Some(guard) = &mut self.namespace_guard {
+                        if let Err(error) = guard.after(statement) {
+                            failed = Some((
+                                statement_index,
+                                format!("fixture namespace placement: {error:#}"),
+                            ));
+                        }
+                    }
+                }
                 if failed.is_some() {
                     break;
                 }
@@ -623,7 +669,19 @@ pub(crate) fn run_mysql_sql_until(
     sql: &str,
     deadline: Option<Instant>,
 ) -> Result<String> {
+    run_mysql_sql_scoped_until(conn, query_timeout, sql, deadline, None)
+}
+pub(crate) fn run_mysql_sql_scoped_until(
+    conn: &ConnectionConfig,
+    query_timeout: u64,
+    sql: &str,
+    deadline: Option<Instant>,
+    guard: Option<crate::namespace_guard::NamespaceGuard>,
+) -> Result<String> {
     let mut session = MysqlSession::new_with_deadline(conn, deadline)?;
+    if let Some(guard) = guard {
+        session.set_namespace_guard(guard);
+    }
     let (ok, execution, message) = session.execute_query(query_timeout, sql, None);
     let cleanup = session.finish();
     match (ok, cleanup) {
@@ -682,13 +740,8 @@ fn case_table_names(
     );
     let output = match run_mysql_sql_until(conn, query_timeout, &sql, deadline) {
         Ok(output) => output,
-        // A database that does not exist has no tables to drop, and the drop
-        // below is idempotent either way.
         Err(error) => {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Err(error);
-            }
-            return Ok(Vec::new());
+            return Err(error.context("case cleanup could not enumerate the exact namespace"));
         }
     };
     Ok(output
@@ -715,12 +768,23 @@ pub(crate) fn reset_case_database_until(
     label: &str,
     deadline: Option<Instant>,
 ) -> Result<()> {
+    reset_case_database_scoped_until(conn, query_timeout, db_name, label, deadline, None)
+}
+pub(crate) fn reset_case_database_scoped_until(
+    conn: &ConnectionConfig,
+    query_timeout: u64,
+    db_name: &str,
+    label: &str,
+    deadline: Option<Instant>,
+    guard: Option<crate::namespace_guard::NamespaceGuard>,
+) -> Result<()> {
     drop_case_database_until(conn, query_timeout, db_name, label, deadline)?;
-    run_mysql_sql_until(
+    run_mysql_sql_scoped_until(
         conn,
         query_timeout,
         &format!("CREATE DATABASE `{db_name}`;"),
         deadline,
+        guard,
     )
     .with_context(|| format!("{} case database reset failed: {}", label, db_name))?;
     Ok(())
