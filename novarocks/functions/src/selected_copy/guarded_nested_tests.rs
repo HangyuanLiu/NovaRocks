@@ -278,7 +278,12 @@ fn nested_interleave_rejects_exact_type_source_choice_and_static_extent_failures
 fn nested_guarded_carriers_do_not_admit_other_encoding_or_child_protocols() {
     for ty in [
         DataType::Null,
-        DataType::FixedSizeBinary(16),
+        DataType::FixedSizeBinary(0),
+        DataType::FixedSizeBinary(-1),
+        DataType::Union(
+            arrow_schema::UnionFields::empty(),
+            arrow_schema::UnionMode::Sparse,
+        ),
         DataType::List(Arc::new(Field::new("item", DataType::Utf8View, true))),
         DataType::Struct(
             vec![Arc::new(Field::new(
@@ -406,4 +411,171 @@ fn legacy_nested_fill_nulls_keeps_its_original_arrow_zip_path() {
             .collect::<Vec<_>>(),
         vec![Some("a"), Some("y"), Some("z"), Some("b")]
     );
+}
+
+#[test]
+fn guarded_fixed_binary_roots_keep_selected_bytes_nulls_metadata_and_extent() {
+    use arrow_array::FixedSizeBinaryArray;
+    let first = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        [Some([1u8; 16]), None, Some([3u8; 16])].into_iter(),
+        16,
+    )
+    .unwrap();
+    let first: ArrayRef = Arc::new(first.slice(1, 2));
+    let second: ArrayRef =
+        Arc::new(FixedSizeBinaryArray::try_from_iter([[9u8; 16]].into_iter()).unwrap());
+    let ty = DataType::FixedSizeBinary(16);
+    let choices = [Some((1, 0)), Some((0, 0)), None, Some((0, 1)), Some((1, 0))];
+    assert!(supports_guarded_result(&ty));
+    assert!(crate::control_values::supports_indexed_result(&ty));
+    let output = assemble_values(
+        AssemblyPlan::Indexed {
+            result_type: &ty,
+            sources: &[Some(&first), Some(&second)],
+            choices: &choices,
+        },
+        &Control,
+    )
+    .unwrap();
+    assert_eq!(output.data_type(), &ty);
+    let fixed = output
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap();
+    assert_eq!(fixed.value_length(), 16);
+    assert_eq!(fixed.len(), 5);
+    assert_eq!(fixed.value(0), &[9u8; 16]);
+    assert!(fixed.is_null(1), "selected source NULL remains NULL");
+    assert!(fixed.is_null(2), "typed NULL sentinel remains NULL");
+    assert_eq!(fixed.value(3), &[3u8; 16]);
+    assert_eq!(fixed.value(4), &[9u8; 16]);
+    let empty = assemble_values(
+        AssemblyPlan::Indexed {
+            result_type: &ty,
+            sources: &[Some(&first), Some(&second)],
+            choices: &[],
+        },
+        &Control,
+    )
+    .unwrap();
+    assert_eq!(empty.data_type(), &ty);
+    assert_eq!(empty.len(), 0);
+
+    let list_field = Arc::new(Field::new("item", ty.clone(), true));
+    let first_list: ArrayRef = Arc::new(ListArray::new(
+        list_field.clone(),
+        arrow_buffer::OffsetBuffer::new(vec![0i32, 2, 2].into()),
+        first.clone(),
+        Some(NullBuffer::from(vec![true, false])),
+    ));
+    let second_list: ArrayRef = Arc::new(ListArray::new(
+        list_field.clone(),
+        arrow_buffer::OffsetBuffer::new(vec![0i32, 1].into()),
+        second.clone(),
+        None,
+    ));
+    let list_ty = DataType::List(list_field);
+    let listed = assemble_values(
+        AssemblyPlan::Indexed {
+            result_type: &list_ty,
+            sources: &[Some(&first_list), Some(&second_list)],
+            choices: &choices,
+        },
+        &Control,
+    )
+    .unwrap();
+    assert_eq!(listed.data_type(), &list_ty);
+    let listed = listed.as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(listed.value_offsets(), &[0, 1, 3, 3, 3, 4]);
+    assert_eq!(
+        (0..5).map(|row| listed.is_valid(row)).collect::<Vec<_>>(),
+        vec![true, true, false, false, true]
+    );
+    let child = listed
+        .values()
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap();
+    assert_eq!(child.len(), 4);
+    assert_eq!(child.value(0), &[9u8; 16]);
+    assert!(child.is_null(1));
+    assert_eq!(child.value(2), &[3u8; 16]);
+    assert_eq!(child.value(3), &[9u8; 16]);
+
+    let fields: arrow_schema::Fields = vec![Arc::new(
+        Field::new("exact_fixed_child", ty.clone(), true).with_metadata(
+            std::collections::HashMap::from([("fixed.fixture.tag".into(), "unchanged".into())]),
+        ),
+    )]
+    .into();
+    let first_struct: ArrayRef = Arc::new(StructArray::new(
+        fields.clone(),
+        vec![first],
+        Some(NullBuffer::from(vec![true, false])),
+    ));
+    let second_struct: ArrayRef = Arc::new(StructArray::new(fields.clone(), vec![second], None));
+    let struct_ty = DataType::Struct(fields);
+    assert!(supports_guarded_result(&struct_ty));
+    let output = assemble_values(
+        AssemblyPlan::Indexed {
+            result_type: &struct_ty,
+            sources: &[Some(&first_struct), Some(&second_struct)],
+            choices: &choices,
+        },
+        &Control,
+    )
+    .unwrap();
+    assert_eq!(output.data_type(), &struct_ty);
+    let output = output.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(
+        (0..5).map(|row| output.is_valid(row)).collect::<Vec<_>>(),
+        vec![true, true, false, false, true],
+    );
+    assert_eq!(output.fields()[0].name(), "exact_fixed_child");
+    assert_eq!(
+        output.fields()[0].metadata()["fixed.fixture.tag"],
+        "unchanged"
+    );
+    let child = output
+        .column(0)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap();
+    assert_eq!(
+        (0..5).map(|row| child.is_valid(row)).collect::<Vec<_>>(),
+        vec![true, false, false, true, true],
+    );
+    assert_eq!(child.value(0), &[9u8; 16]);
+    assert_eq!(
+        child.value(3),
+        &[3u8; 16],
+        "NULL parent keeps actual raw fixed child"
+    );
+    assert_eq!(child.value(4), &[9u8; 16]);
+
+    // Static geometry only: never attempt these enormous allocations.
+    // The Fixed child reaches the SAME MutableBuffer author recursively.
+    let quantum = 64usize.max(arrow_buffer::alloc::ALIGNMENT);
+    let aligned_max = (isize::MAX as usize / quantum) * quantum;
+    let largest = aligned_max / 16;
+    let largest_unrounded = isize::MAX as usize / 16;
+    assert!(largest < largest_unrounded);
+    for shape in [&ty, &struct_ty] {
+        assert!(guarded_result_extent(shape, largest).is_ok());
+        for rows in [largest + 1, largest_unrounded, largest_unrounded + 1] {
+            assert!(matches!(
+                guarded_result_extent(shape, rows),
+                Err(CopyError::Extent(_))
+            ));
+        }
+    }
+    assert!(matches!(
+        super::super::preflight_guarded_interleave(
+            &DataType::FixedSizeBinary(8),
+            &[output.column(0).clone()],
+            &[(0, 0)],
+            |_| Ok(())
+        ),
+        Err(CopyError::Invalid(_))
+    ));
 }
