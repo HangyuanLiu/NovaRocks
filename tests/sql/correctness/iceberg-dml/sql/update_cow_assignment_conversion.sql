@@ -78,3 +78,76 @@ SELECT id, required_text FROM ${case_db}.t_cow_assignment_conversion ORDER BY id
 -- query 11
 -- @skip_result_check=true
 DROP TABLE ${case_db}.t_cow_assignment_conversion FORCE;
+
+
+-- STRING parsing uses the same ordinary CAST author for COW assignment.
+-- Raw floating-point NaN identity is outside this text conversion case.
+-- query 12
+-- @skip_result_check=true
+DROP TABLE IF EXISTS ${case_db}.t_cow_assignment_nonfinite FORCE;
+CREATE TABLE ${case_db}.t_cow_assignment_nonfinite (
+  id INT,
+  token STRING,
+  nullable_float FLOAT,
+  nullable_double DOUBLE,
+  required_float FLOAT NOT NULL,
+  required_double DOUBLE NOT NULL
+) TBLPROPERTIES (
+  "format-version" = "3",
+  "write.row-lineage" = "true",
+  "write.update.mode" = "copy-on-write"
+);
+INSERT INTO ${case_db}.t_cow_assignment_nonfinite VALUES
+  (1, 'NaN', 21, 22, 11, 12),
+  (2, 'inf', 21, 22, 11, 12),
+  (3, '-inf', 21, 22, 11, 12),
+  (4, '1e1000', 21, 22, 11, 12),
+  (5, '2.5', 21, 22, 11, 12);
+
+-- query 13
+-- @skip_result_check=true
+UPDATE ${case_db}.t_cow_assignment_nonfinite
+SET nullable_float = token, nullable_double = token
+WHERE id <= 4;
+-- query 14
+SELECT id, token,
+       nullable_float IS NULL AS float_is_null,
+       CAST(token AS FLOAT) IS NULL AS cast_float_is_null,
+       nullable_double IS NULL AS double_is_null,
+       CAST(token AS DOUBLE) IS NULL AS cast_double_is_null
+FROM ${case_db}.t_cow_assignment_nonfinite ORDER BY id;
+
+-- Each failed assignment must leave both required values and the other rows intact.
+-- query 15
+-- @expect_error=signed COW required field contains NULL
+UPDATE ${case_db}.t_cow_assignment_nonfinite
+SET required_float = token WHERE id = 1;
+-- query 16
+-- @expect_error=signed COW required field contains NULL
+UPDATE ${case_db}.t_cow_assignment_nonfinite
+SET required_double = token WHERE id = 2;
+-- query 17
+-- @expect_error=signed COW required field contains NULL
+UPDATE ${case_db}.t_cow_assignment_nonfinite
+SET required_float = token WHERE id = 3;
+-- query 18
+-- @expect_error=signed COW required field contains NULL
+UPDATE ${case_db}.t_cow_assignment_nonfinite
+SET required_double = token WHERE id = 4;
+-- query 19
+SELECT id,
+       required_float = 11 AS required_float_unchanged,
+       required_double = 12 AS required_double_unchanged,
+       nullable_float IS NULL AS float_is_null,
+       nullable_double IS NULL AS double_is_null
+FROM ${case_db}.t_cow_assignment_nonfinite ORDER BY id;
+-- query 20
+SELECT id,
+       nullable_float = 21 AS float_unchanged,
+       nullable_double = 22 AS double_unchanged,
+       required_float = 11 AS required_float_unchanged,
+       required_double = 12 AS required_double_unchanged
+FROM ${case_db}.t_cow_assignment_nonfinite WHERE id = 5;
+-- query 21
+-- @skip_result_check=true
+DROP TABLE ${case_db}.t_cow_assignment_nonfinite FORCE;

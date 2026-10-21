@@ -556,6 +556,7 @@ fn p05_selected_value_case(source: ArrayRef, expected: ArrayRef) {
 #[test]
 fn p05_numeric_source_widths_and_nonfinite_to_wide_decimal() {
     use arrow_array::*;
+    p05_boolean_wide_decimal_precision_boundary();
     // Decimal coefficient 1200 at scale 2 denotes exactly integer 12.
     let expected = Arc::new(
         Decimal256Array::from(vec![Some(arrow_buffer::i256::from_i128(1200)), None])
@@ -647,6 +648,9 @@ fn p05_numeric_source_widths_and_nonfinite_to_wide_decimal() {
 #[test]
 fn p05_decimal_unsigned_width_limits_and_wide_rescale_policy() {
     use arrow_array::*;
+    p05_wide_decimal_minimum_scale_zero_is_exact();
+    p05_selected_wide_decimal_delta_proofs();
+    p05_decimal_safe_table_miss_retains_static_typed_refusal();
     // Integer endpoints are fixed by their widths, independent of Arrow's
     // decimal implementation. Negative-to-unsigned and max+1 cannot fit.
     macro_rules! width {
@@ -1356,6 +1360,252 @@ fn p05_timestamp_decimal_preparation_contract() {
                 ),
                 Err(CastPrepareError::Unsupported)
             );
+        }
+    }
+}
+
+// These cases qualify the current body against mathematical results. The old
+// helper's invalid precision result and scale-delta panic are retained as FAIL
+// evidence; neither is a successful behavior to reproduce.
+fn p05_boolean_wide_decimal_precision_boundary() {
+    let source = Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])) as ArrayRef;
+    for (policy, allow) in p05_modes() {
+        let r = recipe(DataType::Boolean, DataType::Decimal256(1, 1), policy, allow);
+        for rows in [vec![0, 1, 2], vec![0, 2], vec![]] {
+            let result = output(&r, &source, Selection::try_sparse(3, &rows).unwrap());
+            let values = result
+                .values()
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .unwrap();
+            assert_eq!(values.data_type(), &DataType::Decimal256(1, 1));
+            assert_eq!(values.len(), rows.len());
+            for (ordinal, &row) in rows.iter().enumerate() {
+                // true denotes 1, requiring coefficient10 at scale1: it cannot
+                // fit precision1. false is exactly0 and source NULL stays NULL.
+                if row == 1 {
+                    assert!(values.is_valid(ordinal));
+                    assert_eq!(values.value(ordinal), arrow_buffer::i256::ZERO);
+                } else {
+                    assert!(values.is_null(ordinal));
+                }
+            }
+            let expected_errors: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(ordinal, &row)| {
+                    (row == 0 && policy == DecimalOverflowPolicy::ReportError).then_some(ordinal)
+                })
+                .collect();
+            assert_eq!(
+                result
+                    .errors()
+                    .iter()
+                    .map(|error| error.selected_ordinal())
+                    .collect::<Vec<_>>(),
+                expected_errors
+            );
+        }
+    }
+}
+fn p05_wide_decimal_minimum_scale_zero_is_exact() {
+    for (precision, source_scale, target_scale, downscale) in
+        [(1, i8::MIN, 0, false), (76, 76, i8::MIN, true)]
+    {
+        let source = Arc::new(
+            Decimal256Array::from(vec![
+                Some(arrow_buffer::i256::ZERO),
+                Some(arrow_buffer::i256::ONE),
+                Some(arrow_buffer::i256::MINUS_ONE),
+                None,
+            ])
+            .with_precision_and_scale(precision, source_scale)
+            .unwrap(),
+        ) as ArrayRef;
+        for (policy, allow) in p05_modes() {
+            let r = recipe(
+                source.data_type().clone(),
+                DataType::Decimal128(38, target_scale),
+                policy,
+                allow,
+            );
+            // This pair genuinely selects the scalar DecimalNarrow owner; do
+            // not force a selected-array route to bypass the actual author.
+            assert!(!r.uses_selected_array());
+            assert_eq!(
+                r.source_type().data_type(),
+                &DataType::Decimal256(precision, source_scale)
+            );
+            assert_eq!(
+                r.result_type().data_type(),
+                &DataType::Decimal128(38, target_scale)
+            );
+            for row in 0..4 {
+                let actual = r
+                    .evaluate_row(EvaluatedArgument::Column(&source), row, row, &Control)
+                    .unwrap();
+                if row == 3 {
+                    assert_eq!(actual, CastRowResult::Null);
+                } else if row == 0 || downscale {
+                    // Zero stays zero; dividing any coefficient here by10^204
+                    // rounds to0 independently of precision and source sign.
+                    assert_eq!(actual, CastRowResult::Decimal128(0));
+                } else if policy == DecimalOverflowPolicy::ReportError || allow {
+                    let CastRowResult::RowError(error) = actual else {
+                        panic!("decimal overflow must retain its selected row error");
+                    };
+                    assert_eq!(error.selected_ordinal(), row);
+                } else {
+                    assert_eq!(actual, CastRowResult::Null);
+                }
+            }
+        }
+    }
+}
+
+fn p05_selected_wide_decimal_delta_proofs() {
+    let ten52: i256 = "10000000000000000000000000000000000000000000000000000"
+        .parse()
+        .unwrap();
+    let ten30: i256 = "1000000000000000000000000000000".parse().unwrap();
+    let max76: i256 =
+        "9999999999999999999999999999999999999999999999999999999999999999999999999999"
+            .parse()
+            .unwrap();
+    let cases: Vec<(ArrayRef, DataType, Vec<Option<i256>>)> = vec![
+        (
+            Arc::new(
+                Decimal256Array::from(vec![Some(i256::ONE), Some(-i256::ONE), Some(ten30), None])
+                    .with_precision_and_scale(76, -52)
+                    .unwrap(),
+            ),
+            DataType::Decimal256(76, 0),
+            vec![Some(ten52), Some(-ten52), None, None],
+        ),
+        (
+            Arc::new(
+                Decimal128Array::from(vec![Some(0), Some(1), Some(-1), None])
+                    .with_precision_and_scale(38, i8::MIN)
+                    .unwrap(),
+            ),
+            DataType::Decimal256(76, 0),
+            vec![Some(i256::ZERO), None, None, None],
+        ),
+        (
+            Arc::new(
+                Decimal256Array::from(vec![Some(max76), Some(-max76), Some(i256::ZERO), None])
+                    .with_precision_and_scale(76, 76)
+                    .unwrap(),
+            ),
+            DataType::Decimal256(76, i8::MIN),
+            vec![Some(i256::ZERO), Some(i256::ZERO), Some(i256::ZERO), None],
+        ),
+    ];
+    for (source, target, expected) in cases {
+        for (policy, allow) in p05_modes() {
+            let r = recipe(source.data_type().clone(), target.clone(), policy, allow);
+            for rows in [vec![0, 1, 2, 3], vec![1, 2, 3], vec![]] {
+                let result = output(&r, &source, Selection::try_sparse(4, &rows).unwrap());
+                assert_eq!(result.values().data_type(), &target);
+                let values = result
+                    .values()
+                    .as_any()
+                    .downcast_ref::<Decimal256Array>()
+                    .unwrap();
+                assert_eq!(values.len(), rows.len());
+                let mut errors = vec![];
+                for (ordinal, &row) in rows.iter().enumerate() {
+                    if let Some(value) = expected[row] {
+                        assert!(values.is_valid(ordinal));
+                        assert_eq!(values.value(ordinal), value);
+                    } else {
+                        assert!(values.is_null(ordinal));
+                        if source.is_valid(row)
+                            && (policy == DecimalOverflowPolicy::ReportError || allow)
+                        {
+                            errors.push(ordinal);
+                        }
+                    }
+                }
+                assert_eq!(
+                    result
+                        .errors()
+                        .iter()
+                        .map(|error| error.selected_ordinal())
+                        .collect::<Vec<_>>(),
+                    errors
+                );
+            }
+        }
+    }
+}
+
+fn p05_decimal_safe_table_miss_retains_static_typed_refusal() {
+    use novarocks_failure_contract::FailureProjection;
+    use std::error::Error;
+    fn assert_static(error: &RowDataError, ordinal: usize) {
+        assert_eq!(error.selected_ordinal(), ordinal);
+        assert_eq!(
+            error.failure_fact().reason(),
+            crate::DataFailureReason::InvalidValue
+                .failure_fact()
+                .reason()
+        );
+        let mut cause: Option<&(dyn Error + 'static)> = Some(error);
+        let mut found = false;
+        while let Some(error) = cause {
+            if let Some(arrow_schema::ArrowError::CastError(_)) =
+                error.downcast_ref::<arrow_schema::ArrowError>()
+            {
+                found = true;
+            }
+            cause = error.source();
+        }
+        assert!(
+            found,
+            "static scale-table refusal must retain original Arrow CastError"
+        );
+    }
+    // Arrow's target-carrier table is checked before source_precision+delta.
+    // Delta52/90 fit i8 but miss tables38/76, so even zero/NULL retain the
+    // existing static refusal. These are not unsafe-intermediate repairs.
+    let narrow = Arc::new(
+        Decimal256Array::from(vec![Some(i256::ZERO), None])
+            .with_precision_and_scale(76, -52)
+            .unwrap(),
+    ) as ArrayRef;
+    let wide = Arc::new(
+        Decimal128Array::from(vec![Some(0), None])
+            .with_precision_and_scale(38, -90)
+            .unwrap(),
+    ) as ArrayRef;
+    for (policy, allow) in p05_modes() {
+        let r = recipe(
+            narrow.data_type().clone(),
+            DataType::Decimal128(38, 0),
+            policy,
+            allow,
+        );
+        for row in 0..2 {
+            let CastRowResult::RowError(error) = r
+                .evaluate_row(EvaluatedArgument::Column(&narrow), row, row, &Control)
+                .unwrap()
+            else {
+                panic!("safe delta beyond target table must retain static refusal");
+            };
+            assert_static(&error, row);
+        }
+        let r = recipe(
+            wide.data_type().clone(),
+            DataType::Decimal256(76, 0),
+            policy,
+            allow,
+        );
+        let result = output(&r, &wide, Selection::all(2));
+        assert_eq!(result.values().null_count(), 2);
+        assert_eq!(result.errors().len(), 2);
+        for (ordinal, error) in result.errors().iter().enumerate() {
+            assert_static(error, ordinal);
         }
     }
 }

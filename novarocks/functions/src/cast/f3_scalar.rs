@@ -211,6 +211,44 @@ impl Body {
             work.step()?;
             return finish_numeric_null(recipe, ordinal, integral.map(CastRowResult::Signed), work);
         }
+        if self == Self::DecimalNarrow {
+            let (
+                DataType::Decimal256(source_precision, source_scale),
+                DataType::Decimal128(target_precision, target_scale),
+            ) = (recipe.source.data_type(), recipe.result.data_type())
+            else {
+                return Err(internal("decimal narrowing CAST lost its frozen types"));
+            };
+            let coefficient = if source_null {
+                None
+            } else {
+                Some(
+                    argument
+                        .array()
+                        .as_any()
+                        .downcast_ref::<Decimal256Array>()
+                        .ok_or_else(|| internal("decimal narrowing CAST has a foreign carrier"))?
+                        .value(row),
+                )
+            };
+            if let Some(value) = super::f3_array::arrow_decimal_wide_delta(
+                coefficient,
+                *source_precision,
+                *source_scale,
+                *target_precision,
+                *target_scale,
+                arrow_schema::DECIMAL128_MAX_PRECISION,
+            ) {
+                work.step()?;
+                if source_null {
+                    return Ok(CastRowResult::Null);
+                }
+                let value = value
+                    .and_then(|value| value.to_i128())
+                    .map(CastRowResult::Decimal128);
+                return finish_numeric_null(recipe, ordinal, value, work);
+            }
+        }
         if self == Self::BooleanDecimal {
             let DataType::Decimal128(precision, scale) = recipe.result.data_type() else {
                 return Err(internal("boolean decimal CAST lost its frozen target"));

@@ -22,6 +22,7 @@ use crate::{SelectedValues, Selection, selected_copy};
 use arrow_array::{
     ArrayRef, LargeListArray, ListArray, StructArray, UInt64Array, new_empty_array, new_null_array,
 };
+use arrow_buffer::i256;
 use novarocks_type_contract::ValueTypeRef;
 use std::{alloc::Layout, cell::RefCell, sync::Arc};
 
@@ -605,7 +606,103 @@ impl novarocks_failure_contract::FailureProjection for ArrayCastArrowFailure {
     }
 }
 
+// Resolve only the legal decimal shapes whose Arrow i8 intermediates are
+// unsafe. Outer None delegates to the unchanged Arrow rescale/rounding owner;
+// inner None is a source NULL or a mathematically proven precision overflow.
+pub(super) fn arrow_decimal_wide_delta(
+    coefficient: Option<i256>,
+    source_precision: u8,
+    source_scale: i8,
+    target_precision: u8,
+    target_scale: i8,
+    target_carrier_precision: u8,
+) -> Option<Option<i256>> {
+    let delta = i16::from(target_scale) - i16::from(source_scale);
+    let unsafe_upscale = delta >= 0
+        && (delta > i16::from(i8::MAX)
+            || (delta <= i16::from(target_carrier_precision)
+                && i16::from(source_precision) + delta > i16::from(i8::MAX)));
+    // Arrow looks up the target carrier's power table before evaluating the
+    // precision sum. A representable delta past that table is an existing
+    // static CastError, including on NULL; delegate that refusal unchanged.
+    let unsafe_downscale = -delta > i16::from(i8::MAX);
+    if !unsafe_upscale && !unsafe_downscale {
+        return None;
+    }
+    let Some(coefficient) = coefficient else {
+        return Some(None);
+    };
+    // A downscale here divides by at least10^128. Even the full i256 native
+    // range has magnitude<10^77, hence rounds0 independently of the sign.
+    if unsafe_downscale || coefficient == i256::ZERO {
+        return Some(Some(i256::ZERO));
+    }
+    // A nonzero coefficient multiplied by10^77 cannot fit any supported
+    // decimal precision. A smaller delta may fit Decimal256 even though
+    // source_precision+delta overflows i8, so perform checked value arithmetic.
+    if delta > 76 {
+        return Some(None);
+    }
+    let value = crate::legacy_decimal::pow10_i256(delta as usize)
+        .ok()
+        .and_then(|factor| coefficient.checked_mul(factor));
+    let limit = crate::legacy_decimal::pow10_i256(usize::from(target_precision)).ok();
+    Some(
+        value
+            .zip(limit)
+            .and_then(|(value, limit)| (value < limit && value > -limit).then_some(value)),
+    )
+}
 fn cast_one(source: &ArrayRef, result: &DataType) -> Result<ArrayRef, ArrayCastFailure> {
+    if let DataType::Decimal256(target_precision, target_scale) = result {
+        let input = match source.data_type() {
+            DataType::Decimal128(precision, scale) => {
+                let array = source
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| invalid("decimal widening CAST has a foreign carrier"))?;
+                Some((
+                    *precision,
+                    *scale,
+                    (!array.is_null(0)).then(|| i256::from_i128(array.value(0))),
+                ))
+            }
+            DataType::Decimal256(precision, scale) => {
+                let array = source
+                    .as_any()
+                    .downcast_ref::<Decimal256Array>()
+                    .ok_or_else(|| invalid("wide decimal CAST has a foreign carrier"))?;
+                Some((
+                    *precision,
+                    *scale,
+                    (!array.is_null(0)).then(|| array.value(0)),
+                ))
+            }
+            _ => None,
+        };
+        if let Some((precision, scale, coefficient)) = input {
+            if let Some(value) = arrow_decimal_wide_delta(
+                coefficient,
+                precision,
+                scale,
+                *target_precision,
+                *target_scale,
+                arrow_schema::DECIMAL256_MAX_PRECISION,
+            ) {
+                let array = Decimal256Array::from(vec![value])
+                    .with_precision_and_scale(*target_precision, *target_scale)
+                    .map_err(|cause| {
+                        crate::control_values::AssemblyFailure::arrow(
+                            "CAST decimal metadata",
+                            cause,
+                        )
+                        .into_kernel()
+                    })?;
+                return Ok(Arc::new(array));
+            }
+        }
+    }
+
     if result == &DataType::FixedSizeBinary(16)
         && (numeric(source.data_type())
             || matches!(source.data_type(), DataType::Boolean | DataType::Utf8))
