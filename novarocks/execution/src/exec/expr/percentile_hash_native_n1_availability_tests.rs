@@ -16,7 +16,7 @@
 // under the License.
 
 //! N1 owner-derived admission before real folding; Original binding remains full N.
-use super::sql_scalar_presence_original_tests::{EVALUATOR, SERIAL, fold_count, reset, session};
+use super::sql_fold_observation_test_source::{EVALUATOR, SERIAL, fold_count, reset, session};
 use arrow::datatypes::DataType;
 use novarocks_functions::{
     FunctionArgument, FunctionBindingError, FunctionBindingRequest, FunctionValueType,

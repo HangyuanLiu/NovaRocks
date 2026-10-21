@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Same-journal static environment admission; no preparation or data evaluation.
-use super::e08s1_environment_original_tests::{concat_source, unix_source};
+use super::environment_sql_source_tests::{concat_source, unix_source};
 use novarocks_functions::FunctionBindingError;
 use novarocks_sql::analyze_error::AnalyzeErrorKind;
 use novarocks_sql::compiler::{

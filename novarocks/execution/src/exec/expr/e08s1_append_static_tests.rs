@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Static support shares the CPU's type predicates; suffix payload is never inspected.
-use super::e08s1_append_original_static_tests::bindings;
+use super::append_trailing_sql_source_tests::bindings;
 use arrow::datatypes::{DataType, Field};
 use novarocks_functions::{
     FunctionArgumentType, FunctionBindingError, FunctionResultType, FunctionValueType,

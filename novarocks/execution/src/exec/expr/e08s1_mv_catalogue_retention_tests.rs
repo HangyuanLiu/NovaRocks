@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Same public MV entrypoints; generated calls must use the original Exact loan.
-use super::e08s1_mv_original_catalogue_tests::run_with_denied_loan;
+use super::mv_catalogue_sql_test_source::run_with_denied_loan;
 
 use std::sync::atomic::Ordering;
 #[test]

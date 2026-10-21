@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Exact static profiles borrow ONE original CPU predicate, never dynamic length values.
-use super::e08s1_string_batch_original_tests::{NAMES, calls};
+use super::string_batch_sql_source_tests::{NAMES, calls};
 use arrow::datatypes::DataType;
 use novarocks_functions::{
     FunctionArgument, FunctionArgumentType, FunctionBindingError, FunctionResultType,

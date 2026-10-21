@@ -199,14 +199,6 @@ impl RuntimeKernelControl {
         self.error.wait_interruptibly(duration)
     }
 }
-impl crate::exec::expr::ExprEvaluationControl for RuntimeKernelControl {
-    fn checkpoint(&self) -> ExecutionResult<()> {
-        self.checkpoint_execution()
-    }
-    fn wait(&self, duration: Duration) -> ExecutionResult<()> {
-        self.wait_execution(duration)
-    }
-}
 
 impl KernelEvaluationControl for RuntimeKernelControl {
     fn checkpoint(&self, _work_units: u32) -> Result<(), KernelFailure> {

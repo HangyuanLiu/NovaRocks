@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub mod aggregate;
 pub mod assert;
 pub mod join;
 pub mod nljoin;

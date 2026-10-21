@@ -251,6 +251,13 @@ static PREPARATION_ERROR: LazyLock<ExistingEvaluator> = LazyLock::new(|| Existin
         ),
     )),
 });
+static PROJECTED_SOURCE_ERROR: LazyLock<ExistingEvaluator> = LazyLock::new(|| ExistingEvaluator {
+    mode: Mode::Fail(SqlConstantEvaluationError::from_domain(
+        novarocks_execution::runtime::fragment::ExecutionFailure::from(
+            novarocks_functions::KernelFailure::ResourceExhausted,
+        ),
+    )),
+});
 struct MustNotEvaluate;
 impl SqlConstantEvaluator for MustNotEvaluate {
     fn eval_scalar(
@@ -558,6 +565,51 @@ fn sql_fold_dependency_original_static_failure_classes_and_text_unchanged() {
         ));
     }
 }
+#[test]
+fn sql_fold_dependency_projected_source_keeps_identity_and_does_not_mint_control() {
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    let observer = probe();
+    let actual = compile_typed(
+        "SELECT upper('projected')",
+        &*PROJECTED_SOURCE_ERROR,
+        Some(observer.clone()),
+    )
+    .unwrap_err();
+    let original =
+        compile_typed("SELECT upper('projected')", &*PROJECTED_SOURCE_ERROR, None).unwrap_err();
+    use novarocks_sql::compiler::{SqlCompileError, SqlCompileProgressError};
+    use std::error::Error;
+    assert!(
+        actual
+            .source()
+            .unwrap()
+            .downcast_ref::<SqlCompileError>()
+            .is_some()
+    );
+    let unwrap_source = |error| match error {
+        SqlCompileProgressError::Compile(SqlCompileError::CompilationSource(source)) => source,
+        _ => panic!("projected resource source must propagate"),
+    };
+    let source = unwrap_source(actual);
+    assert_eq!(source, unwrap_source(original));
+    assert_eq!(source.failure_fact().class(), FailureClass::Resource);
+    assert!(
+        source
+            .downcast_ref::<novarocks_execution::runtime::fragment::ExecutionFailure>()
+            .is_some()
+    );
+    let receipts = observer.receipts.lock().unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert!(matches!(
+        &receipts[0].outcome,
+        Some(Outcome::Error {
+            tag: ErrorTag::Source,
+            control: None,
+            ..
+        })
+    ));
+}
+
 #[test]
 fn sql_fold_dependency_query_owned_receipts_are_isolated_and_released() {
     let left = probe();

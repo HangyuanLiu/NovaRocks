@@ -381,7 +381,3 @@ mod sql_fold_dependency_observation_tests;
 #[cfg(test)]
 #[path = "constant_eval/sql_dependency_resolved_binding_source_tests.rs"]
 mod sql_dependency_resolved_binding_source_tests;
-
-#[cfg(test)]
-#[path = "constant_eval/percentile_hash_original_fold_tests.rs"]
-mod percentile_hash_original_fold_tests;

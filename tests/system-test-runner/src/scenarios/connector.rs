@@ -5006,16 +5006,13 @@ fn start_connector_read_on(
     // the root after exchange, which leaves remote page sources free to close
     // before the scenario reaches its reader-ready barrier.
     //
-    // The filter costs one second per row of the chunk it is handed, not one
-    // second per batch. `eval_and` evaluates both operands over the whole chunk
-    // instead of short-circuiting on the left one
-    // (`novarocks/execution/src/exec/expr/comparison.rs`), a literal is
-    // broadcast to the chunk width (`.../expr/mod.rs`), and `eval_sleep` sleeps
-    // once per row of its input
-    // (`.../expr/function/object/utility_functions.rs`). Measured: a three-row
-    // chunk takes 3.02 s. So a split costs its chunk width in seconds, and the
-    // `v % 4096 = 0` predicate does not reduce that -- it is evaluated
-    // alongside the sleep, not before it.
+    // The compiled Boolean region owns row demand and invocation order
+    // (`novarocks/execution/src/exec/expr/compiled_program/guarded.rs` and
+    // `boolean_region.rs`). Its frozen effects and demand decide which rows
+    // reach an operand; legacy eager `eval_and` timings are not a contract
+    // for this path. Keep the scan predicate and the reader-ready barrier as
+    // the actual cancellation stimulus, rather than deriving readiness from
+    // an assumed chunk-wide sleep duration.
     //
     // The cross join is deliberately small. It used to fan out to 1e9, which
     // made the scan's downstream unable to drain: the first split's reader

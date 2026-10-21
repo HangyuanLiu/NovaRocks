@@ -19,14 +19,10 @@ arrow-data.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 bytes.workspace = true
-chrono.workspace = true
-crc32c.workspace = true
 datasketches = { workspace = true, features = ["hll"] }
 futures.workspace = true
 hashbrown = { workspace = true, features = ["raw"] }
 allocator-api2.workspace = true
-hex.workspace = true
-md-5.workspace = true
 novarocks-arrow-ipc-frame.workspace = true
 novarocks-types.workspace = true
 novarocks-execution-contract.workspace = true
@@ -37,22 +33,21 @@ novarocks-memory-failure.workspace = true
 novarocks-spi.workspace = true
 novarocks-type-contract.workspace = true
 once_cell.workspace = true
-rand.workspace = true
-regex.workspace = true
-serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
-sm3.workspace = true
 parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
 prometheus.workspace = true
 threadpool = "1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-util.workspace = true
 tracing.workspace = true
-uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 
 [dev-dependencies]
-novarocks-functions = { workspace = true }
+chrono.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde = { workspace = true, features = ["derive"] }
+uuid = { workspace = true, features = ["v4", "v7", "serde"] }
 prost.workspace = true
 novarocks-workload-control.workspace = true
 novarocks-query-application.workspace = true
@@ -66,15 +61,4 @@ novarocks-parser.workspace = true
 
 [package.metadata.novarocks.test]
 runtime-inputs = []
-env-inputs = [{ name = "UEA5E_TIME_OWNERS_DISABLED", kind = "value" },{ name = "C16_PARENT_SCAN", kind = "file-content" }]
-
-[[package.metadata.novarocks.test.ignored]]
-filter = "test(=exec::expr::legacy_percentile_approx_raw_original_tests::legacy_percentile_approx_raw_original_child_prefix_precedes_any_row_error) | test(=exec::expr::legacy_percentile_approx_raw_original_tests::legacy_percentile_approx_raw_original_decode_full_header_errors_and_ignored_tail) | test(=exec::expr::legacy_percentile_approx_raw_original_tests::legacy_percentile_approx_raw_original_full_actual_carrier_errors_and_zero_rows) | test(=exec::expr::legacy_percentile_hash_original_tests::legacy_percentile_hash_original_all_numeric_readers_slice_null_and_empty) | test(=exec::expr::legacy_percentile_hash_original_tests::legacy_percentile_hash_original_first_only_demand_ignored_target_and_raw_arity) | test(=exec::expr::legacy_percentile_hash_original_tests::legacy_percentile_hash_original_full_carrier_error_null_mask_and_zero_rows) | test(=exec::expr::percentile_hash_original_fold_tests::hash_original_real_fe_fold_evaluates_cast_tail_before_hash)"
-class = "manual"
-reason = "Percentile maintenance is suspended; these retained legacy semantic diagnostics are outside the maintained compiled execution contract."
-
-[package.metadata.cargo-machete]
-ignored = [
-    # Private tests include the FE dependency_artifact_storage.rs module via #[path].
-    "serde",
-]
+env-inputs = []

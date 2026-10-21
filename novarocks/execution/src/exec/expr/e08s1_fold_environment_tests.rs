@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Permanent same original fold-parent frontier, independent of Task submission.
-use super::e08s1_fold_environment_original_tests::optimize;
-use super::sql_scalar_presence_original_tests::{SERIAL, fold_count, reset};
+use super::fold_environment_sql_test_source::optimize;
+use super::sql_fold_observation_test_source::{SERIAL, fold_count, reset};
 use novarocks_sql::{analyze_error::AnalyzeErrorKind, compiler::SqlCompileError};
 #[test]
 fn e08s1_fold_environment_exact_missing_authors_refuse_parent_before_children() {

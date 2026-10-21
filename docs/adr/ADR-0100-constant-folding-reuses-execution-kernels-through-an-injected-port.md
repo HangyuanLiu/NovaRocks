@@ -5,6 +5,10 @@ domain: [sql-compiler]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0189
+    scope: "Frozen binding-owned requests and shared compiled single-node evaluation replace literal-node mapping and the retained evaluator implementation; compiler port, stateless lifetime and optional-fold policy remain active"
+    link: "ADR-0189-frozen-fold-facts-and-shared-compiled-evaluation.md"
 date: 2026-08-20
 provenance:
   - "PR: number pending — SQL constant folding (FoldConstant rule + frontend constant evaluator)"

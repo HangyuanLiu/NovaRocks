@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Original ordinary Table source and its real parent-before-argument admission loan.
-use super::sql_scalar_presence_original_tests::{EVALUATOR, SERIAL, fold_count, reset, session};
+use super::sql_fold_observation_test_source::{EVALUATOR, SERIAL, fold_count, reset, session};
 use novarocks_functions::{FunctionBindingError, FunctionBindingSelection, FunctionKind};
 use novarocks_sql::{
     analyze_error::AnalyzeErrorKind,
