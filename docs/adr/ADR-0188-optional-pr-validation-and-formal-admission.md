@@ -6,7 +6,7 @@ status: active
 supersedes: []
 superseded-by: null
 partially-supersedes:
-  - id: ADR-0187
+  - id: ADR-0189
     scope: "PR-only fast precheck cost decision; formal admission and evidence rules remain active"
 date: 2026-10-20
 provenance:
@@ -23,7 +23,7 @@ code-anchors:
 
 ## 背景与执行事实
 
-GitHub 工作流的检查由触发事件和检出提交关联到 PR；在某 SHA 上手动运行工作流，不足以让结果进入 PR Checks。检查是否阻塞合入由 required checks 配置决定，原生步骤退出与检查结论必须如实保留。ADR-0187 的指定正式来源、启用范围、当前尝试组合及分阶段上线规则继续有效。
+GitHub 工作流的检查由触发事件和检出提交关联到 PR；在某 SHA 上手动运行工作流，不足以让结果进入 PR Checks。检查是否阻塞合入由 required checks 配置决定，原生步骤退出与检查结论必须如实保留。ADR-0189 的指定正式来源、启用范围、当前尝试组合及分阶段上线规则继续有效。
 
 | 检查 | 事件与检出 | 职责及证据类别 |
 |---|---|---|

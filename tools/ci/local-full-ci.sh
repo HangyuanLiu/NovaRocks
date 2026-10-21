@@ -75,33 +75,8 @@ ci_list_stages() {
     {"name": "CI build inputs", "tier": "admission", "domain": ["tools/ci/**"]},
     {"name": "locked Cargo metadata", "tier": "admission", "domain": ["**"]},
     {"name": "Cargo dependency policy", "tier": "admission", "domain": ["**"]},
-    {"name": "generated artifact hygiene", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "JSONObject resource profiles", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "JSONObject resource profile mutations", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "DataSketches resolved source", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "DataSketches source mutations", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "native wire dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "native wire dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "application domain dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "application domain dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "native trust dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "native trust dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "connector role binding boundary", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "connector role binding boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "Iceberg provider dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "Iceberg provider dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "StateStore dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "StateStore dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "SPI dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "SPI dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "memory dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "memory dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "physical plan dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "physical plan dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "local program dependency boundary", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "local program dependency boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "NCP-8 statistics boundary", "tier": "admission", "domain": ["tools/ci/**"]},
-    {"name": "NCP-8 statistics boundary mutations", "tier": "admission", "domain": ["tools/ci/**"]},
+    {"name": "unused dependencies", "tier": "admission", "domain": ["**"]},
+    {"name": "unused dependencies tests", "tier": "admission", "domain": ["tools/ci/**"]},
     {"name": "legacy branding", "tier": "admission", "domain": ["tools/ci/**"]},
     {"name": "legacy branding tests", "tier": "admission", "domain": ["tools/ci/**"]},
     {"name": "system scenario stage tests", "tier": "admission", "domain": ["tools/ci/**"]},
@@ -712,60 +687,10 @@ run_cargo_gates() {
     cargo metadata --locked --format-version 1
   run_fail_fast_stage "Cargo dependency policy" "cargo-deny.log" \
     cargo deny --locked check advisories bans licenses sources
-  run_fail_fast_stage "generated artifact hygiene" "generated-artifact-hygiene.log" \
-    tools/ci/check-generated-artifacts.sh
-  run_fail_fast_stage "JSONObject resource profiles" "json-object-resource-profile.log" \
-    python3 tools/ci/check-json-object-resource-profile.py
-  run_fail_fast_stage "JSONObject resource profile mutations" "json-object-resource-profile-test.log" \
-    python3 tools/ci/tests/json-object-resource-profile-test.py
-  run_fail_fast_stage "DataSketches resolved source" "datasketches-source.log" \
-    python3 tools/ci/check-datasketches-source.py
-  run_fail_fast_stage "DataSketches source mutations" "datasketches-source-test.log" \
-    tools/ci/tests/datasketches-source-test.sh
-  run_fail_fast_stage "native wire dependency boundary" "native-wire-dependency-boundary.log" \
-    tools/ci/check-native-wire-dependency-boundary.py
-  run_fail_fast_stage "native wire dependency boundary mutations" "native-wire-dependency-boundary-test.log" \
-    tools/ci/tests/native-wire-dependency-boundary-test.sh
-  run_fail_fast_stage "application domain dependency boundary" "application-domain-dependency-boundary.log" \
-    tools/ci/check-application-domain-dependency-boundary.py
-  run_fail_fast_stage "application domain dependency boundary mutations" "application-domain-dependency-boundary-test.log" \
-    tools/ci/tests/application-domain-dependency-boundary-test.sh
-  run_fail_fast_stage "native trust dependency boundary" "native-trust-dependency-boundary.log" \
-    tools/ci/check-native-trust-dependency-boundary.py
-  run_fail_fast_stage "native trust dependency boundary mutations" "native-trust-dependency-boundary-test.log" \
-    tools/ci/tests/native-trust-dependency-boundary-test.sh
-  run_fail_fast_stage "connector role binding boundary" "connector-role-binding-boundary.log" \
-    tools/ci/check-connector-role-binding-boundary.py
-  run_fail_fast_stage "connector role binding boundary mutations" "connector-role-binding-boundary-test.log" \
-    tools/ci/tests/connector-role-binding-boundary-test.sh
-  run_fail_fast_stage "Iceberg provider dependency boundary" "iceberg-provider-dependency-boundary.log" \
-    python3 tools/ci/check-iceberg-provider-dependency-boundary.py --manifest-path Cargo.toml
-  run_fail_fast_stage "Iceberg provider dependency boundary mutations" "iceberg-provider-dependency-boundary-test.log" \
-    tools/ci/tests/iceberg-provider-dependency-boundary-test.sh
-  run_fail_fast_stage "StateStore dependency boundary" "state-store-dependency-boundary.log" \
-    python3 tools/ci/check-state-store-dependency-boundary.py --manifest-path Cargo.toml
-  run_fail_fast_stage "StateStore dependency boundary mutations" "state-store-dependency-boundary-test.log" \
-    tools/ci/tests/state-store-dependency-boundary-test.sh
-  run_fail_fast_stage "SPI dependency boundary" "spi-dependency-boundary.log" \
-    python3 tools/ci/check-spi-dependency-boundary.py --manifest-path Cargo.toml
-  run_fail_fast_stage "SPI dependency boundary mutations" "spi-dependency-boundary-test.log" \
-    tools/ci/tests/spi-dependency-boundary-test.sh
-  run_fail_fast_stage "memory dependency boundary" "memory-dependency-boundary.log" \
-    python3 tools/ci/check-memory-dependency-boundary.py --manifest-path Cargo.toml
-  run_fail_fast_stage "memory dependency boundary mutations" "memory-dependency-boundary-test.log" \
-    tools/ci/tests/memory-dependency-boundary-test.sh
-  run_fail_fast_stage "physical plan dependency boundary" "physical-plan-dependency-boundary.log" \
-    python3 tools/ci/check-physical-plan-dependency-boundary.py --manifest-path Cargo.toml
-  run_fail_fast_stage "physical plan dependency boundary mutations" "physical-plan-dependency-boundary-test.log" \
-    tools/ci/tests/physical-plan-dependency-boundary-test.sh
-  run_fail_fast_stage "local program dependency boundary" "local-program-dependency-boundary.log" \
-    python3 tools/ci/check-local-program-dependency-boundary.py --manifest-path Cargo.toml
-  run_fail_fast_stage "local program dependency boundary mutations" "local-program-dependency-boundary-test.log" \
-    python3 tools/ci/tests/local-program-dependency-boundary-test.py
-  run_fail_fast_stage "NCP-8 statistics boundary" "ncp8-statistics-boundary.log" \
-    tools/ci/check-ncp8-statistics-boundary.py
-  run_fail_fast_stage "NCP-8 statistics boundary mutations" "ncp8-statistics-boundary-test.log" \
-    tools/ci/tests/ncp8-statistics-boundary-test.sh
+  run_fail_fast_stage "unused dependencies" "cargo-machete.log" \
+    ci_check_unused_dependencies
+  run_fail_fast_stage "unused dependencies tests" "cargo-machete-test.log" \
+    bash tools/ci/tests/unused-dependencies-stage-test.sh
   run_fail_fast_stage "legacy branding" "legacy-branding.log" \
     tools/ci/check-legacy-branding.sh
   run_fail_fast_stage "legacy branding tests" "legacy-branding-test.log" \

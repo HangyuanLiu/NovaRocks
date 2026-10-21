@@ -10,7 +10,6 @@ workspace = true
 [features]
 
 [dependencies]
-novarocks-failpoint = { workspace = true }
 novarocks-type-contract.workspace = true
 apache-avro.workspace = true
 async-trait.workspace = true
@@ -47,3 +46,11 @@ protoc-bin-vendored.workspace = true
 [package.metadata.novarocks.test]
 runtime-inputs = []
 env-inputs = []
+
+[package.metadata.cargo-machete]
+ignored = [
+    # build.rs generates the private MV persistence protobuf DTOs.
+    "prost-build",
+    # build.rs locates protoc for MV persistence DTO generation.
+    "protoc-bin-vendored",
+]

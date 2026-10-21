@@ -750,6 +750,7 @@ IDE 测试按钮与私有 target 配置、清理责任见 [测试治理](docs/gu
 - `cargo fmt`
 - `cargo clippy`
 - `cargo build`
+- 改动 crate 依赖时参考 [SPI](docs/guides/development/spi-boundary.md)、[StateStore](docs/guides/development/state-store-boundary.md) 与 [Memory](docs/guides/development/memory-boundary.md) 边界指南；依赖方向由 crate 结构与 review 维持，CI 不做依赖边界检查。
 - 按影响面执行 nextest；独立 Cargo doctest，局部调试可用 `cargo test -p <owner>`
 
 共享受管启动从 `ManagedCommand::new(payload)` 构造，monitor 持真实 Child 并负责失联回收；

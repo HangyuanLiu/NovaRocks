@@ -58,21 +58,13 @@ TLS 是无需析构的 const `Cell`，线程只有一个 Q=1 MiB 槽。切槽、
 
 使用方式见 [执行类型与构造责任](typed-execution-types.md)，长期裁决见 [ADR-0176](../../adr/ADR-0176-recursive-execution-types-and-independent-storage-ownership.md)。文档不代替实际 producer/consumer、原拒绝和最后引用退出的功能验证。
 
-## CI 依赖门
+## 依赖方向的 review
 
-`tools/ci/check-memory-dependency-boundary.py` 同时读取 Cargo resolved graph 和 declared dependency edges，后者包含默认 feature 未启用的 optional 边。检查三项能力约束：
+改动 manifest 时，review 同时检查声明边与传递 normal closure；声明边包括默认 feature 未启用的 optional 与 target-specific 依赖：
 
-- `novarocks-memory` 的 normal closure 和 normal 声明表均为空，包括 optional dependency。
-- 核心 dev closure 不含 `novarocks-*`、`arrow*` 或 `tokio`。从 dev 根边进入后继续检查 normal 传递闭包，包含 helper 的未启用 optional 边；中立测试工具可以进入 dev closure。
-- byte-oriented `novarocks-state-store-api` 的 resolved 与 declared normal closure 均不包含内存核心。
+- `novarocks-memory` 的 normal closure 和 normal 声明表保持为空。
+- 核心 dev closure 不引入 `novarocks-*`、`arrow*` 或 `tokio`，中立测试工具可以进入；从 dev 根边进入后继续审查 helper 的 normal 传递闭包及可选能力。
+- byte-oriented `novarocks-state-store-api` 的 normal 声明与传递闭包不包含内存核心。
+- build dependency 只取得构建宿主能力；不要将它与产品 normal 能力或 dev 隔离混为一谈。
 
-build dependency closure 单列报告，当前不作为上述 dev 门强制。图检查不能判断一个只用算术实现的策略是否属于核心，也不代替生命周期、并发和地址安全验证。
-
-检查遵循 [ADR-0058](../../adr/ADR-0058-crate-boundaries-enforce-isolation-not-source-shape-guards.md) 的能力边界原则，不添加旧符号缺席检查，不冻结源文件名称与目录形状。M02a 删除未使用的共享 Reservation 和 memory-arrow 谱系路径后，依赖门围绕当前核心与 StateStore 合同执行，不保留旧 adapter 可选规则。
-
-```bash
-python3 tools/ci/check-memory-dependency-boundary.py --manifest-path Cargo.toml
-tools/ci/tests/memory-dependency-boundary-test.sh
-```
-
-mutation 测试在临时工作区构造合法图及 direct/transitive/optional 违规图，覆盖 normal 零依赖、dev 能力隔离、StateStore 无内存依赖及 build-only 报告。夹具只引用本地 path package，且每次夹具检查强制 Cargo offline。两个入口继续由 `tools/ci/local-full-ci.sh` 的对应阶段执行。
+边界由 crate 结构与 review 维持，CI 不做依赖边界检查。图本身也不能判断一个只用算术实现的策略是否属于核心，更不能代替生命周期、并发和地址安全验证。依赖治理的职责与取舍见 [ADR-0190](../../adr/ADR-0190-dependency-direction-by-structure-and-review.md)；crate 隔离原则见 [ADR-0058](../../adr/ADR-0058-crate-boundaries-enforce-isolation-not-source-shape-guards.md)。

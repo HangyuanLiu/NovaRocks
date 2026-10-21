@@ -54,10 +54,9 @@ git -C "$fixture" add .
 assert_rejected
 git -C "$fixture" rm --quiet --force "sta""rust-path.txt"
 
-mkdir -p "$fixture/baselines" "$fixture/docs/workflow/archive"
-printf '%s\n' "sta""rust" >"$fixture/baselines/historical.txt"
+mkdir -p "$fixture/docs/workflow/archive"
 printf '%s\n' "sta""rust" >"$fixture/docs/workflow/archive/historical.md"
-git -C "$fixture" add baselines docs
+git -C "$fixture" add docs
 "$fixture/tools/ci/check-legacy-branding.sh" "$fixture" >/dev/null
 
 echo "legacy-branding-test: PASS"

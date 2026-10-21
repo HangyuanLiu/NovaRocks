@@ -20,7 +20,7 @@ sha2.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 
 # Test-only. The provider-contract target drives async trait methods; this
-# never reaches the production closure, which the boundary guard verifies.
+# stays outside the production closure, as maintained by crate structure and review.
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 

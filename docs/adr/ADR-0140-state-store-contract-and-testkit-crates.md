@@ -5,6 +5,7 @@ domain: [crate-boundary, provider-spi]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0190]
 date: 2026-09-09
 provenance:
   - "discussion: 2026-09-09 StateStore contract package independence and test-mechanics isolation"

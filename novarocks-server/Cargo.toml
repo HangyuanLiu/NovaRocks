@@ -26,7 +26,6 @@ native-compatibility-test-fixture = ["novarocks-server-application/native-compat
 [dev-dependencies]
 libc.workspace = true
 novarocks-failpoint.workspace = true
-mysql.workspace = true
 novarocks-test-support.workspace = true
 novarocks-server-application.workspace = true
 tempfile.workspace = true

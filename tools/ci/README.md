@@ -82,8 +82,8 @@ so ordinary examples do not select all ignored mechanics helpers.
 
 ## Formal execution
 
-`tools/ci/local-full-ci.sh --cargo-only` retains its existing governance gates
-and invokes `test-run.py batch`. The same wrapper can be invoked explicitly:
+`tools/ci/local-full-ci.sh --cargo-only` runs the dependency/lint stages described
+below and invokes `test-run.py batch`. The same wrapper can be invoked explicitly:
 
 ```bash
 python3 tools/ci/test-run.py batch --output /absolute/local/unique-attempt
@@ -337,9 +337,9 @@ their key includes OS/architecture, lockfiles and pinned tool versions, with an
 OS/architecture prefix fallback to reuse existing packages after dependency
 changes. Tools are installed under `$RUNNER_TEMP/admission-tools`, including
 their Cargo installation metadata. That cache requires an exact match for
-OS/architecture, runner image label, Rust toolchain configuration and both tool
-versions; restored tool versions are checked before use. The separate tool
-directory is added to PATH without caching rustup shims or credentials.
+OS/architecture, runner image label, Rust toolchain configuration and all three tool
+versions (cargo-deny, cargo-nextest and cargo-machete); restored tool versions
+are checked before use. The separate tool directory is added to PATH without caching rustup shims or credentials.
 
 The workflow explicitly saves successfully prepared tools immediately after
 version verification, then fetches locked workspace dependencies for the actual
@@ -361,6 +361,54 @@ CI stage. For focused validation:
 ```bash
 for test in tools/ci/tests/verification-*-test.py; do python3 "$test" || exit 1; done
 ```
+
+## Dependency and lint policy
+
+Dependency direction belongs to crate structure and review, following the
+[SPI](../../docs/guides/development/spi-boundary.md),
+[StateStore](../../docs/guides/development/state-store-boundary.md) and
+[Memory](../../docs/guides/development/memory-boundary.md) guides and
+[ADR-0190](../../docs/adr/ADR-0190-dependency-direction-by-structure-and-review.md). CI does not add dependency-boundary,
+source-shape or product-prerequisite checks.
+
+`Cargo dependency policy` runs cargo-deny for advisories, licenses, banned
+versions and sources under the root `deny.toml`. Versions remain owned by the
+root manifest and `Cargo.lock`. This supply-chain policy does not establish
+architectural direction, reject local path replacements or prove product
+compatibility; source requirements outside its coverage need review and
+behavioral evidence.
+
+The next two stages, in order, are `unused dependencies` and
+`unused dependencies tests`. They run in local full CI, admission and
+`pr-validation`. The first uses **cargo-machete 0.9.2** with `--with-metadata`,
+scanning only top-level directories containing root-workspace members derived
+from locked Cargo metadata. The virtual root and `vendor/` packages with
+independent workspaces/locks are excluded. The stage checks that `Cargo.lock`
+remains unchanged. Nonzero tool exits fail the stage. Any stderr line beginning
+`error when handling ` also fails it, because this version can return 0 after a
+manifest analysis error. The second stage tests the integration, including that
+partial-analysis case. Stage logs are `cargo-machete.log` and
+`cargo-machete-test.log`.
+
+Remove unused dependencies. For a genuine false positive, use the owning
+package's `[package.metadata.cargo-machete] ignored` with a TOML comment
+explaining the macro/generated-code use or required feature activation. Use
+`renamed` when the dependency and imported crate names differ. Do not remove a
+feature-activating dependency without checking feature resolution.
+
+Install the pinned local tool with:
+
+```bash
+cargo install cargo-machete --version 0.9.2 --locked
+```
+
+Global Clippy currently reports warnings without `-D warnings`.
+`novarocks-native-trust` separately denies `clippy::disallowed_methods` and
+`clippy::disallowed_types` at the crate root; its local `clippy.toml` forbids
+configuration-source/filesystem APIs and direct Tonic endpoint connections.
+Clippy reads the nearest `clippy.toml`; configurations do not merge. If a root
+configuration is added or changed, copy its entries into
+native-trust's configuration too, so the nearer file does not hide them.
 
 ## Focused verification
 

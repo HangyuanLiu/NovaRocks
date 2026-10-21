@@ -63,6 +63,57 @@ ci_main_cargo() {
   cargo "$command" --workspace --profile dev --locked --target-dir "$(ci_target_directory main)" "$@"
 }
 
+# Pinned cargo-machete can exit successfully after failing to analyze a
+# manifest. Preserve its diagnostics and reject incomplete analysis as well.
+ci_run_cargo_machete() {
+  local log code=0
+  log="$(mktemp)" || return 2
+  cargo machete --with-metadata "$@" 2>"$log" || code=$?
+  cat "$log" >&2
+  if grep -q '^error when handling ' "$log"; then
+    echo "error: cargo-machete could not analyze every manifest" >&2
+    code=2
+  elif [ "$code" -ne 0 ] && [ "$code" -ne 1 ]; then
+    code=2
+  fi
+  rm -f "$log"
+  return "$code"
+}
+
+ci_check_unused_dependencies() {
+  local metadata directories directory
+  local roots=()
+  metadata="$(cargo metadata --locked --no-deps --format-version 1)" || return 2
+  # Scan member-owned top-level directories, excluding vendor workspaces and
+  # the virtual root manifest. Keep paths intact even when they contain spaces.
+  directories="$(printf '%s\n' "$metadata" | python3 -c '
+import json, sys
+from pathlib import Path
+data = json.load(sys.stdin)
+root = Path(data["workspace_root"])
+members = set(data["workspace_members"])
+directories = set()
+for package in data["packages"]:
+    if package["id"] in members:
+        relative = Path(package["manifest_path"]).relative_to(root)
+        if len(relative.parts) < 2:
+            sys.exit("error: expected workspace members below top-level directories")
+        directories.add(str(root / relative.parts[0]))
+if not directories:
+    sys.exit("error: workspace has no members to analyze")
+print("\n".join(sorted(directories)))
+')" || return 2
+  while IFS= read -r directory; do
+    roots+=("$directory")
+  done <<<"$directories"
+  ci_run_cargo_machete "${roots[@]}" || return $?
+  # --with-metadata invokes all-features Cargo metadata internally.
+  git diff --quiet -- Cargo.lock || {
+    echo "error: cargo machete modified Cargo.lock" >&2
+    return 1
+  }
+}
+
 ci_prepare_main() {
   local receipt="$1" code=0
   ci_validate_build_inputs dev || return $?

@@ -50,12 +50,8 @@ test -n "$NOVAROCKS_MYSQL_IMAGE"
 cd "$WORKSPACE_ROOT"
 
 cargo fmt --all -- --check
-# The contract this provider implements, and the boundary that contract keeps.
-# Both left novarocks-spi, which is connector-only now, so gating a StateStore
-# provider on the connector SPI was checking a package it no longer touches.
+# Test the StateStore contract and shared provider test mechanics.
 cargo test -p novarocks-state-store-api -p novarocks-state-store-testkit
-"$SCRIPT_DIR/check-state-store-dependency-boundary.py" \
-  --manifest-path "$WORKSPACE_ROOT/Cargo.toml"
 cargo check -p novarocks-state-store-mysql --all-targets --all-features
 cargo test -p novarocks-state-store-mysql --lib --features state-store-test-hooks
 

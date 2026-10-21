@@ -56,12 +56,8 @@ test -x "$NOVA_FDB_FDBCLI"
 cd "$WORKSPACE_ROOT"
 
 cargo fmt --all -- --check
-# The contract this provider implements, and the boundary that contract keeps.
-# Both left novarocks-spi, which is connector-only now, so gating a StateStore
-# provider on the connector SPI was checking a package it no longer touches.
+# Test the StateStore contract and shared provider test mechanics.
 cargo test -p novarocks-state-store-api -p novarocks-state-store-testkit
-"$SCRIPT_DIR/check-state-store-dependency-boundary.py" \
-  --manifest-path "$WORKSPACE_ROOT/Cargo.toml"
 cargo check -p novarocks-state-store-foundationdb --all-targets
 cargo check -p novarocks-state-store-foundationdb --features foundationdb-provider,state-store-test-hooks --all-targets
 # The provider lifecycle tests live behind their own feature. Without this line

@@ -37,7 +37,7 @@ WORKFLOW = ".github/workflows/admission.yml"
 SHA = re.compile(r"[0-9a-f]{40}")
 
 
-# Design: ADR-0187 (docs/adr/ADR-0187-merge-queue-admission-and-current-attempt-evidence.md)
+# Design: ADR-0189 (docs/adr/ADR-0189-merge-queue-admission-and-current-attempt-evidence.md)
 def execution_context(environment):
     """Classify the caller, retaining only declared, non-secret run identity."""
     env = environment

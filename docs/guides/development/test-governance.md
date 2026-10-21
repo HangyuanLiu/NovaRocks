@@ -61,7 +61,7 @@ tools/ci/admission.sh --output /absolute/new/admission-attempt
 
 每次正式运行只消费当前尝试。GitHub artifact 包含入口输出和原生运行目录（包括隐藏诊断文件），名称带 run/attempt，配置保留 90 天；这一有限平台保留期不构成持久证据服务。维护者须在到期前为未解决失败和正式引用安排可恢复交接。复跑另建尝试，不能覆盖原失败。只有一位维护者时不要求自审，准入逻辑修改由入队者审阅 diff；只读令牌、无 secret 和每次全新的托管 runner 是执行边界。
 
-上线顺序是本地验证、经授权发布/合入、main 正式基线、经授权启用规则集、真实队列成功/失败/修复再入队验收。本地可发布检查点不等于门禁交付；未执行的正式基线、设置和队列验收继续记为 NOT_RUN。长期规则见 [ADR-0187](../../adr/ADR-0187-merge-queue-admission-and-current-attempt-evidence.md)。
+上线顺序是本地验证、经授权发布/合入、main 正式基线、经授权启用规则集、真实队列成功/失败/修复再入队验收。本地可发布检查点不等于门禁交付；未执行的正式基线、设置和队列验收继续记为 NOT_RUN。长期规则见 [ADR-0189](../../adr/ADR-0189-merge-queue-admission-and-current-attempt-evidence.md)。
 
 ## 影响声明、发现与开发入口
 
@@ -85,7 +85,7 @@ tools/ci/dev-verify.sh compose --base origin/main --root /absolute/local/task-ev
 
 新增测试、workload、采样/比较定义、SQL 指令或架构检查前，先确认现有覆盖为何不足、产品性质、资产性质和最低充分层级、独立预期，以及输入、隔离、真实退出、维护 owner、成本、消费链路和频率。答案靠近原生定义；简单测试可由函数、断言和模块说明承载，无需逐例表单。一次性探索只有明确长期消费者后才按同样条件晋升源码资产。
 
-SQL 文件保留必要的语义输入和断言，多步生命周期编排归 system owner；未知、非法或未实现指令不得静默成为无断言通过。现有指令拒绝行为由 TST-G13 迁移。架构规则保护依赖、类型与模块责任，优先复用声明式工具；存量检查由 TST-G14 收敛，不为本文添加源码 token、精确路径或任务编号门禁。
+SQL 文件保留必要的语义输入和断言，多步生命周期编排归 system owner；未知、非法或未实现指令不得静默成为无断言通过。现有指令拒绝行为由 TST-G13 迁移。依赖方向由 crate 结构与 review 维持，不新增依赖边界检查、源码形状守卫或产品前提检查。API 级约束使用所属 crate 的 Clippy `disallowed-*`，供应链使用 cargo-deny。产品前提优先由行为测试保护；没有行为测试时，在设计中写明它的定位与接受的代价。长期裁决见 [ADR-0190](../../adr/ADR-0190-dependency-direction-by-structure-and-review.md)。
 
 产品修复与治理场景可以成对迁移，但先接受唯一领域 spec；产品 plan 与治理 plan 引用同一设计，划分切片并反链完成情况。没有领域 spec 时先细化并接受，不在两个 plan 各造一套测试设计。M04b 成对迁移先接受 G3 spec，NIG-1 成对迁移先接受 G12 spec；这不要求先完成整个领域。消费未交付接口时记录具体实现硬前置，原有 MEM/M07 等产品验收继续生效。
 

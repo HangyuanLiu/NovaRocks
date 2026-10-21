@@ -37,6 +37,7 @@ jobs:
       NOVA_ADMISSION_RUNNER_LABEL: ubuntu-24.04
       NOVA_CI_CARGO_DENY_VERSION: "0.20.2"
       NOVA_CI_NEXTEST_VERSION: "0.9.148"
+      NOVA_CI_CARGO_MACHETE_VERSION: "0.9.2"
     steps: &admission_steps
       - name: Check out repository
         uses: actions/checkout@v4
@@ -57,7 +58,7 @@ jobs:
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-downloads-v1-${{ hashFiles('**/Cargo.lock') }}-deny-${{ env.NOVA_CI_CARGO_DENY_VERSION }}-nextest-${{ env.NOVA_CI_NEXTEST_VERSION }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-downloads-v1-${{ hashFiles('**/Cargo.lock') }}-deny-${{ env.NOVA_CI_CARGO_DENY_VERSION }}-nextest-${{ env.NOVA_CI_NEXTEST_VERSION }}-machete-${{ env.NOVA_CI_CARGO_MACHETE_VERSION }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-cargo-downloads-v1-
 
@@ -69,7 +70,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: &cargo_tool_path ${{ runner.temp }}/admission-tools
-          key: ${{ runner.os }}-${{ runner.arch }}-${{ env.NOVA_ADMISSION_RUNNER_LABEL }}-cargo-tools-v1-${{ hashFiles('rust-toolchain.toml') }}-deny-${{ env.NOVA_CI_CARGO_DENY_VERSION }}-nextest-${{ env.NOVA_CI_NEXTEST_VERSION }}
+          key: ${{ runner.os }}-${{ runner.arch }}-${{ env.NOVA_ADMISSION_RUNNER_LABEL }}-cargo-tools-v1-${{ hashFiles('rust-toolchain.toml') }}-deny-${{ env.NOVA_CI_CARGO_DENY_VERSION }}-nextest-${{ env.NOVA_CI_NEXTEST_VERSION }}-machete-${{ env.NOVA_CI_CARGO_MACHETE_VERSION }}
 
       - name: Install pinned cargo-deny
         if: steps.cargo_tools.outputs.cache-hit != 'true'
@@ -79,12 +80,19 @@ jobs:
         if: steps.cargo_tools.outputs.cache-hit != 'true'
         run: cargo install cargo-nextest --version "$NOVA_CI_NEXTEST_VERSION" --locked --root "$RUNNER_TEMP/admission-tools"
 
+      - name: Install pinned cargo-machete
+        if: steps.cargo_tools.outputs.cache-hit != 'true'
+        run: cargo install cargo-machete --version "$NOVA_CI_CARGO_MACHETE_VERSION" --locked --root "$RUNNER_TEMP/admission-tools"
+
       - name: Verify pinned Cargo tools
         run: |
           deny_version="$(cargo deny --version)"
           nextest_version="$(cargo nextest --version)"
           echo "$deny_version"
           echo "$nextest_version"
+          machete_version="$(cargo machete --version)"
+          echo "$machete_version"
+          [[ "$machete_version" == "$NOVA_CI_CARGO_MACHETE_VERSION" ]]
           [[ "$deny_version" == "cargo-deny $NOVA_CI_CARGO_DENY_VERSION" ]]
           [[ "$nextest_version" == "cargo-nextest $NOVA_CI_NEXTEST_VERSION" || "$nextest_version" == "cargo-nextest $NOVA_CI_NEXTEST_VERSION "* ]]
 
@@ -201,7 +209,6 @@ jobs:
           # These registered stages never consume a prepared artifact receipt.
           stages=(
             'cargo fmt'
-            'generated artifact hygiene'
             'legacy branding'
             'legacy branding tests'
           )

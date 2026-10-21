@@ -42,8 +42,6 @@ sha2.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 novarocks-fs.workspace = true
 novarocks-connector-contract.workspace = true
-novarocks-proto-codec.workspace = true
-novarocks-proto-models.workspace = true
 novarocks-spi.workspace = true
 novarocks-type-contract.workspace = true
 
@@ -59,3 +57,11 @@ protoc-bin-vendored.workspace = true
 [package.metadata.novarocks.test]
 runtime-inputs = []
 env-inputs = []
+
+[package.metadata.cargo-machete]
+ignored = [
+    # build.rs generates the private Paimon connector protobuf DTOs.
+    "prost-build",
+    # build.rs locates protoc for Paimon connector DTO generation.
+    "protoc-bin-vendored",
+]

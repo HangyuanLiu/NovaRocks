@@ -5,6 +5,7 @@ domain: [crate-boundary]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0190]
 partially-supersedes: [ADR-0150]
 date: 2026-10-09
 provenance:
