@@ -110,7 +110,7 @@ impl std::error::Error for ConstantNodeFailure {
     }
 }
 
-// Design: ADR-0189 (docs/adr/ADR-0189-frozen-fold-facts-and-shared-compiled-evaluation.md)
+// Design: ADR-0191 (docs/adr/ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md)
 pub fn evaluate_constant_node(
     node: ConstantNode<'_>,
     children: &[ConstantValue],

@@ -3451,7 +3451,7 @@ fn execute_update_match_query(
 /// target resolves through the ordinary admitted frozen-snapshot scan lane and
 /// cannot observe a later ref head. Other statement sources still resolve
 /// normally.
-// Design: ADR-0189 (docs/adr/ADR-0189-frozen-fold-facts-and-shared-compiled-evaluation.md)
+// Design: ADR-0191 (docs/adr/ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md)
 fn execute_exact_cow_match_query(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,

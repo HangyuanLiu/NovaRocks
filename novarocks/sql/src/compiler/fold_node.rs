@@ -26,7 +26,7 @@ use novarocks_type_contract::{
 };
 use std::sync::Arc;
 
-// Design: ADR-0189 (docs/adr/ADR-0189-frozen-fold-facts-and-shared-compiled-evaluation.md)
+// Design: ADR-0191 (docs/adr/ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md)
 #[derive(Clone, Debug)]
 pub enum FrozenFoldNode {
     Call(FrozenFoldCall),
