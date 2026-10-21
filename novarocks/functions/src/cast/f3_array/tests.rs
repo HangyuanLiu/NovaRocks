@@ -360,6 +360,116 @@ fn selected_scalar_array_families_keep_independent_values_under_every_policy() {
             Arc::new(LargeStringArray::from(vec![Some("12"), None])),
             Arc::new(Int32Array::from(vec![Some(12), None])),
         ),
+        // The i64 offset carrier keeps Arrow's own parser grammar. In
+        // particular, LargeUtf8 Boolean "2" is NULL and decimal blank is 0;
+        // neither is rewritten through the distinct Utf8 special rules.
+        (
+            Arc::new(LargeStringArray::from(vec![
+                Some("2147483647"),
+                Some("2147483648"),
+                Some("bad"),
+                None,
+            ])),
+            Arc::new(Int32Array::from(vec![Some(i32::MAX), None, None, None])),
+        ),
+        (
+            Arc::new(LargeStringArray::from(vec![
+                Some("1.25"),
+                Some("-0"),
+                Some("NaN"),
+                Some("inf"),
+                Some("-inf"),
+                Some("1e1000"),
+                Some("bad"),
+                None,
+            ])),
+            // 1.25 is binary-exact. The accepted ordinary-CAST text rule
+            // masks every parsed non-finite value; finite negative zero stays.
+            Arc::new(arrow_array::Float32Array::from(vec![
+                Some(1.25),
+                Some(-0.0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ])),
+        ),
+        (
+            Arc::new(LargeStringArray::from(vec![
+                Some("1.25"),
+                Some("-0"),
+                Some("NaN"),
+                Some("inf"),
+                Some("-inf"),
+                Some("1e1000"),
+                Some("bad"),
+                None,
+            ])),
+            Arc::new(arrow_array::Float64Array::from(vec![
+                Some(1.25),
+                Some(-0.0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ])),
+        ),
+        (
+            Arc::new(LargeStringArray::from(vec![
+                Some("1.25"),
+                Some("-1.25"),
+                Some(""),
+                Some("bad"),
+                Some("999.95"),
+                None,
+            ])),
+            // Half-away rounding gives +/-13. Rounding 999.95 to one
+            // decimal needs coefficient 10000, outside precision 4.
+            Arc::new(
+                Decimal128Array::from(vec![Some(13), Some(-13), Some(0), None, None, None])
+                    .with_precision_and_scale(4, 1)
+                    .unwrap(),
+            ),
+        ),
+        (
+            Arc::new(LargeStringArray::from(vec![
+                Some(" true "),
+                Some("off"),
+                Some("1"),
+                Some("2"),
+                Some(""),
+                None,
+            ])),
+            Arc::new(BooleanArray::from(vec![
+                Some(true),
+                Some(false),
+                Some(true),
+                None,
+                None,
+                None,
+            ])),
+        ),
+        (
+            Arc::new(LargeStringArray::from(vec![
+                Some("1970-01-02"),
+                Some("2024-02-29"),
+                Some("2023-02-29"),
+                Some("bad"),
+                None,
+            ])),
+            // Epoch-day arithmetic: 1970-01-02 is 1; 2024 leap-day is 19782.
+            Arc::new(arrow_array::Date32Array::from(vec![
+                Some(1),
+                Some(19_782),
+                None,
+                None,
+                None,
+            ])),
+        ),
         (
             Arc::new(StringArray::from(vec![Some("alpha"), None])),
             Arc::new(LargeStringArray::from(vec![Some("alpha"), None])),

@@ -376,6 +376,97 @@ fn decimal_calendar_reuses_numeric_calendar_grammar() {
             CastRowResult::Null,
         ],
     );
+
+    // Decimal coefficients are first truncated to compact numeric calendar
+    // literals. 1969-12-31 23:59:59 is -1 epoch second; leap-day
+    // 2024-02-29 12:34:56 is exactly 1_709_210_096 epoch seconds.
+    let decimal = Arc::new(
+        Decimal128Array::from(vec![Some(196912312359599), Some(202402291234569), None])
+            .with_precision_and_scale(18, 1)
+            .unwrap(),
+    ) as ArrayRef;
+    for (unit, before_epoch, leap_day) in [
+        (TimeUnit::Second, -1, 1_709_210_096),
+        (TimeUnit::Millisecond, -1_000, 1_709_210_096_000),
+        (TimeUnit::Microsecond, -1_000_000, 1_709_210_096_000_000),
+        (
+            TimeUnit::Nanosecond,
+            -1_000_000_000,
+            1_709_210_096_000_000_000,
+        ),
+    ] {
+        check(
+            decimal.clone(),
+            DataType::Timestamp(unit, None),
+            &[
+                CastRowResult::Timestamp(before_epoch),
+                CastRowResult::Timestamp(leap_day),
+                CastRowResult::Null,
+            ],
+        );
+    }
+    // Negative decimal scale multiplies the coefficient, rather than treating
+    // it as an epoch count. The literal ends in :00, exactly 56 seconds earlier.
+    check(
+        Arc::new(
+            Decimal128Array::from(vec![Some(202402291234), None])
+                .with_precision_and_scale(16, -2)
+                .unwrap(),
+        ),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        &[
+            CastRowResult::Timestamp(1_709_210_040_000_000),
+            CastRowResult::Null,
+        ],
+    );
+    let fixed =
+        crate::largeint::array_from_i128(&[Some(20200101), Some(i64::MAX as i128 + 1), None])
+            .unwrap();
+    check(
+        fixed,
+        DataType::Date32,
+        &[
+            CastRowResult::Signed(18_262),
+            CastRowResult::Null,
+            CastRowResult::Null,
+        ],
+    );
+    // Year 9999 is a valid numeric calendar date and fits epoch microseconds,
+    // but 253_402_300_799 seconds cannot fit an i64 nanosecond carrier.
+    let overflow_sources = [
+        Arc::new(
+            Decimal128Array::from(vec![Some(0), Some(99991231235959), None])
+                .with_precision_and_scale(18, 0)
+                .unwrap(),
+        ) as ArrayRef,
+        crate::largeint::array_from_i128(&[Some(0), Some(99991231235959), None]).unwrap(),
+    ];
+    for input in overflow_sources {
+        for (policy, allow) in modes() {
+            let r = recipe(
+                input.data_type().clone(),
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                policy,
+                allow,
+            );
+            let error = r
+                .evaluate_row(EvaluatedArgument::Column(&input), 0, 1, &Control)
+                .unwrap();
+            let CastRowResult::RowError(error) = error else {
+                panic!("valid out-of-range calendar must report its nanosecond row error")
+            };
+            assert_eq!(error.selected_ordinal(), 0);
+            assert_eq!(
+                error.message(),
+                "CAST failed: numeric datetime literal is out of nanosecond i64 range"
+            );
+            assert_eq!(
+                r.evaluate_row(EvaluatedArgument::Column(&input), 1, 2, &Control)
+                    .unwrap(),
+                CastRowResult::Null
+            );
+        }
+    }
 }
 
 // P05 qualification: exact target limits follow two's-complement integer
