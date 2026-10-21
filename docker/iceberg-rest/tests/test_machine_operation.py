@@ -460,13 +460,19 @@ class MachineOperationTests(unittest.TestCase):
         self.assertEqual(fact["phase"], "command-unknown")
         self.assertTrue(fact["timed_out"])
         self.assertTrue(fact["mutating"])
+        self.assertTrue(fact["command_dispatched"])
+        self.assertGreater(fact["cli_pid"], 0)
+        # The original deadline includes interpreter startup. A dispatched CLI
+        # may exit before its first event; neither outcome authorizes replay.
+        entered = sum(e["event"] == "control.entered" for e in self.events())
+        self.assertIn(entered, (0, 1))
         self.assertFalse(self.lock_held())
         owner = owner_for(self.root)
         with self.assertRaises(runtime.RuntimeFailure) as caught:
             owner.activate({})
         self.assertEqual(caught.exception.code, "MachineOperationUnconfirmed")
         self.assertEqual(self.control_fact()["phase"], "command-unknown")
-        self.assertEqual(sum(e["event"] == "control.entered" for e in self.events()), 1)
+        self.assertEqual(sum(e["event"] == "control.entered" for e in self.events()), entered)
         self.assertFalse((self.root / "control-side-effect").exists())
 
     def test_control_leader_stays_unreaped_until_plugin_actually_exits(self):
