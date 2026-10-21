@@ -2996,41 +2996,6 @@
   ],
   "quarantine": [
     {
-      "unit": "rust-test:novarocks-execution::exec::expr::e08s1_fold_environment_original_tests::e08s1_fold_environment_original_concat_missing_limit_still_reaches_child_fold",
-      "owner": "F3",
-      "review_by": "2026-12-15",
-      "reason": "D0-5(b), D0-10: this original evaluator/catalogue snapshot test is inside the independently approved F3 deletion or migration scope. Preserve its original assertions and raw first failure; D0 must not edit the old oracle.",
-      "exit_condition": "F3 deletes or migrates this exact original test and its successor assertions described in the F3 spec section 5.9 are reviewed; remove this quarantine when F3 is integrated."
-    },
-    {
-      "unit": "rust-test:novarocks-execution::exec::expr::e08s1_fold_environment_original_tests::e08s1_fold_environment_original_unixtime_absent_zone_still_reaches_child_fold",
-      "owner": "F3",
-      "review_by": "2026-12-15",
-      "reason": "D0-5(b), D0-10: this original evaluator/catalogue snapshot test is inside the independently approved F3 deletion or migration scope. Preserve its original assertions and raw first failure; D0 must not edit the old oracle.",
-      "exit_condition": "F3 deletes or migrates this exact original test and its successor assertions described in the F3 spec section 5.9 are reviewed; remove this quarantine when F3 is integrated."
-    },
-    {
-      "unit": "rust-test:novarocks-execution::exec::expr::e08s1_mv_original_catalogue_tests::e08s1_mv_original_first_refresh_generated_bindings_retain_scoped_catalogue",
-      "owner": "F3",
-      "review_by": "2026-12-15",
-      "reason": "D0-5(b), D0-10: this original evaluator/catalogue snapshot test is inside the independently approved F3 deletion or migration scope. Preserve its original assertions and raw first failure; D0 must not edit the old oracle.",
-      "exit_condition": "F3 deletes or migrates this exact original test and its successor assertions described in the F3 spec section 5.9 are reviewed; remove this quarantine when F3 is integrated."
-    },
-    {
-      "unit": "rust-test:novarocks-execution::exec::expr::e08s1_mv_original_catalogue_tests::e08s1_mv_original_incremental_refresh_generated_bindings_retain_scoped_catalogue",
-      "owner": "F3",
-      "review_by": "2026-12-15",
-      "reason": "D0-5(b), D0-10: this original evaluator/catalogue snapshot test is inside the independently approved F3 deletion or migration scope. Preserve its original assertions and raw first failure; D0 must not edit the old oracle.",
-      "exit_condition": "F3 deletes or migrates this exact original test and its successor assertions described in the F3 spec section 5.9 are reviewed; remove this quarantine when F3 is integrated."
-    },
-    {
-      "unit": "rust-test:novarocks-execution::exec::expr::percentile_hash_original_sql_source_tests::percentile_hash_original_live_variadic_source_and_ignored_volatile_tail",
-      "owner": "F3",
-      "review_by": "2026-12-15",
-      "reason": "D0-5(b), D0-10: this original evaluator/catalogue snapshot test is inside the independently approved F3 deletion or migration scope. Preserve its original assertions and raw first failure; D0 must not edit the old oracle.",
-      "exit_condition": "F3 deletes or migrates this exact original test and its successor assertions described in the F3 spec section 5.9 are reviewed; remove this quarantine when F3 is integrated."
-    },
-    {
       "unit": "rust-test:novarocks-frontend-application::dml::insert::shaping::tests::literal_target_casts_keep_original_bitmap_and_hll_declarations",
       "owner": "B7",
       "review_by": "2026-12-15",
