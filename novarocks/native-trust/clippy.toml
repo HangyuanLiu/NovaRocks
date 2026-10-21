@@ -35,6 +35,7 @@ disallowed-methods = [
   { path = "std::fs::copy", reason = "native trust owns no filesystem input or output" },
   { path = "std::fs::create_dir", reason = "native trust owns no filesystem input or output" },
   { path = "std::fs::create_dir_all", reason = "native trust owns no filesystem input or output" },
+  { path = "std::fs::DirBuilder::create", reason = "native trust owns no filesystem input or output" },
   { path = "std::fs::exists", reason = "native trust owns no filesystem input or output" },
   { path = "std::fs::hard_link", reason = "native trust owns no filesystem input or output" },
   { path = "std::fs::metadata", reason = "native trust owns no filesystem input or output" },
@@ -54,6 +55,7 @@ disallowed-methods = [
   { path = "tokio::fs::copy", reason = "native trust owns no filesystem input or output", allow-invalid = true },
   { path = "tokio::fs::create_dir", reason = "native trust owns no filesystem input or output", allow-invalid = true },
   { path = "tokio::fs::create_dir_all", reason = "native trust owns no filesystem input or output", allow-invalid = true },
+  { path = "tokio::fs::DirBuilder::create", reason = "native trust owns no filesystem input or output", allow-invalid = true },
   { path = "tokio::fs::hard_link", reason = "native trust owns no filesystem input or output", allow-invalid = true },
   { path = "tokio::fs::metadata", reason = "native trust owns no filesystem input or output", allow-invalid = true },
   { path = "tokio::fs::read", reason = "native trust owns no filesystem input or output", allow-invalid = true },
@@ -77,8 +79,10 @@ disallowed-methods = [
 ]
 
 disallowed-types = [
+  { path = "std::fs::DirBuilder", reason = "native trust owns no filesystem input or output" },
   { path = "std::fs::File", reason = "native trust owns no filesystem input or output" },
   { path = "std::fs::OpenOptions", reason = "native trust owns no filesystem input or output" },
+  { path = "tokio::fs::DirBuilder", reason = "native trust owns no filesystem input or output", allow-invalid = true },
   { path = "tokio::fs::File", reason = "native trust owns no filesystem input or output", allow-invalid = true },
   { path = "tokio::fs::OpenOptions", reason = "native trust owns no filesystem input or output", allow-invalid = true },
 ]
