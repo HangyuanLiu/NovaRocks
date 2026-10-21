@@ -63,12 +63,48 @@ pub(crate) fn resource(run: &str, kind: char, index: usize, slot: usize) -> Resu
     );
     Ok(result)
 }
-pub(crate) fn namespace_declarations(source: &str) -> Result<BTreeSet<String>> {
-    // Only explicit, line-start SQL DDL declares namespace write ownership.
+fn sql_namespace_declarations(source: &str) -> Result<BTreeSet<String>> {
+    // Only explicit, line-start SQL DDL declares SQL namespace write ownership.
     let re = Regex::new(
         r"(?im)^\s*CREATE\s+DATABASE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:`?[A-Za-z0-9_$\{\}]+`?\s*\.\s*)?`?([A-Za-z0-9_$\{\}]+)`?\s*;",
     )?;
     Ok(re.captures_iter(source).map(|c| c[1].to_string()).collect())
+}
+// Recognize only the existing versioned Variant producer command, not generic
+// shell --namespace arguments, command substitutions or lookalike executables.
+fn variant_producer_command() -> Result<Regex> {
+    Ok(Regex::new(
+        r#"^\s*"\$\{NOVAROCKS_WORKSPACE_ROOT:-\.\}/tests/sql/fixtures/iceberg-variant/run\.sh"\s+--mode\s+(unshredded|shredded|bounds|nested|uuid|write-target|empty-int|empty-bigint|empty-region|observe|unchanged)\s+--namespace\s+([A-Za-z0-9_${}]+)\s+--table\s+[A-Za-z0-9_]+\s+--output\s+"\$receipt_dir"(?:\s+>"\$receipt_dir/run\.log")?\s*$"#,
+    )?)
+}
+fn shell_line<'a>(line: &'a str, shell: &mut bool) -> Option<&'a str> {
+    let trimmed = line.trim_start();
+    if trimmed.to_ascii_lowercase().starts_with("-- query ") {
+        *shell = false;
+    }
+    if let Some(command) = trimmed.strip_prefix("shell:") {
+        *shell = true;
+        Some(command)
+    } else if *shell {
+        Some(line)
+    } else {
+        None
+    }
+}
+pub(crate) fn namespace_declarations(source: &str) -> Result<BTreeSet<String>> {
+    let mut declared = sql_namespace_declarations(source)?;
+    let producer = variant_producer_command()?;
+    let mut shell = false;
+    for line in source.lines() {
+        if let Some(command) = shell_line(line, &mut shell) {
+            if let Some(capture) = producer.captures(command) {
+                if !matches!(&capture[1], "observe" | "unchanged") {
+                    declared.insert(capture[2].to_string());
+                }
+            }
+        }
+    }
+    Ok(declared)
 }
 impl RunNames {
     pub fn prepare(
@@ -308,6 +344,13 @@ pub(crate) fn rewrite_namespaces(
     if mapping.is_empty() {
         return Ok(source.to_string());
     }
+    let sql_declared = sql_namespace_declarations(source)?;
+    let sql_mapping = mapping
+        .iter()
+        .filter(|(name, _)| sql_declared.contains(*name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let producer = variant_producer_command()?;
     let mut result = String::new();
     let mut sql = String::new();
     let mut shell = false;
@@ -322,7 +365,27 @@ pub(crate) fn rewrite_namespaces(
         if shell || trimmed.starts_with("-- @") {
             result.push_str(&rewrite_sql_identifiers(&sql, &mapping));
             sql.clear();
-            result.push_str(&replace_references(line, &mapping));
+            if trimmed.starts_with("-- @") {
+                result.push_str(&replace_references(line, &mapping));
+            } else {
+                // Producer-only ownership changes its namespace argument, never
+                // unrelated shell values or arbitrary commands in the block.
+                let mut rewritten = replace_references(line, &sql_mapping);
+                let command = rewritten
+                    .trim_start()
+                    .strip_prefix("shell:")
+                    .unwrap_or(&rewritten);
+                if let Some(capture) = producer.captures(command) {
+                    if let Some(name) = mapping.get(&capture[2]) {
+                        let argument = capture.get(2).unwrap();
+                        let offset = rewritten.len() - command.len();
+                        let range = offset + argument.start()..offset + argument.end();
+                        let name = name.clone();
+                        rewritten.replace_range(range, &name);
+                    }
+                }
+                result.push_str(&rewritten);
+            }
         } else {
             sql.push_str(line);
         }
@@ -734,6 +797,121 @@ print(json.dumps({'complete':True,'pending':False,'errors':[],'removed':[]}))
         assert!(rewritten.contains(&format!("CREATE EXTERNAL CATALOG {old}")));
         assert!(rewritten.contains(&format!("-- @db={db}")));
         assert!(rewritten.contains(&format!("--namespace {db}")));
+    }
+    fn variant_command(mode: &str, namespace: &str, table: &str) -> String {
+        format!(
+            r#""${{NOVAROCKS_WORKSPACE_ROOT:-.}}/tests/sql/fixtures/iceberg-variant/run.sh" --mode {mode} --namespace {namespace} --table {table} --output "$receipt_dir" >"$receipt_dir/run.log""#
+        )
+    }
+    #[test]
+    fn only_exact_variant_writer_invocations_declare_shell_namespace_ownership() {
+        let writer = variant_command("empty-int", "iru9_${uuid0}", "target");
+        assert_eq!(
+            namespace_declarations(&format!("-- query 1\nshell: set -eu\n{writer}\n")).unwrap(),
+            BTreeSet::from(["iru9_${uuid0}".into()])
+        );
+        for unowned in [
+            writer.clone(),
+            format!("shell: echo {writer}\n"),
+            format!("shell: {writer} && other-command\n"),
+            format!(
+                "shell: {}\n",
+                writer.replace("iceberg-variant/", "other-producer/")
+            ),
+            format!(
+                "shell: {}\n",
+                writer.replace("--mode empty-int", "--mode unknown")
+            ),
+            format!(
+                "shell: {}\n",
+                variant_command("observe", "old_namespace", "target")
+            ),
+            format!(
+                "shell: {}\n",
+                variant_command("unchanged", "old_namespace", "target")
+            ),
+            format!("shell: set -eu\n-- query 2\n{writer}\n"),
+        ] {
+            assert!(
+                namespace_declarations(&unowned).unwrap().is_empty(),
+                "{unowned}"
+            );
+        }
+    }
+    #[test]
+    fn variant_writer_and_readonly_arguments_share_mapping_without_changing_other_shell_values() {
+        let vars =
+            crate::config::case_placeholder_variables(&test_variables(&["case"]), "case").unwrap();
+        let source = format!(
+            "-- query 1\nshell: set -eu\n{}\n{}\n{}\necho original_namespace\nother-producer --namespace original_namespace\n-- query 2\nSELECT * FROM catalog.original_namespace.target;\nSELECT 'original_namespace' AS value;\n",
+            variant_command("empty-int", "original_namespace", "target"),
+            variant_command("observe", "original_namespace", "target"),
+            variant_command("unchanged", "original_namespace", "target"),
+        );
+        let mapping = namespace_mapping(&source, &vars).unwrap();
+        let expected = resource(&vars["run_id"], 'd', 0, 1).unwrap();
+        assert_eq!(
+            mapping,
+            BTreeMap::from([("original_namespace".into(), expected.clone())])
+        );
+        let rewritten = rewrite_namespaces(&source, &vars).unwrap();
+        for mode in ["empty-int", "observe", "unchanged"] {
+            assert!(rewritten.contains(&variant_command(mode, &expected, "target")));
+        }
+        assert!(rewritten.contains(&format!("catalog.{expected}.target")));
+        assert!(rewritten.contains("SELECT 'original_namespace' AS value"));
+        assert!(rewritten.contains("echo original_namespace"));
+        assert!(rewritten.contains("other-producer --namespace original_namespace"));
+    }
+    #[test]
+    fn independent_variant_namespaces_receive_distinct_bounded_slots() {
+        let vars =
+            crate::config::case_placeholder_variables(&test_variables(&["case"]), "case").unwrap();
+        let source = format!(
+            "shell: set -eu\n{}\n{}\n",
+            variant_command("empty-int", "first", "t"),
+            variant_command("empty-bigint", "second", "t")
+        );
+        let map = namespace_mapping(&source, &vars).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_ne!(map["first"], map["second"]);
+        assert!(
+            map.values()
+                .all(|name| name.starts_with(&format!("{}_", vars["run_id"])) && name.len() <= 63)
+        );
+    }
+    #[test]
+    fn existing_variant_dml_cases_bind_the_original_producer_namespace_before_writes() {
+        for (case, source) in [
+            (
+                "variant_get",
+                include_str!("../../../correctness/iceberg-dml/sql/variant_get.sql"),
+            ),
+            (
+                "variant_insert",
+                include_str!("../../../correctness/iceberg-dml/sql/variant_insert.sql"),
+            ),
+            (
+                "variant_mutations",
+                include_str!("../../../correctness/iceberg-dml/sql/variant_mutations.sql"),
+            ),
+        ] {
+            assert_eq!(
+                namespace_declarations(source).unwrap(),
+                BTreeSet::from(["iru9_${uuid0}".into()])
+            );
+            let vars =
+                crate::config::case_placeholder_variables(&test_variables(&[case]), case).unwrap();
+            let rendered = render_expected(source, &vars);
+            let old = format!("iru9_{}", vars["uuid0"]);
+            let map = namespace_mapping(&rendered, &vars).unwrap();
+            let expected = &map[&old];
+            assert!(expected.starts_with(&format!("{}_", vars["run_id"])) && expected.len() <= 63);
+            let rewritten = rewrite_namespaces(&rendered, &vars).unwrap();
+            assert!(rewritten.contains(&format!("--namespace {expected} --table")));
+            assert!(!rewritten.contains(&format!("--namespace {old} --table")));
+            assert!(rewritten.contains(&format!(".{expected}.")));
+        }
     }
     #[test]
     fn branch_qualified_tables_share_namespace_mapping_without_changing_literals() {

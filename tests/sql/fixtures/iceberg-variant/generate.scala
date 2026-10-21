@@ -44,11 +44,13 @@ object VariantFixture {
   }
   def load(): Table = Spark3Util.loadIcebergCatalog(spark,"ice_rest").loadTable(TableIdentifier.of(namespace,tableName))
   def create(schema: Schema, spec: PartitionSpec = PartitionSpec.unpartitioned(), properties: Map[String,String] = Map.empty): Table = {
+    val location = spark.conf.getOption("spark.novarocks.fixture.scopeRoot")
+      .map(root => s"$root/rest/$namespace/$tableName")
     val table = Spark3Util.loadIcebergCatalog(spark,"ice_rest").createTable(
-      TableIdentifier.of(namespace,tableName),schema,spec,
+      TableIdentifier.of(namespace,tableName),schema,spec,location.orNull,
       (Map("format-version"->"3","write.metadata.metrics.default"->"full") ++ properties).asJava)
-    require(spark.conf.getOption("spark.novarocks.fixture.scopeRoot").forall(root => table.location().startsWith(root + "/")),
-      "actual REST table location is outside the original run scratch root")
+    require(location.forall(expected => table.location() == expected),
+      "actual REST table location differs from the original run namespace table location")
     table
   }
   def row(schema: Schema, values: Seq[Any]): Record = {
