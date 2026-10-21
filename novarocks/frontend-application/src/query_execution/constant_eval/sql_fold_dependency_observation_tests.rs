@@ -683,3 +683,49 @@ mod sql_call_dependency_loan_tests;
 
 #[path = "ds_hll_state_fold_source_tests.rs"]
 mod ds_hll_state_fold_source_tests;
+
+#[test]
+fn native_decimal_array_and_temporal_literal_compile_sources_remain_valid() {
+    use arrow::datatypes::{DataType, Field};
+    let decimal_items = DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::Decimal128(3, 2),
+        true,
+    )));
+    let double_items = DataType::List(Arc::new(Field::new("item", DataType::Float64, true)));
+    for (sql, expected) in [
+        // One integer digit and two fractional digits require DECIMAL(3,2).
+        ("SELECT [0.0,0.25,0.5,1.0]", decimal_items),
+        (
+            "SELECT percentile_approx_weighted(2.0,1,[0.0,0.25,0.5,1.0],2048)",
+            double_items.clone(),
+        ),
+        (
+            "SELECT d = '2020-01-01' FROM (SELECT CAST('2020-01-01' AS DATE) AS d) t",
+            DataType::Boolean,
+        ),
+        (
+            "SELECT ABS(CAST(99999999.9949 AS DECIMAL(13,4))) > 99999999.9999",
+            DataType::Boolean,
+        ),
+        // An explicit DOUBLE item declaration remains distinct from inference.
+        ("SELECT ARRAY<DOUBLE>[0.0,0.25,0.5,1.0]", double_items),
+    ] {
+        let owner = compile_typed(sql, super::constant_evaluator(), None)
+            .unwrap_or_else(|error| panic!("real FE literal completion for {sql}: {error:#?}"));
+        let result = owner.plan().result_port().expect("public query result");
+        assert_eq!(result.fields.len(), 1, "{sql}");
+        assert_eq!(result.fields[0].ty.data_type(), &expected, "{sql}");
+        assert_eq!(
+            result.fields[0].ty.logical_type(),
+            novarocks_type_contract::ValueLogicalType::Physical,
+            "{sql}",
+        );
+        novarocks_sql::compiler::author_fragment_package_semantics(
+            &owner,
+            policy(),
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap_or_else(|error| panic!("real literal package semantics for {sql}: {error:#?}"));
+    }
+}

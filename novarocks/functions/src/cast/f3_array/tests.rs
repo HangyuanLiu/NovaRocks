@@ -1719,3 +1719,86 @@ fn p05_decimal_safe_table_miss_retains_static_typed_refusal() {
         }
     }
 }
+
+#[test]
+fn utf8_offset_widening_preserves_exact_successful_null_obligation() {
+    for (policy, allow) in p05_modes() {
+        assert!(!carrier_cast_can_produce_null_with_policy(
+            &DataType::Utf8,
+            &DataType::LargeUtf8,
+            policy,
+            allow,
+        ));
+        for source_nullable in [false, true] {
+            for result_nullable in [false, true] {
+                let prepared = PreparedCastRecipe::try_new(
+                    CastOperation::Carrier,
+                    &FunctionValueType::new(DataType::Utf8, source_nullable),
+                    &FunctionValueType::new(DataType::LargeUtf8, result_nullable),
+                    policy,
+                    allow,
+                    &Control,
+                );
+                if source_nullable && !result_nullable {
+                    assert_eq!(prepared, Err(CastPrepareError::TypeMismatch));
+                    continue;
+                }
+                let r = prepared.unwrap();
+                let input: ArrayRef = Arc::new(StringArray::from(vec![
+                    Some("alpha"),
+                    if source_nullable { None } else { Some("") },
+                    Some("尾"),
+                ]));
+                let rows = [0, 2];
+                for selection in [
+                    Selection::all(3),
+                    Selection::try_sparse(3, &rows).unwrap(),
+                    Selection::try_sparse(3, &[]).unwrap(),
+                ] {
+                    let out = output(&r, &input, selection);
+                    assert!(out.errors().is_empty());
+                    let values = out
+                        .values()
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .unwrap();
+                    assert_eq!(values.len(), selection.len());
+                    for (ordinal, row) in selection.iter().enumerate() {
+                        if row == 1 && source_nullable {
+                            assert!(values.is_null(ordinal));
+                        } else {
+                            assert!(!values.is_null(ordinal));
+                            assert_eq!(values.value(ordinal), ["alpha", "", "尾"][row]);
+                        }
+                    }
+                }
+            }
+        }
+        // The narrow fact never admits another body or weakens NULL sources.
+        assert!(carrier_cast_can_produce_null_with_policy(
+            &DataType::Binary,
+            &DataType::Utf8,
+            policy,
+            allow,
+        ));
+        let r = PreparedCastRecipe::try_new(
+            CastOperation::Carrier,
+            &FunctionValueType::new(DataType::Utf8, false),
+            &FunctionValueType::new(DataType::LargeUtf8, false),
+            policy,
+            allow,
+            &Control,
+        )
+        .unwrap();
+        let invalid: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>]));
+        assert!(matches!(
+            r.evaluate_selected_array(
+                EvaluatedArgument::Column(&invalid),
+                Selection::all(1),
+                &[],
+                &Control
+            ),
+            Err(KernelFailure::InvalidProgram(_))
+        ));
+    }
+}

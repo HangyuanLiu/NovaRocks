@@ -10014,7 +10014,14 @@ impl<'a> ContractLoweringVisitor<'a> {
                 ContractLoweringError::Control(cause)
             }
             other => ContractLoweringError::InvalidFunctionBinding {
-                detail: format!("{other} (value conversion source={source:?}, target={target:?})"),
+                detail: format!(
+                    "{other} (assignment fragment={:?}, owner={owner:?}, expression={expression:?}, source-domain={:?}, target-domain={:?}, source-carrier={:?}, target-carrier={:?}; source={source:?}, target={target:?})",
+                    self.current_fragment,
+                    source.logical_type(),
+                    target.logical_type(),
+                    source.data_type(),
+                    target.data_type(),
+                ),
             },
         })?;
         use crate::compiler::selected_scalar_call::PlannedConversion;

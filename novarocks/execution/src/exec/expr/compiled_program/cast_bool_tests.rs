@@ -572,3 +572,99 @@ fn actual_compiled_bool_cast_compile_and_runtime_failures_keep_every_original_pr
         }
     }
 }
+
+// The signed 128-bit representation contract defines these bytes independently
+// of CAST. A checked package and the actual identity controller must preserve
+// both extrema, NULLs, selection order, and the nominal type.
+#[test]
+fn actual_compiled_largeint_identity_preserves_extreme_bytes_nulls_and_full_metadata() {
+    for (source_null, result_null) in [(false, false), (false, true), (true, true)] {
+        for policy in [
+            DecimalOverflowPolicy::OutputNull,
+            DecimalOverflowPolicy::ReportError,
+        ] {
+            for allow in [false, true] {
+                for mode in [Source::Column, Source::Constant] {
+                    let source = FunctionValueType::try_with_logical_type(
+                        DataType::FixedSizeBinary(16),
+                        source_null,
+                        ValueLogicalType::LargeInt,
+                    )
+                    .unwrap();
+                    let result = source.with_nullable(result_null).unwrap();
+                    let program = compiled(
+                        source.clone(),
+                        result.clone(),
+                        mode,
+                        Wrap::Bare,
+                        policy,
+                        allow,
+                    );
+                    let recipe = program.cast_recipe(root_context(&program).0).unwrap();
+                    assert!(recipe.is_identity());
+                    assert_eq!(recipe.source_type(), &source);
+                    assert_eq!(recipe.result_type(), &result);
+                    let field = recipe.result_type().try_to_field("result").unwrap();
+                    assert_eq!(
+                        field
+                            .metadata()
+                            .get(novarocks_type_contract::NR_LOGICAL_TYPE_KEY)
+                            .map(String::as_str),
+                        Some("largeint")
+                    );
+                    assert_eq!(field.is_nullable(), result_null);
+                    let inputs = [
+                        Some(i128::MIN),
+                        Some(i128::MAX),
+                        Some(-1),
+                        Some(0),
+                        if source_null { None } else { Some(1) },
+                    ];
+                    let padded = std::iter::once(Some(17_i128))
+                        .chain(inputs)
+                        .chain(std::iter::once(Some(23_i128)))
+                        .map(|value| value.map(i128::to_be_bytes));
+                    let array: ArrayRef = Arc::new(
+                        arrow::array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                            padded, 16,
+                        )
+                        .unwrap(),
+                    );
+                    let batch = batch_with_source(&program, array.slice(1, 5), None);
+                    let all = [0, 1, 2, 3, 4];
+                    let sparse = [0, 1, 4];
+                    let empty = [];
+                    for rows in [&all[..], &sparse[..], &empty[..]] {
+                        let selection = if rows.len() == 5 {
+                            Selection::all(5)
+                        } else {
+                            Selection::try_sparse(5, rows).unwrap()
+                        };
+                        let output = instance(&program)
+                            .evaluate(&batch, selection, &Control)
+                            .unwrap();
+                        let actual = output
+                            .values()
+                            .as_any()
+                            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+                            .unwrap();
+                        assert_eq!(actual.data_type(), &DataType::FixedSizeBinary(16));
+                        assert!(output.errors().is_empty());
+                        assert_eq!(actual.len(), rows.len());
+                        for (out_row, &source_row) in rows.iter().enumerate() {
+                            let expected = if matches!(mode, Source::Constant) {
+                                Some(i128::MIN)
+                            } else {
+                                inputs[source_row]
+                            };
+                            assert_eq!(actual.is_null(out_row), expected.is_none());
+                            if let Some(value) = expected {
+                                assert_eq!(actual.value(out_row), value.to_be_bytes().as_slice());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

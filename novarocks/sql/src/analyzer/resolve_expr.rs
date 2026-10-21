@@ -539,21 +539,13 @@ impl<'a> super::AnalyzerContext<'a> {
                     common_type = wider_comparison_value_type(&common_type, &item.value_type)
                         .map_err(|error| AnalyzeError::type_mismatch_source(error, in_list.span))?;
                 }
-                let nullable = expr_typed.value_type.nullable();
-                expr_typed = self.cast_to_value_type(
-                    expr_typed,
-                    super::helpers::with_nullability(common_type.clone(), nullable),
-                    in_list.span,
-                )?;
+                let target = self.implicit_common_cast_target(&expr_typed.value_type, &common_type);
+                expr_typed = self.cast_to_value_type(expr_typed, target, in_list.span)?;
                 let mut coerced_list = Vec::with_capacity(list_typed.len());
                 for item in list_typed {
                     self.check_control()?;
-                    let nullable = item.value_type.nullable();
-                    coerced_list.push(self.cast_to_value_type(
-                        item,
-                        super::helpers::with_nullability(common_type.clone(), nullable),
-                        in_list.span,
-                    )?);
+                    let target = self.implicit_common_cast_target(&item.value_type, &common_type);
+                    coerced_list.push(self.cast_to_value_type(item, target, in_list.span)?);
                 }
                 let list_typed = coerced_list;
                 // Three-valued: `NULL IN (1, 2)` and `1 IN (NULL, 2)` are both
@@ -613,12 +605,9 @@ impl<'a> super::AnalyzerContext<'a> {
                         })
                         .map_err(|error| AnalyzeError::type_mismatch_source(error, between.span))?;
                 let cast = |operand: TypedExpr| {
-                    let nullable = operand.value_type.nullable();
-                    self.cast_to_value_type(
-                        operand,
-                        super::helpers::with_nullability(common_type.clone(), nullable),
-                        between.span,
-                    )
+                    let target =
+                        self.implicit_common_cast_target(&operand.value_type, &common_type);
+                    self.cast_to_value_type(operand, target, between.span)
                 };
                 let expr_typed = cast(expr_typed)?;
                 let low_typed = cast(low_typed)?;
@@ -958,16 +947,10 @@ impl<'a> super::AnalyzerContext<'a> {
                         if !novarocks_functions::builtin::map_lookup_core::has_uninhabited_map_key(
                             &base.value_type,
                         ) {
-                            let nullable = index_typed.value_type.nullable()
-                                || novarocks_functions::signed_integer_cast_can_produce_null(
-                                    index_typed.value_type.data_type(),
-                                    key.data_type(),
-                                );
-                            index_typed = self.cast_to_value_type(
-                                index_typed,
-                                super::helpers::with_nullability(key, nullable),
-                                index.span(),
-                            )?;
+                            let target =
+                                self.implicit_common_cast_target(&index_typed.value_type, &key);
+                            index_typed =
+                                self.cast_to_value_type(index_typed, target, index.span())?;
                         }
                         fields[1].data_type().clone()
                     }
@@ -1577,6 +1560,31 @@ impl<'a> super::AnalyzerContext<'a> {
         Ok(analyzed.pop().expect("a binary boolean chain has operands"))
     }
 
+    /// Common-type coercion is an implicit CAST, not an exact output
+    /// declaration. Freeze its NULL upper bound from the real cast owner
+    /// before optional folding can consume the declaration.
+    fn implicit_common_cast_target(
+        &self,
+        source: &novarocks_type_contract::FunctionValueType,
+        common: &novarocks_type_contract::FunctionValueType,
+    ) -> novarocks_type_contract::FunctionValueType {
+        let target = super::helpers::with_nullability(common.clone(), source.nullable());
+        if source == &target {
+            return target;
+        }
+        let mode = self.sql_semantics.sql_mode();
+        let nullable = source.nullable()
+            || (source.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+                && target.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+                && novarocks_functions::carrier_cast_can_produce_null_with_policy(
+                    source.data_type(),
+                    target.data_type(),
+                    mode.decimal_overflow_policy(),
+                    mode.allow_throw_exception(),
+                ));
+        super::helpers::with_nullability(target, nullable)
+    }
+
     fn analyze_binary_op(
         &self,
         left: &ast::Expr,
@@ -1705,19 +1713,13 @@ impl<'a> super::AnalyzerContext<'a> {
                 .map_err(|message| AnalyzeError::type_mismatch_source(message, left.span()))?
                 {
                     Some(common) => {
-                        let left_nullable = left_coerced.value_type.nullable();
-                        let right_nullable = right_coerced.value_type.nullable();
+                        let left_target =
+                            self.implicit_common_cast_target(&left_coerced.value_type, &common);
+                        let right_target =
+                            self.implicit_common_cast_target(&right_coerced.value_type, &common);
                         (
-                            self.cast_to_value_type(
-                                left_coerced,
-                                super::helpers::with_nullability(common.clone(), left_nullable),
-                                left.span(),
-                            )?,
-                            self.cast_to_value_type(
-                                right_coerced,
-                                super::helpers::with_nullability(common, right_nullable),
-                                right.span(),
-                            )?,
+                            self.cast_to_value_type(left_coerced, left_target, left.span())?,
+                            self.cast_to_value_type(right_coerced, right_target, right.span())?,
                         )
                     }
                     None => (left_coerced, right_coerced),
@@ -1990,24 +1992,13 @@ impl<'a> super::AnalyzerContext<'a> {
                 common = wider_comparison_value_type(&common, &label.value_type)
                     .map_err(|error| AnalyzeError::type_mismatch_source(error, span))?;
             }
-            let nullable = value.value_type.nullable();
-            operand_typed = Some(Box::new(self.cast_to_value_type(
-                *value,
-                super::helpers::with_nullability(common.clone(), nullable),
-                span,
-            )?));
+            let target = self.implicit_common_cast_target(&value.value_type, &common);
+            operand_typed = Some(Box::new(self.cast_to_value_type(*value, target, span)?));
             let mut coerced_when_then = Vec::with_capacity(when_then.len());
             for (label, result) in when_then {
                 self.check_control()?;
-                let nullable = label.value_type.nullable();
-                coerced_when_then.push((
-                    self.cast_to_value_type(
-                        label,
-                        super::helpers::with_nullability(common.clone(), nullable),
-                        span,
-                    )?,
-                    result,
-                ));
+                let target = self.implicit_common_cast_target(&label.value_type, &common);
+                coerced_when_then.push((self.cast_to_value_type(label, target, span)?, result));
             }
             when_then = coerced_when_then;
         }
@@ -4698,11 +4689,17 @@ pub(crate) fn coerce_to_target_type(expr: TypedExpr, target: &DataType) -> Typed
         DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)
     );
     if needs_cast {
+        // Match the same false-ALLOW declaration bound as implicit Boolean
+        // coercion. Occurrence preparation still consumes its frozen ALLOW.
+        let nullable = expr.value_type.nullable()
+            || novarocks_functions::carrier_cast_can_produce_null_with_policy(
+                expr.value_type.data_type(),
+                target,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                false,
+            );
         TypedExpr {
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                target.clone(),
-                expr.value_type.nullable(),
-            ),
+            value_type: novarocks_type_contract::FunctionValueType::new(target.clone(), nullable),
             kind: ExprKind::Cast {
                 expr: Box::new(expr),
                 target: target.clone(),
@@ -5416,10 +5413,13 @@ fn coerce_function_argument(
         });
     }
     let nullable = expr.value_type.nullable()
-        || novarocks_functions::signed_integer_cast_can_produce_null(
-            expr.value_type.data_type(),
-            target,
-        )
+        || (expr.value_type.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+            && novarocks_functions::carrier_cast_can_produce_null_with_policy(
+                expr.value_type.data_type(),
+                target,
+                decimal_overflow_policy,
+                false,
+            ))
         || timestamp_unit_cast_can_return_null(&expr.value_type.data_type(), target);
     Ok(TypedExpr {
         kind: ExprKind::Cast {
@@ -5449,10 +5449,14 @@ fn coerce_selected_function_argument(
         return Ok(coerced);
     }
     let nullable = expr.value_type.nullable()
-        || novarocks_functions::signed_integer_cast_can_produce_null(
-            expr.value_type.data_type(),
-            target.data_type(),
-        )
+        || (expr.value_type.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+            && target.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
+            && novarocks_functions::carrier_cast_can_produce_null_with_policy(
+                expr.value_type.data_type(),
+                target.data_type(),
+                decimal_overflow_policy,
+                false,
+            ))
         || timestamp_unit_cast_can_return_null(&expr.value_type.data_type(), &target.data_type())
         || (expr.value_type.logical_type() == novarocks_type_contract::ValueLogicalType::LargeInt
             && target.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
@@ -10839,6 +10843,105 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+    #[test]
+    fn implicit_common_numeric_coercions_freeze_nullable_casts_before_folding() {
+        use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType};
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        for sql in [
+            "SELECT 0.1 = 0.25",
+            "SELECT 0.1 IN (0.25)",
+            "SELECT 0.1 BETWEEN 0.25 AND 0.75",
+            "SELECT CASE 0.1 WHEN 0.25 THEN 1 ELSE 0 END",
+        ] {
+            let query = resolve_call_policy_query(sql);
+            let QueryBody::Select(select) = &query.body else {
+                panic!("SELECT")
+            };
+            let output = &select.projection[0].expr;
+            let coerced = match &output.kind {
+                ExprKind::BinaryOp { left, .. }
+                | ExprKind::InList { expr: left, .. }
+                | ExprKind::Between { expr: left, .. } => left.as_ref(),
+                ExprKind::Case {
+                    operand: Some(left),
+                    ..
+                } => left.as_ref(),
+                other => panic!("actual common-type consumer: {other:?}"),
+            };
+            if !matches!(output.kind, ExprKind::Case { .. }) {
+                assert!(output.value_type.nullable(), "{sql}");
+            }
+            // CASE result NULLs are authored independently of its operand
+            // and labels. This CAST regression preserves that existing contract.
+            assert_eq!(
+                coerced.value_type,
+                FunctionValueType::new(DataType::Decimal128(3, 2), true),
+                "{sql}"
+            );
+            let ExprKind::Cast {
+                expr,
+                target,
+                decimal_overflow_policy,
+            } = &coerced.kind
+            else {
+                panic!("real CAST")
+            };
+            assert_eq!(
+                expr.value_type,
+                FunctionValueType::new(DataType::Decimal128(2, 1), false)
+            );
+            assert_eq!(target, &DataType::Decimal128(3, 2));
+            assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
+            novarocks_functions::PreparedCastRecipe::try_new(
+                novarocks_functions::CastOperation::Carrier,
+                &expr.value_type,
+                &coerced.value_type,
+                *decimal_overflow_policy,
+                false,
+                &control,
+            )
+            .expect("real prepared cast accepts the common-type producer declaration");
+        }
+        let query = resolve_call_policy_query("SELECT 0.25 = 0.75");
+        let QueryBody::Select(select) = &query.body else {
+            panic!("SELECT")
+        };
+        let output = &select.projection[0].expr;
+        assert!(
+            !output.value_type.nullable(),
+            "equal carriers need no new row operation"
+        );
+        let ExprKind::BinaryOp { left, right, .. } = &output.kind else {
+            panic!("comparison")
+        };
+        assert!(matches!(left.kind, ExprKind::Literal(_)));
+        assert!(matches!(right.kind, ExprKind::Literal(_)));
+    }
+
+    #[test]
+    fn decimal_sink_guard_comparison_preserves_the_numeric_literal_cast_contract() {
+        use novarocks_type_contract::FunctionValueType;
+        let query = resolve_call_policy_query(
+            "SELECT ABS(CAST(99999999.9949 AS DECIMAL(13,4))) > 99999999.9999",
+        );
+        let QueryBody::Select(select) = &query.body else {
+            panic!("SELECT")
+        };
+        let ExprKind::BinaryOp { right, .. } = &select.projection[0].expr.kind else {
+            panic!("comparison")
+        };
+        assert_eq!(
+            right.value_type,
+            FunctionValueType::new(DataType::Decimal128(13, 4), true)
+        );
+        let ExprKind::Cast { expr, .. } = &right.kind else {
+            panic!("literal's genuine common-type CAST")
+        };
+        assert_eq!(
+            expr.value_type,
+            FunctionValueType::new(DataType::Decimal128(12, 4), false)
+        );
     }
 }
 

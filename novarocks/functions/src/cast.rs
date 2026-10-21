@@ -184,7 +184,7 @@ pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow
         return body.can_produce_null(source, DecimalOverflowPolicy::OutputNull, allow);
     }
     if source != target && f3_array::arrow_profile(source, target) {
-        return true;
+        return f3_array::can_produce_null(source, target);
     }
     if matches!(
         source,
@@ -272,7 +272,7 @@ pub fn carrier_cast_can_produce_null_with_policy(
         return body.can_produce_null(source, policy, allow);
     }
     if source != target && f3_array::arrow_profile(source, target) {
-        return true;
+        return f3_array::can_produce_null(source, target);
     }
     if matches!(
         source,
@@ -593,8 +593,9 @@ impl PreparedCastRecipe {
             }
             // A Physical carrier with no primitive conversion kernel is still
             // exactly castable to itself: the value passes unchanged and only
-            // the frozen nullability may widen. Nominal identities are not a
-            // Physical scalar profile and stay refused.
+            // the frozen nullability may widen. The exact nominal LARGEINT
+            // domain also has this identity; no nominal domain is inferred from
+            // its FixedSizeBinary carrier.
             let identity = operation == CastOperation::Carrier
                 && source.data_type() == result.data_type()
                 && source
@@ -602,8 +603,11 @@ impl PreparedCastRecipe {
                         work.step().map_err(crate::kernel_control::compile_failure)
                     })
                     .map_err(CastPrepareError::Kernel)?
-                && source.logical_type() == ValueLogicalType::Physical
-                && result.logical_type() == ValueLogicalType::Physical
+                && ((source.logical_type() == ValueLogicalType::Physical
+                    && result.logical_type() == ValueLogicalType::Physical)
+                    || (source.logical_type() == ValueLogicalType::LargeInt
+                        && result.logical_type() == ValueLogicalType::LargeInt
+                        && source.data_type() == &DataType::FixedSizeBinary(16)))
                 && (Source::from_type(source.data_type()).is_none()
                     || Target::from_type(result.data_type()).is_none());
             work.step()?;

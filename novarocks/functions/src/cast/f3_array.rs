@@ -122,6 +122,12 @@ pub(super) fn arrow_profile(source: &DataType, result: &DataType) -> bool {
                 || (source == &DataType::Boolean && matches!(result, DataType::Decimal256(..)))))
 }
 
+/// Offset widening preserves the source validity bitmap exactly. Other
+/// admitted Arrow bodies retain their existing conservative NULL contract.
+pub(super) fn can_produce_null(source: &DataType, result: &DataType) -> bool {
+    !matches!((source, result), (DataType::Utf8, DataType::LargeUtf8))
+}
+
 pub(super) fn prepare(
     source: &FunctionValueType,
     result: &FunctionValueType,
@@ -133,7 +139,9 @@ pub(super) fn prepare(
         return Ok(None);
     }
     if arrow_profile(source.data_type(), result.data_type()) {
-        if !result.nullable() {
+        if (source.nullable() || can_produce_null(source.data_type(), result.data_type()))
+            && !result.nullable()
+        {
             return Err(CastPrepareError::TypeMismatch);
         }
         return Ok(Some(Body::ArrowScalar));

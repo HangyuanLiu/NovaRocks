@@ -135,17 +135,26 @@ fn decimal_text_exact_p_s_null_promise_and_other_cast_domains_stay_separate() {
                     DataType::Date32,
                     DataType::Timestamp(TimeUnit::Microsecond, None),
                 ] {
-                    assert_eq!(
-                        PreparedCastRecipe::try_new(
-                            CastOperation::Carrier,
-                            &FunctionValueType::from_legacy_declared_projection(ty.clone(), true),
-                            &FunctionValueType::from_legacy_declared_projection(target, true),
-                            DecimalOverflowPolicy::ReportError,
-                            true,
-                            &Control::default()
-                        ),
-                        Err(CastPrepareError::Unsupported)
-                    );
+                    if !wide || target == DataType::Int64 {
+                        // Approved Decimal128->integer/calendar and Decimal256->integer
+                        // routes retain these exact p/s declarations, including -128.
+                        super::tests::assert_f3_admitted_preparation(ty.clone(), target);
+                    } else {
+                        assert_eq!(
+                            PreparedCastRecipe::try_new(
+                                CastOperation::Carrier,
+                                &FunctionValueType::from_legacy_declared_projection(
+                                    ty.clone(),
+                                    true
+                                ),
+                                &FunctionValueType::from_legacy_declared_projection(target, true),
+                                DecimalOverflowPolicy::ReportError,
+                                true,
+                                &Control::default()
+                            ),
+                            Err(CastPrepareError::Unsupported)
+                        );
+                    }
                 }
             }
         }

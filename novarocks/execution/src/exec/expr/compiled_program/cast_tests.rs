@@ -268,6 +268,12 @@ fn fixture(
                     }
                     DataType::Boolean => LiteralValue::Boolean(false),
                     DataType::Date32 => LiteralValue::Date32(0),
+                    DataType::FixedSizeBinary(16)
+                        if ty.logical_type()
+                            == novarocks_type_contract::ValueLogicalType::LargeInt =>
+                    {
+                        LiteralValue::LargeInt(0)
+                    }
                     DataType::Int64 => LiteralValue::Int64(0),
                     DataType::UInt64 => LiteralValue::UInt64(0),
                     DataType::Timestamp(_, None) => LiteralValue::Timestamp(0),
@@ -332,6 +338,12 @@ fn fixture(
                 }
                 DataType::Boolean => LiteralValue::Boolean(true),
                 DataType::Date32 => LiteralValue::Date32(71),
+                DataType::FixedSizeBinary(16)
+                    if source_type.logical_type()
+                        == novarocks_type_contract::ValueLogicalType::LargeInt =>
+                {
+                    LiteralValue::LargeInt(i128::MIN)
+                }
                 DataType::Int64 => LiteralValue::Int64(71),
                 DataType::UInt64 => LiteralValue::UInt64(u64::MAX),
                 DataType::Timestamp(_, None) => LiteralValue::Timestamp(71),

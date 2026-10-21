@@ -365,9 +365,8 @@ fn nullable_proof_depends_on_actual_allow_and_source_not_decimal_policy_or_value
             DataType::Decimal128(10, 0),
         ]
         .into_iter()
-        // Float64 decimal profiles now have their complete positive matrix.
-        // Float32 decimal and the other unsupported pairs retain this boundary.
-        .filter(|target| source != DataType::Float64 || !matches!(target, DataType::Decimal128(..)))
+        // Both Float32 and Float64 decimal routes now have independent P05 value tests.
+        .filter(|target| !matches!(target, DataType::Decimal128(..)))
         {
             assert_eq!(
                 PreparedCastRecipe::try_new(
@@ -381,6 +380,7 @@ fn nullable_proof_depends_on_actual_allow_and_source_not_decimal_policy_or_value
                 Err(CastPrepareError::Unsupported)
             );
         }
+        super::tests::assert_f3_admitted_preparation(source.clone(), DataType::Decimal128(10, 0));
         for operation in [CastOperation::Time, CastOperation::TimeFromDatetime] {
             assert_eq!(
                 PreparedCastRecipe::try_new(

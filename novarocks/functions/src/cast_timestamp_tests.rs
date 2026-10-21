@@ -393,8 +393,14 @@ fn timestamp_nullability_and_effects_follow_exact_five_null_pairs_and_one_error_
             }
         }
     }
+    super::tests::assert_f3_selected_literal_case(
+        Arc::new(arrow_array::TimestampSecondArray::from(vec![
+            Some(123456),
+            None,
+        ])),
+        Arc::new(arrow_array::Int64Array::from(vec![Some(123456), None])),
+    );
     for (source, target) in [
-        (DataType::Timestamp(TimeUnit::Second, None), DataType::Int64),
         (
             DataType::Int64,
             DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
