@@ -38,6 +38,7 @@ import sys
 import time
 from typing import Any, Callable
 import uuid
+from urllib.parse import quote
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -170,15 +171,18 @@ class Docker:
             # Cancellation must settle our child before releasing ownership locks.
             try:
                 os.killpg(process.pid, signal.SIGTERM)
-                process.communicate(timeout=2)
+                stdout, stderr = process.communicate(timeout=2)
             except (ProcessLookupError, subprocess.TimeoutExpired):
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                process.communicate()
+                stdout, stderr = process.communicate()
             if isinstance(error, subprocess.TimeoutExpired):
-                raise RuntimeFailure("DockerOperationTimeout", args[0]) from error
+                failure = RuntimeFailure("DockerOperationTimeout", args[0])
+                failure._docker_stdout, failure._docker_stderr = stdout, stderr
+                failure._docker_returncode, failure._docker_timed_out = process.returncode, True
+                raise failure from error
             raise
         return self.command_result(args, process.returncode, stdout, stderr, absent_ok=absent_ok)
 
@@ -195,7 +199,10 @@ class Docker:
             code = "PortUnavailable" if any(term in stderr.lower() for term in (
                 "port is already allocated", "address already in use",
             )) else "DockerOperationFailed"
-            raise RuntimeFailure(code, f"{args[0]} exited with {returncode}")
+            failure = RuntimeFailure(code, f"{args[0]} exited with {returncode}")
+            failure._docker_stdout, failure._docker_stderr = stdout, stderr
+            failure._docker_returncode, failure._docker_timed_out = returncode, False
+            raise failure
         return stdout.strip()
 
     def daemon_id(self) -> str:
@@ -233,10 +240,65 @@ class Docker:
         return value["Id"]
 
     def compose(self, record: dict[str, Any], args: list[str]) -> str:
-        return self.command([
-            "compose", "--env-file", record["compose_env"], "-p", record["project"],
-            "-f", record["compose_file"], *args,
-        ])
+        try:
+            return self.command([
+                "compose", "--env-file", record["compose_env"], "-p", record["project"],
+                "-f", record["compose_file"], *args,
+            ])
+        except RuntimeFailure as error:
+            if record.get("kind") == "isolated" and hasattr(error, "_docker_stderr"):
+                try:
+                    directory = self._retain_compose_failure(record, args, error)
+                    error.args = (str(error) + "; sanitized diagnostics retained at " +
+                                  self._safe_compose_diagnostics(str(directory), record),)
+                except OSError as retention_error:
+                    # Retention cannot turn the original native failure into
+                    # success or replace its classification with a file error.
+                    error.args = (str(error) + "; safe diagnostics retention failed (" +
+                                  type(retention_error).__name__ + ")",)
+            raise
+
+    @staticmethod
+    def _safe_compose_diagnostics(text, record):
+        secrets = set()
+        def credentials(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if isinstance(item, str) and item and any(term in key.lower() for term in
+                            ("access_key", "secret", "password", "token")):
+                        secrets.add(item)
+                    elif isinstance(item, dict):
+                        credentials(item)
+        credentials(record.get("config", {}))
+        credentials(record.get("external_minio", {}).get("credentials", {}))
+        credentials(record.get("credentials", {}))
+        for secret in sorted(secrets, key=len, reverse=True):
+            for encoded in {secret, quote(secret, safe=""), json.dumps(secret, ensure_ascii=False)[1:-1]}:
+                text = text.replace(encoded, "<redacted>")
+        text = re.sub(r"(?i)([a-z][a-z0-9+.-]*://)[^/\s@]+@", r"\1<redacted>@", text)
+        text = re.sub(r'''(?i)([?&](?:x-amz-(?:credential|signature|security-token)|awsaccesskeyid|signature|sig|token)=)[^&\s\"'<>]+''', r"\1<redacted>", text)
+        text = re.sub(r'''(?im)(\b(?:authorization|[a-z0-9_.-]*(?:password|passwd|secret(?:[_-]?access)?(?:[_-]?key)?|access[_-]?key(?:[_-]?id)?|(?:session[_-]?|security[_-]?)?token|signature|minio[_-]root[_-]user))[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\r\n]*)''', r"\1<redacted>", text)
+        return text
+
+    def _retain_compose_failure(self, record, args, error):
+        state = Path(self.environment.get("XDG_STATE_HOME") or
+                     str(Path(self.environment.get("HOME") or Path.home()) / ".local/state"))
+        root = state / "novarocks/fixture-diagnostics"
+        root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if root.is_symlink() or not root.is_dir() or root.stat().st_uid != os.getuid():
+            raise OSError("private fixture diagnostic owner differs")
+        root.chmod(0o700)
+        directory = root / ("private-compose-" + uuid.uuid4().hex)
+        directory.mkdir(mode=0o700)
+        operation = args[0] if args and args[0] in {"create", "up", "down", "start", "stop", "rm"} else "compose"
+        metadata = dict(schema=1, project=self._safe_compose_diagnostics(record["project"], record),
+                        operation=operation, native_exit=error._docker_returncode,
+                        timed_out=error._docker_timed_out, error_code=error.code,
+                        sanitized=True)
+        atomic_json(directory / "command.json", metadata)
+        for name, value in (("stdout.log", error._docker_stdout), ("stderr.log", error._docker_stderr)):
+            atomic_bytes(directory / name, self._safe_compose_diagnostics(value, record).encode())
+        return directory
 
     def container(self, record: dict[str, Any], service: str) -> dict[str, Any] | None:
         ids = self.command([

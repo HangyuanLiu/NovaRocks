@@ -234,6 +234,63 @@ class McTimeoutClassificationTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "DockerOperationFailed")
 
 
+class ReadonlyControlTimeoutTests(unittest.TestCase):
+    def invoke(self, changes=None, *, args=None, stdout='{"Id":"observed"}', stderr="", undispatched=False,
+               missing_output=False):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = machine.MachineDocker()
+            backend.maintenance_fd = 42
+            backend.maintenance_base = Path(directory) / "machine-test"
+            def supervise(journal, request, timeout):
+                fact = runtime.read_json(journal)
+                fact.update(phase="settled", command_dispatched=not undispatched, command_exit=124 if undispatched else 0,
+                    timed_out=True, interrupted=False, command_succeeded=False)
+                if not undispatched:
+                    fact.update(cli_pid=12345, group_exit_confirmed=True, group_exit_observed=True, leader_waited=True)
+                fact.update(changes or {})
+                if not missing_output:
+                    output = journal.with_suffix(".stdout")
+                    output.write_bytes(stdout if isinstance(stdout, bytes) else stdout.encode())
+                    Path(str(output) + ".stderr").write_text(stderr)
+                return fact
+            with mock.patch.object(backend, "_supervise", side_effect=supervise):
+                try:
+                    backend.command(args or ["container", "inspect", "owned-id", "--format", "{{json .}}"])
+                except runtime.RuntimeFailure as error:
+                    return error
+            self.fail("deadline command unexpectedly succeeded")
+
+    def test_undispatched_readonly_deadline_and_reaped_readonly_exit_carry_private_evidence(self):
+        for kwargs in ({"undispatched":True,"missing_output":True}, {}, {"changes":{"command_exit":-machine.signal.SIGTERM}}):
+            with self.subTest(kwargs=kwargs):
+                error = self.invoke(**kwargs)
+                self.assertEqual(error.code, "DockerOperationTimeout", "ordinary commands retain their failure")
+                self.assertIs(error.readonly_deadline_settled, True)
+
+    def test_mutating_command_never_has_readonly_deferral_evidence(self):
+        error = self.invoke(args=["container", "rm", "owned-id"])
+        self.assertEqual(error.code, "DockerOperationTimeout")
+        self.assertIs(error.readonly_deadline_settled, False)
+
+    def test_failed_cleanup_unknown_group_wrong_identity_or_native_failure_is_not_deferrable(self):
+        for field,value in (("phase","cleanup-failed"),("mutating",True),("interrupted",True),
+                ("group_exit_confirmed",False),("group_exit_observed",False),("leader_waited",False),
+                ("cli_pid",None),("control_root","another-root"),("machine","another-machine"),
+                ("error","ContainerCleanupFailed"),("cleanup_error","OSError"),
+                ("group_observation_error","OSError"),("leader_observation_error","OSError"),
+                ("command_exit",17),("command_exit",False),("command_dispatched",None)):
+            with self.subTest(field=field,value=value):
+                self.assertIs(self.invoke({field:value}).readonly_deadline_settled, False)
+
+    def test_invalid_or_missing_native_output_and_error_stderr_are_not_deferrable(self):
+        for kwargs in ({"stdout":"invalid JSON"},{"stdout":"[]"},{"stdout":b"\xff"},
+                {"missing_output":True},{"stderr":"Error response from daemon: denied"},
+                {"undispatched":True,"stdout":"unexpected dispatched output"},
+                {"undispatched":True,"missing_output":True,"changes":{"cli_pid":12345}}):
+            with self.subTest(kwargs=kwargs):
+                self.assertIs(self.invoke(**kwargs).readonly_deadline_settled, False)
+
+
 class TerminalPortRecoveryTests(unittest.TestCase):
     def fixture(self, directory):
         base = Path(directory) / "machine-test"
@@ -535,6 +592,53 @@ class MachineTests(unittest.TestCase):
         report = self.owner.sweep(expected_version=state["version"], expected_generation=state["generation"])
         self.assertTrue(report["complete"])
         self.assertIn(("sweep", True), self.backend.events)
+
+    def test_sweep_projects_only_confirmed_readonly_timeout_without_extending_deadline(self):
+        state = self.start()
+        original = time.monotonic() + 100
+        self.backend.operation_deadline = original
+        failure = runtime.RuntimeFailure("DockerOperationTimeout", "container")
+        failure.readonly_deadline_settled = True
+        def timed_out(record):
+            self.assertLessEqual(self.backend.operation_deadline, deadline)
+            raise failure
+        deadline = time.monotonic() + 1
+        with mock.patch.object(self.backend, "healthy", side_effect=timed_out):
+            with self.assertRaisesRegex(runtime.RuntimeFailure, "ScratchSweepTimeout") as caught:
+                self.owner.sweep(deadline=deadline, expected_version=state["version"], expected_generation=state["generation"])
+        self.assertIs(caught.exception.__cause__, failure)
+        self.assertEqual(self.backend.operation_deadline, original)
+        self.assertEqual(self.owner.read_saved_state(), state)
+        self.assertNotIn(("sweep", True), self.backend.events)
+
+    def test_sweep_does_not_defer_unconfirmed_timeout_or_other_failure(self):
+        self.start()
+        for code,evidence in (("DockerOperationTimeout",False),("DockerOperationFailed",True),
+                              ("RunBudgetExpired",False),("ContainerCleanupUnconfirmed",False)):
+            with self.subTest(code=code):
+                failure = runtime.RuntimeFailure(code, "actual failure")
+                failure.readonly_deadline_settled = evidence
+                with mock.patch.object(self.backend, "healthy", side_effect=failure):
+                    self.assert_code(code, lambda:self.owner.sweep(deadline=time.monotonic()+1))
+
+    def test_sweep_daemon_observation_runs_under_the_same_maintenance_lock(self):
+        self.start()
+        self.owner._daemon = "local-daemon"
+        def daemon():
+            self.assertIsNotNone(self.backend.maintenance_fd)
+            return "local-daemon"
+        with mock.patch.object(self.backend, "daemon_id", side_effect=daemon):
+            self.assertTrue(self.owner.sweep(deadline=time.monotonic()+1)["complete"])
+
+    def test_sweep_never_defers_operation_recovery_or_an_unsettled_operation(self):
+        self.start()
+        failure = runtime.RuntimeFailure("DockerOperationTimeout", "readonly recovery probe")
+        failure.readonly_deadline_settled = True
+        with mock.patch.object(self.backend, "settle_operations", side_effect=failure):
+            self.assert_code("DockerOperationTimeout", lambda:self.owner.sweep(deadline=time.monotonic()+1))
+        with mock.patch.object(self.backend, "healthy", side_effect=failure), \
+                mock.patch.object(self.backend, "unsettled_operations", return_value=[("owned-journal", {"phase":"command-unknown"})]):
+            self.assert_code("DockerOperationTimeout", lambda:self.owner.sweep(deadline=time.monotonic()+1))
 
     def test_wrong_version_neither_attaches_nor_rebuilds_services(self):
         first = self.start()

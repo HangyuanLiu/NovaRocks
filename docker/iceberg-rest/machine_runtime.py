@@ -498,11 +498,65 @@ class MachineDocker(runtime.Docker):
         result = self._supervise(journal, dict(operation="control", environment=self.environment,
             args=args, deadline_monotonic=deadline), timeout)
         if result.get("timed_out"):
-            raise runtime.RuntimeFailure("DockerOperationTimeout", args[0])
+            error = runtime.RuntimeFailure("DockerOperationTimeout", args[0])
+            # Only the sweep owner may project this private completion evidence
+            # into a bounded observation timeout. Ordinary commands still fail.
+            error.readonly_deadline_settled = self._readonly_deadline_settled(
+                args, fact, result, journal)
+            raise error
         output = journal.with_suffix(".stdout")
         stderr = Path(str(output) + ".stderr")
         return self.command_result(args, result.get("command_exit", 1), output.read_text() if output.exists() else "",
             stderr.read_text() if stderr.exists() else "", absent_ok=absent_ok)
+
+    @staticmethod
+    def _readonly_deadline_settled(args, original, result, journal):
+        if (original["mutating"] is not False or result.get("mutating") is not False
+                or type(result.get("schema")) is not int
+                or any(result.get(key) != original[key] for key in
+                       ("schema", "kind", "control_root", "machine"))
+                or result.get("phase") != "settled" or result.get("timed_out") is not True
+                or result.get("interrupted") is not False
+                or result.get("command_succeeded") is not False
+                or any(key in result for key in ("error", "cleanup_error", "cleanup_failed",
+                                                "leader_observation_error", "group_observation_error"))):
+            return False
+        dispatched, code = result.get("command_dispatched"), result.get("command_exit")
+        if type(code) is not int:
+            return False
+        output = journal.with_suffix(".stdout")
+        stderr = Path(str(output) + ".stderr")
+        try:
+            if dispatched is False:
+                return (code == 124 and not any(key in result for key in
+                        ("cli_pid", "group_exit_confirmed", "group_exit_observed", "leader_waited"))
+                        and not any(path.is_symlink() or (path.exists() and path.stat().st_size)
+                                    for path in (output, stderr)))
+            if (dispatched is not True or type(result.get("cli_pid")) is not int or result["cli_pid"] <= 0
+                    or not all(result.get(key) is True for key in
+                               ("group_exit_confirmed", "group_exit_observed", "leader_waited"))
+                    or code not in {0, 124, -signal.SIGTERM, -signal.SIGKILL,
+                                    128 + signal.SIGTERM, 128 + signal.SIGKILL}
+                    or not output.is_file() or output.is_symlink()
+                    or not stderr.is_file() or stderr.is_symlink() or stderr.stat().st_size):
+                return False
+            # A killed read can have a truncated body. A native successful read
+            # must still satisfy its known output protocol before deferral.
+            if code != 0:
+                return True
+            text = output.read_text().strip()
+            if args[-2:] == ["--format", "{{json .}}"]:
+                return isinstance(json.loads(text), dict)
+            if args[:2] == ["context", "inspect"]:
+                value = json.loads(text)
+                return isinstance(value, str) and bool(value)
+            if args[0] == "ps":
+                return all(re.fullmatch(r"[0-9a-f]{12,64}", line) for line in text.splitlines())
+            if args[0] == "info" or args[:2] == ["context", "show"]:
+                return re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", text) is not None
+        except (OSError, UnicodeError, ValueError):
+            return False
+        return False
 
     def unsettled_operations(self, base):
         pending = []
@@ -884,9 +938,10 @@ class MachineOwner:
         previous_deadline = getattr(self.backend, "operation_deadline", None)
         deadline = min(deadline, previous_deadline) if previous_deadline is not None else deadline
         self.backend.operation_deadline = deadline
+        observation_only = True
         try:
-            self.assert_live_daemon()
             with self.maintenance_lock(deadline):
+                self.assert_live_daemon()
                 state = self.read_saved_state()
                 if not state or state["phase"] != "ready":
                     raise runtime.RuntimeFailure("MachineUnavailable", "machine is not available for sweep")
@@ -895,12 +950,22 @@ class MachineOwner:
                 if expected_generation is not None and state["generation"] != expected_generation:
                     raise runtime.RuntimeFailure("MachineUnavailable", "sweep publication activation changed")
                 self.backend.validate_minio_volume(state)
+                observation_only = False
                 self.backend.settle_operations(self.base)
+                observation_only = True
                 if not self.backend.healthy(state):
                     raise runtime.RuntimeFailure("MachineUnavailable", "machine services are not healthy")
+                observation_only = False
                 report = self._sweeper(state).sweep(expired_only=True, deadline=deadline)
                 self._save_scratch_observation(state, report)
                 return report
+        except runtime.RuntimeFailure as error:
+            if (observation_only and error.code == "DockerOperationTimeout"
+                    and getattr(error, "readonly_deadline_settled", False) is True
+                    and not self.backend.unsettled_operations(self.base)):
+                raise runtime.RuntimeFailure("ScratchSweepTimeout",
+                    "bounded sweep observation deadline elapsed after confirmed readonly completion") from error
+            raise
         finally:
             self.backend.operation_deadline = previous_deadline
 

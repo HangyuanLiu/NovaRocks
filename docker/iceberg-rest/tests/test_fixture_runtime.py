@@ -22,6 +22,7 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 import signal
+import shutil
 import sys
 import tempfile
 import time
@@ -162,6 +163,65 @@ class DockerCommandTests(unittest.TestCase):
         env = runtime.controlled_environment({"PATH": "path", "COMPOSE_PROJECT_NAME": "foreign",
             "REST_IMAGE": "foreign", "DOCKER_CONTEXT": "desktop-linux"})
         self.assertEqual(env, {"PATH": "path", "DOCKER_CONTEXT": "desktop-linux"})
+
+    def test_private_compose_failure_retains_safe_native_output_after_entry_purge(self):
+        entry = self.root / "private-entry"
+        entry.mkdir()
+        secret = 'fixture-SECRET-"quoted"-$value'
+        record = dict(kind="isolated", project="nr-isolated-rest-unit", compose_file=str(entry / "compose.yml"),
+            compose_env=str(entry / "compose.env"), config={"credentials":{"access_key":"fixture-AK", "secret_key":secret}},
+            external_minio={"credentials":{"access_key":"shared-AK", "secret_key":"shared-SECRET"}})
+        stderr = ("services.rest.command: invalid command configuration\n" + secret + "\n" + json.dumps(secret) +
+            '\nAWS_SECRET_ACCESS_KEY="unknown-env-secret"\nMINIO_ROOT_USER=unknown-root-key\n' +
+            'Authorization: Bearer unknown-bearer\n{"session_token":"unknown-token"}\n' +
+            'http://unknown-user:unknown-password@minio:9000/x?X-Amz-Signature=unknown-signature&x=1\nshared-SECRET\n')
+        _, environment = self.fake_docker()
+        environment["XDG_STATE_HOME"] = str(self.root / "state")
+        executable = self.root / "bin/docker"
+        executable.write_text(f"#!{sys.executable}\nimport sys\nsys.stdout.write('private fixture-AK output\\n')\nsys.stderr.write({stderr!r})\nsys.exit(17)\n")
+        backend = runtime.Docker(environment=environment)
+        with self.assertRaises(runtime.RuntimeFailure) as caught:
+            backend.compose(record, ["up", "-d"])
+        self.assertEqual(caught.exception.code, "DockerOperationFailed")
+        directory = Path(str(caught.exception).split("sanitized diagnostics retained at ", 1)[1])
+        shutil.rmtree(entry)
+        metadata = json.loads((directory / "command.json").read_text())
+        self.assertEqual(metadata["native_exit"], 17)
+        self.assertEqual(metadata["operation"], "up")
+        self.assertNotIn("args", metadata)
+        retained = "\n".join(path.read_text() for path in directory.iterdir())
+        self.assertIn("services.rest.command: invalid command configuration", retained)
+        for value in (secret, json.dumps(secret)[1:-1], "fixture-AK", "shared-SECRET", "unknown-env-secret",
+                      "unknown-root-key", "unknown-bearer", "unknown-token", "unknown-password", "unknown-signature"):
+            self.assertNotIn(value, retained + str(caught.exception))
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(directory.parent.stat().st_mode & 0o777, 0o700)
+        for path in directory.iterdir():
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_success_and_shared_failure_do_not_persist_private_diagnostics(self):
+        record = dict(kind="isolated", project="private", compose_env="saved.env", compose_file="saved.yml")
+        backend = runtime.Docker(environment={"XDG_STATE_HOME":str(self.root / "state")})
+        with mock.patch.object(backend, "command", return_value="ok"):
+            self.assertEqual(backend.compose(record, ["up"]), "ok")
+        with mock.patch.object(backend, "command", side_effect=runtime.RuntimeFailure("DockerOperationFailed", "compose exited 1")):
+            with self.assertRaises(runtime.RuntimeFailure):
+                backend.compose({**record, "kind":"machine"}, ["up"])
+        self.assertFalse((self.root / "state").exists())
+
+    def test_retention_io_failure_preserves_original_native_failure(self):
+        backend = runtime.Docker()
+        try:
+            runtime.Docker.command_result(["compose"], 23, "private stdout", "private stderr")
+        except runtime.RuntimeFailure as original:
+            with mock.patch.object(backend, "command", side_effect=original), \
+                    mock.patch.object(backend, "_retain_compose_failure", side_effect=OSError("private path")):
+                with self.assertRaises(runtime.RuntimeFailure) as caught:
+                    backend.compose({"kind":"isolated", "compose_env":"saved.env", "project":"private", "compose_file":"saved.yml"}, ["up"])
+        self.assertEqual(caught.exception.code, "DockerOperationFailed")
+        self.assertEqual(caught.exception._docker_returncode, 23)
+        self.assertNotIn("private stderr", str(caught.exception))
+        self.assertIn("retention failed", str(caught.exception))
 
 
     def fake_docker(self):
