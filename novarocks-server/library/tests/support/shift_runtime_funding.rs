@@ -24,7 +24,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use novarocks_execution::{
-    exec::expr::agg::ExecutionFunctionSetBuilder,
+    runtime::function_set::ExecutionFunctionSetBuilder,
     runtime::{
         execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig},
         preparation_metadata::CompiledSchemaSite,

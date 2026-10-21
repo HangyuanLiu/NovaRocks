@@ -288,14 +288,20 @@ mod error_projection_tests {
             let source = SharedFailureCause::new(original.clone());
             let expected = original.failure_fact();
             let error = PhysicalEncodeError::from(PackageFreezeError::Semantics(
-                PackageSemanticsError::Source(source.clone()),
+                PackageSemanticsError::PrimitiveSource {
+                    source: source.clone(),
+                    cast: None,
+                },
             ));
             assert_eq!(error.failure_fact(), expected);
             let PhysicalEncodeError::Source(outer) = &error else {
                 panic!("freeze must retain its actual author");
             };
             let freeze = outer.downcast_ref::<PackageFreezeError>().unwrap();
-            let PackageFreezeError::Semantics(PackageSemanticsError::Source(actual)) = freeze
+            let PackageFreezeError::Semantics(PackageSemanticsError::PrimitiveSource {
+                source: actual,
+                cast: None,
+            }) = freeze
             else {
                 panic!("comparison source identity was not retained");
             };

@@ -2117,11 +2117,16 @@ pub fn fixed_interleave_extent(ty: &DataType, rows: usize) -> Result<(), CopyErr
     if let Some(width) = ty.primitive_width() {
         buffer_extent(rows, width)?;
     } else if let DataType::FixedSizeBinary(width) = ty {
-        buffer_extent(
-            rows,
-            usize::try_from(*width)
-                .map_err(|_| CopyError::Invalid("copy frozen carrier has a negative width"))?,
-        )?;
+        // Arrow's MutableArrayData uses a MutableBuffer for this carrier.
+        // Its capacity rounds to 64 bytes before the target-aligned Layout.
+        let width = usize::try_from(*width)
+            .map_err(|_| CopyError::Invalid("copy frozen carrier has a negative width"))?;
+        buffer_extent(rows, width)?;
+        let capacity = zip::rounded_capacity(mul(rows, width)?)?;
+        let padded = (capacity as u128).next_multiple_of(arrow_buffer::alloc::ALIGNMENT as u128);
+        if padded > isize::MAX as u128 {
+            return Err(CopyError::backing_bytes(padded));
+        }
     } else if *ty != DataType::Boolean {
         return Err(CopyError::unsupported(ty));
     }

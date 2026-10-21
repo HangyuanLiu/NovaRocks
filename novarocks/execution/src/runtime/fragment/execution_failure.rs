@@ -813,6 +813,12 @@ impl From<novarocks_functions::AggregateInputBatchError> for ExecutionFailure {
     }
 }
 
+impl From<novarocks_functions::largeint::LargeIntCarrierFailure> for ExecutionFailure {
+    fn from(cause: novarocks_functions::largeint::LargeIntCarrierFailure) -> Self {
+        Self::from_domain(cause)
+    }
+}
+
 impl From<novarocks_functions::array_projection::ArrayProjectionFailure> for ExecutionFailure {
     fn from(source: novarocks_functions::array_projection::ArrayProjectionFailure) -> Self {
         Self::from_domain(source)

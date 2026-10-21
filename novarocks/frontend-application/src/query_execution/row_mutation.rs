@@ -21,8 +21,9 @@
 //! interprets provider identity values nor derives a physical write strategy.
 
 mod cast_footprint;
+mod signed_layout;
 mod uniqueness;
-use cast_footprint::CowSignedCastFootprint;
+use cast_footprint::CowSignedLayoutFootprint;
 use std::sync::Arc;
 use std::time::Instant;
 use uniqueness::BoundedMutationKeys;
@@ -402,38 +403,37 @@ impl BoundedRowMutationMatchCollector {
     }
 }
 
-/// Casts one match batch to the signed selection layout. Both the Arrow
-/// result path and the relayed CowSelectionArrowV1 path use it, so the signed
-/// types are applied by one rule.
-pub fn cast_to_signed_selection(
+/// Normalize an already converted match batch to its signed layout. The whole
+/// batch is preflighted before dictionary or layout construction allocates.
+#[cfg(test)]
+pub fn normalize_to_signed_selection(
     schema: &SchemaRef,
     batch: &RecordBatch,
 ) -> Result<RecordBatch, String> {
-    if batch.num_columns() != schema.fields().len() {
-        return Err("COW match query output width differs from its signed contract".to_string());
-    }
-    let columns = batch
-        .columns()
-        .iter()
-        .zip(schema.fields())
-        .map(|(column, field)| {
-            novarocks_execution::exec::expr::cast_array_to_target(column, field.data_type())
-                .map_err(|error| {
-                    format!(
-                        "cast COW match ordinal to its signed type {:?}: {error}",
-                        field.data_type()
-                    )
-                })
-        })
-        .collect::<Result<Vec<ArrayRef>, _>>()?;
-    RecordBatch::try_new(Arc::clone(schema), columns)
-        .map_err(|error| format!("assemble signed COW match batch: {error}"))
+    CowSignedLayoutFootprint::for_batch(schema, batch, 0, 0, 0)
+        .map_err(|error| error.to_string())?;
+    signed_layout::normalize(schema, batch).map_err(|error| error.to_string())
 }
 
-/// Preserve source eligibility through a canonical signed cast. The source
-/// receipt proves all input backing; the kernel preflight precedes the cast.
+#[cfg(test)]
+pub(crate) fn normalize_signed_column(
+    array: &ArrayRef,
+    field: &arrow::datatypes::Field,
+) -> Result<ArrayRef, String> {
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![field.clone()]));
+    let source_schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("input", array.data_type().clone(), true),
+    ]));
+    let batch = RecordBatch::try_new(source_schema, vec![Arc::clone(array)])
+        .map_err(|error| error.to_string())?;
+    let normalized = normalize_to_signed_selection(&schema, &batch)?;
+    Ok(Arc::clone(normalized.column(0)))
+}
+
+/// Preserve source eligibility through signed layout normalization. The source
+/// receipt proves all input backing; whole-batch preflight precedes allocation.
 /// The copied output is minted by the same safe owner, with no raw adoption.
-fn cast_owned_to_signed_selection(
+fn normalize_owned_to_signed_selection(
     schema: &SchemaRef,
     source: &ConnectorRowMutationSourceBatch,
     retained_selection: usize,
@@ -441,14 +441,6 @@ fn cast_owned_to_signed_selection(
     retention: Option<&ConnectorPayloadRetentionGuard>,
 ) -> Result<ConnectorRowMutationSourceBatch, ConnectorError> {
     let input = source.batch();
-    // Check the target's closed source profile before the cast can allocate.
-    let mut owner = match retention {
-        Some(guard) => ConnectorRowMutationSourceBuilder::try_new_with_guard(
-            Arc::clone(schema),
-            guard.clone(),
-        )?,
-        None => ConnectorRowMutationSourceBuilder::try_new(Arc::clone(schema))?,
-    };
     let observed_input = ConnectorRowConversionFootprint::retained_batch_bytes(input)?;
     let source_scratch = source.source_bytes().saturating_sub(observed_input);
     // 32 MiB validator + 8 MiB bookkeeping coexist while collecting. The
@@ -456,8 +448,8 @@ fn cast_owned_to_signed_selection(
     let other_live = assembly_bytes
         .checked_add(40 * 1024 * 1024)
         .and_then(|bytes| bytes.checked_add(MAX_CONNECTOR_ROW_MUTATION_SOURCE_BYTES))
-        .ok_or_else(|| invalid_match("COW cast coexistence accounting overflowed"))?;
-    let footprint = CowSignedCastFootprint::for_batch(
+        .ok_or_else(|| invalid_match("COW layout coexistence accounting overflowed"))?;
+    let footprint = CowSignedLayoutFootprint::for_batch(
         schema,
         input,
         retained_selection,
@@ -470,12 +462,20 @@ fn cast_owned_to_signed_selection(
         temporary_bytes = footprint.temporary_bytes,
         copy_peak_bytes = footprint.copy_peak_bytes,
         peak_bytes = footprint.peak_bytes,
-        "COW signed cast construction preflight"
+        "COW signed layout construction preflight"
     );
-    let cast = cast_to_signed_selection(schema, input).map_err(invalid_match)?;
+    // The complete normalization/copy peak was admitted before this owner allocates.
+    let mut owner = match retention {
+        Some(guard) => ConnectorRowMutationSourceBuilder::try_new_with_guard(
+            Arc::clone(schema),
+            guard.clone(),
+        )?,
+        None => ConnectorRowMutationSourceBuilder::try_new(Arc::clone(schema))?,
+    };
+    let normalized = signed_layout::normalize(schema, input)?;
     let mut columns = owner.children(schema.fields().len())?;
     let mut node = 0;
-    for column in cast.columns() {
+    for column in normalized.columns() {
         let data = column.to_data();
         let copy = owner.copy_data(node, &data)?;
         fn nodes(data: &arrow::array::ArrayData) -> usize {
@@ -484,14 +484,14 @@ fn cast_owned_to_signed_selection(
         node += nodes(&data);
         columns.push(copy)?;
     }
-    owner.finish(cast.num_rows(), columns)
+    owner.finish(normalized.num_rows(), columns)
 }
 
 /// Collects a relayed CowSelectionArrowV1 stream into the bounded selection.
 ///
 /// Relayed bodies are assembled into whole records whose declared length is
 /// checked against the collector's byte budget before any assembly buffer is
-/// reserved. Each BATCH record is decoded, cast to the signed layout and
+/// reserved. Each BATCH record is decoded, normalized to the signed layout and
 /// handed to the bounded collector at once, so no second copy of the stream
 /// is retained. A body taken into assembly may be acknowledged before its
 /// record completes; nothing is a published selection until `finish`.
@@ -602,7 +602,7 @@ impl RelayedCowSelectionCollector {
                 }
                 return Ok(());
             };
-            let batch = cast_owned_to_signed_selection(
+            let batch = normalize_owned_to_signed_selection(
                 schema,
                 &batch,
                 collector.byte_count() as usize,
@@ -676,23 +676,17 @@ impl CowMatchRootConsumer {
         Ok(consumer)
     }
 
-    pub(crate) fn push_body(&mut self, body: &[u8]) -> Result<(), String> {
-        self.collector
-            .push_body(body)
-            .map_err(|error| error.to_string())
+    pub(crate) fn push_body(&mut self, body: &[u8]) -> Result<(), ConnectorError> {
+        self.collector.push_body(body)
     }
 
-    pub(crate) fn check_end(&self, output_rows: u64) -> Result<(), String> {
-        self.collector
-            .check_end(output_rows)
-            .map_err(|error| error.to_string())
+    pub(crate) fn check_end(&self, output_rows: u64) -> Result<(), ConnectorError> {
+        self.collector.check_end(output_rows)
     }
 
-    pub(crate) fn finish(mut self) -> Result<ConnectorRowMutationSelection, String> {
-        let selection = self.collector.finish().map_err(|error| error.to_string())?;
-        self.validator
-            .validate_selection(&selection)
-            .map_err(|error| error.to_string())?;
+    pub(crate) fn finish(mut self) -> Result<ConnectorRowMutationSelection, ConnectorError> {
+        let selection = self.collector.finish()?;
+        self.validator.validate_selection(&selection)?;
         Ok(selection)
     }
 }
@@ -1207,6 +1201,65 @@ mod tests {
     }
 
     #[test]
+    fn signed_layout_required_null_fails_with_typed_error_at_relay_boundary() {
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)])),
+            vec![Arc::new(Int32Array::from(vec![None::<i32>]))],
+        )
+        .unwrap();
+        let signed = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let stop = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
+        let mut collector =
+            RelayedCowSelectionCollector::try_new(context(stop, 1 << 20), None, signed).unwrap();
+        let error = collector
+            .push_body(&relayed_stream(&[input.clone()]))
+            .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(error.to_string().contains("required field contains NULL"));
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let expected = error.failure_fact();
+        assert_eq!(expected.class(), FailureClass::Data);
+        // Use the real four-column mutation contract at the RootConsumer boundary.
+        let signed = selection_schema();
+        let mut input_fields = signed
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        input_fields[0] = input_fields[0].clone().with_nullable(true);
+        let input = RecordBatch::try_new(
+            Arc::new(Schema::new(input_fields)),
+            vec![
+                Arc::new(Int32Array::from(vec![None::<i32>])),
+                Arc::new(Int32Array::from(vec![10])),
+                Arc::new(Int32Array::from(vec![Some(11)])),
+                Arc::new(Int8Array::from(vec![REPLACE_EFFECT_TAG])),
+            ],
+        )
+        .unwrap();
+        let mut consumer = CowMatchRootConsumer::try_new(
+            context(
+                Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                1 << 20,
+            ),
+            signed,
+            contract(),
+            ConnectorRowMutationIntent::Merge {
+                effects: vec![ConnectorRowMutationEffect::Replace],
+            },
+        )
+        .unwrap();
+        let error = consumer.push_body(&relayed_stream(&[input])).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(error.failure_fact(), expected);
+        assert!(
+            error
+                .to_string()
+                .contains("signed COW required field contains NULL")
+        );
+    }
+
+    #[test]
     fn relayed_selection_equals_the_arrow_selection_across_any_body_split() {
         let inputs = vec![
             batch(vec![
@@ -1546,7 +1599,13 @@ mod tests {
             ])]))
             .unwrap();
         duplicate.check_end(2).unwrap();
-        assert!(duplicate.finish().unwrap_err().contains("more than once"));
+        assert!(
+            duplicate
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("more than once")
+        );
 
         let mut partial = make();
         partial.push_body(&stream[..stream.len() - 1]).unwrap();

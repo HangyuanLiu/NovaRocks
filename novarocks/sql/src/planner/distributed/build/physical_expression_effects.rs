@@ -106,6 +106,7 @@ pub(crate) enum PhysicalExpressionEffectsError {
     Cast(CastPrepareError),
     /// A cast between these carriers has no prepared recipe.
     UnsupportedCast {
+        source: CastPrepareError,
         from: arrow::datatypes::DataType,
         to: arrow::datatypes::DataType,
     },
@@ -164,12 +165,15 @@ enum AuthoredPhysicalExpressionRequest<'a> {
     Window(AuthoredPhysicalWindowRequest<'a>),
 }
 macro_rules! recipe_error {
-    ($error:ty, $variant:ident) => {
+    ($error:ident, $variant:ident) => {
         impl From<$error> for PhysicalExpressionEffectsError {
             fn from(error: $error) -> Self {
-                match error.control_error() {
-                    Some(cause) => Self::Control(cause),
-                    None => Self::$variant(error),
+                match error {
+                    $error::Control(cause)
+                    | $error::Kernel(novarocks_functions::KernelFailure::CompileControl(cause)) => {
+                        Self::Control(cause)
+                    }
+                    other => Self::$variant(other),
                 }
             }
         }
@@ -187,8 +191,8 @@ recipe_error!(ComparisonPrepareError, Comparison);
 ///
 /// Caller admission covers maps, bounded stack, request/type clones and owner
 /// preparation coexistence. Cooperative work and fallible Vec storage are not
-/// a funding grant. Primary nested control returns without a completion check;
-/// success and ordinary errors observe the original footer.
+/// a funding grant. An originating error starts no fallible completion check;
+/// successful facts still observe the original footer.
 pub(crate) fn author_physical_expression_effects_observed(
     input: PhysicalExpressionEffectsInput<'_>,
     functions: &dyn SqlFunctionCatalog,
@@ -506,21 +510,7 @@ fn compose_expression_effects_observed<'source>(
         }
         Ok(AuthoredPhysicalExpressionEffects { summaries, calls })
     })();
-    let primary_constant = match &result {
-        Err(PhysicalExpressionEffectsError::Argument(argument))
-        | Err(PhysicalExpressionEffectsError::Request(PhysicalScalarRequestError::Argument(
-            argument,
-        )))
-        | Err(PhysicalExpressionEffectsError::WindowRequest(
-            PhysicalWindowRequestError::Argument(argument),
-        )) => argument.is_constant_limit(),
-        _ => false,
-    };
-    if primary_constant || matches!(&result, Err(PhysicalExpressionEffectsError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    work.finish_result(result, PhysicalExpressionEffectsError::from)
 }
 
 fn primitive_own_effects(
@@ -676,10 +666,13 @@ fn primitive_own_effects(
                 control,
             )
             .map_err(|error| match error {
-                CastPrepareError::Unsupported => PhysicalExpressionEffectsError::UnsupportedCast {
-                    from: child.ty.data_type().clone(),
-                    to: source.ty.data_type().clone(),
-                },
+                cause @ CastPrepareError::Unsupported => {
+                    PhysicalExpressionEffectsError::UnsupportedCast {
+                        source: cause,
+                        from: child.ty.data_type().clone(),
+                        to: source.ty.data_type().clone(),
+                    }
+                }
                 other => other.into(),
             })?;
             work.flush()?;

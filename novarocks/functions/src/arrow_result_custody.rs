@@ -576,8 +576,9 @@ fn wrap_data<C: Send + Sync + 'static>(
     original: &ArrayData,
     owner: &HostShared<OriginalBacking<C>>,
     work: &mut EvaluationCheckpoints<'_>,
-) -> Result<ArrayData, KernelFailure> {
+) -> Result<(ArrayData, bool), KernelFailure> {
     work.flush()?;
+    let mut has_custody_buffer = !original.buffers().is_empty();
     let mut buffers = Vec::new();
     buffers
         .try_reserve_exact(original.buffers().len())
@@ -591,10 +592,13 @@ fn wrap_data<C: Send + Sync + 'static>(
         .try_reserve_exact(original.child_data().len())
         .map_err(|_| KernelFailure::ResourceExhausted)?;
     for child in original.child_data() {
-        children.push(wrap_data(child, owner, work)?);
+        let (child, child_has_custody_buffer) = wrap_data(child, owner, work)?;
+        has_custody_buffer |= child_has_custody_buffer;
+        children.push(child);
         work.step()?;
     }
     let nulls = wrap_nulls(original.nulls(), owner, work)?;
+    has_custody_buffer |= nulls.is_some();
     work.flush()?;
     // SAFETY: every structural field and every visible byte comes from the
     // same original ArrayData. No field, logical offset, validity bit, child
@@ -609,7 +613,7 @@ fn wrap_data<C: Send + Sync + 'static>(
             .build_unchecked()
     };
     work.flush()?;
-    Ok(data)
+    Ok((data, has_custody_buffer))
 }
 
 pub(crate) struct RetainedArrowResult {
@@ -926,19 +930,19 @@ fn wrap_original_group<C: Send + Sync + 'static>(
             _ => Err(invalid("primitive custody requires its exact typed Arrow carrier")),
         );
     }
-    let data = wrap_data(&loan.data, &owner, work)?;
+    let (data, has_custody_buffer) = wrap_data(&loan.data, &owner, work)?;
     work.flush()?;
-    let result =
-        if data.buffers().is_empty() && data.child_data().is_empty() && data.nulls().is_none() {
-            // A bufferless root has no payload alias; the root object retains
-            // the actual backing owner without inventing a validity buffer.
-            Arc::new(BufferlessResult {
-                values: make_array(data),
-                owner: owner.clone(),
-            }) as ArrayRef
-        } else {
-            make_array(data)
-        };
+    let result = if !has_custody_buffer {
+        // The same recursive wrap proved that no node has a custodian.
+        // Keep the actual source on the root, including Struct<Null> and
+        // fixed-size-list metadata, without inventing a validity buffer.
+        Arc::new(BufferlessResult {
+            values: make_array(data),
+            owner: owner.clone(),
+        }) as ArrayRef
+    } else {
+        make_array(data)
+    };
     work.flush()?;
     Ok(result)
 }
@@ -953,7 +957,8 @@ impl<C> std::fmt::Debug for BufferlessResult<C> {
     }
 }
 // SAFETY: this wrapper is created only from make_array(original ArrayData)
-// when that data has no buffers, child data, or validity buffer. Every Array
+// when neither the root nor any child data has a Buffer or validity bitmap.
+// Child metadata alone cannot keep a BufferCustodian alive. Every Array
 // fact and as_any downcast is delegated to that SAME immutable built-in array;
 // no length, type, offset, bitmap, alignment, or pointer is authored here.
 // slice delegates bounds/type construction to the original array and retains

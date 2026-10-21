@@ -22,7 +22,7 @@
 
 use super::{
     execution::{FinalTaskInfoCollector, RootResultPolls},
-    internal_result::InternalDomainSlot,
+    internal_result::{InternalDomainFailure, InternalDomainSlot},
     query_registry::ActiveQueryGuard,
 };
 use crate::{
@@ -66,7 +66,7 @@ use std::{
     time::Duration,
 };
 
-type InternalJob = InternalResultCpuJob<Result<InternalDomainSlot, String>>;
+type InternalJob = InternalResultCpuJob<Result<InternalDomainSlot, InternalDomainFailure>>;
 const LOCAL_HOLDERS: [StatementNativeLocalHolder; 5] = [
     StatementNativeLocalHolder::RootPolls,
     StatementNativeLocalHolder::InternalCpu,

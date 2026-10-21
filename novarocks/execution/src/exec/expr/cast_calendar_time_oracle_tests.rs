@@ -14,8 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Original calendar-to-TIME contract, pinned before sharing its computation.
-use super::legacy_text_time_cast_baseline_tests::{actual, modes, values};
+//! Calendar-to-TIME values follow calendar/time-of-day arithmetic, independently
+//! of the retired arena evaluator.
 use arrow::array::*;
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_functions::{
@@ -23,10 +23,20 @@ use novarocks_functions::{
     PreparedCastRecipe, Selection,
 };
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
+    CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionValueType, PureCompileControl,
 };
 use std::sync::Arc;
 use std::time::Duration;
+pub(super) fn modes() -> impl Iterator<Item = (bool, DecimalOverflowPolicy)> {
+    [false, true].into_iter().flat_map(|allow| {
+        [
+            DecimalOverflowPolicy::OutputNull,
+            DecimalOverflowPolicy::ReportError,
+        ]
+        .into_iter()
+        .map(move |policy| (allow, policy))
+    })
+}
 struct Control;
 impl PureCompileControl for Control {
     fn checkpoint(&self, _: CompilePhase, n: u32) -> Result<(), CompileControlError> {
@@ -135,17 +145,33 @@ fn expected(dtype: &DataType) -> Vec<Option<i64>> {
 }
 fn raw(dtype: DataType) {
     for (allow, policy) in modes() {
-        for datetime in [false, true] {
-            let a = corpus(&dtype);
-            assert_eq!(
-                values(&actual(a.clone(), allow, policy, datetime).unwrap()),
-                expected(&dtype)
-            );
-            assert_eq!(
-                values(&actual(a.slice(1, 6), allow, policy, datetime).unwrap()),
-                expected(&dtype)[1..7]
-            );
-            assert!(values(&actual(a.slice(0, 0), allow, policy, datetime).unwrap()).is_empty());
+        for operation in [CastOperation::Time, CastOperation::TimeFromDatetime] {
+            let source = FunctionValueType::new(dtype.clone(), true);
+            let target = FunctionValueType::new(DataType::Time64(TimeUnit::Microsecond), true);
+            let recipe =
+                PreparedCastRecipe::try_new(operation, &source, &target, policy, allow, &Control)
+                    .unwrap();
+            let input = corpus(&dtype);
+            let expected = expected(&dtype);
+            for (array, values) in [
+                (input.clone(), expected.clone()),
+                (input.slice(1, 6), expected[1..7].to_vec()),
+                (input.slice(0, 0), vec![]),
+            ] {
+                let actual = (0..array.len())
+                    .map(|row| {
+                        match recipe
+                            .evaluate_row(EvaluatedArgument::Column(&array), row, row, &Control)
+                            .unwrap()
+                        {
+                            CastRowResult::Null => None,
+                            CastRowResult::Signed(value) => Some(value),
+                            other => panic!("calendar TIME row kind: {other:?}"),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, values);
+            }
         }
     }
 }
@@ -174,20 +200,12 @@ fn differential(dtype: DataType) {
                     operation, &source, &target, policy, allow, &Control,
                 )
                 .unwrap();
-                for a in [
-                    corpus(&dtype),
-                    corpus(&dtype).slice(1, 6),
-                    corpus(&dtype).slice(0, 0),
+                let expected = expected(&dtype);
+                for (a, expect) in [
+                    (corpus(&dtype), expected.clone()),
+                    (corpus(&dtype).slice(1, 6), expected[1..7].to_vec()),
+                    (corpus(&dtype).slice(0, 0), vec![]),
                 ] {
-                    let expect = values(
-                        &actual(
-                            a.clone(),
-                            allow,
-                            policy,
-                            operation == CastOperation::TimeFromDatetime,
-                        )
-                        .unwrap(),
-                    );
                     let rows = (0..a.len())
                         .filter(|r| nullable || !a.is_null(*r))
                         .collect::<Vec<_>>();

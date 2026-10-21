@@ -18,7 +18,7 @@
 use super::super::{
     filter_conjunction_actual_sql_compiler_tests::compiler_results,
     numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue,
-    numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields,
+    sql_test_source::sql_source_with_declared_fields,
 };
 use super::*;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all};

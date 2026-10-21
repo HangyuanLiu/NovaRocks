@@ -25,7 +25,6 @@ use super::{
 use novarocks_execution::{
     exec::{
         chunk::ChunkSchemaRef,
-        expr::agg::SealedExecutionFunctionSet,
         operators::CompiledWindowProcessorFactory,
         pipeline::{
             binding::{ExchangeBindings, ScanBindings},
@@ -35,6 +34,7 @@ use novarocks_execution::{
     },
     runtime::{
         fragment::{CompiledWriterBindings, ExecutionResult},
+        function_set::SealedExecutionFunctionSet,
         preparation_metadata::{
             CompiledSchemaPreparationScope, CompiledSchemaSite, PreparationMetadataFailure,
             prepare_operator_schema_for_test,

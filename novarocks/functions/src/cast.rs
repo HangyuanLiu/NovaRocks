@@ -45,6 +45,12 @@ use std::{error::Error, fmt};
 #[path = "cast_calendar.rs"]
 mod calendar;
 
+#[path = "cast/f3_scalar.rs"]
+mod f3_scalar;
+
+#[path = "cast/f3_array.rs"]
+mod f3_array;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CastOperation {
     Carrier,
@@ -174,6 +180,12 @@ pub fn signed_integer_cast_can_produce_null(source: &DataType, target: &DataType
 /// Successful-NULL obligations of exact primitive carrier casts. This is a
 /// static semantic fact, not an installed runtime capability whitelist.
 pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow: bool) -> bool {
+    if let Some(body) = f3_scalar::profile(source, target) {
+        return body.can_produce_null(source, DecimalOverflowPolicy::OutputNull, allow);
+    }
+    if source != target && f3_array::arrow_profile(source, target) {
+        return f3_array::can_produce_null(source, target);
+    }
     if matches!(
         source,
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
@@ -191,7 +203,9 @@ pub fn carrier_cast_can_produce_null(source: &DataType, target: &DataType, allow
     {
         return true;
     }
-    if source == &DataType::Float64 && matches!(target, DataType::Decimal128(..)) {
+    if matches!(source, DataType::Float32 | DataType::Float64)
+        && matches!(target, DataType::Decimal128(..))
+    {
         return true;
     }
     if source == &DataType::Binary && target == &DataType::Utf8 {
@@ -254,6 +268,12 @@ pub fn carrier_cast_can_produce_null_with_policy(
     policy: DecimalOverflowPolicy,
     allow: bool,
 ) -> bool {
+    if let Some(body) = f3_scalar::profile(source, target) {
+        return body.can_produce_null(source, policy, allow);
+    }
+    if source != target && f3_array::arrow_profile(source, target) {
+        return f3_array::can_produce_null(source, target);
+    }
     if matches!(
         source,
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
@@ -372,6 +392,8 @@ impl DecimalTextSource {
 /// What a prepared cast does to a value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CastBody {
+    ExtendedScalar(f3_scalar::Body),
+    SelectedArray(f3_array::Body),
     /// Original List retag/null-child computation on an exact selected domain.
     Collection,
     IntegralDecimal {
@@ -454,7 +476,36 @@ impl PreparedCastRecipe {
             if operation == CastOperation::Carrier
                 && source.logical_type() == ValueLogicalType::Physical
                 && result.logical_type() == ValueLogicalType::Physical
-                && source.data_type() == &DataType::Float64
+            {
+                // The original Arrow path only admits DATE's Int32/Int64 epoch
+                // projection. Do not prepare a row operation for narrower ints.
+                if source.data_type() == &DataType::Date32
+                    && matches!(result.data_type(), DataType::Int8 | DataType::Int16)
+                {
+                    return Err(CastPrepareError::Unsupported);
+                }
+                if let Some(body) = f3_scalar::profile(source.data_type(), result.data_type()) {
+                    if (source.nullable()
+                        || body.can_produce_null(source.data_type(), policy, allow_throw_exception))
+                        && !result.nullable()
+                    {
+                        return Err(CastPrepareError::TypeMismatch);
+                    }
+                    work.step()?;
+                    return Ok(Self {
+                        operation,
+                        source: source.clone(),
+                        result: result.clone(),
+                        body: CastBody::ExtendedScalar(body),
+                        decimal_overflow_policy: policy,
+                        allow_throw_exception,
+                    });
+                }
+            }
+            if operation == CastOperation::Carrier
+                && source.logical_type() == ValueLogicalType::Physical
+                && result.logical_type() == ValueLogicalType::Physical
+                && matches!(source.data_type(), DataType::Float32 | DataType::Float64)
                 && let DataType::Decimal128(precision, scale) = result.data_type()
             {
                 // Original successful NULLs occur for nonfinite/overflow input
@@ -542,8 +593,9 @@ impl PreparedCastRecipe {
             }
             // A Physical carrier with no primitive conversion kernel is still
             // exactly castable to itself: the value passes unchanged and only
-            // the frozen nullability may widen. Nominal identities are not a
-            // Physical scalar profile and stay refused.
+            // the frozen nullability may widen. The exact nominal LARGEINT
+            // domain also has this identity; no nominal domain is inferred from
+            // its FixedSizeBinary carrier.
             let identity = operation == CastOperation::Carrier
                 && source.data_type() == result.data_type()
                 && source
@@ -551,8 +603,11 @@ impl PreparedCastRecipe {
                         work.step().map_err(crate::kernel_control::compile_failure)
                     })
                     .map_err(CastPrepareError::Kernel)?
-                && source.logical_type() == ValueLogicalType::Physical
-                && result.logical_type() == ValueLogicalType::Physical
+                && ((source.logical_type() == ValueLogicalType::Physical
+                    && result.logical_type() == ValueLogicalType::Physical)
+                    || (source.logical_type() == ValueLogicalType::LargeInt
+                        && result.logical_type() == ValueLogicalType::LargeInt
+                        && source.data_type() == &DataType::FixedSizeBinary(16)))
                 && (Source::from_type(source.data_type()).is_none()
                     || Target::from_type(result.data_type()).is_none());
             work.step()?;
@@ -735,6 +790,16 @@ impl PreparedCastRecipe {
                     source: source.clone(),
                     result: result.clone(),
                     body: CastBody::LargeIntText,
+                    decimal_overflow_policy: policy,
+                    allow_throw_exception,
+                });
+            }
+            if let Some(body) = f3_array::prepare(source, result, &mut work)? {
+                return Ok(Self {
+                    operation,
+                    source: source.clone(),
+                    result: result.clone(),
+                    body: CastBody::SelectedArray(body),
                     decimal_overflow_policy: policy,
                     allow_throw_exception,
                 });
@@ -925,8 +990,39 @@ impl PreparedCastRecipe {
             control,
         )
     }
+    /// Exact array-valued cast bodies use the selected invocation port instead
+    /// of forcing nested/byte/wide-decimal values through a scalar result enum.
+    pub fn uses_selected_array(&self) -> bool {
+        matches!(self.body, CastBody::Collection | CastBody::SelectedArray(_))
+    }
+    pub fn evaluate_selected_array<'a>(
+        &self,
+        argument: EvaluatedArgument<'_>,
+        selection: crate::Selection<'a>,
+        inherited: &[RowDataError],
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<crate::SelectedValues<'a>, KernelFailure> {
+        match self.body {
+            CastBody::Collection => {
+                self.evaluate_collection(argument, selection, inherited, control)
+            }
+            CastBody::SelectedArray(body) => {
+                f3_array::evaluate(body, self, argument, selection, inherited, control)
+            }
+            _ => Err(invalid(
+                "selected array invocation requires its prepared CAST body",
+            )),
+        }
+    }
     pub fn own_effects(&self, context: ExpressionEffectContext) -> ScopedExpressionEffects {
         let may_raise_row_error = match self.body {
+            CastBody::SelectedArray(f3_array::Body::ArrowScalar) => true,
+            CastBody::SelectedArray(f3_array::Body::Structure) => false,
+            CastBody::ExtendedScalar(body) => body.may_raise(
+                self.source.data_type(),
+                self.decimal_overflow_policy,
+                self.allow_throw_exception,
+            ),
             CastBody::IntegralDecimal { .. } => crate::integral_decimal128::may_raise(
                 self.source.data_type(),
                 self.result.data_type(),
@@ -946,8 +1042,8 @@ impl PreparedCastRecipe {
             // Preserve original signed MIN abs and -128 negation panics; static
             // factor errors also retain their real selected row attribution.
             CastBody::FloatDecimal { .. } => true,
-            // Raw Date32 admits invalid days and original unchecked arithmetic.
-            // Preserve its data error and overflow panic rather than promising never-fails.
+            // Raw Date32 admits invalid days. Checked calendar conversion
+            // retains their row-data errors under every build profile.
             CastBody::DateFloat { .. } => true,
             // Conservatively retain failure awareness for the original i128 MIN
             // positive-scale abs bug; do not translate its panic into a row error.
@@ -1012,8 +1108,13 @@ impl PreparedCastRecipe {
         control.checkpoint(0)?;
         let mut work = EvaluationCheckpoints::new(control);
         let outcome = (|| {
-            if self.is_collection() {
-                return Err(invalid("List CAST requires its actual selected invocation"));
+            if self.uses_selected_array() {
+                return Err(invalid(
+                    "array CAST requires its actual selected invocation",
+                ));
+            }
+            if let CastBody::ExtendedScalar(body) = self.body {
+                return body.evaluate(self, argument, ordinal, logical_row, &mut work);
             }
             if let CastBody::FloatDecimal { precision, scale } = self.body {
                 let row = self.checked_row_with_shape(
@@ -1021,7 +1122,11 @@ impl PreparedCastRecipe {
                     ordinal,
                     logical_row,
                     &mut work,
-                    |array| array.as_any().is::<Float64Array>(),
+                    |array| match self.source.data_type() {
+                        DataType::Float32 => array.as_any().is::<Float32Array>(),
+                        DataType::Float64 => array.as_any().is::<Float64Array>(),
+                        _ => false,
+                    },
                 )?;
                 // Static factors precede NULL masking exactly as the original
                 // Types array conversion. No value is validated during prepare.
@@ -1049,12 +1154,23 @@ impl PreparedCastRecipe {
                         ))
                     };
                 }
-                let value = argument
-                    .array()
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .ok_or_else(|| internal("float Decimal source has a foreign carrier"))?
-                    .value(row);
+                let value = match self.source.data_type() {
+                    DataType::Float32 => f64::from(
+                        argument
+                            .array()
+                            .as_any()
+                            .downcast_ref::<Float32Array>()
+                            .ok_or_else(|| internal("float Decimal source has a foreign carrier"))?
+                            .value(row),
+                    ),
+                    DataType::Float64 => argument
+                        .array()
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .ok_or_else(|| internal("float Decimal source has a foreign carrier"))?
+                        .value(row),
+                    _ => return Err(internal("float Decimal source lost its frozen carrier")),
+                };
                 work.step()?;
                 return Ok(
                     match factors.expr_value(value, precision, self.decimal_overflow_policy) {
@@ -1991,7 +2107,7 @@ impl PreparedCastRecipe {
         work: &mut EvaluationCheckpoints<'_>,
         concrete_shape: impl FnOnce(&dyn Array) -> bool,
     ) -> Result<usize, KernelFailure> {
-        if let EvaluatedArgument::Constant(value) = argument {
+        if let Some(value) = argument.constant_value() {
             let actual = value.value_type();
             let matches = actual.fits_value_type_observed(&self.source, || work.step())?;
             work.step()?;
@@ -2009,6 +2125,7 @@ impl PreparedCastRecipe {
         }
         let shape = match argument {
             EvaluatedArgument::Scalar(array) => array.len() == 1,
+            EvaluatedArgument::ConstantView(value) => value.has_original_shape(),
             EvaluatedArgument::SelectedColumn(values) => {
                 values.selection().row(ordinal) == Some(logical_row)
             }

@@ -900,16 +900,23 @@ fn null_predicates_preserve_authored_uuid_and_variant_operand_domains_in_exact_c
 #[test]
 fn physical_unary_type_and_control_contradictions_cannot_publish_a_local_program() {
     let functions = functions();
-    assert!(match fixture(
-        &functions,
-        Operation::Not,
-        Mode::Project,
-        FunctionValueType::new(DataType::Int64, true),
-        Claim::Accurate
-    ) {
-        Err(error) => error.is_producer_defect(),
-        Ok(_) => false,
-    });
+    // Numeric physical NOT is supported; raw text and nominal JSON are not.
+    for input_type in [
+        FunctionValueType::new(DataType::Utf8, true),
+        FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+            .unwrap(),
+    ] {
+        assert!(match fixture(
+            &functions,
+            Operation::Not,
+            Mode::Project,
+            input_type,
+            Claim::Accurate
+        ) {
+            Err(error) => error.is_producer_defect(),
+            Ok(_) => false,
+        });
+    }
     for operation in [Operation::Not, Operation::IsNull, Operation::IsNotNull] {
         assert!(match fixture(
             &functions,

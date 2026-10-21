@@ -113,3 +113,51 @@ fn extrema_core_retains_bounded_typed_carrier_failure() {
         assert!(error.to_string().len() <= 512);
     }
 }
+
+#[test]
+fn f3_extrema_values_have_handwritten_numeric_and_strict_null_oracles() {
+    // Derivation: greatest/least choose max/min of [-2,5] and [9,3].
+    // Any NULL argument makes that row NULL under the frozen strict rule.
+    let arrays = [
+        Arc::new(arrow_array::Float64Array::from(vec![
+            Some(-2.0),
+            Some(9.0),
+            None,
+        ])) as ArrayRef,
+        Arc::new(arrow_array::Float64Array::from(vec![
+            Some(5.0),
+            Some(3.0),
+            Some(7.0),
+        ])) as ArrayRef,
+    ];
+    let arguments = arrays
+        .iter()
+        .map(EvaluatedArgument::Column)
+        .collect::<Vec<_>>();
+    for (operation, expected) in [
+        (ExtremaOperation::Greatest, vec![Some(5.0), Some(9.0), None]),
+        (ExtremaOperation::Least, vec![Some(-2.0), Some(3.0), None]),
+    ] {
+        let control = Control {
+            calls: AtomicUsize::new(0),
+            reject: None,
+            cause: KernelFailure::Cancelled,
+        };
+        let mut work = EvaluationCheckpoints::new(&control);
+        let output = evaluate_values(
+            operation,
+            &arguments,
+            Selection::all(3),
+            Some(&DataType::Float64),
+            false,
+            &mut work,
+            None,
+        )
+        .unwrap();
+        let values = output
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), expected);
+    }
+}

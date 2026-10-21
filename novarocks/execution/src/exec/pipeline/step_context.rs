@@ -182,16 +182,6 @@ impl<'a> StepContext<'a> {
     }
 }
 
-impl crate::exec::expr::ExprEvaluationControl for StepContext<'_> {
-    fn checkpoint(&self) -> ExecutionResult<()> {
-        StepContext::checkpoint(self)
-    }
-    fn wait(&self, duration: std::time::Duration) -> ExecutionResult<()> {
-        self.control.wait_until_stopped(duration);
-        StepContext::checkpoint(self)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

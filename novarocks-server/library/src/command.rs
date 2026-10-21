@@ -142,7 +142,9 @@ fn run_backend(
     role: launch::RoleConfig,
     native_compatibility_id: NativeCompatibilityId,
     static_plan: &ServerStaticPlan,
-    function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
+    function_set: std::sync::Arc<
+        novarocks_execution::runtime::function_set::SealedExecutionFunctionSet,
+    >,
     provider_manifest: Arc<ServerProviderManifest>,
     memory_authority: Arc<MemoryAuthority>,
     runtime: &tokio::runtime::Runtime,
@@ -209,7 +211,9 @@ async fn run_all_in_one(
     be: launch::RoleConfig,
     native_compatibility_id: NativeCompatibilityId,
     static_plan: &ServerStaticPlan,
-    function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
+    function_set: std::sync::Arc<
+        novarocks_execution::runtime::function_set::SealedExecutionFunctionSet,
+    >,
     provider_manifest: Arc<ServerProviderManifest>,
     memory_authority: Arc<MemoryAuthority>,
     runtime: tokio::runtime::Handle,
@@ -377,13 +381,11 @@ fn run(
     let native_compatibility = native_compatibility::resolve_native_compatibility_material(
         provider_manifest.contracts(),
         functions.digest(),
-        function_set.implementation_manifest_digest(),
         static_plan.compatibility_component(),
     )?;
     tracing::info!(
         native_compatibility_id = %native_compatibility.id(),
         function_catalog_digest = %hex::encode(functions.digest()),
-        execution_implementation_manifest_digest = %hex::encode(function_set.implementation_manifest_digest()),
         static_plan_interpreter = ?native_compatibility.static_plan_interpreter(),
         static_plan_interpreter_digest = %hex::encode(native_compatibility.static_plan_interpreter_digest()),
         build_identity = build.native_build_identity,
@@ -438,6 +440,12 @@ mod tests {
         let value = super::build_information_value(&build).expect("build information");
         let again = super::build_information_value(&build).expect("repeated build information");
         assert_eq!(value, again, "support reporting is deterministic");
+        assert!(
+            !value
+                .to_string()
+                .contains("execution_implementation_manifest_digest"),
+            "build information contains only current compatibility facts"
+        );
         let interpreter = &value["static_plan_interpreter"];
         assert_eq!(interpreter["name"], "compiled_package");
         let sealed = interpreter["sealed_definition_count"].as_u64().unwrap() as usize;
@@ -601,7 +609,6 @@ mod tests {
             assert!(installed.effects().environment_dependencies.is_empty());
         }
         assert_ne!(catalog.digest(), [0; 32]);
-        assert_ne!(function_set.implementation_manifest_digest(), [0; 32]);
     }
 }
 

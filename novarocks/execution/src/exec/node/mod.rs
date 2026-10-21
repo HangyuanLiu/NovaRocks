@@ -14,13 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub mod aggregate;
-pub mod analytic;
 pub mod assert;
-pub mod change_event_expand;
 pub mod join;
 pub mod nljoin;
-pub mod runtime_filter;
 pub mod scan;
 pub mod set_op;
 pub mod sort;

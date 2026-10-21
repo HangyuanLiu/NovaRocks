@@ -117,23 +117,16 @@ use novarocks_spi::connector::write_stack::{
 };
 
 use crate::exec::chunk::{Chunk, ChunkSchema, record_batch_additional_bytes, record_batch_bytes};
-use crate::exec::expr::agg::SealedExecutionFunctionSet;
-use crate::exec::expr::{ExprArena, ExprNode};
-use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 use crate::exec::node::table_write_relation::{
-    ConnectorCommitFragmentEncoder, WriterMultiplexRelationSchema, WriterMultiplexRelationTemplate,
-    WriterRelationPreparation,
+    ConnectorCommitFragmentEncoder, WriterMultiplexRelationTemplate, WriterRelationPreparation,
 };
 #[cfg(novarocks_dev_controls)]
 use crate::exec::node::table_write_relation::{
     TableWriteAggregateBoundary, TableWriteAggregateGuard,
 };
-#[cfg(test)]
-use crate::exec::node::table_writer::WriterFixture;
 use crate::exec::node::table_writer::{
-    TableWriterInputProjection, TableWriterPhysicalContextTemplate, TableWriterRuntimeBinding,
+    TableWriterPhysicalContextTemplate, TableWriterRuntimeBinding,
 };
-use crate::exec::operators::AggregateProcessorFactory;
 use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::pipeline::async_writer::{AsyncWriterOwner, AsyncWriterQueueConfig};
 use crate::exec::pipeline::operator::{FinishWatch, InputEncodingPolicy, Operator};
@@ -179,8 +172,7 @@ struct TableWriterPlan {
     writer_multiplex_schema: WriterRelationPreparation,
     /// Each driver's partial aggregate over its projected pages, emitting one
     /// state row whose auxiliary channels the writer packs as sparse
-    /// `AGGREGATE_PARTIAL` rows. A plan-tree writer binds it from the
-    /// process function set; a compiled writer from its prepared calls.
+    /// `AGGREGATE_PARTIAL` rows, through its genuine compiled prepared calls.
     partial_aggregate_factory: Option<Arc<dyn OperatorFactory>>,
     #[cfg(test)]
     local_partial_source: Option<LocalPreparedWriterPartial>,
@@ -207,28 +199,6 @@ pub(crate) trait WriterProjectionFactory: Send + Sync {
     fn create(&self) -> Box<dyn WriterPageProjection>;
 }
 
-impl WriterPageProjection for TableWriterInputProjection {
-    fn prepare(
-        &mut self,
-        factory: Option<&Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
-    ) -> ExecutionResult<()> {
-        self.prepare_created(factory)
-    }
-    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
-        self.bind_evaluation_runtime_state(state);
-        Ok(())
-    }
-    fn project(&mut self, chunk: &Chunk) -> ExecutionResult<Chunk> {
-        self.project_created(chunk)
-    }
-}
-
-impl WriterProjectionFactory for TableWriterInputProjection {
-    fn create(&self) -> Box<dyn WriterPageProjection> {
-        Box::new(self.clone())
-    }
-}
-
 /// Factory for per-driver table writers.
 ///
 /// It deliberately holds no writer, no mutex, and no driver accounting: every
@@ -239,66 +209,6 @@ pub struct TableWriterOperatorFactory {
 }
 
 impl TableWriterOperatorFactory {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "A local writer joins frozen facts and exact Task capabilities"
-    )]
-    #[cfg(test)]
-    pub(crate) fn try_new_local(
-        node_id: i32,
-        target: WriteTargetOrdinal,
-        expected_schema: arrow::datatypes::SchemaRef,
-        projection: TableWriterInputProjection,
-        writer_multiplex_schema: WriterMultiplexRelationTemplate,
-        prepared_partials: Option<novarocks_local_program::PreparedWriterAggregateCalls>,
-        partial_input_layout: novarocks_local_program::StaticLayout,
-        partial_output_layout: novarocks_local_program::StaticLayout,
-        error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
-        binding: &TableWriterRuntimeBinding,
-    ) -> ExecutionResult<Self> {
-        if binding.execution.catalog_handle() != binding.handle.binding().catalog_handle() {
-            return Err(writer_contract(
-                "table writer catalog handle does not match its query-leased write execution",
-            ));
-        }
-        if projection.schema().as_ref() != expected_schema.as_ref() {
-            return Err(writer_contract(
-                "table writer input projection does not produce the expected writer schema",
-            ));
-        }
-        let local_partial_source = prepared_partials.map(|calls| LocalPreparedWriterPartial {
-            calls,
-            input_layout: partial_input_layout,
-            output_layout: partial_output_layout,
-            error,
-        });
-        let name = if node_id >= 0 {
-            format!("TABLE_WRITER (id={node_id})")
-        } else {
-            "TABLE_WRITER".to_string()
-        };
-        Ok(Self {
-            name,
-            plan: Arc::new(TableWriterPlan {
-                handle: binding.handle.clone(),
-                target,
-                execution: Arc::clone(&binding.execution),
-                expected_schema,
-                projection: Arc::new(projection),
-                physical_template: binding.physical_template,
-                request_context: binding.request_context.clone(),
-                fragment_encoder: Arc::clone(&binding.fragment_encoder),
-                writer_multiplex_schema: WriterRelationPreparation::compiled(
-                    writer_multiplex_schema,
-                ),
-                partial_aggregate_factory: None,
-                local_partial_source,
-                #[cfg(novarocks_dev_controls)]
-                aggregate_guard: Arc::clone(&binding.aggregate_guard),
-            }),
-        })
-    }
-
     /// A compiled writer: its projection evaluates the program's
     /// WriterProjection roots onto the exact provider schema, and its
     /// statistics, if any, run the program's prepared partial calls. It reads
@@ -345,240 +255,55 @@ impl TableWriterOperatorFactory {
         })
     }
 
-    /// Construct a composite writer with the exact process function set used
-    /// to bind every ordinary partial aggregate in its typed tail.
+    /// Fixture-only composition through the actual compiled projection and
+    /// immutable prepared COUNT handles; no erased aggregate or arena bridge.
     #[cfg(test)]
     fn for_test_fixture(
-        node: &WriterFixture,
-        function_set: Arc<SealedExecutionFunctionSet>,
+        node: &tests::WriterFixture,
+        state: &RuntimeState,
     ) -> ExecutionResult<Self> {
-        let name = if node.node_id >= 0 {
-            format!("TABLE_WRITER (id={})", node.node_id)
-        } else {
-            "TABLE_WRITER".to_string()
-        };
-        let partial_aggregate_factory = build_partial_aggregate_factory(
+        Self::for_test_fixture_with_projection_layout(node, state).map(|(factory, _)| factory)
+    }
+
+    #[cfg(test)]
+    fn for_test_fixture_with_projection_layout(
+        node: &tests::WriterFixture,
+        state: &RuntimeState,
+    ) -> ExecutionResult<(Self, novarocks_local_program::StaticLayout)> {
+        let (program, projection, _) = tests::compiled_projection(
+            node.projection.ty.clone(),
+            node.expected_schema.clone(),
+            state.error_state(),
+        );
+        let relation_layout = tests::relation_layout(node.writer_multiplex_schema.chunk_schema());
+        let relation = WriterMultiplexRelationTemplate::try_new(&relation_layout)?;
+        let mut factory = Self::try_new_compiled(
             node.node_id,
-            &node.partial_aggregate_plan().calls,
-            node.writer_multiplex_schema(),
-            function_set,
-        )?
-        .map(|factory| Arc::new(factory) as Arc<dyn OperatorFactory>);
-        Ok(Self {
-            name,
-            plan: Arc::new(TableWriterPlan {
-                handle: node.handle().clone(),
-                target: node.target(),
-                execution: Arc::clone(node.execution()),
-                expected_schema: Arc::clone(node.expected_schema()),
-                projection: Arc::new(node.projection().clone()),
-                physical_template: node.physical_template(),
-                request_context: node.request_context().clone(),
-                fragment_encoder: Arc::clone(node.fragment_encoder()),
-                writer_multiplex_schema: WriterRelationPreparation::Existing(
-                    node.writer_multiplex_schema().clone(),
-                ),
-                partial_aggregate_factory,
-                #[cfg(test)]
-                local_partial_source: None,
-                #[cfg(novarocks_dev_controls)]
-                aggregate_guard: Arc::clone(node.aggregate_guard()),
-            }),
-        })
-    }
-}
-
-/// Explicit construction-plan expansion adapter; local preparation supplies
-/// the actual owner and requires complete frozen selection facts.
-#[cfg(test)]
-fn build_partial_aggregate_factory(
-    node_id: i32,
-    calls: &[crate::exec::node::table_write_aggregate::WriterPartialAggregateCall],
-    writer_multiplex_schema: &WriterMultiplexRelationSchema,
-    function_set: Arc<SealedExecutionFunctionSet>,
-) -> ExecutionResult<Option<AggregateProcessorFactory>> {
-    build_partial_aggregate_factory_core(
-        node_id,
-        calls,
-        writer_multiplex_schema,
-        function_set,
-        None,
-    )
-}
-
-#[cfg(test)]
-fn build_partial_aggregate_factory_core(
-    node_id: i32,
-    calls: &[crate::exec::node::table_write_aggregate::WriterPartialAggregateCall],
-    writer_multiplex_schema: &WriterMultiplexRelationSchema,
-    function_set: Arc<SealedExecutionFunctionSet>,
-    owner: Option<&dyn crate::exec::pipeline::operator::InputConstructionOwner>,
-) -> ExecutionResult<Option<AggregateProcessorFactory>> {
-    if calls.is_empty() {
-        return Ok(None);
-    }
-    let mut arena = ExprArena::default();
-    let mut functions = Vec::with_capacity(calls.len());
-    let mut resolved = Vec::with_capacity(calls.len());
-    if let Some(owner) = owner {
-        owner.request(
-            std::alloc::Layout::array::<crate::exec::chunk::ChunkSlotSchema>(calls.len()).map_err(
-                |_| {
-                    crate::exec::pipeline::operator::ConstructionFailure::Control(
-                        novarocks_type_contract::CompileControlError::ResourceExhausted,
-                    )
-                },
-            )?,
+            node.target,
+            node.expected_schema.clone(),
+            projection,
+            relation,
+            None,
+            &node.binding,
         )?;
-    }
-    let mut output_slots = Vec::new();
-    output_slots.try_reserve_exact(calls.len()).map_err(|_| {
-        crate::exec::pipeline::operator::ConstructionFailure::Control(
-            novarocks_type_contract::CompileControlError::ResourceExhausted,
-        )
-    })?;
-    for call in calls {
-        if call.resolved.argument_types.len() != 1 {
-            return Err(writer_contract(format_args!(
-                "writer partial aggregate {} requires exactly one planned input type, got {}",
-                call.function_name,
-                call.resolved.argument_types.len()
-            )));
-        }
-        let input_type = call
-            .resolved
-            .argument_types
-            .first()
-            .ok_or_else(|| writer_contract("writer partial aggregate input type is missing"))?
-            .clone();
-        let input = if owner.is_some() {
-            let frozen = call.frozen.as_ref().ok_or_else(|| {
-                writer_contract("writer partial aggregate lacks its complete frozen selection")
-            })?;
-            let [novarocks_type_contract::FunctionArgumentType::Value(value)] =
-                frozen.selected().argument_types.as_slice()
-            else {
-                return Err(writer_contract(
-                    "writer partial aggregate frozen input is not one complete scalar",
-                ));
-            };
-            if value.data_type() != &input_type {
-                return Err(writer_contract(
-                    "writer partial aggregate frozen input differs from its resolved layout",
-                ));
-            }
-            arena.push_value_typed(ExprNode::SlotId(call.input_slot_id), value.clone())
-        } else {
-            arena.push_typed(ExprNode::SlotId(call.input_slot_id), input_type.clone())
+        let novarocks_local_program::ProgramNodeKind::TableWriter { projection, .. } =
+            program.graph().nodes()[program.graph().root().index()].kind()
+        else {
+            unreachable!()
         };
-        functions.push(AggFunction {
-            frozen: call.frozen.clone(),
-            name: call.function_name.to_string(),
-            inputs: vec![input],
-            input_is_intermediate: false,
-            types: Some(AggTypeSignature {
-                intermediate_type: Some(call.resolved.intermediate_type.clone()),
-                output_type: Some(call.resolved.output_type.clone()),
-                input_arg_type: Some(input_type),
-            }),
-            order: Default::default(),
-        });
-        resolved.push(call.resolved.clone());
-        let output_slot = writer_multiplex_schema
-            .chunk_schema()
-            .slot(call.intermediate_slot_id)
-            .cloned()
-            .ok_or_else(|| {
-                writer_contract(format_args!(
-                    "writer partial aggregate output slot {} is absent from the multiplex schema",
-                    call.intermediate_slot_id
-                ))
-            })?;
-        if let Some(owner) = owner {
-            let frozen = call.frozen.as_ref().ok_or_else(|| {
-                writer_contract("writer partial aggregate lacks its complete frozen selection")
-            })?;
-            let selected = frozen.selected().aggregate.as_ref().ok_or_else(|| {
-                writer_contract("writer partial frozen selection has no aggregate signature")
-            })?;
-            let actual = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
-                output_slot.typed_binding().clone(),
-            )
-            .map_err(ExecutionFailure::from_domain)?;
-            if selected.intermediate_type.data_type() != &call.resolved.intermediate_type
-                || !actual.same_physical_binding_ignoring_root_nullability_observed(
-                    &selected.intermediate_type,
-                    || {
-                        owner.observe(
-                            0,
-                            &[],
-                            crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
-                                units: 1,
-                            },
-                        )
-                    },
-                )?
-            {
-                return Err(writer_contract(format_args!(
-                    "writer partial aggregate output slot {} type mismatch: relation={:?}, frozen={:?}",
-                    call.intermediate_slot_id, actual, selected.intermediate_type
-                )));
-            }
-        } else if output_slot.data_type() != &call.resolved.intermediate_type {
-            return Err(writer_contract(format_args!(
-                "writer partial aggregate output slot {} type mismatch: relation={:?}, resolved={:?}",
-                call.intermediate_slot_id,
-                output_slot.data_type(),
-                call.resolved.intermediate_type
-            )));
+        let projection_layout = projection.layout.clone();
+        if node.partial_count != 0 {
+            Arc::get_mut(&mut factory.plan)
+                .expect("unpublished fixture plan")
+                .local_partial_source = Some(tests::prepare_count_source(
+                node.partial_count,
+                projection.layout.clone(),
+                relation_layout,
+                state,
+            ));
         }
-        output_slots.push(output_slot);
+        Ok((factory, projection_layout))
     }
-    let output_chunk_schema = match owner {
-        Some(owner) => {
-            let schema = ChunkSchema::try_new_typed_observed::<
-                crate::exec::pipeline::operator::ConstructionFailure,
-            >(
-                output_slots,
-                owner.storage_lifetime(),
-                |layout| owner.request(layout),
-                |units| {
-                    owner.observe(
-                        0,
-                        &[],
-                        crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
-                            units,
-                        },
-                    )
-                },
-            )?;
-            owner.request(
-                novarocks_type_contract::owned_resources::layout::arc_layout(
-                    std::alloc::Layout::new::<ChunkSchema>(),
-                )
-                .map_err(crate::exec::pipeline::operator::ConstructionFailure::Resource)?,
-            )?;
-            Arc::new(schema)
-        }
-        None => Arc::new(ChunkSchema::try_new(output_slots)?),
-    };
-    AggregateProcessorFactory::new_native(
-        node_id,
-        Arc::new(arena),
-        Vec::new(),
-        functions,
-        function_set,
-        resolved,
-        true,
-        false,
-        output_chunk_schema,
-        Vec::new(),
-        None,
-        1,
-        None,
-    )
-    .map(Some)
-    .map_err(Into::into)
 }
 
 impl TableWriterOperatorFactory {
@@ -1394,6 +1119,9 @@ impl TableWriterOperator {
 
     #[cfg(test)]
     fn replace_partial_aggregate_for_test(&mut self, partial: Box<dyn Operator>) {
+        // A replacement is the actual child under test. Do not let prepare
+        // silently overwrite it with the deferred compiled COUNT fixture.
+        self.local_partial_source = None;
         let mut child = ChildStep::new(partial, self.readiness_observable.clone());
         if let Some(control) = &self.runtime_error {
             child
@@ -1908,10 +1636,6 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::exec::chunk::ChunkSchema;
-    use crate::exec::expr::{ExprArena, ExprNode};
-    use crate::exec::node::table_write_aggregate::{
-        WriterPartialAggregateCall, WriterPartialAggregatePlan,
-    };
     use crate::exec::node::table_write_relation::WriterMultiplexRelationSchema;
     use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
     use crate::exec::pipeline::fragment_context::FragmentContext;
@@ -1982,9 +1706,15 @@ pub(crate) mod tests {
     }
 
     fn install_construction(operator: &mut dyn Operator, state: &RuntimeState) {
+        let tracker = state
+            .mem_tracker()
+            .unwrap_or_else(|| MemTracker::new_root("writer input construction fixture"));
+        // Bind the actual allocation host used by compiled finite-input
+        // custody, on the same tracker as this operation's construction owner.
+        operator.set_mem_tracker(tracker.clone());
         let construction = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
             crate::exec::pipeline::pipeline::representation_construction_profile().expect("actual runtime construction profile"),
-            MemTracker::new_root("writer input construction fixture"), state.error_state(),
+            tracker, state.error_state(),
         ).expect("actual construction factory");
         operator.set_construction_factory(construction);
     }
@@ -2048,7 +1778,11 @@ pub(crate) mod tests {
         with_step(state, |ctx| {
             let step = operator;
             if operation == PipelineOperation::Finishing {
-                step.finish(ctx).unwrap();
+                // StepOperator EOS is a no-payload control signal. Any
+                // finalization output/failure is observed by admitted drive.
+                if let Err(error) = step.finish(ctx) {
+                    return error;
+                }
             }
             for _ in 0..64 {
                 match step.drive(ctx) {
@@ -2159,6 +1893,7 @@ pub(crate) mod tests {
     }
 
     struct ProjectedInputObserver {
+        value_slot: SlotId,
         values: Arc<std::sync::Mutex<Vec<i64>>>,
         finishing: bool,
         cancelled: bool,
@@ -2183,7 +1918,7 @@ pub(crate) mod tests {
         ) -> ExecutionResult<StepResult> {
             let chunk = chunk.into_uncovered_chunk()?;
             let values = chunk
-                .column_by_slot_id(SlotId::new(1))?
+                .column_by_slot_id(self.value_slot)?
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| {
@@ -2358,9 +2093,9 @@ pub(crate) mod tests {
             ] {
                 let stats = Arc::new(WriteExecutionStats::default());
                 let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
-                let (node, functions) = writer_fixture_with_count_partials(execution, 1);
-                let factory =
-                    TableWriterOperatorFactory::for_test_fixture(&node, functions).unwrap();
+                let node = writer_fixture_with_count_partials(execution, 1);
+                let state = test_runtime_state();
+                let factory = writer_factory(&node, &state);
                 let mut operator = factory.create_operator(1, 0);
                 let original: ExecutionFailure = cause.clone().into();
                 operator
@@ -2372,7 +2107,7 @@ pub(crate) mod tests {
                             cancelled: false,
                         },
                     )));
-                let state = test_runtime_state();
+
                 install_construction(&mut operator, &state);
                 operator.prepare().unwrap();
                 operator.bind_runtime_state(&state).unwrap();
@@ -2657,45 +2392,146 @@ pub(crate) mod tests {
         Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]))
     }
 
+    #[derive(Clone)]
+    pub(crate) struct ProjectionRecipe {
+        pub(super) ty: novarocks_type_contract::FunctionValueType,
+        schema: arrow::datatypes::SchemaRef,
+    }
+    pub(crate) struct WriterFixture {
+        pub(super) node_id: i32,
+        pub(super) binding: TableWriterRuntimeBinding,
+        pub(super) target: WriteTargetOrdinal,
+        pub(super) expected_schema: arrow::datatypes::SchemaRef,
+        pub(super) projection: ProjectionRecipe,
+        pub(super) writer_multiplex_schema: WriterMultiplexRelationSchema,
+        pub(super) partial_count: usize,
+    }
+    impl std::fmt::Debug for WriterFixture {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("WriterFixture")
+                .field("node_id", &self.node_id)
+                .finish_non_exhaustive()
+        }
+    }
+    impl WriterFixture {
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "independent writer fixture declarations and runtime capability"
+        )]
+        pub(crate) fn try_new(
+            node_id: i32,
+            handle: ConnectorWriterHandle,
+            target: WriteTargetOrdinal,
+            execution: Arc<dyn ConnectorWriteExecution>,
+            expected_schema: arrow::datatypes::SchemaRef,
+            projection: ProjectionRecipe,
+            physical: TableWriterPhysicalContextTemplate,
+            request: ConnectorRequestContext,
+            encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
+        ) -> Result<Self, crate::exec::fragment::error::ExecPlanBuildError> {
+            Self::try_new_with_relation(
+                node_id,
+                handle,
+                target,
+                execution,
+                expected_schema,
+                projection,
+                physical,
+                request,
+                encoder,
+                WriterMultiplexRelationSchema::empty(),
+                0,
+            )
+        }
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "independent writer fixture declarations and runtime capability"
+        )]
+        pub(crate) fn try_new_with_relation(
+            node_id: i32,
+            handle: ConnectorWriterHandle,
+            target: WriteTargetOrdinal,
+            execution: Arc<dyn ConnectorWriteExecution>,
+            expected_schema: arrow::datatypes::SchemaRef,
+            projection: ProjectionRecipe,
+            physical: TableWriterPhysicalContextTemplate,
+            request: ConnectorRequestContext,
+            encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
+            relation: WriterMultiplexRelationSchema,
+            partial_count: usize,
+        ) -> Result<Self, crate::exec::fragment::error::ExecPlanBuildError> {
+            let binding =
+                TableWriterRuntimeBinding::try_new(handle, execution, physical, request, encoder)?;
+            if projection.schema.as_ref() != expected_schema.as_ref() {
+                return Err(crate::exec::fragment::error::ExecPlanBuildError::new(
+                    crate::exec::fragment::error::ExecPlanInvariant::Schema,
+                    "table writer input projection does not produce the expected writer schema",
+                ));
+            }
+            Ok(Self {
+                node_id,
+                binding,
+                target,
+                expected_schema,
+                projection,
+                writer_multiplex_schema: relation,
+                partial_count,
+            })
+        }
+        #[cfg(novarocks_dev_controls)]
+        fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateGuard>) -> Self {
+            self.binding = self.binding.with_aggregate_guard(guard);
+            self
+        }
+        fn writer_multiplex_schema(&self) -> &WriterMultiplexRelationSchema {
+            &self.writer_multiplex_schema
+        }
+    }
+    pub(crate) fn identity_projection() -> ProjectionRecipe {
+        ProjectionRecipe {
+            ty: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+            schema: writer_input_schema(),
+        }
+    }
     fn typed_writer_input_schema() -> crate::exec::chunk::ChunkSchemaRef {
-        let schema = writer_input_schema();
+        let (_, _, layout) = compiled_projection(
+            identity_projection().ty,
+            writer_input_schema(),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        );
         let value = novarocks_type_contract::FunctionValueType::new(DataType::Int32, false);
         let slot = crate::exec::chunk::ChunkSlotSchema::try_new_typed(
             SlotId::new(1),
-            schema.fields()[0].clone(),
+            layout.schema().fields()[0].clone(),
             value.typed_binding().clone(),
             None,
             novarocks_type_contract::ValueTypeStorageLifetime::pure(),
         )
-        .expect("explicit typed writer input slot");
+        .unwrap();
         Arc::new(
             ChunkSchema::try_new_typed(
                 vec![slot],
                 novarocks_type_contract::ValueTypeStorageLifetime::pure(),
             )
-            .expect("explicit typed writer input schema"),
+            .unwrap(),
         )
     }
-
-    pub(crate) fn identity_projection() -> TableWriterInputProjection {
-        let mut arena = ExprArena::default();
-        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let schema = typed_writer_input_schema();
-        TableWriterInputProjection::try_new_typed(arena, vec![expr], schema.clone(), schema)
-            .expect("projection")
-    }
-
     pub(crate) fn input_chunk(values: Vec<i32>) -> Chunk {
-        let schema = writer_input_schema();
+        let schema = typed_writer_input_schema();
         let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
+            schema.arrow_schema_ref(),
             vec![Arc::new(Int32Array::from(values)) as ArrayRef],
         )
-        .expect("batch");
-        let chunk_schema = typed_writer_input_schema();
-        Chunk::new_with_chunk_schema(batch, chunk_schema)
+        .unwrap();
+        crate::exec::chunk::typed_fixture::chunk(
+            batch,
+            &[SlotId::new(1)],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                false,
+            )],
+        )
     }
-
     pub(crate) fn writer_fixture(execution: Arc<dyn ConnectorWriteExecution>) -> WriterFixture {
         WriterFixture::try_new(
             2,
@@ -2708,56 +2544,31 @@ pub(crate) mod tests {
             request_context(),
             Arc::new(TestFragmentEncoder),
         )
-        .expect("writer fixture")
+        .unwrap()
     }
-
-    fn writer_factory(node: &WriterFixture) -> TableWriterOperatorFactory {
-        TableWriterOperatorFactory::for_test_fixture(
-            node,
-            crate::runtime::execution_runtime::test_execution_function_set(),
-        )
-        .expect("table writer factory")
+    fn writer_factory(node: &WriterFixture, state: &RuntimeState) -> TableWriterOperatorFactory {
+        TableWriterOperatorFactory::for_test_fixture(node, state)
+            .expect("actual compiled table writer factory")
     }
-
     pub(crate) fn writer_fixture_with_count_partials(
         execution: Arc<dyn ConnectorWriteExecution>,
         count: usize,
-    ) -> (WriterFixture, Arc<SealedExecutionFunctionSet>) {
-        let function_set = crate::runtime::execution_runtime::test_execution_function_set();
-        let resolved = function_set
-            .catalog()
-            .resolve_aggregate_trusted("count", &[DataType::Int32])
-            .expect("count(Int32)");
+    ) -> WriterFixture {
         let channels = (0..count)
             .map(|index| {
                 WriterAuxiliaryChannel::try_new(
-                    10_000 + u32::try_from(index).expect("channel index"),
+                    10_000 + index as u32,
                     format!("partial_{index}"),
-                    novarocks_type_contract::FunctionValueType::new(
-                        resolved.intermediate_type.clone(),
-                        true,
-                    ),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
                 )
-                .expect("auxiliary channel")
+                .unwrap()
             })
             .collect::<Vec<_>>();
-        let contract = WriterMultiplexSchema::try_new(channels.clone()).expect("multiplex schema");
-        let relation = WriterMultiplexRelationSchema::try_new(contract).expect("relation schema");
-        let partial = WriterPartialAggregatePlan {
-            prepared: None,
-            calls: channels
-                .iter()
-                .map(|channel| WriterPartialAggregateCall {
-                    // Explicit legacy carrier fixture; this is not frozen-binding admission.
-                    frozen: None,
-                    input_slot_id: SlotId::new(1),
-                    function_name: Arc::from("count"),
-                    resolved: resolved.clone(),
-                    intermediate_slot_id: SlotId::new(channel.slot_id()),
-                })
-                .collect(),
-        };
-        let node = WriterFixture::try_new_with_relation(
+        let relation = WriterMultiplexRelationSchema::try_new(
+            WriterMultiplexSchema::try_new(channels).unwrap(),
+        )
+        .unwrap();
+        WriterFixture::try_new_with_relation(
             2,
             writer_handle(),
             target(0),
@@ -2768,10 +2579,616 @@ pub(crate) mod tests {
             request_context(),
             Arc::new(TestFragmentEncoder),
             relation,
-            partial,
+            count,
         )
-        .expect("composite table writer node");
-        (node, function_set)
+        .unwrap()
+    }
+
+    struct FixtureCompileControl;
+    impl novarocks_type_contract::PureCompileControl for FixtureCompileControl {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+
+    /// Compile the real one-column writer slot projection with exact provider
+    /// facts. The stream cut is authored explicitly; no actor or plan-tree
+    /// evaluator is constructed. Provider recipe validation and LocalCompiler
+    /// remain the actual authors of the projection's checked frozen port.
+    pub(crate) fn compiled_projection(
+        ty: novarocks_type_contract::FunctionValueType,
+        provider_schema: arrow::datatypes::SchemaRef,
+        errors: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
+    ) -> (
+        Arc<novarocks_local_program::LocalProgram>,
+        Arc<dyn WriterProjectionFactory>,
+        novarocks_local_program::StaticLayout,
+    ) {
+        use novarocks_connector_contract::{
+            ConnectorCodecCategory, ConnectorCodecRevision, ConnectorEncodedPayload,
+            ConnectorEnvelopeHeader, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+            ConnectorWriteInputShape, ConnectorWriteRecipeCompiler, ConnectorWriteRecipeDraft,
+            PureProviderCompileError, PureProviderManifestEntry, PureProviderProgramCatalog,
+            PureProviderProgramDefinition,
+        };
+        use novarocks_physical_plan::*;
+        use novarocks_type_contract::{
+            ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
+            ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionValueType,
+            SemanticParameters,
+        };
+        use std::collections::BTreeMap;
+        let control = FixtureCompileControl;
+        assert_eq!(provider_schema.fields().len(), 1);
+        let binding = adapter().binding().clone();
+        let payload = ConnectorEncodedPayload::new(
+            ConnectorEnvelopeHeader::new(
+                binding.descriptor().provider_id.clone(),
+                binding.catalog_handle().clone(),
+                ConnectorCodecCategory::WriteHandle,
+                ConnectorCodecRevision::try_new(1).unwrap(),
+            ),
+            bytes::Bytes::from_static(b"writer-handle"),
+        );
+        let token = ConnectorWriteFieldToken::from_bytes([1; 32]);
+        let draft = ConnectorWriteRecipeDraft::try_new(
+            binding,
+            payload,
+            ConnectorWriteInputShape::Data {
+                fields: vec![
+                    ConnectorWriteFieldBinding::try_new_typed(
+                        token,
+                        provider_schema.fields()[0].as_ref().clone(),
+                        ty.clone(),
+                    )
+                    .unwrap(),
+                ],
+            },
+        )
+        .unwrap();
+        let ordinal = novarocks_physical_plan::WriteTargetOrdinal::try_new(0).unwrap();
+        let mut builder = FragmentBuilder::new(FragmentId::new(71));
+        let source = NodeId::new(0);
+        let input = NodeId::new(1);
+        let writer = NodeId::new(2);
+        let value = builder
+            .add_value(
+                ty.clone(),
+                ValueOrigin::NodeOutput {
+                    node: source,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        // The physical Int64 literal vocabulary cannot stand in for Int32
+        // or a nominal JSON source. Admit the exact declared carrier/type as
+        // a checked pool, preserving the real WriterProjection slot author.
+        let array: ArrayRef = match ty.data_type() {
+            DataType::Boolean => Arc::new(arrow::array::BooleanArray::from(vec![true])),
+            DataType::Int32 => Arc::new(Int32Array::from(vec![1])),
+            DataType::Int64 => Arc::new(Int64Array::from(vec![1])),
+            DataType::Utf8 => Arc::new(arrow::array::StringArray::from(vec!["{}"])),
+            _ => panic!(
+                "the writer lifecycle fixture declares only its original scalar source types"
+            ),
+        };
+        let pool_id = ConstantPoolId::new(0);
+        let pool = novarocks_functions::ConstantPool::try_new(
+            Arc::new(ty.try_to_field("writer_fixture_cell").unwrap()),
+            ty.clone(),
+            array.to_data(),
+            crate::exec::expr::test_support::constant_policy(),
+            novarocks_type_contract::CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        let mut constants = ConstantPools::empty();
+        constants.insert(pool_id, pool).unwrap();
+        let cell = builder
+            .add_expression(
+                source,
+                ty.clone(),
+                ExprKind::Constant(ConstantReference {
+                    pool: pool_id,
+                    ordinal: 0,
+                }),
+            )
+            .unwrap();
+        builder
+            .add_values(source, Box::from([Box::from([cell])]), Box::from([value]))
+            .unwrap();
+        let read = builder
+            .add_expression(input, ty.clone(), ExprKind::Value(value))
+            .unwrap();
+        let projected = builder
+            .add_value(
+                ty.clone(),
+                ValueOrigin::Expr {
+                    node: input,
+                    expr: read,
+                },
+            )
+            .unwrap();
+        builder
+            .add_project(
+                input,
+                source,
+                Box::from([(read, projected)]),
+                Box::from([projected]),
+            )
+            .unwrap();
+        let fields = novarocks_spi::connector::write_stack::writer_output_schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let (role, kind) = match index {
+                    0 => (
+                        WriterRelationFieldRole::Kind,
+                        WriterDerivedKind::RelationKind,
+                    ),
+                    1 => (
+                        WriterRelationFieldRole::TargetOrdinal,
+                        WriterDerivedKind::WriteTargetOrdinal,
+                    ),
+                    2 => (
+                        WriterRelationFieldRole::RowCount,
+                        WriterDerivedKind::AffectedRows,
+                    ),
+                    3 => (
+                        WriterRelationFieldRole::CommitFragment,
+                        WriterDerivedKind::CommitFragment,
+                    ),
+                    _ => unreachable!(),
+                };
+                let ty = FunctionValueType::new(field.data_type().clone(), field.is_nullable());
+                let value = builder
+                    .add_value(
+                        ty.clone(),
+                        ValueOrigin::WriterDerived {
+                            writer_node: writer,
+                            kind,
+                        },
+                    )
+                    .unwrap();
+                WriterRelationField {
+                    value,
+                    name: field.name().as_str().into(),
+                    ty,
+                    role,
+                }
+            })
+            .collect::<Vec<_>>();
+        let property = |distribution| PhysicalProperties {
+            distribution,
+            row_multiplicity: RowMultiplicity::SingleCopy,
+            ordering: Box::default(),
+        };
+        builder
+            .insert_node_unchecked(PhysicalNode {
+                id: writer,
+                inputs: Box::from([input]),
+                required_inputs: Box::from([property(Distribution::Singleton)]),
+                output_properties: property(Distribution::Unconstrained),
+                output: OutputPort {
+                    node: writer,
+                    columns: fields.iter().map(|f| f.value).collect(),
+                },
+                kind: NodeKind::TableWriter {
+                    target: WriterTarget {
+                        handle: draft.payload().clone(),
+                        write_target_ordinal: ordinal,
+                        input: Box::from([projected]),
+                        required_distribution: Distribution::Singleton,
+                        target_fields: Box::from([WriterTargetField {
+                            token,
+                            provider_name: provider_schema.fields()[0].name().clone().into(),
+                            input: projected,
+                            ty: ty.clone(),
+                            hidden: false,
+                        }]),
+                        output_schema: WriterRelationSchema {
+                            revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
+                            fields: fields.clone().into_boxed_slice(),
+                        },
+                        partial_aggregates: Box::default(),
+                    },
+                },
+            })
+            .unwrap();
+        let edge = EdgeId::new(9);
+        let fragment = builder
+            .finish_definition(
+                writer,
+                FragmentSink::Stream { edge },
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+            )
+            .unwrap();
+        let roots = PhysicalExpressionRoots::try_new(&fragment, &control).unwrap();
+        let domain = EvaluationDomainId::new(0);
+        let mut invocations = vec![];
+        let mut bindings = vec![];
+        for (index, (site, root)) in roots.sites().iter().enumerate() {
+            let use_id = ExpressionUseId::new(index as u32);
+            invocations.push(ExpressionInvocation {
+                context: ExpressionEffectContext {
+                    use_id,
+                    domain,
+                    demand: root.demand,
+                },
+                definition: root.expr,
+                control: ControlShape::Eager,
+                arguments: Box::default(),
+            });
+            bindings.push((*site, use_id));
+        }
+        let flow = ExpressionControlFlow::try_new(
+            vec![ExpressionEvaluationDomain {
+                id: domain,
+                parent: None,
+                guard: None,
+            }],
+            invocations,
+            fragment.expressions(),
+            novarocks_type_contract::CompilePhase::Validate,
+            &control,
+        )
+        .unwrap();
+        let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &control).unwrap();
+        let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &control).unwrap();
+        let cut = OutboundFragmentCut {
+            edge,
+            kind: EdgeKind::Stream,
+            destination_fragment: FragmentId::new(72),
+            destination_node: NodeId::new(0),
+            projection: fields
+                .iter()
+                .map(|f| CutValue {
+                    value: f.value,
+                    ty: f.ty.clone(),
+                })
+                .collect(),
+            destination_imports: fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| CutImport {
+                    source: CutValue {
+                        value: f.value,
+                        ty: f.ty.clone(),
+                    },
+                    destination: ValueId::new(i as u32),
+                })
+                .collect(),
+            partitioning: EdgePartitioning {
+                source: Distribution::Singleton,
+                source_multiplicity: RowMultiplicity::SingleCopy,
+                destination: Distribution::Singleton,
+                destination_multiplicity: RowMultiplicity::SingleCopy,
+            },
+            change_stream_writer: None,
+            writer_result: Some(WriterResultCut {
+                write_target_ordinal: ordinal,
+                schema_revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
+                fields: fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| WriterResultCutField {
+                        source: f.value,
+                        destination: ValueId::new(i as u32),
+                        name: f.name.clone(),
+                        ty: f.ty.clone(),
+                        role: f.role,
+                    })
+                    .collect(),
+            }),
+        };
+        let package = FragmentPackage::try_new(
+            FragmentPackageInput {
+                constants,
+                version: PlanVersionId::try_new([71; 16]).unwrap(),
+                required: RequiredContracts::default(),
+                expression_uses: uses,
+                calls,
+                pruning: FrozenFragmentPruning::try_new(fragment.id(), vec![], &control).unwrap(),
+                fragment,
+                cuts: FragmentCuts {
+                    outbound: Box::from([cut]),
+                    ..Default::default()
+                },
+                result: None,
+                parameters: SemanticParameters::try_new([]).unwrap(),
+                scans: BTreeMap::new(),
+                writes: BTreeMap::from([(writer, draft)]),
+                annotations: Box::default(),
+            },
+            FragmentPackageAdmission {
+                plan_limits: PlanLimits::FROZEN,
+                source_retained_bytes: 64 * 1024 * 1024,
+                property_projection_limits: PropertyProofProjectionLimits {
+                    max_request_bytes: 16 * 1024 * 1024,
+                    max_coexisting_bytes: 256 * 1024 * 1024,
+                    max_projection_work: 16 * 1024 * 1024,
+                },
+            },
+            &control,
+        )
+        .unwrap();
+        struct KeepDraft;
+        impl ConnectorWriteRecipeCompiler for KeepDraft {
+            type Error = ConnectorError;
+            fn compile_private(
+                &self,
+                draft: &ConnectorWriteRecipeDraft,
+                _: &dyn novarocks_type_contract::PureCompileControl,
+            ) -> Result<ConnectorWriteRecipeDraft, PureProviderCompileError<ConnectorError>>
+            {
+                Ok(draft.clone())
+            }
+        }
+        let provider = adapter().binding().descriptor().provider_id.clone();
+        let providers = PureProviderProgramCatalog::try_new(
+            &[PureProviderManifestEntry::new(
+                provider.clone(),
+                false,
+                true,
+            )],
+            vec![PureProviderProgramDefinition::new(
+                provider,
+                None,
+                Some(Arc::new(KeepDraft)
+                    as Arc<
+                        dyn ConnectorWriteRecipeCompiler<Error = ConnectorError>,
+                    >),
+            )],
+            &control,
+        )
+        .unwrap();
+        let validated = novarocks_local_compiler::validate_fragment_providers(
+            Arc::new(package),
+            &providers,
+            &control,
+        )
+        .unwrap();
+        let program = Arc::new(
+            novarocks_local_compiler::compile_fragment(
+                validated,
+                &crate::exec::expr::compiled_program::tests::rng_subset(),
+                novarocks_local_compiler::LocalCompileOptions {
+                    pipeline_dop: std::num::NonZeroUsize::MIN,
+                    root_sink_dop: None,
+                    kernel_abi: novarocks_local_program::KernelAbiVersion::CURRENT,
+                    constants: crate::exec::expr::test_support::constant_policy(),
+                    exchange_wait: Duration::from_secs(120),
+                },
+                &control,
+            )
+            .unwrap(),
+        );
+        let id = program.graph().root();
+        let novarocks_local_program::ProgramNodeKind::TableWriter { input, .. } =
+            program.graph().nodes()[id.index()].kind()
+        else {
+            panic!("actual compiled writer")
+        };
+        let input_layout = program.graph().nodes()[input.index()]
+            .output_layout()
+            .clone();
+        assert_eq!(input_layout.slots(), &[SlotId::new(1)]);
+        let projection = Arc::new(
+            super::super::compiled_writer::CompiledWriterProjection::try_new(
+                program.clone(),
+                id,
+                errors,
+            )
+            .unwrap(),
+        ) as Arc<dyn WriterProjectionFactory>;
+        (program, projection, input_layout)
+    }
+
+    #[derive(Debug)]
+    enum CountPreparationFailure {
+        Creator(crate::exec::pipeline::operator::ConstructionFailure),
+        Layout(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+        Calls(novarocks_local_program::PreparedWriterCallsError),
+    }
+    impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+        for CountPreparationFailure
+    {
+        fn from(
+            cause: novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+        ) -> Self {
+            Self::Layout(cause)
+        }
+    }
+    impl From<novarocks_local_program::PreparedWriterCallsError> for CountPreparationFailure {
+        fn from(cause: novarocks_local_program::PreparedWriterCallsError) -> Self {
+            Self::Calls(cause)
+        }
+    }
+    pub(super) fn relation_layout(
+        schema: &crate::exec::chunk::ChunkSchemaRef,
+    ) -> novarocks_local_program::StaticLayout {
+        // This borrows complete typed relation declarations, never infers a
+        // semantic type from a row value or an observed first batch.
+        let types = schema
+            .slots()
+            .iter()
+            .map(|slot| {
+                novarocks_type_contract::FunctionValueType::try_from_typed_binding(
+                    slot.typed_binding().clone(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        crate::exec::chunk::typed_fixture::layout(
+            schema.arrow_schema_ref(),
+            &schema.slot_ids(),
+            &types,
+        )
+    }
+    pub(super) fn prepare_count_source(
+        count: usize,
+        input: novarocks_local_program::StaticLayout,
+        output: novarocks_local_program::StaticLayout,
+        state: &RuntimeState,
+    ) -> LocalPreparedWriterPartial {
+        use novarocks_functions::*;
+        use novarocks_type_contract::{
+            CallProofScope, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
+            ExpressionEffectContext, ExpressionUseId, SemanticParameters,
+        };
+        let original =
+            novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
+                .unwrap();
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        builder
+            .register(
+                original
+                    .definition("count", FunctionKind::Aggregate)
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+        let catalog = builder
+            .seal_pure([InstalledPureKernel {
+                function: FunctionId::try_new("builtin.aggregate/count/v1").unwrap(),
+                kind: FunctionKind::Aggregate,
+                implementation: PureImplementationDeclaration {
+                    overload: FunctionOverloadId::try_new("builtin.aggregate/count/derived-v1")
+                        .unwrap(),
+                    implementation: PureImplementationId::try_new(
+                        "builtin.aggregate/count/selected-v1",
+                    )
+                    .unwrap(),
+                    abi: PureKernelAbi::AggregateWindowV1,
+                },
+                aggregate_state_format: Some(
+                    AggregateStateFormatIdentity::try_new("novarocks/count/state-v1").unwrap(),
+                ),
+            }])
+            .unwrap();
+        let declared = FunctionValueType::new(DataType::Int32, false);
+        let args = [FunctionArgument::Value {
+            value_type: declared.clone(),
+            constant: None,
+        }];
+        let request = || FunctionBindingRequest {
+            arguments: &args,
+            logical_argument_count: 1,
+            expected_result_type: None,
+        };
+        let bound = catalog
+            .metadata()
+            .resolve_bound_trusted(
+                "count",
+                FunctionKind::Aggregate,
+                request(),
+                &FixtureCompileControl,
+            )
+            .unwrap();
+        let selected = Arc::new(bound.selected);
+        let factory=crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),MemTracker::new_root("writer real prepared COUNT source"),state.error_state(),
+        ).unwrap();
+        let owner = factory.begin_compiled_layout_construction(&output).unwrap();
+        owner
+            .request(
+                std::alloc::Layout::array::<novarocks_local_program::PreparedWriterAggregateCall>(
+                    count,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut calls = Vec::with_capacity(count);
+        let parameters = SemanticParameters::try_new([]).unwrap();
+        for index in 0..count {
+            let context = ExpressionEffectContext {
+                use_id: ExpressionUseId::new(index as u32),
+                domain: EvaluationDomainId::new(index as u32),
+                demand: EvaluationDemand::Value,
+            };
+            let input_use = [Some(ExpressionUseId::new(count as u32 + index as u32))];
+            let token = catalog
+                .prepare_fresh(
+                    CallEffectInput {
+                        context,
+                        argument_uses: CallArgumentUses::SelectedChannels(&input_use),
+                        function_id: &bound.function_id,
+                        kind: FunctionKind::Aggregate,
+                        selected: &selected,
+                        request: request(),
+                        environment: &[],
+                        parameters: &parameters,
+                        decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                        proof_scope: CallProofScope::Domain(context.domain),
+                    },
+                    selected.clone(),
+                    PureCallPreparation::Aggregate {
+                        arguments: ScopedExpressionEffects::pure_value(context),
+                        options: AggregatePreparationOptions {
+                            state_interpretation: None,
+                            phase: AggregateKernelPhase::Partial,
+                            distinct: false,
+                            order_keys: Arc::from([]),
+                            state_input_type: None,
+                        },
+                    },
+                    &FixtureCompileControl,
+                )
+                .unwrap();
+            let PreparedPureKernel::Aggregate(handle) = token.prepared() else {
+                panic!("actual COUNT aggregate handle")
+            };
+            let output_position = index + 4;
+            calls.push(novarocks_local_program::PreparedWriterAggregateCall::new(
+                handle.clone(),
+                input.slots()[0],
+                output.slots()[output_position],
+                output_position,
+                owner.storage_lifetime(),
+            ));
+        }
+        if calls.capacity() != calls.len() {
+            owner.request(std::alloc::Layout::array::<novarocks_local_program::PreparedWriterAggregateCall>(calls.len()).unwrap()).unwrap();
+        }
+        let calls = novarocks_local_program::PreparedWriterAggregateCalls::try_new_observed::<
+            CountPreparationFailure,
+        >(
+            calls.into_boxed_slice(),
+            AggregateKernelPhase::Partial,
+            owner.storage_lifetime(),
+            |layout| {
+                owner
+                    .request(layout)
+                    .map_err(CountPreparationFailure::Creator)
+            },
+            || {
+                owner
+                    .observe(
+                        0,
+                        &[],
+                        crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
+                            units: 1,
+                        },
+                    )
+                    .map_err(CountPreparationFailure::Creator)
+            },
+        )
+        .unwrap();
+        LocalPreparedWriterPartial {
+            calls,
+            input_layout: input,
+            output_layout: output,
+            error: state.error_state(),
+        }
     }
 
     #[test]
@@ -2817,9 +3234,9 @@ pub(crate) mod tests {
     fn prepared_writer_does_not_open_provider_until_activation() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
-        let factory = writer_factory(&writer_fixture(execution));
-        let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
+        let factory = writer_factory(&writer_fixture(execution), &state);
+        let mut operator = factory.create(1, 0);
 
         install_construction(operator.as_mut(), &state);
         operator.prepare().expect("prepare writer");
@@ -2842,9 +3259,9 @@ pub(crate) mod tests {
     fn prepared_writer_abort_does_not_wait_for_an_unstarted_actor() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
-        let factory = writer_factory(&writer_fixture(execution));
-        let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
+        let factory = writer_factory(&writer_fixture(execution), &state);
+        let mut operator = factory.create(1, 0);
 
         install_construction(operator.as_mut(), &state);
         operator.prepare().expect("prepare writer");
@@ -2864,12 +3281,13 @@ pub(crate) mod tests {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
         let writer_rows = Arc::clone(&execution.writer_rows);
-        let factory = writer_factory(&writer_fixture(execution.clone()));
+        let state = test_runtime_state();
+        let factory = writer_factory(&writer_fixture(execution.clone()), &state);
 
         let dop = 4;
         let mut operators: Vec<Box<dyn Operator>> =
             (0..dop).map(|driver| factory.create(dop, driver)).collect();
-        let state = test_runtime_state();
+
         for (driver, operator) in operators.iter_mut().enumerate() {
             bind(operator, &state);
             complete_native_input(
@@ -2905,11 +3323,10 @@ pub(crate) mod tests {
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
         let writer_rows = Arc::clone(&execution.writer_rows);
         let expected_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let mut arena = ExprArena::default();
-        let input = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let projection =
-            TableWriterInputProjection::try_new(arena, vec![input], Arc::clone(&expected_schema))
-                .expect("target projection");
+        let projection = ProjectionRecipe {
+            ty: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            schema: expected_schema.clone(),
+        };
         let node = WriterFixture::try_new(
             2,
             writer_handle(),
@@ -2922,23 +3339,45 @@ pub(crate) mod tests {
             Arc::new(TestFragmentEncoder),
         )
         .expect("projecting writer node");
-        let mut operator = writer_factory(&node).create_operator(1, 0);
+        let state = test_runtime_state();
+        let (factory, projection_layout) =
+            TableWriterOperatorFactory::for_test_fixture_with_projection_layout(&node, &state)
+                .unwrap();
+        let mut operator = factory.create_operator(1, 0);
         let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
         operator
             .kernel_for_test_mut()
             .replace_partial_aggregate_for_test(Box::new(Transform::hydrating(
                 ProjectedInputObserver {
+                    value_slot: projection_layout.slots()[0],
                     values: Arc::clone(&observed),
                     finishing: false,
                     cancelled: false,
                 },
             )));
-        let state = test_runtime_state();
+
+        install_construction(&mut operator, &state);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
         operator.activate(&state).expect("activate");
-        complete_native_input(&mut operator, &state, input_chunk(vec![7, 11]))
-            .expect("push projected page");
+        complete_native_input(&mut operator, &state, {
+            let (_, _, layout) = compiled_projection(
+                node.projection.ty.clone(),
+                node.expected_schema.clone(),
+                state.error_state(),
+            );
+            let batch = RecordBatch::try_new(
+                layout.schema().clone(),
+                vec![Arc::new(Int64Array::from(vec![7_i64, 11])) as ArrayRef],
+            )
+            .unwrap();
+            crate::exec::chunk::typed_fixture::chunk(
+                batch,
+                layout.slots(),
+                &[node.projection.ty.clone()],
+            )
+        })
+        .expect("push projected page");
         assert_eq!(
             observed.lock().expect("observed values").as_slice(),
             &[7_i64, 11_i64]
@@ -2958,14 +3397,13 @@ pub(crate) mod tests {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
         let writer_rows = Arc::clone(&execution.writer_rows);
-        let (node, function_set) = writer_fixture_with_count_partials(execution, 1);
+        let node = writer_fixture_with_count_partials(execution, 1);
         let node = node.with_aggregate_guard(Arc::new(RejectAggregateBoundary(
             TableWriteAggregateBoundary::PartialUpdate,
         )));
-        let mut operator = TableWriterOperatorFactory::for_test_fixture(&node, function_set)
-            .expect("writer factory")
-            .create(1, 0);
         let state = test_runtime_state();
+        let mut operator = writer_factory(&node, &state).create(1, 0);
+
         bind(&mut operator, &state);
         let error = native_failure(
             operator.as_mut(),
@@ -2990,14 +3428,13 @@ pub(crate) mod tests {
     fn partial_aggregate_guard_rejects_finalize_without_success_output() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
-        let (node, function_set) = writer_fixture_with_count_partials(execution, 1);
+        let node = writer_fixture_with_count_partials(execution, 1);
         let node = node.with_aggregate_guard(Arc::new(RejectAggregateBoundary(
             TableWriteAggregateBoundary::PartialFinalize,
         )));
-        let mut operator = TableWriterOperatorFactory::for_test_fixture(&node, function_set)
-            .expect("writer factory")
-            .create(1, 0);
         let state = test_runtime_state();
+        let mut operator = writer_factory(&node, &state).create(1, 0);
+
         bind(&mut operator, &state);
         complete_native_input(operator.as_mut(), &state, input_chunk(vec![1, 2, 3]))
             .expect("input before finalize fault");
@@ -3022,9 +3459,10 @@ pub(crate) mod tests {
             let execution = Arc::new(
                 TestWriteExecution::new(Arc::clone(&stats)).with_fragments(fragment_count, 4),
             );
-            let factory = writer_factory(&writer_fixture(execution));
-            let mut operator = factory.create(1, 0);
             let state = test_runtime_state();
+            let factory = writer_factory(&writer_fixture(execution), &state);
+            let mut operator = factory.create(1, 0);
+
             bind(&mut operator, &state);
             complete_native_input(operator.as_mut(), &state, input_chunk(vec![1, 2, 3, 4, 5]))
                 .expect("append without premature output");
@@ -3071,11 +3509,11 @@ pub(crate) mod tests {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
         let writer_rows = Arc::clone(&execution.writer_rows);
-        let (node, function_set) = writer_fixture_with_count_partials(execution, 1_024);
-        let factory = TableWriterOperatorFactory::for_test_fixture(&node, function_set)
-            .expect("composite factory");
-        let mut operator = factory.create(1, 0);
+        let node = writer_fixture_with_count_partials(execution, 1_024);
         let state = test_runtime_state();
+        let factory = writer_factory(&node, &state);
+        let mut operator = factory.create(1, 0);
+
         bind(&mut operator, &state);
         complete_native_input(operator.as_mut(), &state, input_chunk(vec![1, 2]))
             .expect("first page");
@@ -3149,9 +3587,9 @@ pub(crate) mod tests {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
         let writer_rows = Arc::clone(&execution.writer_rows);
-        let (node, function_set) = writer_fixture_with_count_partials(execution, 1);
-        let factory = TableWriterOperatorFactory::for_test_fixture(&node, function_set)
-            .expect("composite factory");
+        let node = writer_fixture_with_count_partials(execution, 1);
+        let state = test_runtime_state();
+        let factory = writer_factory(&node, &state);
         let slot_id = SlotId::new(
             node.writer_multiplex_schema()
                 .contract()
@@ -3165,7 +3603,7 @@ pub(crate) mod tests {
             .replace_partial_aggregate_for_test(Box::new(Transform::hydrating(
                 StreamingPartial::new(slot_id, Arc::clone(&aggregate_rows)),
             )));
-        let state = test_runtime_state();
+
         install_construction(&mut operator, &state);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
@@ -3215,6 +3653,8 @@ pub(crate) mod tests {
             );
         }
         accept_native_input(&mut operator, &state, raw).expect("the same second raw page resumes");
+        // EOS only marks input complete; the subsequent admitted drive
+        // drains both accepted partial output and finalization output.
         operator
             .finish_for_test(&state)
             .expect("signal EOS once with accepted work outstanding");
@@ -3285,7 +3725,7 @@ pub(crate) mod tests {
             request_context(),
             Arc::new(TestFragmentEncoder),
             relation,
-            WriterPartialAggregatePlan::default(),
+            0,
         )
         .expect("writer node");
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -3305,14 +3745,15 @@ pub(crate) mod tests {
                 .expect("oversized partial schema");
         let partial = Chunk::new_with_chunk_schema(batch, chunk_schema);
 
-        let factory = writer_factory(&node);
+        let state = test_runtime_state_with_packet_budget(PACKET_BYTES, None);
+        let factory = writer_factory(&node, &state);
         let mut operator = factory.create_operator(1, 0);
         operator
             .kernel_for_test_mut()
             .replace_partial_aggregate_for_test(Box::new(Transform::hydrating(
                 OneShotPartial::new(partial),
             )));
-        let state = test_runtime_state_with_packet_budget(PACKET_BYTES, None);
+
         install_construction(&mut operator, &state);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
@@ -3384,7 +3825,7 @@ pub(crate) mod tests {
             request_context(),
             Arc::new(TestFragmentEncoder),
             relation,
-            WriterPartialAggregatePlan::default(),
+            0,
         )
         .expect("writer node");
         let fields = channels
@@ -3408,14 +3849,15 @@ pub(crate) mod tests {
                 .expect("wide partial schema");
         let partial = Chunk::new_with_chunk_schema(batch, chunk_schema);
 
-        let factory = writer_factory(&node);
+        let state = test_runtime_state_with_packet_budget(PACKET_BYTES, None);
+        let factory = writer_factory(&node, &state);
         let mut operator = factory.create_operator(1, 0);
         operator
             .kernel_for_test_mut()
             .replace_partial_aggregate_for_test(Box::new(Transform::hydrating(
                 OneShotPartial::new(partial),
             )));
-        let state = test_runtime_state_with_packet_budget(PACKET_BYTES, None);
+
         install_construction(&mut operator, &state);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
@@ -3499,9 +3941,10 @@ pub(crate) mod tests {
     fn table_writer_reports_zero_rows_when_it_wrote_nothing() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)).with_fragments(0, 0));
-        let factory = writer_factory(&writer_fixture(execution));
-        let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
+        let factory = writer_factory(&writer_fixture(execution), &state);
+        let mut operator = factory.create(1, 0);
+
         bind(&mut operator, &state);
         operator.finish_for_test(&state).expect("finish");
         let chunks = wait_for_output(&mut operator, &state).expect("writer output");
@@ -3518,9 +3961,10 @@ pub(crate) mod tests {
             TestWriteExecution::new(Arc::clone(&stats))
                 .with_fragments(1, MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES),
         );
-        let factory = writer_factory(&writer_fixture(execution));
-        let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
+        let factory = writer_factory(&writer_fixture(execution), &state);
+        let mut operator = factory.create(1, 0);
+
         bind(&mut operator, &state);
         operator
             .finish_for_test(&state)
@@ -3533,9 +3977,9 @@ pub(crate) mod tests {
             TestWriteExecution::new(Arc::clone(&stats))
                 .with_fragments(1, MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1),
         );
-        let factory = writer_factory(&writer_fixture(execution));
-        let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
+        let factory = writer_factory(&writer_fixture(execution), &state);
+        let mut operator = factory.create(1, 0);
         bind(&mut operator, &state);
         operator
             .finish_for_test(&state)
@@ -3578,10 +4022,11 @@ pub(crate) mod tests {
     fn cancelling_one_driver_aborts_only_its_own_writer() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(Arc::clone(&stats)));
-        let factory = writer_factory(&writer_fixture(execution));
+        let state = test_runtime_state();
+        let factory = writer_factory(&writer_fixture(execution), &state);
         let mut first = factory.create(2, 0);
         let mut second = factory.create(2, 1);
-        let state = test_runtime_state();
+
         bind(&mut first, &state);
         bind(&mut second, &state);
         assert!(poll_until(
@@ -3632,9 +4077,10 @@ pub(crate) mod tests {
         }
 
         let execution = Arc::new(FailingExecution(catalog_handle()));
-        let factory = writer_factory(&writer_fixture(execution));
-        let mut operator = factory.create(1, 0);
         let state = test_runtime_state();
+        let factory = writer_factory(&writer_fixture(execution), &state);
+        let mut operator = factory.create(1, 0);
+
         bind(&mut operator, &state);
         assert!(poll_until(
             || state.error().is_some(),
@@ -3692,9 +4138,10 @@ pub(crate) mod tests {
             catalog_handle: catalog_handle(),
             aborted: Arc::clone(&aborted),
         });
-        let factory = writer_factory(&writer_fixture(execution));
-        let mut operator = factory.create_operator(1, 0);
         let state = test_runtime_state();
+        let factory = writer_factory(&writer_fixture(execution), &state);
+        let mut operator = factory.create_operator(1, 0);
+
         install_construction(&mut operator, &state);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
@@ -3751,8 +4198,9 @@ pub(crate) mod tests {
         let mut execution = TestWriteExecution::new(Arc::clone(&stats));
         execution.finish_gate = Some(finish_gate.clone());
         let execution = Arc::new(execution);
-        let factory = writer_factory(&writer_fixture(execution));
         let runtime_state = Arc::new(test_runtime_state());
+        let factory = writer_factory(&writer_fixture(execution), runtime_state.as_ref());
+
         let mut writer = factory.create(1, 0);
         bind(&mut writer, runtime_state.as_ref());
         let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3878,13 +4326,14 @@ pub(crate) mod tests {
             gate: Arc::clone(&gate),
             rows: Arc::clone(&rows),
         });
-        let factory = writer_factory(&writer_fixture(execution));
+        let state = test_runtime_state();
+        let factory = writer_factory(&writer_fixture(execution), &state);
         let mut operator = factory.create_operator(1, 0);
         let profiles = OperatorProfiles::new(crate::runtime::profile::RuntimeProfile::new(
             "slow-writer-metrics",
         ));
         operator.set_profiles(profiles.clone());
-        let state = test_runtime_state();
+
         install_construction(&mut operator, &state);
         operator.prepare().expect("prepare");
         operator.bind_runtime_state(&state).expect("bind");
@@ -4013,7 +4462,7 @@ pub(crate) mod tests {
         });
         let memory = MemTracker::new_root("table-writer-cancel-test");
         let runtime_state = Arc::new(test_runtime_state_with_mem(Some(Arc::clone(&memory))));
-        let factory = writer_factory(&writer_fixture(execution));
+        let factory = writer_factory(&writer_fixture(execution), runtime_state.as_ref());
         let mut writer = factory.create(1, 0);
         bind(&mut writer, runtime_state.as_ref());
         let mut driver = PipelineDriver::new(
@@ -4045,6 +4494,29 @@ pub(crate) mod tests {
             }
         }
         assert!(memory.current() > 0, "queued Arrow input must be charged");
+        // Find the actor's actual installed queue owner after PipelineDriver
+        // has rebound the operator trackers. Compiled schemas and prepared
+        // creators remain live until driver retirement and are not queue data.
+        fn collect_writer_queues(root: &Arc<MemTracker>, queues: &mut Vec<Arc<MemTracker>>) {
+            if root.label() == "ConnectorWriterQueue" {
+                queues.push(root.clone());
+            }
+            for child in root.children() {
+                collect_writer_queues(&child, queues);
+            }
+        }
+        let mut queues = Vec::new();
+        collect_writer_queues(&memory, &mut queues);
+        assert_eq!(
+            queues.len(),
+            1,
+            "one actual actor queue belongs to this driver"
+        );
+        let queued_input = queues.pop().unwrap();
+        assert!(
+            queued_input.current() > 0,
+            "actual queue owns the in-flight Arrow input"
+        );
 
         let fragment = Arc::new(FragmentContext::new(
             None,
@@ -4069,6 +4541,10 @@ pub(crate) mod tests {
         assert!(!abort_started.load(Ordering::Acquire));
         assert!(task.has_pending_finish());
         assert!(memory.current() > 0, "in-flight append retains its input");
+        assert!(
+            queued_input.current() > 0,
+            "the queue keeps its input until append exits"
+        );
         append_gate.notify_one();
         assert!(poll_until(
             || abort_started.load(Ordering::Acquire),
@@ -4083,9 +4559,13 @@ pub(crate) mod tests {
             "fragment completion must wait for the writer's actual abort exit"
         );
         assert_eq!(
-            memory.current(),
+            queued_input.current(),
             0,
             "cancel must release queued Arrow input"
+        );
+        assert!(
+            memory.current() > 0,
+            "live driver retains its compiled schema/creator owners while abort is pending"
         );
 
         abort_gate.notify_one();
@@ -4132,11 +4612,12 @@ pub(crate) mod tests {
         use crate::runtime::fragment::ExecutionFailureCause;
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(stats.clone()));
-        let mut operator = writer_factory(&writer_fixture(execution)).create_operator(1, 0);
+        let state = test_runtime_state();
+        let mut operator = writer_factory(&writer_fixture(execution), &state).create_operator(1, 0);
         operator
             .kernel_for_test_mut()
             .replace_partial_aggregate_for_test(Box::new(Transform::hydrating(ClosedPartial)));
-        let state = test_runtime_state();
+
         install_construction(&mut operator, &state);
         operator.prepare().unwrap();
         operator.bind_runtime_state(&state).unwrap();
@@ -4177,15 +4658,23 @@ pub(crate) mod tests {
         use crate::exec::pipeline::{shape::StepOperator, step::InputResult};
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(stats.clone()).with_fragments(0, 0));
-        let mut operator = writer_factory(&writer_fixture(execution)).create_operator(1, 0);
-        let child = Probe::new(false);
+        let memory = MemTracker::new_root("native writer child handoff");
+        let state = test_runtime_state_with_mem(Some(memory.clone()));
+        let (factory, projection_layout) =
+            TableWriterOperatorFactory::for_test_fixture_with_projection_layout(
+                &writer_fixture(execution),
+                &state,
+            )
+            .unwrap();
+        let mut operator = factory.create_operator(1, 0);
+        let child = Probe::with_slot(false, projection_layout.slots()[0]);
         child.finish_ready.store(false, Ordering::Release);
         operator
             .kernel_for_test_mut()
             .replace_partial_aggregate_for_test(sink(child.clone()));
-        let memory = MemTracker::new_root("native writer child handoff");
+
         operator.set_mem_tracker(memory.clone());
-        let state = test_runtime_state_with_mem(Some(memory.clone()));
+
         install_construction(&mut operator, &state);
         operator.prepare().unwrap();
         operator.bind_runtime_state(&state).unwrap();
@@ -4238,15 +4727,46 @@ pub(crate) mod tests {
             ));
             assert_eq!(*child.rows.lock().unwrap(), [7, 11]);
             operator.finish(ctx).unwrap();
-            loop {
+            let parked = loop {
                 let result = operator.drive(ctx).unwrap();
                 assert!(result.output.is_none());
                 if let NextStep::Wait(wait) = result.next {
-                    assert!(!wait.is_ready());
-                    break;
+                    let partial = operator
+                        .kernel_for_test()
+                        .partial_aggregate
+                        .as_ref()
+                        .unwrap();
+                    let child_wait = partial
+                        .wait()
+                        .expect("child finalization must remain blocked");
+                    assert!(Arc::ptr_eq(&child_wait.observable, &child.event));
+                    assert!(!child_wait.is_ready());
+                    assert!(!operator.kernel_for_test().writer_finish_requested);
+                    // Queue release can wake the parent while its child remains blocked.
+                    if !wait.is_ready() {
+                        break wait;
+                    }
+                    continue;
                 }
                 assert!(matches!(result.next, NextStep::Runnable));
-            }
+            };
+            // Exercise the writer subscription after parking without releasing the child.
+            operator
+                .kernel_for_test()
+                .writer
+                .observable()
+                .notify_observers();
+            assert!(parked.is_ready());
+            let result = operator.drive(ctx).unwrap();
+            assert!(result.output.is_none());
+            assert!(matches!(result.next, NextStep::Wait(_)));
+            let partial = operator
+                .kernel_for_test()
+                .partial_aggregate
+                .as_ref()
+                .unwrap();
+            assert!(!partial.wait().unwrap().is_ready());
+            assert!(!operator.kernel_for_test().writer_finish_requested);
         });
         assert!(poll_until(
             || stats.appended_rows.load(Ordering::Acquire) == 2,
@@ -4317,8 +4837,10 @@ pub(crate) mod tests {
     fn terminal_writer_keeps_pending_finish_until_actor_handle_exits() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(stats));
-        let mut writer = writer_factory(&writer_fixture(execution)).create_operator(1, 0);
         let runtime_state = test_runtime_state_with_mem(None);
+        let mut writer =
+            writer_factory(&writer_fixture(execution), &runtime_state).create_operator(1, 0);
+
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         let actor_gate = Arc::clone(&gate);
         let actor = runtime_state
@@ -4363,7 +4885,8 @@ pub(crate) mod tests {
     fn a_table_writer_is_never_the_pipeline_sink() {
         let stats = Arc::new(WriteExecutionStats::default());
         let execution = Arc::new(TestWriteExecution::new(stats));
-        let factory = writer_factory(&writer_fixture(execution));
+        let state = test_runtime_state();
+        let factory = writer_factory(&writer_fixture(execution), &state);
         assert!(!factory.is_sink());
         assert!(!factory.is_source());
     }

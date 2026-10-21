@@ -17,8 +17,22 @@
 
 //! Actual LocalCompiler Binary-to-Utf8 CAST, native constant source and first-failure contracts.
 use super::*;
-use crate::exec::expr::legacy_binary_text_cast_baseline_tests::{actual, input};
 use arrow::array::{BinaryArray, StringArray};
+// Literal bytes and UTF8 validity determine these independent values: NUL
+// and Unicode survive, an empty sequence is empty text, and 0xff is invalid.
+fn input() -> ArrayRef {
+    Arc::new(
+        BinaryArray::from(vec![
+            Some(b"pad".as_slice()),
+            Some("你好\0🙂".as_bytes()),
+            Some(b"".as_slice()),
+            Some(b"\xffa".as_slice()),
+            None,
+            Some(b"tail".as_slice()),
+        ])
+        .slice(1, 4),
+    )
+}
 fn binary_batch(program: &LocalProgram, source: ArrayRef) -> RecordBatch {
     let n = source.len();
     RecordBatch::try_new(
@@ -59,16 +73,8 @@ fn binary_text_actual_compiler_full_profile_all_policies_source_nullability_slic
                     .evaluate(&batch, selected, &Control)
                     .unwrap();
                 assert!(result.errors().is_empty());
-                let mut expected = vec![];
-                for row in selected.iter() {
-                    let old = actual(&source.slice(row, 1), policy, allow).unwrap();
-                    let old = old.as_any().downcast_ref::<StringArray>().unwrap();
-                    expected.push(if old.is_null(0) {
-                        None
-                    } else {
-                        Some(old.value(0).to_string())
-                    });
-                }
+                let values = [Some("你好\0🙂"), Some(""), None, None];
+                let expected = selected.iter().map(|row| values[row]).collect::<Vec<_>>();
                 assert_eq!(
                     result.values().to_data(),
                     StringArray::from(expected).to_data()

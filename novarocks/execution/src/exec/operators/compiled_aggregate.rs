@@ -310,7 +310,7 @@ impl CompiledAggregateProcessorFactory {
         }
         // Preserve an already published task failure at this installation
         // boundary before the cooperative kernel sees only a stopped state.
-        crate::exec::expr::ExprEvaluationControl::checkpoint(control)?;
+        control.checkpoint_execution()?;
         self.topn = Some(CompiledAggregateTopNFactory::try_new(
             &self.program,
             self.node,
@@ -1058,8 +1058,10 @@ impl CompiledAggregateProcessor {
             .tracker
             .as_ref()
             .ok_or(crate::exec::pipeline::operator::ConstructionFailure::MissingOwner)?;
-        let index_allocator = crate::exec::expr::agg::AggregateAllocator::new(Arc::clone(tracker));
-        let mut indices = crate::exec::expr::agg::AggregateVec::new_in(index_allocator);
+        let index_allocator =
+            crate::exec::hash_table::allocation::AggregateAllocator::new(Arc::clone(tracker));
+        let mut indices =
+            crate::exec::hash_table::allocation::AggregateVec::new_in(index_allocator);
         indices
             .try_reserve_exact(groups)
             .map_err(|_| KernelFailure::ResourceExhausted)?;
@@ -1520,11 +1522,7 @@ mod failure_latch_tests {
                 .as_ref()
                 .is_some_and(|states| states[0].len() == 2)
         );
-        error.set_error(novarocks_functions::KernelFailure::Internal(
-            novarocks_functions::KernelDiagnostic::new(
-                &("stop installed COUNT DISTINCT after accumulation"),
-            ),
-        ));
+        error.set_error(KernelFailure::Cancelled);
         let original = processor.apply_for_test(&state, input.clone()).unwrap_err();
         assert_eq!(
             original.cause(),
@@ -1564,14 +1562,12 @@ mod failure_latch_tests {
         processor.apply_for_test(&state, input.clone()).unwrap();
         assert_eq!(processor.groups, 2);
         assert!(tracker.current() > 0);
-        error.set_error(novarocks_functions::KernelFailure::Internal(
+        let stop = ExecutionFailure::from(KernelFailure::Internal(
             novarocks_functions::KernelDiagnostic::new(&("originating task stop")),
         ));
+        error.set_error(stop.clone());
         let original = processor.apply_for_test(&state, input.clone()).unwrap_err();
-        assert_eq!(
-            original.cause(),
-            &ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
-        );
+        assert_eq!(original.cause(), stop.cause());
         assert_eq!(
             tracker.current(),
             creator_bytes,

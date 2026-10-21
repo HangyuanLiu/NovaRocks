@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::exec::expr::ExprId;
 use crate::runtime::endpoint::FragmentDestination;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 pub use novarocks_execution_contract::DataStreamPartitionType;
@@ -28,9 +27,7 @@ use std::collections::HashSet;
 #[derive(Clone)]
 pub struct DataStreamSinkFactoryInput {
     pub dest_node_id: i32,
-    pub output_exprs: Vec<ExprId>,
     pub output_partition_type: DataStreamPartitionType,
-    pub output_partition_exprs: Vec<ExprId>,
     pub output_columns: Vec<SlotId>,
     pub destinations: Vec<FragmentDestination>,
 }
@@ -39,16 +36,9 @@ impl DataStreamSinkFactoryInput {
     pub fn try_from_static_program(
         dest_node_id: i32,
         output_partition_type: DataStreamPartitionType,
-        output_exprs: Vec<ExprId>,
-        mut output_partition_exprs: Vec<ExprId>,
         output_columns: Vec<SlotId>,
         destinations: Vec<FragmentDestination>,
     ) -> ExecutionResult<Self> {
-        if !output_exprs.is_empty() {
-            return Err(ExecutionFailure::from_domain(
-                SinkInputFailure::UnsupportedOutputExpressions,
-            ));
-        }
         let mut seen = HashSet::new();
         if let Some(slot_id) = output_columns
             .iter()
@@ -58,14 +48,9 @@ impl DataStreamSinkFactoryInput {
                 SinkInputFailure::DuplicateSlot(*slot_id),
             ));
         }
-        if !output_partition_type.requires_exprs() {
-            output_partition_exprs.clear();
-        }
         Ok(Self {
             dest_node_id,
-            output_exprs,
             output_partition_type,
-            output_partition_exprs,
             output_columns,
             destinations,
         })
@@ -74,8 +59,6 @@ impl DataStreamSinkFactoryInput {
     pub fn try_new(
         dest_node_id: i32,
         output_partition_type: DataStreamPartitionType,
-        output_exprs: Vec<ExprId>,
-        output_partition_exprs: Vec<ExprId>,
         output_columns: Vec<i32>,
         destinations: Vec<FragmentDestination>,
     ) -> ExecutionResult<Self> {
@@ -95,8 +78,6 @@ impl DataStreamSinkFactoryInput {
         Self::try_from_static_program(
             dest_node_id,
             output_partition_type,
-            output_exprs,
-            output_partition_exprs,
             parsed_output_columns,
             destinations,
         )
@@ -105,7 +86,6 @@ impl DataStreamSinkFactoryInput {
 
 #[derive(Debug)]
 enum SinkInputFailure {
-    UnsupportedOutputExpressions,
     DuplicateSlot(SlotId),
     InvalidSlot {
         raw: i32,
@@ -115,9 +95,6 @@ enum SinkInputFailure {
 impl std::fmt::Display for SinkInputFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupportedOutputExpressions => {
-                f.write_str("DATA_STREAM_SINK output_exprs are not supported")
-            }
             Self::DuplicateSlot(slot) => write!(
                 f,
                 "DATA_STREAM_SINK: duplicate output_columns slot id: {slot}"
@@ -156,8 +133,6 @@ mod tests {
         let failure = super::DataStreamSinkFactoryInput::try_new(
             17,
             DataStreamPartitionType::Unpartitioned,
-            vec![],
-            vec![],
             vec![-1],
             vec![],
         )

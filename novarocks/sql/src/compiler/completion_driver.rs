@@ -160,6 +160,16 @@ impl SqlFinalPlanCompileRequest {
             &session.sql_semantics,
         )
         .map_err(SqlCompileError::from)?;
+        // Retain the producer's actual checked constants across discovery and
+        // catalog rounds. The loan is rebuilt against this normalized query;
+        // syntax transformations must validate the original structural sites.
+        let materialized_source = match statement.kind {
+            super::SqlStatementInputKind::MaterializedValuesQuery { source, .. } => {
+                source.loan(&query, &control)?;
+                Some(source)
+            }
+            _ => None,
+        };
         let common = FinalPlanCommon {
             version,
             intent,
@@ -171,6 +181,7 @@ impl SqlFinalPlanCompileRequest {
             dop_domain,
             scan_read_budget,
             display_intent,
+            materialized_source,
         };
 
         // A persisted semantic snapshot is required before an optional MV
@@ -295,6 +306,9 @@ struct FinalPlanCommon {
     dop_domain: PipelineDopDomain,
     scan_read_budget: ScanReadBudget,
     display_intent: SqlDisplayIntent,
+    // Both variants hold Arc-backed constant collections. Cloning this source
+    // for analysis preserves original pool/ordinal facts, not AST pointers.
+    materialized_source: Option<super::materialized_values::MaterializedValues>,
 }
 
 pub(crate) struct SqlMaterializedViewCompletionState {
@@ -532,8 +546,24 @@ fn analyze_with_catalog(
     control: &SqlCompileControl,
 ) -> Result<SqlAnalyzedQuery, SqlCompileError> {
     let catalog = SqlPlannerTableSnapshot::new(catalog);
+    let query = Box::new(query);
+    let statement = match &common.materialized_source {
+        Some(source) => {
+            // Resolve a fresh loan only over the actual query entering this
+            // analysis round, under the original request control. No pointer
+            // map or inferred literal is carried through AST cloning.
+            source.loan(&query, control)?;
+            SqlStatementInput {
+                kind: super::SqlStatementInputKind::MaterializedValuesQuery {
+                    query,
+                    source: source.clone(),
+                },
+            }
+        }
+        None => SqlStatementInput::parsed_query(query),
+    };
     let request = SqlAnalyzeRequest::new(
-        SqlStatementInput::parsed_query(Box::new(query)),
+        statement,
         common.intent.clone(),
         common.session.clone(),
         common.environment,
@@ -796,6 +826,7 @@ fn optimize_to_physical(
         constant_evaluator,
         Arc::clone(&function_catalog),
         decimal_overflow_policy,
+        root_allow_throw_exception,
         control,
     )
     .with_fold_dependency_observer(control.fold_dependency_observer().cloned());

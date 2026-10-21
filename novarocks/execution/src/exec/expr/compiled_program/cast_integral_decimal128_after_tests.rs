@@ -19,7 +19,7 @@
 use super::*;
 use novarocks_functions::{KernelDiagnostic, KernelFailure};
 use std::{sync::Mutex, time::Duration};
-fn compare_profile(dtype: DataType, p: u8, s: i8) {
+fn compare_profile(dtype: DataType, p: u8, s: i8, expected_full: [Expected; 5]) {
     let (min, max) = bound(&dtype);
     let target = DataType::Decimal128(p, s);
     for (policy, allow) in modes() {
@@ -32,7 +32,11 @@ fn compare_profile(dtype: DataType, p: u8, s: i8) {
             policy,
             allow,
         );
-        for source in [full.clone(), full.slice(1, 4), full.slice(0, 0)] {
+        for (source, fixed) in [
+            (full.clone(), expected_full.as_slice()),
+            (full.slice(1, 4), &expected_full[1..]),
+            (full.slice(0, 0), &expected_full[..0]),
+        ] {
             let n = source.len();
             let b = RecordBatch::try_new(
                 program.graph().nodes()[1].output_layout().schema().clone(),
@@ -59,15 +63,17 @@ fn compare_profile(dtype: DataType, p: u8, s: i8) {
                 let mut expected = Vec::new();
                 let mut errors = Vec::new();
                 for (ordinal, row) in rows.iter().copied().enumerate() {
-                    match actual(source.slice(row, 1), target.clone(), policy, allow) {
-                        Ok(a) => expected.push(values(&a)[0]),
-                        Err(message) => {
-                            expected.push(None);
-                            errors.push((ordinal, message.detail().to_owned()));
-                        }
+                    let (value, error) = fixed[row].result(policy);
+                    expected.push(value);
+                    if let Some(message) = error {
+                        errors.push((ordinal, message.to_owned()));
                     }
                 }
-                assert_eq!(values(output.values()), expected);
+                assert_eq!(
+                    values(output.values()),
+                    expected,
+                    "{dtype:?} -> Decimal128({p}, {s}), rows {rows:?}, {policy:?}, allow {allow}"
+                );
                 assert_eq!(
                     output
                         .errors()
@@ -82,27 +88,104 @@ fn compare_profile(dtype: DataType, p: u8, s: i8) {
 }
 #[test]
 fn integral_decimal128_actual_after_full_width_precision_scale_policy_sparse_and_empty() {
-    for dtype in [
-        DataType::Int8,
-        DataType::Int16,
-        DataType::Int32,
-        DataType::Int64,
+    // Fixed raw-output tables for [source MIN, source NULL, source MAX, +1,-1].
+    // Decimal coefficient = integer*10^scale; negative scales truncate toward
+    // zero. Precision p requires coefficient magnitude < 10^p. O denotes a
+    // finite overflow, independently of source NULL, and is never computed by
+    // a reference converter. These tables include full physical source extrema.
+    for (dtype, p, s, expected) in [
+        (DataType::Int8, 3, 0, [V(-128), N, V(127), V(1), V(-1)]),
+        (DataType::Int8, 4, 0, [V(-128), N, V(127), V(1), V(-1)]),
+        (
+            DataType::Int8,
+            7,
+            2,
+            [V(-12800), N, V(12700), V(100), V(-100)],
+        ),
+        (DataType::Int8, 7, -2, [V(-1), N, V(1), V(0), V(0)]),
+        (DataType::Int8, 18, 1, [V(-1280), N, V(1270), V(10), V(-10)]),
+        (DataType::Int8, 19, 1, [V(-1280), N, V(1270), V(10), V(-10)]),
+        (DataType::Int8, 38, 1, [V(-1280), N, V(1270), V(10), V(-10)]),
+        (DataType::Int8, 38, 38, [O, N, O, O, O]),
+        (DataType::Int8, 38, -38, [V(0), N, V(0), V(0), V(0)]),
+        (DataType::Int16, 3, 0, [O, N, O, V(1), V(-1)]),
+        (DataType::Int16, 4, 0, [O, N, O, V(1), V(-1)]),
+        (
+            DataType::Int16,
+            7,
+            2,
+            [V(-3276800), N, V(3276700), V(100), V(-100)],
+        ),
+        (DataType::Int16, 7, -2, [V(-327), N, V(327), V(0), V(0)]),
+        (
+            DataType::Int16,
+            18,
+            1,
+            [V(-327680), N, V(327670), V(10), V(-10)],
+        ),
+        (
+            DataType::Int16,
+            19,
+            1,
+            [V(-327680), N, V(327670), V(10), V(-10)],
+        ),
+        (
+            DataType::Int16,
+            38,
+            1,
+            [V(-327680), N, V(327670), V(10), V(-10)],
+        ),
+        (DataType::Int16, 38, 38, [O, N, O, O, O]),
+        (DataType::Int16, 38, -38, [V(0), N, V(0), V(0), V(0)]),
+        (DataType::Int32, 3, 0, [O, N, O, V(1), V(-1)]),
+        (DataType::Int32, 4, 0, [O, N, O, V(1), V(-1)]),
+        (DataType::Int32, 7, 2, [O, N, O, V(100), V(-100)]),
+        (DataType::Int32, 7, -2, [O, N, O, V(0), V(0)]),
+        (
+            DataType::Int32,
+            18,
+            1,
+            [V(-21474836480), N, V(21474836470), V(10), V(-10)],
+        ),
+        (
+            DataType::Int32,
+            19,
+            1,
+            [V(-21474836480), N, V(21474836470), V(10), V(-10)],
+        ),
+        (
+            DataType::Int32,
+            38,
+            1,
+            [V(-21474836480), N, V(21474836470), V(10), V(-10)],
+        ),
+        (DataType::Int32, 38, 38, [O, N, O, O, O]),
+        (DataType::Int32, 38, -38, [V(0), N, V(0), V(0), V(0)]),
+        (DataType::Int64, 3, 0, [O, N, O, V(1), V(-1)]),
+        (DataType::Int64, 4, 0, [O, N, O, V(1), V(-1)]),
+        (DataType::Int64, 7, 2, [O, N, O, V(100), V(-100)]),
+        (DataType::Int64, 7, -2, [O, N, O, V(0), V(0)]),
+        (DataType::Int64, 18, 1, [O, N, O, V(10), V(-10)]),
+        (DataType::Int64, 19, 1, [O, N, O, V(10), V(-10)]),
+        (
+            DataType::Int64,
+            38,
+            1,
+            [
+                V(-92233720368547758080),
+                N,
+                V(92233720368547758070),
+                V(10),
+                V(-10),
+            ],
+        ),
+        (DataType::Int64, 38, 38, [O, N, O, O, O]),
+        (DataType::Int64, 38, -38, [V(0), N, V(0), V(0), V(0)]),
     ] {
-        for (p, s) in [
-            (3, 0),
-            (4, 0),
-            (7, 2),
-            (7, -2),
-            (18, 1),
-            (19, 1),
-            (38, 1),
-            (38, 38),
-            (38, -38),
-        ] {
-            compare_profile(dtype.clone(), p, s);
-        }
+        compare_profile(dtype, p, s, expected);
     }
 }
+
 #[test]
 fn integral_decimal128_actual_after_original_i64_constant_broadcast_exact_source() {
     for (policy, allow) in modes() {

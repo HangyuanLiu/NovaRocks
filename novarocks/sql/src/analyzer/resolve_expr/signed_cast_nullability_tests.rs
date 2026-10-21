@@ -140,3 +140,135 @@ fn non_signed_constructor_keeps_existing_nullability_and_target_metadata() {
         }
     }
 }
+
+#[test]
+fn implicit_decimal_function_coercion_uses_the_original_cast_null_contract() {
+    let control = crate::compiler::SqlCompileControl::unbounded();
+    let catalog = crate::functions::builtin_sql_function_catalog().snapshot();
+    for policy in [
+        DecimalOverflowPolicy::OutputNull,
+        DecimalOverflowPolicy::ReportError,
+    ] {
+        let input = source(FunctionValueType::new(DataType::Decimal128(2, 1), false));
+        let target = FunctionValueType::new(DataType::Decimal128(3, 2), false);
+        let ordinary = coerce_function_argument(input.clone(), target.data_type(), policy).unwrap();
+        let selected = coerce_selected_function_argument(
+            catalog.as_ref(),
+            input.clone(),
+            &target,
+            policy,
+            crate::constant::test_constant_policy(),
+            &control,
+        )
+        .unwrap();
+        for output in [ordinary, selected] {
+            // The shared recipe conservatively declares successful NULL even
+            // for this widening. ReportError remains an error rather than NULL.
+            assert_eq!(
+                output.value_type.nullable(),
+                policy == DecimalOverflowPolicy::OutputNull
+            );
+            let ExprKind::Cast {
+                expr,
+                target: actual_target,
+                decimal_overflow_policy,
+            } = &output.kind
+            else {
+                panic!("the original scalar conversion must remain a CAST")
+            };
+            assert_eq!(format!("{expr:?}"), format!("{input:?}"));
+            assert_eq!(actual_target, target.data_type());
+            assert_eq!(*decimal_overflow_policy, policy);
+            novarocks_functions::PreparedCastRecipe::try_new(
+                novarocks_functions::CastOperation::Carrier,
+                &input.value_type,
+                &output.value_type,
+                policy,
+                false,
+                &control,
+            )
+            .expect("actual prepared CAST accepts its producer's complete declaration");
+        }
+        let signed = source(FunctionValueType::new(DataType::Int8, false));
+        let widened = coerce_function_argument(signed, &DataType::Int64, policy).unwrap();
+        assert!(
+            !widened.value_type.nullable(),
+            "infallible signed widening stays non-null"
+        );
+    }
+}
+
+#[test]
+fn implicit_temporal_comparison_coercion_preserves_possible_null_and_real_source() {
+    let control = crate::compiler::SqlCompileControl::unbounded();
+    for target in [
+        DataType::Date32,
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+    ] {
+        let input = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String("2024-02-01".into())),
+            value_type: FunctionValueType::new(DataType::Utf8, false),
+        };
+        let output = coerce_to_target_type(input.clone(), &target);
+        assert_eq!(
+            output.value_type,
+            FunctionValueType::new(target.clone(), true)
+        );
+        let ExprKind::Cast {
+            expr,
+            target: actual_target,
+            decimal_overflow_policy,
+        } = &output.kind
+        else {
+            panic!("temporal comparison must preserve its runtime CAST")
+        };
+        assert_eq!(format!("{expr:?}"), format!("{input:?}"));
+        assert_eq!(actual_target, &target);
+        assert_eq!(*decimal_overflow_policy, DecimalOverflowPolicy::OutputNull);
+        for allow in [false, true] {
+            novarocks_functions::PreparedCastRecipe::try_new(
+                novarocks_functions::CastOperation::Carrier,
+                &input.value_type,
+                &output.value_type,
+                DecimalOverflowPolicy::OutputNull,
+                allow,
+                &control,
+            )
+            .expect("implicit temporal declaration remains valid under the actual ALLOW fact");
+        }
+        let non_temporal = coerce_to_target_type(input.clone(), &DataType::Boolean);
+        assert_eq!(format!("{non_temporal:?}"), format!("{input:?}"));
+    }
+}
+
+#[test]
+fn primitive_null_fact_does_not_redeclare_a_nominal_largeint_conversion() {
+    let control = crate::compiler::SqlCompileControl::unbounded();
+    let catalog = crate::functions::builtin_sql_function_catalog().snapshot();
+    let input = source(FunctionValueType::new(DataType::Int32, false));
+    let target = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        false,
+        ValueLogicalType::LargeInt,
+    )
+    .unwrap();
+    let output = coerce_selected_function_argument(
+        catalog.as_ref(),
+        input.clone(),
+        &target,
+        DecimalOverflowPolicy::OutputNull,
+        crate::constant::test_constant_policy(),
+        &control,
+    )
+    .unwrap();
+    assert_eq!(output.value_type, target);
+    let ExprKind::FunctionCall { binding, args, .. } = &output.kind else {
+        panic!("the original value-domain conversion author must own this boundary")
+    };
+    assert_eq!(
+        binding.function_id.as_str(),
+        "builtin.scalar/value_domain_conversion/v1"
+    );
+    assert_eq!(args.len(), 1);
+    assert_eq!(format!("{:?}", args[0]), format!("{input:?}"));
+}

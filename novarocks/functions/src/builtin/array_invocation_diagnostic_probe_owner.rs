@@ -345,6 +345,9 @@ impl InvocationScalarKernelInstance for ArrayProjectionDiagnosticInstance {
             let (offset, len) = match arg {
                 EvaluatedArgument::Column(array) => return Ok(array.clone()),
                 EvaluatedArgument::Scalar(_) => (0, usize::from(rows != 0)),
+                EvaluatedArgument::ConstantView(value) => {
+                    (value.original().ordinal() as usize, usize::from(rows != 0))
+                }
                 EvaluatedArgument::Constant(value) => {
                     (value.ordinal() as usize, usize::from(rows != 0))
                 }

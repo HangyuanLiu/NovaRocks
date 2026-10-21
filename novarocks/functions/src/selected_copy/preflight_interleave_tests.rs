@@ -255,11 +255,33 @@ fn fixed_binary_interleave_preserves_selected_bytes_nulls_and_exact_width() {
         preflight_guarded_interleave(&DataType::FixedSizeBinary(8), &arrays, &choices, |_| Ok(())),
         Err(CopyError::Invalid(_))
     ));
-    assert!(
-        fixed_interleave_extent(&DataType::FixedSizeBinary(16), isize::MAX as usize / 16).is_ok()
-    );
-    assert!(matches!(
-        fixed_interleave_extent(&DataType::FixedSizeBinary(16), isize::MAX as usize / 16 + 1),
-        Err(CopyError::Extent(_))
-    ));
+    // Pure layout arithmetic only: do not allocate at this boundary.
+    // MutableBuffer rounds to 64 bytes, then checks its target-aligned Layout.
+    // The independent boundary uses the actual allocator alignment as well.
+    let quantum = 64usize.max(arrow_buffer::alloc::ALIGNMENT);
+    let aligned_max = (isize::MAX as usize / quantum) * quantum;
+    for width in [4usize, 16] {
+        let ty = DataType::FixedSizeBinary(width as i32);
+        let safe_rows = aligned_max / width;
+        let unrounded_rows = isize::MAX as usize / width;
+        assert!(
+            std::alloc::Layout::from_size_align(safe_rows * width, arrow_buffer::alloc::ALIGNMENT)
+                .is_ok()
+        );
+        assert!(
+            std::alloc::Layout::from_size_align(
+                (safe_rows + 1) * width,
+                arrow_buffer::alloc::ALIGNMENT
+            )
+            .is_err()
+        );
+        assert!(safe_rows < unrounded_rows);
+        assert!(fixed_interleave_extent(&ty, safe_rows).is_ok());
+        for rows in [safe_rows + 1, unrounded_rows, unrounded_rows + 1] {
+            assert!(matches!(
+                fixed_interleave_extent(&ty, rows),
+                Err(CopyError::Extent(_))
+            ));
+        }
+    }
 }

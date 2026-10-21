@@ -18,19 +18,15 @@
 //! Frame. The shared SQL fixture deliberately disables folding; native whole
 //! cases and production FE folding remain separate acceptance obligations.
 use super::compiled_program::CompiledExpressionInstance;
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
 use super::numeric_unary_owned_transaction_tests::{batch, programs_with_catalogue};
-use crate::exec::chunk::{Chunk, ChunkSchema};
-use crate::exec::expr::{ExprArena, ExprNode, function};
+use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::DataType;
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_local_program::{
     ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeKind,
 };
 
-use novarocks_types::SlotId;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 struct Control;
@@ -52,33 +48,6 @@ impl KernelEvaluationControl for Control {
     fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
         panic!("BitwiseNot frame never waits")
     }
-}
-fn original(input: ArrayRef) -> ArrayRef {
-    let dtype = input.data_type().clone();
-    let data = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new(
-            "operand",
-            dtype.clone(),
-            true,
-        )])),
-        vec![input],
-    )
-    .unwrap();
-    let schema =
-        ChunkSchema::try_ref_from_schema_and_slot_ids(data.schema().as_ref(), &[SlotId::new(17)])
-            .unwrap();
-    let mut arena = ExprArena::default();
-    let child = arena.push_typed(ExprNode::SlotId(SlotId::new(17)), dtype.clone());
-    let root = arena.push_typed(
-        ExprNode::FunctionCall {
-            kind: function::lookup_function("bitnot").unwrap(),
-            args: vec![child],
-        },
-        dtype,
-    );
-    arena
-        .eval(root, &Chunk::new_with_chunk_schema(data, schema))
-        .unwrap()
 }
 // Loan the already installed catalogue author; the old unary fixture's
 // deliberately IF/COALESCE-only wrapper is unchanged.
@@ -127,13 +96,28 @@ fn producer_root(
 }
 #[test]
 fn native_bitnot_intrinsic_actual_sql_signed_four_widths_frame_matches_original_and_full_fvt() {
-    let cases: Vec<ArrayRef> = vec![
-        Arc::new(Int8Array::from(vec![i8::MIN, -1, 0, 1, i8::MAX])),
-        Arc::new(Int16Array::from(vec![i16::MIN, -1, 0, 1, i16::MAX])),
-        Arc::new(Int32Array::from(vec![i32::MIN, -1, 0, 1, i32::MAX])),
-        Arc::new(Int64Array::from(vec![i64::MIN, -1, 0, 1, i64::MAX])),
+    // For a fixed signed two's-complement width, complement swaps MIN/MAX,
+    // maps -1 to zero, zero to -1, and one to -2. These are independent inputs
+    // and fixed expected arrays, not an evaluator over the supplied input.
+    let cases: Vec<(ArrayRef, ArrayRef)> = vec![
+        (
+            Arc::new(Int8Array::from(vec![i8::MIN, -1, 0, 1, i8::MAX])),
+            Arc::new(Int8Array::from(vec![i8::MAX, 0, -1, -2, i8::MIN])),
+        ),
+        (
+            Arc::new(Int16Array::from(vec![i16::MIN, -1, 0, 1, i16::MAX])),
+            Arc::new(Int16Array::from(vec![i16::MAX, 0, -1, -2, i16::MIN])),
+        ),
+        (
+            Arc::new(Int32Array::from(vec![i32::MIN, -1, 0, 1, i32::MAX])),
+            Arc::new(Int32Array::from(vec![i32::MAX, 0, -1, -2, i32::MIN])),
+        ),
+        (
+            Arc::new(Int64Array::from(vec![i64::MIN, -1, 0, 1, i64::MAX])),
+            Arc::new(Int64Array::from(vec![i64::MAX, 0, -1, -2, i64::MIN])),
+        ),
     ];
-    for input in cases {
+    for (input, expected) in cases {
         let source = sql_source(
             "SELECT ~k AS original_inverted FROM fixture.source",
             input.data_type().clone(),
@@ -149,7 +133,6 @@ fn native_bitnot_intrinsic_actual_sql_signed_four_widths_frame_matches_original_
         let (program, root) = producer_root(&plans);
         let data = batch(&program, root, input.clone());
         let mut frame = CompiledExpressionInstance::try_new(program, root, &Control).unwrap();
-        let expected = original(input.clone());
         let all = frame
             .evaluate(&data, Selection::all(input.len()), &Control)
             .unwrap();
@@ -208,15 +191,17 @@ fn native_bitnot_intrinsic_actual_sql_largeint_cast_uses_exact_logical_recipe() 
     );
     let mut frame = CompiledExpressionInstance::try_new(program, root, &Control).unwrap();
     let out = frame.evaluate(&data, Selection::all(4), &Control).unwrap();
-    let argument = novarocks_types::largeint::array_from_i128(&[
-        Some(i64::MIN as i128),
-        Some(-1),
+    // The SQL cast sign-extends each INT64 to 128 bits. Its complement
+    // follows ~x = -x - 1 over signed 128-bit values, without narrowing back.
+    let expected = novarocks_types::largeint::array_from_i128(&[
+        Some(9_223_372_036_854_775_807),
         Some(0),
-        Some(i64::MAX as i128),
+        Some(-1),
+        Some(-9_223_372_036_854_775_808),
     ])
     .unwrap();
     assert!(out.errors().is_empty());
-    assert_eq!(out.values().to_data(), original(argument).to_data());
+    assert_eq!(out.values().to_data(), expected.to_data());
     assert_eq!(
         source.plan().result_port().unwrap().fields[0]
             .ty
@@ -237,7 +222,11 @@ fn native_bitnot_intrinsic_actual_sql_nullable_values_current_domain_matches_ori
     let mut frame = CompiledExpressionInstance::try_new(program, root, &Control).unwrap();
     let out = frame.evaluate(&data, Selection::all(3), &Control).unwrap();
     assert!(out.errors().is_empty());
-    assert_eq!(out.values().to_data(), original(input).to_data());
+    // Complement keeps NULL and maps 1 -> -2, -2 -> 1.
+    assert_eq!(
+        out.values().to_data(),
+        Int64Array::from(vec![Some(-2), None, Some(1)]).to_data()
+    );
     let rows = [0, 2];
     let sparse = frame
         .evaluate(&data, Selection::try_sparse(3, &rows).unwrap(), &Control)
@@ -299,11 +288,16 @@ fn native_bitnot_intrinsic_actual_project_sql_unchanged_constants_execute_each_r
 }
 #[test]
 fn native_bitnot_intrinsic_actual_sql_largeint_full128_and_nullable_constant_sources() {
-    for value in [
-        Some(i128::MIN),
-        Some(i128::MAX),
-        Some((1_i128 << 100) + 5),
-        None,
+    for (value, expected) in [
+        (Some(i128::MIN), Some(i128::MAX)),
+        (Some(i128::MAX), Some(i128::MIN)),
+        // 2^100 + 5 complements to -2^100 - 6. The decimal expected value
+        // is fixed independently of the runtime bit-array implementation.
+        (
+            Some((1_i128 << 100) + 5),
+            Some(-1_267_650_600_228_229_401_496_703_205_382_i128),
+        ),
+        (None, None),
     ] {
         // Numeric literals exercise full-width authoring independently of the
         // explicit Utf8 -> LargeInt conversion covered below.
@@ -313,8 +307,8 @@ fn native_bitnot_intrinsic_actual_sql_largeint_full128_and_nullable_constant_sou
         };
         let outputs = constant_outputs(&format!("SELECT ~{operand} AS original_inverted"));
         assert_eq!(outputs.len(), 1);
-        let original_input = novarocks_types::largeint::array_from_i128(&[value]).unwrap();
-        assert_eq!(outputs[0].to_data(), original(original_input).to_data());
+        let expected = novarocks_types::largeint::array_from_i128(&[expected]).unwrap();
+        assert_eq!(outputs[0].to_data(), expected.to_data());
     }
 }
 #[test]

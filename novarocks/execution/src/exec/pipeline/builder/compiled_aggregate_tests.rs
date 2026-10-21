@@ -599,9 +599,20 @@ fn group_keys_equate_null_every_nan_and_signed_zero_as_the_key_table_owns_them()
         Some(-0.0),
         Some(-f64::NAN),
     ];
-    let chunks = run_single(&float_key_plan(&catalog, &keys), &catalog);
+    let plan = float_key_plan(&catalog, &keys);
+    let declared = plan.result_port().unwrap().fields[0].ty.clone();
+    assert_eq!(declared, FunctionValueType::new(DataType::Float64, true));
+    let chunks = run_single(&plan, &catalog);
     let mut groups = Vec::new();
     for chunk in &chunks {
+        // Actual NULL groups retain the original nullable frozen declaration;
+        // runtime data must not invent a new output type or widen non-NULL facts.
+        assert!(chunk.chunk_schema().is_typed());
+        assert!(chunk.record_batch().schema().field(0).is_nullable());
+        assert_eq!(
+            chunk.chunk_schema().slots()[0].typed_binding(),
+            declared.typed_binding(),
+        );
         let key = chunk
             .record_batch()
             .column(0)

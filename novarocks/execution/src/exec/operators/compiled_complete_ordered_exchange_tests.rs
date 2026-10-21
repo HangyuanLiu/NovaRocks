@@ -47,7 +47,7 @@ pub(super) fn retain_received_buffer(
         3,
         false,
         sender,
-        control,
+        &|| control.checkpoint_execution(),
     )
     .unwrap()
     .into_iter()

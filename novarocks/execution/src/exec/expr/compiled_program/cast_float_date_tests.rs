@@ -17,8 +17,21 @@
 
 //! Actual LocalCompiler strict float-DATE profiles and native source/first-failure contracts.
 use super::*;
-use crate::exec::expr::legacy_float_date_cast_baseline_tests::{actual, input};
-use arrow::array::Date32Array;
+use arrow::array::{Date32Array, Float32Array, Float64Array};
+// Pure authored input construction; conversion to f32 defines the source
+// carrier, not the expected DATE. No old evaluator is borrowed.
+fn input(wide: bool, values: Vec<Option<f64>>) -> ArrayRef {
+    if wide {
+        Arc::new(Float64Array::from(values))
+    } else {
+        Arc::new(Float32Array::from(
+            values
+                .into_iter()
+                .map(|v| v.map(|v| v as f32))
+                .collect::<Vec<_>>(),
+        ))
+    }
+}
 fn float_batch(program: &LocalProgram, source: ArrayRef) -> RecordBatch {
     let n = source.len();
     let schema = program.graph().nodes()[1].output_layout().schema().clone();
@@ -96,41 +109,50 @@ fn float_date_actual_compiler_all_profiles_root_nullability_allow_policies_slice
                         let rows = [1, 2, 3, 5];
                         let selection = Selection::try_sparse(values.len(), &rows).unwrap();
                         let result = evaluator.evaluate(&batch, selection, &Control).unwrap();
-                        let mut expected = Vec::new();
-                        let mut error_ordinals = Vec::new();
-                        for (ordinal, row) in selection.iter().enumerate() {
-                            match actual(&source.slice(row, 1), policy, allow) {
-                                Ok(old) => {
-                                    let old = old.as_any().downcast_ref::<Date32Array>().unwrap();
-                                    expected.push(if old.is_null(0) {
-                                        None
-                                    } else {
-                                        Some(old.value(0))
-                                    });
-                                }
-                                Err(message) => {
-                                    expected.push(None);
-                                    error_ordinals.push(ordinal);
-                                    assert_eq!(
-                                        result
-                                            .errors()
-                                            .iter()
-                                            .find(|e| e.selected_ordinal() == ordinal)
-                                            .unwrap()
-                                            .message(),
-                                        message.detail()
-                                    );
-                                }
-                            }
-                        }
+                        // YYYYMMDD numeric grammar: 19700102 is epoch day 1;
+                        // February 30 is invalid. In f64, 20240229 means leap
+                        // day 19_782. f32 has ULP 2 here: ties-to-even rounds
+                        // 20240229 to 20240228, which is day 19_781. Infinity
+                        // is invalid under both policies and both allow flags.
+                        // These are calendar/IEEE-derived literals, not results
+                        // obtained from either the new or retired cast code.
+                        let expected = vec![
+                            Some(1),
+                            None,
+                            Some(if wide { 19_782 } else { 19_781 }),
+                            None,
+                        ];
+                        let expected_errors = [
+                            (
+                                1,
+                                format!(
+                                    "CAST failed: from {:?} to Date32: invalid date literal 20240230",
+                                    source_type(wide)
+                                ),
+                            ),
+                            (
+                                3,
+                                format!(
+                                    "CAST failed: from {:?} to Date32: invalid date literal inf",
+                                    source_type(wide)
+                                ),
+                            ),
+                        ];
                         assert_eq!(
                             result
                                 .errors()
                                 .iter()
                                 .map(|e| e.selected_ordinal())
                                 .collect::<Vec<_>>(),
-                            error_ordinals
+                            vec![1, 3],
                         );
+                        assert_eq!(result.errors().len(), expected_errors.len());
+                        for (error, (ordinal, message)) in
+                            result.errors().iter().zip(&expected_errors)
+                        {
+                            assert_eq!(error.selected_ordinal(), *ordinal);
+                            assert_eq!(error.message(), message.as_str());
+                        }
                         assert_eq!(
                             result.values().to_data(),
                             Date32Array::from(expected).to_data()
@@ -188,8 +210,13 @@ fn float_date_actual_compiler_native_float_constant_negative_zero_is_original_er
                 let result = instance(&program)
                     .evaluate(&batch, selection, &Control)
                     .unwrap();
-                let original_source = input(wide, vec![Some(-0.0)]);
-                let message = actual(&original_source, policy, allow).unwrap_err();
+                // Signed zero truncates to the integer date literal 0, which
+                // has neither a valid month nor day; it is a row error, not a
+                // successful NULL. This diagnostic follows the numeric grammar.
+                let message = format!(
+                    "CAST failed: from {:?} to Date32: invalid date literal 0",
+                    source_type(wide)
+                );
                 assert_eq!(
                     result.values().to_data(),
                     Date32Array::from(vec![None, None]).to_data()
@@ -197,7 +224,7 @@ fn float_date_actual_compiler_native_float_constant_negative_zero_is_original_er
                 assert_eq!(result.errors().len(), 2);
                 for (ordinal, error) in result.errors().iter().enumerate() {
                     assert_eq!(error.selected_ordinal(), ordinal);
-                    assert_eq!(error.message(), message.detail());
+                    assert_eq!(error.message(), message);
                 }
             }
         }

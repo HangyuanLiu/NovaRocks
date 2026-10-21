@@ -95,6 +95,7 @@ pub(crate) struct OptimizerEnvironment<'a> {
     constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
     function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    root_allow_throw_exception: bool,
     fold_dependency_observer: Option<Arc<dyn crate::compiler::SqlFoldDependencyObserver>>,
 }
 
@@ -104,6 +105,7 @@ impl<'a> OptimizerEnvironment<'a> {
         constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
         function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
         decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+        root_allow_throw_exception: bool,
         control: &'a dyn PureCompileControl,
     ) -> Self {
         Self {
@@ -111,6 +113,7 @@ impl<'a> OptimizerEnvironment<'a> {
             constant_evaluator,
             function_catalog,
             decimal_overflow_policy,
+            root_allow_throw_exception,
             control,
             fold_dependency_observer: None,
         }
@@ -205,6 +208,7 @@ pub(crate) fn optimize_with_test_table_statistics(
             None,
             crate::functions::test_function_catalog_snapshot(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            false,
             test_optimizer_control(),
         ),
     )
@@ -238,6 +242,7 @@ pub(crate) fn optimize_with_root_distribution_and_test_table_statistics(
             None,
             crate::functions::test_function_catalog_snapshot(),
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            false,
             test_optimizer_control(),
         ),
     )
@@ -258,6 +263,7 @@ fn optimize_with_root_property(
         constant_evaluator,
         function_catalog,
         decimal_overflow_policy,
+        root_allow_throw_exception,
         control,
         fold_dependency_observer,
     } = environment;
@@ -284,6 +290,7 @@ fn optimize_with_root_property(
         decimal_overflow_policy,
         control,
     );
+    rewrite_ctx.set_root_allow_throw_exception(root_allow_throw_exception);
     rewrite_ctx.policy_mut().max_iterations = options.rewrite_max_iterations;
     rewrite_ctx.set_query_stats_input(stats_input.clone());
     rewrite_ctx.set_deadline(deadline);
@@ -1555,6 +1562,7 @@ mod is_known_rule_name_tests {
                 None,
                 crate::functions::test_function_catalog_snapshot(),
                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                false,
                 test_optimizer_control(),
             ),
         )

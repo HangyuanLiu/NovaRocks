@@ -138,7 +138,7 @@ fn float_decimal128_complete_metadata_effect_nullable_and_policy() {
             .is_err()
         );
     }
-    for source in [DataType::Float32, DataType::Utf8] {
+    for source in [DataType::Float16] {
         assert_eq!(
             PreparedCastRecipe::try_new(
                 CastOperation::Carrier,
@@ -267,20 +267,56 @@ fn float_decimal128_original_value_static_error_and_hidden_null() {
         ),
         Err(KernelFailure::InvalidProgram(_))
     ));
-    // Test-only regression evidence: no runtime catch, row NULL replacement or new panic policy.
-    for (scale, array) in [
-        (i8::MIN, input(vec![None])),
-        (0, input(vec![Some(i128::MIN as f64)])),
+    // Extreme scale keeps the existing static-factor error channel even for
+    // NULL input; the minimum signed coefficient follows the overflow policy.
+    let scale = recipe(38, i8::MIN, true)
+        .evaluate_row(
+            EvaluatedArgument::Column(&input(vec![None])),
+            0,
+            0,
+            &Control::default(),
+        )
+        .unwrap();
+    let CastRowResult::RowError(error) = scale else {
+        panic!("unrepresentable scale must refuse")
+    };
+    assert_eq!(
+        error.message(),
+        "CAST failed: from Float64 to Decimal128(38, -128): decimal scale overflow while casting float to DECIMAL: scale=-128"
+    );
+    let minimum = input(vec![Some(i128::MIN as f64)]);
+    for policy in [
+        DecimalOverflowPolicy::OutputNull,
+        DecimalOverflowPolicy::ReportError,
     ] {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            recipe(38, scale, true).evaluate_row(
-                EvaluatedArgument::Column(&array),
+        let r = PreparedCastRecipe::try_new(
+            CastOperation::Carrier,
+            &FunctionValueType::new(DataType::Float64, true),
+            &FunctionValueType::new(DataType::Decimal128(38, 0), true),
+            policy,
+            false,
+            &Control::default(),
+        )
+        .unwrap();
+        let got = r
+            .evaluate_row(
+                EvaluatedArgument::Column(&minimum),
                 0,
                 0,
                 &Control::default(),
             )
-        }));
-        assert_eq!(result.is_err(), cfg!(debug_assertions));
+            .unwrap();
+        match (policy, got) {
+            (DecimalOverflowPolicy::OutputNull, CastRowResult::Null) => {}
+            (DecimalOverflowPolicy::ReportError, CastRowResult::RowError(error)) => {
+                assert_eq!(error.selected_ordinal(), 0);
+                assert_eq!(
+                    error.message(),
+                    "Expr evaluate meet error: The numeric type cast involving decimal overflows"
+                );
+            }
+            (_, other) => panic!("coefficient overflow policy changed: {other:?}"),
+        }
     }
 }
 #[test]
@@ -345,26 +381,30 @@ fn float_decimal128_compile_callbacks_preserve_three_causes_no_tail() {
             Ok(())
         }
     }
-    for (source, result, op) in [
+    for (source, result, op, expected_error) in [
         (
             DataType::Float64,
             FunctionValueType::new(DataType::Decimal128(38, i8::MIN), true),
             CastOperation::Carrier,
+            None,
         ),
         (
             DataType::Float64,
             FunctionValueType::new(DataType::Decimal128(18, 4), false),
             CastOperation::Carrier,
+            Some(CastPrepareError::TypeMismatch),
         ),
         (
             DataType::Float32,
             FunctionValueType::new(DataType::Decimal128(18, 4), true),
             CastOperation::Carrier,
+            None,
         ),
         (
             DataType::Float64,
             FunctionValueType::new(DataType::Decimal128(18, 4), true),
             CastOperation::Time,
+            Some(CastPrepareError::Unsupported),
         ),
     ] {
         let source = FunctionValueType::from_legacy_declared_projection(source, true);
@@ -380,12 +420,17 @@ fn float_decimal128_compile_callbacks_preserve_three_causes_no_tail() {
             true,
             &baseline,
         );
-        assert_eq!(
-            original.is_ok(),
-            op == CastOperation::Carrier
-                && result.nullable()
-                && source.data_type() == &DataType::Float64
-        );
+        // Both floating carriers are admitted; malformed result nullability
+        // and the unrelated time operation retain their exact refusal kinds.
+        match expected_error {
+            Some(expected) => assert_eq!(original, Err(expected)),
+            None => {
+                let prepared = original.unwrap();
+                assert_eq!(prepared.operation(), op);
+                assert_eq!(prepared.source_type(), &source);
+                assert_eq!(prepared.result_type(), &result);
+            }
+        }
         let trace = baseline.calls.lock().unwrap().clone();
         assert!(!trace.is_empty());
         for at in 0..trace.len() {

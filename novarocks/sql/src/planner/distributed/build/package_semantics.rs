@@ -68,13 +68,16 @@ pub enum PackageSemanticsError {
     Control(CompileControlError),
     /// The original constant admission owner, without reclassifying its limit.
     ConstantSource(novarocks_functions::ConstantError),
-    /// A comparison author retained with its original fact and diagnostic.
-    Source(novarocks_failure_contract::SharedFailureCause),
     Occurrence(String),
     Journal(String),
     Effects(String),
-    /// An exact prepared-cast capability refusal, before package extraction.
+    /// An exact prepared-primitive capability refusal, before package extraction.
     UnsupportedCapability(String),
+    /// The actual primitive author retains its class, reason and source.
+    PrimitiveSource {
+        source: novarocks_failure_contract::SharedFailureCause,
+        cast: Option<(arrow::datatypes::DataType, arrow::datatypes::DataType)>,
+    },
     Pruning(String),
     /// A captured call's constant policy differs from the statement policy.
     PolicyMismatch(PhysicalCallSite),
@@ -85,11 +88,14 @@ impl fmt::Display for PackageSemanticsError {
         match self {
             Self::Control(cause) => cause.fmt(f),
             Self::ConstantSource(cause) => write!(f, "constant admission limit: {cause}"),
-            Self::Source(cause) => cause.fmt(f),
             Self::Occurrence(detail) => write!(f, "package expression occurrences: {detail}"),
             Self::Journal(detail) => write!(f, "package call source: {detail}"),
             Self::Effects(detail) => write!(f, "package call effects: {detail}"),
             Self::UnsupportedCapability(detail) => f.write_str(detail),
+            Self::PrimitiveSource { source, cast } => match cast {
+                Some((from, to)) => write!(f, "package cast {from:?} to {to:?}: {source}"),
+                None => source.fmt(f),
+            },
             Self::Pruning(detail) => write!(f, "package pruning: {detail}"),
             Self::PolicyMismatch(site) => write!(
                 f,
@@ -104,7 +110,7 @@ impl std::error::Error for PackageSemanticsError {
         match self {
             Self::Control(cause) => Some(cause),
             Self::ConstantSource(cause) => Some(cause),
-            Self::Source(cause) => Some(cause),
+            Self::PrimitiveSource { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -117,7 +123,7 @@ impl novarocks_failure_contract::FailureProjection for PackageSemanticsError {
         let (class, code) = match self {
             Self::Control(cause) => return cause.failure_fact(),
             Self::ConstantSource(cause) => return cause.failure_fact(),
-            Self::Source(cause) => return cause.failure_fact(),
+            Self::PrimitiveSource { source, .. } => return source.failure_fact(),
             Self::Occurrence(_) => (FailureClass::Invariant, 7),
             Self::Journal(_) => (FailureClass::Invariant, 8),
             Self::Effects(_) => (FailureClass::Invariant, 9),
@@ -197,21 +203,46 @@ fn constant_limit_from_effects(
 
 impl From<PhysicalFragmentEffectsError> for PackageSemanticsError {
     fn from(error: PhysicalFragmentEffectsError) -> Self {
+        use PhysicalExpressionEffectsError as E;
+        use novarocks_failure_contract::SharedFailureCause;
+        use novarocks_functions::{
+            ArithmeticPrepareError as A, CastPrepareError as C, ComparisonPrepareError as B,
+            KernelFailure,
+        };
         let error = match constant_limit_from_effects(error) {
             Ok(cause) => return Self::ConstantSource(cause),
             Err(error) => error,
         };
         match error {
-            PhysicalFragmentEffectsError::Control(cause) => Self::Control(cause),
-            PhysicalFragmentEffectsError::Expressions(
-                PhysicalExpressionEffectsError::Comparison(cause),
-            ) => match cause.control_error() {
-                Some(control) => Self::Control(control),
-                None => Self::Source(novarocks_failure_contract::SharedFailureCause::new(cause)),
+            PhysicalFragmentEffectsError::Control(cause)
+            | PhysicalFragmentEffectsError::Expressions(
+                E::Control(cause)
+                | E::Cast(C::Control(cause) | C::Kernel(KernelFailure::CompileControl(cause)))
+                | E::Arithmetic(A::Control(cause) | A::Kernel(KernelFailure::CompileControl(cause)))
+                | E::Comparison(B::Control(cause) | B::Kernel(KernelFailure::CompileControl(cause))),
+            ) => Self::Control(cause),
+            PhysicalFragmentEffectsError::Expressions(E::UnsupportedCast { source, from, to }) => {
+                Self::PrimitiveSource {
+                    source: SharedFailureCause::new(source),
+                    cast: Some((from, to)),
+                }
+            }
+            PhysicalFragmentEffectsError::Expressions(E::Cast(source)) => Self::PrimitiveSource {
+                source: SharedFailureCause::new(source),
+                cast: None,
             },
-            error @ PhysicalFragmentEffectsError::Expressions(
-                PhysicalExpressionEffectsError::UnsupportedCast { .. },
-            ) => Self::UnsupportedCapability(format!("package call effects: {error:?}")),
+            PhysicalFragmentEffectsError::Expressions(E::Arithmetic(source)) => {
+                Self::PrimitiveSource {
+                    source: SharedFailureCause::new(source),
+                    cast: None,
+                }
+            }
+            PhysicalFragmentEffectsError::Expressions(E::Comparison(source)) => {
+                Self::PrimitiveSource {
+                    source: SharedFailureCause::new(source),
+                    cast: None,
+                }
+            }
             other => Self::Effects(format!("{other:?}")),
         }
     }
@@ -281,11 +312,7 @@ fn author_one(
     })();
     let aggregate_environments = match environments {
         Ok(environments) => environments,
-        Err(PackageSemanticsError::Control(cause)) => return Err(cause.into()),
-        Err(error) => {
-            work.finish()?;
-            return Err(error);
-        }
+        Err(error) => return work.finish_result(Err(error), PackageSemanticsError::from),
     };
     let scopes = (|| {
         let mut expressions: BTreeMap<ExpressionUseId, PhysicalCallSourceScope<'_>> =
@@ -397,11 +424,7 @@ fn author_one(
     })();
     let (expressions, relations) = match scopes {
         Ok(scopes) => scopes,
-        Err(PackageSemanticsError::Control(cause)) => return Err(cause.into()),
-        Err(error) => {
-            work.finish()?;
-            return Err(error);
-        }
+        Err(error) => return work.finish_result(Err(error), PackageSemanticsError::from),
     };
     work.finish()?;
     let effects = author_sql_fragment_effects_observed(
@@ -432,30 +455,167 @@ fn author_one(
 mod capability_projection_tests {
     use super::*;
     use arrow::datatypes::{DataType, Field};
-    use novarocks_functions::CastPrepareError;
+    use novarocks_failure_contract::{FailureClass, FailureProjection};
+    use novarocks_functions::{
+        ArithmeticPrepareError as A, CastPrepareError as C, ComparisonPrepareError as B,
+        KernelFailure,
+    };
     use std::sync::Arc;
+
+    fn assert_primitive_source<E>(original: E)
+    where
+        E: std::error::Error + FailureProjection + Clone + PartialEq + Send + Sync + 'static,
+        PhysicalExpressionEffectsError: From<E>,
+    {
+        let expected = original.failure_fact();
+        let error = PackageSemanticsError::from(PhysicalFragmentEffectsError::from(
+            PhysicalExpressionEffectsError::from(original.clone()),
+        ));
+        assert_eq!(error.failure_fact(), expected);
+        assert!(std::error::Error::source(&error).is_some());
+        let PackageSemanticsError::PrimitiveSource { source, cast } = error else {
+            panic!("the original primitive must retain its typed source");
+        };
+        assert!(cast.is_none());
+        assert_eq!(source.downcast_ref::<E>(), Some(&original));
+        assert_eq!(source.failure_fact(), expected);
+    }
 
     #[test]
     fn package_semantics_keeps_exact_cast_refusals_separate_from_invalid_programs() {
         let from = DataType::List(Arc::new(Field::new("item", DataType::Int8, true)));
         let to = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
         let error = PackageSemanticsError::from(PhysicalFragmentEffectsError::Expressions(
-            PhysicalExpressionEffectsError::UnsupportedCast { from, to },
+            PhysicalExpressionEffectsError::UnsupportedCast {
+                source: C::Unsupported,
+                from: from.clone(),
+                to: to.clone(),
+            },
         ));
-        let PackageSemanticsError::UnsupportedCapability(detail) = error else {
-            panic!("exact cast capability identity was lost");
+        assert_eq!(error.failure_fact(), C::Unsupported.failure_fact());
+        let PackageSemanticsError::PrimitiveSource { source, cast } = error else {
+            panic!("exact cast capability source was lost");
         };
-        assert!(detail.contains("Int8") && detail.contains("Int64"));
-        for error in [
-            PhysicalExpressionEffectsError::Cast(CastPrepareError::TypeMismatch),
+        assert_eq!(cast, Some((from, to)));
+        assert_eq!(source.downcast_ref::<C>(), Some(&C::Unsupported));
+        assert_primitive_source(C::TypeMismatch);
+        let error = PackageSemanticsError::from(PhysicalFragmentEffectsError::Expressions(
             PhysicalExpressionEffectsError::InvalidSource("UnsupportedCast diagnostic"),
+        ));
+        assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
+    }
+
+    #[test]
+    fn primitive_capability_refusals_remain_distinct_from_invalid_types() {
+        assert_primitive_source(C::Unsupported);
+        assert_primitive_source(A::Unsupported);
+        assert_primitive_source(B::Unsupported);
+        assert_primitive_source(C::TypeMismatch);
+        assert_primitive_source(A::TypeMismatch);
+        assert_primitive_source(B::TypeMismatch);
+    }
+
+    #[test]
+    fn actual_primitive_authors_keep_capability_sources_through_the_package_boundary() {
+        use novarocks_functions::{
+            CastOperation, PreparedArithmeticRecipe, PreparedCastRecipe, PreparedComparisonRecipe,
+            PreparedNullSafeComparisonRecipe,
+        };
+        use novarocks_type_contract::{
+            ArithmeticOperator, ComparisonOperator, DecimalOverflowPolicy, FunctionValueType,
+        };
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let value = |data_type| FunctionValueType::new(data_type, true);
+        let from = value(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Int8,
+            true,
+        ))));
+        let to = value(DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        ))));
+        let cast = PreparedCastRecipe::try_new(
+            CastOperation::Carrier,
+            &from,
+            &to,
+            DecimalOverflowPolicy::OutputNull,
+            false,
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(cast, C::Unsupported);
+        assert_primitive_source(cast);
+        let text = value(DataType::Utf8);
+        let arithmetic = PreparedArithmeticRecipe::try_new(
+            ArithmeticOperator::Add,
+            &text,
+            &text,
+            &text,
+            DecimalOverflowPolicy::OutputNull,
+            false,
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(arithmetic, A::Unsupported);
+        assert_primitive_source(arithmetic);
+        let comparison =
+            PreparedComparisonRecipe::try_new(ComparisonOperator::Eq, &from, &from, &control)
+                .unwrap_err();
+        assert_eq!(comparison, B::Unsupported);
+        assert_primitive_source(comparison);
+        let binary = value(DataType::Binary);
+        let null_safe =
+            PreparedNullSafeComparisonRecipe::try_new(&binary, &binary, &control).unwrap_err();
+        assert_eq!(null_safe, B::Unsupported);
+        assert_primitive_source(null_safe);
+    }
+
+    #[test]
+    fn primitive_kernel_sources_retain_capacity_type_and_stop_facts_without_reclassification() {
+        use novarocks_failure_contract::{FailureReason, domain};
+        use std::num::NonZeroU16;
+        for error in [
+            KernelFailure::Capacity(novarocks_functions::KernelCapacityRefusal::new(
+                FailureReason::new(domain::MEMORY, NonZeroU16::new(8).unwrap()),
+                16,
+                8,
+                16,
+            )),
+            KernelFailure::from(novarocks_type_contract::ValueTypeError::TooDeep),
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::InvalidProgram(novarocks_functions::KernelDiagnostic::new(
+                "UnsupportedCast",
+            )),
+            KernelFailure::Operational(novarocks_functions::KernelDiagnostic::new("unsupported")),
         ] {
-            assert!(matches!(
-                PackageSemanticsError::from(PhysicalFragmentEffectsError::Expressions(error)),
-                PackageSemanticsError::Effects(_)
-            ));
+            assert_primitive_source(C::Kernel(error.clone()));
+            assert_primitive_source(A::Kernel(error.clone()));
+            assert_primitive_source(B::Kernel(error));
         }
     }
+
+    #[derive(Debug)]
+    struct DataClassControlSource;
+    impl std::fmt::Display for DataClassControlSource {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("original caller refusal")
+        }
+    }
+    impl std::error::Error for DataClassControlSource {}
+    impl FailureProjection for DataClassControlSource {
+        fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
+            use novarocks_failure_contract::{FailureFact, FailureReason, domain};
+            FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(domain::SQL, std::num::NonZeroU16::new(65000).unwrap()),
+            )
+        }
+    }
+    impl novarocks_failure_contract::OuterFailureProjection for DataClassControlSource {}
 
     #[test]
     fn package_semantics_capability_projection_preserves_original_control_causes() {
@@ -463,11 +623,41 @@ mod capability_projection_tests {
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
+            CompileControlError::from_domain(novarocks_type_contract::ValueTypeError::TooDeep),
+            CompileControlError::from_domain(DataClassControlSource),
         ] {
-            assert!(matches!(
-                PackageSemanticsError::from(PhysicalFragmentEffectsError::Control(cause.clone())),
-                PackageSemanticsError::Control(actual) if actual == cause
-            ));
+            let expected = cause.failure_fact();
+            let direct =
+                PackageSemanticsError::from(PhysicalFragmentEffectsError::Control(cause.clone()));
+            assert_eq!(direct.failure_fact(), expected);
+            assert!(matches!(direct, PackageSemanticsError::Control(actual) if actual == cause));
+            for error in [
+                PhysicalExpressionEffectsError::Cast(C::Control(cause.clone())),
+                PhysicalExpressionEffectsError::Arithmetic(A::Control(cause.clone())),
+                PhysicalExpressionEffectsError::Comparison(B::Control(cause.clone())),
+                PhysicalExpressionEffectsError::Cast(C::Kernel(KernelFailure::CompileControl(
+                    cause.clone(),
+                ))),
+                PhysicalExpressionEffectsError::Arithmetic(A::Kernel(
+                    KernelFailure::CompileControl(cause.clone()),
+                )),
+                PhysicalExpressionEffectsError::Comparison(B::Kernel(
+                    KernelFailure::CompileControl(cause.clone()),
+                )),
+                PhysicalExpressionEffectsError::from(C::Kernel(KernelFailure::CompileControl(
+                    cause.clone(),
+                ))),
+                PhysicalExpressionEffectsError::from(A::Kernel(KernelFailure::CompileControl(
+                    cause.clone(),
+                ))),
+                PhysicalExpressionEffectsError::from(B::Kernel(KernelFailure::CompileControl(
+                    cause.clone(),
+                ))),
+            ] {
+                let error = PackageSemanticsError::from(PhysicalFragmentEffectsError::from(error));
+                assert_eq!(error.failure_fact(), expected);
+                assert!(matches!(error, PackageSemanticsError::Control(actual) if actual == cause));
+            }
         }
     }
 }
@@ -615,7 +805,7 @@ mod comparison_source_projection_tests {
             assert_eq!(expected.class(), expected_class);
             let error = package(original.clone());
             assert_eq!(error.failure_fact(), expected);
-            let PackageSemanticsError::Source(source) = &error else {
+            let PackageSemanticsError::PrimitiveSource { source, cast: None } = &error else {
                 panic!("comparison source was replaced by a SQL diagnostic");
             };
             assert_eq!(
@@ -694,7 +884,7 @@ mod comparison_source_projection_tests {
         let error = package(original.clone());
         assert_eq!(error.failure_fact(), expected);
         assert_eq!(error.failure_fact().class(), FailureClass::Invariant);
-        let PackageSemanticsError::Source(source) = error else {
+        let PackageSemanticsError::PrimitiveSource { source, cast: None } = error else {
             panic!("the original kernel source was not retained");
         };
         assert_eq!(

@@ -158,9 +158,35 @@ fn control_values_retains_actual_arrow_source_with_bounded_diagnostic() {
 }
 #[test]
 fn control_values_indexed_rejects_dedicated_carriers_without_fallback() {
+    let ty = DataType::FixedSizeBinary(16);
+    assert!(supports_indexed_result(&ty));
+    let source = Arc::new(
+        arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            [Some([7_u8; 16]), None].into_iter(),
+            16,
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    let output = assemble_values(
+        AssemblyPlan::Indexed {
+            result_type: &ty,
+            sources: &[Some(&source)],
+            choices: &[Some((0, 0)), Some((0, 1)), None],
+        },
+        &LegacyControl,
+    )
+    .unwrap();
+    assert_eq!(output.data_type(), &ty);
+    let fixed = output
+        .as_any()
+        .downcast_ref::<arrow_array::FixedSizeBinaryArray>()
+        .unwrap();
+    assert_eq!(fixed.value(0), &[7_u8; 16]);
+    assert!(fixed.is_null(1));
+    assert!(fixed.is_null(2));
     for ty in [
         DataType::Null,
-        DataType::FixedSizeBinary(16),
+        DataType::FixedSizeBinary(0),
         DataType::Map(
             Arc::new(Field::new(
                 "entries",

@@ -2049,7 +2049,7 @@ fn compiled_nested_loop_step_waits_before_preparation_and_drains_after_eos() {
 #[test]
 fn compiled_hash_probe_steps_page_duplicate_matches_and_keep_eos_behind_the_cursor() {
     use crate::exec::chunk::{Chunk, ChunkSchema};
-    use crate::exec::operators::hashjoin::join_probe_utils::MAX_JOIN_OUTPUT_ROWS_PER_BATCH;
+    use crate::exec::operators::hashjoin::MAX_JOIN_OUTPUT_ROWS_PER_BATCH;
     use crate::exec::pipeline::{
         input::RawInput,
         step::{AdmissionNext, InputResult, NextStep},

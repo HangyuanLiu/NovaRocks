@@ -578,8 +578,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
-    use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::exec::chunk::Chunk;
     use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
     use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
     use crate::exec::pipeline::driver::PipelineDriver;
@@ -1374,28 +1373,64 @@ mod tests {
         );
     }
 
-    fn created_fixture_schema(
-        schema: &Arc<Schema>,
-        slots: &[SlotId],
-        types: &[novarocks_functions::FunctionValueType],
-    ) -> ChunkSchemaRef {
-        let declared = crate::exec::chunk::typed_fixture::layout(Arc::clone(schema), slots, types);
-        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-            crate::runtime::mem_tracker::MemTracker::new_root("executor complete fixture schema"),
-            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
-        )
-        .expect("actual fixture schema host");
-        factory
-            .create_compiled_chunk_schema(&declared)
-            .expect("created fixture schema")
+    // This is a test-only pipeline lifecycle stimulus, not an SQL SLEEP
+    // implementation. The normal receiver owns accepted/prepared input while
+    // the driver blocks in the exact RuntimeErrorState interruptible waiter.
+    struct CancellableWaitFactory;
+    impl OperatorFactory for CancellableWaitFactory {
+        fn name(&self) -> &str {
+            "CancellableWait"
+        }
+        fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
+            Box::new(crate::exec::pipeline::shape::Transform::hydrating(
+                CancellableWait {
+                    runtime_error: None,
+                },
+            ))
+        }
+    }
+    struct CancellableWait {
+        runtime_error: Option<Arc<crate::runtime::runtime_state::RuntimeErrorState>>,
+    }
+    impl OperatorLifecycle for CancellableWait {
+        fn name(&self) -> &str {
+            "CancellableWait"
+        }
+        fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+            self.runtime_error = Some(state.error_state());
+            Ok(())
+        }
+    }
+    impl crate::exec::pipeline::operator::InputEncodingPolicy for CancellableWait {}
+    impl crate::exec::pipeline::shape::TransformKernel for CancellableWait {
+        fn apply(
+            &mut self,
+            _ctx: &mut crate::exec::pipeline::step_context::StepContext<'_>,
+            input: crate::exec::pipeline::input::PreparedInput,
+        ) -> ExecutionResult<crate::exec::pipeline::step::StepResult> {
+            let chunk = input.into_uncovered_chunk()?;
+            let runtime_error = self.runtime_error.as_ref().ok_or_else(|| {
+                ExecutionFailure::from_domain(
+                    crate::runtime::runtime_state::RuntimeBindingFailure::MissingExecutionRuntime,
+                )
+            })?;
+            // Keep the original 60-second wait. Only cancellation can let this
+            // fixture meet the two-second physical-join deadline below.
+            runtime_error.wait_interruptibly(Duration::from_secs(60))?;
+            let rows = u64::try_from(chunk.len()).expect("fixture rows fit u64");
+            Ok(crate::exec::pipeline::step::StepResult::new(
+                Some(chunk),
+                crate::exec::pipeline::step::NextStep::NeedInput,
+                rows,
+            ))
+        }
     }
 
     #[test]
     fn cancelled_sleep_physically_joins_before_the_next_single_thread_pipeline() {
-        use crate::exec::expr::LiteralValue;
-        use crate::exec::expr::function::FunctionKind;
-
+        // The historical test name is retained as a tracking key. The
+        // stimulus is now CancellableWait, not compiled SLEEP capability;
+        // both use this same real runtime waiting/cancellation owner.
         // This dedicated executor has exactly one physical execution thread.
         let runtime = Arc::new(
             ExecutionRuntime::new(
@@ -1405,6 +1440,7 @@ mod tests {
             )
             .unwrap(),
         );
+        assert_eq!(runtime.config().driver_threads, 1);
         let slot = SlotId::new(1);
         let input_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
@@ -1414,39 +1450,6 @@ mod tests {
         .unwrap();
         let input_type = novarocks_functions::FunctionValueType::new(DataType::Int64, false);
         let chunk = crate::exec::chunk::typed_fixture::chunk(batch, &[slot], &[input_type]);
-        // SLEEP's installed scalar declaration is nullable; it is not a member
-        // of the total-scalar family even when this literal is non-null.
-        let sleep_type = novarocks_functions::FunctionValueType::new(DataType::Boolean, true);
-        let output_schema = Arc::new(Schema::new(vec![Field::new(
-            "sleep",
-            DataType::Boolean,
-            true,
-        )]));
-        let mut arena = ExprArena::default();
-        let seconds = arena.push_value_typed(
-            ExprNode::Literal(LiteralValue::Int64(60)),
-            novarocks_functions::FunctionValueType::new(DataType::Int64, false),
-        );
-        let sleep = arena.push_value_typed(
-            ExprNode::FunctionCall {
-                kind: FunctionKind::Object("sleep"),
-                args: vec![seconds],
-            },
-            sleep_type.clone(),
-        );
-        // F3 retains the legacy evaluator as a test oracle. This direct
-        // operator graph owns no construction tree or fragment decoder.
-        let output = created_fixture_schema(&output_schema, &[slot], &[sleep_type]);
-        let project = crate::exec::operators::ProjectFixtureFactory::from_fixture_schema(
-            2,
-            false,
-            Arc::new(arena),
-            vec![sleep],
-            vec![slot],
-            Some(output.slots().to_vec()),
-            None,
-            output,
-        );
         let prepare = |factories: Vec<Box<dyn OperatorFactory>>| {
             let state = Arc::new(RuntimeState::new(
                 None,
@@ -1490,29 +1493,39 @@ mod tests {
         };
         let (prepared, state, output) = prepare(vec![
             Box::new(crate::exec::operators::ValuesSourceFactory::new(chunk, 1)),
-            Box::new(project),
+            Box::new(CancellableWaitFactory),
         ]);
         let running = prepared.start();
         let deadline = Instant::now() + Duration::from_secs(2);
         while state.error_state().waiting_count() == 0 && Instant::now() < deadline {
             std::thread::yield_now();
         }
-        let entered_sleep = state.error_state().waiting_count() == 1;
+        let entered_wait = state.error_state().waiting_count() == 1;
         assert!(
             running.cancel(crate::runtime::fragment::FragmentCancelReason::new(
                 "cancel actual SLEEP".to_string()
             ))
         );
+        let cancellation = state.error().expect("cancel installed its actual cause");
         let (tx, rx) = mpsc::channel();
-        let join = std::thread::spawn(move || tx.send(running.join()).unwrap());
+        let join = std::thread::spawn(move || {
+            let result = running.join();
+            let stopped = running
+                .stopped_fact()
+                .expect("join proves physical driver exit");
+            assert_eq!(stopped.conclusion(), result);
+            assert_eq!(running.conclusion(), Some(result.clone()));
+            tx.send(result).unwrap();
+        });
         let result = rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("cancel must drain the physical SLEEP driver");
+            .expect("cancel must drain the physical waiting driver");
         join.join().unwrap();
         assert!(
-            entered_sleep,
-            "the single execution thread must enter SLEEP before cancellation"
+            entered_wait,
+            "the single execution thread must enter its actual wait before cancellation"
         );
+        assert!(result.as_ref().unwrap_err().same_occurrence(&cancellation));
         assert_eq!(
             result.map_err(|source| source.detail().to_owned()),
             Err("cancel actual SLEEP".to_owned())
@@ -1520,7 +1533,7 @@ mod tests {
         assert_eq!(state.error_state().waiting_count(), 0);
         assert!(
             output.take_chunks().is_empty(),
-            "cancelled expression must publish no partial chunk"
+            "cancelled transform must publish no partial chunk"
         );
 
         let next_type = novarocks_functions::FunctionValueType::new(DataType::Int32, false);
@@ -1540,7 +1553,15 @@ mod tests {
         )]);
         let running = prepared.start();
         let (tx, rx) = mpsc::channel();
-        let join = std::thread::spawn(move || tx.send(running.join()).unwrap());
+        let join = std::thread::spawn(move || {
+            let result = running.join();
+            let stopped = running
+                .stopped_fact()
+                .expect("join proves physical driver exit");
+            assert_eq!(stopped.conclusion(), result);
+            assert_eq!(running.conclusion(), Some(result.clone()));
+            tx.send(result).unwrap();
+        });
         assert_eq!(
             rx.recv_timeout(Duration::from_secs(2))
                 .expect("the freed single execution thread must run the next pipeline"),

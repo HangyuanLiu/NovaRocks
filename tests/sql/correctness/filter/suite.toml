@@ -18,7 +18,31 @@
 explicit_only = false
 
 [impact]
-paths = ["novarocks/execution/src/exec/operators/filter_processor.rs", "novarocks/execution/src/exec/expr/comparison.rs"]
+paths = [
+    "novarocks/functions/src/comparison.rs",
+    "novarocks/functions/src/logical_null.rs",
+    "novarocks/functions/src/native_between.rs",
+    "novarocks/functions/src/native_inlist.rs",
+    "novarocks/functions/src/native_like.rs",
+    "novarocks/functions/src/control_values.rs",
+    "novarocks/execution/src/exec/expr/compiled_program.rs",
+    "novarocks/execution/src/exec/expr/compiled_program/**",
+    "novarocks/execution/src/exec/operators/compiled_expression.rs",
+    "novarocks/local-compiler/src/expressions.rs",
+    "novarocks/functions/src/lib.rs",
+    "novarocks/functions/src/evaluation.rs",
+    "novarocks/functions/src/kernel_input.rs",
+    "novarocks/functions/src/invocation_scope.rs",
+    "novarocks/functions/src/invocation_scalar_resources.rs",
+    "novarocks/functions/src/arithmetic.rs",
+    "novarocks/functions/src/cast.rs",
+    "novarocks/functions/src/array_projection.rs",
+    "novarocks/functions/src/selected_copy.rs",
+    "novarocks/functions/src/selected_copy/guarded_nested.rs",
+    "novarocks/functions/src/arrow_result_custody.rs",
+    "novarocks/functions/src/array_backing_geometry.rs",
+    "novarocks/functions/src/source_custody_resources.rs",
+]
 
 [reuse]
 scope = "suite"

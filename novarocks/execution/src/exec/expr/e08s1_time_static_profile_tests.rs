@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Source-independent exact TIME types do not replace the original emitted-source refiner.
-use super::e08s1_time_original_profile_tests::{bindings, domains, full_binding};
+use super::time_profile_sql_source_tests::{bindings, domains, full_binding};
 use arrow::datatypes::{DataType, TimeUnit};
 use novarocks_functions::{
     FunctionArgumentType, FunctionBindingError, FunctionResultType, FunctionValueType,

@@ -19,7 +19,22 @@ explicit_only = true
 heavy = { reason = "cost", detail = "Two exhaustive window frame matrices; run serially on native 1FE+3BE." }
 
 [impact]
-paths = ["novarocks/execution/src/exec/operators/analytic_*.rs"]
+paths = [
+    "novarocks/execution/src/exec/operators/analytic_*.rs",
+    "novarocks/functions/src/evaluation.rs",
+    "novarocks/functions/src/kernel_input.rs",
+    "novarocks/execution/src/exec/expr/compiled_program.rs",
+    "novarocks/execution/src/exec/expr/compiled_program/**",
+    "novarocks/execution/src/exec/operators/compiled_window*.rs",
+    "novarocks/functions/src/window_call.rs",
+    "novarocks/functions/src/window_invocation_input.rs",
+    "novarocks/functions/src/aggregate_call/encoding.rs",
+    "novarocks/local-compiler/src/expressions.rs",
+    "novarocks/functions/src/array_projection.rs",
+    "novarocks/functions/src/arrow_result_custody.rs",
+    "novarocks/functions/src/array_backing_geometry.rs",
+    "novarocks/functions/src/source_custody_resources.rs",
+]
 
 [reuse]
 scope = "suite"

@@ -18,8 +18,8 @@
 use super::compiled_program::CompiledExpressionInstance;
 use super::filter_conjunction_actual_sql_compiler_tests::{compile_options, validate_package};
 use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields;
 use super::numeric_unary_owned_transaction_tests::frozen_reads_with_explicit_source_shape;
+use super::sql_test_source::sql_source_with_declared_fields;
 use arrow::{
     array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array},
     datatypes::{DataType, Field},
@@ -414,7 +414,7 @@ fn actual_stored_signed_indexes_keep_width_source_null_and_sparse_sliced_results
 
 #[test]
 fn actual_map_key_keeps_original_exact_binding_and_candidate_named_refusal() {
-    use super::numeric_unary_original_nonnull_sql_baseline_tests::try_sql_source_with_declared_fields;
+    use super::sql_test_source::try_sql_source_with_declared_fields;
     use novarocks_sql::{
         analyze_error::AnalyzeErrorKind,
         compiler::{SqlCompileError, SqlCompileProgressError},

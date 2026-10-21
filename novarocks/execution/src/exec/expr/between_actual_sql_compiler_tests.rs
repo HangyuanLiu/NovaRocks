@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Actual SQL source and permanent Frame witnesses. Before preparation is RED
-//! at the original package effect author; raw scalar oracles remain independent.
+//! Actual SQL/package/Frame witnesses with independent interval truth tables.
 use super::compiled_program::CompiledExpressionInstance;
-use super::legacy_between_observed_baseline_tests::original;
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_scan_residuals;
-use arrow::array::{Array, ArrayRef, BooleanArray, Decimal128Array, Int64Array, UInt64Array};
+use super::sql_test_source::sql_source;
+use arrow::array::{Array, ArrayRef, BooleanArray, Decimal128Array, Int64Array};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
@@ -94,7 +92,8 @@ fn between_sql_source_original_required_native_case_retains_actual_bound_decimal
         }
     }
 }
-fn evaluate(sql: &str, input: ArrayRef, low: ArrayRef, high: ArrayRef, negated: bool, truth: bool) {
+fn evaluate(sql: &str, input: ArrayRef, expected: &[Option<bool>], truth: bool) {
+    assert_eq!(expected.len(), input.len());
     let source = sql_source(sql, input.data_type().clone());
     assert_eq!(
         between_count(&source),
@@ -103,7 +102,6 @@ fn evaluate(sql: &str, input: ArrayRef, low: ArrayRef, high: ArrayRef, negated: 
     );
     let functions =
         super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue();
-    // This original author call is deliberately permanent RED before support.
     let programs = programs_with_catalogue_and_original_scan_residuals(&source, &functions);
     let mut found = None;
     for program in programs.values() {
@@ -160,31 +158,24 @@ fn evaluate(sql: &str, input: ArrayRef, low: ArrayRef, high: ArrayRef, negated: 
     assert_eq!(schema.fields().len(), 1);
     assert_eq!(schema.field(0).data_type(), input.data_type());
     let data = RecordBatch::try_new(schema, vec![input.clone()]).unwrap();
-    let old = original(vec![input.clone(), low, high], negated).unwrap();
     for rows in [(0..input.len()).collect::<Vec<_>>(), vec![0], Vec::new()] {
         let selection = Selection::try_sparse(input.len(), &rows).unwrap();
         let mut frame =
             CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
         let out = frame.evaluate(&data, selection, &Control).unwrap();
         assert!(out.errors().is_empty());
-        let indices = UInt64Array::from(
-            rows.iter()
-                .map(|r| u64::try_from(*r).unwrap())
-                .collect::<Vec<_>>(),
-        );
-        let expected = arrow::compute::take(old.as_ref(), &indices, None).unwrap();
-        let wanted = if truth {
+        // The SQL predicate's value channel is three-valued. Its truth-only
+        // filter channel maps UNKNOWN to false, independently of Frame output.
+        let wanted: ArrayRef = if truth {
             Arc::new(BooleanArray::from(
-                expected
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .unwrap()
-                    .iter()
-                    .map(|v| v.unwrap_or(false))
+                rows.iter()
+                    .map(|row| expected[*row].unwrap_or(false))
                     .collect::<Vec<_>>(),
-            )) as ArrayRef
+            ))
         } else {
-            expected
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|row| expected[*row]).collect::<Vec<_>>(),
+            ))
         };
         assert_eq!(out.values().to_data(), wanted.to_data());
     }
@@ -201,9 +192,9 @@ fn between_actual_compiler_positive_value_and_truthonly_int64_source() {
         evaluate(
             sql,
             Arc::new(Int64Array::from(vec![0, 1, 3, 5, 9])),
-            Arc::new(Int64Array::from(vec![1; 5])),
-            Arc::new(Int64Array::from(vec![5; 5])),
-            false,
+            // Inclusive interval [1, 5]: 0 and 9 are outside; both ends
+            // and the interior value 3 are inside.
+            &[Some(false), Some(true), Some(true), Some(true), Some(false)],
             truth,
         );
     }
@@ -213,9 +204,14 @@ fn between_actual_compiler_negated_value_source() {
     evaluate(
         "SELECT k NOT BETWEEN 1 AND 5 AS original_range FROM fixture.source",
         Arc::new(Int64Array::from(vec![0, 1, 3, 5, 9])),
-        Arc::new(Int64Array::from(vec![1; 5])),
-        Arc::new(Int64Array::from(vec![5; 5])),
-        true,
+        // With no NULL inputs, NOT BETWEEN complements [1, 5].
+        &[
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(true),
+        ],
         false,
     );
 }
@@ -231,9 +227,9 @@ fn between_actual_compiler_required_decimal_bound_source() {
     evaluate(
         "SELECT k BETWEEN CAST(100.0 AS DECIMAL(6,1)) AND CAST(150 AS DECIMAL(4,0)) AS original_range FROM fixture.source",
         make(7, 2, vec![12000, 9000]),
-        make(6, 1, vec![1000; 2]),
-        make(4, 0, vec![150; 2]),
-        false,
+        // Coefficient 12000 at scale 2 is 120, between 1000/10 and
+        // 150/1; coefficient 9000 is 90 and is below the lower bound.
+        &[Some(true), Some(false)],
         false,
     );
 }
@@ -252,9 +248,9 @@ fn between_actual_compiler_decimal_literals_without_integral_cast_source() {
     evaluate(
         "SELECT k BETWEEN 100.0 AND 150.0 AS original_range FROM fixture.source",
         make(vec![12000, 9000]),
-        make(vec![10000; 2]),
-        make(vec![15000; 2]),
-        false,
+        // Decimal literals [100.0, 150.0] name the same numeric interval
+        // independently of the mixed-precision bound carrier cast above.
+        &[Some(true), Some(false)],
         false,
     );
 }

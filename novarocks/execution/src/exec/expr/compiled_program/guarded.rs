@@ -19,6 +19,7 @@
 //! frame. Kernel calls temporarily borrow one stable domain, then erase that
 //! borrow into owned values before resuming the parent continuation.
 use super::boolean_region::BooleanRows;
+use super::node_recipes::{ComparisonPosition, NodeRecipes, ProgramNodeRecipes};
 use super::*;
 use arrow::array::{Array, BooleanArray};
 use novarocks_local_program::ProgramNodeId;
@@ -30,6 +31,7 @@ pub(super) fn supports_result(ty: &DataType) -> bool {
 
 enum OwnedValue {
     Constant(novarocks_functions::ConstantValue),
+    ConstantView(constant_projection::CanonicalConstant),
     Column(ArrayRef),
     Source(ArrayRef, Arc<input_source::ActualInvocationDomain>),
     Selected(ArrayRef, Box<[RowDataError]>),
@@ -64,6 +66,7 @@ impl OwnedValue {
                 .into_value(selection, work)?
                 .retaining_continuation(owner, work)?,
             Self::Constant(value) => Value::Constant(value),
+            Self::ConstantView(value) => Value::ConstantView(value),
             Self::Column(value) => Value::Column(value),
             Self::Source(array, domain) => {
                 let actual = domain.selection(work.control)?;
@@ -175,6 +178,14 @@ impl OwnedValue {
                 let owner = input_source::ArrayContinuation::from_constant(&value, allocator);
                 Self::Constant(value).with_continuation(owner.or(previous))
             }
+            Self::ConstantView(value) => {
+                // The projection's new creator is independent of original CV
+                // purity. Its existing pin already contains that exact CV.
+                let owner = previous.or_else(|| {
+                    input_source::ArrayContinuation::from_constant(&value.original, allocator)
+                });
+                Self::ConstantView(value).with_continuation(owner)
+            }
             Self::Selected(array, errors) => {
                 let (array, creator) =
                     input_source::retain_result_type_with_creator(array, ty, allocator, control)?;
@@ -236,8 +247,8 @@ struct Child {
     ordinals: Vec<usize>,
     value: OwnedValue,
 }
-struct Frame {
-    occurrence: ProgramUseRef,
+pub(super) struct Frame<K = ProgramUseRef> {
+    occurrence: K,
     activation: novarocks_functions::ScalarInvocationActivation,
     rows: Vec<usize>,
     output_rows: Vec<usize>,
@@ -255,9 +266,9 @@ struct Frame {
     temporal: Option<TemporalValues>,
     membership: Option<novarocks_functions::native_inlist::InRows>,
 }
-impl Frame {
+impl<K> Frame<K> {
     fn new(
-        occurrence: ProgramUseRef,
+        occurrence: K,
         shape: ControlShape,
         result_type: &DataType,
         mut rows: Vec<usize>,
@@ -563,7 +574,7 @@ impl Frame {
     fn attach_between(
         &mut self,
         child: Child,
-        program: &novarocks_local_program::ExpressionProgram,
+        recipes: &dyn NodeRecipes,
         negated: bool,
         batch_rows: usize,
         work: &mut Work<'_, '_>,
@@ -642,11 +653,11 @@ impl Frame {
             work,
         )?;
         let site = if ordinal == 1 {
-            novarocks_local_program::ProgramComparisonSite::BetweenLower(self.occurrence)
+            ComparisonPosition::BetweenLower
         } else {
-            novarocks_local_program::ProgramComparisonSite::BetweenUpper(self.occurrence)
+            ComparisonPosition::BetweenUpper
         };
-        let recipe = program
+        let recipe = recipes
             .comparison_recipe(site)
             .ok_or_else(|| invalid("missing exact BETWEEN bound comparison recipe"))?;
         let output = evaluate_comparison(
@@ -682,7 +693,7 @@ impl Frame {
     fn attach_membership(
         &mut self,
         child: Child,
-        program: &novarocks_local_program::ExpressionProgram,
+        recipes: &dyn NodeRecipes,
         batch_rows: usize,
         work: &mut Work<'_, '_>,
     ) -> Result<(), KernelFailure> {
@@ -691,8 +702,8 @@ impl Frame {
             .next
             .checked_sub(1)
             .ok_or_else(|| internal("IN completed before its source phase"))?;
-        let recipe = program
-            .native_inlist_recipe(self.occurrence)
+        let recipe = recipes
+            .native_inlist_recipe()
             .ok_or_else(|| invalid("missing exact IN recipe"))?;
         let mut rows = Vec::with_capacity(child.ordinals.len());
         for &parent in &child.ordinals {
@@ -768,7 +779,7 @@ impl Frame {
             &mut |event| in_event(event, work),
         ))?;
         let equalities = if expected.data_type() == &DataType::Utf8 {
-            in_observed(crate::exec::expr::in_pred::utf8_equality_observed(
+            in_observed(super::utf8_inlist::utf8_equality_observed(
                 left.values(),
                 right.values(),
                 &mut |event| in_event(event, work),
@@ -801,7 +812,7 @@ impl Frame {
     fn attach(
         &mut self,
         child: Child,
-        program: &novarocks_local_program::ExpressionProgram,
+        recipes: &dyn NodeRecipes,
         shape: ControlShape,
         demand: EvaluationDemand,
         child_is_pure: bool,
@@ -809,10 +820,10 @@ impl Frame {
         work: &mut Work<'_, '_>,
     ) -> Result<(), KernelFailure> {
         if let ControlShape::Membership { .. } = shape {
-            return self.attach_membership(child, program, batch_rows, work);
+            return self.attach_membership(child, recipes, batch_rows, work);
         }
         if let ControlShape::Between { negated } = shape {
-            return self.attach_between(child, program, negated, batch_rows, work);
+            return self.attach_between(child, recipes, negated, batch_rows, work);
         }
         if let ControlShape::TemporalSource(source_shape) = shape {
             return self.attach_temporal(child, source_shape, batch_rows, work);
@@ -909,13 +920,10 @@ impl Frame {
                 };
                 let recipe = if simple {
                     Some(
-                        program
-                            .comparison_recipe(
-                                novarocks_local_program::ProgramComparisonSite::CaseWhen {
-                                    occurrence: self.occurrence,
-                                    arm: ((ordinal - offset) / 2) as u32,
-                                },
-                            )
+                        recipes
+                            .comparison_recipe(ComparisonPosition::CaseWhen(
+                                ((ordinal - offset) / 2) as u32,
+                            ))
                             .ok_or_else(|| invalid("missing exact CASE WHEN comparison recipe"))?,
                     )
                 } else {
@@ -1075,6 +1083,423 @@ impl Frame {
         });
         Ok(())
     }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum CompletionKind {
+    Like {
+        negated: bool,
+    },
+    InList {
+        is_not_in: bool,
+    },
+    Between {
+        plan: novarocks_type_contract::NativeBetweenPlan,
+    },
+    Boolean,
+    Cast,
+    Negate,
+    BitNot,
+    Arithmetic,
+    Comparison {
+        null_safe: bool,
+    },
+    Case,
+    Unary(super::unary::UnaryIntrinsic),
+    Call,
+}
+impl CompletionKind {
+    fn from_static(kind: &StaticExprKind) -> Option<Self> {
+        Some(match kind {
+            StaticExprKind::PreparedLike { negated, .. } => Self::Like { negated: *negated },
+            StaticExprKind::PreparedInList { is_not_in, .. } => Self::InList {
+                is_not_in: *is_not_in,
+            },
+            StaticExprKind::PreparedBetween { plan, .. } => Self::Between { plan: *plan },
+            StaticExprKind::NaryAnd { .. } | StaticExprKind::NaryOr { .. } => Self::Boolean,
+            StaticExprKind::PreparedCast { .. } => Self::Cast,
+            StaticExprKind::PreparedNativeNegate(_) => Self::Negate,
+            StaticExprKind::PreparedNativeBitNot(_) => Self::BitNot,
+            StaticExprKind::PreparedArithmetic { .. } => Self::Arithmetic,
+            StaticExprKind::PreparedNullSafeComparison { .. } => {
+                Self::Comparison { null_safe: true }
+            }
+            kind if kind.ordinary_comparison().is_some() => Self::Comparison { null_safe: false },
+            StaticExprKind::Case { .. } => Self::Case,
+            StaticExprKind::Not(_) => Self::Unary(super::unary::UnaryIntrinsic::Not),
+            StaticExprKind::IsNull(_) => Self::Unary(super::unary::UnaryIntrinsic::IsNull),
+            StaticExprKind::IsNotNull(_) => Self::Unary(super::unary::UnaryIntrinsic::IsNotNull),
+            StaticExprKind::BoundCall { .. } => Self::Call,
+            _ => return None,
+        })
+    }
+}
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The node's recipes, row demand and evaluation owner remain explicit"
+)]
+fn complete_node<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
+    kind: &CompletionKind,
+    frame: &mut Frame<K>,
+    recipes: &dyn NodeRecipes,
+    shape: ControlShape,
+    demand: EvaluationDemand,
+    result_type: &novarocks_functions::FunctionValueType,
+    local_selection: Selection<'a>,
+    original_domain: bool,
+    instances: &mut BTreeMap<K, scalar_invocation::CallInstance>,
+    allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    work: &mut Work<'_, '_>,
+) -> Result<OwnedValue, E> {
+    Ok(match kind {
+        CompletionKind::Like { negated } => {
+            if frame.children.len() != 2 {
+                return Err(invalid("LIKE requires its original ordered operands").into());
+            }
+            let mut children = std::mem::take(&mut frame.children).into_iter();
+            let text = children
+                .next()
+                .ok_or_else(|| internal("missing original LIKE source"))?
+                .value
+                .into_value(local_selection, work)?;
+            let pattern = children
+                .next()
+                .ok_or_else(|| internal("missing original LIKE pattern"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = recipes
+                .native_like_recipe()
+                .ok_or_else(|| invalid("missing exact LIKE recipe"))?;
+            if recipe.negated() != *negated {
+                return Err(invalid("LIKE negative expansion differs from original source").into());
+            }
+            work.flush()?;
+            let output = recipe.evaluate_selected(
+                text.argument(),
+                pattern.argument(),
+                local_selection,
+                demand == EvaluationDemand::TruthOnly,
+                work.control,
+            )?;
+            work.flush()?;
+            OwnedValue::from_selected(output)
+        }
+        CompletionKind::InList { is_not_in } => {
+            let recipe = recipes
+                .native_inlist_recipe()
+                .ok_or_else(|| invalid("missing IN completion recipe"))?;
+            if recipe.negated() != *is_not_in || frame.children.len() != 1 {
+                return Err(invalid("IN completion differs from its ordered source").into());
+            }
+            let source = frame
+                .children
+                .pop()
+                .ok_or_else(|| internal("missing original IN source"))?;
+            let source = source.value.into_value(local_selection, work)?;
+            let output =
+                source.materialize(local_selection, &recipe.source_type().data_type(), work)?;
+            let mut failed = Vec::with_capacity(frame.errors.len());
+            for &row in frame.errors.keys() {
+                failed.push(row);
+                work.step()?;
+            }
+            let state = frame
+                .membership
+                .take()
+                .ok_or_else(|| internal("missing IN state at completion"))?;
+            let result = in_observed(state.finish_selected_observed(
+                output.values(),
+                *is_not_in,
+                demand == EvaluationDemand::TruthOnly,
+                &failed,
+                &mut |event| in_event(event, work),
+            ))?;
+            let mut errors = Vec::with_capacity(frame.errors.len());
+            for (_, error) in std::mem::take(&mut frame.errors) {
+                errors.push(error);
+                work.step()?;
+            }
+            work.flush()?;
+            OwnedValue::from_selected(SelectedValues::try_new_observed(
+                local_selection,
+                &result_type.data_type(),
+                Arc::new(result),
+                errors.into_boxed_slice(),
+                || work.step(),
+            )?)
+        }
+        CompletionKind::Between { plan } => {
+            if !frame.children.is_empty() {
+                return Err(invalid("BETWEEN comparison phase was not completed").into());
+            }
+            let state = frame
+                .boolean
+                .take()
+                .ok_or_else(|| internal("missing BETWEEN Boolean continuation"))?;
+            let (array, errors) = state.finish(
+                plan.connective(),
+                demand,
+                std::mem::take(&mut frame.errors),
+                work,
+            )?;
+            OwnedValue::from_selected(SelectedValues::try_new_observed(
+                local_selection,
+                &result_type.data_type(),
+                array,
+                errors,
+                || work.step(),
+            )?)
+        }
+        CompletionKind::Boolean => {
+            let state = frame
+                .boolean
+                .take()
+                .ok_or_else(|| internal("missing Boolean continuation"))?;
+            let (array, errors) =
+                state.finish(shape, demand, std::mem::take(&mut frame.errors), work)?;
+            OwnedValue::from_selected(SelectedValues::try_new_observed(
+                local_selection,
+                &result_type.data_type(),
+                array,
+                errors,
+                || work.step(),
+            )?)
+        }
+        CompletionKind::Cast => {
+            if frame.children.len() != 1 {
+                return Err(invalid("cast requires its exact operand").into());
+            }
+            let child = std::mem::take(&mut frame.children)
+                .into_iter()
+                .next()
+                .ok_or_else(|| internal("missing cast operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = recipes
+                .cast_recipe()
+                .ok_or_else(|| invalid("missing exact cast recipe"))?;
+            if recipe.is_identity() {
+                // The value passes unchanged, with its row errors;
+                // only the frozen nullability widens.
+                OwnedValue::from_materialized(child.materialize(
+                    local_selection,
+                    &recipe.result_type().data_type(),
+                    work,
+                )?)
+            } else {
+                OwnedValue::from_selected(evaluate_cast(recipe, &child, local_selection, work)?)
+            }
+        }
+        CompletionKind::Negate => {
+            if frame.children.len() != 1 {
+                return Err(invalid("native negate requires its exact ordered operand").into());
+            }
+            let child = frame
+                .children
+                .pop()
+                .ok_or_else(|| internal("missing native negate operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = recipes
+                .native_negate_recipe()
+                .ok_or_else(|| invalid("missing exact native negate recipe"))?;
+            work.flush()?;
+            let output =
+                recipe.evaluate_selected(child.argument(), local_selection, work.control)?;
+            work.flush()?;
+            OwnedValue::from_selected(output)
+        }
+        CompletionKind::BitNot => {
+            if frame.children.len() != 1 {
+                return Err(invalid("native BitwiseNot requires its exact ordered operand").into());
+            }
+            let child = frame
+                .children
+                .pop()
+                .ok_or_else(|| internal("missing native BitwiseNot operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = recipes
+                .native_bitnot_recipe()
+                .ok_or_else(|| invalid("missing exact native BitwiseNot recipe"))?;
+            work.flush()?;
+            let output =
+                recipe.evaluate_selected(child.argument(), local_selection, work.control)?;
+            work.flush()?;
+            OwnedValue::from_selected(output)
+        }
+        CompletionKind::Arithmetic => {
+            if frame.children.len() != 2 {
+                return Err(invalid("arithmetic requires its exact ordered operands").into());
+            }
+            let mut children = std::mem::take(&mut frame.children).into_iter();
+            let left = children
+                .next()
+                .ok_or_else(|| internal("missing arithmetic left operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let right = children
+                .next()
+                .ok_or_else(|| internal("missing arithmetic right operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = recipes
+                .arithmetic_recipe()
+                .ok_or_else(|| invalid("missing exact arithmetic recipe"))?;
+            OwnedValue::from_selected(evaluate_arithmetic(
+                recipe,
+                &left,
+                &right,
+                local_selection,
+                work,
+            )?)
+        }
+        CompletionKind::Comparison { null_safe } => {
+            if frame.children.len() != 2 {
+                return Err(invalid("comparison requires its exact ordered operands").into());
+            }
+            let mut children = std::mem::take(&mut frame.children).into_iter();
+            let left = children
+                .next()
+                .ok_or_else(|| internal("missing comparison left operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let right = children
+                .next()
+                .ok_or_else(|| internal("missing comparison right operand"))?
+                .value
+                .into_value(local_selection, work)?;
+            let recipe = if *null_safe {
+                ComparisonRecipe::NullSafe(
+                    recipes
+                        .null_safe_comparison_recipe()
+                        .ok_or_else(|| invalid("missing exact null-safe comparison recipe"))?,
+                )
+            } else {
+                ComparisonRecipe::Ordinary(
+                    recipes
+                        .comparison_recipe(ComparisonPosition::Binary)
+                        .ok_or_else(|| invalid("missing exact comparison recipe"))?,
+                )
+            };
+            OwnedValue::from_selected(evaluate_comparison(
+                recipe,
+                &left,
+                &right,
+                local_selection,
+                work,
+            )?)
+        }
+        CompletionKind::Case => assemble(
+            &frame.children,
+            &frame.choices,
+            &mut frame.errors,
+            &result_type.data_type(),
+            local_selection,
+            work,
+        )?,
+        CompletionKind::Unary(kind) => {
+            if frame.children.len() != 1 {
+                return Err(invalid("unary occurrence requires its exact operand").into());
+            }
+            let child = frame
+                .children
+                .pop()
+                .ok_or_else(|| internal("missing actual unary operand"))?;
+            let value = child.value.into_value(local_selection, work)?;
+            OwnedValue::from_selected(super::unary::evaluate(
+                *kind,
+                &value,
+                local_selection,
+                work,
+            )?)
+        }
+        CompletionKind::Call => {
+            let prepared_call = recipes
+                .prepared_call()
+                .ok_or_else(|| invalid("missing prepared node call"))?;
+            match prepared_call {
+                PreparedPureKernel::Scalar(_) | PreparedPureKernel::ScalarInvocation(_) => {
+                    let prepared = match prepared_call {
+                        PreparedPureKernel::Scalar(p) => scalar_invocation::PreparedCall::Kernel(p),
+                        PreparedPureKernel::ScalarInvocation(p) => {
+                            scalar_invocation::PreparedCall::Invocation(p)
+                        }
+                        _ => {
+                            return Err(E::from(invalid(
+                                "ordinary call changed its prepared lifecycle",
+                            )));
+                        }
+                    };
+                    if original_domain {
+                        let result = evaluate_original_invocation::<E, K>(
+                            frame.occurrence.clone(),
+                            prepared,
+                            &frame.children,
+                            &frame.domain,
+                            local_selection,
+                            frame.activation,
+                            instances,
+                            allocator,
+                            work,
+                        )?;
+                        OwnedValue::from_selected(result)
+                    } else {
+                        let mut children = Vec::with_capacity(frame.children.len());
+                        for child in std::mem::take(&mut frame.children) {
+                            children.push(child.value.into_value(local_selection, work)?);
+                            work.step()?;
+                        }
+                        OwnedValue::from_selected(evaluate_scalar::<E, K>(
+                            frame.occurrence.clone(),
+                            prepared,
+                            &children,
+                            local_selection,
+                            frame.activation,
+                            instances,
+                            allocator,
+                            work,
+                        )?)
+                    }
+                }
+                PreparedPureKernel::ControlIntrinsic(_)
+                    if matches!(shape, ControlShape::TemporalSource(_)) =>
+                {
+                    let state = frame
+                        .temporal
+                        .take()
+                        .ok_or_else(|| internal("missing temporal continuation at completion"))?;
+                    state.finish(shape, &mut frame.errors, local_selection, work)?
+                }
+                PreparedPureKernel::ControlIntrinsic(_) => {
+                    if shape == ControlShape::If {
+                        finish_if(
+                            &frame.children,
+                            &frame.choices,
+                            &mut frame.errors,
+                            &frame.routes,
+                            local_selection.is_empty(),
+                            &result_type.data_type(),
+                            local_selection,
+                            work,
+                        )?
+                    } else {
+                        assemble(
+                            &frame.children,
+                            &frame.choices,
+                            &mut frame.errors,
+                            &result_type.data_type(),
+                            local_selection,
+                            work,
+                        )?
+                    }
+                }
+                _ => {
+                    return Err(invalid("compiled occurrence has a different lifecycle").into());
+                }
+            }
+        }
+    })
 }
 
 #[expect(
@@ -1251,35 +1676,8 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
         if let Some(ordinals) = next {
             let child_use = invocation.arguments[frame.next];
             frame.next += 1;
-            let mut rows = Vec::with_capacity(if original_domain {
-                frame.domain.rows().len()
-            } else {
-                ordinals.len()
-            });
-            if original_domain {
-                for &row in frame.domain.rows() {
-                    rows.push(row);
-                    work.step()?;
-                }
-            } else {
-                for &ordinal in &ordinals {
-                    rows.push(frame.rows[ordinal]);
-                    work.step()?;
-                }
-            }
-            // A control author supplies its actual phase mask. Eager required
-            // children retain the parent source domain; no leaf guesses it.
-            let child_domain = if invocation.control == ControlShape::If
-                && frame.next > 1
-                && (!rows.is_empty() || frame.rows.is_empty())
-            {
-                frame.domain.filtered(&rows, work.control)?
-            } else {
-                // Other control/selected owners keep their existing logical
-                // demand and inherit the actual carrier. Only their own typed
-                // policy may demand a full original-domain child invocation.
-                frame.domain.clone()
-            };
+            let (rows, child_domain, child_activation) =
+                child_context(&frame, invocation.control, &ordinals, original_domain, work)?;
             let child = Frame::new(
                 ProgramUseRef {
                     arena: frame.occurrence.arena,
@@ -1293,16 +1691,7 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                 rows,
                 child_domain,
                 needs_original.contains(&child_use),
-                if original_domain && !frame.domain.rows().is_empty()
-                    || !ordinals.is_empty()
-                    || frame.activation
-                        == novarocks_functions::ScalarInvocationActivation::Activated
-                        && frame.rows.is_empty()
-                {
-                    novarocks_functions::ScalarInvocationActivation::Activated
-                } else {
-                    novarocks_functions::ScalarInvocationActivation::ValidateOnly
-                },
+                child_activation,
                 ordinals,
                 work,
             )?;
@@ -1310,10 +1699,17 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
             frames.push(child);
             continue;
         }
+        // Row domains are immutable once traversal finishes this frame. Move
+        // their existing vectors out so completion can mutate the other state
+        // without cloning rows or adding observation callbacks.
+        let completion_rows = std::mem::take(&mut frame.rows);
+        let completion_output_rows = std::mem::take(&mut frame.output_rows);
         let local_selection =
-            Selection::try_sparse_observed(input.num_rows(), &frame.rows, || work.step())?;
+            Selection::try_sparse_observed(input.num_rows(), &completion_rows, || work.step())?;
         let output_selection =
-            Selection::try_sparse_observed(input.num_rows(), &frame.output_rows, || work.step())?;
+            Selection::try_sparse_observed(input.num_rows(), &completion_output_rows, || {
+                work.step()
+            })?;
         // Clone only explicit finite continuations of actually evaluated
         // children. No host request occurs before the original leaf outcome.
         let child_sources = frame
@@ -1321,24 +1717,14 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
             .iter()
             .filter_map(|child| child.value.continuation())
             .collect();
-        let value = if frame.rows.is_empty()
+        let value = if completion_rows.is_empty()
             && frame.activation == novarocks_functions::ScalarInvocationActivation::ValidateOnly
         {
-            work.flush()?;
-            let array = new_empty_array(&result_type.data_type());
-            work.flush()?;
-            OwnedValue::Selected(array, Box::default())
+            complete_undemanded_leaf(result_type.data_type(), work)?
         } else {
             match definition.kind() {
                 StaticExprKind::Constant(constant) => {
-                    work.flush()?;
-                    validate_evaluated_argument_observed(
-                        EvaluatedArgument::Constant(constant),
-                        local_selection,
-                        result_type,
-                        work.control,
-                    )?;
-                    OwnedValue::Constant(constant.clone())
+                    complete_constant_leaf(constant, result_type, local_selection, allocator, work)?
                 }
                 StaticExprKind::SlotId(_) => {
                     let Some(ProgramLexicalSource::Input(ProgramChannelSite::Layout {
@@ -1382,408 +1768,33 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                         .transpose()?;
                     OwnedValue::Source(array, frame.domain.clone()).with_continuation(owner)
                 }
-                StaticExprKind::PreparedLike { negated, .. } => {
-                    if frame.children.len() != 2 {
-                        return Err(invalid("LIKE requires its original ordered operands").into());
-                    }
-                    let mut children = std::mem::take(&mut frame.children).into_iter();
-                    let text = children
-                        .next()
-                        .ok_or_else(|| internal("missing original LIKE source"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let pattern = children
-                        .next()
-                        .ok_or_else(|| internal("missing original LIKE pattern"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let recipe = program
-                        .native_like_recipe(frame.occurrence)
-                        .ok_or_else(|| invalid("missing exact LIKE recipe"))?;
-                    if recipe.negated() != *negated {
-                        return Err(invalid(
-                            "LIKE negative expansion differs from original source",
-                        )
-                        .into());
-                    }
-                    work.flush()?;
-                    let output = recipe.evaluate_selected(
-                        text.argument(),
-                        pattern.argument(),
-                        local_selection,
-                        invocation.context.demand == EvaluationDemand::TruthOnly,
-                        work.control,
-                    )?;
-                    work.flush()?;
-                    OwnedValue::from_selected(output)
-                }
-                StaticExprKind::PreparedInList { is_not_in, .. } => {
-                    let recipe = program
-                        .native_inlist_recipe(frame.occurrence)
-                        .ok_or_else(|| invalid("missing IN completion recipe"))?;
-                    if recipe.negated() != *is_not_in || frame.children.len() != 1 {
-                        return Err(invalid("IN completion differs from its ordered source").into());
-                    }
-                    let source = frame
-                        .children
-                        .pop()
-                        .ok_or_else(|| internal("missing original IN source"))?;
-                    let source = source.value.into_value(local_selection, work)?;
-                    let output = source.materialize(
-                        local_selection,
-                        &recipe.source_type().data_type(),
-                        work,
-                    )?;
-                    let mut failed = Vec::with_capacity(frame.errors.len());
-                    for &row in frame.errors.keys() {
-                        failed.push(row);
-                        work.step()?;
-                    }
-                    let state = frame
-                        .membership
-                        .take()
-                        .ok_or_else(|| internal("missing IN state at completion"))?;
-                    let result = in_observed(state.finish_selected_observed(
-                        output.values(),
-                        *is_not_in,
-                        invocation.context.demand == EvaluationDemand::TruthOnly,
-                        &failed,
-                        &mut |event| in_event(event, work),
-                    ))?;
-                    let mut errors = Vec::with_capacity(frame.errors.len());
-                    for (_, error) in std::mem::take(&mut frame.errors) {
-                        errors.push(error);
-                        work.step()?;
-                    }
-                    work.flush()?;
-                    OwnedValue::from_selected(SelectedValues::try_new_observed(
-                        local_selection,
-                        &result_type.data_type(),
-                        Arc::new(result),
-                        errors.into_boxed_slice(),
-                        || work.step(),
-                    )?)
-                }
-                StaticExprKind::PreparedBetween { plan, .. } => {
-                    if !frame.children.is_empty() {
-                        return Err(invalid("BETWEEN comparison phase was not completed").into());
-                    }
-                    let state = frame
-                        .boolean
-                        .take()
-                        .ok_or_else(|| internal("missing BETWEEN Boolean continuation"))?;
-                    let (array, errors) = state.finish(
-                        plan.connective(),
-                        invocation.context.demand,
-                        std::mem::take(&mut frame.errors),
-                        work,
-                    )?;
-                    OwnedValue::from_selected(SelectedValues::try_new_observed(
-                        local_selection,
-                        &result_type.data_type(),
-                        array,
-                        errors,
-                        || work.step(),
-                    )?)
-                }
-                StaticExprKind::NaryAnd { .. } | StaticExprKind::NaryOr { .. } => {
-                    let state = frame
-                        .boolean
-                        .take()
-                        .ok_or_else(|| internal("missing Boolean continuation"))?;
-                    let (array, errors) = state.finish(
+                kind => {
+                    let recipes = ProgramNodeRecipes {
+                        program,
+                        occurrence: frame.occurrence,
+                    };
+                    complete_node::<E, _>(
+                        &CompletionKind::from_static(kind)
+                            .ok_or_else(|| invalid("unsupported compiled root definition"))?,
+                        &mut frame,
+                        &recipes,
                         invocation.control,
                         invocation.context.demand,
-                        std::mem::take(&mut frame.errors),
+                        result_type,
+                        local_selection,
+                        original_domain,
+                        instances,
+                        allocator,
                         work,
-                    )?;
-                    OwnedValue::from_selected(SelectedValues::try_new_observed(
-                        local_selection,
-                        &result_type.data_type(),
-                        array,
-                        errors,
-                        || work.step(),
-                    )?)
+                    )?
                 }
-                StaticExprKind::PreparedCast { .. } => {
-                    if frame.children.len() != 1 {
-                        return Err(invalid("cast requires its exact operand").into());
-                    }
-                    let child = std::mem::take(&mut frame.children)
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| internal("missing cast operand"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let recipe = program
-                        .cast_recipe(frame.occurrence)
-                        .ok_or_else(|| invalid("missing exact cast recipe"))?;
-                    if recipe.is_identity() {
-                        // The value passes unchanged, with its row errors;
-                        // only the frozen nullability widens.
-                        OwnedValue::from_materialized(child.materialize(
-                            local_selection,
-                            &recipe.result_type().data_type(),
-                            work,
-                        )?)
-                    } else {
-                        OwnedValue::from_selected(evaluate_cast(
-                            recipe,
-                            &child,
-                            local_selection,
-                            work,
-                        )?)
-                    }
-                }
-                StaticExprKind::PreparedNativeNegate(_) => {
-                    if frame.children.len() != 1 {
-                        return Err(
-                            invalid("native negate requires its exact ordered operand").into()
-                        );
-                    }
-                    let child = frame
-                        .children
-                        .pop()
-                        .ok_or_else(|| internal("missing native negate operand"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let recipe = program
-                        .native_negate_recipe(frame.occurrence)
-                        .ok_or_else(|| invalid("missing exact native negate recipe"))?;
-                    work.flush()?;
-                    let output = recipe.evaluate_selected(
-                        child.argument(),
-                        local_selection,
-                        work.control,
-                    )?;
-                    work.flush()?;
-                    OwnedValue::from_selected(output)
-                }
-                StaticExprKind::PreparedNativeBitNot(_) => {
-                    if frame.children.len() != 1 {
-                        return Err(invalid(
-                            "native BitwiseNot requires its exact ordered operand",
-                        )
-                        .into());
-                    }
-                    let child = frame
-                        .children
-                        .pop()
-                        .ok_or_else(|| internal("missing native BitwiseNot operand"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let recipe = program
-                        .native_bitnot_recipe(frame.occurrence)
-                        .ok_or_else(|| invalid("missing exact native BitwiseNot recipe"))?;
-                    work.flush()?;
-                    let output = recipe.evaluate_selected(
-                        child.argument(),
-                        local_selection,
-                        work.control,
-                    )?;
-                    work.flush()?;
-                    OwnedValue::from_selected(output)
-                }
-                StaticExprKind::PreparedArithmetic { .. } => {
-                    if frame.children.len() != 2 {
-                        return Err(
-                            invalid("arithmetic requires its exact ordered operands").into()
-                        );
-                    }
-                    let mut children = std::mem::take(&mut frame.children).into_iter();
-                    let left = children
-                        .next()
-                        .ok_or_else(|| internal("missing arithmetic left operand"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let right = children
-                        .next()
-                        .ok_or_else(|| internal("missing arithmetic right operand"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let recipe = program
-                        .arithmetic_recipe(frame.occurrence)
-                        .ok_or_else(|| invalid("missing exact arithmetic recipe"))?;
-                    OwnedValue::from_selected(evaluate_arithmetic(
-                        recipe,
-                        &left,
-                        &right,
-                        local_selection,
-                        work,
-                    )?)
-                }
-                kind if kind.ordinary_comparison().is_some()
-                    || matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. }) =>
-                {
-                    if frame.children.len() != 2 {
-                        return Err(
-                            invalid("comparison requires its exact ordered operands").into()
-                        );
-                    }
-                    let mut children = std::mem::take(&mut frame.children).into_iter();
-                    let left = children
-                        .next()
-                        .ok_or_else(|| internal("missing comparison left operand"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let right = children
-                        .next()
-                        .ok_or_else(|| internal("missing comparison right operand"))?
-                        .value
-                        .into_value(local_selection, work)?;
-                    let recipe =
-                        if matches!(kind, StaticExprKind::PreparedNullSafeComparison { .. }) {
-                            ComparisonRecipe::NullSafe(
-                                program
-                                    .null_safe_comparison_recipe(frame.occurrence)
-                                    .ok_or_else(|| {
-                                        invalid("missing exact null-safe comparison recipe")
-                                    })?,
-                            )
-                        } else {
-                            ComparisonRecipe::Ordinary(
-                                program
-                                    .comparison_recipe(
-                                        novarocks_local_program::ProgramComparisonSite::Binary(
-                                            frame.occurrence,
-                                        ),
-                                    )
-                                    .ok_or_else(|| invalid("missing exact comparison recipe"))?,
-                            )
-                        };
-                    OwnedValue::from_selected(evaluate_comparison(
-                        recipe,
-                        &left,
-                        &right,
-                        local_selection,
-                        work,
-                    )?)
-                }
-                StaticExprKind::Case { .. } => assemble(
-                    &frame.children,
-                    &frame.choices,
-                    &mut frame.errors,
-                    &result_type.data_type(),
-                    local_selection,
-                    work,
-                )?,
-                StaticExprKind::Not(_)
-                | StaticExprKind::IsNull(_)
-                | StaticExprKind::IsNotNull(_) => {
-                    if frame.children.len() != 1 {
-                        return Err(invalid("unary occurrence requires its exact operand").into());
-                    }
-                    let child = frame
-                        .children
-                        .pop()
-                        .ok_or_else(|| internal("missing actual unary operand"))?;
-                    let value = child.value.into_value(local_selection, work)?;
-                    OwnedValue::from_selected(super::unary::evaluate(
-                        definition.kind(),
-                        &value,
-                        local_selection,
-                        work,
-                    )?)
-                }
-                StaticExprKind::BoundCall { .. } => {
-                    let call = &resolved.calls()[&ProgramCallSite::Expression(frame.occurrence)];
-                    match call.specialization().prepared() {
-                        PreparedPureKernel::Scalar(_) | PreparedPureKernel::ScalarInvocation(_) => {
-                            let prepared = match call.specialization().prepared() {
-                                PreparedPureKernel::Scalar(p) => {
-                                    scalar_invocation::PreparedCall::Kernel(p)
-                                }
-                                PreparedPureKernel::ScalarInvocation(p) => {
-                                    scalar_invocation::PreparedCall::Invocation(p)
-                                }
-                                _ => {
-                                    return Err(E::from(invalid(
-                                        "ordinary call changed its prepared lifecycle",
-                                    )));
-                                }
-                            };
-                            if original_domain {
-                                let result = evaluate_original_invocation::<E>(
-                                    frame.occurrence,
-                                    prepared,
-                                    &frame.children,
-                                    &frame.domain,
-                                    local_selection,
-                                    frame.activation,
-                                    instances,
-                                    allocator,
-                                    work,
-                                )?;
-                                OwnedValue::from_selected(result)
-                            } else {
-                                let mut children = Vec::with_capacity(frame.children.len());
-                                for child in std::mem::take(&mut frame.children) {
-                                    children.push(child.value.into_value(local_selection, work)?);
-                                    work.step()?;
-                                }
-                                OwnedValue::from_selected(evaluate_scalar::<E>(
-                                    frame.occurrence,
-                                    prepared,
-                                    &children,
-                                    local_selection,
-                                    frame.activation,
-                                    instances,
-                                    allocator,
-                                    work,
-                                )?)
-                            }
-                        }
-                        PreparedPureKernel::ControlIntrinsic(_)
-                            if matches!(invocation.control, ControlShape::TemporalSource(_)) =>
-                        {
-                            let state = frame.temporal.take().ok_or_else(|| {
-                                internal("missing temporal continuation at completion")
-                            })?;
-                            state.finish(
-                                invocation.control,
-                                &mut frame.errors,
-                                local_selection,
-                                work,
-                            )?
-                        }
-                        PreparedPureKernel::ControlIntrinsic(_) => {
-                            if invocation.control == ControlShape::If {
-                                finish_if(
-                                    &frame.children,
-                                    &frame.choices,
-                                    &mut frame.errors,
-                                    &frame.routes,
-                                    frame.rows.is_empty(),
-                                    &result_type.data_type(),
-                                    local_selection,
-                                    work,
-                                )?
-                            } else {
-                                assemble(
-                                    &frame.children,
-                                    &frame.choices,
-                                    &mut frame.errors,
-                                    &result_type.data_type(),
-                                    local_selection,
-                                    work,
-                                )?
-                            }
-                        }
-                        _ => {
-                            return Err(
-                                invalid("compiled occurrence has a different lifecycle").into()
-                            );
-                        }
-                    }
-                }
-                _ => return Err(invalid("unsupported compiled root definition").into()),
             }
         };
-        let value = if frame.output_rows != frame.rows {
+        let value = if completion_output_rows != completion_rows {
             project_owned(
                 value,
-                &frame.rows,
-                &frame.output_rows,
+                &completion_rows,
+                &completion_output_rows,
                 input.num_rows(),
                 work,
             )?
@@ -1833,7 +1844,10 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
                     ordinals: frame.parent_ordinals,
                     value,
                 },
-                program,
+                &ProgramNodeRecipes {
+                    program,
+                    occurrence: parent.occurrence,
+                },
                 shape,
                 parent_invocation.context.demand,
                 child_is_pure,
@@ -1870,14 +1884,14 @@ pub(super) fn evaluate_tree<'a, E: scalar_invocation::FrameFailure>(
     clippy::too_many_arguments,
     reason = "Keep actual source scope and outer demand explicit"
 )]
-fn evaluate_original_invocation<'a, E: scalar_invocation::FrameFailure>(
-    occurrence: ProgramUseRef,
+fn evaluate_original_invocation<'a, E: scalar_invocation::FrameFailure, K: Ord + Clone>(
+    occurrence: K,
     prepared: scalar_invocation::PreparedCall<'_>,
     children: &[Child],
     domain: &Arc<input_source::ActualInvocationDomain>,
     demand: Selection<'a>,
     activation: novarocks_functions::ScalarInvocationActivation,
-    instances: &mut BTreeMap<ProgramUseRef, scalar_invocation::CallInstance>,
+    instances: &mut BTreeMap<K, scalar_invocation::CallInstance>,
     allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
     work: &mut Work<'_, '_>,
 ) -> Result<SelectedValues<'a>, E> {
@@ -1887,6 +1901,7 @@ fn evaluate_original_invocation<'a, E: scalar_invocation::FrameFailure>(
     for child in children {
         sources.push(match child.value.uncontinued() {
             OwnedValue::Constant(value) => ScalarInvocationSource::Constant(value),
+            OwnedValue::ConstantView(value) => ScalarInvocationSource::ConstantView(value.view()),
             OwnedValue::Source(array, source) => ScalarInvocationSource::Array(
                 EvaluatedSourceLoan::new(array, source.selection(work.control)?),
             ),
@@ -1898,7 +1913,7 @@ fn evaluate_original_invocation<'a, E: scalar_invocation::FrameFailure>(
         work.step()?;
     }
     work.flush()?;
-    if let std::collections::btree_map::Entry::Vacant(entry) = instances.entry(occurrence) {
+    if let std::collections::btree_map::Entry::Vacant(entry) = instances.entry(occurrence.clone()) {
         let instance = match prepared.instantiate(allocator.cloned()) {
             Ok(instance) => instance,
             Err(cause) => {
@@ -2409,9 +2424,9 @@ fn evaluate_cast<'a>(
     };
     use novarocks_functions::CastRowResult as R;
     let ty = &recipe.result_type().data_type();
-    if recipe.is_collection() {
+    if recipe.uses_selected_array() {
         work.flush()?;
-        return recipe.evaluate_collection(
+        return recipe.evaluate_selected_array(
             child.argument(),
             selection,
             child.errors(),
@@ -2996,6 +3011,7 @@ fn duplicate_child(child: &Child, work: &mut Work<'_, '_>) -> Result<Child, Kern
     let value = match child.value.uncontinued() {
         OwnedValue::Continued(_, _) => unreachable!("continuation was unwrapped"),
         OwnedValue::Constant(value) => OwnedValue::Constant(value.clone()),
+        OwnedValue::ConstantView(value) => OwnedValue::ConstantView(value.clone()),
         OwnedValue::Column(value) => OwnedValue::Column(Arc::clone(value)),
         OwnedValue::Source(value, domain) => OwnedValue::Source(Arc::clone(value), domain.clone()),
         OwnedValue::Selected(value, source_errors) => {
@@ -3079,6 +3095,144 @@ fn validate_membership_phase(
 #[path = "copy_continuation_tests.rs"]
 mod copy_continuation_tests;
 
+#[path = "constant_driver.rs"]
+pub(super) mod constant_driver;
+
+fn complete_constant_leaf(
+    constant: &novarocks_functions::ConstantValue,
+    result: &novarocks_functions::FunctionValueType,
+    selection: Selection<'_>,
+    allocator: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    work: &mut Work<'_, '_>,
+) -> Result<OwnedValue, KernelFailure> {
+    work.flush()?;
+    let exact = novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+        constant.pool().array().data_type(),
+        result.data_type(),
+        || work.step(),
+    )?;
+    // Only actual array DataType fields can require an execution wrapper.
+    // The original root source Field and its provider annotations are not
+    // array metadata. Composite exact equality ignores spare metadata capacity;
+    // let the existing normalizer prove its zero-construction fast path.
+    let composite = matches!(
+        constant.pool().array().data_type(),
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::ListView(_)
+            | DataType::LargeListView(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+            | DataType::Union(_, _)
+    );
+    if exact && !composite {
+        validate_evaluated_argument_observed(
+            EvaluatedArgument::Constant(constant),
+            selection,
+            result,
+            work.control,
+        )?;
+        return Ok(OwnedValue::Constant(constant.clone()));
+    }
+    // Original CV owns semantics and NULL rules; source annotations never
+    // rewrite it. The shared normalizer may change representation only.
+    if !constant
+        .value_type()
+        .fits_physical_binding_observed(result, || work.step())?
+    {
+        return Err(invalid(
+            "constant argument differs from its complete frozen declaration",
+        ));
+    }
+    match constant_projection::project(constant, result, allocator, work)? {
+        Some((projected, creator)) => {
+            validate_evaluated_argument_observed(
+                projected.argument(),
+                selection,
+                result,
+                work.control,
+            )?;
+            Ok(OwnedValue::ConstantView(projected).with_continuation(creator))
+        }
+        None => {
+            validate_evaluated_argument_observed(
+                EvaluatedArgument::Constant(constant),
+                selection,
+                result,
+                work.control,
+            )?;
+            Ok(OwnedValue::Constant(constant.clone()))
+        }
+    }
+}
+
+fn child_context<K>(
+    frame: &Frame<K>,
+    shape: ControlShape,
+    ordinals: &[usize],
+    original_domain: bool,
+    work: &mut Work<'_, '_>,
+) -> Result<
+    (
+        Vec<usize>,
+        Arc<input_source::ActualInvocationDomain>,
+        novarocks_functions::ScalarInvocationActivation,
+    ),
+    KernelFailure,
+> {
+    let mut rows = Vec::with_capacity(if original_domain {
+        frame.domain.rows().len()
+    } else {
+        ordinals.len()
+    });
+    if original_domain {
+        for &row in frame.domain.rows() {
+            rows.push(row);
+            work.step()?;
+        }
+    } else {
+        for &ordinal in ordinals {
+            rows.push(frame.rows[ordinal]);
+            work.step()?;
+        }
+    }
+    // A control author supplies its actual phase mask. Eager required
+    // children retain the parent source domain; no leaf guesses it.
+    let child_domain = if shape == ControlShape::If
+        && frame.next > 1
+        && (!rows.is_empty() || frame.rows.is_empty())
+    {
+        frame.domain.filtered(&rows, work.control)?
+    } else {
+        // Other control/selected owners keep their existing logical
+        // demand and inherit the actual carrier. Only their own typed
+        // policy may demand a full original-domain child invocation.
+        frame.domain.clone()
+    };
+
+    let activation = if original_domain && !frame.domain.rows().is_empty()
+        || !ordinals.is_empty()
+        || frame.activation == novarocks_functions::ScalarInvocationActivation::Activated
+            && frame.rows.is_empty()
+    {
+        novarocks_functions::ScalarInvocationActivation::Activated
+    } else {
+        novarocks_functions::ScalarInvocationActivation::ValidateOnly
+    };
+    Ok((rows, child_domain, activation))
+}
+
+fn complete_undemanded_leaf(
+    ty: &DataType,
+    work: &mut Work<'_, '_>,
+) -> Result<OwnedValue, KernelFailure> {
+    work.flush()?;
+    let array = new_empty_array(ty);
+    work.flush()?;
+    Ok(OwnedValue::Selected(array, Box::default()))
+}
+
 #[cfg(test)]
 mod result_creator_continuation_tests {
     use super::*;
@@ -3124,6 +3278,7 @@ mod result_creator_continuation_tests {
     #[test]
     fn fresh_selected_creator_pin_does_not_own_output_array_and_preserves_previous_source_creator()
     {
+        canonical_constant_creator_cases();
         let source_drops = Arc::new(AtomicUsize::new(0));
         let canonical_drops = Arc::new(AtomicUsize::new(0));
         let source_type = declared(&source_drops);
@@ -3194,5 +3349,321 @@ mod result_creator_continuation_tests {
         assert_eq!(source_drops.load(Ordering::SeqCst), 1);
         assert_eq!(canonical_drops.load(Ordering::SeqCst), 1);
         assert_eq!(tracker.current(), 0);
+    }
+    impl novarocks_type_contract::PureCompileControl for Active {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+    fn canonical_constant_creator_cases() {
+        canonical_root_source_annotations_need_no_wrapper_host();
+        use arrow::array::{ListArray, NullArray, StructArray};
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        use arrow::datatypes::Field;
+        use novarocks_functions::{ConstantPolicy, ConstantPool};
+
+        for (finite, bufferless) in [(false, false), (true, false), (false, true)] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let child = Arc::new(
+                Field::new(
+                    "payload",
+                    if bufferless {
+                        DataType::Null
+                    } else {
+                        DataType::Int32
+                    },
+                    true,
+                )
+                .with_metadata([("provider.fact".into(), "kept".into())].into()),
+            );
+            let raw: ArrayRef = if bufferless {
+                Arc::new(StructArray::new(
+                    vec![child].into(),
+                    vec![Arc::new(NullArray::new(3))],
+                    None,
+                ))
+            } else {
+                Arc::new(ListArray::new(
+                    child,
+                    OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 3, 4])),
+                    Arc::new(Int32Array::from(vec![111, 22, 33, 999])),
+                    None,
+                ))
+            };
+            let pure = FunctionValueType::new(raw.data_type().clone(), false);
+            let ty = if finite {
+                FunctionValueType::try_from_value(
+                    pure.value_type().clone(),
+                    ValueLayout::try_new(
+                        raw.data_type(),
+                        ValueTypeStorageLifetime::held(Arc::new(Creator(drops.clone()))),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+            } else {
+                pure
+            };
+            let policy = ConstantPolicy {
+                max_rows: 16,
+                max_array_nodes: 128,
+                max_logical_elements: 1024,
+                max_retained_buffer_bytes: 1 << 20,
+                max_type_depth: 64,
+                max_type_nodes: 4096,
+                max_dictionary_depth: 64,
+                max_metadata_bytes: 1 << 20,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            };
+            let pool = ConstantPool::try_new(
+                Arc::new(Field::new("original", raw.data_type().clone(), false)),
+                ty.clone(),
+                raw.to_data(),
+                policy,
+                novarocks_type_contract::CompilePhase::Validate,
+                &Active,
+            )
+            .unwrap();
+            let original = pool.value(1).unwrap();
+            if !finite && !bufferless {
+                canonical_projection_original_refusal_prefix(&original, &ty);
+            }
+            let tracker =
+                crate::runtime::mem_tracker::MemTracker::new_root("canonical-cv-wrapper-creator");
+            let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
+                crate::runtime::tracked_state_allocator::expression_allocation_host(
+                    tracker.clone(),
+                );
+            let observed = ObservedControl {
+                original: &Active,
+                refused: AtomicBool::new(false),
+                operation_aborted: AtomicBool::new(false),
+            };
+            let mut work = Work {
+                control: &observed,
+                pending: 0,
+                scalar_scope: None,
+            };
+            let value =
+                complete_constant_leaf(&original, &ty, Selection::all(1), Some(&host), &mut work)
+                    .unwrap();
+            let created = match value.uncontinued() {
+                OwnedValue::ConstantView(view) => {
+                    assert_eq!(view.original.ordinal(), 1);
+                    assert_eq!(
+                        view.original.pool().backing_identity(),
+                        original.pool().backing_identity()
+                    );
+                    view.created.clone()
+                }
+                _ => panic!("raw annotations require the actual metadata creator"),
+            };
+            let value = value
+                .retaining_result_type(&ty, Some(&host), &Active)
+                .unwrap();
+            let materialized = value
+                .into_value(Selection::all(1), &mut work)
+                .unwrap()
+                .materialize(Selection::all(1), ty.data_type(), &mut work)
+                .unwrap();
+            let output = materialized.values().clone();
+            let alias = if bufferless {
+                None
+            } else {
+                Some(output.to_data().child_data()[0].buffers()[0].clone())
+            };
+            drop((materialized, original, pool, ty, raw, host));
+            assert!(
+                created.upgrade().is_some(),
+                "new creator must survive actual root gather even for a pure original CV"
+            );
+            assert!(tracker.current() > 0);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            let last = output.clone();
+            drop(output);
+            assert!(created.upgrade().is_some());
+            drop(last);
+            if let Some(alias) = alias {
+                assert!(
+                    created.upgrade().is_some(),
+                    "last child Buffer retains metadata creator"
+                );
+                std::thread::spawn(move || drop(alias)).join().unwrap();
+            }
+            assert!(created.upgrade().is_none());
+            assert_eq!(drops.load(Ordering::SeqCst), usize::from(finite));
+            assert_eq!(tracker.current(), 0);
+            assert_eq!(tracker.allocated(), tracker.deallocated());
+        }
+    }
+
+    fn canonical_projection_original_refusal_prefix(
+        original: &novarocks_functions::ConstantValue,
+        ty: &FunctionValueType,
+    ) {
+        use std::sync::Mutex;
+        struct Probe {
+            checks: Mutex<Vec<u32>>,
+            fail: Option<(usize, KernelFailure)>,
+        }
+        impl KernelEvaluationControl for Probe {
+            fn checkpoint(&self, work: u32) -> Result<(), KernelFailure> {
+                let mut checks = self.checks.lock().unwrap();
+                let at = checks.len();
+                checks.push(work);
+                if let Some((stop, cause)) = &self.fail
+                    && *stop == at
+                {
+                    Err(cause.clone())
+                } else {
+                    Ok(())
+                }
+            }
+            fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+                panic!("projection cannot wait")
+            }
+        }
+        fn run(
+            original: &novarocks_functions::ConstantValue,
+            ty: &FunctionValueType,
+            host: &Arc<dyn novarocks_functions::AggregateStateAllocator>,
+            probe: &Probe,
+        ) -> Result<OwnedValue, KernelFailure> {
+            let observed = ObservedControl {
+                original: probe,
+                refused: AtomicBool::new(false),
+                operation_aborted: AtomicBool::new(false),
+            };
+            let mut work = Work {
+                control: &observed,
+                pending: 0,
+                scalar_scope: None,
+            };
+            complete_constant_leaf(original, ty, Selection::all(1), Some(host), &mut work)
+        }
+        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("canonical-cv-prefix");
+        let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
+            crate::runtime::tracked_state_allocator::expression_allocation_host(tracker.clone());
+        let good = Probe {
+            checks: Mutex::new(vec![]),
+            fail: None,
+        };
+        drop(run(original, ty, &host, &good).unwrap());
+        let checks = good.checks.into_inner().unwrap();
+        assert_eq!(tracker.current(), 0);
+        let limited =
+            crate::runtime::mem_tracker::MemTracker::new_root("canonical-cv-actual-capacity");
+        limited.install_limit_once(1).unwrap();
+        let limited_host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
+            crate::runtime::tracked_state_allocator::expression_allocation_host(limited.clone());
+        let limited_probe = Probe {
+            checks: Mutex::new(vec![]),
+            fail: None,
+        };
+        let capacity = match run(original, ty, &limited_host, &limited_probe) {
+            Err(cause) => cause,
+            Ok(_) => panic!("the real finite host must refuse new metadata stock"),
+        };
+        assert!(matches!(capacity, KernelFailure::Capacity(_)));
+        let limited_checks = limited_probe.checks.into_inner().unwrap();
+        assert_eq!(limited_checks, checks[..limited_checks.len()]);
+        assert_eq!(limited.current(), 0);
+        for cause in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            capacity,
+            KernelFailure::Internal(KernelDiagnostic::new("original projection callback source")),
+        ] {
+            for at in 0..checks.len() {
+                let probe = Probe {
+                    checks: Mutex::new(vec![]),
+                    fail: Some((at, cause.clone())),
+                };
+                let actual = match run(original, ty, &host, &probe) {
+                    Err(cause) => cause,
+                    Ok(_) => panic!("original callback refusal"),
+                };
+                assert_eq!(actual, cause);
+                assert_eq!(probe.checks.into_inner().unwrap(), checks[..=at]);
+                assert_eq!(tracker.current(), 0);
+            }
+        }
+    }
+    fn canonical_root_source_annotations_need_no_wrapper_host() {
+        use arrow::array::StructArray;
+        use arrow::datatypes::Field;
+        struct NoAllocationHost;
+        impl novarocks_functions::AggregateStateAllocator for NoAllocationHost {
+            fn allocate(
+                &self,
+                _: std::alloc::Layout,
+            ) -> Result<std::ptr::NonNull<u8>, KernelFailure> {
+                panic!("canonical array needs no new wrapper or custody allocation")
+            }
+            unsafe fn release(&self, _: std::ptr::NonNull<u8>, _: std::alloc::Layout) {
+                panic!("the source author made no host allocation")
+            }
+        }
+        let array: ArrayRef = Arc::new(StructArray::new(
+            vec![Arc::new(Field::new("payload", DataType::Int32, true))].into(),
+            vec![Arc::new(Int32Array::from(vec![11, 22, 33]))],
+            None,
+        ));
+        let ty = FunctionValueType::new(array.data_type().clone(), false);
+        let field = Arc::new(
+            Field::new("provider-root", array.data_type().clone(), false)
+                .with_metadata([("provider.root".into(), "must stay original".into())].into()),
+        );
+        let policy = novarocks_functions::ConstantPolicy {
+            max_rows: 16,
+            max_array_nodes: 128,
+            max_logical_elements: 1024,
+            max_retained_buffer_bytes: 1 << 20,
+            max_type_depth: 64,
+            max_type_nodes: 4096,
+            max_dictionary_depth: 64,
+            max_metadata_bytes: 1 << 20,
+            max_library_validation_work: 1 << 20,
+            max_library_validation_bytes: 1 << 20,
+        };
+        let pool = novarocks_functions::ConstantPool::try_new(
+            field,
+            ty.clone(),
+            array.to_data(),
+            policy,
+            novarocks_type_contract::CompilePhase::Validate,
+            &Active,
+        )
+        .unwrap();
+        let value = pool.value(1).unwrap();
+        let host: Arc<dyn novarocks_functions::AggregateStateAllocator> =
+            Arc::new(NoAllocationHost);
+        let observed = ObservedControl {
+            original: &Active,
+            refused: AtomicBool::new(false),
+            operation_aborted: AtomicBool::new(false),
+        };
+        let mut work = Work {
+            control: &observed,
+            pending: 0,
+            scalar_scope: None,
+        };
+        let actual =
+            complete_constant_leaf(&value, &ty, Selection::all(1), Some(&host), &mut work).unwrap();
+        let OwnedValue::Constant(actual) = actual else {
+            panic!("root annotations are not array metadata")
+        };
+        assert_eq!(actual.ordinal(), 1);
+        assert!(Arc::ptr_eq(actual.pool().array(), value.pool().array()));
+        assert_eq!(
+            actual.field().metadata()["provider.root"],
+            "must stay original"
+        );
     }
 }

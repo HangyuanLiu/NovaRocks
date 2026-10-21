@@ -15,9 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Permanent exact Binary-to-Utf8 recipe equality against actual original arena CAST.
-use super::legacy_binary_text_cast_baseline_tests::{actual, input};
-use arrow::array::{Array, ArrayRef, BinaryArray, StringArray};
+//! Exact Binary-to-Utf8 recipe with independent fixed UTF-8/NULL expectations.
+use arrow::array::{Array, ArrayRef, BinaryArray};
 use arrow::datatypes::DataType;
 use novarocks_functions::{
     CastOperation, CastRowResult, EvaluatedArgument, KernelEvaluationControl, KernelFailure,
@@ -43,6 +42,22 @@ impl KernelEvaluationControl for Control {
         panic!("binary CAST never waits")
     }
 }
+// Pure sliced data fixture, shared with retained dependents when needed.
+pub(super) fn input() -> ArrayRef {
+    Arc::new(
+        BinaryArray::from(vec![
+            Some(b"pad".as_slice()),
+            Some("你好\0🙂".as_bytes()),
+            Some(b"".as_slice()),
+            Some(b"\xffa".as_slice()),
+            None,
+            Some(b"tail".as_slice()),
+        ])
+        .slice(1, 4),
+    )
+}
+const EXPECTED: [Option<&str>; 4] = [Some("你好\0🙂"), Some(""), None, None];
+
 #[test]
 fn binary_text_oracle_exact_profile_source_nullability_policies_every_byte_slice_and_selection() {
     let values = input();
@@ -61,24 +76,23 @@ fn binary_text_oracle_exact_profile_source_nullability_policies_every_byte_slice
                     &Control,
                 )
                 .unwrap();
-                for source in [
-                    values.clone(),
-                    values.slice(0, 0),
-                    Arc::new(BinaryArray::from(vec![Some(
-                        (0u8..=255).collect::<Vec<_>>().as_slice(),
-                    )])) as ArrayRef,
+                for (source, expected_rows) in [
+                    (values.clone(), &EXPECTED[..]),
+                    (values.slice(0, 0), &[][..]),
+                    (
+                        Arc::new(BinaryArray::from(vec![Some(
+                            (0u8..=255).collect::<Vec<_>>().as_slice(),
+                        )])) as ArrayRef,
+                        &[None][..],
+                    ),
                 ] {
-                    let old = actual(&source, policy, allow).unwrap();
-                    let old = old.as_any().downcast_ref::<StringArray>().unwrap();
+                    assert_eq!(source.len(), expected_rows.len());
                     for row in 0..source.len() {
                         if source.is_null(row) && !nullable {
                             continue;
                         }
-                        let expected = if old.is_null(row) {
-                            CastRowResult::Null
-                        } else {
-                            CastRowResult::Text(old.value(row).into())
-                        };
+                        let expected = expected_rows[row]
+                            .map_or(CastRowResult::Null, |text| CastRowResult::Text(text.into()));
                         assert_eq!(
                             recipe
                                 .evaluate_row(
@@ -106,13 +120,8 @@ fn binary_text_oracle_exact_profile_source_nullability_policies_every_byte_slice
                 )
                 .unwrap();
                 for (ordinal, row) in selected.iter().enumerate() {
-                    let old = actual(&values.slice(row, 1), policy, allow).unwrap();
-                    let old = old.as_any().downcast_ref::<StringArray>().unwrap();
-                    let expected = if old.is_null(0) {
-                        CastRowResult::Null
-                    } else {
-                        CastRowResult::Text(old.value(0).into())
-                    };
+                    let expected = EXPECTED[row]
+                        .map_or(CastRowResult::Null, |text| CastRowResult::Text(text.into()));
                     assert_eq!(
                         recipe
                             .evaluate_row(

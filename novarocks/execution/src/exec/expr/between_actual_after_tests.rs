@@ -18,10 +18,10 @@
 //! Actual SQL author -> native package -> LocalCompiler -> mutable Frame.
 //! New fixtures are UNRUN until the root's serialized Execution test window.
 use super::compiled_program::CompiledExpressionInstance;
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue;
+use super::sql_test_source::sql_source;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int64Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_local_program::{
@@ -177,38 +177,26 @@ fn between_actual_after_nullable_case_sparse_sliced_and_empty_three_valued_outpu
         }
     }
 }
-fn original_negate_error() -> String {
-    use crate::exec::chunk::{Chunk, ChunkSchema};
-    use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
-    use novarocks_types::SlotId;
-    let data = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)])),
-        vec![Arc::new(Int64Array::from(vec![i64::MIN]))],
-    )
-    .unwrap();
-    let cs =
-        ChunkSchema::try_ref_from_schema_and_slot_ids(data.schema().as_ref(), &[SlotId::new(17)])
-            .unwrap();
-    let chunk = Chunk::new_with_chunk_schema(data, cs);
-    let mut arena = ExprArena::default();
-    let operand = arena.push_typed(ExprNode::SlotId(SlotId::new(17)), DataType::Int64);
-    let zero = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(0)), DataType::Int64);
-    let negate = arena.push_typed(
-        ExprNode::Sub(
-            zero,
-            operand,
-            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        ),
-        DataType::Int64,
-    );
-    arena.eval(negate, &chunk).unwrap_err().detail().to_owned()
-}
+// Negating -2^63 requires +2^63, beyond signed INT64's maximum 2^63-1.
+// The frozen arithmetic diagnostic spells the typed zero/subtraction and the
+// original offending decimal value; no evaluator manufactures this expectation.
+const NEGATE_MIN_ERROR: &str =
+    "Arithmetic overflow: Overflow happened on: 0 - -9223372036854775808";
 #[test]
 fn between_actual_after_upper_error_is_required_even_after_false_lower_and_lower_error_is_first() {
-    let expected_error = original_negate_error();
-    for sql in [
-        "SELECT k BETWEEN 9223372036854775807 AND -k FROM fixture.source",
-        "SELECT k BETWEEN -k AND -k FROM fixture.source",
+    for (sql, expected) in [
+        (
+            "SELECT k BETWEEN 9223372036854775807 AND -k FROM fixture.source",
+            // A false lower comparison never suppresses the required upper
+            // NEGATE error at MIN. For 0 and MAX the conjunction is false.
+            vec![None, Some(false), Some(false)],
+        ),
+        (
+            "SELECT k BETWEEN -k AND -k FROM fixture.source",
+            // At MIN the lower error is retained once. At 0 both comparisons
+            // are true; MAX <= -MAX is false for the final row.
+            vec![None, Some(true), Some(false)],
+        ),
     ] {
         let (program, site) = compiled(sql);
         let data = batch(
@@ -221,8 +209,8 @@ fn between_actual_after_upper_error_is_required_even_after_false_lower_and_lower
         let out = frame.evaluate(&data, Selection::all(3), &Control).unwrap();
         assert_eq!(out.errors().len(), 1);
         assert_eq!(out.errors()[0].selected_ordinal(), 0);
-        assert_eq!(out.errors()[0].message(), expected_error);
-        assert_eq!(values(&out)[0], None);
+        assert_eq!(out.errors()[0].message(), NEGATE_MIN_ERROR);
+        assert_eq!(values(&out), expected);
         assert!(!out.values().is_null(1));
     }
 }

@@ -178,10 +178,10 @@ impl<T> InternalResultValue<T> {
         &self.window
     }
 
-    pub(crate) fn try_transform<R>(
+    pub(crate) fn try_transform<R, E>(
         self,
-        transform: impl FnOnce(T, &ResultWindowAlias) -> Result<R, String>,
-    ) -> Result<InternalResultValue<R>, String> {
+        transform: impl FnOnce(T, &ResultWindowAlias) -> Result<R, E>,
+    ) -> Result<InternalResultValue<R>, E> {
         let Self {
             value,
             window,

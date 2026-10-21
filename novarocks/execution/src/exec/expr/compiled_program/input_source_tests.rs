@@ -633,3 +633,240 @@ fn compiled_canonical_empty_result_keeps_its_own_creator_independent_of_equal_so
     assert_eq!(canonical_drops.load(Ordering::SeqCst), 1);
     assert_eq!(tracker.current(), 0);
 }
+
+// Exercise real SQL/LocalCompiler CASE roots over the original finite input.
+// Parent validity masks required children; only demanded branches read payloads.
+#[test]
+fn fixed_binary_case_roots_preserve_values_and_input_lifetime() {
+    use crate::exec::expr::filter_conjunction_actual_sql_compiler_tests::compiler_results_with_declared_read_fields;
+    use crate::exec::expr::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
+    use crate::exec::expr::sql_test_source::sql_source_with_declared_fields;
+    use arrow::array::{
+        ArrayRef, FixedSizeBinaryArray, Int32Array, StructArray, builder::FixedSizeBinaryBuilder,
+    };
+    use arrow::buffer::NullBuffer;
+    use arrow::datatypes::Field;
+    use novarocks_local_program::ProgramNodeKind;
+    let nested = DataType::Struct(
+        vec![Arc::new(Field::new(
+            "f",
+            DataType::FixedSizeBinary(4),
+            false,
+        ))]
+        .into(),
+    );
+    let fields = [
+        Field::new("raw", DataType::FixedSizeBinary(16), false),
+        Field::new("st", nested, true),
+        Field::new("n", DataType::Int32, false),
+    ];
+    let source = sql_source_with_declared_fields(
+        "SELECT CASE WHEN n=10 THEN raw ELSE NULL END AS raw,CASE WHEN n=10 THEN st ELSE NULL END AS st,n+1 AS next_n FROM fixture",
+        &fields,
+    );
+    let programs = compiler_results_with_declared_read_fields(
+        &source,
+        &fields,
+        &installed_builtin_owner_catalogue(),
+    );
+    let mut sites = Vec::new();
+    for program in programs.into_values() {
+        let program = Arc::new(program.expect("real SQL fixed roots compile unchanged"));
+        for node in program.graph().nodes() {
+            if let ProgramNodeKind::Project { input, exprs, .. } = node.kind() {
+                let child = &program.graph().nodes()[input.index()];
+                if exprs.len() == 3
+                    && matches!(child.kind(), ProgramNodeKind::Scan { .. })
+                    && child.output_layout().schema().fields().len() == 3
+                {
+                    assert_eq!(
+                        child.output_layout().schema().field(0).data_type(),
+                        &DataType::FixedSizeBinary(16)
+                    );
+                    assert_eq!(
+                        child.output_layout().schema().field(1).data_type(),
+                        fields[1].data_type()
+                    );
+                    for &expression in &exprs[..2] {
+                        assert!(
+                            matches!(
+                                program
+                                    .graph()
+                                    .expressions()
+                                    .node(expression)
+                                    .unwrap()
+                                    .kind(),
+                                novarocks_local_program::StaticExprKind::Case { .. }
+                            ),
+                            "the real SQL author must preserve both whole CASE roots"
+                        );
+                    }
+                    sites.push((program.clone(), node.local_id().unwrap(), *input));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        sites.len(),
+        1,
+        "use the one genuine scan-fed Project, not another fragment's input"
+    );
+    let (program, node, input) = sites.pop().unwrap();
+    let sparse = [1usize];
+    let empty = [];
+    for expression in [0u32, 1] {
+        for selection in [
+            Selection::all(2),
+            Selection::try_sparse(2, &sparse).unwrap(),
+            Selection::try_sparse(2, &empty).unwrap(),
+        ] {
+            let layout = program.graph().nodes()[input.index()].output_layout();
+            let mut raw = FixedSizeBinaryBuilder::with_capacity(2, 16);
+            raw.append_value([0x11; 16]).unwrap();
+            raw.append_value([0x22; 16]).unwrap();
+            let mut child = FixedSizeBinaryBuilder::with_capacity(2, 4);
+            child.append_value([1, 2, 3, 4]).unwrap();
+            child.append_null();
+            let DataType::Struct(nested_fields) = layout.schema().field(1).data_type() else {
+                panic!("actual frozen Struct")
+            };
+            assert!(!nested_fields[0].is_nullable());
+            let st: ArrayRef = Arc::new(
+                StructArray::try_new(
+                    nested_fields.clone(),
+                    vec![Arc::new(child.finish())],
+                    Some(NullBuffer::from(vec![true, false])),
+                )
+                .unwrap(),
+            );
+            let batch = RecordBatch::try_new(
+                layout.schema().clone(),
+                vec![
+                    Arc::new(raw.finish()),
+                    st,
+                    Arc::new(Int32Array::from(vec![10, 20])),
+                ],
+            )
+            .unwrap();
+            let mut chunk = Chunk::try_new_with_chunk_schema(
+                batch,
+                ChunkSchema::from_compiled_layout(layout).unwrap(),
+            )
+            .unwrap();
+            let source_tracker = MemTracker::new_root("fixed-case-input-source");
+            chunk.try_transfer_to(&source_tracker).unwrap();
+            let source_bytes = source_tracker.current();
+            assert!(source_bytes > 0);
+            let actual_owner = chunk.source_authority().owner_identity();
+            let actual_array = chunk.record_batch().column(expression as usize).clone();
+            let condition_array = chunk.record_batch().column(2).clone();
+            let seen = Arc::new(Mutex::new([0usize; 2]));
+            let observed = seen.clone();
+            let observer: Arc<SlotSourceObserver> = Arc::new(move |column| {
+                let (array, source) = column.into_parts();
+                let ordinal = if Arc::ptr_eq(array, &condition_array) {
+                    0
+                } else {
+                    assert!(
+                        Arc::ptr_eq(array, &actual_array),
+                        "CASE observes its own payload or condition Slot only"
+                    );
+                    1
+                };
+                let BorrowedInputSource::Attached(source) = source else {
+                    panic!("actual input source must survive")
+                };
+                assert_eq!(source.owner_identity(), actual_owner);
+                observed.lock().unwrap()[ordinal] += 1;
+            });
+            let host_tracker = MemTracker::new_root("fixed-case-result-host");
+            let host = crate::runtime::tracked_state_allocator::expression_allocation_host(
+                host_tracker.clone(),
+            );
+            let mut instance = CompiledExpressionInstance::try_new_with_allocator(
+                program.clone(),
+                ProgramExpressionRootSite::Node {
+                    node,
+                    role: ProgramNodeExpressionRole::ProjectOutput { expression },
+                },
+                &Control,
+                Some(host),
+            )
+            .unwrap();
+            instance.observe_slot_source(observer);
+            let output = evaluate(
+                &mut instance,
+                CompiledInputLoan::from_chunk(&chunk),
+                selection,
+            )
+            .expect("the real whole CASE must prepare and materialize with its exact declaration");
+            assert!(output.errors().is_empty());
+            assert_eq!(output.values().len(), selection.len());
+            assert_eq!(
+                *seen.lock().unwrap(),
+                [
+                    usize::from(!selection.is_empty()),
+                    usize::from(selection.iter().any(|row| row == 0))
+                ],
+                "condition is read once; the THEN payload is read only for the true row"
+            );
+            if expression == 0 {
+                let raw = output
+                    .values()
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .unwrap();
+                assert_eq!(raw.value_length(), 16);
+                for (i, row) in selection.iter().enumerate() {
+                    assert_eq!(raw.is_null(i), row == 1);
+                    if row == 0 {
+                        assert_eq!(raw.value(i), &[0x11; 16]);
+                    }
+                }
+            } else {
+                let st = output
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
+                let DataType::Struct(fields) = st.data_type() else {
+                    unreachable!()
+                };
+                assert!(!fields[0].is_nullable());
+                for (i, row) in selection.iter().enumerate() {
+                    assert_eq!(st.is_null(i), row == 1);
+                    if row == 0 {
+                        assert_eq!(
+                            st.column(0)
+                                .as_any()
+                                .downcast_ref::<FixedSizeBinaryArray>()
+                                .unwrap()
+                                .value(i),
+                            &[1, 2, 3, 4]
+                        );
+                    }
+                }
+            }
+            let data = output.values().to_data();
+            let last = if expression == 0 {
+                data.buffers()[0].clone()
+            } else {
+                data.child_data()[0].buffers()[0].clone()
+            };
+            drop(data);
+            drop(output);
+            drop(instance);
+            drop(chunk);
+            if !selection.is_empty() {
+                assert_eq!(
+                    source_tracker.current(),
+                    source_bytes,
+                    "the output Buffer retains the exact original source"
+                );
+            }
+            std::thread::spawn(move || drop(last)).join().unwrap();
+            assert_eq!(source_tracker.current(), 0);
+            assert_eq!(host_tracker.current(), 0);
+        }
+    }
+}

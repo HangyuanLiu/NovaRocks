@@ -18,7 +18,33 @@
 explicit_only = false
 
 [impact]
-paths = ["novarocks/execution/src/exec/expr/array_expr.rs", "novarocks/execution/src/exec/expr/struct_expr.rs", "novarocks/execution/src/exec/expr/function/array/**"]
+paths = [
+    "novarocks/functions/src/builtin/array_*.rs",
+    "novarocks/functions/src/builtin/map_*.rs",
+    "novarocks/functions/src/builtin/collection_*.rs",
+    "novarocks/functions/src/array_*.rs",
+    "novarocks/functions/src/array_projection/**",
+    "novarocks/functions/src/higher_order_*.rs",
+    "novarocks/functions/src/lambda_rows.rs",
+    "novarocks/functions/src/control_values.rs",
+    "novarocks/functions/src/selected_copy.rs",
+    "novarocks/local-compiler/src/array_projection.rs",
+    "novarocks/execution/src/exec/expr/compiled_program.rs",
+    "novarocks/execution/src/exec/expr/compiled_program/**",
+    "novarocks/execution/src/exec/operators/compiled_expression.rs",
+    "novarocks/local-compiler/src/expressions.rs",
+    "novarocks/functions/src/lib.rs",
+    "novarocks/functions/src/evaluation.rs",
+    "novarocks/functions/src/kernel_input.rs",
+    "novarocks/functions/src/invocation_scope.rs",
+    "novarocks/functions/src/invocation_scalar_resources.rs",
+    "novarocks/functions/src/cast/f3_array.rs",
+    "novarocks/functions/src/cast/f3_array/**",
+    "novarocks/functions/src/list_cast_selected.rs",
+    "novarocks/functions/src/selected_copy/guarded_nested.rs",
+    "novarocks/functions/src/arrow_result_custody.rs",
+    "novarocks/functions/src/source_custody_resources.rs",
+]
 
 [reuse]
 scope = "suite"

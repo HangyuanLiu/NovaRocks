@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Actual analysis/request-snapshot admission probes; not a complete support seal.
-use super::sql_scalar_presence_original_tests::{EVALUATOR, SERIAL, fold_count, reset, session};
+use super::sql_fold_observation_test_source::{EVALUATOR, SERIAL, fold_count, reset, session};
 use arrow::datatypes::DataType;
 use novarocks_functions::{
     FunctionArgument, FunctionBindingError, FunctionKind, FunctionSpecializationFailure,
@@ -47,7 +47,7 @@ fn analyze(sql: &str) -> Result<(), SqlCompileError> {
         builtin_sql_function_catalog(),
         &EVALUATOR,
         None,
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         SqlCompileControl::unbounded(),
     );
     SqlCompiler::analyze(request)?.into_pending()?;
@@ -225,7 +225,7 @@ fn sql_presence_candidate_completion_uses_actual_request_mode_before_fold_or_pub
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
         &EVALUATOR,
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         SqlCompileControl::unbounded(),
         PipelineDopDomain {
             min: 1,

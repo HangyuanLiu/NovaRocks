@@ -16,14 +16,13 @@
 // under the License.
 
 //! Actual original SQL source receipts and permanent IN/NOT IN Frame witnesses.
-//! Before preparation these are RED at UnsupportedExpression(InList).
+//! Expected truth values are fixed independently of any value evaluator.
 use super::compiled_program::CompiledExpressionInstance;
-use super::legacy_inlist_required_baseline_tests::{original, original_required_case_operand};
-use super::numeric_unary_original_nonnull_sql_baseline_tests::{
+use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_inlist_source;
+use super::sql_test_source::{
     sql_source_with_single_field, sql_source_with_single_field_and_core_residuals,
 };
-use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_inlist_source;
-use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, StringArray, UInt64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
@@ -108,22 +107,13 @@ fn inlist_sql_source_original_required_numeric_and_nullable_region_facts() {
         );
     }
 }
-fn evaluate(
-    sql: &str,
-    field: Field,
-    input: ArrayRef,
-    candidates: Vec<ArrayRef>,
-    negated: bool,
-    truth: bool,
-    original_operand: Option<ArrayRef>,
-) {
+fn evaluate(sql: &str, field: Field, input: ArrayRef, expected: &[Option<bool>], truth: bool) {
     // Same original SQL's legitimate optimizer variant, not a claim that
     // the native default producer emitted this exact residual site.
     let source = sql_source_with_single_field_and_core_residuals(sql, field);
     assert!(inspect(&source) > 0);
     let functions =
         super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue();
-    // This actual package effects author is deliberately RED before IN support.
     let programs = programs_with_catalogue_and_original_inlist_source(&source, &functions);
     let mut found = None;
     for program in programs.values() {
@@ -179,9 +169,7 @@ fn evaluate(
     assert_eq!(schema.fields().len(), 1);
     assert_eq!(schema.field(0).data_type(), input.data_type());
     let data = RecordBatch::try_new(schema, vec![input.clone()]).unwrap();
-    let mut arrays = vec![original_operand.unwrap_or_else(|| input.clone())];
-    arrays.extend(candidates);
-    let old = original(arrays, negated).unwrap();
+    assert_eq!(expected.len(), input.len());
     for rows in [
         (0..input.len()).collect::<Vec<_>>(),
         (0..input.len()).filter(|r| r % 2 == 0).collect(),
@@ -193,25 +181,7 @@ fn evaluate(
         let out = frame.evaluate(&data, selection, &Control).unwrap();
         assert!(out.errors().is_empty());
         assert_eq!(out.selection(), selection);
-        let indices = UInt64Array::from(
-            rows.iter()
-                .map(|r| u64::try_from(*r).unwrap())
-                .collect::<Vec<_>>(),
-        );
-        let expected = arrow::compute::take(old.as_ref(), &indices, None).unwrap();
-        let wanted = if truth {
-            Arc::new(BooleanArray::from(
-                expected
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .unwrap()
-                    .iter()
-                    .map(|v| v.unwrap_or(false))
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef
-        } else {
-            expected
-        };
+        let wanted = BooleanArray::from(rows.iter().map(|row| expected[*row]).collect::<Vec<_>>());
         assert_eq!(out.values().to_data(), wanted.to_data());
     }
 }
@@ -235,18 +205,13 @@ fn texts() -> ArrayRef {
 }
 #[test]
 fn inlist_actual_compiler_i32_value_nullable_literal_list() {
+    // A match dominates the later NULL; nonmatches and NULL source are NULL.
     evaluate(
         "SELECT ship_code IN (1,2,NULL) FROM t0",
         Field::new("ship_code", DataType::Int32, true),
         ints(),
-        vec![
-            Arc::new(Int32Array::from(vec![Some(1); 5])),
-            Arc::new(Int32Array::from(vec![Some(2); 5])),
-            Arc::new(Int32Array::from(vec![None; 5])),
-        ],
+        &[Some(true), Some(true), None, None, None],
         false,
-        false,
-        None,
     );
 }
 #[test]
@@ -255,28 +220,25 @@ fn inlist_actual_compiler_utf8_value_nullable_original_region_source() {
         "SELECT c_region IN ('ASIA','AMERICA') FROM t_filter_customer_metrics",
         Field::new("c_region", DataType::Utf8, true),
         texts(),
-        vec![
-            Arc::new(StringArray::from(vec![Some("ASIA"); 5])),
-            Arc::new(StringArray::from(vec![Some("AMERICA"); 5])),
-        ],
+        &[Some(true), Some(true), Some(false), None, Some(false)],
         false,
-        false,
-        None,
     );
 }
 #[test]
 fn inlist_actual_compiler_i32_notin_truthonly_original_scan_source() {
+    // TruthOnly projects SQL UNKNOWN to false; 3 and 9 are the two nonmembers.
     evaluate(
         "SELECT ship_code FROM t0 WHERE ship_code NOT IN (1,2)",
         Field::new("ship_code", DataType::Int32, true),
         ints(),
-        vec![
-            Arc::new(Int32Array::from(vec![Some(1); 5])),
-            Arc::new(Int32Array::from(vec![Some(2); 5])),
+        &[
+            Some(false),
+            Some(false),
+            Some(true),
+            Some(false),
+            Some(true),
         ],
         true,
-        true,
-        None,
     );
 }
 #[test]
@@ -285,16 +247,16 @@ fn inlist_actual_compiler_utf8_truthonly_original_required_predicate() {
         "SELECT c_region FROM t_filter_customer_metrics WHERE c_region IN ('ASIA','AMERICA')",
         Field::new("c_region", DataType::Utf8, true),
         texts(),
-        vec![
-            Arc::new(StringArray::from(vec![Some("ASIA"); 5])),
-            Arc::new(StringArray::from(vec![Some("AMERICA"); 5])),
+        &[
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(false),
         ],
-        false,
         true,
-        None,
     );
 }
-
 #[test]
 fn inlist_actual_compiler_utf8_case_truthonly_original_required_source() {
     let input: ArrayRef = Arc::new(Int32Array::from(vec![
@@ -304,17 +266,19 @@ fn inlist_actual_compiler_utf8_case_truthonly_original_required_source() {
         None,
         Some(59),
     ]));
-    let operand = original_required_case_operand(input.clone());
+    // The ordered thresholds produce A, B, C, E, E. Only A/B are members;
+    // SQL NULL does not satisfy a WHEN comparison and therefore selects ELSE.
     evaluate(
         "SELECT ship_code FROM t0 WHERE (CASE WHEN ship_code >= 90 THEN 'A' WHEN ship_code >= 80 THEN 'B' WHEN ship_code >= 70 THEN 'C' WHEN ship_code >= 60 THEN 'D' ELSE 'E' END) IN ('A','B')",
         Field::new("ship_code", DataType::Int32, true),
         input,
-        vec![
-            Arc::new(StringArray::from(vec![Some("A"); 5])),
-            Arc::new(StringArray::from(vec![Some("B"); 5])),
+        &[
+            Some(true),
+            Some(true),
+            Some(false),
+            Some(false),
+            Some(false),
         ],
-        false,
         true,
-        Some(operand),
     );
 }

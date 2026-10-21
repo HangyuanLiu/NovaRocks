@@ -238,6 +238,71 @@ class Run(unittest.TestCase):
         self.assertLess(len(expression.encode()),128)
         self.assertEqual(len(actual),13228)
 
+    def test_large_partial_regular_binaries_use_bounded_exact_complements(self):
+        bindings = {}
+        metadata = {}
+        listing = {'rust-suites': {}}
+        values = []
+        wanted = set()
+        clauses = []
+        for binary, size, omitted in (('p0', 2277, 1), ('p1', 1874, 1),
+                                      ('p2', 2718, 2), ('p3', 3293, 6)):
+            names = ['parser::session::case_%05d' % n for n in range(size)]
+            excluded = set(names[:omitted])
+            bindings[binary] = {'package-id': binary, 'binary-name': binary}
+            metadata[binary] = {'name': binary}
+            listing['rust-suites'][binary] = {'testcases': {
+                name: {'ignored': False, 'filter-match': {'status': 'matches'}} for name in names}}
+            listing['rust-suites'][binary]['testcases']['helper'] = {
+                'ignored': True, 'filter-match': {'status': 'mismatch'}}
+            for name in names[omitted:]:
+                value = self.scope('rust-test', binary+'::'+name)
+                values.append(value)
+                wanted.add(value.key)
+            clauses.append('(package(={0}) & binary(={0}) & not ({1}))'.format(
+                binary, ' | '.join('test(={})'.format(name) for name in sorted(excluded))))
+        # Model the native response from the fixed omitted fixtures, independently
+        # of the expression under test. The author must submit these exact clauses.
+        selected = copy.deepcopy(listing)
+        for binary, suite in selected['rust-suites'].items():
+            for name, case in suite['testcases'].items():
+                case['filter-match']['status'] = (
+                    'matches' if 'rust-test:'+binary+'::'+name in wanted else 'mismatch')
+        with mock.patch.object(run, 'native_list', return_value=selected) as native:
+            expression, actual = run._regular_expression(values, bindings, metadata, self.inputs, listing)
+        self.assertEqual(expression, ' | '.join(clauses))
+        self.assertEqual(native.call_args.args, (self.inputs, expression))
+        self.assertLess(len(expression.encode()), 4096)
+        self.assertEqual(set(actual), wanted)
+        self.assertEqual(len(actual), 10152)
+        # A native result which also selects even one omitted test must still fail.
+        selected['rust-suites']['p0']['testcases']['parser::session::case_00000']['filter-match']['status'] = 'matches'
+        with mock.patch.object(run, 'native_list', return_value=selected):
+            with self.assertRaisesRegex(ValueError, 'changes requested'):
+                run._regular_expression(values, bindings, metadata, self.inputs, listing)
+
+    def test_regular_binary_compression_keeps_prefix_ambiguity_guard(self):
+        bindings = {'p': {'package-id': 'p', 'binary-name': 'lib'},
+                    'p::exec': {'package-id': 'p', 'binary-name': 'exec'}}
+        listing = {'rust-suites': {
+            'p': {'testcases': {'exec::module::check': {'ignored': False}}},
+            'p::exec': {'testcases': {'different_check': {'ignored': False}}}}}
+        value = self.scope('rust-test', 'p::exec::module::check')
+        selected = copy.deepcopy(listing)
+        selected['rust-suites']['p']['testcases']['exec::module::check']['filter-match'] = {'status': 'matches'}
+        selected['rust-suites']['p::exec']['testcases']['different_check']['filter-match'] = {'status': 'mismatch'}
+        with mock.patch.object(run, 'native_list', return_value=selected):
+            expression, actual = run._regular_expression([value], bindings,
+                {'p': self.metadata['packages'][0]}, self.inputs, listing)
+        self.assertEqual(expression, '(package(=pkg) & binary(=lib))')
+        self.assertEqual(actual, [value.key])
+        listing['rust-suites']['p::exec']['testcases']['module::check'] = {'ignored': False}
+        with mock.patch.object(run, 'native_list') as native:
+            with self.assertRaisesRegex(ValueError, 'no unique'):
+                run._regular_expression([value], bindings,
+                    {'p': self.metadata['packages'][0]}, self.inputs, listing)
+        native.assert_not_called()
+
     def test_native_inventory_keeps_deferred_aggregate_scope_before_results(self):
         item={'name':'workspace nextest and doctests','tier':'admission','domain':['**']}
         self.native['stages']['stages']=[item]

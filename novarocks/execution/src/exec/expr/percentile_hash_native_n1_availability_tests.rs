@@ -16,7 +16,7 @@
 // under the License.
 
 //! N1 owner-derived admission before real folding; Original binding remains full N.
-use super::sql_scalar_presence_original_tests::{EVALUATOR, SERIAL, fold_count, reset, session};
+use super::sql_fold_observation_test_source::{EVALUATOR, SERIAL, fold_count, reset, session};
 use arrow::datatypes::DataType;
 use novarocks_functions::{
     FunctionArgument, FunctionBindingError, FunctionBindingRequest, FunctionValueType,
@@ -116,7 +116,7 @@ fn hash_native_n1_exact_admission_preserves_original_variadic_binding_and_refuse
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             &EVALUATOR,
-            super::pure_differential::constant_policy(),
+            super::test_support::constant_policy(),
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
                 min: 1,

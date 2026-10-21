@@ -17,11 +17,5 @@
 #[path = "common/mod.rs"]
 mod common;
 
-#[path = "exec/avg_decimal.rs"]
-mod avg_decimal;
-#[path = "exec/clone_expr.rs"]
-mod clone_expr;
 #[path = "exec/exec_test.rs"]
 mod exec_test;
-#[path = "exec/statistic_agg.rs"]
-mod statistic_agg;

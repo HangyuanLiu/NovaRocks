@@ -574,8 +574,6 @@ fn bool_cast_does_not_author_nominal_fixed_bytes_encoded_or_unsupported_operatio
     for source in [
         ty(DataType::Binary, true),
         ty(DataType::Float16, true),
-        ty(DataType::Decimal128(10, 0), true),
-        ty(DataType::FixedSizeBinary(16), true),
         FunctionValueType::try_with_logical_type(
             DataType::FixedSizeBinary(16),
             true,
@@ -605,6 +603,29 @@ fn bool_cast_does_not_author_nominal_fixed_bytes_encoded_or_unsupported_operatio
             );
         }
     }
+    // Boolean->decimal is approved P05; the reverse D128->Boolean still refuses.
+    super::tests::assert_f3_admitted_preparation(DataType::Boolean, DataType::Decimal128(10, 0));
+    assert_eq!(
+        PreparedCastRecipe::try_new(
+            CastOperation::Carrier,
+            &ty(DataType::Decimal128(10, 0), true),
+            &boolean,
+            DecimalOverflowPolicy::OutputNull,
+            true,
+            &CompileControl::default(),
+        ),
+        Err(CastPrepareError::Unsupported)
+    );
+    let fixed = Arc::new(
+        arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            [Some(1_i128.to_be_bytes()), Some(0_i128.to_be_bytes()), None].into_iter(),
+            16,
+        )
+        .unwrap(),
+    ) as ArrayRef;
+    let bools = Arc::new(BooleanArray::from(vec![Some(true), Some(false), None])) as ArrayRef;
+    super::tests::assert_f3_selected_literal_case(Arc::clone(&bools), Arc::clone(&fixed));
+    super::tests::assert_f3_selected_literal_case(fixed, bools);
     for operation in [CastOperation::Time, CastOperation::TimeFromDatetime] {
         assert_eq!(
             PreparedCastRecipe::try_new(

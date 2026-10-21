@@ -561,7 +561,7 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
     dep_manager: DependencyManager,
     pipeline_dop: i32,
     root_sink_dop: Option<i32>,
-    function_set: Arc<SealedExecutionFunctionSet>,
+    _function_set: Arc<SealedExecutionFunctionSet>,
     error: Arc<RuntimeErrorState>,
     ordered: Option<&CompiledOrderedFilterContext>,
 ) -> ExecutionResult<PipelineGraph> {
@@ -581,8 +581,6 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
     writer_bindings.validate(program)?;
     validate_compiled_runtime_filter_bindings(program, runtime_filter_session.as_ref())?;
     let mut ctx = PipelineBuildContext {
-        arena: Arc::new(ExprArena::default()),
-        function_set,
         dep_manager,
         runtime_filter_execution: PipelineRuntimeFilterExecution {
             session: runtime_filter_session,
@@ -662,12 +660,6 @@ impl OperatorFactory for ProfiledCompiledFactory {
     #[cfg(test)]
     fn is_edge_gated(&self) -> bool {
         self.inner.is_edge_gated()
-    }
-    #[cfg(test)]
-    fn native_aggregate_topn_producers(
-        &self,
-    ) -> &[crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding] {
-        self.inner.native_aggregate_topn_producers()
     }
 }
 
@@ -1099,7 +1091,7 @@ fn build_node(
                                         expr_id,
                                         nullable,
                                     } => Ok(crate::exec::node::unpivot::UnpivotConstant::Scalar {
-                                        expr_id: crate::exec::expr::ExprId(expr_id.index()),
+                                        expr_id: *expr_id,
                                         nullable: *nullable,
                                     }),
                                     novarocks_local_program::UnpivotConstant::Int32List(values) => {

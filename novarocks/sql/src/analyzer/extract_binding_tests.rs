@@ -198,7 +198,9 @@ fn extract_binding_all_six_units_preserve_canonical_targets_and_original_catalog
                     nullable
                         || matches!(
                             carrier,
-                            DataType::Timestamp(TimeUnit::Second | TimeUnit::Millisecond, _)
+                            // Arrow offset narrowing retains its conservative NULL declaration.
+                            DataType::LargeUtf8
+                                | DataType::Timestamp(TimeUnit::Second | TimeUnit::Millisecond, _)
                         ),
                 )
             };

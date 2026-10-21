@@ -17,6 +17,7 @@ specific language governing permissions and limitations
 under the License.
 -->
 
+
 # NovaRocks - AI Agents Guide
 
 This document is a quick operational index for agents working on NovaRocks.
@@ -247,15 +248,33 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
   不拥有 live scan、writer、connector 或 async capability。
 
 - `novarocks/execution/src/exec/node/**`
-  compiled 与旧 evaluator 仍复用的值描述、scan/writer 等运行能力；
-  `ExecPlan`、`ExecNode` 构造树和 lowering bridge 已删除，不得按目录名删除共享值类型。
+  compiled 复用的中立值描述、scan/writer 等运行能力；不构造旧执行树。
+  不得按目录名删除共享值类型、typed failure 或实际 construction helper。
 
 - `novarocks/execution/src/exec/expr/**`
-  `compiled_program/**` 执行已绑定的 pure 核心。旧 `ExprArena`、名字注册表、函数外壳和
-  legacy aggregate adapter 暂留给 F3：FE `query_execution/constant_eval.rs`、
-  `query_execution/row_mutation.rs` 的 COW cast 以及 compiled 的
-  `exec/expr/compiled_program/guarded.rs` 共享 IN helper 仍有生产依赖。
-  旧 evaluator 的私有 differential oracle 测试也保留；它不是生产计划树解释器。
+  只有 compiled 求值器与保留的真实 SQL/独立预期测试；不保留旧 arena、名字分派或 legacy aggregate adapter。
+  折叠走 SQL `compiler/fold_node.rs` 的 FrozenFoldCall/Intrinsic 与共享 lowering 作者 → FE
+  `query_execution/constant_eval.rs` 端口 → Execution `compiled_program/constant_node.rs` 单节点入口，
+  复用 `guarded::Frame` 和 Functions 的实际计算。原 admitted CV 与 canonical runtime 参数分开保留。
+  同形常量规范化保留原 pool/ordinal 与实际 creator；source custody 按真实 Arrow 子树的
+  geometry/validity 预检并续接。根无 Buffer 不代表后代无 Buffer；来源持有不授予容量。
+  控制结果的 carrier 准入、精确宽度/NULL 与布局预检共用 Functions `control_values.rs` 和
+  `selected_copy` 作者；`FixedSizeBinary` 保持原宽度字节，不重解释成整数或变长 Binary。
+  有符号 IN helper/recipe 在 `novarocks/functions/src/native_inlist.rs`；UTF8 借用比较在
+  `compiled_program/utf8_inlist.rs`。不得恢复旧 evaluator 或用函数名重建调用。
+
+- COW 赋值转换属于选择查询：`query_execution/dml/mutation_flow.rs` 提交完整根输出声明，
+  SQL `analyzer/root_output_declaration.rs` 复用原 value-conversion 作者，执行前核对 signed 根类型。
+  FE `query_execution/row_mutation/signed_layout.rs` 只规范化布局/metadata 并准确展开允许的 dictionary，
+  不做值 cast，也不以 carrier 推测逻辑领域或放宽 signed NULL/width 约束。
+  STRING→FLOAT/DOUBLE 解析出的 NaN、±Inf（含过大指数文本）按普通 CAST 变为 NULL；
+  可空目标签名接收 NULL，必填目标保留原 Connector Data fact，经安全错误投影拒绝且写入不能完成。
+  不加 COW 专用 cast mode；原本就是浮点的非有限值不属于文本解析规则。
+
+- `novarocks/execution/src/runtime/function_set.rs`
+  只封存真实 EngineFunctionCatalog metadata；不持有旧实现 map、legacy registry 或 implementation manifest。
+  `novarocks/version/src/lib.rs` 的 compatibility domain/生产 epoch 为 7；旧执行实现摘要不再参与，
+  函数目录、pure 目录、descriptor、plan contract 与 Provider/carrier 事实仍保持 exact-island 判定。
 
 - `novarocks/execution/src/exec/operators/**`
   compiled 算子与 factory；`compiled_expression.rs` 直接运行 compiled expression，
@@ -488,9 +507,6 @@ F0–F2 只交付翻转、删旧与完整 R/D/U 失败交接，不代表能力�
 
 - `LocalProgram`: `novarocks/local-program/src/**`
   纯 compiled program；Task 的 exchange、scan、writer 与 sink 能力在 BE preparation 另行绑定。
-
-- `ExprArena` / `ExprNode`: `novarocks/execution/src/exec/expr/mod.rs`
-  F3 待迁移的旧表达式求值器，供 FE 折叠等保留调用方与私有 oracle 使用；不构造生产 fragment 树。
 
 - `RuntimeState`: `novarocks/execution/src/runtime/runtime_state.rs`
   Runtime context for cache and runtime filter behavior.

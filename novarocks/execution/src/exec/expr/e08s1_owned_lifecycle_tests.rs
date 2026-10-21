@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Actual installed lifecycle/static-profile admission. This is not the full E08s1 seal.
-use super::sql_scalar_presence_original_tests::{EVALUATOR, SERIAL, fold_count, reset, session};
+use super::sql_fold_observation_test_source::{EVALUATOR, SERIAL, fold_count, reset, session};
 use arrow::datatypes::{DataType, Field};
 use novarocks_functions::{
     FunctionArgument, FunctionBindingError, FunctionValueType, PureCallLifecycle as Lifecycle,
@@ -50,7 +50,7 @@ fn analyze(sql: &str) -> Result<(), SqlCompileError> {
         builtin_sql_function_catalog(),
         &EVALUATOR,
         None,
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         SqlCompileControl::unbounded(),
     );
     SqlCompiler::analyze(request)?.into_pending()?;

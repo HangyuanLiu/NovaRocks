@@ -31,10 +31,9 @@
 //! - Types: `TypedConnectorScanSource`, `TypedConnectorScanOp`.
 //!
 //! Current limitations:
-//! - The dynamic filter handed to the provider is the truthful unconstrained
-//!   one until this fragment's runtime-filter consumer contracts are decoded.
-//!   `ScanSource::with_runtime_filter_contracts` is the one seam a live,
-//!   backend-driven filter is substituted through.
+//! - The provider receives an unconstrained filter unless a runtime owner
+//!   supplies recorded consumer contracts. Compiled expression filtering
+//!   remains with its pipeline owner.
 //!
 //! Provider neutrality: this file holds protocol-validated carriers and trait
 //! objects only. It never matches a provider variant and never downcasts, so it
@@ -56,7 +55,6 @@ use crate::typed_preparation_flow::StreamPreparationFlow;
 use crate::typed_scan_filter::TypedScanLiveDynamicFilterFactory;
 use novarocks_execution::connector::{SplitQueue, TaskAttemptSplitQueues};
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
-use novarocks_execution::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
 use novarocks_execution::exec::node::scan::{
     BoundScanRanges, ScanOp, ScanSource, ScanStreamSource,
 };
@@ -462,36 +460,6 @@ impl ScanSource for TypedConnectorScanSource {
 
     fn profile_name(&self) -> Option<String> {
         Some("TypedConnectorScan".to_string())
-    }
-
-    /// Subscribe to the live filter this fragment's consumer contracts describe.
-    ///
-    /// `DynamicFilterBinding.filter_id` on the scan carrier is the runtime
-    /// filter's binding id, so a contract is matched to a binding by that id
-    /// alone. With no session or no contract this scan keeps the truthful
-    /// unconstrained filter it was built with rather than claiming feedback it
-    /// never receives.
-    fn with_runtime_filter_contracts(
-        &self,
-        contracts: &[RuntimeFilterConsumerBinding],
-    ) -> Result<Option<Arc<dyn ScanSource>>, String> {
-        let by_filter_id: BTreeMap<u32, RuntimeFilterConsumerContract> = contracts
-            .iter()
-            .map(|binding| {
-                (
-                    binding.contract.binding_id().get(),
-                    binding.contract.clone(),
-                )
-            })
-            .collect();
-        if by_filter_id.is_empty() {
-            return Ok(None);
-        }
-        // Recorded, not subscribed. Subscribing needs the attempt's
-        // runtime-filter session, which the lifecycle will not hand out while
-        // this fragment is still being decoded, so the subscription happens
-        // when the scan binds.
-        Ok(Some(Arc::new(self.with_recorded_contracts(by_filter_id))))
     }
 }
 

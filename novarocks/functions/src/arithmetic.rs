@@ -575,7 +575,7 @@ pub(crate) fn checked_row(
     validate: impl FnOnce(&dyn Array) -> Result<(), KernelFailure>,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<Option<usize>, KernelFailure> {
-    if let EvaluatedArgument::Constant(value) = argument {
+    if let Some(value) = argument.constant_value() {
         let actual = value.value_type();
         let matches = actual.logical_type() == expected.logical_type()
             && (!actual.nullable() || expected.nullable());
@@ -598,6 +598,7 @@ pub(crate) fn checked_row(
     }
     let shape_matches = match argument {
         EvaluatedArgument::Scalar(array) => array.len() == 1,
+        EvaluatedArgument::ConstantView(value) => value.has_original_shape(),
         EvaluatedArgument::SelectedColumn(values) => {
             values.selection().row(ordinal) == Some(logical_row)
         }

@@ -17,7 +17,7 @@
 
 use super::guarded_tests::{author, call, compile_checked_fragment_with_parameters};
 use super::*;
-use crate::exec::expr::pure_differential::HarnessControl as Control;
+use crate::exec::expr::test_support::HarnessControl as Control;
 use crate::exec::operators::compiled_expression::{RuntimeKernelControl, evaluate_all};
 use crate::runtime::{
     fragment::ExecutionFailureCause,

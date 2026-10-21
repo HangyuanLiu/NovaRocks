@@ -18,7 +18,7 @@
 //! installed provider contract fixture, LocalCompiler and the actual Frame.
 //! This fixture does not execute a connector or claim a host memory grant.
 use super::compiled_program::CompiledExpressionInstance;
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
+use super::sql_test_source::sql_source;
 use arrow::{
     array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array},
     datatypes::{DataType, Field, Schema},
@@ -199,6 +199,8 @@ pub(super) fn frozen_reads_with_explicit_source_shape(
                     DataType::Int16 => ConnectorValueType::SmallInt,
                     DataType::Int32 => ConnectorValueType::Integer,
                     DataType::Int64 => ConnectorValueType::BigInt,
+                    DataType::Float32 => ConnectorValueType::Real,
+                    DataType::Float64 => ConnectorValueType::Double,
                     DataType::Utf8 if admit_required_inlist_shape => connector_type_for_value_type(
                         &field.ty,
                     )

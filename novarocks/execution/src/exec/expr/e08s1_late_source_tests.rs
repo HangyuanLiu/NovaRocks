@@ -16,7 +16,7 @@
 // under the License.
 
 //! Actual source journal/all-definition capability consumer; no replacement graph.
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source;
+use super::sql_test_source::sql_source;
 use arrow::datatypes::DataType;
 
 use novarocks_sql::compiler::{

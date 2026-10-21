@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Same original current-root binding is checked even when LogicalOnly has no fold walk.
-use super::e08s1_logical_environment_original_tests::logical;
-use super::sql_scalar_presence_original_tests::{SERIAL, fold_count, reset};
+use super::logical_environment_sql_test_source::logical;
+use super::sql_fold_observation_test_source::{SERIAL, fold_count, reset};
 use novarocks_sql::{analyze_error::AnalyzeErrorKind, compiler::SqlCompileError};
 #[test]
 fn e08s1_logical_environment_exact_absent_source_is_named_with_original_span() {

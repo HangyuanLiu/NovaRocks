@@ -33,9 +33,7 @@ fn source(full: bool) -> novarocks_sql::compiler::SqlAuthoredPhysicalPlan {
     } else {
         "SELECT approx_top_k(v) AS a,approx_top_k(v,3) AS b,approx_top_k(v,3,100) AS c FROM fixture"
     };
-    super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_declared_fields(
-        sql, &fields,
-    )
+    super::sql_test_source::sql_source_with_declared_fields(sql, &fields)
 }
 #[test]
 fn approx_top_k_actual_original_required_sql_ordered_full_binding_source() {

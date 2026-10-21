@@ -1962,8 +1962,8 @@ impl CompiledWriterFinalAggregate {
         // Group indices are temporary; their real allocator releases them after
         // emit, independently of the returned target array's late lifetime.
         let tracker = bound_tracker(self.tracker.as_ref(), "CompiledWriterFinalAggregate")?;
-        let allocator = crate::exec::expr::agg::AggregateAllocator::new(tracker);
-        let mut indices = crate::exec::expr::agg::AggregateVec::new_in(allocator);
+        let allocator = crate::exec::hash_table::allocation::AggregateAllocator::new(tracker);
+        let mut indices = crate::exec::hash_table::allocation::AggregateVec::new_in(allocator);
         indices
             .try_reserve_exact(count)
             .map_err(|_| KernelFailure::ResourceExhausted)?;
@@ -2349,10 +2349,6 @@ mod opaque_memory_host_tests;
 #[cfg(test)]
 #[path = "compiled_writer_statistics/prepared_source_tests.rs"]
 mod prepared_source_tests;
-
-#[path = "compiled_writer_statistics/prepared_grouped.rs"]
-mod prepared_grouped;
-pub(crate) use prepared_grouped::create_prepared_grouped_in;
 
 #[cfg(test)]
 #[path = "compiled_writer_statistics/prepared_final_tests.rs"]

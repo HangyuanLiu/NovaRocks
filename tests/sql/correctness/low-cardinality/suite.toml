@@ -18,7 +18,29 @@
 explicit_only = false
 
 [impact]
-paths = ["novarocks/execution/src/exec/dict_encode.rs", "novarocks/execution/src/exec/expr/dict_decode.rs", "novarocks/execution/src/exec/expr/dict_peel.rs"]
+paths = [
+    "novarocks/execution/src/exec/dict_encode.rs",
+    "novarocks/execution/src/exec/chunk/hydrate.rs",
+    "novarocks/execution/src/exec/chunk/typed_array_normalization.rs",
+    "novarocks/execution/src/exec/chunk/required_dictionary_nulls.rs",
+    "novarocks/functions/src/array_projection/required_dictionary_nulls.rs",
+    "novarocks/functions/src/selected_copy.rs",
+    "novarocks/functions/src/kernel_input.rs",
+    "novarocks/execution/src/exec/expr/compiled_program.rs",
+    "novarocks/execution/src/exec/expr/compiled_program/**",
+    "novarocks/execution/src/exec/operators/compiled_expression.rs",
+    "novarocks/local-compiler/src/expressions.rs",
+    "novarocks/functions/src/array_projection.rs",
+    "novarocks/functions/src/array_projection/**",
+    "novarocks/execution/src/exec/pipeline/input_construction.rs",
+    "novarocks/execution/src/exec/pipeline/input_construction/**",
+    "novarocks/functions/src/lib.rs",
+    "novarocks/functions/src/evaluation.rs",
+    "novarocks/functions/src/selected_copy/guarded_nested.rs",
+    "novarocks/functions/src/arrow_result_custody.rs",
+    "novarocks/functions/src/array_backing_geometry.rs",
+    "novarocks/functions/src/source_custody_resources.rs",
+]
 
 [reuse]
 scope = "suite"

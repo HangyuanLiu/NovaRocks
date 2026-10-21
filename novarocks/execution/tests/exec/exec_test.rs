@@ -37,11 +37,6 @@ fn test_chunk_module() {
 }
 
 #[test]
-fn test_expr_module() {
-    assert_type_accessible::<novarocks_execution::exec::expr::ExprArena>();
-}
-
-#[test]
 fn test_local_program_type() {
     assert_type_accessible::<novarocks_local_program::LocalProgram>();
 }

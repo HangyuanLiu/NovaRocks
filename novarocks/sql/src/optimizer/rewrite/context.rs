@@ -69,6 +69,7 @@ pub(crate) struct RewriteContext<'a> {
     disabled_rules: HashSet<String>,
     session_settings: SessionOptimizerSettings,
     decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    root_allow_throw_exception: bool,
     policy: RewritePolicy,
     trace: RewriteTrace,
     extension: Option<Arc<dyn Any + Send + Sync>>,
@@ -100,6 +101,7 @@ impl<'a> RewriteContext<'a> {
             disabled_rules: session_settings.disabled_rules.iter().cloned().collect(),
             session_settings,
             decimal_overflow_policy,
+            root_allow_throw_exception: false,
             policy: RewritePolicy::default(),
             trace: RewriteTrace::default(),
             extension: None,
@@ -191,6 +193,13 @@ impl<'a> RewriteContext<'a> {
 
     pub(crate) fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
         self.decimal_overflow_policy
+    }
+
+    pub(crate) fn set_root_allow_throw_exception(&mut self, value: bool) {
+        self.root_allow_throw_exception = value;
+    }
+    pub(crate) fn root_allow_throw_exception(&self) -> bool {
+        self.root_allow_throw_exception
     }
 
     pub(crate) fn trace(&self) -> &RewriteTrace {

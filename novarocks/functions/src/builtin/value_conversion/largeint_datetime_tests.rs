@@ -19,7 +19,8 @@
 use super::*;
 use arrow_schema::TimeUnit;
 use novarocks_type_contract::{
-    CompileControlError, ValueConstructionFailure, ValueTypeStorageHold, ValueTypeStorageLifetime,
+    CompileControlError, CompilePhase, ValueConstructionFailure, ValueTypeStorageHold,
+    ValueTypeStorageLifetime,
 };
 use std::sync::{
     Arc,
@@ -99,17 +100,6 @@ fn largeint_datetime_intermediate_is_only_exact_nullable_i64_and_existing_frozen
         conversion_intermediate_type(&bytes, &timestamp).unwrap(),
         None,
         "same physical domain is not nominal numeric authority"
-    );
-    assert!(
-        crate::PreparedCastRecipe::try_new(
-            crate::CastOperation::Carrier,
-            &bytes,
-            &timestamp,
-            novarocks_type_contract::DecimalOverflowPolicy::ReportError,
-            true,
-            crate::binding_test_control()
-        )
-        .is_err()
     );
     assert_eq!(
         conversion_intermediate_type(&FunctionValueType::new(DataType::Int64, true), &timestamp)
@@ -198,5 +188,70 @@ fn largeint_datetime_intermediate_every_actual_constructor_refusal_is_preserved_
             );
             assert_eq!(calls, at + 1);
         }
+    }
+}
+
+#[test]
+fn physical_fixed16_calendar_cast_keeps_numeric_grammar_and_nominal_rejections() {
+    let bytes = FunctionValueType::new(DataType::FixedSizeBinary(16), true);
+    let timestamp = target(true);
+    // Approved P05 restores the pre-migration physical-byte calendar body.
+    // It is direct Physical -> Physical; it does not author LARGEINT identity
+    // or install a direct nominal LARGEINT -> Timestamp conversion overload.
+    let recipe = crate::PreparedCastRecipe::try_new(
+        crate::CastOperation::Carrier,
+        &bytes,
+        &timestamp,
+        novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+        true,
+        crate::binding_test_control(),
+    )
+    .unwrap();
+    let values = crate::largeint::array_from_i128(&[Some(20200101), Some(99999999), None]).unwrap();
+    let control = crate::CompileKernelControl::new(
+        crate::binding_test_control(),
+        CompilePhase::FunctionSpecialization,
+    );
+    // Calendar literal 20200101 means 2020-01-01 00:00:00 UTC, exactly
+    // 1_577_836_800 seconds after the Unix epoch. Invalid calendar dates
+    // and source NULL retain the original successful-NULL behavior.
+    for (row, expected) in [
+        crate::CastRowResult::Timestamp(1_577_836_800_000_000),
+        crate::CastRowResult::Null,
+        crate::CastRowResult::Null,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            recipe
+                .evaluate_row(
+                    crate::EvaluatedArgument::Column(&values),
+                    row,
+                    row,
+                    &control
+                )
+                .unwrap(),
+            expected
+        );
+    }
+    let uuid = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        true,
+        ValueLogicalType::Uuid,
+    )
+    .unwrap();
+    for nominal in [source(true), uuid] {
+        assert_eq!(
+            crate::PreparedCastRecipe::try_new(
+                crate::CastOperation::Carrier,
+                &nominal,
+                &timestamp,
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+                true,
+                crate::binding_test_control(),
+            ),
+            Err(crate::CastPrepareError::Unsupported)
+        );
     }
 }

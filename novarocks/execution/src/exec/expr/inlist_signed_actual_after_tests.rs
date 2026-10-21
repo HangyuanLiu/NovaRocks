@@ -18,10 +18,10 @@
 //! Signed IN source/ordered lifecycle probes. UNRUN until serialized root tests.
 //! Formal host MEM grants and the Utf8 Variant environment remain separate gates.
 use super::compiled_program::CompiledExpressionInstance;
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_single_field_and_core_residuals;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_inlist_source;
+use super::sql_test_source::sql_source_with_single_field_and_core_residuals;
 use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_local_program::{
@@ -260,43 +260,12 @@ fn inlist_signed_actual_all_widths_value_truthonly_null_sparse_sliced_empty() {
         }
     }
 }
-fn original_negate_after_match_error() -> String {
-    use crate::exec::chunk::{Chunk, ChunkSchema};
-    use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
-    use novarocks_types::SlotId;
-    let data = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)])),
-        vec![Arc::new(Int64Array::from(vec![i64::MIN, 7, 0]))],
-    )
-    .unwrap();
-    let schema =
-        ChunkSchema::try_ref_from_schema_and_slot_ids(data.schema().as_ref(), &[SlotId::new(17)])
-            .unwrap();
-    let chunk = Chunk::new_with_chunk_schema(data, schema);
-    let mut arena = ExprArena::default();
-    let input = arena.push_typed(ExprNode::SlotId(SlotId::new(17)), DataType::Int64);
-    let zero = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(0)), DataType::Int64);
-    let negative = arena.push_typed(
-        ExprNode::Sub(
-            zero,
-            input,
-            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-        ),
-        DataType::Int64,
-    );
-    let root = arena.push_typed(
-        ExprNode::In {
-            child: input,
-            values: vec![input, negative],
-            is_not_in: false,
-        },
-        DataType::Boolean,
-    );
-    arena.eval(root, &chunk).unwrap_err().detail().to_owned()
-}
+// The additive inverse of i64::MIN is outside the signed 64-bit carrier.
+// This exact native subtraction diagnostic is the public row-error contract.
+const NEGATE_MIN_ERROR: &str =
+    "Arithmetic overflow: Overflow happened on: 0 - -9223372036854775808";
 #[test]
 fn inlist_signed_actual_match_never_masks_later_data_error_and_sparse_isolates_it() {
-    let full = original_negate_after_match_error();
     for sql in [
         "SELECT k IN (k,-k) FROM t0",
         "SELECT k NOT IN (k,-k) FROM t0",
@@ -314,7 +283,11 @@ fn inlist_signed_actual_match_never_masks_later_data_error_and_sparse_isolates_i
         assert_eq!(values(&out), vec![None, Some(!negated), Some(!negated)]);
         assert_eq!(out.errors().len(), 1);
         assert_eq!(out.errors()[0].selected_ordinal(), 0);
-        assert_eq!(out.errors()[0].message(), full);
+        assert_eq!(out.errors()[0].message(), NEGATE_MIN_ERROR);
+        assert_eq!(
+            out.errors()[0].reason(),
+            novarocks_functions::DataFailureReason::NumericOutOfRange
+        );
         let rows = [1, 2];
         let selection = Selection::try_sparse(3, &rows).unwrap();
         let mut frame =
@@ -470,5 +443,143 @@ fn inlist_signed_actual_original_control_codec_roundtrip_and_invalid_ordered_use
             }
         }
         assert_eq!(seen, 1);
+    }
+}
+
+#[test]
+fn inlist_signed_actual_match_or_null_candidate_keeps_required_case_child_error_and_control() {
+    // A prior match, NULL candidate, or runtime NULL source cannot suppress
+    // the later required CASE expression. All are actual single-column SQL.
+    for (source, prefix) in [
+        ("k", "k"),
+        ("k", "CAST(NULL AS BIGINT)"),
+        (
+            "(CASE WHEN k < 0 THEN CAST(NULL AS BIGINT) ELSE k END)",
+            "k",
+        ),
+    ] {
+        for operator in ["IN", "NOT IN"] {
+            let negated = operator == "NOT IN";
+            let sql = format!(
+                "SELECT {source} {operator} ({prefix},CASE WHEN k < 0 THEN -k ELSE k END) FROM t0"
+            );
+            let (program, site) = compiled(&sql, DataType::Int64);
+            let snapshot = program
+                .checked()
+                .channels()
+                .expressions()
+                .resolved_calls()
+                .snapshot();
+            let flow = &snapshot.flows()[&site.arena()];
+            let membership = &flow.uses()[&snapshot.bindings()[&site]];
+            assert_eq!(membership.control, ControlShape::Membership { negated });
+            assert_eq!(membership.arguments.len(), 3);
+            let case_use = &flow.uses()[&membership.arguments[2]];
+            assert_eq!(
+                case_use.control,
+                ControlShape::Case {
+                    simple: false,
+                    arms: 1,
+                    has_else: true
+                }
+            );
+            assert_eq!(
+                case_use.context.demand,
+                novarocks_type_contract::EvaluationDemand::Value
+            );
+            assert_eq!(
+                flow.domains()[&case_use.context.domain].guard.unwrap().kind,
+                novarocks_type_contract::GuardKind::MembershipAfterSource { ordinal: 1 }
+            );
+            let definition = snapshot.roots().arenas()[&site.arena()]
+                .node(membership.definition)
+                .unwrap();
+            let StaticExprKind::PreparedInList {
+                values: definitions,
+                ..
+            } = definition.kind()
+            else {
+                panic!("actual ordered membership")
+            };
+            assert_eq!(definitions.len(), 2);
+            for (ordinal, definition) in definitions.iter().enumerate() {
+                assert_eq!(
+                    flow.uses()[&membership.arguments[ordinal + 1]].definition,
+                    *definition
+                );
+            }
+            let data = batch(
+                &program,
+                site,
+                Arc::new(Int64Array::from(vec![
+                    Some(i64::MIN),
+                    Some(7),
+                    Some(0),
+                    None,
+                ])),
+            );
+            let expected = [None, Some(!negated), Some(!negated), None];
+            for rows in [vec![0, 1, 2, 3], vec![0, 2], vec![1, 2, 3], vec![]] {
+                let selection = Selection::try_sparse(4, &rows).unwrap();
+                let mut frame =
+                    CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
+                let output = frame.evaluate(&data, selection, &Control).unwrap();
+                assert_eq!(output.selection(), selection);
+                assert_eq!(
+                    values(&output),
+                    rows.iter().map(|row| expected[*row]).collect::<Vec<_>>()
+                );
+                let failed_ordinal = rows.iter().position(|row| *row == 0);
+                assert_eq!(output.errors().len(), usize::from(failed_ordinal.is_some()));
+                if let Some(ordinal) = failed_ordinal {
+                    assert_eq!(output.errors()[0].selected_ordinal(), ordinal);
+                    assert_eq!(
+                        output.errors()[0].reason(),
+                        novarocks_functions::DataFailureReason::NumericOutOfRange
+                    );
+                    assert_eq!(output.errors()[0].message(), NEGATE_MIN_ERROR);
+                }
+            }
+            // The same actual CASE succeeds for -7 and its selected THEN path
+            // remains observable. Refuse every recorded runtime callback and
+            // preserve the original cause, exact prefix and failed latch.
+            let success = batch(
+                &program,
+                site,
+                Arc::new(Int64Array::from(vec![Some(-7), Some(0), Some(9), None])),
+            );
+            let record = Callback::new(usize::MAX, KernelFailure::Cancelled);
+            let mut frame =
+                CompiledExpressionInstance::try_new(program.clone(), site, &Control).unwrap();
+            let output = frame
+                .evaluate(&success, Selection::all(4), &record)
+                .unwrap();
+            assert!(output.errors().is_empty());
+            let trace = record.trace.lock().unwrap().clone();
+            assert!(!trace.is_empty());
+            for stop in 1..=trace.len() {
+                for cause in causes() {
+                    let mut frame =
+                        CompiledExpressionInstance::try_new(program.clone(), site, &Control)
+                            .unwrap();
+                    let refused = Callback::new(stop, cause.clone());
+                    assert_eq!(
+                        frame
+                            .evaluate(&success, Selection::all(4), &refused)
+                            .unwrap_err(),
+                        cause
+                    );
+                    assert_eq!(*refused.trace.lock().unwrap(), trace[..stop]);
+                    let after = Callback::new(usize::MAX, KernelFailure::Cancelled);
+                    assert_eq!(
+                        frame
+                            .evaluate(&success, Selection::all(4), &after)
+                            .unwrap_err(),
+                        KernelFailure::InstanceFailed
+                    );
+                    assert!(after.trace.lock().unwrap().is_empty());
+                }
+            }
+        }
     }
 }

@@ -20,8 +20,8 @@
 //! it does not claim native whole-case or provider execution acceptance.
 use super::compiled_program::CompiledFilterConjunctionInstance;
 use super::numeric_unary_ordered_sql_source_tests::installed_builtin_owner_catalogue;
-use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source_with_single_field_and_core_residuals;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_inlist_source;
+use super::sql_test_source::sql_source_with_single_field_and_core_residuals;
 use arrow::{
     array::{ArrayRef, BooleanArray, Int32Array},
     datatypes::{DataType, Field},

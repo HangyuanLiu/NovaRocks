@@ -1485,3 +1485,254 @@ mod percentile_raw_private_frame_tests;
 
 #[path = "scalar_invocation_frame_tests.rs"]
 mod scalar_invocation_frame_tests;
+
+#[test]
+fn constant_entry_reuses_actual_prepared_if_coalesce_and_declines_rand() {
+    use super::constant_node::{
+        ConstantNode, ConstantNodeOutcome, DeclineReason, evaluate_constant_node,
+    };
+    let program = program(Shape::Random);
+    let calls = program
+        .expressions()
+        .checked()
+        .channels()
+        .expressions()
+        .resolved_calls()
+        .calls();
+    for (identity, cases) in [
+        (
+            "builtin.scalar/if/v1",
+            vec![
+                (Some(true), Some(17.0), Some(42.0), 17.0),
+                (Some(false), Some(17.0), Some(42.0), 42.0),
+                (None, Some(17.0), Some(42.0), 42.0),
+            ],
+        ),
+        (
+            "builtin.scalar/coalesce/v1",
+            vec![
+                (None, None, Some(42.0), 42.0),
+                (None, Some(17.0), Some(42.0), 17.0),
+            ],
+        ),
+    ] {
+        let prepared = calls
+            .values()
+            .find(|call| call.call_contract().function_id().as_str() == identity)
+            .unwrap()
+            .specialization()
+            .prepared();
+        let selected = prepared.call_contract().selected();
+        let FunctionResultType::Scalar(result) = &selected.result_type else {
+            panic!("scalar control");
+        };
+        for (flag, left, right, expected) in cases {
+            let mut children = vec![];
+            for (ordinal, ty) in selected.argument_types.iter().enumerate() {
+                let novarocks_functions::FunctionArgumentType::Value(ty) = ty else {
+                    panic!("value control");
+                };
+                let array: arrow::array::ArrayRef = if ty.data_type() == &DataType::Boolean {
+                    Arc::new(BooleanArray::from(vec![flag]))
+                } else {
+                    let first = if identity == "builtin.scalar/if/v1" {
+                        ordinal == 1
+                    } else {
+                        ordinal == 0
+                    };
+                    Arc::new(Float64Array::from(vec![if first { left } else { right }]))
+                };
+                children.push(
+                    ConstantValue::from_scalar_array(
+                        Arc::new(ty.try_to_field("source").unwrap()),
+                        ty.clone(),
+                        array.to_data(),
+                        options().constants,
+                        CompilePhase::FunctionSpecialization,
+                        &Control,
+                    )
+                    .unwrap(),
+                );
+            }
+            let output = evaluate_constant_node(
+                ConstantNode::Call(prepared),
+                &children,
+                result,
+                &Control,
+                CompilePhase::FunctionSpecialization,
+            )
+            .unwrap();
+            let ConstantNodeOutcome::Value(output) = output else {
+                panic!("control must produce its selected value");
+            };
+            assert_eq!(
+                output
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(0),
+                expected
+            );
+        }
+    }
+    let rand = calls
+        .values()
+        .find(|call| call.call_contract().function_id().as_str() == "builtin.scalar/rand/v1")
+        .unwrap()
+        .specialization()
+        .prepared();
+    let FunctionResultType::Scalar(result) = &rand.call_contract().selected().result_type else {
+        panic!("scalar rand");
+    };
+    assert!(matches!(
+        evaluate_constant_node(
+            ConstantNode::Call(rand),
+            &[],
+            result,
+            &Control,
+            CompilePhase::FunctionSpecialization
+        )
+        .unwrap(),
+        ConstantNodeOutcome::Declined(DeclineReason::EffectfulCall)
+    ));
+}
+
+#[test]
+fn constant_entry_strict_null_skips_creation_and_opaque_requirement_declines_before_creation() {
+    use super::constant_node::{
+        ConstantNode, ConstantNodeOutcome, DeclineReason, evaluate_constant_node,
+    };
+    use novarocks_functions::{
+        PreparedPureKernel, PreparedScalarKernel, ScalarCallContract, ScalarKernelInstance,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Debug)]
+    struct Counted {
+        actual: Arc<dyn PreparedScalarKernel>,
+        creates: Arc<AtomicUsize>,
+        opaque: bool,
+    }
+    impl PreparedScalarKernel for Counted {
+        fn contract(&self) -> &Arc<ScalarCallContract> {
+            self.actual.contract()
+        }
+        fn instance_retained_upper_bound(&self) -> usize {
+            self.actual.instance_retained_upper_bound()
+        }
+        fn instance_inline_allocation_bytes(&self) -> usize {
+            if self.opaque { 1 } else { 0 }
+        }
+        fn create_instance(&self) -> Result<Box<dyn ScalarKernelInstance>, KernelFailure> {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            self.actual.create_instance()
+        }
+    }
+    let program = program(Shape::Decimal);
+    let actual = program
+        .expressions()
+        .checked()
+        .channels()
+        .expressions()
+        .resolved_calls()
+        .calls()
+        .values()
+        .find(|call| call.call_contract().function_id().as_str() == "builtin.scalar/round/v1")
+        .unwrap()
+        .specialization()
+        .prepared();
+    let PreparedPureKernel::Scalar(actual) = actual else {
+        panic!("actual scalar ROUND owner")
+    };
+    assert_eq!(actual.instance_inline_allocation_bytes(), 0);
+    assert_eq!(
+        actual.contract().effects().null_behavior,
+        novarocks_type_contract::FunctionNullBehavior::Strict
+    );
+    let FunctionResultType::Scalar(result) = &actual.contract().selected().result_type else {
+        panic!("scalar result")
+    };
+    let make_children = |blocked| {
+        actual
+            .contract()
+            .selected()
+            .argument_types
+            .iter()
+            .map(|ty| {
+                let novarocks_functions::FunctionArgumentType::Value(ty) = ty else {
+                    panic!("value argument")
+                };
+                let array: arrow::array::ArrayRef = match ty.data_type() {
+                    DataType::Decimal128(p, s) => Arc::new(
+                        Decimal128Array::from(vec![if blocked { None } else { Some(123) }])
+                            .with_precision_and_scale(*p, *s)
+                            .unwrap(),
+                    ),
+                    DataType::Int64 => Arc::new(Int64Array::from(vec![Some(-1)])),
+                    other => panic!("unexpected actual ROUND signature: {other:?}"),
+                };
+                ConstantValue::from_scalar_array(
+                    Arc::new(ty.try_to_field("source").unwrap()),
+                    ty.clone(),
+                    array.to_data(),
+                    options().constants,
+                    CompilePhase::FunctionSpecialization,
+                    &Control,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let creates = Arc::new(AtomicUsize::new(0));
+    let call = PreparedPureKernel::Scalar(Arc::new(Counted {
+        actual: actual.clone(),
+        creates: creates.clone(),
+        opaque: false,
+    }));
+    let outcome = evaluate_constant_node(
+        ConstantNode::Call(&call),
+        &make_children(true),
+        result,
+        &Control,
+        CompilePhase::FunctionSpecialization,
+    )
+    .unwrap();
+    let ConstantNodeOutcome::Value(array) = outcome else {
+        panic!("strict NULL is a successful SQL NULL")
+    };
+    assert!(array.is_null(0));
+    assert_eq!(creates.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        evaluate_constant_node(
+            ConstantNode::Call(&call),
+            &make_children(false),
+            result,
+            &Control,
+            CompilePhase::FunctionSpecialization
+        )
+        .unwrap(),
+        ConstantNodeOutcome::Value(_)
+    ));
+    assert_eq!(
+        creates.load(Ordering::SeqCst),
+        1,
+        "the sentinel observes actual admitted creation"
+    );
+    creates.store(0, Ordering::SeqCst);
+    let opaque = PreparedPureKernel::Scalar(Arc::new(Counted {
+        actual: actual.clone(),
+        creates: creates.clone(),
+        opaque: true,
+    }));
+    assert!(matches!(
+        evaluate_constant_node(
+            ConstantNode::Call(&opaque),
+            &make_children(false),
+            result,
+            &Control,
+            CompilePhase::FunctionSpecialization
+        )
+        .unwrap(),
+        ConstantNodeOutcome::Declined(DeclineReason::OpaqueHostRequired)
+    ));
+    assert_eq!(creates.load(Ordering::SeqCst), 0);
+}

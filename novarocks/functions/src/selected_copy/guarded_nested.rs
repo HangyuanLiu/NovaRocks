@@ -30,6 +30,7 @@ pub fn supports_guarded_result(ty: &DataType) -> bool {
         DataType::Struct(fields) => fields
             .iter()
             .all(|field| supports_guarded_result(field.data_type())),
+        DataType::FixedSizeBinary(width) => *width > 0,
         DataType::Boolean
         | DataType::Utf8
         | DataType::Binary

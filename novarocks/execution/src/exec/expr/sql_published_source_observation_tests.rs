@@ -129,7 +129,7 @@ fn query(
         SqlPlanningEnvironment::Distributed,
         builtin_sql_function_catalog().snapshot(),
         noop_constant_evaluator(),
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         control.clone(),
         PipelineDopDomain {
             min: 1,
@@ -167,7 +167,7 @@ fn dml(sql: &str, control: SqlCompileControl) -> Result<SqlAuthoredPhysicalPlan,
         &functions,
         noop_constant_evaluator(),
         None,
-        super::pure_differential::constant_policy(),
+        super::test_support::constant_policy(),
         control.clone(),
     ))?
     .into_pending()?;

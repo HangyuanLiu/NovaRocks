@@ -28,11 +28,8 @@ mod aggregate;
 pub use aggregate::topn_boundary::AggregateTopNBoundaryError;
 pub(crate) use aggregate::topn_boundary::OwnedTopNBoundaryError;
 pub(crate) mod analytic_shared;
-mod analytic_sink;
-mod analytic_source;
 mod assert_num_rows_processor;
 mod blocked_duration;
-mod change_event_expand_processor;
 pub(crate) mod compiled_aggregate;
 mod compiled_aggregate_topn;
 pub(crate) mod compiled_change_events;
@@ -52,13 +49,11 @@ mod compiled_writer_failure;
 pub(crate) mod compiled_writer_statistics;
 mod data_stream_sink;
 mod exchange_source;
-mod filter_processor;
 pub(crate) mod hashjoin;
 mod limit_processor;
 mod local_exchange_sink;
 mod local_exchange_source;
 pub(crate) mod local_exchanger;
-mod multi_cast_data_stream_sink;
 mod nljoin;
 mod noop_sink;
 mod project_processor;
@@ -70,46 +65,25 @@ pub(crate) mod runtime_filter;
 pub mod scan;
 mod setop;
 mod sort;
-mod split_data_stream_sink;
 mod statistics_materializer;
 pub(crate) mod table_finish;
 mod table_finish_failure;
-mod table_function_processor;
 pub(crate) mod table_writer;
 mod unpivot_processor;
 mod values_source;
 
-pub use aggregate::AggregateProcessorFactory;
-pub use aggregate::streaming_sink::AggregateStreamingSinkFactory;
-pub use aggregate::streaming_source::AggregateStreamingSourceFactory;
-pub(crate) use aggregate::streaming_state::AggregateStreamingState;
-pub use analytic_sink::AnalyticSinkFactory;
-pub use analytic_source::AnalyticSourceFactory;
 pub use assert_num_rows_processor::AssertNumRowsProcessorFactory;
-#[cfg(test)]
-pub(crate) use change_event_expand_processor::ChangeEventExpandFixtureFactory;
 pub(crate) use data_stream_sink::CompiledPartitionKeys;
 pub use data_stream_sink::DataStreamSinkFactory;
 #[cfg(test)]
 pub(crate) use data_stream_sink::partition_chunk_by_hash_arrays;
 pub use exchange_source::ExchangeSourceFactory;
-#[cfg(test)]
-pub(crate) use filter_processor::FilterEncodingPolicy;
-#[cfg(test)]
-pub(crate) use filter_processor::FilterFixtureFactory;
-pub use hashjoin::{
-    BroadcastJoinProbeProcessorFactory, HashJoinBuildSinkFactory,
-    PartitionedJoinProbeProcessorFactory,
-};
 pub use limit_processor::LimitProcessorFactory;
 pub use local_exchange_sink::LocalExchangeSinkFactory;
 pub use local_exchange_source::LocalExchangeSourceFactory;
-pub use multi_cast_data_stream_sink::MultiCastDataStreamSinkFactory;
+pub use nljoin::NlJoinBuildSinkFactory;
 pub(crate) use nljoin::NlJoinSharedState;
-pub use nljoin::{NlJoinBuildSinkFactory, NlJoinProbeProcessorFactory};
 pub use noop_sink::NoopSinkFactory;
-#[cfg(test)]
-pub(crate) use project_processor::ProjectFixtureFactory;
 #[cfg(test)]
 pub(crate) use project_processor::materialize_project_output;
 #[cfg(test)]
@@ -128,15 +102,9 @@ pub use setop::{
     ExceptSinkFactory, ExceptSourceFactory, IntersectSinkFactory, IntersectSourceFactory,
     UnionAllSinkFactory, UnionAllSourceFactory,
 };
-pub use sort::SortProcessorFactory;
-pub use split_data_stream_sink::SplitDataStreamSinkFactory;
 pub(crate) use statistics_materializer::StatisticsMaterializerFactory;
 pub use table_finish::TableFinishOperatorFactory;
-#[cfg(test)]
-pub(crate) use table_function_processor::TableFunctionFixtureFactory;
 pub use table_writer::TableWriterOperatorFactory;
-#[cfg(test)]
-pub(crate) use unpivot_processor::UnpivotFixtureFactory;
 pub use values_source::ValuesSourceFactory;
 
 #[cfg(novarocks_dev_controls)]

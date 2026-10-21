@@ -199,6 +199,33 @@ impl std::error::Error for KernelFailure {
     }
 }
 
+/// Runs a kernel during the caller's explicit compilation phase.
+/// Compilation never acquires a waiting capability through this adapter.
+pub struct CompileKernelControl<'a> {
+    control: &'a dyn novarocks_type_contract::PureCompileControl,
+    phase: novarocks_type_contract::CompilePhase,
+}
+impl<'a> CompileKernelControl<'a> {
+    pub fn new(
+        control: &'a dyn novarocks_type_contract::PureCompileControl,
+        phase: novarocks_type_contract::CompilePhase,
+    ) -> Self {
+        Self { control, phase }
+    }
+}
+impl KernelEvaluationControl for CompileKernelControl<'_> {
+    fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+        self.control
+            .checkpoint(self.phase, units)
+            .map_err(compile_failure)
+    }
+    fn wait(&self, _: Duration) -> Result<(), KernelFailure> {
+        Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+            "compile-time kernel evaluation cannot wait",
+        )))
+    }
+}
+
 pub const MAX_UNOBSERVED_KERNEL_WORK: u32 = 256;
 
 /// Runtime-owned interruption/work control, independent of statement semantic

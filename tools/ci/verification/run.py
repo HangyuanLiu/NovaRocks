@@ -741,7 +741,7 @@ def _rust_expression(scope, bindings, metadata, listing=None):
 
 
 def _regular_expression(scopes, bindings, metadata, inputs, listing):
-    """Compress only complete native binaries, then verify exact native membership."""
+    """Compress native binary sets, then verify exact native membership."""
     wanted = {str(unit) for scope in scopes for unit in scope.units}
     groups = {}
     for scope in scopes:
@@ -757,7 +757,11 @@ def _regular_expression(scopes, bindings, metadata, inputs, listing):
         if set(names) == all_regular:
             expressions.append(prefix+')')
         else:
-            expressions.append(prefix+' & ('+' | '.join('test(={})'.format(name) for name in sorted(names))+'))')
+            included = prefix+' & ('+' | '.join('test(={})'.format(name) for name in sorted(names))+'))'
+            excluded = prefix+' & not ('+' | '.join('test(={})'.format(name) for name in sorted(all_regular-set(names)))+'))'
+            # Resume may omit only a few already satisfied tests from a large
+            # binary. Keep the shorter exact set expression below argv limits.
+            expressions.append(min((included, excluded), key=lambda value: len(value.encode())))
     expression = ' | '.join(expressions)
     verified = native_list(inputs, expression)
     actual = {'rust-test:'+binary+'::'+name

@@ -42,7 +42,6 @@ use novarocks_types::SlotId;
 use crate::exec::chunk::{
     Chunk, ChunkSchemaRef, RootArrayStorageLimits, borrowed_root_chunk_schema_storage,
 };
-use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
 use crate::exec::node::unpivot::{UnpivotConstant, UnpivotValueMapping};
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
@@ -71,35 +70,31 @@ const WORK_QUANTUM: usize = RootProfileV1::CELLS_PER_TURN;
 
 enum StatisticsLiteralSource {
     #[cfg(test)]
-    Fixture(Arc<ExprArena>),
+    Fixture(Arc<[novarocks_local_program::StaticLiteral]>),
     Compiled(Arc<novarocks_local_program::LocalProgram>),
 }
 impl StatisticsLiteralSource {
-    fn blob(&self, expr: crate::exec::expr::ExprId) -> Option<&str> {
+    fn blob(&self, expr: novarocks_local_program::ProgramExprId) -> Option<&str> {
         match self {
             #[cfg(test)]
-            Self::Fixture(arena) => match arena.node(expr) {
-                Some(ExprNode::Literal(LiteralValue::Utf8(value))) => Some(value),
-                Some(ExprNode::Constant(value)) => Self::constant_blob(value),
+            Self::Fixture(literals) => match literals.get(expr.index())? {
+                novarocks_local_program::StaticLiteral::Utf8(value) => Some(value),
                 _ => None,
             },
-            Self::Compiled(program) => {
-                let id = novarocks_local_program::ProgramExprId::new(expr.0);
-                match program.graph().expressions().node(id)?.kind() {
-                    novarocks_local_program::StaticExprKind::Literal(
-                        novarocks_local_program::StaticLiteral::Utf8(value),
-                    ) => Some(value),
-                    novarocks_local_program::StaticExprKind::Constant(value) => {
-                        Self::constant_blob(value)
-                    }
-                    _ => None,
+            Self::Compiled(program) => match program.graph().expressions().node(expr)?.kind() {
+                novarocks_local_program::StaticExprKind::Literal(
+                    novarocks_local_program::StaticLiteral::Utf8(value),
+                ) => Some(value),
+                novarocks_local_program::StaticExprKind::Constant(value) => {
+                    Self::constant_blob(value)
                 }
-            }
+                _ => None,
+            },
         }
     }
     fn constant_blob(value: &novarocks_functions::ConstantValue) -> Option<&str> {
-        // Both plan carriers retain the selected constant and its complete
-        // declaration. Read its actual ordinal through the one constant reader.
+        // The frozen constant retains its complete declaration. Read its
+        // actual ordinal through the one constant reader.
         if value.pool().array().data_type() != &DataType::Utf8
             || value.value_type().nullable()
             || !matches!(value.value_type().value_type().kind(), ValueKind::String)
@@ -110,8 +105,8 @@ impl StatisticsLiteralSource {
     }
 }
 /// Compiled execution retains its original immutable declaration until the
-/// actual BE preparation owner creates a runtime schema. The explicit legacy
-/// adapter keeps its already-authored source schema only during expansion.
+/// actual BE preparation owner creates a runtime schema. Unit fixtures retain
+/// their independently authored schema without an expression evaluator.
 enum StatisticsSchemaPreparation {
     #[cfg(test)]
     Fixture {
@@ -160,7 +155,7 @@ impl StatisticsMaterializerFactory {
     )]
     #[cfg(test)]
     fn from_test_facts(
-        arena: Arc<ExprArena>,
+        literals: Arc<[novarocks_local_program::StaticLiteral]>,
         value_slot: SlotId,
         literal_slots: Vec<SlotId>,
         mappings: Vec<UnpivotValueMapping>,
@@ -171,7 +166,7 @@ impl StatisticsMaterializerFactory {
         max_bytes: usize,
     ) -> ExecutionResult<Self> {
         Self::try_new_from_source(
-            StatisticsLiteralSource::Fixture(arena),
+            StatisticsLiteralSource::Fixture(literals),
             value_slot,
             literal_slots,
             mappings,
@@ -1356,8 +1351,8 @@ mod tests {
         max_rows: usize,
         mappings: usize,
     ) -> ExecutionResult<StatisticsMaterializerFactory> {
-        let mut arena = ExprArena::default();
-        let expr_id = arena.push_typed(ExprNode::Literal(LiteralValue::Utf8(blob)), DataType::Utf8);
+        let expr_id = novarocks_local_program::ProgramExprId::new(0);
+        let literals = Arc::from([novarocks_local_program::StaticLiteral::Utf8(blob.into())]);
         let mapping = UnpivotValueMapping {
             input_value_slot_id: SlotId::new(99),
             constants: vec![
@@ -1370,7 +1365,7 @@ mod tests {
             ],
         };
         StatisticsMaterializerFactory::from_test_facts(
-            Arc::new(arena),
+            literals,
             SlotId::new(3),
             vec![SlotId::new(1), SlotId::new(2), SlotId::new(4)],
             vec![mapping; mappings],

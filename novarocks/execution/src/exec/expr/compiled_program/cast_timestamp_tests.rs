@@ -84,8 +84,109 @@ fn timestamp_batch(
     .unwrap()
 }
 
+// Independent coefficient tables for [-1001,-1,0,1,1001,MIN,MAX,NULL].
+// Unit ratios are decimal powers; narrowing truncates toward zero. The table
+// explicitly records range overflow as a successful NULL except for the
+// separately frozen microsecond-to-nanosecond row-error contract.
+fn expected_unit_rows(source: TimeUnit, target: TimeUnit) -> [Option<i64>; 8] {
+    use TimeUnit::*;
+    match (source, target) {
+        (Second, Second)
+        | (Millisecond, Millisecond)
+        | (Microsecond, Microsecond)
+        | (Nanosecond, Nanosecond) => [
+            Some(-1001),
+            Some(-1),
+            Some(0),
+            Some(1),
+            Some(1001),
+            Some(i64::MIN),
+            Some(i64::MAX),
+            None,
+        ],
+        (Second, Millisecond) | (Millisecond, Microsecond) | (Microsecond, Nanosecond) => [
+            Some(-1_001_000),
+            Some(-1_000),
+            Some(0),
+            Some(1_000),
+            Some(1_001_000),
+            None,
+            None,
+            None,
+        ],
+        (Second, Microsecond) | (Millisecond, Nanosecond) => [
+            Some(-1_001_000_000),
+            Some(-1_000_000),
+            Some(0),
+            Some(1_000_000),
+            Some(1_001_000_000),
+            None,
+            None,
+            None,
+        ],
+        (Second, Nanosecond) => [
+            Some(-1_001_000_000_000),
+            Some(-1_000_000_000),
+            Some(0),
+            Some(1_000_000_000),
+            Some(1_001_000_000_000),
+            None,
+            None,
+            None,
+        ],
+        (Millisecond, Second) | (Microsecond, Millisecond) | (Nanosecond, Microsecond) => [
+            Some(-1),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(1),
+            Some(-9_223_372_036_854_775),
+            Some(9_223_372_036_854_775),
+            None,
+        ],
+        (Microsecond, Second) | (Nanosecond, Millisecond) => [
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(-9_223_372_036_854),
+            Some(9_223_372_036_854),
+            None,
+        ],
+        (Nanosecond, Second) => [
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(-9_223_372_036),
+            Some(9_223_372_036),
+            None,
+        ],
+    }
+}
+fn expected_constant_unit(source: TimeUnit, target: TimeUnit) -> i64 {
+    use TimeUnit::*;
+    match (source, target) {
+        (Second, Second)
+        | (Millisecond, Millisecond)
+        | (Microsecond, Microsecond)
+        | (Nanosecond, Nanosecond) => 71,
+        (Second, Millisecond) | (Millisecond, Microsecond) | (Microsecond, Nanosecond) => 71_000,
+        (Second, Microsecond) | (Millisecond, Nanosecond) => 71_000_000,
+        (Second, Nanosecond) => 71_000_000_000,
+        (Millisecond, Second)
+        | (Microsecond, Millisecond)
+        | (Nanosecond, Microsecond)
+        | (Microsecond, Second)
+        | (Nanosecond, Millisecond)
+        | (Nanosecond, Second) => 0,
+    }
+}
+
 #[test]
-fn timestamp_cast_compiler_controller_all_sixteen_pairs_keep_exact_units_and_legacy_row_oracles() {
+fn timestamp_cast_compiler_controller_all_sixteen_pairs_keep_independent_coefficient_tables() {
     let values = [
         Some(8),
         Some(-1001),
@@ -123,46 +224,26 @@ fn timestamp_cast_compiler_controller_all_sixteen_pairs_keep_exact_units_and_leg
                         output.values().data_type(),
                         &DataType::Timestamp(target, None)
                     );
-                    let actual = timestamp_values(&output);
-                    let mut expected_errors = Vec::new();
-                    for (ordinal, &row) in rows.iter().enumerate() {
-                        // The pre-existing full-carrier author is independent of
-                        // this recipe/controller and its selected row mapping.
-                        let array = timestamp_array(source, vec![values[row]]);
-                        match crate::exec::expr::cast::cast_with_special_rules(
-                            &array,
-                            &DataType::Timestamp(target, None),
-                        ) {
-                            Ok(legacy) => {
-                                let expected = SelectedValues::try_new(
-                                    Selection::all(1),
-                                    &DataType::Timestamp(target, None),
-                                    legacy,
-                                    Box::default(),
-                                )
-                                .unwrap();
-                                assert_eq!(
-                                    actual[ordinal],
-                                    timestamp_values(&expected)[0],
-                                    "{source:?}->{target:?}"
-                                );
-                            }
-                            Err(error) => {
-                                assert_eq!(
-                                    (source, target),
-                                    (TimeUnit::Microsecond, TimeUnit::Nanosecond)
-                                );
-                                assert!(
-                                    error
-                                        .to_string()
-                                        .contains("microsecond->nanosecond overflow")
-                                );
-                                assert_eq!(actual[ordinal], None);
-                                expected_errors.push(ordinal);
-                            }
-                        }
-                    }
+                    assert_eq!(
+                        timestamp_values(&output),
+                        expected_unit_rows(source, target)
+                    );
+                    let expected_errors =
+                        if (source, target) == (TimeUnit::Microsecond, TimeUnit::Nanosecond) {
+                            vec![5, 6]
+                        } else {
+                            Vec::new()
+                        };
                     assert_eq!(errors(&output), expected_errors);
+                    for error in output.errors() {
+                        let raw = values[rows[error.selected_ordinal()]].unwrap();
+                        assert_eq!(
+                            error.message(),
+                            format!(
+                                "CAST failed: from Timestamp(Microsecond, None) to Timestamp(Nanosecond, None): CAST timestamp microsecond->nanosecond overflow: value {raw} cannot be represented as nanoseconds in i64"
+                            )
+                        );
+                    }
                     let empty = evaluator
                         .evaluate(
                             &batch,
@@ -237,20 +318,7 @@ fn timestamp_cast_literal_broadcast_and_batch_splits_keep_original_coefficients(
                 false,
             );
             let batch = timestamp_batch(&program, &[Some(i64::MAX); 5], &[Some(true); 5]);
-            let array = timestamp_array(source, vec![Some(71)]);
-            let legacy = crate::exec::expr::cast::cast_with_special_rules(
-                &array,
-                &DataType::Timestamp(target, None),
-            )
-            .unwrap();
-            let expected = SelectedValues::try_new(
-                Selection::all(1),
-                &DataType::Timestamp(target, None),
-                legacy,
-                Box::default(),
-            )
-            .unwrap();
-            let coefficient = timestamp_values(&expected)[0];
+            let coefficient = Some(expected_constant_unit(source, target));
             let rows = [0, 2, 4];
             let mut evaluator = instance(&program);
             for _ in 0..2 {

@@ -82,8 +82,6 @@ pub(crate) use compiled::{CompiledOrderedFilterContext, build_compiled_pipeline_
 use crate::runtime_filter as execution;
 
 use super::operator_factory::OperatorFactory;
-use crate::exec::expr::agg::SealedExecutionFunctionSet;
-use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::node::assert::AssertNumRowsMode;
 use crate::exec::operators::hashjoin::broadcast_join_shared::BroadcastJoinSharedState;
 use crate::exec::operators::local_exchanger::{LocalExchangePartitionSpec, LocalExchanger};
@@ -96,6 +94,7 @@ use crate::exec::operators::{
 use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
 use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::distribution::{Distribution, StreamDesc};
+use crate::runtime::function_set::SealedExecutionFunctionSet;
 
 /// Pipeline-level plan metadata produced by pipeline graph construction.
 pub struct PipelinePlan {
@@ -118,8 +117,6 @@ struct PipelineBuildResult {
 }
 
 struct PipelineBuildContext {
-    arena: Arc<ExprArena>,
-    function_set: Arc<SealedExecutionFunctionSet>,
     dep_manager: DependencyManager,
     runtime_filter_execution: PipelineRuntimeFilterExecution,
     exchange_bindings: ExchangeBindings,
@@ -163,7 +160,6 @@ fn gather_to_one(
         partition_count,
         dop as usize,
         LocalExchangePartitionSpec::Single,
-        Arc::clone(&ctx.arena),
         ctx.local_exchange_buffer_mem_limit_per_driver,
         ctx.local_exchange_max_buffered_rows,
     );
@@ -209,12 +205,8 @@ fn hand_off_to_dop(
 ) -> PipelineBuildResult {
     let consumer_count = target_dop.max(1) as usize;
     let producer_count = build.pipeline.dop.max(1) as usize;
-    let exchanger = LocalExchanger::new_handoff(
-        producer_count,
-        consumer_count,
-        ctx.operator_buffer_chunks,
-        Arc::clone(&ctx.arena),
-    );
+    let exchanger =
+        LocalExchanger::new_handoff(producer_count, consumer_count, ctx.operator_buffer_chunks);
     build
         .pipeline
         .factories
@@ -278,7 +270,6 @@ fn shuffle_input_slots_with_distribution(
         partition_count,
         producer_count,
         LocalExchangePartitionSpec::InputSlotIds(partition_slot_ids),
-        Arc::clone(&ctx.arena),
         ctx.local_exchange_buffer_mem_limit_per_driver,
         ctx.local_exchange_max_buffered_rows,
     );

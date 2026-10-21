@@ -1034,8 +1034,8 @@ fn compiled_writer_bindings_cover_exactly_the_programs_writer_family() {
         .unwrap();
 }
 
-/// Collect-on-write statistics on the compiled path, differentially against
-/// the plan-tree writer and finish bound from the process function set: the
+/// Collect-on-write statistics on the compiled path, checked against the
+/// independent DataSketches wire oracle and SPI relation metadata: the
 /// Iceberg Theta sketch of `c1` (BIGINT NOT NULL) and `c2` (nullable STRING),
 /// frozen and prepared exactly as the frontend does.
 pub(crate) fn compiled_statistics_finish_fixture()
@@ -1080,7 +1080,6 @@ mod statistics {
     use novarocks_connector_iceberg_functions::{
         ICEBERG_THETA_AGGREGATE_NAME, ICEBERG_THETA_IMPLEMENTATION_IDENTITY,
         ICEBERG_THETA_STATE_FORMAT_IDENTITY, IcebergFunctionBundle, estimate_compact_theta,
-        iceberg_theta_registration,
     };
     use novarocks_functions::{
         AggregateBindingSelection, AggregateKernelPhase, AggregatePreparationOptions,
@@ -1100,37 +1099,23 @@ mod statistics {
     use novarocks_spi::connector::write_stack::{
         ROOT_WRITE_RESULT_BLOB_TYPE_INDEX, ROOT_WRITE_RESULT_BODY_INDEX,
         ROOT_WRITE_RESULT_INPUT_FIELDS_INDEX, ROOT_WRITE_RESULT_PROPERTIES_INDEX,
-        ROOT_WRITE_RESULT_TARGET_INDEX, RootWriteResultSchema, WriterAuxiliaryChannel,
-        WriterMultiplexSchema, WriterRowKind, root_write_result_column_id,
+        ROOT_WRITE_RESULT_TARGET_INDEX, WriterAuxiliaryChannel, WriterMultiplexSchema,
+        WriterRowKind, root_write_result_column_id,
     };
     use novarocks_type_contract::{
         CallProofScope, DecimalOverflowPolicy, EvaluationDemand, ExpressionEffects,
         SemanticParameters,
     };
-    use novarocks_types::SlotId;
 
     use crate::exec::chunk::ChunkSchema;
-    use crate::exec::expr::agg::{
-        ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
-        contribute_builtin_aggregate_implementations,
-    };
-    use crate::exec::expr::{ExprArena, ExprNode};
-    use crate::exec::node::table_write_aggregate::{
-        WriterFinalAggregateCall, WriterFinalAggregatePlan,
-        WriterGroupedUnpivotMapping as V1Mapping, WriterGroupedUnpivotPlan,
-        WriterPartialAggregateCall,
-    };
-    use crate::exec::node::table_write_relation::{
-        RootWriteResultRelationSchema, WRITE_RELATION_TARGET_SLOT, WriterMultiplexRelationSchema,
-    };
-    use crate::exec::node::table_writer::TableWriterInputProjection;
+    use crate::exec::node::table_write_relation::WriterMultiplexRelationSchema;
     use crate::exec::operators::compiled_writer::{
         compiled_table_finish_factory, compiled_table_writer_factory,
     };
     use crate::exec::operators::compiled_writer_statistics::CompiledFinishStatistics;
-    use crate::exec::operators::table_finish::FinishStatisticsFactory;
     use crate::exec::operators::{TableFinishOperatorFactory, TableWriterOperatorFactory};
     use crate::exec::pipeline::operator::Operator;
+    use crate::runtime::function_set::{ExecutionFunctionSetBuilder, SealedExecutionFunctionSet};
     use crate::runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 
     const THETA_OVERLOADS: [&str; 17] = [
@@ -1155,10 +1140,8 @@ mod statistics {
     const BLOB_TYPE: &str = "apache-datasketches-theta-v1";
     const LIST_POOL: ConstantPoolId = ConstantPoolId::new(1);
     const MAP_POOL: ConstantPoolId = ConstantPoolId::new(2);
-    /// The plan-tree writer's auxiliary channels and final channels.
-    const V1_CHANNELS: [u32; 2] = [10_000, 10_001];
-    const V1_GROUPING: u32 = 20_000;
-    const V1_FINALS: [u32; 2] = [20_001, 20_002];
+    // Independent SPI relation schema; slot numbering grants no call authority.
+    const EXPECTED_CHANNELS: [u32; 2] = [10_000, 10_001];
 
     /// The compiled catalogue: the installed Iceberg bundle sealed with its
     /// own pure owner.
@@ -1191,15 +1174,14 @@ mod statistics {
             .unwrap()
     }
 
-    /// The plan-tree function set: builtin implementations and the Iceberg
-    /// bundle, as the process composes it.
+    /// P14's metadata-only function-set owner seals the original definitions.
+    /// No erased aggregate implementation or legacy adapter is registered.
     fn theta_function_set() -> Arc<SealedExecutionFunctionSet> {
         let mut builder = ExecutionFunctionSetBuilder::new();
         novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
             .unwrap();
-        contribute_builtin_aggregate_implementations(&mut builder).unwrap();
-        builder
-            .register_typed_aggregate(iceberg_theta_registration().unwrap())
+        IcebergFunctionBundle
+            .contribute(builder.catalog_builder_mut())
             .unwrap();
         Arc::new(builder.seal().unwrap())
     }
@@ -2070,23 +2052,10 @@ mod statistics {
         .unwrap()
     }
 
-    fn input_slots(program: &LocalProgram) -> Vec<SlotId> {
-        let root = program.graph().root();
-        let ProgramNodeKind::TableWriter { input, .. } =
-            program.graph().nodes()[root.index()].kind()
-        else {
-            panic!("a writer program")
-        };
-        program.graph().nodes()[input.index()]
-            .output_layout()
-            .slots()
-            .to_vec()
-    }
-
-    fn v1_multiplex() -> WriterMultiplexRelationSchema {
+    fn expected_multiplex() -> WriterMultiplexRelationSchema {
         WriterMultiplexRelationSchema::try_new(
             WriterMultiplexSchema::try_new(
-                V1_CHANNELS
+                EXPECTED_CHANNELS
                     .iter()
                     .enumerate()
                     .map(|(channel, slot)| {
@@ -2104,353 +2073,22 @@ mod statistics {
         .unwrap()
     }
 
-    // The comparison fixture authors complete plain writer bindings once;
-    // runtime preparation must consume a pure declaration, not an eager schema.
-    fn v1_layout(
-        schema: &crate::exec::chunk::ChunkSchema,
-    ) -> novarocks_local_program::StaticLayout {
-        novarocks_local_program::StaticLayout::try_new_typed_for_compile(
-            schema.arrow_schema_ref(),
-            Arc::from(schema.slot_ids()),
-            schema
-                .slots()
-                .iter()
-                .map(|slot| (slot.typed_binding().clone(), slot.unique_id()))
-                .collect(),
-            schema.storage_lifetime(),
-            |_| Ok(()),
-            &FixtureControl,
-        )
-        .unwrap()
-    }
-
-    fn v1_writer_template()
-    -> crate::exec::node::table_write_relation::WriterMultiplexRelationTemplate {
-        let relation = v1_multiplex();
-        crate::exec::node::table_write_relation::WriterMultiplexRelationTemplate::try_new_reserved(
-            &v1_layout(relation.chunk_schema()),
-        )
-        .unwrap()
-    }
-
-    fn v1_root_template() -> crate::exec::node::table_write_relation::RootWriteResultRelationTemplate
-    {
-        let relation =
-            RootWriteResultRelationSchema::try_new(RootWriteResultSchema::new()).unwrap();
-        crate::exec::node::table_write_relation::RootWriteResultRelationTemplate::try_new_reserved(
-            &v1_layout(relation.chunk_schema()),
-        )
-        .unwrap()
-    }
-
-    #[derive(Debug)]
-    enum V1PreparationFailure {
-        Creator(crate::exec::pipeline::operator::ConstructionFailure),
-        Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
-        Source(novarocks_local_program::PreparedWriterCallsError),
-    }
-    impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
-        for V1PreparationFailure
-    {
-        fn from(
-            value: novarocks_type_contract::owned_resources::layout::LayoutResourceError,
-        ) -> Self {
-            Self::Resource(value)
-        }
-    }
-    impl From<novarocks_local_program::PreparedWriterCallsError> for V1PreparationFailure {
-        fn from(value: novarocks_local_program::PreparedWriterCallsError) -> Self {
-            Self::Source(value)
-        }
-    }
-    /// The plan-tree writer over the same input port, bound by name from the
-    /// the original frozen compiler source.
-    fn v1_writer(
-        compiled: &Compiled,
-        function_set: &Arc<SealedExecutionFunctionSet>,
-        recorded: &Arc<Mutex<Recorded>>,
-    ) -> TableWriterOperatorFactory {
-        let mut arena = ExprArena::default();
-        let slots = input_slots(&compiled.writer);
-        let ProgramNodeKind::TableWriter {
-            projection: original,
-            ..
-        } = compiled.writer.graph().nodes()[compiled.writer.graph().root().index()].kind()
-        else {
-            panic!("actual compiled writer");
-        };
-        let exprs = slots
-            .iter()
-            .enumerate()
-            .map(|(ordinal, slot)| {
-                arena.push_value_typed(
-                    ExprNode::SlotId(*slot),
-                    novarocks_type_contract::FunctionValueType::try_from_typed_binding(
-                        original.layout.value_binding_at(ordinal).unwrap().clone(),
-                    )
-                    .unwrap(),
-                )
-            })
-            .collect();
-        let ProgramNodeKind::TableWriter {
-            projection: original_projection,
-            partial_aggregates,
-            ..
-        } = compiled.writer.graph().nodes()[compiled.writer.graph().root().index()].kind()
-        else {
-            panic!("actual compiled writer");
-        };
-        // Provider input promises are independent of the source's observed
-        // values and of the partial processor's frozen input occurrence.
-        let expected = Arc::new(Schema::new(
-            draft()
-                .input()
-                .fields_iter()
-                .map(|binding| binding.field().clone())
-                .collect::<Vec<_>>(),
-        ));
-        let projection =
-            TableWriterInputProjection::try_new(arena, exprs, Arc::clone(&expected)).unwrap();
-        // Borrow the compiler's genuine frozen installed partial handles.
-        // Only the fixture's independent carrier slots differ.
-        let state = statistics_state(Arc::clone(function_set));
-        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("v1-writer-preparation");
-        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
-            tracker, state.error_state(),
-        ).unwrap();
-        let template = v1_writer_template();
-        let output_layout = v1_layout(v1_multiplex().chunk_schema());
-        let input_layout = novarocks_local_program::StaticLayout::try_new_typed_for_compile(
-            Arc::clone(original_projection.layout.schema()),
-            Arc::from(projection.chunk_schema().slot_ids()),
-            (0..original_projection.layout.slots().len())
-                .map(|ordinal| {
-                    (
-                        original_projection
-                            .layout
-                            .value_binding_at(ordinal)
-                            .unwrap()
-                            .clone(),
-                        original_projection
-                            .layout
-                            .slot_metadata_at(ordinal)
-                            .unwrap()
-                            .1,
-                    )
-                })
-                .collect(),
-            original_projection.layout.storage_lifetime(),
-            |_| Ok(()),
-            &FixtureControl,
-        )
-        .unwrap();
-        let owner = factory
-            .begin_compiled_layout_construction(&output_layout)
-            .unwrap();
-        owner
-            .request(
-                std::alloc::Layout::array::<novarocks_local_program::PreparedWriterAggregateCall>(
-                    partial_aggregates.len(),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let mut prepared = Vec::new();
-        prepared
-            .try_reserve_exact(partial_aggregates.len())
-            .unwrap();
-        for (channel, call) in partial_aggregates.iter().enumerate() {
-            let site = novarocks_local_program::ProgramCallSite::WriterPartial {
-                node: compiled.writer.graph().root(),
-                call: u32::try_from(channel).unwrap(),
-            };
-            let Some(novarocks_local_program::ProgramStateTemplate::Aggregate { kernel, .. }) =
-                compiled.writer.state_template(site)
-            else {
-                panic!("actual frozen partial handle");
-            };
-            let actual = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
-                input_layout.value_binding_at(channel).unwrap().clone(),
-            )
-            .unwrap();
-            let expected_argument = kernel.contract().logical_argument_types().next().unwrap();
-            assert!(
-                actual
-                    .fits_value_type_observed(expected_argument, || Ok::<
-                        (),
-                        novarocks_type_contract::ValueTypeError,
-                    >(()))
-                    .unwrap(),
-                "independent V1 occurrence must fit its real selected origin: actual={actual:?}, selected={expected_argument:?}"
-            );
-            let output = SlotId::new(V1_CHANNELS[channel]);
-            let position = output_layout
-                .slots()
-                .iter()
-                .position(|slot| *slot == output)
-                .unwrap();
-            prepared.push(novarocks_local_program::PreparedWriterAggregateCall::new(
-                kernel.clone(),
-                projection.chunk_schema().slot_ids()[channel],
-                output,
-                position,
-                owner.storage_lifetime(),
-            ));
-        }
-        if prepared.capacity() != prepared.len() {
-            owner.request(std::alloc::Layout::array::<novarocks_local_program::PreparedWriterAggregateCall>(prepared.len()).unwrap()).unwrap();
-        }
-        let prepared = novarocks_local_program::PreparedWriterAggregateCalls::try_new_observed::<V1PreparationFailure>(
-            prepared.into_boxed_slice(), novarocks_functions::AggregateKernelPhase::Partial, owner.storage_lifetime(),
-            |layout| owner.request(layout).map_err(V1PreparationFailure::Creator),
-            || owner.observe(0, &[], novarocks_functions::array_projection::ArrayNormalizationStep::InspectConstructionWork { units: 1 }).map_err(V1PreparationFailure::Creator),
-        ).unwrap();
-        TableWriterOperatorFactory::try_new_local(
-            7,
-            compiled.target,
-            expected,
-            projection,
-            template,
-            Some(prepared),
-            input_layout,
-            output_layout,
-            state.error_state(),
-            &binding(recorded),
-        )
-        .unwrap()
-    }
-
-    /// The plan-tree finish of the same target, with its decoder-owned
-    /// blob-type literal.
-    fn v1_finish(
-        compiled: &Compiled,
-        function_set: &Arc<SealedExecutionFunctionSet>,
-    ) -> TableFinishOperatorFactory {
-        let mut arena = ExprArena::default();
-        let target = compiled.target;
-        let blob = arena.push_value_typed(
-            ExprNode::Literal(crate::exec::expr::LiteralValue::Utf8(BLOB_TYPE.to_string())),
-            inputs()[1].with_nullable(false).unwrap(),
-        );
-        let ProgramNodeKind::TableFinish {
-            final_aggregates: original,
-            writer_multiplex_layout,
-            ..
-        } = compiled.finish.graph().nodes()[compiled.finish.graph().root().index()].kind()
-        else {
-            panic!("actual compiled finish");
-        };
-        let state = statistics_state(function_set.clone());
-        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(), crate::runtime::mem_tracker::MemTracker::new_root("v1-final-preparation"), state.error_state(),
-        ).unwrap();
-        let owner = factory
-            .begin_compiled_layout_construction(writer_multiplex_layout)
-            .unwrap();
-        owner
-            .request(
-                std::alloc::Layout::array::<novarocks_local_program::PreparedWriterAggregateCall>(
-                    original.calls.len(),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let mut prepared = Vec::new();
-        prepared.try_reserve_exact(original.calls.len()).unwrap();
-        for (ordinal, _) in original.calls.iter().enumerate() {
-            let site = novarocks_local_program::ProgramCallSite::WriterFinal {
-                node: compiled.finish.graph().root(),
-                call: u32::try_from(ordinal).unwrap(),
-            };
-            let Some(novarocks_local_program::ProgramStateTemplate::Aggregate { kernel, .. }) =
-                compiled.finish.state_template(site)
-            else {
-                panic!("actual frozen final handle");
-            };
-            prepared.push(novarocks_local_program::PreparedWriterAggregateCall::new(
-                kernel.clone(),
-                SlotId::new(V1_CHANNELS[ordinal]),
-                SlotId::new(V1_FINALS[ordinal]),
-                ordinal + 1,
-                owner.storage_lifetime(),
-            ));
-        }
-        if prepared.capacity() != prepared.len() {
-            owner.request(std::alloc::Layout::array::<novarocks_local_program::PreparedWriterAggregateCall>(prepared.len()).unwrap()).unwrap();
-        }
-        let prepared = novarocks_local_program::PreparedWriterAggregateCalls::try_new_observed::<V1PreparationFailure>(prepared.into_boxed_slice(), novarocks_functions::AggregateKernelPhase::Final, owner.storage_lifetime(), |layout| owner.request(layout).map_err(V1PreparationFailure::Creator), || owner.observe(0, &[], novarocks_functions::array_projection::ArrayNormalizationStep::InspectConstructionWork { units: 1 }).map_err(V1PreparationFailure::Creator)).unwrap();
-        let calls = original
-            .calls
-            .iter()
-            .enumerate()
-            .map(|(channel, call)| WriterFinalAggregateCall {
-                frozen: call.frozen.clone(),
-                function_name: call.function_name.clone(),
-                resolved: call.resolved.clone(),
-                intermediate_input_slot_id: SlotId::new(V1_CHANNELS[channel]),
-                final_output_slot_id: SlotId::new(V1_FINALS[channel]),
-            })
-            .collect::<Vec<_>>();
-        let root = |index| SlotId::new(root_write_result_column_id(index));
-        let plan = WriterFinalAggregatePlan {
-            prepared: Some(prepared),
-            calls,
-            unpivot: Some(WriterGroupedUnpivotPlan {
-                grouping_input_slot_id: WRITE_RELATION_TARGET_SLOT,
-                grouping_output_slot_id: SlotId::new(V1_GROUPING),
-                passthrough_output_slot_id: root(ROOT_WRITE_RESULT_TARGET_INDEX),
-                value_output_slot_id: root(ROOT_WRITE_RESULT_BODY_INDEX),
-                literal_output_slot_ids: vec![
-                    root(ROOT_WRITE_RESULT_INPUT_FIELDS_INDEX),
-                    root(ROOT_WRITE_RESULT_BLOB_TYPE_INDEX),
-                    root(ROOT_WRITE_RESULT_PROPERTIES_INDEX),
-                ],
-                mappings: (0..2)
-                    .map(|channel| V1Mapping {
-                        grouping_key: target.get(),
-                        input_value_slot_id: SlotId::new(V1_FINALS[channel]),
-                        constants: vec![
-                            crate::exec::node::unpivot::UnpivotConstant::Int32List(vec![
-                                channel as i32 + 1,
-                            ]),
-                            crate::exec::node::unpivot::UnpivotConstant::Scalar {
-                                expr_id: blob,
-                                nullable: false,
-                            },
-                            crate::exec::node::unpivot::UnpivotConstant::Utf8Map(Vec::new()),
-                        ],
-                    })
-                    .collect(),
-                max_output_rows: 1024,
-                max_output_bytes: 1 << 20,
-            }),
-        };
-        TableFinishOperatorFactory::new_local(
-            8,
-            vec![target],
-            v1_writer_template(),
-            v1_root_template(),
-            plan,
-            &TableFinishRuntimeBinding::new(Arc::new(AcceptCarriers)),
-            Arc::new(arena),
-        )
-        .unwrap()
-    }
-
-    fn poll(operator: &mut Box<dyn Operator>, state: &RuntimeState) -> Result<Vec<Chunk>, String> {
+    fn poll_typed(
+        operator: &mut Box<dyn Operator>,
+        state: &RuntimeState,
+    ) -> crate::runtime::fragment::ExecutionResult<Vec<Chunk>> {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut calls = TestDriver::new(operator.as_mut(), state);
         let mut output = Vec::new();
         loop {
             if let Some(error) = state.error() {
-                return Err(error.to_string());
+                return Err(error);
             }
             assert!(
                 Instant::now() <= deadline,
                 "timed out waiting for operator output"
             );
-            let step = calls.drive().map_err(|e| e.to_string())?;
+            let step = calls.drive()?;
             if let Some(chunk) = step.output {
                 output.push(chunk);
             }
@@ -2461,6 +2099,10 @@ mod statistics {
                 NextStep::NeedInput => panic!("fixture signaled EOS before finalization"),
             }
         }
+    }
+
+    fn poll(operator: &mut Box<dyn Operator>, state: &RuntimeState) -> Result<Vec<Chunk>, String> {
+        poll_typed(operator, state).map_err(|error| error.to_string())
     }
 
     /// One actual writer admission and accepted continuation, preserving raw
@@ -2582,19 +2224,17 @@ mod statistics {
 
     /// Run one finish over every writer relation chunk, each re-slotted to
     /// the finish's own receiver port as the exchange delivers it.
-    fn run_finish(
+    fn run_finish_typed(
         factory: &TableFinishOperatorFactory,
         relation: &crate::exec::chunk::ChunkSchemaRef,
         chunks: &[Chunk],
         state: &RuntimeState,
-    ) -> Result<Vec<Chunk>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<Vec<Chunk>> {
         let mut operator = factory.create(1, 0);
         install_statistics_construction(operator.as_mut(), state);
-        operator.prepare().map_err(|e| e.to_string())?;
-        operator
-            .bind_runtime_state(state)
-            .map_err(|e| e.to_string())?;
-        operator.activate(state).map_err(|e| e.to_string())?;
+        operator.prepare()?;
+        operator.bind_runtime_state(state)?;
+        operator.activate(state)?;
         for chunk in chunks {
             let delivered = Chunk::try_new_with_chunk_schema(
                 chunk.record_batch().clone(),
@@ -2605,11 +2245,19 @@ mod statistics {
                 operator.as_mut(),
                 state,
                 delivered,
-            )
-            .map_err(|error| error.to_string())?;
+            )?;
         }
-        operator.finish_for_test(state).map_err(|e| e.to_string())?;
-        poll(&mut operator, state)
+        operator.finish_for_test(state)?;
+        poll_typed(&mut operator, state)
+    }
+
+    fn run_finish(
+        factory: &TableFinishOperatorFactory,
+        relation: &crate::exec::chunk::ChunkSchemaRef,
+        chunks: &[Chunk],
+        state: &RuntimeState,
+    ) -> Result<Vec<Chunk>, String> {
+        run_finish_typed(factory, relation, chunks, state).map_err(|error| error.to_string())
     }
 
     fn compiled_relation(program: &LocalProgram) -> crate::exec::chunk::ChunkSchemaRef {
@@ -2624,6 +2272,241 @@ mod statistics {
         ChunkSchema::from_compiled_layout(writer_multiplex_layout).unwrap()
     }
 
+    // Retain the old comparison fixture's explicit correspondence check on
+    // the real projection and genuine installed partial handles, without
+    // constructing an independent legacy occurrence or executable adapter.
+    fn assert_partial_correspondence(compiled: &Compiled) {
+        let root = compiled.writer.graph().root();
+        let ProgramNodeKind::TableWriter {
+            projection,
+            partial_aggregates,
+            ..
+        } = compiled.writer.graph().nodes()[root.index()].kind()
+        else {
+            panic!("actual compiled writer");
+        };
+        for (channel, _) in partial_aggregates.iter().enumerate() {
+            let site = novarocks_local_program::ProgramCallSite::WriterPartial {
+                node: root,
+                call: u32::try_from(channel).unwrap(),
+            };
+            let Some(novarocks_local_program::ProgramStateTemplate::Aggregate { kernel, .. }) =
+                compiled.writer.state_template(site)
+            else {
+                panic!("actual frozen partial handle");
+            };
+            let actual = FunctionValueType::try_from_typed_binding(
+                projection.layout.value_binding_at(channel).unwrap().clone(),
+            )
+            .unwrap();
+            let selected = kernel.contract().logical_argument_types().next().unwrap();
+            assert!(
+                actual
+                    .fits_value_type_observed(selected, || Ok::<
+                        (),
+                        novarocks_type_contract::ValueTypeError,
+                    >(()))
+                    .unwrap(),
+                "real compiled projection must fit its exact selected origin: actual={actual:?}, selected={selected:?}"
+            );
+        }
+    }
+
+    // Independent Apache DataSketches wire oracle. The declared fixture has
+    // BIGINT canonical bytes in little-endian order and raw UTF-8 strings.
+    // This calls neither the legacy adapter nor the installed NovaRocks kernel.
+    fn expected_theta(rows: &[(i64, Option<&str>)]) -> [Vec<u8>; 2] {
+        use datasketches::hash::value::raw_bytes;
+        use datasketches::theta::ThetaSketchBuilder;
+        let mut numbers = ThetaSketchBuilder::default().lg_k(12).build().unwrap();
+        let mut strings = ThetaSketchBuilder::default().lg_k(12).build().unwrap();
+        for (number, text) in rows {
+            numbers.update(raw_bytes::from_slice(&number.to_le_bytes()));
+            if let Some(text) = text {
+                strings.update(raw_bytes::from_slice(text.as_bytes()));
+            }
+        }
+        let compact = |sketch: datasketches::theta::ThetaSketch| {
+            let compact = sketch.compact(true);
+            if compact.is_empty() {
+                // Ordered compact-v3 empty preamble, no hash payload.
+                vec![1, 3, 3, 0, 0, 0x1e, 0, 0]
+            } else {
+                compact.serialize()
+            }
+        };
+        [compact(numbers), compact(strings)]
+    }
+
+    fn expected_writer_batches(target: u32, rows: &[(i64, Option<&str>)]) -> Vec<RecordBatch> {
+        let sketches = expected_theta(rows);
+        let relation = expected_multiplex();
+        let schema = relation.chunk_schema().arrow_schema_ref();
+        let batch =
+            |kind: WriterRowKind, count: Option<i64>, fragment: Option<&[u8]>, partial: bool| {
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int8Array::from(vec![kind.to_wire()])) as ArrayRef,
+                        Arc::new(Int32Array::from(vec![i32::try_from(target).unwrap()])),
+                        Arc::new(Int64Array::from(vec![count])),
+                        Arc::new(BinaryArray::from(vec![fragment])),
+                        Arc::new(BinaryArray::from(vec![
+                            partial.then_some(sketches[0].as_slice()),
+                        ])),
+                        Arc::new(BinaryArray::from(vec![
+                            partial.then_some(sketches[1].as_slice()),
+                        ])),
+                    ],
+                )
+                .unwrap()
+            };
+        // Two small compact bodies fit one packed partial row. It precedes
+        // the separate row-count and the provider's one fixed staged fragment.
+        vec![
+            batch(WriterRowKind::AggregatePartial, None, None, true),
+            batch(
+                WriterRowKind::RowCount,
+                Some(i64::try_from(rows.len()).unwrap()),
+                None,
+                false,
+            ),
+            batch(WriterRowKind::CommitFragment, None, Some(b"staged"), false),
+        ]
+    }
+
+    // Fixed SPI root rows: kind, target, count, fragment, one input field id,
+    // artifact body. These are expected data, not output read back as an oracle.
+    type ExpectedRootRow = (
+        i8,
+        Option<i32>,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Option<i32>,
+        Option<Vec<u8>>,
+    );
+    fn expected_root_batch(rows: &[ExpectedRootRow]) -> RecordBatch {
+        let schema = root_write_result_schema();
+        let DataType::List(item) = schema.field(4).data_type() else {
+            unreachable!()
+        };
+        let lists = ListArray::from_iter_primitive::<arrow::datatypes::Int32Type, _, _>(
+            rows.iter().map(|row| row.4.map(|id| vec![Some(id)])),
+        );
+        let lists = ListArray::new(
+            item.clone(),
+            lists.offsets().clone(),
+            lists.values().clone(),
+            lists.nulls().cloned(),
+        );
+        let DataType::Map(entries, sorted) = schema.field(7).data_type() else {
+            unreachable!()
+        };
+        let DataType::Struct(fields) = entries.data_type() else {
+            unreachable!()
+        };
+        let children = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef,
+                Arc::new(StringArray::from(Vec::<&str>::new())),
+            ],
+            None,
+        );
+        let maps = MapArray::try_new(
+            entries.clone(),
+            arrow::buffer::OffsetBuffer::new(arrow::buffer::ScalarBuffer::from(vec![
+                0_i32;
+                rows.len() + 1
+            ])),
+            children,
+            Some(arrow::buffer::NullBuffer::from(
+                rows.iter().map(|row| row.4.is_some()).collect::<Vec<_>>(),
+            )),
+            *sorted,
+        )
+        .unwrap();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int8Array::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(Int32Array::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+                )),
+                Arc::new(BinaryArray::from(
+                    rows.iter().map(|row| row.3.as_deref()).collect::<Vec<_>>(),
+                )),
+                Arc::new(lists),
+                Arc::new(StringArray::from(
+                    rows.iter()
+                        .map(|row| row.4.map(|_| BLOB_TYPE))
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(BinaryArray::from(
+                    rows.iter().map(|row| row.5.as_deref()).collect::<Vec<_>>(),
+                )),
+                Arc::new(maps),
+            ],
+        )
+        .unwrap()
+    }
+    fn expected_root_batches(
+        target: u32,
+        drivers: usize,
+        rows: &[(i64, Option<&str>)],
+    ) -> Vec<RecordBatch> {
+        use novarocks_spi::connector::write_stack::RootRowKind;
+        let target = i32::try_from(target).unwrap();
+        let sketches = expected_theta(rows);
+        vec![
+            expected_root_batch(&[(
+                RootRowKind::Summary.to_wire(),
+                None,
+                Some(i64::try_from(rows.len()).unwrap()),
+                None,
+                None,
+                None,
+            )]),
+            expected_root_batch(
+                &(0..drivers)
+                    .map(|_| {
+                        (
+                            RootRowKind::PreparedFragment.to_wire(),
+                            Some(target),
+                            None,
+                            Some(b"staged".to_vec()),
+                            None,
+                            None,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            expected_root_batch(&[
+                (
+                    RootRowKind::ArtifactDraft.to_wire(),
+                    Some(target),
+                    None,
+                    None,
+                    Some(1),
+                    Some(sketches[0].clone()),
+                ),
+                (
+                    RootRowKind::ArtifactDraft.to_wire(),
+                    Some(target),
+                    None,
+                    None,
+                    Some(2),
+                    Some(sketches[1].clone()),
+                ),
+            ]),
+        ]
+    }
+
     fn batches(chunks: &[Chunk]) -> Vec<RecordBatch> {
         chunks
             .iter()
@@ -2633,31 +2516,32 @@ mod statistics {
 
     /// Every column of `actual` equals `expected` and so do field names and
     /// carriers; the two relations differ only in their slot numbering.
-    fn assert_same_rows(actual: &[Chunk], expected: &[Chunk]) {
-        let (actual, expected) = (batches(actual), batches(expected));
+    fn assert_same_rows(actual: &[Chunk], expected: &[RecordBatch]) {
+        let actual = batches(actual);
         assert_eq!(actual.len(), expected.len(), "same batch count");
-        for (actual, expected) in actual.iter().zip(&expected) {
+        for (actual, expected) in actual.iter().zip(expected) {
             assert_eq!(actual.schema().fields(), expected.schema().fields());
             assert_eq!(actual.columns(), expected.columns());
         }
     }
 
-    struct Differential {
+    struct StatisticsRun {
         compiled_writer: Vec<Vec<Chunk>>,
-        v1_writer: Vec<Vec<Chunk>>,
-        compiled_root: Result<Vec<Chunk>, String>,
-        v1_root: Result<Vec<Chunk>, String>,
+        expected_writer: Vec<Vec<RecordBatch>>,
+        compiled_root: crate::runtime::fragment::ExecutionResult<Vec<Chunk>>,
+        expected_root: Vec<RecordBatch>,
     }
 
-    /// Run the same per-driver pages through the compiled and the plan-tree
-    /// writer and finish. `keep` selects which writer rows reach the finish.
-    fn differential(
+    /// Run actual compiled writer/finish; expectations use only fixture rows,
+    /// independent SDK sketches and SPI metadata. `keep` filters delivered rows.
+    fn statistics_run(
         target: u32,
         driver_rows: &[Vec<(i64, Option<&str>)>],
         keep: impl Fn(i8) -> bool,
-    ) -> Differential {
+    ) -> StatisticsRun {
         let all = driver_rows.iter().flatten().copied().collect::<Vec<_>>();
         let compiled = compiled(target, &all, driver_rows.len());
+        assert_partial_correspondence(&compiled);
         let function_set = theta_function_set();
         let state = statistics_state(Arc::clone(&function_set));
         let pages = driver_rows
@@ -2680,11 +2564,11 @@ mod statistics {
         )
         .unwrap();
         let compiled_writer = run_writer(&compiled_factory, &pages, &state);
-        let v1_writer = run_writer(
-            &v1_writer(&compiled, &function_set, &recorded),
-            &pages,
-            &state,
-        );
+        let expected_writer = driver_rows
+            .iter()
+            .map(|rows| expected_writer_batches(target, rows))
+            .collect();
+        let expected_root = expected_root_batches(target, driver_rows.len(), &all);
         let kept = |chunks: &[Vec<Chunk>]| {
             chunks
                 .iter()
@@ -2717,24 +2601,17 @@ mod statistics {
             &state.error_state(),
         )
         .unwrap();
-        let compiled_root = run_finish(
+        let compiled_root = run_finish_typed(
             &compiled_finish,
             &compiled_relation(&compiled.finish),
             &kept(&compiled_writer),
             &state,
         );
-        let v1_state = statistics_state(Arc::clone(&function_set));
-        let v1_root = run_finish(
-            &v1_finish(&compiled, &function_set),
-            v1_multiplex().chunk_schema(),
-            &kept(&v1_writer),
-            &v1_state,
-        );
-        Differential {
+        StatisticsRun {
             compiled_writer,
-            v1_writer,
+            expected_writer,
             compiled_root,
-            v1_root,
+            expected_root,
         }
     }
 
@@ -2791,9 +2668,8 @@ mod statistics {
         bodies
     }
 
-    /// The compiled writer and finish produce exactly the plan-tree writer's
-    /// multiplex rows and the plan-tree finish's Root rows, Theta bodies
-    /// byte for byte, over repeated values and a NULL string.
+    /// Compare every multiplex/Root field and compact Theta byte to an
+    /// independent SDK wire oracle over repeated values and a NULL string.
     #[test]
     fn compiled_statistics_match_the_plan_tree_writer_and_finish_byte_for_byte() {
         let rows = vec![
@@ -2803,10 +2679,10 @@ mod statistics {
             (3, Some("a")),
             (5, Some("c")),
         ];
-        let run = differential(0, &[rows], |_| true);
+        let run = statistics_run(0, &[rows], |_| true);
         assert_eq!(run.compiled_writer.len(), 1);
-        for (compiled, v1) in run.compiled_writer.iter().zip(&run.v1_writer) {
-            assert_same_rows(compiled, v1);
+        for (compiled, expected) in run.compiled_writer.iter().zip(&run.expected_writer) {
+            assert_same_rows(compiled, expected);
             let partials = compiled
                 .iter()
                 .map(|chunk| {
@@ -2826,8 +2702,7 @@ mod statistics {
             assert!(partials >= 1, "the driver packs its sketches");
         }
         let compiled_root = run.compiled_root.expect("the compiled finish publishes");
-        let v1_root = run.v1_root.expect("the plan-tree finish publishes");
-        assert_same_rows(&compiled_root, &v1_root);
+        assert_same_rows(&compiled_root, &run.expected_root);
         let bodies = bodies(&compiled_root);
         assert_eq!(bodies.len(), 2, "one artifact per mapping");
         assert_eq!((bodies[0].0, bodies[0].1.as_slice()), (0, [1].as_slice()));
@@ -2841,12 +2716,12 @@ mod statistics {
     /// so the finish covers every channel and publishes empty sketches.
     #[test]
     fn an_empty_writer_emits_its_initial_sketches() {
-        let run = differential(0, &[Vec::new()], |_| true);
-        for (compiled, v1) in run.compiled_writer.iter().zip(&run.v1_writer) {
-            assert_same_rows(compiled, v1);
+        let run = statistics_run(0, &[Vec::new()], |_| true);
+        for (compiled, expected) in run.compiled_writer.iter().zip(&run.expected_writer) {
+            assert_same_rows(compiled, expected);
         }
         let compiled_root = run.compiled_root.expect("the compiled finish publishes");
-        assert_same_rows(&compiled_root, &run.v1_root.expect("plan-tree finish"));
+        assert_same_rows(&compiled_root, &run.expected_root);
         let bodies = bodies(&compiled_root);
         assert_eq!(bodies.len(), 2);
         for (_, _, body) in bodies {
@@ -2855,27 +2730,31 @@ mod statistics {
     }
 
     /// A target whose aggregate partials never arrive fails coverage at
-    /// finalize, with the plan-tree finish's own error.
+    /// finalize, with the fixed required-coverage diagnostic.
     #[test]
     fn a_missing_partial_fails_coverage_like_the_plan_tree_finish() {
-        let run = differential(0, &[vec![(1, Some("a"))]], |kind| {
+        let run = statistics_run(0, &[vec![(1, Some("a"))]], |kind| {
             kind != WriterRowKind::AggregatePartial.to_wire()
         });
         let compiled = run.compiled_root.expect_err("coverage refuses");
-        let v1 = run.v1_root.expect_err("coverage refuses");
-        assert!(
-            compiled
-                .contains("table finish target 0 has no non-null aggregate partial for channel 0"),
-            "{compiled}"
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
+        assert_eq!(
+            compiled.detail(),
+            "table finish target 0 has no non-null aggregate partial for channel 0"
         );
-        assert_eq!(compiled, v1);
+        assert_eq!(
+            compiled.failure_fact(),
+            FailureFact::new(
+                FailureClass::Invariant,
+                crate::runtime::fragment::ExecutionReason::FinishCoverage.reason(),
+            )
+        );
     }
 
     /// Three drivers per writer and two write targets: every driver packs
-    /// its own sketches exactly as the plan-tree writer does, and the
-    /// compiled final aggregate merges strictly by target -- whatever order
-    /// the rows of both targets arrive in -- into exactly what each target's
-    /// plan-tree finish publishes, emitting the targets in ascending order.
+    /// its own independently checked sketches, and the compiled final aggregate
+    /// merges strictly by target in either arrival order into the SDK sketch
+    /// over that target's original inputs, emitting targets in ascending order.
     #[test]
     fn three_drivers_and_two_targets_merge_strictly_by_target() {
         let drivers = |offset: i64| {
@@ -2886,25 +2765,26 @@ mod statistics {
             ]
         };
         let runs = [
-            differential(0, &drivers(0), |_| true),
-            differential(1, &drivers(100), |_| true),
+            statistics_run(0, &drivers(0), |_| true),
+            statistics_run(1, &drivers(100), |_| true),
         ];
         let mut expected = BTreeMap::new();
         for (target, run) in runs.iter().enumerate() {
             assert_eq!(run.compiled_writer.len(), 3);
-            for (compiled, v1) in run.compiled_writer.iter().zip(&run.v1_writer) {
-                assert_same_rows(compiled, v1);
+            for (compiled, expected) in run.compiled_writer.iter().zip(&run.expected_writer) {
+                assert_same_rows(compiled, expected);
             }
             let root = run
                 .compiled_root
                 .as_ref()
                 .expect("the compiled finish publishes");
-            assert_same_rows(root, run.v1_root.as_ref().expect("plan-tree finish"));
-            let bodies = bodies(root)
-                .into_iter()
-                .map(|(_, _, body)| body)
-                .collect::<Vec<_>>();
-            expected.insert(target as i32, bodies);
+            assert_same_rows(root, &run.expected_root);
+            // Interleaved merge is compared to an independent whole-input SDK
+            // sketch, never to a preceding compiled finish's actual body.
+            expected.insert(
+                target as i32,
+                expected_theta(&drivers(target as i64 * 100).concat()).to_vec(),
+            );
         }
         // Both targets' aggregate partial rows, target 1's first, through
         // the compiled final aggregate of one finish program.
@@ -3021,7 +2901,7 @@ mod statistics {
 
     /// The Task's aggregate guard installed on a compiled writer and finish
     /// is consulted by the compiled statistics at each aggregate boundary,
-    /// exactly as on the plan-tree path.
+    /// while retaining the exact installed boundary failure.
     #[cfg(novarocks_dev_controls)]
     #[test]
     fn the_task_aggregate_guard_rejects_compiled_statistics_work() {

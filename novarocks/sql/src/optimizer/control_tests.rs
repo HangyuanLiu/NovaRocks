@@ -66,6 +66,7 @@ fn environment<'a>(
         None,
         crate::functions::test_function_catalog_snapshot(),
         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        false,
         control,
     )
 }

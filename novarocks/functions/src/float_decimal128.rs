@@ -16,7 +16,7 @@
 // under the License.
 
 //! Original actual Types Float64/Float32 -> Decimal128 value and array author.
-//! Preserve relaxed precision, signed-abs and i8-negation bugs; no cast policy is inferred here.
+//! Preserve relaxed precision with checked signed magnitudes; no cast policy is inferred here.
 use crate::decimal128_rescale::DecimalCastFailure;
 use arrow_array::{ArrayRef, Decimal128Array};
 use std::fmt;
@@ -56,9 +56,11 @@ impl Factors {
                 .ok_or(FactorFailure::Scale(scale))?;
             factor as f64
         } else {
-            // Original unchecked i8 negation remains a panic in checked builds.
-            let factor = crate::legacy_decimal::checked_pow10_i128(((-scale) as u32) as usize)
-                .ok_or(FactorFailure::Scale(scale))?;
+            // The full i8 scale domain includes MIN; its magnitude must not
+            // overflow before the existing bounded-factor refusal.
+            let factor =
+                crate::legacy_decimal::checked_pow10_i128(usize::from(scale.unsigned_abs()))
+                    .ok_or(FactorFailure::Scale(scale))?;
             1.0 / (factor as f64)
         };
         let effective_precision = if precision <= 18 { 18 } else { precision };
@@ -93,7 +95,7 @@ impl Factors {
             ExprValue::Null
         }
     }
-    /// Sole original per-value arithmetic, including the original MIN abs panic.
+    /// Per-value arithmetic checks the full signed coefficient range without overflow.
     pub fn value(&self, v: f64) -> Option<i128> {
         if !v.is_finite() {
             return None;
@@ -109,7 +111,7 @@ impl Factors {
             return None;
         }
         let unscaled = unscaled_f as i128;
-        if unscaled.abs() >= self.abs_limit {
+        if unscaled.unsigned_abs() >= self.abs_limit as u128 {
             return None;
         }
         Some(unscaled)

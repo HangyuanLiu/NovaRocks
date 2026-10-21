@@ -15,22 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Real original Cast -> typed zero/Sub -> Cast NULL, plus the sole prepared recipe.
-use crate::exec::chunk::{Chunk, ChunkSchema};
-use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
-use arrow::{
-    array::{Array, ArrayRef, Int64Array},
-    datatypes::{DataType, Schema},
-    record_batch::RecordBatch,
-};
+//! Public prepared Cast -> native typed-zero/Sub -> Cast stimulus, with
+//! independent narrow-boundary values and exact successful-NULL declarations.
+use arrow::array::{Array, ArrayRef, Int8Array, Int64Array};
+use arrow::datatypes::DataType;
 use novarocks_functions::{
-    EvaluatedArgument, KernelEvaluationControl, KernelFailure, PreparedNativeNegateRecipe,
-    Selection, native_negate_computed_result_type,
+    CastOperation, CastRowResult, EvaluatedArgument, KernelEvaluationControl, KernelFailure,
+    PreparedCastRecipe, PreparedNativeNegateRecipe, Selection, native_negate_computed_result_type,
 };
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionValueType, PureCompileControl,
 };
-use novarocks_types::SlotId;
 use std::{sync::Arc, time::Duration};
 struct Control;
 impl PureCompileControl for Control {
@@ -50,63 +45,27 @@ impl KernelEvaluationControl for Control {
 }
 #[test]
 fn numeric_unary_narrow_source_raw_cast_negate_widen_null_and_recipe_metadata() {
+    // These are explicit fixture declarations. They are never reconstructed
+    // from the Arrow arrays' carrier types or their observed NULL counts.
     let source_type = FunctionValueType::new(DataType::Int64, false);
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            source_type.try_to_field("source").unwrap(),
-        ])),
-        vec![Arc::new(Int64Array::from(vec![i64::from(i8::MIN)])) as ArrayRef],
-    )
-    .unwrap();
-    let schema =
-        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
-            .unwrap();
-    let chunk = Chunk::new_with_chunk_schema(batch, schema);
-    let mut arena = ExprArena::default();
-    arena.set_allow_throw_exception(false);
-    let source = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
-    let narrow = arena.push_typed(
-        ExprNode::Cast(source, DecimalOverflowPolicy::OutputNull),
-        DataType::Int8,
-    );
-    let zero = arena.push_typed(ExprNode::Literal(LiteralValue::Int8(0)), DataType::Int8);
-    let negate = arena.push_typed(
-        ExprNode::Sub(zero, narrow, DecimalOverflowPolicy::OutputNull),
-        DataType::Int8,
-    );
-    let widen = arena.push_typed(
-        ExprNode::Cast(negate, DecimalOverflowPolicy::OutputNull),
-        DataType::Int64,
-    );
-    let input = arena.eval(narrow, &chunk).unwrap();
-    assert_eq!(input.data_type(), &DataType::Int8);
-    assert!(
-        !input.is_null(0),
-        "the original narrowing source itself is valid -128"
-    );
-    let original = arena.eval(negate, &chunk).unwrap();
-    assert_eq!(original.data_type(), &DataType::Int8);
-    assert!(
-        original.is_null(0),
-        "0 - -128 = 128 casts to successful Int8 NULL"
-    );
-    let original_widened = arena.eval(widen, &chunk).unwrap();
-    assert_eq!(original_widened.data_type(), &DataType::Int64);
-    assert!(
-        original_widened.is_null(0),
-        "original widening preserves NULL"
-    );
     let narrow_type = FunctionValueType::new(DataType::Int8, false);
     let computed = native_negate_computed_result_type(&narrow_type, &Control).unwrap();
     assert_eq!(computed.data_type().clone(), DataType::Int8);
     assert!(computed.nullable());
+    let computed_wide = native_negate_computed_result_type(&source_type, &Control).unwrap();
     assert!(
-        !native_negate_computed_result_type(&source_type, &Control)
-            .unwrap()
-            .nullable(),
+        !computed_wide.nullable(),
         "Int64 has row overflow, not successful own NULL"
     );
+
+    // -128 is representable in INT8. Its additive inverse +128 is not, so
+    // native typed-zero/Sub returns successful NULL at the INT8 output cast.
+    let input: ArrayRef = Arc::new(Int8Array::from(vec![i8::MIN]));
+    assert_eq!(input.data_type(), &DataType::Int8);
+    assert!(!input.is_null(0), "the explicit narrow input is valid -128");
     let recipe = PreparedNativeNegateRecipe::try_new(&narrow_type, &computed, &Control).unwrap();
+    assert_eq!(recipe.source_type(), &narrow_type);
+    assert_eq!(recipe.result_type(), &computed);
     let actual = recipe
         .evaluate_selected(
             EvaluatedArgument::Column(&input),
@@ -115,5 +74,92 @@ fn numeric_unary_narrow_source_raw_cast_negate_widen_null_and_recipe_metadata() 
         )
         .unwrap();
     assert!(actual.errors().is_empty());
-    assert_eq!(actual.values().to_data(), original.to_data());
+    assert_eq!(actual.values().data_type(), &DataType::Int8);
+    assert_eq!(
+        actual.values().to_data(),
+        Int8Array::from(vec![None::<i8>]).to_data()
+    );
+
+    // Preserve the genuine three-operation stimulus separately. INT64->INT8
+    // admits the full INT64 source domain, hence its declaration permits own
+    // successful NULLs even though this exact -128 input narrows successfully.
+    let cast_narrow_type = FunctionValueType::new(DataType::Int8, true);
+    let narrow_cast = PreparedCastRecipe::try_new(
+        CastOperation::Carrier,
+        &source_type,
+        &cast_narrow_type,
+        DecimalOverflowPolicy::OutputNull,
+        false,
+        &Control,
+    )
+    .unwrap();
+    assert_eq!(narrow_cast.source_type(), &source_type);
+    assert_eq!(narrow_cast.result_type(), &cast_narrow_type);
+    let wide_input: ArrayRef = Arc::new(Int64Array::from(vec![-128]));
+    let narrowed = narrow_cast
+        .evaluate_row(EvaluatedArgument::Column(&wide_input), 0, 0, &Control)
+        .unwrap();
+    let CastRowResult::Signed(value) = narrowed else {
+        panic!("the real INT64 -128 to INT8 cast must succeed with a signed value");
+    };
+    assert_eq!(value, -128);
+    // Package the actual public scalar result for the next prepared owner;
+    // this checked representation conversion performs no expected calculation.
+    let narrowed: ArrayRef = Arc::new(Int8Array::from(vec![i8::try_from(value).unwrap()]));
+    let chain_result =
+        native_negate_computed_result_type(narrow_cast.result_type(), &Control).unwrap();
+    let chain_negate =
+        PreparedNativeNegateRecipe::try_new(narrow_cast.result_type(), &chain_result, &Control)
+            .unwrap();
+    let negated = chain_negate
+        .evaluate_selected(
+            EvaluatedArgument::Column(&narrowed),
+            Selection::all(1),
+            &Control,
+        )
+        .unwrap();
+    assert!(negated.errors().is_empty());
+    assert_eq!(
+        negated.values().to_data(),
+        Int8Array::from(vec![None::<i8>]).to_data()
+    );
+    let widened_type = FunctionValueType::new(DataType::Int64, true);
+    let widen_cast = PreparedCastRecipe::try_new(
+        CastOperation::Carrier,
+        chain_negate.result_type(),
+        &widened_type,
+        DecimalOverflowPolicy::OutputNull,
+        false,
+        &Control,
+    )
+    .unwrap();
+    assert_eq!(widen_cast.source_type(), chain_negate.result_type());
+    assert_eq!(widen_cast.result_type(), &widened_type);
+    assert_eq!(
+        widen_cast
+            .evaluate_row(EvaluatedArgument::Column(negated.values()), 0, 0, &Control)
+            .unwrap(),
+        CastRowResult::Null,
+        "the real widening cast preserves the successful narrow NULL"
+    );
+
+    // INT64 MIN differs: its inverse +2^63 is outside INT64, producing a
+    // required row error rather than an own successful-NULL result declaration.
+    let wide_recipe =
+        PreparedNativeNegateRecipe::try_new(&source_type, &computed_wide, &Control).unwrap();
+    let minimum: ArrayRef = Arc::new(Int64Array::from(vec![i64::MIN]));
+    let overflow = wide_recipe
+        .evaluate_selected(
+            EvaluatedArgument::Column(&minimum),
+            Selection::all(1),
+            &Control,
+        )
+        .unwrap();
+    assert_eq!(overflow.errors().len(), 1);
+    assert_eq!(overflow.errors()[0].selected_ordinal(), 0);
+    assert_eq!(
+        overflow.errors()[0].message(),
+        "Arithmetic overflow: Overflow happened on: 0 - -9223372036854775808"
+    );
+    assert!(overflow.values().is_null(0));
 }

@@ -17,7 +17,7 @@
 
 use super::cast_timestamp_tests::timestamp_array;
 use super::*;
-use arrow::array::Date32Array;
+use arrow::array::{Date32Array, StringArray};
 use arrow::datatypes::TimeUnit;
 
 #[test]
@@ -62,14 +62,35 @@ fn temporal_cast_actual_compiler_sparse_date_profiles_and_constant_producers() {
                     .unwrap();
                     let mut evaluator = instance(&program);
                     let result = evaluator.evaluate(&batch, selection, &Control).unwrap();
-                    let legacy =
-                        crate::exec::expr::cast::cast_with_special_rules(&dates, &target).unwrap();
-                    let expected = arrow::compute::take(
-                        legacy.as_ref(),
-                        &arrow::array::UInt32Array::from(rows.map(|r| r as u32).to_vec()),
-                        None,
-                    )
-                    .unwrap();
+                    // Unix-day/calendar facts, independent of either cast path.
+                    let expected: ArrayRef = match &target {
+                        DataType::Utf8 => Arc::new(StringArray::from(vec![
+                            Some("1969-12-31"),
+                            if nullable { None } else { Some("1970-01-01") },
+                            Some("1970-01-02"),
+                            Some("2024-02-29"),
+                        ])),
+                        DataType::Timestamp(unit, None) => {
+                            let (day, leap) = match unit {
+                                TimeUnit::Second => (86_400, 1_709_164_800),
+                                TimeUnit::Millisecond => (86_400_000, 1_709_164_800_000),
+                                TimeUnit::Microsecond => (86_400_000_000, 1_709_164_800_000_000),
+                                TimeUnit::Nanosecond => {
+                                    (86_400_000_000_000, 1_709_164_800_000_000_000)
+                                }
+                            };
+                            timestamp_array(
+                                *unit,
+                                vec![
+                                    Some(-day),
+                                    if nullable { None } else { Some(0) },
+                                    Some(day),
+                                    Some(leap),
+                                ],
+                            )
+                        }
+                        _ => unreachable!("fixed temporal corpus"),
+                    };
                     assert_eq!(result.values().to_data(), expected.to_data());
                     assert!(result.errors().is_empty());
                     let constant = compiled(
@@ -93,9 +114,20 @@ fn temporal_cast_actual_compiler_sparse_date_profiles_and_constant_producers() {
                     let result = instance(&constant)
                         .evaluate(&batch, selection, &Control)
                         .unwrap();
-                    let array: ArrayRef = Arc::new(Date32Array::from(vec![71; 4]));
-                    let expected =
-                        crate::exec::expr::cast::cast_with_special_rules(&array, &target).unwrap();
+                    // Unix day 71 is 1970-03-13, 6_134_400 seconds after epoch.
+                    let expected: ArrayRef = match &target {
+                        DataType::Utf8 => Arc::new(StringArray::from(vec!["1970-03-13"; 4])),
+                        DataType::Timestamp(unit, None) => {
+                            let value = match unit {
+                                TimeUnit::Second => 6_134_400,
+                                TimeUnit::Millisecond => 6_134_400_000,
+                                TimeUnit::Microsecond => 6_134_400_000_000,
+                                TimeUnit::Nanosecond => 6_134_400_000_000_000,
+                            };
+                            timestamp_array(*unit, vec![Some(value); 4])
+                        }
+                        _ => unreachable!("fixed temporal corpus"),
+                    };
                     assert_eq!(result.values().to_data(), expected.to_data());
                 }
             }

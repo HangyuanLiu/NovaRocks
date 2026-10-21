@@ -1289,3 +1289,32 @@ fn compiled_receiver_schema_first_memory_refusal_rolls_back_without_registration
     drop(factory);
     assert_eq!(tracker.current(), 0);
 }
+
+// The retained DataStream path must bind the outbound gate at materialization,
+// before an operator can send. Multi/split legacy fixture materializers retire
+// with their old evaluator; this uses an actual compiled single-branch sink.
+#[test]
+fn compiled_stream_materialization_keeps_its_exact_edge_gate() {
+    let programs = programs();
+    let gates =
+        crate::runtime::fragment::io::exchange_edge::ExchangeEdgeGates::try_new(std::iter::empty())
+            .unwrap();
+    for gated in [false, true] {
+        let factory = materialize_compiled_sink(
+            &programs.producer,
+            &stream_assignment(),
+            PRODUCER_FINST,
+            crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
+            None,
+            gated.then(|| Arc::clone(&gates)),
+        )
+        .unwrap();
+        assert_eq!(factory.is_edge_gated(), gated);
+        let expected = format!(
+            "EXCHANGE_SINK (id={})",
+            programs.producer.graph().root().index()
+        );
+        assert_eq!(factory.name(), expected);
+        assert_eq!(factory.create(1, 0).name(), expected);
+    }
+}

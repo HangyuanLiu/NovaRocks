@@ -109,6 +109,7 @@ fn options() -> LocalCompileOptions {
 enum Shape {
     Binary(BinaryOperator),
     SimpleCase,
+    CarrierCast,
 }
 #[derive(Clone, Copy)]
 enum Mode {
@@ -129,6 +130,7 @@ struct Fixture {
     rand_request: Option<FunctionBindingRequest<'static>>,
     rand_definitions: Vec<ExprId>,
     constant_policy: ConstantPolicy,
+    carrier_cast: bool,
 }
 fn input_literal(ty: &FunctionValueType, floating_bits: Option<u64>) -> LiteralValue {
     if ty.nullable() {
@@ -193,18 +195,23 @@ fn fixture(
     let a = builder
         .add_expression(NodeId::new(0), left.clone(), ExprKind::Value(inputs[0].1))
         .unwrap();
-    let b = builder
-        .add_expression(NodeId::new(0), right.clone(), ExprKind::Value(inputs[1].1))
-        .unwrap();
+    let b = if matches!(shape, Shape::CarrierCast) {
+        a
+    } else {
+        builder
+            .add_expression(NodeId::new(0), right.clone(), ExprKind::Value(inputs[1].1))
+            .unwrap()
+    };
     let mut rand_selected = None;
     let mut rand_request = None;
     let mut rand_definitions = vec![];
     let (kind, result, ordered) = match shape {
         Shape::Binary(op) => {
             let ty = match output {
-                OutputClaim::Accurate => {
-                    FunctionValueType::new(DataType::Boolean, left.nullable() || right.nullable())
-                }
+                OutputClaim::Accurate => FunctionValueType::new(
+                    DataType::Boolean,
+                    op != BinaryOperator::EqForNull && (left.nullable() || right.nullable()),
+                ),
                 OutputClaim::NonBoolean => FunctionValueType::new(DataType::Int64, true),
                 OutputClaim::Narrow => FunctionValueType::new(DataType::Boolean, false),
             };
@@ -220,6 +227,20 @@ fn fixture(
                 vec![a, b],
             )
         }
+        Shape::CarrierCast => (
+            ExprKind::Cast {
+                expr: a,
+                target: right.data_type().clone(),
+                decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                allow_throw_exception: novarocks_type_contract::SemanticParameterRef {
+                    id: novarocks_type_contract::SemanticParameterId::new(7),
+                    expected_key:
+                        novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+                },
+            },
+            right.clone(),
+            vec![a],
+        ),
         Shape::SimpleCase => {
             let request = FunctionBindingRequest {
                 arguments: &[],
@@ -336,6 +357,7 @@ fn fixture(
         rand_request,
         rand_definitions,
         constant_policy: options().constants,
+        carrier_cast: matches!(shape, Shape::CarrierCast),
     })
 }
 fn uses(fixture: &Fixture) -> PhysicalRootUses {
@@ -357,6 +379,7 @@ fn uses(fixture: &Fixture) -> PhysicalRootUses {
             self.next_use += 17;
             let (shape, args) = match &fixture.fragment.expressions().get(expr).unwrap().kind {
                 ExprKind::Binary { left, right, .. } => (ControlShape::Eager, vec![*left, *right]),
+                ExprKind::Cast { expr, .. } => (ControlShape::Eager, vec![*expr]),
                 ExprKind::Case {
                     operand,
                     when_then,
@@ -453,6 +476,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
         rand_request,
         rand_definitions,
         constant_policy,
+        carrier_cast,
     } = fixture;
     // Both emitted RAND definitions use the same genuine initial zero-argument request.
     let entries = rand_definitions
@@ -508,9 +532,18 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
         rand_request,
         rand_definitions,
         constant_policy,
+        carrier_cast,
     };
     let expression_uses = uses(&fixture);
-    let parameters = SemanticParameters::try_new([]).unwrap();
+    let parameters = SemanticParameters::try_new(if carrier_cast {
+        vec![(
+            novarocks_type_contract::SemanticParameterId::new(7),
+            novarocks_type_contract::SemanticParameterValue::AllowThrowException(true),
+        )]
+    } else {
+        vec![]
+    })
+    .unwrap();
     let mut frozen = vec![];
     for invocation in expression_uses.flow().uses().values() {
         let ExprKind::FunctionCall { function, .. } = &fixture
@@ -1040,6 +1073,7 @@ fn nullable_null_domain_keeps_a_checked_recipe_instead_of_a_nonnullable_boolean_
         };
         let sites = match shape {
             Shape::Binary(_) => vec![ProgramComparisonSite::Binary(occurrence)],
+            Shape::CarrierCast => unreachable!("this matrix only contains comparison nodes"),
             Shape::SimpleCase => vec![
                 ProgramComparisonSite::CaseWhen { occurrence, arm: 0 },
                 ProgramComparisonSite::CaseWhen { occurrence, arm: 1 },
@@ -1070,3 +1104,113 @@ fn package_admission() -> novarocks_physical_plan::FragmentPackageAdmission {
         },
     }
 }
+
+#[test]
+fn actual_fragment_compilation_preserves_primitive_capability_refusals() {
+    let functions = functions();
+    let nested = FunctionValueType::new(
+        DataType::List(Arc::new(arrow_schema::Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        ))),
+        true,
+    );
+    for operator in [
+        BinaryOperator::Eq,
+        BinaryOperator::Lt,
+        BinaryOperator::EqForNull,
+    ] {
+        let source = package(
+            &functions,
+            fixture(
+                &functions,
+                Shape::Binary(operator),
+                Mode::Project,
+                nested.clone(),
+                nested.clone(),
+                OutputClaim::Accurate,
+                None,
+            )
+            .unwrap(),
+        );
+        let error = compile(source, &functions, &Control).unwrap_err();
+        assert!(
+            error.is_unsupported(),
+            "actual comparison capability refusal must reach the public category: {error}"
+        );
+        let FragmentCompileError::Owner {
+            error,
+            phase: "expressions",
+        } = error
+        else {
+            panic!("expected original comparison owner");
+        };
+        assert!(matches!(
+            error.downcast_ref::<crate::expressions::ExpressionLoweringError>(),
+            Some(crate::expressions::ExpressionLoweringError::Comparison(
+                novarocks_functions::ComparisonPrepareError::Unsupported
+            ))
+        ));
+    }
+    let source = package(
+        &functions,
+        fixture(
+            &functions,
+            Shape::CarrierCast,
+            Mode::Project,
+            FunctionValueType::new(DataType::Date32, true),
+            FunctionValueType::new(DataType::Int8, true),
+            OutputClaim::Accurate,
+            None,
+        )
+        .unwrap(),
+    );
+    let error = compile(source, &functions, &Control).unwrap_err();
+    assert!(
+        error.is_unsupported(),
+        "actual cast capability refusal must reach the public category: {error}"
+    );
+    let FragmentCompileError::Owner {
+        error,
+        phase: "expressions",
+    } = error
+    else {
+        panic!("expected original cast owner");
+    };
+    assert!(matches!(
+        error.downcast_ref::<crate::expressions::ExpressionLoweringError>(),
+        Some(crate::expressions::ExpressionLoweringError::Cast(
+            novarocks_functions::CastPrepareError::Unsupported
+        ))
+    ));
+}
+
+#[test]
+fn final_program_primitive_errors_preserve_only_typed_unsupported() {
+    use novarocks_functions::{
+        ArithmeticPrepareError as A, CastPrepareError as C, ComparisonPrepareError as B,
+    };
+    use novarocks_local_program::ProgramPrimitiveError as P;
+    for (primitive, expected) in [
+        (P::Arithmetic(A::Unsupported), true),
+        (P::Cast(C::Unsupported), true),
+        (P::Comparison(B::Unsupported), true),
+        (P::Arithmetic(A::TypeMismatch), false),
+        (P::Cast(C::TypeMismatch), false),
+        (P::Comparison(B::TypeMismatch), false),
+        (P::Invalid("invalid recipe"), false),
+        (P::Control(CompileControlError::Cancelled), false),
+    ] {
+        let error = FragmentCompileError::Owner {
+            phase: "local program",
+            error: novarocks_failure_contract::SharedFailureCause::new(
+                novarocks_local_program::LocalProgramCompileError::Primitive(primitive),
+            ),
+        };
+        assert_eq!(error.is_unsupported(), expected);
+    }
+}
+
+#[path = "public_recipe_tests.rs"]
+mod public_recipe_tests;

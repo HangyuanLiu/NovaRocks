@@ -36,9 +36,7 @@ fn producer_partition(detail: String) -> ExecutionFailure {
 use crate::runtime_filter as execution;
 use arrow::array::ArrayRef;
 
-use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::node::join::JoinRuntimeFilterProducerBinding;
-use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
+use crate::runtime_filter::RuntimeFilterExecutionContract;
 
 #[derive(Default)]
 struct NativeProducerInstanceCoordinator {
@@ -77,42 +75,6 @@ impl NativeMembershipProducerBinding {
             session,
             coordinator: Arc::new(NativeProducerInstanceCoordinator::default()),
         }
-    }
-
-    fn from_plan(
-        spec: &JoinRuntimeFilterProducerBinding,
-        build_keys: &[ExprId],
-        eq_null_safe: &[bool],
-        arena: &ExprArena,
-        session: execution::RuntimeFilterSessionRef,
-    ) -> ExecutionResult<Self> {
-        let build_expr = build_keys.get(spec.build_key_index).ok_or_else(|| {
-            producer_contract(format!(
-                "native runtime-filter binding_id={} join key ordinal {} is out of bounds for {} build keys",
-                spec.binding_id(), spec.build_key_index, build_keys.len()
-            ))
-        })?;
-        if *build_expr != spec.build_expr_id {
-            return Err(producer_contract(format!(
-                "native runtime-filter binding_id={} build expression does not match join key ordinal {}",
-                spec.binding_id(),
-                spec.build_key_index
-            )));
-        }
-        Self::checked(
-            spec.contract(),
-            spec.build_key_index,
-            eq_null_safe,
-            || {
-                arena.data_type(spec.build_expr_id).cloned().ok_or_else(|| {
-                    producer_contract(format!(
-                        "native runtime-filter binding_id={} build expression has no frozen data type",
-                        spec.binding_id()
-                    ))
-                })
-            },
-            session,
-        )
     }
 
     /// The checks every hash-join membership producer passes, whatever
@@ -174,33 +136,6 @@ pub(crate) struct NativeRuntimeFilterProducerFactory {
 }
 
 impl NativeRuntimeFilterProducerFactory {
-    pub(crate) fn from_plan(
-        specs: &[JoinRuntimeFilterProducerBinding],
-        build_keys: &[ExprId],
-        eq_null_safe: &[bool],
-        arena: &ExprArena,
-        session: execution::RuntimeFilterSessionRef,
-        local_partition_count: i32,
-    ) -> ExecutionResult<Self> {
-        let local_partition_count = checked_local_partition_count(local_partition_count)?;
-        let bindings = specs
-            .iter()
-            .map(|spec| {
-                NativeMembershipProducerBinding::from_plan(
-                    spec,
-                    build_keys,
-                    eq_null_safe,
-                    arena,
-                    Arc::clone(&session),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            bindings,
-            local_partition_count,
-        })
-    }
-
     /// The membership producers of one compiled hash join. Each producer is
     /// the build-key ordinal it observes and its runtime contract;
     /// `build_key_type` gives the static type of the compiled build-key root
@@ -594,10 +529,7 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{NativeRuntimeFilterProducerFactory, execution};
-    use crate::exec::expr::{ExprArena, ExprNode};
-    use crate::exec::node::join::JoinRuntimeFilterProducerBinding;
-    use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
-    use novarocks_types::SlotId;
+    use crate::runtime_filter::RuntimeFilterExecutionContract;
 
     #[derive(Debug, Eq, PartialEq)]
     enum Event {
@@ -722,9 +654,8 @@ mod tests {
     }
 
     fn producer_binding(
-        build_expr_id: crate::exec::expr::ExprId,
         null_semantics: execution::RuntimeFilterNullSemantics,
-    ) -> JoinRuntimeFilterProducerBinding {
+    ) -> (usize, execution::RuntimeFilterProducerContract) {
         let schema =
             execution::RuntimeFilterMembershipSchema::new(&DataType::Int32, null_semantics)
                 .expect("test membership schema");
@@ -734,13 +665,7 @@ mod tests {
             RuntimeFilterExecutionContract::Membership(schema),
         )
         .expect("test membership producer contract");
-        JoinRuntimeFilterProducerBinding::new(build_expr_id, 0, contract)
-    }
-
-    fn build_key_arena() -> (ExprArena, crate::exec::expr::ExprId) {
-        let mut arena = ExprArena::default();
-        let build_key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        (arena, build_key)
+        (0, contract)
     }
 
     #[test]
@@ -773,14 +698,12 @@ mod tests {
                 producer_open_count: AtomicUsize::new(0),
             });
             let session_ref: execution::RuntimeFilterSessionRef = session.clone();
-            let (arena, build_key) = build_key_arena();
-            let spec = producer_binding(build_key, null_semantics);
+            let spec = producer_binding(null_semantics);
 
-            let factory = NativeRuntimeFilterProducerFactory::from_plan(
+            let factory = NativeRuntimeFilterProducerFactory::from_compiled(
                 &[spec],
-                &[build_key],
                 &[eq_null_safe],
-                &arena,
+                |_| Ok(DataType::Int32),
                 session_ref,
                 1,
             );
@@ -799,7 +722,6 @@ mod tests {
             producer_open_count: AtomicUsize::new(0),
         });
         let session_ref: execution::RuntimeFilterSessionRef = session.clone();
-        let (arena, build_key) = build_key_arena();
         let schema = execution::RuntimeFilterMembershipSchema::new(
             &DataType::Int32,
             execution::RuntimeFilterNullSemantics::NeverMatches,
@@ -811,13 +733,12 @@ mod tests {
             RuntimeFilterExecutionContract::Membership(schema),
         )
         .expect("final-domain producer contract");
-        let spec = JoinRuntimeFilterProducerBinding::new(build_key, 0, contract);
+        let spec = (0, contract);
 
-        let error = match NativeRuntimeFilterProducerFactory::from_plan(
+        let error = match NativeRuntimeFilterProducerFactory::from_compiled(
             &[spec],
-            &[build_key],
             &[false],
-            &arena,
+            |_| Ok(DataType::Int32),
             session_ref,
             1,
         ) {
@@ -882,16 +803,11 @@ mod tests {
             producer_open_count: AtomicUsize::new(0),
         });
         let session_ref: execution::RuntimeFilterSessionRef = session;
-        let (arena, build_key) = build_key_arena();
-        let spec = producer_binding(
-            build_key,
-            execution::RuntimeFilterNullSemantics::NullSafeEqual,
-        );
-        let factory = NativeRuntimeFilterProducerFactory::from_plan(
+        let spec = producer_binding(execution::RuntimeFilterNullSemantics::NullSafeEqual);
+        let factory = NativeRuntimeFilterProducerFactory::from_compiled(
             &[spec],
-            &[build_key],
             &[true],
-            &arena,
+            |_| Ok(DataType::Int32),
             session_ref,
             1,
         )

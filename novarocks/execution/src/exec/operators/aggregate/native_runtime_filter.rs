@@ -19,15 +19,12 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::exec::expr::agg::AggregateVec;
-use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
-use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
-use crate::exec::operators::aggregate::topn_boundary::{
-    AggregateTopNBoundaryBinding, AggregateTopNBoundaryError, OwnedAggregateTopNBoundaryState,
-};
+use crate::exec::hash_table::allocation::AggregateVec;
+use crate::exec::operators::aggregate::topn_boundary::OwnedAggregateTopNBoundaryState;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime_filter as execution;
-use crate::runtime_filter::contribution::{ContributionCodecError, OrderedTuple};
+use crate::runtime_filter::RuntimeFilterExecutionContract;
+use crate::runtime_filter::contribution::ContributionCodecError;
 use crate::runtime_filter::{OrderedTopNAllocationHost, OwnedOrderKey};
 use novarocks_functions::{KernelEvaluationControl, KernelFailure, SourceBackingOwner};
 
@@ -38,19 +35,17 @@ struct AggregateTopNProducerInstanceCoordinator {
 
 #[derive(Clone)]
 enum Coordinator {
-    Legacy(Arc<AggregateTopNProducerInstanceCoordinator>),
     Owned(SourceBackingOwner<AggregateTopNProducerInstanceCoordinator>),
 }
 impl Coordinator {
     fn failed(&self) -> &AtomicBool {
         match self {
-            Self::Legacy(value) => &value.failed,
             Self::Owned(value) => &value.borrowed().failed,
         }
     }
 }
 
-/// Both allocation adapters retain the original domain source. Operator
+/// The owned path retains the original domain source. Operator
 /// context is added only at the execution boundary.
 enum SessionFailure {
     Definition(execution::RuntimeFilterContractViolation),
@@ -63,7 +58,6 @@ enum SessionFailure {
         binding: u32,
         cause: ContributionCodecError,
     },
-    Boundary(AggregateTopNBoundaryError),
     Execution(ExecutionFailure),
 }
 impl SessionFailure {
@@ -78,7 +72,6 @@ impl SessionFailure {
             Self::Definition(cause) => cause.into(),
             Self::Contract { cause, .. } => cause.into(),
             Self::Codec { cause, .. } => cause.into(),
-            Self::Boundary(cause) => ExecutionFailure::from_domain(cause),
             Self::Execution(cause) => cause,
         }
     }
@@ -129,31 +122,18 @@ impl AggregateTopNProducerBinding {
             coordinator: coordinator()?,
         })
     }
-    fn from_plan(
-        spec: &AggregateTopNRuntimeFilterProducerBinding,
-        session: execution::RuntimeFilterSessionRef,
-    ) -> ExecutionResult<Self> {
-        Self::from_parts(spec.binding_id(), spec.contract().clone(), session, || {
-            Ok(Coordinator::Legacy(Arc::new(
-                AggregateTopNProducerInstanceCoordinator::default(),
-            )))
-        })
-        .map_err(SessionFailure::execution)
-    }
 }
 
 struct OwnedBindings {
     bindings: AggregateVec<AggregateTopNProducerBinding>,
 }
 enum BindingStorage {
-    Legacy(Vec<AggregateTopNProducerBinding>),
     Owned(SourceBackingOwner<OwnedBindings>),
 }
 impl Deref for BindingStorage {
     type Target = [AggregateTopNProducerBinding];
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Legacy(values) => values,
             Self::Owned(owner) => &owner.borrowed().bindings,
         }
     }
@@ -174,23 +154,6 @@ impl std::fmt::Debug for AggregateTopNProducerSessionFactory {
     }
 }
 impl AggregateTopNProducerSessionFactory {
-    pub(crate) fn from_plan(
-        specs: &[AggregateTopNRuntimeFilterProducerBinding],
-        session: execution::RuntimeFilterSessionRef,
-        local_partition_count: i32,
-    ) -> ExecutionResult<Self> {
-        let local_partition_count = validate_partition_count(local_partition_count)?;
-        let bindings = specs
-            .iter()
-            .map(|spec| AggregateTopNProducerBinding::from_plan(spec, Arc::clone(&session)))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            bindings: BindingStorage::Legacy(bindings),
-            local_partition_count,
-            host: None,
-        })
-    }
-
     pub(crate) fn try_from_compiled(
         specs: &[novarocks_local_program::AggregateTopNFilter],
         session: execution::RuntimeFilterSessionRef,
@@ -260,36 +223,6 @@ impl AggregateTopNProducerSessionFactory {
                 RuntimeFilterExecutionContract::Ordered(order) => Some(order),
                 _ => None,
             })
-    }
-    pub(crate) fn create_for_driver(
-        &self,
-        actual_dop: i32,
-        local_index: i32,
-    ) -> ExecutionResult<AggregateTopNProducerSession> {
-        let partition = self.driver_partition(actual_dop, local_index)?;
-        if self.host.is_some() {
-            return Err(SessionFailure::contract(
-                "compiled aggregate TopN producer requires controlled driver creation".into(),
-            )
-            .execution());
-        }
-        Ok(AggregateTopNProducerSession {
-            streams: StreamStorage::Legacy(
-                self.bindings
-                    .iter()
-                    .cloned()
-                    .map(|binding| {
-                        AggregateTopNProducerStream::new(
-                            binding,
-                            partition,
-                            self.local_partition_count,
-                        )
-                    })
-                    .collect(),
-            ),
-            completed: false,
-            host: None,
-        })
     }
     pub(crate) fn create_for_driver_owned(
         &self,
@@ -371,14 +304,12 @@ fn validate_partition_count(local_partition_count: i32) -> ExecutionResult<u32> 
 }
 
 enum StreamStorage {
-    Legacy(Vec<AggregateTopNProducerStream>),
     Owned(AggregateVec<AggregateTopNProducerStream>),
 }
 impl Deref for StreamStorage {
     type Target = [AggregateTopNProducerStream];
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Legacy(values) => values,
             Self::Owned(values) => values,
         }
     }
@@ -386,7 +317,6 @@ impl Deref for StreamStorage {
 impl DerefMut for StreamStorage {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
-            Self::Legacy(values) => values,
             Self::Owned(values) => values,
         }
     }
@@ -397,9 +327,6 @@ pub(crate) struct AggregateTopNProducerSession {
     host: Option<OrderedTopNAllocationHost>,
 }
 impl AggregateTopNProducerSession {
-    pub(crate) fn bind(&mut self) -> ExecutionResult<()> {
-        self.bind_core(None).map_err(SessionFailure::execution)
-    }
     pub(crate) fn bind_owned(
         &mut self,
         control: &dyn KernelEvaluationControl,
@@ -420,46 +347,6 @@ impl AggregateTopNProducerSession {
             }
         }
         Ok(())
-    }
-    pub(crate) fn submit_pending(
-        &mut self,
-        boundaries: &mut [AggregateTopNBoundaryBinding],
-    ) -> ExecutionResult<()> {
-        self.update(
-            boundaries,
-            false,
-            None,
-            |boundary, finish| {
-                if finish {
-                    boundary.state_mut().finish()
-                } else {
-                    boundary.state_mut().take_pending_tightening()
-                }
-                .map_err(SessionFailure::Boundary)
-            },
-            |contract, bound, cap| encode_execution_ordered_bound(contract, &bound, cap),
-        )
-        .map_err(SessionFailure::execution)
-    }
-    pub(crate) fn finish(
-        &mut self,
-        boundaries: &mut [AggregateTopNBoundaryBinding],
-    ) -> ExecutionResult<()> {
-        self.update(
-            boundaries,
-            true,
-            None,
-            |boundary, finish| {
-                if finish {
-                    boundary.state_mut().finish()
-                } else {
-                    boundary.state_mut().take_pending_tightening()
-                }
-                .map_err(SessionFailure::Boundary)
-            },
-            |contract, bound, cap| encode_execution_ordered_bound(contract, &bound, cap),
-        )
-        .map_err(SessionFailure::execution)
     }
     pub(crate) fn submit_pending_owned(
         &mut self,
@@ -510,7 +397,7 @@ impl AggregateTopNProducerSession {
         );
         self.finish_owned_attempt(result)
     }
-    /// This is the one final-flush/submission/close chronology for both adapters.
+    /// This is the owned final-flush/submission/close chronology.
     fn update<B, K>(
         &mut self,
         boundaries: &mut [B],
@@ -566,12 +453,6 @@ impl AggregateTopNProducerSession {
                 Err(cause.execution())
             }
         }
-    }
-    pub(crate) fn fail(
-        &mut self,
-        reason: execution::RuntimeFilterProducerFailure,
-    ) -> ExecutionResult<()> {
-        self.fail_core(reason).map_err(SessionFailure::execution)
     }
     pub(crate) fn fail_owned(
         &mut self,
@@ -782,9 +663,8 @@ impl AggregateTopNProducerStream {
         self.terminal = true;
         // An owned driver can be destroyed after construction but before bind.
         // It has no service handle with which to settle a bound sibling, so it
-        // must leave that sibling's once-fail right intact. Legacy keeps its
-        // original coordinator transition, including the unbound case.
-        if matches!(self.binding.coordinator, Coordinator::Owned(_)) && self.producer.is_none() {
+        // must leave that sibling's once-fail right intact.
+        if self.producer.is_none() {
             return Ok(());
         }
         if self
@@ -807,36 +687,6 @@ impl AggregateTopNProducerStream {
         Ok(())
     }
 }
-fn encode_execution_ordered_bound(
-    producer: &execution::RuntimeFilterProducerContract,
-    bound: &OrderedTuple,
-    max_contribution_bytes: usize,
-) -> Result<execution::RuntimeFilterContribution, SessionFailure> {
-    let encoded = (|| {
-        let RuntimeFilterExecutionContract::Ordered(contract) = producer.contract() else {
-            return Err(ContributionCodecError::SchemaMismatch);
-        };
-        let update = execution::contribution::OrderedBoundUpdate::try_new(contract, bound.clone())
-            .map_err(|_| ContributionCodecError::SchemaMismatch)?;
-        let typed = execution::contribution::RuntimeFilterContribution::ordered_bound(update);
-        execution::contribution::encode_contribution(
-            &typed,
-            execution::contribution::ContributionCodecExpectation::OrderedBound(contract),
-            max_contribution_bytes,
-        )
-    })()
-    .map_err(|cause| SessionFailure::Codec {
-        binding: producer.binding_id().get(),
-        cause,
-    })?;
-    let (contract_digest, canonical_bytes) = encoded.into_parts();
-    Ok(execution::RuntimeFilterContribution::new(
-        execution::RuntimeFilterContributionKind::OrderedBound,
-        contract_digest,
-        canonical_bytes,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -846,14 +696,6 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{AggregateTopNProducerSessionFactory, execution};
-    use crate::exec::expr::ExprId;
-    use crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding;
-    use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
-    use crate::exec::operators::aggregate::topn_boundary::AggregateTopNBoundaryBinding;
-    use crate::runtime_filter::contribution::{
-        OrderedScalar, OrderedTuple, RuntimeOrderContract, RuntimeOrderKey, RuntimeOrderNullOrder,
-        RuntimeOrderSortDirection,
-    };
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Event {
@@ -1044,49 +886,113 @@ mod tests {
         Arc::new(RecordingSession { state })
     }
 
-    fn ordered_contract() -> Arc<RuntimeOrderContract> {
-        Arc::new(RuntimeOrderContract::from_frozen(
-            [RuntimeOrderKey::with_order(
-                DataType::Int64,
-                RuntimeOrderSortDirection::Ascending,
-                RuntimeOrderNullOrder::Last,
-            )],
-            [0; 32],
-            [0; 32],
-        ))
+    /// Thin test-only adapters keep the protocol scenarios readable while
+    /// invoking the actual owned production methods and their control owner.
+    /// They do not restore any uncontrolled production compatibility API.
+    struct TestFactory {
+        actual: AggregateTopNProducerSessionFactory,
+        host: execution::OrderedTopNAllocationHost,
+        control: OwnedControl,
+    }
+    impl TestFactory {
+        fn new(
+            specs: &[novarocks_local_program::AggregateTopNFilter],
+            session: execution::RuntimeFilterSessionRef,
+            dop: i32,
+        ) -> crate::runtime::fragment::ExecutionResult<Self> {
+            let (_tracker, host) = owned_host();
+            let control = OwnedControl::pass();
+            let actual = AggregateTopNProducerSessionFactory::try_from_compiled(
+                specs, session, dop, &host, &control,
+            )?;
+            Ok(Self {
+                actual,
+                host,
+                control,
+            })
+        }
+        fn local_partition_count(&self) -> u32 {
+            self.actual.local_partition_count()
+        }
+        fn create_for_driver(
+            &self,
+            dop: i32,
+            index: i32,
+        ) -> crate::runtime::fragment::ExecutionResult<TestSession> {
+            Ok(TestSession {
+                actual: self
+                    .actual
+                    .create_for_driver_owned(dop, index, &self.control)?,
+                control: OwnedControl::pass(),
+            })
+        }
+    }
+    struct TestSession {
+        actual: super::AggregateTopNProducerSession,
+        control: OwnedControl,
+    }
+    impl TestSession {
+        fn bind(&mut self) -> crate::runtime::fragment::ExecutionResult<()> {
+            self.actual.bind_owned(&self.control)
+        }
+        fn submit_pending(
+            &mut self,
+            boundaries: &mut [super::OwnedAggregateTopNBoundaryState],
+        ) -> crate::runtime::fragment::ExecutionResult<()> {
+            self.actual.submit_pending_owned(boundaries, &self.control)
+        }
+        fn finish(
+            &mut self,
+            boundaries: &mut [super::OwnedAggregateTopNBoundaryState],
+        ) -> crate::runtime::fragment::ExecutionResult<()> {
+            self.actual.finish_owned(boundaries, &self.control)
+        }
+        fn fail(
+            &mut self,
+            reason: execution::RuntimeFilterProducerFailure,
+        ) -> crate::runtime::fragment::ExecutionResult<()> {
+            self.actual.fail_owned(reason)
+        }
     }
 
-    fn binding(binding_id: u32, limit: u32) -> AggregateTopNRuntimeFilterProducerBinding {
-        let contract = ordered_contract();
-        AggregateTopNRuntimeFilterProducerBinding::new(
-            ExprId(binding_id as usize),
-            0,
-            NonZeroU32::new(limit).expect("non-zero TopN limit"),
-            execution::RuntimeFilterProducerContract::ordered_bound(
-                execution::RuntimeFilterBindingId::new(binding_id),
-                execution::RuntimeFilterChannelId::new(binding_id + 100),
-                RuntimeFilterExecutionContract::Ordered(contract.into()),
-            )
-            .expect("ordered producer contract"),
-        )
+    fn binding(binding_id: u32, limit: u32) -> novarocks_local_program::AggregateTopNFilter {
+        let mut spec = compiled_spec(binding_id);
+        spec.limit = NonZeroU32::new(limit).expect("non-zero TopN limit");
+        spec
+    }
+
+    fn observe_protocol_group(
+        factory: &TestFactory,
+        boundary: &mut super::OwnedAggregateTopNBoundaryState,
+        group_id: usize,
+        value: &str,
+    ) {
+        let tuple = factory
+            .host
+            .copy_utf8(Some(value), &factory.control)
+            .expect("actual owned UTF8 key");
+        boundary
+            .observe_owned_group(group_id, tuple, &factory.control)
+            .expect("monotonic aggregate group id");
     }
 
     fn boundary(
-        binding: &AggregateTopNRuntimeFilterProducerBinding,
-        values: &[i64],
-    ) -> AggregateTopNBoundaryBinding {
-        let mut boundary = AggregateTopNBoundaryBinding::try_from_spec(binding)
-            .expect("aggregate TopN boundary binding");
-        let contract = boundary.state().contract().clone();
+        factory: &TestFactory,
+        spec: &novarocks_local_program::AggregateTopNFilter,
+        values: &[&str],
+    ) -> super::OwnedAggregateTopNBoundaryState {
+        let contract = factory
+            .host
+            .shared_order_contract(spec.producer.contract(), &factory.control)
+            .expect("strict compiled order contract");
+        let mut boundary = super::OwnedAggregateTopNBoundaryState::try_new_owned(
+            spec.limit,
+            contract,
+            &factory.host,
+        )
+        .expect("actual owned aggregate TopN boundary");
         for (group_id, value) in values.iter().copied().enumerate() {
-            boundary
-                .state_mut()
-                .observe_new_group(
-                    group_id,
-                    OrderedTuple::try_new(&contract, [Some(OrderedScalar::Int64(value))])
-                        .expect("ordered candidate tuple"),
-                )
-                .expect("monotonic aggregate group id");
+            observe_protocol_group(factory, &mut boundary, group_id, value);
         }
         boundary
     }
@@ -1095,7 +1001,7 @@ mod tests {
     fn aggregate_topn_runtime_filter_forwards_dop_partitions_and_sequences() {
         let state = Arc::new(RecordingState::with_open_actions([]));
         let spec = binding(7, 2);
-        let factory = AggregateTopNProducerSessionFactory::from_plan(
+        let factory = TestFactory::new(
             std::slice::from_ref(&spec),
             recording_session(Arc::clone(&state)),
             2,
@@ -1106,8 +1012,8 @@ mod tests {
         let mut second = factory.create_for_driver(2, 1).expect("second driver");
         first.bind().expect("bind first driver");
         second.bind().expect("bind second driver");
-        let mut first_boundaries = [boundary(&spec, &[9, 4])];
-        let mut second_boundaries = [boundary(&spec, &[8, 3])];
+        let mut first_boundaries = [boundary(&factory, &spec, &["9", "4"])];
+        let mut second_boundaries = [boundary(&factory, &spec, &["8", "3"])];
         first
             .submit_pending(&mut first_boundaries)
             .expect("submit first boundary");
@@ -1156,7 +1062,7 @@ mod tests {
     fn aggregate_topn_runtime_filter_withholds_not_ready_and_flushes_final_tightening() {
         let state = Arc::new(RecordingState::with_open_actions([]));
         let spec = binding(8, 2);
-        let factory = AggregateTopNProducerSessionFactory::from_plan(
+        let factory = TestFactory::new(
             std::slice::from_ref(&spec),
             recording_session(Arc::clone(&state)),
             1,
@@ -1165,19 +1071,11 @@ mod tests {
         let mut session = factory.create_for_driver(1, 0).expect("driver");
         session.bind().expect("bind");
 
-        let mut boundary = boundary(&spec, &[5]);
+        let mut boundary = boundary(&factory, &spec, &["5"]);
         session
             .submit_pending(std::slice::from_mut(&mut boundary))
             .expect("not-ready boundary does not submit");
-        let contract = boundary.state().contract().clone();
-        boundary
-            .state_mut()
-            .observe_new_group(
-                1,
-                OrderedTuple::try_new(&contract, [Some(OrderedScalar::Int64(3))])
-                    .expect("ordered candidate tuple"),
-            )
-            .expect("second group");
+        observe_protocol_group(&factory, &mut boundary, 1, "3");
         session
             .finish(std::slice::from_mut(&mut boundary))
             .expect("finish flushes the first real tightening");
@@ -1204,12 +1102,8 @@ mod tests {
     #[test]
     fn aggregate_topn_runtime_filter_rejects_dop_drift_and_invalid_partition() {
         let state = Arc::new(RecordingState::with_open_actions([]));
-        let factory = AggregateTopNProducerSessionFactory::from_plan(
-            &[binding(9, 1)],
-            recording_session(state),
-            2,
-        )
-        .expect("factory");
+        let factory =
+            TestFactory::new(&[binding(9, 1)], recording_session(state), 2).expect("factory");
 
         assert_eq!(factory.local_partition_count(), 2);
         assert!(
@@ -1231,7 +1125,7 @@ mod tests {
         for action in [OpenAction::Unavailable, OpenAction::SessionClosed] {
             let state = Arc::new(RecordingState::with_open_actions([action]));
             let spec = binding(10, 1);
-            let factory = AggregateTopNProducerSessionFactory::from_plan(
+            let factory = TestFactory::new(
                 std::slice::from_ref(&spec),
                 recording_session(Arc::clone(&state)),
                 1,
@@ -1240,7 +1134,7 @@ mod tests {
             let mut session = factory.create_for_driver(1, 0).expect("driver");
             session.bind().expect("unavailable capability is fail-open");
             session
-                .finish(&mut [boundary(&spec, &[1])])
+                .finish(&mut [boundary(&factory, &spec, &["1"])])
                 .expect("unavailable capability remains fail-open");
             assert_eq!(
                 state.events(),
@@ -1258,7 +1152,7 @@ mod tests {
             OpenAction::Bound,
             OpenAction::Rejected,
         ]));
-        let factory = AggregateTopNProducerSessionFactory::from_plan(
+        let factory = TestFactory::new(
             &[binding(11, 1), binding(12, 1)],
             recording_session(Arc::clone(&state)),
             1,
@@ -1291,12 +1185,8 @@ mod tests {
     #[test]
     fn aggregate_topn_runtime_filter_explicit_fail_and_drop_are_single_fail_open() {
         let state = Arc::new(RecordingState::with_open_actions([]));
-        let factory = AggregateTopNProducerSessionFactory::from_plan(
-            &[binding(13, 1)],
-            recording_session(Arc::clone(&state)),
-            1,
-        )
-        .expect("factory");
+        let factory = TestFactory::new(&[binding(13, 1)], recording_session(Arc::clone(&state)), 1)
+            .expect("factory");
         {
             let mut first = factory.create_for_driver(1, 0).expect("first driver");
             let mut second = factory.create_for_driver(1, 0).expect("second driver");
@@ -1325,7 +1215,7 @@ mod tests {
         );
 
         let drop_state = Arc::new(RecordingState::with_open_actions([]));
-        let drop_factory = AggregateTopNProducerSessionFactory::from_plan(
+        let drop_factory = TestFactory::new(
             &[binding(14, 1)],
             recording_session(Arc::clone(&drop_state)),
             1,
@@ -1356,7 +1246,7 @@ mod tests {
             .expect("submit actions lock")
             .push_back(SubmitAction::TerminalNoop);
         let spec = binding(15, 1);
-        let factory = AggregateTopNProducerSessionFactory::from_plan(
+        let factory = TestFactory::new(
             std::slice::from_ref(&spec),
             recording_session(Arc::clone(&state)),
             1,
@@ -1365,10 +1255,10 @@ mod tests {
         let mut session = factory.create_for_driver(1, 0).expect("driver");
         session.bind().expect("bind");
         session
-            .submit_pending(&mut [boundary(&spec, &[1])])
+            .submit_pending(&mut [boundary(&factory, &spec, &["1"])])
             .expect("terminal noop is fail-open");
         session
-            .finish(&mut [boundary(&spec, &[1])])
+            .finish(&mut [boundary(&factory, &spec, &["1"])])
             .expect("terminal noop suppresses close");
 
         assert_eq!(

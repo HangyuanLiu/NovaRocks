@@ -358,9 +358,8 @@ fn float_result_nullability_depends_only_on_source_and_types_are_not_domain_gues
             DataType::Decimal128(10, 0),
         ]
         .into_iter()
-        // Float64 decimal profiles now have their complete positive matrix.
-        // Float32 decimal and the other unsupported pairs retain this boundary.
-        .filter(|target| source != DataType::Float64 || !matches!(target, DataType::Decimal128(..)))
+        // Both Float32 and Float64 decimal routes now have independent P05 value tests.
+        .filter(|target| !matches!(target, DataType::Decimal128(..)))
         {
             assert_eq!(
                 PreparedCastRecipe::try_new(
@@ -375,6 +374,20 @@ fn float_result_nullability_depends_only_on_source_and_types_are_not_domain_gues
             );
         }
     }
+    for source in sources() {
+        super::tests::assert_f3_admitted_preparation(source.clone(), DataType::Decimal128(10, 0));
+        assert_eq!(
+            PreparedCastRecipe::try_new(
+                CastOperation::Carrier,
+                &ty(source, false),
+                &ty(DataType::Decimal128(10, 0), false),
+                DecimalOverflowPolicy::OutputNull,
+                false,
+                &CompileControl::default(),
+            ),
+            Err(CastPrepareError::TypeMismatch)
+        );
+    }
     let foreign_sources = [
         FunctionValueType::try_with_logical_type(
             DataType::FixedSizeBinary(16),
@@ -388,7 +401,6 @@ fn float_result_nullability_depends_only_on_source_and_types_are_not_domain_gues
             ValueLogicalType::Uuid,
         )
         .unwrap(),
-        ty(DataType::FixedSizeBinary(16), false),
     ];
     for source in foreign_sources {
         assert_eq!(
@@ -403,6 +415,36 @@ fn float_result_nullability_depends_only_on_source_and_types_are_not_domain_gues
             Err(CastPrepareError::Unsupported)
         );
     }
+    assert_eq!(
+        PreparedCastRecipe::try_new(
+            CastOperation::Carrier,
+            &ty(DataType::FixedSizeBinary(16), false),
+            &ty(DataType::Float64, false),
+            DecimalOverflowPolicy::OutputNull,
+            false,
+            &CompileControl::default(),
+        ),
+        Err(CastPrepareError::TypeMismatch)
+    );
+    super::tests::assert_f3_selected_literal_case(
+        Arc::new(
+            arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                [
+                    Some(12_i128.to_be_bytes()),
+                    Some((-12_i128).to_be_bytes()),
+                    None,
+                ]
+                .into_iter(),
+                16,
+            )
+            .unwrap(),
+        ),
+        Arc::new(arrow_array::Float64Array::from(vec![
+            Some(12.0),
+            Some(-12.0),
+            None,
+        ])),
+    );
 }
 
 #[test]

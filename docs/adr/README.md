@@ -115,6 +115,7 @@ code-anchors:
 
 领域哲学：查询 pipeline 的 CPU 推进只有一个执行者——driver 池。任何算子（包括 scan 这类 I/O 源）等待时都以 Pending 与可观察的唤醒交还线程，而不是占着线程阻塞或另建执行器；远端 I/O 由独立 I/O runtime 执行，driver 只 await 受管结果。让出靠共享的轮次预算完成，不承诺抢占 kernel。结束以观察到的真实退出为准：close 只观察，丢弃观察者不转移责任，所有 pending finish 只有一个事件入口。并行度声明必须是事实——声明的 DOP 与实际不符时在声明处兑现，而不是让下游逐处补边界。
 
+- [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）
 - [ADR-0187](ADR-0187-receiver-owned-steps-and-single-task-conclusion.md) — 接收方为何接受后准备、领域失败为何贯穿唯一 Task 结论，并由原 owner 继续观察真实退出（active；仅部分替代 ADR-0095 对已知非 Analyze 执行事实的不透明化，Analyze code/span 与历史 MV 边界保留）
 - [ADR-0185](ADR-0185-compiled-packages-are-the-sole-static-plan-path.md) — 静态计划为何只走 compiled package，能力缺口为何以准确拒绝与完整失败账交接，最终为何仍须全量清账（active；部分替代 ADR-0124 的兼容材料，exact-island 与 ingress 规则保留）
 - ADR-0159 — connector scan 为何由 driver 直接 poll page stream、在 scan 分支内扇出，并以观察到的退出为结束（active）
@@ -214,6 +215,7 @@ code-anchors:
 不得以 all-in-one 便利、feature-specific flow 或共享 runtime state 绕过边界。协议必须正面处理重复、延迟、乱序、
 丢失、过期 ownership 与进程失败，使分布式生命周期可测试、可观察并可独立演进。
 
+- [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）
 - [ADR-0187](ADR-0187-receiver-owned-steps-and-single-task-conclusion.md) — 接收方为何接受后准备、领域失败为何贯穿唯一 Task 结论，并由原 owner 继续观察真实退出（active；仅部分替代 ADR-0095 对已知非 Analyze 执行事实的不透明化，Analyze code/span 与历史 MV 边界保留）
 - [ADR-0185](ADR-0185-compiled-packages-are-the-sole-static-plan-path.md) — 静态计划为何只走 compiled package，能力缺口为何以准确拒绝与完整失败账交接，最终为何仍须全量清账（active；部分替代 ADR-0124 的兼容材料，exact-island 与 ingress 规则保留）
 - ADR-0007 — FE 全局协调与 BE 本地查询生命周期为何保持进程和状态机分离（active）
@@ -256,11 +258,12 @@ code-anchors:
 
 领域哲学：SQL compiler 只消费一次 statement admission 冻结的 SQL 事实，并只产出 SQL facts；application owner 保留 session、view rewrite、topology、native encoding 与 lifecycle assembly。catalog、statistics 与 scan preparation 对同一表必须复用同一 exact Connector binding，缺失事实必须显式失败或保守降级，不能重新读取 latest。
 
+- [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）
 - [ADR-0185](ADR-0185-compiled-packages-are-the-sole-static-plan-path.md) — 静态计划为何只走 compiled package，能力缺口为何以准确拒绝与完整失败账交接，最终为何仍须全量清账（active；部分替代 ADR-0124 的兼容材料，exact-island 与 ingress 规则保留）
 - ADR-0073 — SQL compiler 为何先完成全部 binding 分析物化、再冻结 statistics 并以无 catalog 的第二阶段优化封存（active）
 - ADR-0040 — SQL compiler 为何先完成依赖倒置闭包、再进行独立 crate 物理迁移（active）
 - ADR-0153 — 完成的 PhysicalPlan 为何是唯一静态执行权威，首次 Task 提交为何关闭替换窗口（active；其中「首次提交关闭替换窗口 / DispatchSeal」规则已由 ADR-0161 的一次激活与固定版本恢复替换，其余仍有效）
-- ADR-0100 — 常量折叠为何经注入端口复用执行 kernel，并对无法一致表示的结果拒绝折叠（active）
+- ADR-0100 — 常量折叠为何经注入端口复用执行 kernel，并对无法一致表示的结果拒绝折叠（active；请求词汇与旧实现映射由 ADR-0191 部分替代，端口、无状态生命周期、optional-fold 与原拒折门继续有效）
 - ADR-0145 — 查询语义为何先于 per-attempt execution access 冻结，重试为何不得重新规划或携带秘密（active）
 
 - ADR-0161 — 纯本地程序为何分离 Task 接管、安装、覆盖观察与实际收敛（active；继承逻辑执行/Native入口/冻结身份的有效规则）
@@ -393,6 +396,7 @@ engine port 保留 query、connector 和 external commit truth。native persiste
 Iceberg；Paimon 仅支持已声明的只读快照，StarRocks 已废弃且不能恢复内部表或 server runtime。每次写入必须复用 admission 冻结的 immutable request identity；跨 crate 只传中立 DTO 与 opaque
 handles，不以 service locator、core callback、metadata fallback 或公共 SPI 模糊 owner。
 
+- [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）
 - ADR-0020 — DELETE/equality-delete application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（active）
 - ADR-0021 — native frontend INSERT 为何只支持 Iceberg，并与 external StarRocks connector 隔离（active）
 - ADR-0110 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）

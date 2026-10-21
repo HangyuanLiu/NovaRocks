@@ -31,9 +31,14 @@ fn nominal_largeint_text_actual_compiler_matches_v1_sparse_min_max_null_slice_em
         assert!(output.errors().is_empty());
         assert_eq!(
             output.values().to_data(),
-            crate::exec::expr::cast::cast_with_special_rules(&raw, &DataType::Utf8)
-                .unwrap()
-                .to_data()
+            // Exact signed base-10 spelling of the declared 128-bit extremes.
+            StringArray::from(vec![
+                Some("-170141183460469231731687303715884105728"),
+                Some("42"),
+                None,
+                Some("170141183460469231731687303715884105727")
+            ])
+            .to_data()
         );
     }
     let output = evaluator

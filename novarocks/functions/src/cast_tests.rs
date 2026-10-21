@@ -568,8 +568,6 @@ fn unsupported_operations_domains_and_foreign_runtime_addresses_are_never_null_f
     for source in [
         ty(DataType::Binary, true),
         ty(DataType::Float16, true),
-        ty(DataType::Decimal128(10, 0), true),
-        ty(DataType::FixedSizeBinary(16), true),
         FunctionValueType::try_with_logical_type(
             DataType::FixedSizeBinary(16),
             true,
@@ -595,6 +593,25 @@ fn unsupported_operations_domains_and_foreign_runtime_addresses_are_never_null_f
             Err(CastPrepareError::Unsupported)
         );
     }
+    assert_f3_selected_literal_case(
+        Arc::new(
+            arrow_array::FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                [
+                    Some(12_i128.to_be_bytes()),
+                    Some((-12_i128).to_be_bytes()),
+                    None,
+                ]
+                .into_iter(),
+                16,
+            )
+            .unwrap(),
+        ),
+        Arc::new(arrow_array::Int8Array::from(vec![
+            Some(12_i8),
+            Some(-12_i8),
+            None,
+        ])),
+    );
     let recipe = prepare(
         ty(DataType::Int64, false),
         ty(DataType::Int8, true),
@@ -818,17 +835,13 @@ fn same_carrier_without_a_kernel_prepares_an_identity_with_no_row_operation() {
         !kernel.is_identity(),
         "a kernel-backed carrier keeps its row operation"
     );
-    assert!(matches!(
-        PreparedCastRecipe::try_new(
-            CastOperation::Carrier,
-            &ty(DataType::Utf8, false),
-            &ty(DataType::Binary, true),
-            DecimalOverflowPolicy::OutputNull,
-            true,
-            &CompileControl::default(),
-        ),
-        Err(CastPrepareError::Unsupported)
-    ));
+    assert_f3_selected_literal_case(
+        Arc::new(arrow_array::StringArray::from(vec![Some("a\0b"), None])),
+        Arc::new(arrow_array::BinaryArray::from(vec![
+            Some(b"a\0b".as_slice()),
+            None,
+        ])),
+    );
 }
 
 #[test]
@@ -894,4 +907,209 @@ fn signed_successful_null_fact_matches_exact_carriers_independently_of_policy_an
         &DataType::Int32,
         true
     ));
+}
+
+// Approved P05 additions keep the original complete-type preparation contract.
+// Callers provide independent literal values, never another cast evaluator.
+pub(super) fn assert_f3_admitted_preparation(source: DataType, target: DataType) {
+    let source = ty(source, true);
+    let target = ty(target, true);
+    for policy in [
+        DecimalOverflowPolicy::OutputNull,
+        DecimalOverflowPolicy::ReportError,
+    ] {
+        for allow in [false, true] {
+            let recipe = PreparedCastRecipe::try_new(
+                CastOperation::Carrier,
+                &source,
+                &target,
+                policy,
+                allow,
+                &CompileControl::default(),
+            )
+            .unwrap();
+            assert_eq!(recipe.source_type(), &source);
+            assert_eq!(recipe.result_type(), &target);
+        }
+    }
+}
+pub(super) fn assert_f3_selected_literal_case(source: ArrayRef, expected: ArrayRef) {
+    let source_type = ty(source.data_type().clone(), true);
+    let result_type = ty(expected.data_type().clone(), true);
+    for policy in [
+        DecimalOverflowPolicy::OutputNull,
+        DecimalOverflowPolicy::ReportError,
+    ] {
+        for allow in [false, true] {
+            let recipe = PreparedCastRecipe::try_new(
+                CastOperation::Carrier,
+                &source_type,
+                &result_type,
+                policy,
+                allow,
+                &CompileControl::default(),
+            )
+            .unwrap();
+            assert_eq!(recipe.source_type(), &source_type);
+            assert_eq!(recipe.result_type(), &result_type);
+            assert!(recipe.uses_selected_array());
+            let output = recipe
+                .evaluate_selected_array(
+                    EvaluatedArgument::Column(&source),
+                    Selection::all(source.len()),
+                    &[],
+                    &Control::default(),
+                )
+                .unwrap();
+            assert!(output.errors().is_empty());
+            assert_eq!(output.values().to_data(), expected.to_data());
+        }
+    }
+}
+
+// LARGEINT is a semantic identity carried by signed big-endian i128 bytes.
+// Root NULL widening changes no value or semantic metadata.
+#[test]
+fn exact_largeint_identity_preserves_nominal_domain_and_refuses_narrowing_or_retagging() {
+    let largeint = |nullable| {
+        FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            nullable,
+            ValueLogicalType::LargeInt,
+        )
+        .unwrap()
+    };
+    for policy in [
+        DecimalOverflowPolicy::OutputNull,
+        DecimalOverflowPolicy::ReportError,
+    ] {
+        for allow in [false, true] {
+            for (source_null, result_null) in [(false, false), (false, true), (true, true)] {
+                let source = largeint(source_null);
+                let result = largeint(result_null);
+                let recipe = prepare(source.clone(), result.clone(), policy, allow);
+                assert!(recipe.is_identity());
+                assert_eq!(recipe.source_type(), &source);
+                assert_eq!(recipe.result_type(), &result);
+                assert_eq!(
+                    recipe.result_type().logical_type(),
+                    ValueLogicalType::LargeInt
+                );
+                let field = recipe
+                    .result_type()
+                    .try_to_field("largeint_result")
+                    .unwrap();
+                assert_eq!(field.data_type(), &DataType::FixedSizeBinary(16));
+                assert_eq!(field.is_nullable(), result_null);
+                assert_eq!(
+                    field
+                        .metadata()
+                        .get(novarocks_type_contract::NR_LOGICAL_TYPE_KEY)
+                        .map(String::as_str),
+                    Some("largeint")
+                );
+                assert!(
+                    !recipe
+                        .own_effects(context())
+                        .for_use(context())
+                        .unwrap()
+                        .may_raise_row_error
+                );
+            }
+            assert_eq!(
+                PreparedCastRecipe::try_new(
+                    CastOperation::Carrier,
+                    &largeint(true),
+                    &largeint(false),
+                    policy,
+                    allow,
+                    &CompileControl::default()
+                ),
+                Err(CastPrepareError::TypeMismatch)
+            );
+            let nominal = largeint(true);
+            let physical = ty(DataType::FixedSizeBinary(16), true);
+            let uuid = FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                true,
+                ValueLogicalType::Uuid,
+            )
+            .unwrap();
+            let json = FunctionValueType::try_with_logical_type(
+                DataType::Utf8,
+                true,
+                ValueLogicalType::Json,
+            )
+            .unwrap();
+            for (source, target) in [
+                (&nominal, &physical),
+                (&physical, &nominal),
+                (&nominal, &uuid),
+                (&uuid, &nominal),
+                (&uuid, &uuid),
+                (&json, &json),
+            ] {
+                assert_eq!(
+                    PreparedCastRecipe::try_new(
+                        CastOperation::Carrier,
+                        source,
+                        target,
+                        policy,
+                        allow,
+                        &CompileControl::default()
+                    ),
+                    Err(CastPrepareError::Unsupported)
+                );
+            }
+            for operation in [CastOperation::Time, CastOperation::TimeFromDatetime] {
+                assert_eq!(
+                    PreparedCastRecipe::try_new(
+                        operation,
+                        &nominal,
+                        &nominal,
+                        policy,
+                        allow,
+                        &CompileControl::default()
+                    ),
+                    Err(CastPrepareError::Unsupported)
+                );
+            }
+        }
+    }
+    let source = largeint(false);
+    let result = largeint(true);
+    let baseline = CompileControl::default();
+    PreparedCastRecipe::try_new(
+        CastOperation::Carrier,
+        &source,
+        &result,
+        DecimalOverflowPolicy::ReportError,
+        true,
+        &baseline,
+    )
+    .unwrap();
+    let steps = baseline.trace.lock().unwrap().len();
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for at in 0..steps {
+            let control = CompileControl {
+                refusal: Some((at, cause.clone())),
+                ..Default::default()
+            };
+            let failure = PreparedCastRecipe::try_new(
+                CastOperation::Carrier,
+                &source,
+                &result,
+                DecimalOverflowPolicy::ReportError,
+                true,
+                &control,
+            )
+            .unwrap_err();
+            assert_eq!(failure.control_error(), Some(cause.clone()));
+            assert_eq!(control.trace.lock().unwrap().len(), at + 1);
+        }
+    }
 }

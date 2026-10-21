@@ -648,9 +648,6 @@ mod tests {
     use arrow::array::{Float64Array, Int64Array, LargeBinaryArray};
 
     use super::VariantPathSpec;
-    use crate::exec::chunk::{Chunk, ChunkSchema};
-    use crate::exec::expr::function::variant::{eval_try_variant_get, eval_variant_get};
-    use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
     use novarocks_types::SlotId;
 
     fn engine_variant_from_json(rows: Vec<Option<&str>>) -> ArrayRef {
@@ -761,43 +758,6 @@ mod tests {
         variant_path_spec_for("$.a", DataType::Int64, strict)
     }
 
-    fn expression_variant_get_result_for_source(
-        source: ArrayRef,
-        strict: bool,
-    ) -> ExecutionResult<ArrayRef> {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "v",
-            DataType::LargeBinary,
-            true,
-        )]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![source]).expect("expr batch");
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(1)])
-                .expect("expr chunk schema");
-        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("expr chunk");
-
-        let mut arena = ExprArena::default();
-        let source = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::LargeBinary);
-        let path = arena.push_typed(
-            ExprNode::Literal(LiteralValue::Utf8("$.a".to_string())),
-            DataType::Utf8,
-        );
-        let ty = arena.push_typed(
-            ExprNode::Literal(LiteralValue::Utf8("bigint".to_string())),
-            DataType::Utf8,
-        );
-        let args = [source, path, ty];
-        if strict {
-            eval_variant_get(&arena, ExprId(usize::MAX), &args, &chunk)
-        } else {
-            eval_try_variant_get(&arena, ExprId(usize::MAX), &args, &chunk)
-        }
-    }
-
-    fn expression_variant_get_result(strict: bool) -> ExecutionResult<ArrayRef> {
-        expression_variant_get_result_for_source(test_engine_variant(), strict)
-    }
-
     fn materialized_variant_path(strict: bool) -> ExecutionResult<RecordBatch> {
         materialize_variant_path_columns(
             engine_variant_batch(),
@@ -819,6 +779,9 @@ mod tests {
         }
     }
 
+    // Historical test names remain stable in the P12/P13 retention map.
+    // The value oracle is now independent literals; the actual stimulation
+    // stays at this retained materialization owner's existing unit-test layer.
     #[test]
     fn variant_path_materialization_matches_variant_get_on_normalized_engine_source() {
         let source = engine_variant_from_json(vec![
@@ -843,7 +806,9 @@ mod tests {
             &[variant_path_spec(true)],
         )
         .expect("materialize");
-        let expected = expression_variant_get_result_for_source(source, true).expect("expr");
+        // Independent JSON path semantics: $.a selects 1/99, a missing key
+        // and the source SQL NULL both produce SQL NULL. No evaluator oracle.
+        let expected: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(99), None, None]));
         assert_eq!(batch.num_columns(), 1);
         assert_eq!(batch.schema().field(0).name(), "v_a");
         assert_int64_array_eq(batch.column(0), &expected);
@@ -889,6 +854,21 @@ mod tests {
     #[test]
     fn variant_path_strict_errors_but_try_returns_null_on_cast_failure() {
         let error = materialized_variant_path(true).expect_err("strict cast must fail");
+        use crate::runtime::fragment::ExecutionReason;
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        let fact = error.failure_fact();
+        assert_eq!(fact.class(), FailureClass::Data);
+        assert_eq!(fact.reason(), ExecutionReason::VariantKernelValue.reason());
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        let mut retains_sdk_cause = false;
+        while let Some(cause) = source {
+            retains_sdk_cause |= cause.downcast_ref::<arrow::error::ArrowError>().is_some();
+            source = cause.source();
+        }
+        assert!(
+            retains_sdk_cause,
+            "strict extraction retains its actual SDK cause"
+        );
         assert!(
             error.to_string().contains("variant_get"),
             "error names strict function: {error}"
@@ -928,7 +908,10 @@ mod tests {
     #[test]
     fn variant_path_normalized_source_matches_variant_get() {
         let batch = materialized_variant_path(false).expect("materialize normalized engine source");
-        let expected = expression_variant_get_result(false).expect("expr normalized engine source");
+        // TRY extraction additionally maps the nonnumeric string in row 3
+        // to SQL NULL; the source bytes and path are unchanged from the corpus.
+        let expected: ArrayRef =
+            Arc::new(Int64Array::from(vec![Some(1), Some(99), None, None, None]));
         assert_int64_array_eq(batch.column(0), &expected);
     }
 }

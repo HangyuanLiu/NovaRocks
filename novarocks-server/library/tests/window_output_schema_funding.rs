@@ -19,7 +19,7 @@
 //! Explicit test retirement does not prove production Work teardown.
 use arrow::datatypes::{DataType, Field};
 use novarocks_execution::{
-    exec::expr::agg::ExecutionFunctionSetBuilder,
+    runtime::function_set::ExecutionFunctionSetBuilder,
     runtime::{preparation_metadata::CompiledSchemaSite, query_memory::QueryMemoryBinding},
 };
 use novarocks_functions::{

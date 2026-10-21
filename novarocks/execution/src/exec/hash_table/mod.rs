@@ -21,3 +21,6 @@ pub mod key_layout;
 pub mod key_storage;
 pub mod key_strategy;
 pub mod key_table;
+
+pub(crate) mod allocation;
+pub mod array_views;

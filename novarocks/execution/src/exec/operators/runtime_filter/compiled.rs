@@ -17,8 +17,8 @@
 
 //! Runtime-filter consumers of a compiled LocalProgram node.
 //!
-//! The consumer state is the same arena-free state an ExprArena plan uses:
-//! bindings, subscriptions, the gate and the row masks. Only the keys differ.
+//! The shared consumer state owns bindings, subscriptions, the gate and row
+//! masks independently of compiled key evaluation.
 //! Each binding's key is the node's `RuntimeFilter { binding }` root, and every
 //! driver evaluates it through its own `CompiledExpressionInstance`. The root
 //! reads exactly its frozen input port, so a chunk is filtered as it arrives:
@@ -34,13 +34,13 @@ use novarocks_local_program::{
 use super::{RuntimeFilterApplication, RuntimeFilterConsumerState, RuntimeFilterKeyProvider};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
-use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
 use crate::exec::operators::compiled_expression::{
     RuntimeKernelControl, evaluate_all, evaluate_chunk_all, instances, root_value_type,
 };
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::runtime_state::RuntimeErrorState;
 use crate::runtime_filter as execution;
+use crate::runtime_filter::RuntimeFilterExecutionContract;
 
 /// The runtime-filter consumers of one compiled node, shared by its drivers:
 /// the consumer state and the key root of every binding, in binding order.

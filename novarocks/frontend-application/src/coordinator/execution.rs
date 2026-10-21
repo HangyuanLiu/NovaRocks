@@ -22,7 +22,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use super::internal_result::{InternalDomainSlot, InternalDomainState};
+use super::internal_result::{InternalDomainFailure, InternalDomainSlot, InternalDomainState};
 use super::root_result_relay::{RelayedRootAnswer, RelayedRootPolls};
 use crate::native::fragment_transport::{
     FinalTaskInfoRead, NativeTaskResultTransport, TaskReadGrace, TaskResultTransport,
@@ -1195,8 +1195,9 @@ impl FrontendDistributedQueryCoordinator {
         } else {
             None
         };
-        let mut pending_internal: Option<InternalResultCpuJob<Result<InternalDomainSlot, String>>> =
-            None;
+        let mut pending_internal: Option<
+            InternalResultCpuJob<Result<InternalDomainSlot, InternalDomainFailure>>,
+        > = None;
 
         let root_status_source = if matches!(
             intent,
@@ -1665,6 +1666,16 @@ impl FrontendDistributedQueryCoordinator {
                         let domain = match claimed.try_transform(|result, _| result) {
                             Ok(domain) => domain,
                             Err(error) => {
+                                if let Some(input) = error.execution_input() {
+                                    break Err(self.fail_execution_task_round_with_root_reader(
+                                        &mut relayed_reader, &mut root_result_polls, root_task,
+                                        query_id, &mut round, &split_delivery, classification,
+                                        QueryFailureCause::FrontendExecution, input,
+                                    ));
+                                }
+                                let InternalDomainFailure::Diagnostic(error) = error else {
+                                    unreachable!("typed source projected its execution input")
+                                };
                                 break Err(self.fail_task_round_with_root_reader(
                                     &mut relayed_reader,
                                     &mut root_result_polls,

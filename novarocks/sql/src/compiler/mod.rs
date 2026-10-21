@@ -65,6 +65,7 @@ pub use mv_rewrite::{
 
 // The request profile has one owner; application test fixtures may author
 // their explicit ceiling without a second default or translation vocabulary.
+pub use crate::analyzer::root_output_declaration::root_output_type_matches;
 pub use novarocks_functions::ConstantPolicy;
 
 /// SQL's read-only observation of statement cancellation.
@@ -527,18 +528,12 @@ pub use fold_observation::{
 };
 pub(crate) use fold_observation::{SqlFoldEvaluatorLoan, evaluate_fold_dependency_observed};
 
-/// One scalar node shape the optimizer may ask a constant evaluator to fold.
-///
-/// The vocabulary is deliberately SQL-owned: it never names an execution
-/// expression node, kernel, or arena handle. Growing it is a compiler-boundary
-/// decision, not an execution-layer one.
-#[derive(Clone, Debug, PartialEq)]
-pub enum FoldNodeKind {
-    BinaryOp(BinOp, novarocks_type_contract::DecimalOverflowPolicy),
-    UnaryOp(UnOp),
-    Cast(novarocks_type_contract::DecimalOverflowPolicy),
-    Function { name: String },
-}
+mod fold_node;
+pub use fold_node::{
+    CarrierStep, ConversionPlan, FrozenFoldArgumentSource, FrozenFoldCall, FrozenFoldIntrinsic,
+    FrozenFoldNode,
+};
+pub(crate) mod selected_scalar_call;
 
 /// One already-folded argument of a fold request.
 #[derive(Clone, Debug)]
@@ -556,10 +551,10 @@ pub struct FoldArg {
 /// per-node calculator with no traversal knowledge.
 #[derive(Clone, Debug)]
 pub struct FoldRequest {
-    /// Existing emitted-pattern error policy, authored by SQL after its
-    /// children really folded; absence preserves raw reference evaluation.
-    pub regexp_count_pattern_source: Option<novarocks_type_contract::RegexpCountPatternSource>,
-    pub kind: FoldNodeKind,
+    /// Exact selected call or intrinsic facts authored by SQL lowering.
+    pub kind: FrozenFoldNode,
+    /// Original admitted sources for observation. A selected call separately
+    /// retains canonical runtime arguments through FrozenFoldCall::arguments.
     pub args: Vec<FoldArg>,
     /// Explicit host-admitted policy for the newly evaluated backing.
     pub constant_policy: novarocks_functions::ConstantPolicy,
@@ -627,17 +622,30 @@ pub trait SqlConstantEvaluator: Send + Sync {
     }
 }
 
-/// Request failures stay distinct from a failed optional legacy evaluation.
+/// Outer author failures stay distinct from a normal optional row-data result.
 /// Kernel strings are not interpreted to infer a control category.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SqlConstantEvaluationError {
     Control(novarocks_type_contract::CompileControlError),
     Constant(novarocks_functions::ConstantError),
     Source(novarocks_failure_contract::SharedFailureCause),
+    /// An outer evaluator failure is fatal even when its producer fact is Data.
+    Outer(novarocks_failure_contract::SharedFailureCause),
     Evaluation(String),
 }
 
 impl SqlConstantEvaluationError {
+    pub fn outer_domain<E>(source: E) -> Self
+    where
+        E: std::error::Error
+            + novarocks_failure_contract::FailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::Outer(novarocks_failure_contract::SharedFailureCause::new(source))
+    }
+
     pub fn from_domain<E>(source: E) -> Self
     where
         E: std::error::Error
@@ -673,7 +681,7 @@ impl From<novarocks_type_contract::ValueTypeError> for SqlConstantEvaluationErro
 
 impl From<novarocks_functions::KernelFailure> for SqlConstantEvaluationError {
     fn from(error: novarocks_functions::KernelFailure) -> Self {
-        Self::from_domain(error)
+        Self::outer_domain(error)
     }
 }
 
@@ -688,7 +696,7 @@ impl fmt::Display for SqlConstantEvaluationError {
         match self {
             Self::Control(error) => error.fmt(f),
             Self::Constant(error) => error.fmt(f),
-            Self::Source(error) => error.fmt(f),
+            Self::Source(error) | Self::Outer(error) => error.fmt(f),
             Self::Evaluation(error) => f.write_str(error),
         }
     }
@@ -699,7 +707,7 @@ impl std::error::Error for SqlConstantEvaluationError {
         match self {
             Self::Control(source) => Some(source),
             Self::Constant(source) => Some(source),
-            Self::Source(source) => Some(source),
+            Self::Source(source) | Self::Outer(source) => Some(source),
             Self::Evaluation(_) => None,
         }
     }
@@ -981,6 +989,7 @@ pub struct SqlAnalyzeRequest<'a> {
     pub(crate) mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
     pub(crate) imv_rewrite: Option<&'a SqlImvPlanningInput>,
     pub(crate) control: SqlCompileControl,
+    pub(crate) root_output_declaration: Option<Vec<novarocks_type_contract::FunctionValueType>>,
 }
 
 impl<'a> SqlAnalyzeRequest<'a> {
@@ -1010,6 +1019,7 @@ impl<'a> SqlAnalyzeRequest<'a> {
             mv_rewrite,
             imv_rewrite: None,
             control,
+            root_output_declaration: None,
         }
     }
 
@@ -1044,7 +1054,29 @@ impl<'a> SqlAnalyzeRequest<'a> {
             mv_rewrite: None,
             imv_rewrite: None,
             control,
+            root_output_declaration: None,
         }
+    }
+
+    /// Exact target domains for the root projection of an internal DML read.
+    /// SQL text cannot supply this input; no type is reconstructed from spelling.
+    pub fn with_root_output_declaration(
+        mut self,
+        declaration: Vec<novarocks_type_contract::FunctionValueType>,
+    ) -> Result<Self, SqlCompileError> {
+        self.check_control()?;
+        if self.intent != SqlCompileIntent::DmlInternalRead
+            || matches!(
+                &self.statement.kind,
+                SqlStatementInputKind::LogicalPlan { .. }
+            )
+        {
+            return Err(SqlCompileError::InvalidRequest(
+                "root output declarations require an analyzed internal DML read".into(),
+            ));
+        }
+        self.root_output_declaration = Some(declaration);
+        Ok(self)
     }
 
     fn freeze_scalar_presence_scope(&mut self) {
@@ -1627,7 +1659,7 @@ impl SqlCompiler {
                         "SQL analysis requires a function catalog".to_string(),
                     )
                 })?;
-                let (resolved, ctes, mut factory) =
+                let (mut resolved, ctes, mut factory) =
                     crate::analyzer::analyze_with_materialized_values_and_sql_semantics(
                         &query,
                         catalog,
@@ -1645,6 +1677,15 @@ impl SqlCompiler {
                     )
                     .map_err(SqlCompileError::from)?;
                 request.check_control()?;
+                crate::analyzer::root_output_declaration::apply_root_output_declaration(
+                    &mut resolved,
+                    &mut factory,
+                    request.root_output_declaration.as_deref(),
+                    functions,
+                    &request.session.sql_semantics,
+                    request.constant_policy,
+                    &request.control,
+                )?;
                 let logical_plan =
                     crate::planner::plan_query(resolved, ctes, &mut factory, &request.control)?;
                 let consumer_requires_semantic_snapshot =
@@ -1894,6 +1935,7 @@ impl SqlCompiler {
                     constant_evaluator,
                     Arc::clone(&function_catalog),
                     decimal_overflow_policy,
+                    root_allow_throw_exception,
                     &control,
                 )
                 .with_fold_dependency_observer(control.fold_dependency_observer().cloned()),
@@ -1909,6 +1951,7 @@ impl SqlCompiler {
                     constant_evaluator,
                     Arc::clone(&function_catalog),
                     decimal_overflow_policy,
+                    root_allow_throw_exception,
                     &control,
                 )
                 .with_fold_dependency_observer(control.fold_dependency_observer().cloned()),
@@ -3512,11 +3555,8 @@ mod tests {
             }
         }
         let request = FoldRequest {
-            regexp_count_pattern_source: None,
             constant_policy: crate::constant::test_constant_policy(),
-            kind: FoldNodeKind::Function {
-                name: "fixture/no-op".into(),
-            },
+            kind: FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Not),
             args: Vec::new(),
             result_type: novarocks_type_contract::FunctionValueType::new(
                 arrow::datatypes::DataType::Int64,
@@ -3744,11 +3784,10 @@ mod tests {
                 .unwrap()
                 .eval_scalar(
                     &FoldRequest {
-                        regexp_count_pattern_source: None,
                         constant_policy: crate::constant::test_constant_policy(),
-                        kind: FoldNodeKind::Cast(
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                        ),
+                        kind: FrozenFoldNode::Intrinsic(FrozenFoldIntrinsic::Cast {
+                            plan: ConversionPlan::Identity,
+                        }),
                         args: Vec::new(),
                         result_type: novarocks_type_contract::FunctionValueType::new(
                             arrow::datatypes::DataType::Decimal128(3, 0),

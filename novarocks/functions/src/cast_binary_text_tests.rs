@@ -113,8 +113,19 @@ fn binary_text_recipe_exact_type_root_null_obligation_and_refuses_other_routes()
             }
         }
     }
+    // LargeBinary now uses the admitted Arrow byte-width route; Fixed->UTF8
+    // remains outside Arrow's supported direct cast pairs.
+    super::tests::assert_f3_selected_literal_case(
+        Arc::new(arrow_array::LargeBinaryArray::from(vec![
+            Some(b"valid\0text".as_slice()),
+            None,
+        ])),
+        Arc::new(arrow_array::StringArray::from(vec![
+            Some("valid\0text"),
+            None,
+        ])),
+    );
     for ty in [
-        DataType::LargeBinary,
         DataType::FixedSizeBinary(1),
         DataType::FixedSizeBinary(15),
         DataType::FixedSizeBinary(17),

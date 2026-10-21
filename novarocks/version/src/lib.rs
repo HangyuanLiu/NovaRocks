@@ -43,8 +43,9 @@ use sha2::{Digest, Sha256};
 // Design: ADR-0124 (docs/adr/ADR-0124-native-compatibility-islands-and-ingress-admission.md)
 /// Domain separator for the immutable Native compatibility identity encoding.
 ///
-/// Version 6 adds the static plan interpreter component.
-pub const NATIVE_COMPATIBILITY_DOMAIN: &[u8] = b"novarocks.native-compatibility-id/v6\0";
+/// Version 7 removes the retired execution implementation manifest component.
+/// The static-plan interpreter component keeps its frozen v1 domain and bytes.
+pub const NATIVE_COMPATIBILITY_DOMAIN: &[u8] = b"novarocks.native-compatibility-id/v7\0";
 
 /// Domain separator for the pure physical-plan contract component.
 const PLAN_CONTRACT_DOMAIN: &[u8] = b"novarocks.physical-plan-contract/v1\0";
@@ -87,6 +88,9 @@ impl StaticPlanInterpreter {
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
 ///
+/// Epoch 7 removes the retired evaluator implementation from compatibility
+/// material. Catalogue, provider, descriptor and compiled static facts retain
+/// their own authority. Pre-F3 binaries stay in another island.
 /// Epoch 6 adds signed Native caller role and exact process identity claims.
 /// Epoch-5 receivers reject these closed JWT fields, so the two cannot share
 /// an island. Diagnostic subjects do not provide process identity.
@@ -100,11 +104,11 @@ impl StaticPlanInterpreter {
 /// boundary under the synchronous creation and direct release contract, so
 /// the two never share an island.
 #[cfg(not(feature = "native-compatibility-test-fixture"))]
-pub const NATIVE_COMPAT_EPOCH: u64 = 6;
+pub const NATIVE_COMPAT_EPOCH: u64 = 7;
 
 /// Test-only alternate epoch used to produce an actual different-island binary.
 #[cfg(feature = "native-compatibility-test-fixture")]
-pub const NATIVE_COMPAT_EPOCH: u64 = 7;
+pub const NATIVE_COMPAT_EPOCH: u64 = 8;
 
 #[cfg(all(feature = "native-compatibility-test-fixture", not(debug_assertions)))]
 compile_error!("native-compatibility-test-fixture is only supported by debug and dev-opt builds");
@@ -181,7 +185,6 @@ pub struct NativeCompatibilityMaterial {
     id: NativeCompatibilityId,
     descriptor_digest: [u8; 32],
     function_catalog_digest: [u8; 32],
-    execution_implementation_manifest_digest: [u8; 32],
     plan_contract_revision: u32,
     plan_contract_digest: [u8; 32],
     static_plan_interpreter: StaticPlanInterpreter,
@@ -201,10 +204,6 @@ impl NativeCompatibilityMaterial {
 
     pub const fn function_catalog_digest(&self) -> [u8; 32] {
         self.function_catalog_digest
-    }
-
-    pub const fn execution_implementation_manifest_digest(&self) -> [u8; 32] {
-        self.execution_implementation_manifest_digest
     }
 
     /// Revision supplied by Server from its statically linked plan contract.
@@ -319,7 +318,6 @@ pub fn derive_native_compatibility_material(
     descriptor_set: &[u8],
     carriers: impl IntoIterator<Item = NativeCarrierDeclaration>,
     function_catalog_digest: [u8; 32],
-    execution_implementation_manifest_digest: [u8; 32],
     plan_contract_revision: u32,
     static_plan_interpreter: StaticPlanInterpreter,
     epoch: u64,
@@ -360,7 +358,6 @@ pub fn derive_native_compatibility_material(
     hasher.update(NATIVE_COMPATIBILITY_DOMAIN);
     hasher.update(descriptor_digest);
     hasher.update(function_catalog_digest);
-    hasher.update(execution_implementation_manifest_digest);
     hasher.update(plan_contract_digest);
     hasher.update(static_plan_interpreter_digest);
     hasher.update(
@@ -385,7 +382,6 @@ pub fn derive_native_compatibility_material(
         id: NativeCompatibilityId::new(hasher.finalize().into()),
         descriptor_digest,
         function_catalog_digest,
-        execution_implementation_manifest_digest,
         plan_contract_revision,
         plan_contract_digest,
         static_plan_interpreter,
@@ -399,7 +395,6 @@ pub fn derive_native_compatibility_material(
 pub fn derive_repository_native_compatibility_material(
     carriers: impl IntoIterator<Item = NativeCarrierDeclaration>,
     function_catalog_digest: [u8; 32],
-    execution_implementation_manifest_digest: [u8; 32],
     plan_contract_revision: u32,
     static_plan_interpreter: StaticPlanInterpreter,
 ) -> Result<NativeCompatibilityMaterial, NativeCompatibilityError> {
@@ -407,7 +402,6 @@ pub fn derive_repository_native_compatibility_material(
         FILE_DESCRIPTOR_SET,
         carriers,
         function_catalog_digest,
-        execution_implementation_manifest_digest,
         plan_contract_revision,
         static_plan_interpreter,
         NATIVE_COMPAT_EPOCH,
@@ -438,7 +432,6 @@ mod tests {
             b"descriptor-v1",
             carriers(),
             [0x31; 32],
-            [0x41; 32],
             1,
             COMPILED,
             1,
@@ -447,13 +440,9 @@ mod tests {
 
         assert_eq!(
             material.id().to_string(),
-            "75500bcc71f4993afd30d08e60cd09da95ad15aa0e8b6817951b641d17cd5d2f"
+            "5d9045a98612cebc1069648d014c64e33c9712641dcdcc60bf00cdf06372cd16"
         );
         assert_eq!(material.function_catalog_digest(), [0x31; 32]);
-        assert_eq!(
-            material.execution_implementation_manifest_digest(),
-            [0x41; 32]
-        );
         assert_eq!(material.plan_contract_revision(), 1);
         assert_eq!(
             material.plan_contract_digest(),
@@ -473,7 +462,6 @@ mod tests {
             b"descriptor-v1",
             carriers(),
             [0x31; 32],
-            [0x41; 32],
             1,
             COMPILED,
             1,
@@ -483,7 +471,6 @@ mod tests {
             b"descriptor-v2",
             carriers(),
             [0x31; 32],
-            [0x41; 32],
             1,
             COMPILED,
             1,
@@ -496,7 +483,6 @@ mod tests {
                 NativeCarrierDeclaration::try_new("starrocks", 1).expect("starrocks declaration"),
             ],
             [0x31; 32],
-            [0x41; 32],
             1,
             COMPILED,
             1,
@@ -514,7 +500,6 @@ mod tests {
                 NativeCarrierDeclaration::try_new("starrocks", 1).expect("starrocks declaration"),
             ],
             [0x31; 32],
-            [0x41; 32],
             1,
             COMPILED,
             1,
@@ -524,27 +509,15 @@ mod tests {
             b"descriptor-v1",
             carriers(),
             [0x32; 32],
-            [0x41; 32],
             1,
             COMPILED,
             1,
         )
         .expect("catalog-only material");
-        let implementation_only = derive_native_compatibility_material(
-            b"descriptor-v1",
-            carriers(),
-            [0x31; 32],
-            [0x42; 32],
-            1,
-            COMPILED,
-            1,
-        )
-        .expect("implementation-only material");
         let epoch = derive_native_compatibility_material(
             b"descriptor-v1",
             carriers(),
             [0x31; 32],
-            [0x41; 32],
             1,
             COMPILED,
             2,
@@ -554,7 +527,6 @@ mod tests {
             b"descriptor-v1",
             carriers(),
             [0x31; 32],
-            [0x41; 32],
             2,
             COMPILED,
             1,
@@ -565,7 +537,6 @@ mod tests {
         assert_ne!(original.id(), provider_revision.id());
         assert_ne!(original.id(), private_descriptor.id());
         assert_ne!(original.id(), catalog_only.id());
-        assert_ne!(original.id(), implementation_only.id());
         assert_ne!(original.id(), epoch.id());
         assert_ne!(original.id(), plan_contract.id());
         assert_ne!(epoch.id(), plan_contract.id());
@@ -581,10 +552,6 @@ mod tests {
             original.function_catalog_digest(),
             plan_contract.function_catalog_digest()
         );
-        assert_eq!(
-            original.execution_implementation_manifest_digest(),
-            plan_contract.execution_implementation_manifest_digest()
-        );
         assert_eq!(original.carriers(), plan_contract.carriers());
         assert_eq!(original.epoch(), plan_contract.epoch());
     }
@@ -595,7 +562,6 @@ mod tests {
             b"descriptor-v1",
             carriers(),
             [0x31; 32],
-            [0x41; 32],
             0,
             COMPILED,
             1,
@@ -612,7 +578,6 @@ mod tests {
             b"descriptor-v1",
             [duplicate.clone(), duplicate],
             [0x31; 32],
-            [0x41; 32],
             1,
             COMPILED,
             1,
@@ -630,7 +595,6 @@ mod tests {
                 NativeCarrierDeclaration::try_new("iceberg", 1).expect("iceberg declaration"),
             ],
             [0x31; 32],
-            [0x41; 32],
             1,
             COMPILED,
             1,
@@ -655,7 +619,6 @@ mod tests {
                 b"descriptor-v1",
                 carriers(),
                 [0x31; 32],
-                [0x41; 32],
                 1,
                 COMPILED,
                 epoch,
@@ -681,7 +644,6 @@ mod tests {
                 b"descriptor-v1",
                 carriers(),
                 [0x31; 32],
-                [0x41; 32],
                 1,
                 COMPILED,
                 epoch,
@@ -697,9 +659,9 @@ mod tests {
     #[test]
     fn test_fixture_epoch_is_explicit_and_never_ambient() {
         #[cfg(feature = "native-compatibility-test-fixture")]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 7);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 8);
         #[cfg(not(feature = "native-compatibility-test-fixture"))]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 6);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 7);
     }
     #[test]
     fn signed_process_claims_do_not_share_the_subject_only_epoch() {
@@ -708,7 +670,6 @@ mod tests {
                 b"same-descriptor",
                 carriers(),
                 [0x31; 32],
-                [0x41; 32],
                 1,
                 COMPILED,
                 epoch,
@@ -725,7 +686,6 @@ mod tests {
                 b"same-descriptor",
                 carriers(),
                 [0x31; 32],
-                [0x41; 32],
                 1,
                 COMPILED,
                 epoch,
@@ -741,7 +701,6 @@ mod tests {
             b"descriptor-v1",
             carriers(),
             [0x31; 32],
-            [0x41; 32],
             1,
             interpreter,
             1,
@@ -756,7 +715,7 @@ mod tests {
         });
         assert_eq!(
             material.id().to_string(),
-            "75500bcc71f4993afd30d08e60cd09da95ad15aa0e8b6817951b641d17cd5d2f"
+            "5d9045a98612cebc1069648d014c64e33c9712641dcdcc60bf00cdf06372cd16"
         );
         assert_eq!(
             material.static_plan_interpreter(),
@@ -767,7 +726,7 @@ mod tests {
     }
 
     /// Two binaries built from one tree share every descriptor, catalogue,
-    /// implementation and plan digest. The interpreter each composed is the
+    /// pure-interpreter and plan digest. The interpreter each composed is the
     /// only input that tells their islands apart, and it alone must.
     #[test]
     fn the_static_plan_interpreter_alone_separates_islands_built_from_one_tree() {
@@ -790,10 +749,6 @@ mod tests {
                 compiled.function_catalog_digest()
             );
             assert_eq!(
-                material.execution_implementation_manifest_digest(),
-                compiled.execution_implementation_manifest_digest()
-            );
-            assert_eq!(
                 material.plan_contract_digest(),
                 compiled.plan_contract_digest()
             );
@@ -804,6 +759,43 @@ mod tests {
 
     /// Production identity is a pure function of its inputs: deriving it
     /// again yields the same island, never a per-process value.
+    #[test]
+    fn retired_evaluator_material_does_not_share_the_pre_f3_epoch() {
+        let at = |epoch| {
+            derive_native_compatibility_material(
+                b"descriptor-v1",
+                carriers(),
+                [0x31; 32],
+                1,
+                COMPILED,
+                epoch,
+            )
+            .unwrap()
+        };
+        assert_ne!(NATIVE_COMPAT_EPOCH, 6);
+        assert_ne!(at(NATIVE_COMPAT_EPOCH).id(), at(6).id());
+        // Frozen pre-F3 vector has the same visible fixture inputs plus its
+        // retired [0x41;32] implementation digest. It cannot identify this ABI.
+        assert_ne!(
+            at(1).id().to_string(),
+            "75500bcc71f4993afd30d08e60cd09da95ad15aa0e8b6817951b641d17cd5d2f"
+        );
+    }
+
+    #[test]
+    fn compiled_component_keeps_the_frozen_v1_domain_tag_and_pure_digest() {
+        // Independent SHA256 vector: domain || tag 2 || 32 bytes of 0x51.
+        // Changing the outer material must not rewrite this composed fact.
+        assert_eq!(
+            COMPILED.component_digest(),
+            [
+                0xcb, 0x15, 0x99, 0x9b, 0xd4, 0x5a, 0x89, 0xb8, 0x40, 0xbe, 0xae, 0xa1, 0x12, 0x25,
+                0x5a, 0x26, 0xca, 0x77, 0x1a, 0xd5, 0x70, 0x07, 0x1e, 0xee, 0x3a, 0x7c, 0x8f, 0x02,
+                0xa9, 0xe1, 0x74, 0x34
+            ]
+        );
+    }
+
     #[test]
     fn a_compiled_identity_is_deterministic() {
         let interpreter = StaticPlanInterpreter::CompiledPackage {

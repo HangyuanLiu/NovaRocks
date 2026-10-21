@@ -88,10 +88,24 @@ fn decimal_text_actual_compiler_both_widths_scales_sparse_slice_and_empty() {
                         !wide && scale > 0,
                     );
                     let result = evaluator.evaluate(&batch, selection, &Control).unwrap();
-                    let old =
-                        crate::exec::expr::cast::cast_with_special_rules(&input, &DataType::Utf8)
-                            .unwrap();
-                    assert_eq!(result.values().to_data(), old.to_data());
+                    // The frozen text owner spells nonpositive scales as the
+                    // raw integer. Positive scales place exactly `scale` digits
+                    // after the point; these literals are independent of its formatter.
+                    let (five, minus_one) = match (wide, scale) {
+                        (_, -3 | 0) => ("5", "-1"),
+                        (_, 2) => ("0.05", "-0.01"),
+                        (false, 38) => (
+                            "0.00000000000000000000000000000000000005",
+                            "-0.00000000000000000000000000000000000001",
+                        ),
+                        (true, 76) => (
+                            "0.0000000000000000000000000000000000000000000000000000000000000000000000000005",
+                            "-0.0000000000000000000000000000000000000000000000000000000000000000000000000001",
+                        ),
+                        _ => unreachable!(),
+                    };
+                    let expected = StringArray::from(vec![Some(five), None, Some(minus_one)]);
+                    assert_eq!(result.values().to_data(), expected.to_data());
                     assert!(result.errors().is_empty());
                     let result = evaluator
                         .evaluate(&batch, Selection::try_sparse(3, &[]).unwrap(), &Control)

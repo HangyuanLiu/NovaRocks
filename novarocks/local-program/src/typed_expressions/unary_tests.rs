@@ -76,10 +76,35 @@ fn public_unary_type_author_preserves_value_child_under_both_root_demands() {
 fn public_unary_type_author_refuses_wrong_boolean_domains_and_nullability() {
     for demand in [EvaluationDemand::Value, EvaluationDemand::TruthOnly] {
         for json in [false, true] {
+            // Numeric physical NOT is supported; raw text and nominal JSON are not.
+            let operand_type = if json {
+                FunctionValueType::try_with_logical_type(
+                    DataType::Utf8,
+                    false,
+                    ValueLogicalType::Json,
+                )
+                .unwrap()
+            } else {
+                FunctionValueType::new(DataType::Utf8, false)
+            };
+            let field = Arc::new(operand_type.try_to_field("actual_unsupported_not").unwrap());
+            let constant = ConstantValue::from_utf8(
+                field,
+                operand_type.clone(),
+                "{}",
+                policy(),
+                CompilePhase::LowerProgram,
+                &Control,
+            )
+            .unwrap();
+            let operand = (
+                StaticExprNode::new(StaticExprKind::Constant(constant), DataType::Utf8, None),
+                FunctionArgumentType::Value(operand_type),
+            );
             assert_eq!(
                 unary(
                     StaticExprKind::Not(ProgramExprId::new(0)),
-                    non_boolean(json),
+                    operand,
                     FunctionValueType::new(DataType::Boolean, true),
                     demand
                 )

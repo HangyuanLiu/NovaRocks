@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use allocator_api2::alloc::Allocator;
 
-use crate::exec::expr::agg::{AggregateAllocator, AggregateVec};
+use crate::exec::hash_table::allocation::{AggregateAllocator, AggregateVec};
 use crate::runtime::mem_tracker::MemTracker;
 #[cfg(test)]
 use crate::runtime::mem_tracker::process_mem_tracker;

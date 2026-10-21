@@ -130,6 +130,40 @@ impl<'a> Selection<'a> {
     }
 }
 
+/// Borrowed execution representation of ONE original checked constant.
+///
+/// The actual producer owns the canonical same-shape array and retains the SAME
+/// source CV. This loan grants neither a semantic declaration nor capacity.
+/// Validation still checks original full semantics and the exact actual carrier.
+#[derive(Clone, Copy, Debug)]
+pub struct CanonicalConstantView<'a> {
+    original: &'a crate::ConstantValue,
+    values: &'a ArrayRef,
+}
+impl<'a> CanonicalConstantView<'a> {
+    /// Facts supplied by the actual projection author, like EvaluatedSourceLoan.
+    /// The producer must obtain values from this selected CV through the shared
+    /// representation author, retaining its real source and construction owner.
+    /// This constructor does not prove payload equality or encoding capability;
+    /// those are the pairing obligations of that actual producer, not metadata.
+    pub const fn from_authored_projection(
+        original: &'a crate::ConstantValue,
+        values: &'a ArrayRef,
+    ) -> Self {
+        Self { original, values }
+    }
+    pub const fn original(self) -> &'a crate::ConstantValue {
+        self.original
+    }
+    pub fn has_original_shape(self) -> bool {
+        self.values.len() == self.original.pool().array().len()
+            && (self.original.ordinal() as usize) < self.values.len()
+    }
+    pub const fn values(self) -> &'a ArrayRef {
+        self.values
+    }
+}
+
 /// Broadcasting is explicit. A one-row column is not silently converted to
 /// a scalar, and scalar NULL remains distinct from an unevaluated argument.
 #[derive(Clone, Copy, Debug)]
@@ -137,15 +171,27 @@ pub enum EvaluatedArgument<'a> {
     Scalar(&'a ArrayRef),
     /// One checked SQL value. Other rows in its retained pool are not inputs.
     Constant(&'a crate::ConstantValue),
+    /// Canonical same-shape broadcast retaining its original checked CV.
+    ConstantView(CanonicalConstantView<'a>),
     Column(&'a ArrayRef),
     SelectedColumn(&'a SelectedValues<'a>),
 }
 
 impl<'a> EvaluatedArgument<'a> {
+    /// The identical semantic/source author for raw and canonical CV loans.
+    pub fn constant_value(self) -> Option<&'a crate::ConstantValue> {
+        match self {
+            Self::Constant(value) => Some(value),
+            Self::ConstantView(value) => Some(value.original()),
+            _ => None,
+        }
+    }
+
     pub fn array(self) -> &'a ArrayRef {
         match self {
             Self::Scalar(array) | Self::Column(array) => array,
             Self::Constant(value) => value.pool().array(),
+            Self::ConstantView(value) => value.values(),
             Self::SelectedColumn(output) => output.values(),
         }
     }
@@ -155,6 +201,7 @@ impl<'a> EvaluatedArgument<'a> {
     pub fn value_row(self, selected_ordinal: usize, batch_row: usize) -> usize {
         match self {
             Self::Scalar(_) => 0,
+            Self::ConstantView(value) => value.original().ordinal() as usize,
             Self::Constant(value) => value.ordinal() as usize,
             Self::Column(_) => batch_row,
             Self::SelectedColumn(_) => selected_ordinal,
@@ -188,6 +235,13 @@ impl<'a> EvaluatedArgument<'a> {
             // The immutable owner has already checked this ordinal. A pool
             // may contain many rows; the call broadcasts only this value.
             Self::Constant(_) => return Ok(()),
+            Self::ConstantView(value) => {
+                return if value.has_original_shape() {
+                    Ok(())
+                } else {
+                    Err(EvaluationContractError::ArgumentLength.into())
+                };
+            }
             Self::Scalar(_) => 1,
             Self::Column(_) => selection.batch_rows(),
             Self::SelectedColumn(output) => {

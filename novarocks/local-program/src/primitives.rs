@@ -54,10 +54,12 @@ impl From<CompileControlError> for ProgramPrimitiveError {
 }
 impl From<ComparisonPrepareError> for ProgramPrimitiveError {
     fn from(value: ComparisonPrepareError) -> Self {
-        if let Some(cause) = value.control_error() {
-            Self::Control(cause)
-        } else {
-            Self::Comparison(value)
+        match value {
+            ComparisonPrepareError::Control(cause)
+            | ComparisonPrepareError::Kernel(novarocks_functions::KernelFailure::CompileControl(
+                cause,
+            )) => Self::Control(cause),
+            original => Self::Comparison(original),
         }
     }
 }
@@ -327,12 +329,8 @@ fn compile_core<H>(
                         .into());
                     }
                     work.flush()?;
-                    let recipe = PreparedComparisonRecipe::try_new(
-                        operator,
-                        value(left)?,
-                        value(right)?,
-                        control,
-                    )?;
+                    let recipe =
+                        prepare_comparison_node(operator, value(left)?, value(right)?, control)?;
                     let result = value(invocation.definition)?;
                     if *result.data_type() != arrow_schema::DataType::Boolean
                         || result.logical_type() != ValueLogicalType::Physical
@@ -388,7 +386,7 @@ fn compile_core<H>(
                     }
                     for arm in 0..arms {
                         work.flush()?;
-                        let recipe = PreparedComparisonRecipe::try_new(
+                        let recipe = prepare_comparison_node(
                             ComparisonOperator::Eq,
                             value(children[0])?,
                             value(children[1 + arm as usize * 2])?,
@@ -408,10 +406,12 @@ fn compile_core<H>(
 
 impl From<novarocks_functions::ArithmeticPrepareError> for ProgramPrimitiveError {
     fn from(value: novarocks_functions::ArithmeticPrepareError) -> Self {
-        if let Some(cause) = value.control_error() {
-            Self::Control(cause)
-        } else {
-            Self::Arithmetic(value)
+        match value {
+            novarocks_functions::ArithmeticPrepareError::Control(cause)
+            | novarocks_functions::ArithmeticPrepareError::Kernel(
+                novarocks_functions::KernelFailure::CompileControl(cause),
+            ) => Self::Control(cause),
+            original => Self::Arithmetic(original),
         }
     }
 }
@@ -495,7 +495,7 @@ pub(crate) fn compile_arithmetic_with_factory<H, F: ValueSchemaCreationFactory<H
                         )
                         .map_err(arithmetic_creation_failure)?
                     }
-                    None => novarocks_functions::PreparedArithmeticRecipe::try_new(
+                    None => prepare_arithmetic_node(
                         *operator,
                         value(*left)?,
                         value(*right)?,
@@ -527,10 +527,12 @@ pub(crate) fn compile_arithmetic_with_factory<H, F: ValueSchemaCreationFactory<H
 
 impl From<novarocks_functions::CastPrepareError> for ProgramPrimitiveError {
     fn from(value: novarocks_functions::CastPrepareError) -> Self {
-        if let Some(cause) = value.control_error() {
-            Self::Control(cause)
-        } else {
-            Self::Cast(value)
+        match value {
+            novarocks_functions::CastPrepareError::Control(cause)
+            | novarocks_functions::CastPrepareError::Kernel(
+                novarocks_functions::KernelFailure::CompileControl(cause),
+            ) => Self::Control(cause),
+            original => Self::Cast(original),
         }
     }
 }
@@ -596,7 +598,7 @@ pub(crate) fn compile_casts_with_factory<H, F: ValueSchemaCreationFactory<H>>(
                     .into());
                 }
                 work.flush()?;
-                let recipe = novarocks_functions::PreparedCastRecipe::try_new(
+                let recipe = prepare_cast_node(
                     *operation,
                     value(*child)?,
                     value(invocation.definition)?,
@@ -692,11 +694,8 @@ pub(crate) fn compile_null_safe_comparisons_with_factory<H, F: ValueSchemaCreati
                     .into());
                 }
                 work.flush()?;
-                let recipe = novarocks_functions::PreparedNullSafeComparisonRecipe::try_new(
-                    value(*left)?,
-                    value(*right)?,
-                    control,
-                )?;
+                let recipe =
+                    prepare_null_safe_comparison_node(value(*left)?, value(*right)?, control)?;
                 before_recipe_insert(&recipes, &mut retained, &mut work)?;
                 recipes.insert(ProgramUseRef { arena, use_id }, recipe);
                 work.step()?;
@@ -774,7 +773,7 @@ pub(crate) fn compile_native_negate_with_factory<H, F: ValueSchemaCreationFactor
                     .into());
                 }
                 work.flush()?;
-                let recipe = novarocks_functions::PreparedNativeNegateRecipe::try_new(
+                let recipe = prepare_native_negate_node(
                     value(*child)?,
                     value(invocation.definition)?,
                     control,
@@ -856,7 +855,7 @@ pub(crate) fn compile_native_bitnot_with_factory<H, F: ValueSchemaCreationFactor
                     .into());
                 }
                 work.flush()?;
-                let recipe = novarocks_functions::PreparedNativeBitNotRecipe::try_new(
+                let recipe = prepare_native_bitnot_node(
                     value(*child)?,
                     value(invocation.definition)?,
                     control,
@@ -1098,4 +1097,167 @@ pub(crate) fn compile_native_like_with_factory<H, F: ValueSchemaCreationFactory<
         entries: result?,
         _storage: retained.storage(),
     })
+}
+
+/// Prepare one ordinary comparison with the same exact domains as a program use.
+pub fn prepare_comparison_node(
+    operator: ComparisonOperator,
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    control: &dyn PureCompileControl,
+) -> Result<PreparedComparisonRecipe, ProgramPrimitiveError> {
+    Ok(PreparedComparisonRecipe::try_new(
+        operator, left, right, control,
+    )?)
+}
+pub fn prepare_null_safe_comparison_node(
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    control: &dyn PureCompileControl,
+) -> Result<novarocks_functions::PreparedNullSafeComparisonRecipe, ProgramPrimitiveError> {
+    Ok(novarocks_functions::PreparedNullSafeComparisonRecipe::try_new(left, right, control)?)
+}
+pub fn prepare_cast_node(
+    operation: novarocks_functions::CastOperation,
+    source: &FunctionValueType,
+    result: &FunctionValueType,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    allow_throw_exception: bool,
+    control: &dyn PureCompileControl,
+) -> Result<novarocks_functions::PreparedCastRecipe, ProgramPrimitiveError> {
+    Ok(novarocks_functions::PreparedCastRecipe::try_new(
+        operation,
+        source,
+        result,
+        policy,
+        allow_throw_exception,
+        control,
+    )?)
+}
+pub fn prepare_arithmetic_node(
+    operator: novarocks_type_contract::ArithmeticOperator,
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    result: &FunctionValueType,
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    allow_throw_exception: bool,
+    control: &dyn PureCompileControl,
+) -> Result<novarocks_functions::PreparedArithmeticRecipe, ProgramPrimitiveError> {
+    Ok(novarocks_functions::PreparedArithmeticRecipe::try_new(
+        operator,
+        left,
+        right,
+        result,
+        policy,
+        allow_throw_exception,
+        control,
+    )?)
+}
+pub fn prepare_native_negate_node(
+    source: &FunctionValueType,
+    result: &FunctionValueType,
+    control: &dyn PureCompileControl,
+) -> Result<novarocks_functions::PreparedNativeNegateRecipe, ProgramPrimitiveError> {
+    Ok(novarocks_functions::PreparedNativeNegateRecipe::try_new(
+        source, result, control,
+    )?)
+}
+pub fn prepare_native_bitnot_node(
+    source: &FunctionValueType,
+    result: &FunctionValueType,
+    control: &dyn PureCompileControl,
+) -> Result<novarocks_functions::PreparedNativeBitNotRecipe, ProgramPrimitiveError> {
+    Ok(novarocks_functions::PreparedNativeBitNotRecipe::try_new(
+        source, result, control,
+    )?)
+}
+
+#[cfg(test)]
+mod primitive_source_projection_tests {
+    use super::*;
+    use novarocks_failure_contract::{FailureProjection, FailureReason, domain};
+    use novarocks_functions::{
+        ArithmeticPrepareError as A, CastPrepareError as C, ComparisonPrepareError as B,
+        KernelFailure,
+    };
+    use std::{error::Error, num::NonZeroU16};
+
+    #[test]
+    fn primitive_preparation_keeps_bare_kernel_stops_capacity_and_domain_sources() {
+        for original in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+            KernelFailure::Capacity(novarocks_functions::KernelCapacityRefusal::new(
+                FailureReason::new(domain::MEMORY, NonZeroU16::new(8).unwrap()),
+                16,
+                8,
+                16,
+            )),
+            KernelFailure::from(novarocks_type_contract::ValueTypeError::TooDeep),
+            KernelFailure::from(
+                novarocks_type_contract::ValueTypeError::InvalidLogicalCarrier(
+                    ValueLogicalType::Json,
+                ),
+            ),
+        ] {
+            let expected = original.failure_fact();
+            for error in [
+                ProgramPrimitiveError::from(A::Kernel(original.clone())),
+                ProgramPrimitiveError::from(B::Kernel(original.clone())),
+                ProgramPrimitiveError::from(C::Kernel(original.clone())),
+            ] {
+                assert!(!matches!(error, ProgramPrimitiveError::Control(_)));
+                assert_eq!(error.failure_fact(), expected);
+                let kernel = error
+                    .source()
+                    .unwrap()
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<KernelFailure>()
+                    .unwrap();
+                // Kernel Source equality retains the same shared occurrence,
+                // not just a replacement with equal diagnostic text.
+                assert_eq!(kernel, &original);
+            }
+        }
+    }
+
+    #[test]
+    fn primitive_preparation_unwraps_only_actual_caller_control_channels() {
+        for original in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+            CompileControlError::from_domain(novarocks_type_contract::ValueTypeError::TooDeep),
+        ] {
+            let expected = original.failure_fact();
+            for error in [
+                ProgramPrimitiveError::from(A::Control(original.clone())),
+                ProgramPrimitiveError::from(B::Control(original.clone())),
+                ProgramPrimitiveError::from(C::Control(original.clone())),
+                ProgramPrimitiveError::from(A::Kernel(KernelFailure::CompileControl(
+                    original.clone(),
+                ))),
+                ProgramPrimitiveError::from(B::Kernel(KernelFailure::CompileControl(
+                    original.clone(),
+                ))),
+                ProgramPrimitiveError::from(C::Kernel(KernelFailure::CompileControl(
+                    original.clone(),
+                ))),
+            ] {
+                assert_eq!(error.failure_fact(), expected);
+                assert_eq!(
+                    error
+                        .source()
+                        .unwrap()
+                        .downcast_ref::<CompileControlError>(),
+                    Some(&original)
+                );
+                assert!(
+                    matches!(error, ProgramPrimitiveError::Control(actual) if actual == original)
+                );
+            }
+        }
+    }
 }
