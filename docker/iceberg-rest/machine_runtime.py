@@ -143,6 +143,39 @@ def verified_bom(repo: Path, store: Path | None = None) -> dict:
 class MachineDocker(runtime.Docker):
     """Machine operations preserve the shared network and the selected MinIO volume."""
 
+    def __init__(self, timeout=90, environment=None):
+        self.require_native_supervision()
+        super().__init__(timeout=timeout, environment=environment)
+
+    @staticmethod
+    def require_native_supervision():
+        # Python 3.10 made macOS monotonic clocks comparable across processes.
+        # The supervisor receives an absolute clock and pins an unreaped leader;
+        # silently selecting another interpreter would change that contract.
+        if sys.version_info < (3, 10):
+            raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "machine supervision requires Python 3.10 or newer")
+        if os.name != "posix" or not (sys.platform == "darwin" or sys.platform.startswith("linux")):
+            raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "machine supervision requires native Linux or macOS process groups")
+        missing = [name for name in ("waitid", "killpg") if not callable(getattr(os, name, None))]
+        missing += [name for name in ("WNOWAIT", "WEXITED", "WNOHANG", "P_PID")
+                    if not isinstance(getattr(os, name, None), int)
+                    or isinstance(getattr(os, name, None), bool) or getattr(os, name) <= 0]
+        if missing:
+            raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "machine supervision requires os." + ", os.".join(missing))
+        clock = time.get_clock_info("monotonic")
+        if not clock.monotonic or clock.adjustable:
+            raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "machine supervision requires an unadjustable monotonic clock")
+        if sys.platform == "darwin":
+            import ctypes
+            try:
+                native = ctypes.CDLL(None)
+                native.proc_listpids
+                native.proc_pidinfo
+            except (AttributeError, OSError) as error:
+                raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "machine supervision requires native process group observation") from error
+        elif not Path("/proc/self/stat").is_file():
+            raise runtime.RuntimeFailure("FixturePrerequisiteMissing", "machine supervision requires native proc process state")
+
     @staticmethod
     def labels(record):
         if record.get("kind") != "machine":

@@ -545,8 +545,16 @@ fn rewrite_sql_identifiers(line: &str, mapping: &BTreeMap<String, String>) -> St
                 .next()
                 .unwrap_or("");
             let remaining_dots = name_tail.bytes().filter(|b| *b == b'.').count();
+            // Iceberg branch/tag table references add one final qualifier. It
+            // is part of the table reference, never a second namespace slot.
+            let branch_or_tag = remaining_dots == 2
+                && name_tail.rsplit('.').next().is_some_and(|part| {
+                    let part = part.trim_matches('`');
+                    part.starts_with("branch_") || part.starts_with("tag_")
+                });
             if let Some(new) = mapping.get(name).filter(|_| {
-                (database && !following) || (!database && following && remaining_dots == 1)
+                (database && !following)
+                    || (!database && following && (remaining_dots == 1 || branch_or_tag))
             }) {
                 if quoted {
                     result.push('`');
@@ -726,6 +734,24 @@ print(json.dumps({'complete':True,'pending':False,'errors':[],'removed':[]}))
         assert!(rewritten.contains(&format!("CREATE EXTERNAL CATALOG {old}")));
         assert!(rewritten.contains(&format!("-- @db={db}")));
         assert!(rewritten.contains(&format!("--namespace {db}")));
+    }
+    #[test]
+    fn branch_qualified_tables_share_namespace_mapping_without_changing_literals() {
+        let vars =
+            crate::config::case_placeholder_variables(&test_variables(&["case"]), "case").unwrap();
+        let old = format!("ns_{}", vars["uuid0"]);
+        let source = format!(
+            "CREATE DATABASE catalog.{old};\nCREATE TABLE catalog.{old}.t (id INT);\nINSERT INTO catalog.{old}.t.branch_dev VALUES (1);\nUPDATE catalog.`{old}`.`t`.`branch_dev` SET id=2;\nDELETE FROM {old}.t.branch_dev WHERE id=2;\nSELECT * FROM catalog.{old}.t.tag_snapshot;\nSELECT '{old}', 'catalog.{old}.t.branch_dev' AS data FROM ordinary;\n"
+        );
+        let rewritten = rewrite_namespaces(&source, &vars).unwrap();
+        let db = resource(&vars["run_id"], 'd', 0, 1).unwrap();
+        assert!(rewritten.contains(&format!("catalog.{db}.t.branch_dev")));
+        assert!(rewritten.contains(&format!("catalog.`{db}`.`t`.`branch_dev`")));
+        assert!(rewritten.contains(&format!("DELETE FROM {db}.t.branch_dev")));
+        assert!(rewritten.contains(&format!("catalog.{db}.t.tag_snapshot")));
+        assert!(rewritten.contains(&format!(
+            "SELECT '{old}', 'catalog.{old}.t.branch_dev' AS data"
+        )));
     }
     #[test]
     fn multiline_database_names_and_golden_references_use_the_same_mapping() {

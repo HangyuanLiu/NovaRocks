@@ -24,6 +24,7 @@ import tempfile
 import socket
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -122,6 +123,54 @@ class Backend:
 
     def disconnect(self, record, container):
         self.events.append(("disconnect", container))
+
+
+class SupervisionPrerequisiteTests(unittest.TestCase):
+    def assert_blocked_before_effects(self, prerequisite):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "not-created"
+            with prerequisite, \
+                    mock.patch.object(runtime.Docker, "command") as command, \
+                    mock.patch.object(machine.subprocess, "Popen") as spawn, \
+                    mock.patch.object(runtime, "atomic_json") as journal, \
+                    mock.patch("sys.stderr"):
+                self.assertEqual(machine.main(["--root", str(state), "status"]), 75)
+                with self.assertRaisesRegex(runtime.RuntimeFailure, "FixturePrerequisiteMissing"):
+                    machine.MachineDocker()
+                command.assert_not_called()
+                spawn.assert_not_called()
+                journal.assert_not_called()
+            self.assertFalse(state.exists())
+
+    def test_old_python_rejects_before_docker_or_journal_creation(self):
+        self.assert_blocked_before_effects(mock.patch.object(machine.sys, "version_info", (3, 9, 6)))
+
+    def test_missing_native_wait_capability_rejects_before_docker_or_journal_creation(self):
+        for name in ("waitid", "killpg", "WNOWAIT", "WEXITED", "WNOHANG", "P_PID"):
+            with self.subTest(capability=name):
+                self.assert_blocked_before_effects(mock.patch.object(machine.os, name, None))
+
+    def test_unsupported_platform_or_clock_rejects_before_docker_or_journal_creation(self):
+        self.assert_blocked_before_effects(mock.patch.object(machine.sys, "platform", "unsupported"))
+        for monotonic, adjustable in ((False, False), (True, True)):
+            self.assert_blocked_before_effects(mock.patch.object(machine.time, "get_clock_info",
+                return_value=SimpleNamespace(monotonic=monotonic, adjustable=adjustable)))
+
+    def test_missing_native_group_observation_rejects_before_docker_or_journal_creation(self):
+        if machine.sys.platform == "darwin":
+            import ctypes
+            prerequisite = mock.patch.object(ctypes, "CDLL", return_value=SimpleNamespace())
+        else:
+            prerequisite = mock.patch.object(machine.Path, "is_file", return_value=False)
+        self.assert_blocked_before_effects(prerequisite)
+
+    def test_fake_backend_does_not_require_native_supervision(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(machine.sys, "version_info", (3, 9, 6)), \
+                mock.patch.object(machine.os, "waitid", None):
+            backend = Backend()
+            owner = machine.MachineOwner(directory, backend=backend, sweeper_factory=Sweeper)
+            self.assertEqual(owner.activate(owner.required_definition({}, bom()))["phase"], "ready")
 
 
 class TerminalPortRecoveryTests(unittest.TestCase):

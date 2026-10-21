@@ -102,6 +102,14 @@ impl NamespaceGuard {
             (false, [catalog, namespace, table]) => {
                 Some((catalog.clone(), namespace.clone(), Some(table.clone())))
             }
+            (false, [catalog, namespace, table, reference])
+                if reference
+                    .strip_prefix("branch_")
+                    .or_else(|| reference.strip_prefix("tag_"))
+                    .is_some_and(|name| !name.is_empty()) =>
+            {
+                Some((catalog.clone(), namespace.clone(), Some(table.clone())))
+            }
             (false, [namespace, table]) => self
                 .catalog
                 .clone()
@@ -247,22 +255,33 @@ impl NamespaceGuard {
                             _ => None,
                         })
                         .collect::<BTreeMap<_, _>>();
-                    let fact = match properties.get("iceberg.catalog.type").map(String::as_str) {
-                        Some("rest") => Catalog::Rest(
-                            properties
-                                .get("iceberg.catalog.uri")
-                                .context("REST catalog omitted exact URI")?
-                                .trim_end_matches('/')
-                                .to_string(),
-                        ),
-                        Some("hadoop") => Catalog::Hadoop(
-                            properties
-                                .get("iceberg.catalog.warehouse")
-                                .context("Hadoop catalog omitted exact warehouse")?
-                                .clone(),
-                        ),
-                        _ => Catalog::Other,
-                    };
+                    // Mirror the provider's accepted aliases and precedence. This runs
+                    // after successful SQL; it must project the same catalog facts.
+                    let kind = properties.get("iceberg.catalog.type");
+                    let provider = properties.get("type");
+                    let fact =
+                        if provider.is_some_and(|value| !value.eq_ignore_ascii_case("iceberg")) {
+                            Catalog::Other
+                        } else {
+                            match kind.map(|value| value.to_ascii_lowercase()).as_deref() {
+                                Some("rest") => Catalog::Rest(
+                                    properties
+                                        .get("uri")
+                                        .or_else(|| properties.get("iceberg.catalog.uri"))
+                                        .context("REST catalog omitted exact URI")?
+                                        .trim_end_matches('/')
+                                        .to_string(),
+                                ),
+                                None | Some("hadoop") => Catalog::Hadoop(
+                                    properties
+                                        .get("iceberg.catalog.warehouse")
+                                        .or_else(|| properties.get("warehouse"))
+                                        .context("Hadoop catalog omitted exact warehouse")?
+                                        .clone(),
+                                ),
+                                _ => Catalog::Other,
+                            }
+                        };
                     self.facts
                         .0
                         .lock()
@@ -446,6 +465,60 @@ mod tests {
         (base, thread)
     }
     #[test]
+    fn rest_catalog_aliases_follow_provider_uri_precedence() {
+        for (properties, expected) in [
+            (r#""uri"="http://127.0.0.1:1/""#, "http://127.0.0.1:1"),
+            (
+                r#""iceberg.catalog.uri"="http://127.0.0.1:2""#,
+                "http://127.0.0.1:2",
+            ),
+            (
+                r#""uri"="http://127.0.0.1:3", "iceberg.catalog.uri"="http://127.0.0.1:4""#,
+                "http://127.0.0.1:3",
+            ),
+        ] {
+            let mut guard = guard();
+            guard.after(&format!(
+                r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="REST", {properties});"#
+            )).unwrap();
+            assert!(
+                matches!(guard.catalog_fact("catalog").unwrap(), Some(Catalog::Rest(uri)) if uri == expected)
+            );
+        }
+        let mut guard = guard();
+        assert!(guard.after(r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="rest");"#).is_err());
+    }
+    #[test]
+    fn non_iceberg_catalog_does_not_acquire_a_hadoop_write_guard() {
+        let mut guard = guard();
+        guard.after(r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="paimon", "warehouse"="s3://novarocks/ready");"#).unwrap();
+        assert!(matches!(
+            guard.catalog_fact("catalog").unwrap(),
+            Some(Catalog::Other)
+        ));
+    }
+    #[test]
+    fn hadoop_catalog_aliases_follow_provider_default_and_warehouse_precedence() {
+        for (properties, expected) in [
+            (r#""warehouse"="s3://novarocks/a""#, "s3://novarocks/a"),
+            (
+                r#""iceberg.catalog.warehouse"="s3://novarocks/b""#,
+                "s3://novarocks/b",
+            ),
+            (
+                r#""iceberg.catalog.type"="HADOOP", "warehouse"="s3://novarocks/c", "iceberg.catalog.warehouse"="s3://novarocks/d""#,
+                "s3://novarocks/d",
+            ),
+        ] {
+            let mut guard = guard();
+            guard.after(&format!(r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="iceberg", {properties});"#)).unwrap();
+            assert!(
+                matches!(guard.catalog_fact("catalog").unwrap(), Some(Catalog::Hadoop(root)) if root == expected)
+            );
+            assert!(guard.before("CREATE DATABASE catalog.foreign").is_err());
+        }
+    }
+    #[test]
     fn successful_sql_namespace_is_placed_then_read_back_at_exact_run_root() {
         let mut guard = guard();
         let namespace = guard.identity.resource_name("d0000").unwrap();
@@ -537,6 +610,45 @@ mod tests {
             .insert("catalog".into(), Catalog::Rest("http://127.0.0.1:1".into()));
         assert!(guard.before("CREATE DATABASE readonly_namespace").is_err());
         assert!(guard.before("SELECT * FROM readonly_namespace.t").is_ok());
+    }
+    #[test]
+    fn qualified_branch_writes_require_the_original_rest_namespace() {
+        let guard = guard();
+        let namespace = guard.identity.resource_name("d0000").unwrap();
+        guard
+            .facts
+            .0
+            .lock()
+            .unwrap()
+            .insert("catalog".into(), Catalog::Rest("http://127.0.0.1:1".into()));
+        for reference in ["branch_dev", "tag_release"] {
+            assert!(
+                guard
+                    .before(&format!(
+                        "INSERT INTO catalog.foreign.t.{reference} VALUES (1)"
+                    ))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exact namespace")
+            );
+            assert!(
+                guard
+                    .before(&format!(
+                        "INSERT INTO catalog.{namespace}.t.{reference} VALUES (1)"
+                    ))
+                    .is_ok()
+            );
+        }
+        for reference in ["unknown", "branch_", "tag_"] {
+            let statements = novarocks_parser::parse(&format!(
+                "INSERT INTO catalog.foreign.t.{reference} VALUES (1)"
+            ))
+            .unwrap();
+            let Statement::Dml(DmlStatement::Insert(value)) = &statements[0] else {
+                panic!("expected INSERT");
+            };
+            assert!(guard.target(&value.target, false).unwrap().is_none());
+        }
     }
     #[test]
     fn expired_clock_rejects_before_rest_network_access() {

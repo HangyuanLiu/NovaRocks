@@ -36,6 +36,8 @@ The bootstrap path supports these standard benchmark data sets:
 - TPC-H SF1 through `tpch-dbgen`
 - TPC-DS 1GB through `dsdgen`
 
+Spark producer 从固定机器容器的 AWS 环境读取访问材料，bootstrap 不把凭证拼入 Spark 命令行。`NOVAROCKS_BENCHMARK_SPARK_MEMORY` 可显式设置当前环境所需的 driver/executor heap；它不改变数据规模、p4布局、fixture key判据或结果oracle。
+
 Benchmark data must come from standard generators. Spark is only used to
 convert generated pipe-delimited raw files into Iceberg tables. TPC-H and
 TPC-DS schemas are parsed from the generator-provided DDL files so table

@@ -32,6 +32,8 @@ docker/iceberg-rest/fixture-runtime.sh start  # Explicit machine maintenance.
 docker/iceberg-rest/up.sh                     # Attach this worktree only.
 ```
 
+机器工具需要 Python 3.10 或更新版本，并提供 POSIX `waitid/WNOWAIT` 与进程组观察能力；本机验证使用 Python 3.14。macOS 的 CLT Python 3.9 不满足原生监督与跨进程单调时钟合同，工具在调用 Docker 前返回 BLOCKED。请在调用环境的 PATH 明确选择已安装且满足能力的 Python；工具不自动安装或切换解释器。
+
 普通 `up.sh` 要求机器已经 ready、健康且完整版本匹配，不启动、修复或升级服务。机器未就绪、维护中、输入缺失或版本不符返回 BLOCKED（75）。实际生命周期、身份或执行错误保留失败，准入后的期限耗尽不改称 BLOCKED。CI 仍 verify→attach→读取一次 publication，不自行 provision/upgrade。
 
 机器控制目录默认 `${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/fixture-machine`；管理命令支持子命令前的 `--root`，控制目录不是另一个资源命名空间。daemon 上的固定 authority 卷阻止换目录创建第二套。机器配置持久保存在 daemon 对应 machine 目录；公共 status 隐去凭证。

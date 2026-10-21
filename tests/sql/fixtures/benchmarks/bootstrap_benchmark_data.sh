@@ -663,8 +663,6 @@ run_spark_loader() {
       --warehouse '$exact_warehouse' \
       --manifest-output '$manifest_uri' \
       --s3-endpoint '${NOVAROCKS_SPARK_S3_ENDPOINT:-http://minio:9000}' \
-      --s3-access-key '$AWS_S3_ACCESS_KEY_ID' \
-      --s3-secret-key '$AWS_S3_SECRET_ACCESS_KEY' \
       --generator '$generator_name' \
       --generator-version '$generator_version' \
       --fixture-contract-json '$fixture_contract_in_spark' \

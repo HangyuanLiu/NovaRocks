@@ -354,6 +354,16 @@ pub fn placeholder_variables(
                 ),
             );
         }
+        // This is a mutable case-author warehouse, separate from READY datasets.
+        if variables
+            .get("iceberg_test_warehouse")
+            .is_some_and(|value| value.starts_with("s3://"))
+        {
+            variables.insert(
+                "iceberg_test_warehouse".into(),
+                format!("{root}/hadoop/extra/s{}", variables["__suite_ordinal"]),
+            );
+        }
     }
     substitute_known_variable_values(&mut variables);
     Ok(variables)
@@ -759,6 +769,51 @@ oss_endpoint = "http://127.0.0.1:9000"
         assert!(!warehouse.contains("${"));
     }
 
+    #[test]
+    fn mutable_extra_warehouse_uses_run_scope_without_rebinding_ready_datasets() {
+        let mut config = RunnerConfig::default();
+        config.fixture_names = Some(std::sync::Arc::new(crate::fixture_context::test_names(
+            "iceberg",
+            &["case"],
+        )));
+        for (key, value) in [
+            ("iceberg_test_warehouse", "s3://novarocks/legacy-extra"),
+            (
+                "dataset_iceberg_catalog_warehouse",
+                "s3://novarocks/benchmark/ready",
+            ),
+            (
+                "iceberg_rest_warehouse",
+                "s3://novarocks/readonly-server-root",
+            ),
+        ] {
+            config.values.insert(key.into(), value.into());
+        }
+        let values = placeholder_variables(&config, "iceberg").unwrap();
+        assert_eq!(
+            values["iceberg_test_warehouse"],
+            format!("{}/hadoop/extra/s0", values["__scratch_scope"])
+        );
+        assert_eq!(
+            values["dataset_iceberg_catalog_warehouse"],
+            "s3://novarocks/benchmark/ready"
+        );
+        assert_eq!(
+            values["iceberg_rest_warehouse"],
+            "s3://novarocks/readonly-server-root"
+        );
+        assert_eq!(
+            config.values["iceberg_test_warehouse"],
+            "s3://novarocks/legacy-extra"
+        );
+        config
+            .values
+            .insert("iceberg_test_warehouse".into(), "/tmp/private-extra".into());
+        assert_eq!(
+            placeholder_variables(&config, "iceberg").unwrap()["iceberg_test_warehouse"],
+            "/tmp/private-extra"
+        );
+    }
     #[test]
     fn suite_defaults_never_invent_fixture_endpoints_or_credentials() {
         for suite in [
