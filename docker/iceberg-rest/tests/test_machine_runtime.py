@@ -173,6 +173,67 @@ class SupervisionPrerequisiteTests(unittest.TestCase):
             self.assertEqual(owner.activate(owner.required_definition({}, bom()))["phase"], "ready")
 
 
+class McTimeoutClassificationTests(unittest.TestCase):
+    def invoke(self, changes=None, output="NOVA_SCRATCH_MC_EXIT=0\n", *, absent_stdout=False):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = machine.MachineDocker()
+            backend.maintenance_fd = 42
+            record = dict(kind="machine", namespace="owned", control_root=directory,
+                version="v", generation="g", network="owned-network",
+                compose_file=str(Path(directory) / "compose.yml"),
+                credentials={"access_key":"key", "secret_key":"secret"},
+                images={"mc":{"image_id":"sha256:mc"}})
+            def supervise(journal, request, timeout):
+                fact = runtime.read_json(journal)
+                fact.update(phase="settled", create_dispatched=True, container_id="exact-owned-id",
+                    container_absent=True, group_exit_confirmed=True, group_exit_observed=True,
+                    leader_waited=True, command_exit=0, timed_out=False, command_succeeded=True)
+                fact.update(changes or {})
+                if not absent_stdout:
+                    if isinstance(output, bytes):
+                        journal.with_suffix(".stdout").write_bytes(output)
+                    else:
+                        journal.with_suffix(".stdout").write_text(output)
+                return fact
+            with mock.patch.object(backend, "_supervise", side_effect=supervise):
+                return backend.run_mc(record, "private MC script")
+
+    def test_success_returns_original_output_and_native_nonzero_stays_failure(self):
+        self.assertEqual(self.invoke(), "NOVA_SCRATCH_MC_EXIT=0\n")
+        with self.assertRaisesRegex(runtime.RuntimeFailure, "DockerOperationFailed"):
+            self.invoke({"command_succeeded":False, "command_exit":17})
+
+    def test_confirmed_cleaned_timeout_preserves_private_native_output(self):
+        output = "private-native-SECRET\nNOVA_SCRATCH_MC_EXIT=17\n"
+        with self.assertRaises(runtime.RuntimeFailure) as caught:
+            self.invoke({"command_succeeded":False, "timed_out":True}, output)
+        self.assertEqual(caught.exception.code, "DockerOperationTimeout")
+        self.assertEqual(caught.exception.stdout, output)
+        self.assertNotIn("SECRET", str(caught.exception))
+        with self.assertRaises(runtime.RuntimeFailure) as caught:
+            self.invoke({"command_succeeded":False, "timed_out":True,
+                         "create_dispatched":False}, absent_stdout=True)
+        self.assertEqual(caught.exception.code, "DockerOperationTimeout")
+        self.assertIsNone(caught.exception.stdout)
+
+    def test_missing_started_output_or_unreadable_native_bytes_stays_failure(self):
+        changes = {"command_succeeded":False, "timed_out":True, "start_dispatched":True}
+        with self.assertRaisesRegex(runtime.RuntimeFailure, "DockerOperationFailed"):
+            self.invoke(changes, absent_stdout=True)
+        with self.assertRaisesRegex(runtime.RuntimeFailure, "DockerOperationFailed"):
+            self.invoke(changes, b"\xff\x80")
+
+    def test_unknown_cleanup_or_observation_or_cancellation_is_never_typed_timeout(self):
+        for field, value in (("phase","cleanup-failed"), ("container_absent",False),
+                ("container_name","foreign"), ("container_id",None), ("group_exit_confirmed",False),
+                ("group_exit_observed",False), ("leader_waited",False), ("interrupted",True),
+                ("error","ContainerCleanupFailed"), ("group_observation_error","OSError"),
+                ("leader_observation_error","OSError"), ("command_exit",17), ("create_exit",17)):
+            with self.subTest(field=field), self.assertRaises(runtime.RuntimeFailure) as caught:
+                self.invoke({"command_succeeded":False, "timed_out":True, field:value})
+            self.assertEqual(caught.exception.code, "DockerOperationFailed")
+
+
 class TerminalPortRecoveryTests(unittest.TestCase):
     def fixture(self, directory):
         base = Path(directory) / "machine-test"

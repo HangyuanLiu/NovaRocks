@@ -49,9 +49,12 @@ class PrivateDeadlineTests(unittest.TestCase):
             stdout, stderr = child.communicate(timeout=8)
             return child.returncode, stdout, stderr
         finally:
-            try: os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError: pass
-            child.wait()
+            # Normal communicate already reaped the leader. Only an unreaped
+            # original child can still pin the process group for safe cleanup.
+            if child.returncode is None:
+                try: os.killpg(child.pid, signal.SIGKILL)
+                except ProcessLookupError: pass
+                child.wait()
             temporary.cleanup()
 
     def test_exact_argv_survives_exec_and_shell_metacharacters(self):

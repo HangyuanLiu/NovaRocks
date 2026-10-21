@@ -234,7 +234,8 @@ class CommandOwner:
                 self.save(command_exit=command_exit, timed_out=timed_out,
                           interrupted=not self.alive())
             else:
-                self.save(interrupted=not self.alive(), command_exit=None)
+                timed_out = timed_out or time.monotonic() >= self.deadline
+                self.save(interrupted=not self.alive(), command_exit=None, timed_out=timed_out)
         finally:
             code, _ = self.command(["container", "rm", "--force", identity],
                                     self.journal.with_suffix(".cleanup"), cleanup=True)
@@ -242,6 +243,7 @@ class CommandOwner:
                 self.save(phase="cleanup-failed", error="ContainerCleanupFailed")
                 raise runtime.RuntimeFailure("ContainerCleanupFailed", "operation container did not exit")
             self.save(phase="settled", container_absent=True,
+                      timed_out=timed_out,
                       command_succeeded=command_exit == 0 and not self.owner_lost and not timed_out)
         return 0 if self.fact.get("command_succeeded") else 1
 

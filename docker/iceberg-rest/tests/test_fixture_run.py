@@ -108,6 +108,17 @@ class RunTests(unittest.TestCase):
                 owner.return_value.sweep.side_effect=expire
                 with self.assertRaisesRegex(fixture_runtime.RuntimeFailure,"RunBudgetExpired") as caught: fixture_run.startup_sweep(self.env,budget=budget)
             self.assertEqual(caught.exception.report,{"complete":True,"removed":[],"errors":[]})
+            clock[0] = time.monotonic()
+            budget = replace(budget, deadline=clock[0]+budget.cleanup_grace_seconds+2)
+            partial = {"complete":False,"removed":[],"errors":[{"code":"ScratchSweepTimeout"}]}
+            def expire_partial(**kwargs):
+                clock[0] += 3
+                return partial
+            with patch("machine_runtime.MachineOwner") as owner:
+                owner.return_value.sweep.side_effect = expire_partial
+                with self.assertRaisesRegex(fixture_runtime.RuntimeFailure,"RunBudgetExpired") as caught:
+                    fixture_run.startup_sweep(self.env,budget=budget)
+            self.assertEqual(caught.exception.report,partial)
 
     def test_generic_admission_and_context_remain_read_only_and_cli_retains_failed_report(self):
         with patch.dict(os.environ,{},clear=True):

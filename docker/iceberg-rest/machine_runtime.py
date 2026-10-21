@@ -30,6 +30,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import time
@@ -400,9 +401,30 @@ class MachineDocker(runtime.Docker):
                                        "MINIO_ROOT_PASSWORD=" + credentials["secret_key"] + "\n").encode())
         result = self._supervise(journal, dict(environment=self.environment, network=record["network"],
             env_file=str(env_file), script=script, deadline_monotonic=deadline), timeout)
-        if not result.get("command_succeeded"):
-            raise runtime.RuntimeFailure("DockerOperationFailed", "mc command did not finish successfully: " + str(journal))
         output = journal.with_suffix(".stdout")
+        if not result.get("command_succeeded"):
+            deadline_exits = {None, 0, 124, -signal.SIGTERM, -signal.SIGKILL,
+                              128 + signal.SIGTERM, 128 + signal.SIGKILL}
+            clean_exit = (result.get("phase") == "settled" and result.get("container_absent") is True
+                and result.get("container_name") == name and not result.get("interrupted")
+                and not any(result.get(key) for key in ("error", "leader_observation_error", "group_observation_error"))
+                and all(result.get(key) in deadline_exits for key in ("create_exit", "command_exit"))
+                and (result.get("create_dispatched") is False or (
+                    isinstance(result.get("container_id"), str) and bool(result["container_id"])
+                    and all(result.get(key) is True for key in
+                            ("group_exit_confirmed", "group_exit_observed", "leader_waited")))))
+            if result.get("timed_out") is True and clean_exit:
+                error = runtime.RuntimeFailure("DockerOperationTimeout", "mc deadline expired after confirmed cleanup: " + str(journal))
+                # Keep any native MC failure available to its protocol owner.
+                # Public error text and sweep reports never include this body.
+                if not output.exists() and result.get("start_dispatched") is True:
+                    raise runtime.RuntimeFailure("DockerOperationFailed", "mc timeout output is missing: " + str(journal))
+                try:
+                    error.stdout = (output.read_bytes() if binary else output.read_text()) if output.exists() else None
+                except (OSError, UnicodeError) as read_error:
+                    raise runtime.RuntimeFailure("DockerOperationFailed", "mc timeout output is unreadable: " + str(journal)) from read_error
+                raise error
+            raise runtime.RuntimeFailure("DockerOperationFailed", "mc command did not finish successfully: " + str(journal))
         return output.read_bytes() if binary else output.read_text()
 
     def _supervise(self, journal, request, timeout):

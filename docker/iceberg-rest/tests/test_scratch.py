@@ -783,6 +783,36 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(len(self.backend.calls), 1)
         self.assertFalse(result["enumeration_complete"])
 
+    def test_only_confirmed_native_or_predispatch_timeout_becomes_sweep_timeout(self):
+        for code in ("DockerOperationTimeout", "OperationDeadlineExceeded", "ContainerCleanupUnconfirmed",
+                     "DockerOperationFailed", "RunBudgetExpired"):
+            with self.subTest(code=code), patch.object(self.backend, "run_mc",
+                    side_effect=runtime.RuntimeFailure(code, "private diagnostics")):
+                result = self.sweep(False)
+                expected = "ScratchSweepTimeout" if code in {"DockerOperationTimeout", "OperationDeadlineExceeded"} else code
+                self.assertFalse(result["complete"])
+                self.assertEqual(result["errors"][-1]["code"], expected)
+                self.assertFalse(result["enumeration_complete"])
+
+    def test_cleaned_timeout_never_hides_explicit_native_mc_failure(self):
+        cases = [
+            ("\nNOVA_SCRATCH_MC_EXIT=0\n", "ScratchSweepTimeout"),
+            ('{"status":"success"}\n{"truncated":', "ScratchSweepTimeout"),
+            ('{"truncated":\nNOVA_SCRATCH_MC_EXIT=0\n', "InvalidMcResponse"),
+            ("\nNOVA_SCRATCH_MC_EXIT=17\n", "ScratchMcFailed"),
+            ('{"status":"error","error":{"cause":{"error":{"Code":"AccessDenied","Message":"SECRET"}}}}\nNOVA_SCRATCH_MC_EXIT=17\n', "ScratchAccessDenied"),
+            ('{"status":"error","error":{"cause":{"error":{"Code":"AccessDenied"}}}}', "ScratchAccessDenied"),
+        ]
+        for output, expected in cases:
+            with self.subTest(expected=expected):
+                error = runtime.RuntimeFailure("DockerOperationTimeout", "cleanup confirmed")
+                error.stdout = output
+                with patch.object(self.backend, "run_mc", side_effect=error):
+                    result = self.sweep(False)
+                self.assertFalse(result["complete"])
+                self.assertEqual(result["errors"][-1]["code"], expected)
+                self.assertNotIn("SECRET", json.dumps(result))
+
     def test_malformed_native_response_cannot_become_empty_success(self):
         for output in ("not json\nNOVA_SCRATCH_MC_EXIT=0", "{}", "\nNOVA_SCRATCH_MC_EXIT=2",
                        '{}\nNOVA_SCRATCH_MC_EXIT=0'):

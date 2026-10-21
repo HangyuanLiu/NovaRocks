@@ -261,13 +261,25 @@ class ScratchSweeper:
         script = ('export MC_HOST_store="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000"\n'
                   "set +e\n" + command + " 2>&1\nnr_mc_exit=$?\n"
                   "printf '\\nNOVA_SCRATCH_MC_EXIT=%s\\n' \"$nr_mc_exit\"\nexit 0")
-        output = self.backend.run_mc(self.record, script, deadline=deadline)
+        timed_out = False
+        try:
+            output = self.backend.run_mc(self.record, script, deadline=deadline)
+        except runtime.RuntimeFailure as error:
+            if error.code == "OperationDeadlineExceeded":
+                raise runtime.RuntimeFailure("ScratchSweepTimeout", "scratch sweep deadline expired before dispatch") from error
+            if error.code != "DockerOperationTimeout":
+                raise
+            timed_out = True
+            output = getattr(error, "stdout", None)
+            if output is None:
+                raise runtime.RuntimeFailure("ScratchSweepTimeout", "scratch mc deadline expired after confirmed cleanup") from error
         if len(output.encode()) > MAX_MC_BYTES:
             raise runtime.RuntimeFailure("InvalidMcResponse", "mc response exceeds byte limit")
         lines = output.splitlines()
-        if not lines or not re.fullmatch(r"NOVA_SCRATCH_MC_EXIT=[0-9]+", lines[-1]):
+        has_status = bool(lines and re.fullmatch(r"NOVA_SCRATCH_MC_EXIT=[0-9]+", lines[-1]))
+        if not has_status and not timed_out:
             raise runtime.RuntimeFailure("InvalidMcResponse", "missing native mc exit")
-        status = int(lines.pop().split("=", 1)[1])
+        status = int(lines.pop().split("=", 1)[1]) if has_status else None
         records, missing = [], False
         body = "\n".join(lines).strip()
         decoder = json.JSONDecoder()
@@ -276,6 +288,10 @@ class ScratchSweeper:
                 value, consumed = decoder.raw_decode(body)
                 body = body[consumed:].lstrip()
             except (TypeError, ValueError) as error:
+                if timed_out and not has_status:
+                    # A deadline may truncate the final JSON object. Complete
+                    # native error objects before it still take precedence.
+                    break
                 raise runtime.RuntimeFailure("InvalidMcResponse", "non-JSON mc response") from error
             if not isinstance(value, dict):
                 raise runtime.RuntimeFailure("InvalidMcResponse", "invalid mc JSON shape")
@@ -293,6 +309,8 @@ class ScratchSweeper:
             records.append(value)
         if status and not (absent_ok and missing and not records):
             raise runtime.RuntimeFailure("ScratchMcFailed", f"mc exited with {status}")
+        if timed_out:
+            raise runtime.RuntimeFailure("ScratchSweepTimeout", "scratch mc deadline expired after confirmed cleanup")
         self._check(deadline)
         return records
 

@@ -107,6 +107,9 @@ if args[0]=='create':
         event('create.exit',code=1)
         raise SystemExit(1)
     save(info)
+    if config.get('hold_created'):
+        event('create.saved')
+        gate('create-release')
     print(info['Id'],flush=True)
     event('create.exit',code=0)
     raise SystemExit(0)
@@ -127,19 +130,24 @@ if args[0]=='start':
         def terminate(signum,frame):
             event('start.signal',signal=signum)
             gate('start-release')
-            event('start.exit',code=128+signum)
-            raise SystemExit(128+signum)
+            code=config.get('start_term_exit',128+signum)
+            event('start.exit',code=code)
+            raise SystemExit(code)
         signal.signal(signal.SIGTERM,terminate)
         while True:time.sleep(0.01)
     if config.get('binary'):
         sys.stdout.buffer.write(b'\x00\xff\x80PAR1\n');sys.stdout.buffer.flush()
     else:
         print('fake mc output',flush=True)
-    event('start.exit',code=0)
-    raise SystemExit(0)
+    code=config.get('start_exit',0)
+    event('start.exit',code=code)
+    raise SystemExit(code)
 if args[:2]==['container','rm']:
     event('rm.entered')
     if config.get('hold_rm'):gate('rm-release')
+    if config.get('rm_exit'):
+        event('rm.exit',code=config['rm_exit'])
+        raise SystemExit(config['rm_exit'])
     info=json.loads(state.read_text())
     assert args==['container','rm','--force',info['Id']],args
     state.unlink();event('rm.exit')
@@ -323,6 +331,47 @@ class MachineOperationTests(unittest.TestCase):
         self.assertFalse(self.lock_held())
         self.assertNotIn("fixture-test-secret", json.dumps(events))
         self.assertEqual(self.journal_path().with_suffix(".env").stat().st_mode & 0o777, 0o600)
+
+    def test_cleaned_start_timeout_with_native_exit_zero_is_typed_timeout(self):
+        self.start_owner(hold_start=True, timeout=0.4, start_term_exit=0)
+        self.until(lambda: self.event("start.signal"), "original start deadline")
+        (self.root / "start-release").touch()
+        self.assertEqual(self.wait_owner(1)["error"], "DockerOperationTimeout")
+        fact = self.fact()
+        self.assertEqual(fact["command_exit"], 0)
+        self.assertTrue(fact["timed_out"])
+        self.assertEqual(fact["phase"], "settled")
+        self.assertTrue(fact["container_absent"])
+        self.assertTrue(fact["group_exit_observed"])
+        self.assertTrue(fact["leader_waited"])
+        self.assertFalse(self.lock_held())
+
+    def test_cleaned_create_timeout_records_top_level_timeout_without_start(self):
+        self.start_owner(hold_created=True, timeout=0.4)
+        self.assertEqual(self.wait_owner(1)["error"], "DockerOperationTimeout")
+        fact = self.fact()
+        self.assertTrue(fact["create_timed_out"])
+        self.assertTrue(fact["timed_out"])
+        self.assertEqual(fact["phase"], "settled")
+        self.assertTrue(fact["container_absent"])
+        self.assertIsNone(self.event("start.entered"))
+        self.assertFalse(self.lock_held())
+
+    def test_native_nonzero_start_stays_failure(self):
+        self.start_owner(start_exit=17)
+        self.assertEqual(self.wait_owner(1)["error"], "DockerOperationFailed")
+        self.assertFalse(self.fact()["timed_out"])
+        self.assertTrue(self.fact()["container_absent"])
+
+    def test_timeout_with_native_cleanup_failure_stays_unconfirmed(self):
+        self.start_owner(hold_start=True, timeout=0.4, rm_exit=17)
+        self.until(lambda: self.event("start.signal"), "original start deadline")
+        (self.root / "start-release").touch()
+        self.assertEqual(self.wait_owner(1)["error"], "ContainerCleanupUnconfirmed")
+        fact = self.fact()
+        self.assertTrue(fact["timed_out"])
+        self.assertEqual(fact["phase"], "cleanup-failed")
+        self.assertTrue((self.root / "container.json").exists())
 
     def test_sigkill_during_create_retains_inherited_flock_through_actual_cleanup(self):
         self.start_owner(hold_create=True, hold_rm=True)
