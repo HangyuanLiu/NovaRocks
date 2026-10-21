@@ -1183,6 +1183,8 @@ fn load_sql_case_from_file_with_variables(
     )?;
     let namespace_rewrites = crate::fixture_context::namespace_mapping(&content, case_variables)?;
     let content = crate::fixture_context::rewrite_namespaces(&content, case_variables)?;
+    let catalogs = crate::catalog_symbol::CatalogSymbols::from_variables(case_variables)?;
+    let content = catalogs.rewrite_source(&content)?;
 
     let lines: Vec<String> = content.lines().map(ToString::to_string).collect();
     let markers: Vec<(usize, usize)> = lines
@@ -1288,7 +1290,8 @@ fn load_sql_case_from_file_with_variables(
         }
         let sql = crate::fixture_context::rewrite_metadata_filters(&sql, &namespace_rewrites);
 
-        let merged_meta = merge_meta(&file_meta, &section_meta);
+        let mut merged_meta = merge_meta(&file_meta, &section_meta);
+        catalogs.rewrite_meta(&mut merged_meta, &sql)?;
         if let Some(contract) = &merged_meta.query_stats_contract {
             if merged_meta.expect_error.is_some()
                 || merged_meta.expect_error_code.is_some()
@@ -1421,10 +1424,17 @@ pub fn load_suite_hook(
         &format!("{}: placeholder substitution", path.display()),
     )?;
     let lines: Vec<String> = content.lines().map(ToString::to_string).collect();
-    let (catalog, db, sql) = extract_suite_hook(&lines, meta_re)
+    let (mut catalog, db, sql) = extract_suite_hook(&lines, meta_re)
         .with_context(|| format!("{}: invalid suite hook metadata", path.display()))?;
     if sql.is_empty() {
         return Ok(None);
+    }
+    let catalogs = crate::catalog_symbol::CatalogSymbols::from_variables(variables)?;
+    let sql = catalogs.rewrite_source(&sql)?;
+    if let Some(value) = &mut catalog {
+        if let Some(mapped) = catalogs.lookup(value) {
+            *value = mapped.into();
+        }
     }
 
     Ok(Some(SuiteHook {

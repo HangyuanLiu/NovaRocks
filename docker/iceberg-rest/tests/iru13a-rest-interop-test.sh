@@ -21,6 +21,9 @@ set -euo pipefail
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 fixture_dir=$(cd "$script_dir/.." && pwd)
 repo_root=$(cd "$fixture_dir/../.." && pwd)
+source "$repo_root/tools/ci/lib/build_capabilities.sh"
+ci_validate_build_environment
+ci_set_default_build_jobs
 
 # Resolve once. The caller owns fixture startup; this driver never changes bindings or inputs.
 publication=$(python3 - "$fixture_dir" <<'PY'
@@ -153,9 +156,11 @@ facts = {
     'lock_sha256': hashlib.sha256(Path('Cargo.lock').read_bytes()).hexdigest(),
 }
 (root / 'source-build-facts.json').write_text(json.dumps(facts, indent=2) + '\n')
+# Keep the canonical development dependency graph; selection below binds only
+# the provider's fourteen ignored tests from the actual Cargo artifact.
 output = run('build', [
-    'cargo', 'test', '--locked', '--offline', '--profile', 'dev', '-j2',
-    '-p', 'novarocks-connector-iceberg', '--lib', '--no-run', '--message-format=json',
+    'cargo', 'build', '--workspace', '--locked', '--offline', '--profile', 'dev',
+    '--target-dir', os.environ['CARGO_TARGET_DIR'], '--tests', '--bins', '--message-format=json',
 ])
 executables = set()
 for line in output.splitlines():

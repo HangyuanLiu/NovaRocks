@@ -17,6 +17,7 @@
 
 mod be_log_directive;
 pub mod build_information;
+mod catalog_symbol;
 mod cluster;
 mod config;
 mod control_plan;
@@ -2537,12 +2538,23 @@ fn run_case_observed(
                         if let Some(step) =
                             case.steps.iter().find(|step| step.query_number == *query)
                         {
-                            fixture_context::render_expected_result(
+                            if let Err(error) = fixture_context::render_expected_result(
                                 &step.sql,
                                 result,
                                 &case.expected_variables,
                                 &case.namespace_rewrites,
-                            );
+                            ) {
+                                let _ = writeln!(
+                                    log,
+                                    "    ❌ expected catalog metadata binding failed: {error:#}"
+                                );
+                                return CaseOutcome {
+                                    case_id: case.case_id.clone(),
+                                    status: CaseStatus::Fail,
+                                    elapsed: case_elapsed,
+                                    log,
+                                };
+                            }
                         }
                     }
                     Some(results)
@@ -5680,10 +5692,9 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         fixture_context::admit(&runner_config, &base_dir, cli.fixture_budget_secs)?;
     let naming_sources =
         fixture_context::selected_sources(&cli, &base_dir, &suite_names, &suite_configs)?;
-    runner_config.fixture_names = Some(Arc::new(fixture_context::RunNames::prepare(
-        &fixture_budget,
-        &naming_sources,
-    )?));
+    let mut fixture_names = fixture_context::RunNames::prepare(&fixture_budget, &naming_sources)?;
+    fixture_names.seal_catalogs(&runner_config, &naming_sources, &suite_configs)?;
+    runner_config.fixture_names = Some(Arc::new(fixture_names));
     fixture_context::startup_sweep(&runner_config, &base_dir, &fixture_budget)?;
     // Before the proxy: it forwards to whatever REST Catalog this run uses, and
     // an isolated one has to exist first.
@@ -5890,11 +5901,17 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                         format!("failed to load suite cleanup hook for {}", suite.name)
                     })?;
 
+            let catalog = suite_init_hook
+                .as_ref()
+                .and_then(|hook| hook.catalog.clone())
+                .unwrap_or_else(|| suite.default_catalog.clone());
             let suite_catalog_override = Some(
-                suite_init_hook
+                runner_config
+                    .fixture_names
                     .as_ref()
-                    .and_then(|hook| hook.catalog.clone())
-                    .unwrap_or_else(|| suite.default_catalog.clone()),
+                    .and_then(|names| names.catalogs.lookup(&catalog))
+                    .unwrap_or(&catalog)
+                    .to_string(),
             );
             let suite_db_override = suite_init_hook.as_ref().and_then(|hook| hook.db.clone());
 

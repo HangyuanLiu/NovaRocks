@@ -32,6 +32,8 @@ pub(crate) struct RunNames {
     pub run_id: String,
     pub scope: String,
     pub suites: BTreeMap<String, SuiteNames>,
+    pub catalogs: crate::catalog_symbol::CatalogSymbols,
+    hms_warehouses: BTreeMap<String, String>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct SuiteNames {
@@ -77,6 +79,18 @@ fn variant_producer_command() -> Result<Regex> {
         r#"^\s*"\$\{NOVAROCKS_WORKSPACE_ROOT:-\.\}/tests/sql/fixtures/iceberg-variant/run\.sh"\s+--mode\s+(unshredded|shredded|bounds|nested|uuid|write-target|empty-int|empty-bigint|empty-region|observe|unchanged)\s+--namespace\s+([A-Za-z0-9_${}]+)\s+--table\s+[A-Za-z0-9_]+\s+--output\s+"\$receipt_dir"(?:\s+>"\$receipt_dir/run\.log")?\s*$"#,
     )?)
 }
+// These match the complete, versioned producer commands. Read/cleanup modes
+// refer to a declaration from the same source; they never mint another scope.
+fn hms_producer_command() -> Result<Regex> {
+    Ok(Regex::new(
+        r#"^\s*python3\s+"\$\{NOVAROCKS_WORKSPACE_ROOT:-\.\}/tests/sql/fixtures/iceberg-hms/fixture\.py"\s+(prepare|before|after|cleanup)\s+([A-Za-z0-9_${}]+)\s*$"#,
+    )?)
+}
+fn trino_producer_command() -> Result<Regex> {
+    Ok(Regex::new(
+        r#"^\s*"\$\{NOVAROCKS_WORKSPACE_ROOT:-\.\}/tests/datasketches-tck/interop/trino/verify_rest_catalog\.sh"\s+(create-parent|verify-current)\s+([A-Za-z0-9_${}]+)\s+[A-Za-z0-9_${}]+(?:\s+id\s+4\s+3\s+1\s+3)?\s*$"#,
+    )?)
+}
 fn shell_line<'a>(line: &'a str, shell: &mut bool) -> Option<&'a str> {
     let trimmed = line.trim_start();
     if trimmed.to_ascii_lowercase().starts_with("-- query ") {
@@ -94,11 +108,24 @@ fn shell_line<'a>(line: &'a str, shell: &mut bool) -> Option<&'a str> {
 pub(crate) fn namespace_declarations(source: &str) -> Result<BTreeSet<String>> {
     let mut declared = sql_namespace_declarations(source)?;
     let producer = variant_producer_command()?;
+    let hms = hms_producer_command()?;
+    let trino = trino_producer_command()?;
     let mut shell = false;
     for line in source.lines() {
         if let Some(command) = shell_line(line, &mut shell) {
             if let Some(capture) = producer.captures(command) {
                 if !matches!(&capture[1], "observe" | "unchanged") {
+                    declared.insert(capture[2].to_string());
+                }
+            }
+            if let Some(capture) = hms.captures(command) {
+                if &capture[1] == "prepare" {
+                    declared.insert(capture[2].to_string());
+                    declared.insert(format!("{}_new", &capture[2]));
+                }
+            }
+            if let Some(capture) = trino.captures(command) {
+                if &capture[1] == "create-parent" && !command.trim_end().ends_with(" id 4 3 1 3") {
                     declared.insert(capture[2].to_string());
                 }
             }
@@ -198,7 +225,69 @@ impl RunNames {
             run_id: run.identity().run_id.clone(),
             scope: run.identity().scope_root.clone(),
             suites: names,
+            catalogs: Default::default(),
+            hms_warehouses: Default::default(),
         })
+    }
+    /// Second pass: hook roles never participate in case ordinal allocation.
+    pub fn seal_catalogs(
+        &mut self,
+        config: &RunnerConfig,
+        sources: &BTreeMap<String, Vec<std::path::PathBuf>>,
+        suites: &BTreeMap<String, SuiteConfig>,
+    ) -> Result<()> {
+        let mut rendered = Vec::new();
+        let machine = config
+            .values
+            .get("fixture_env_file")
+            .map(|env| -> Result<bool> {
+                let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
+                    Path::new(env).with_file_name("manifest.json"),
+                )?)?;
+                Ok(manifest["runtime"]["machine"].is_object())
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let hms = hms_producer_command()?;
+        for (suite, files) in sources {
+            if machine {
+                for file in files {
+                    let source = std::fs::read_to_string(file)?;
+                    let mut shell = false;
+                    if source.lines().any(|line| {
+                        shell_line(line, &mut shell)
+                            .and_then(|command| hms.captures(command))
+                            .is_some_and(|capture| &capture[1] == "prepare")
+                    }) {
+                        self.hms_warehouses
+                            .insert(suite.clone(), format!("{}/hms", self.scope));
+                    }
+                }
+            }
+
+            let mut variables = config.values.clone();
+            crate::config::apply_suite_placeholder_defaults(&mut variables, suite);
+            self.extend_suite_variables(suite, &mut variables)?;
+            variables.insert("suite".into(), suite.clone());
+            for path in [&suites[suite].init_sql, &suites[suite].cleanup_sql]
+                .into_iter()
+                .flatten()
+            {
+                if path.exists() {
+                    rendered.push(render_expected(&std::fs::read_to_string(path)?, &variables));
+                }
+            }
+            for file in files {
+                let case = file
+                    .file_stem()
+                    .and_then(|v| v.to_str())
+                    .context("invalid case identity")?;
+                let variables = crate::config::case_placeholder_variables(&variables, case)?;
+                rendered.push(render_expected(&std::fs::read_to_string(file)?, &variables));
+            }
+        }
+        self.catalogs = crate::catalog_symbol::CatalogSymbols::seal(&self.run_id, &rendered)?;
+        Ok(())
     }
     pub fn extend_suite_variables(
         &self,
@@ -212,10 +301,14 @@ impl RunNames {
         variables.insert("run_id".into(), self.run_id.clone());
         variables.insert("suite_run_id".into(), self.run_id.clone());
         variables.insert("__scratch_scope".into(), self.scope.clone());
+        if let Some(warehouse) = self.hms_warehouses.get(suite) {
+            variables.insert("iceberg_hms_warehouse".into(), warehouse.clone());
+        }
         variables.insert("__suite_ordinal".into(), names.ordinal.to_string());
         for (case, ordinal) in &names.cases {
             variables.insert(format!("__case_ordinal.{case}"), ordinal.to_string());
         }
+        self.catalogs.extend_variables(variables)?;
         for slot in 0..10 {
             let name = resource(&self.run_id, 's', names.ordinal, slot)?;
             variables.insert(format!("suite_uuid{slot}"), name.clone());
@@ -351,6 +444,8 @@ pub(crate) fn rewrite_namespaces(
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
     let producer = variant_producer_command()?;
+    let hms = hms_producer_command()?;
+    let trino = trino_producer_command()?;
     let mut result = String::new();
     let mut sql = String::new();
     let mut shell = false;
@@ -371,6 +466,39 @@ pub(crate) fn rewrite_namespaces(
                 // Producer-only ownership changes its namespace argument, never
                 // unrelated shell values or arbitrary commands in the block.
                 let mut rewritten = replace_references(line, &sql_mapping);
+                let original_command = line.trim_start().strip_prefix("shell:").unwrap_or(line);
+                if let Some(capture) = hms.captures(original_command) {
+                    if let (Some(base), Some(sibling)) = (
+                        mapping.get(&capture[2]),
+                        mapping.get(&format!("{}_new", &capture[2])),
+                    ) {
+                        let argument = capture.get(2).unwrap();
+                        let offset = line.len() - original_command.len();
+                        let mut exact = line.to_string();
+                        exact.replace_range(
+                            offset + argument.start()..offset + argument.end(),
+                            base,
+                        );
+                        let newline = if exact.ends_with('\n') { "\n" } else { "" };
+                        rewritten =
+                            format!("{} --new-namespace {sibling}{newline}", exact.trim_end());
+                    }
+                } else if let Some(capture) = trino.captures(original_command) {
+                    let read = &capture[1] == "verify-current";
+                    ensure!(
+                        read == original_command.trim_end().ends_with(" id 4 3 1 3"),
+                        "invalid versioned Trino producer argument shape"
+                    );
+                    if let Some(base) = mapping.get(&capture[2]) {
+                        let argument = capture.get(2).unwrap();
+                        let offset = line.len() - original_command.len();
+                        rewritten = line.to_string();
+                        rewritten.replace_range(
+                            offset + argument.start()..offset + argument.end(),
+                            base,
+                        );
+                    }
+                }
                 let command = rewritten
                     .trim_start()
                     .strip_prefix("shell:")
@@ -391,6 +519,122 @@ pub(crate) fn rewrite_namespaces(
         }
     }
     result.push_str(&rewrite_sql_identifiers(&sql, &mapping));
+    result = rewrite_delta_namespace_refs(&result, &mapping)?;
+    let mut shell = false;
+    let families: Vec<_> = source
+        .lines()
+        .filter_map(|line| {
+            shell_line(line, &mut shell)
+                .and_then(|command| hms.captures(command))
+                .filter(|capture| &capture[1] == "prepare")
+                .map(|capture| capture[2].to_string())
+        })
+        .collect();
+    if !families.is_empty() {
+        if let Some(warehouse) = variables.get("iceberg_hms_warehouse") {
+            use novarocks_parser::ast::{
+                IcebergStatement, IcebergTableAction, LiteralKind, Statement,
+            };
+            let masked = crate::catalog_symbol::sql_source(&result);
+            let mut edits = Vec::new();
+            for range in crate::catalog_symbol::ranges(&masked)? {
+                let sql = &masked[range.clone()];
+                if let Ok(statements) = novarocks_parser::parse(sql) {
+                    for statement in statements {
+                        if let Statement::Iceberg(IcebergStatement::AlterTable(table)) = statement {
+                            if let IcebergTableAction::AddFiles(files) = table.action {
+                                if let LiteralKind::String(value) = &files.location.kind {
+                                    for family in &families {
+                                        if value
+                                            == &format!(
+                                                "{}/iru7/{family}/v1/data",
+                                                warehouse.trim_end_matches('/')
+                                            )
+                                        {
+                                            if let Some(mapped) = mapping.get(family) {
+                                                edits.push((
+                                                    range.start + files.location.span.start(),
+                                                    range.start + files.location.span.end(),
+                                                    format!(
+                                                        "'{}/iru7/{mapped}/v1/data'",
+                                                        warehouse.trim_end_matches('/')
+                                                    ),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (start, end, value) in edits.into_iter().rev() {
+                result.replace_range(start..end, &value);
+            }
+        }
+    }
+    Ok(result)
+}
+// The internal delta TVF's first argument is a table identity. It is not an
+// ordinary SQL string; only its namespace component consumes this mapping.
+fn rewrite_delta_namespace_refs(
+    source: &str,
+    mapping: &BTreeMap<String, String>,
+) -> Result<String> {
+    use novarocks_parser::ast::{Expr, FunctionCall, LiteralKind, Visit, walk_function_call};
+    struct References<'a> {
+        mapping: &'a BTreeMap<String, String>,
+        edits: Vec<(usize, usize, String)>,
+    }
+    impl Visit for References<'_> {
+        fn visit_function_call(&mut self, call: &FunctionCall) {
+            if call.name.parts.len() == 1
+                && call.name.parts[0]
+                    .value
+                    .eq_ignore_ascii_case("__nr_ivm_delta")
+            {
+                if let Some(Expr::Literal(literal)) = call.arguments.first() {
+                    if let LiteralKind::String(value) = &literal.kind {
+                        let parts: Vec<_> = value.split('.').collect();
+                        if parts.len() == 3 {
+                            if let Some(namespace) = self.mapping.get(parts[1]) {
+                                self.edits.push((
+                                    literal.span.start(),
+                                    literal.span.end(),
+                                    format!("'{}.{namespace}.{}'", parts[0], parts[2]),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            walk_function_call(self, call);
+        }
+    }
+    let masked = crate::catalog_symbol::sql_source(source);
+    let mut edits = Vec::new();
+    for range in crate::catalog_symbol::ranges(&masked)? {
+        if let Ok(statements) = novarocks_parser::parse(&masked[range.clone()]) {
+            let mut visitor = References {
+                mapping,
+                edits: Vec::new(),
+            };
+            for statement in &statements {
+                visitor.visit_statement(statement);
+            }
+            edits.extend(
+                visitor
+                    .edits
+                    .into_iter()
+                    .map(|(start, end, value)| (range.start + start, range.start + end, value)),
+            );
+        }
+    }
+    let mut result = source.to_string();
+    for (start, end, value) in edits.into_iter().rev() {
+        result.replace_range(start..end, &value);
+    }
     Ok(result)
 }
 pub(crate) fn namespace_mapping(
@@ -485,7 +729,7 @@ pub(crate) fn render_expected_result(
     result: &mut crate::types::ResultSet,
     variables: &HashMap<String, String>,
     mapping: &BTreeMap<String, String>,
-) {
+) -> Result<()> {
     for cell in result
         .header
         .iter_mut()
@@ -520,6 +764,9 @@ pub(crate) fn render_expected_result(
             }
         }
     }
+    crate::catalog_symbol::CatalogSymbols::from_variables(variables)?
+        .render_expected(sql, result)?;
+    Ok(())
 }
 fn replace_references(text: &str, mapping: &BTreeMap<String, String>) -> String {
     let mut text = text.to_string();
@@ -666,6 +913,8 @@ fn rewrite_sql_identifiers(line: &str, mapping: &BTreeMap<String, String>) -> St
 #[cfg(test)]
 pub(crate) fn test_names(suite: &str, cases: &[&str]) -> RunNames {
     RunNames {
+        catalogs: Default::default(),
+        hms_warehouses: Default::default(),
         run_id: "nr_scratch_1792540800000_0123456789abcdef0123456789abcdef".into(),
         scope:
             "s3://novarocks/test/scratch/nr_scratch_1792540800000_0123456789abcdef0123456789abcdef"
@@ -695,6 +944,75 @@ pub(crate) fn test_variables(cases: &[&str]) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_hms_pair_and_trino_writer_bind_references_without_new_observer_ownership() {
+        let mut vars =
+            crate::config::case_placeholder_variables(&test_variables(&["case"]), "case").unwrap();
+        vars.insert(
+            "iceberg_hms_warehouse".into(),
+            "s3://novarocks/unit/hms".into(),
+        );
+        let base = format!("iru7_{}", vars["uuid0"]);
+        let producer = format!(
+            r#"python3 "${{NOVAROCKS_WORKSPACE_ROOT:-.}}/tests/sql/fixtures/iceberg-hms/fixture.py" prepare {base}"#
+        );
+        let source = format!(
+            "-- query 1\nshell: {producer}\n-- query 2\nCREATE DATABASE c.{base}_new;\nALTER TABLE c.{base}.v2 ADD FILES FROM 's3://novarocks/unit/hms/iru7/{base}/v1/data';\nSELECT 's3://novarocks/unit/hms/iru7/{base}/v1/data';\n-- query 3\nshell: {}\n",
+            producer.replace(" prepare ", " after ")
+        );
+        let mapping = namespace_mapping(&source, &vars).unwrap();
+        let out = rewrite_namespaces(&source, &vars).unwrap();
+        let mapped = &mapping[&base];
+        let sibling = &mapping[&format!("{base}_new")];
+        assert_ne!(mapped, sibling);
+        assert_eq!(mapped.len(), 63);
+        assert_eq!(sibling.len(), 63);
+        assert!(out.contains(&format!("prepare {mapped} --new-namespace {sibling}")));
+        assert!(out.contains(&format!("after {mapped} --new-namespace {sibling}")));
+        assert!(out.contains(&format!(
+            "ADD FILES FROM 's3://novarocks/unit/hms/iru7/{mapped}/v1/data'"
+        )));
+        assert!(out.contains(&format!(
+            "SELECT 's3://novarocks/unit/hms/iru7/{base}/v1/data'"
+        )));
+        assert!(
+            namespace_declarations(&source.replace(" prepare ", " before "))
+                .unwrap()
+                .iter()
+                .all(|name| name != &base)
+        );
+        let trino = r#""${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/datasketches-tck/interop/trino/verify_rest_catalog.sh""#;
+        let source = format!(
+            "-- query 1\nshell: {trino} create-parent producer_ns table1\n-- query 2\nSELECT * FROM c.producer_ns.table1;\n-- query 3\nshell: {trino} verify-current producer_ns table1 id 4 3 1 3\n"
+        );
+        let mapping = namespace_mapping(&source, &vars).unwrap();
+        let out = rewrite_namespaces(&source, &vars).unwrap();
+        assert!(out.contains(&format!("create-parent {} table1", mapping["producer_ns"])));
+        assert!(out.contains(&format!(
+            "verify-current {} table1 id 4 3 1 3",
+            mapping["producer_ns"]
+        )));
+        assert!(out.contains(&format!("c.{}.table1", mapping["producer_ns"])));
+        assert!(
+            namespace_declarations(&source.replace("create-parent", "verify-current"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            namespace_declarations("shell: arbitrary --namespace producer_ns")
+                .unwrap()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn delta_tvf_first_argument_uses_namespace_identity_but_ordinary_literals_do_not() {
+        let mapping = BTreeMap::from([("old_ns".into(), "canonical_namespace".into())]);
+        let sql =
+            "SELECT 'c.old_ns.t', ordinary('c.old_ns.t') FROM __nr_ivm_delta('c.old_ns.t',0,0);";
+        let out = rewrite_delta_namespace_refs(sql, &mapping).unwrap();
+        assert!(out.contains("SELECT 'c.old_ns.t', ordinary('c.old_ns.t')"));
+        assert!(out.contains("__nr_ivm_delta('c.canonical_namespace.t',0,0)"));
+    }
     #[test]
     fn explicit_startup_sweep_skips_private_publications_without_starting_a_command() {
         let root = tempfile::tempdir().unwrap();
@@ -950,7 +1268,8 @@ print(json.dumps({'complete':True,'pending':False,'errors':[],'removed':[]}))
             &mut result,
             &vars,
             &mapping,
-        );
+        )
+        .unwrap();
         assert_eq!(result.rows[0], vec![expected, "raw_namespace".to_string()]);
     }
     #[test]
@@ -992,7 +1311,7 @@ print(json.dumps({'complete':True,'pending':False,'errors':[],'removed':[]}))
             header: vec!["schema_name".into(), "data_value".into()],
             rows: vec![vec!["old_ns".into(), "old_ns".into()]],
         };
-        render_expected_result(&actual, &mut result, &HashMap::new(), &mapping);
+        render_expected_result(&actual, &mut result, &HashMap::new(), &mapping).unwrap();
         assert_eq!(result.rows[0], vec!["new_ns", "old_ns"]);
     }
     #[test]

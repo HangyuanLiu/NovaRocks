@@ -33,6 +33,7 @@ import re
 import subprocess
 import signal
 import sys
+import time
 import urllib.parse
 import urllib.request
 import uuid
@@ -46,7 +47,7 @@ import time
 from pyspark.sql import SparkSession
 
 spark = SparkSession.builder.getOrCreate()
-action, ns, warehouse = sys.argv[1:]
+action, ns, new_ns, warehouse = sys.argv[1:]
 root = warehouse.rstrip('/') + '/iru7/' + ns
 prefix = 'hms_catalog.' + ns
 if action == 'prepare':
@@ -79,7 +80,7 @@ if action == 'prepare':
         locations['v' + str(version)] = actual
     result = {'prepared': ns, 'actual_locations': locations}
 elif action == 'snapshot':
-    namespaces = sorted(row[0] for row in spark.sql('SHOW NAMESPACES IN hms_catalog').collect() if row[0] in [ns, ns + '_new'])
+    namespaces = sorted(row[0] for row in spark.sql('SHOW NAMESPACES IN hms_catalog').collect() if row[0] in [ns, new_ns])
     result = {'namespaces': namespaces, 'tables': {}, 'views': {}, 'metadata_location': {}}
     for namespace in namespaces:
         qualified = 'hms_catalog.' + namespace
@@ -97,7 +98,7 @@ elif action == 'snapshot':
             # This is the current pointer, not the last historical log entry.
             result['metadata_location'][namespace + '.' + name] = table.operations().current().metadataFileLocation()
 elif action == 'cleanup':
-    namespaces = [row[0] for row in spark.sql('SHOW NAMESPACES IN hms_catalog').collect() if row[0] in [ns, ns + '_new']]
+    namespaces = [row[0] for row in spark.sql('SHOW NAMESPACES IN hms_catalog').collect() if row[0] in [ns, new_ns]]
     for namespace in namespaces:
         qualified = 'hms_catalog.' + namespace
         for row in spark.sql('SHOW TABLES IN ' + qualified).collect():
@@ -111,7 +112,9 @@ spark.stop()
 '''
 
 
-def run_spark(workspace, action, namespace):
+def run_spark(workspace, action, namespace, *, new_namespace=None):
+    if new_namespace is None:
+        new_namespace = namespace + '_new'
     required = ['NOVA_ENV_COMPOSE_ENV', 'NOVA_ENV_COMPOSE_PROJECT',
                 'NOVA_ENV_COMPOSE_FILE', 'NOVAROCKS_SPARK_DEFAULTS',
                 'NOVAROCKS_SPARK_HMS_DEFAULTS', 'NOVAROCKS_ICEBERG_HMS_WAREHOUSE']
@@ -135,7 +138,7 @@ def run_spark(workspace, action, namespace):
                            input=content, text=True, check=True)
         output = subprocess.run(compose + ['/opt/spark/bin/spark-submit',
                                  '--properties-file', folder + '/spark-defaults.conf',
-                                 folder + '/fixture.py', action, namespace,
+                                 folder + '/fixture.py', action, namespace, new_namespace,
                                  os.environ['NOVAROCKS_ICEBERG_HMS_WAREHOUSE']],
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if output.returncode:
@@ -190,23 +193,25 @@ def s3_request(bucket, parameters, method="GET", key=""):
         return ET.fromstring(body) if body else None
 
 
-def inventory(namespace):
+def inventory(namespace, *, new_namespace=None):
+    if new_namespace is None:
+        new_namespace = namespace + '_new'
     warehouse = urllib.parse.urlsplit(os.environ['NOVAROCKS_ICEBERG_HMS_WAREHOUSE'])
     if warehouse.scheme != 's3' or not warehouse.netloc:
         raise RuntimeError('HMS fixture must use the generated s3 warehouse')
     base = warehouse.path.strip('/')
     # Include the explicit namespace location and the owner's default locations
     # for attempted sibling namespace/table creations. Never inventory only v3.
-    prefixes = [base + '/iru7/' + namespace + '/', base + '/' + namespace + '/',
-                base + '/' + namespace + '_new/', base + '/' + namespace + '.db/',
-                base + '/' + namespace + '_new.db/']
+    prefixes = [base + '/iru7/' + namespace + '/']
+    prefixes += [base + '/' + name + suffix for name in [namespace, new_namespace]
+                 for suffix in ['/', '.db/']]
     prefixes = [(warehouse.netloc, prefix) for prefix in prefixes]
     original = os.environ.get('NOVA_FIXTURE_HMS_ORIGINAL_WAREHOUSE')
     if original:
         original = urllib.parse.urlsplit(original)
         original_base = original.path.strip('/')
-        prefixes += [(original.netloc, original_base + '/' + namespace + suffix) for suffix in
-                     ['/', '_new/', '.db/', '_new.db/']]
+        prefixes += [(original.netloc, original_base + '/' + name + suffix)
+                     for name in [namespace, new_namespace] for suffix in ['/', '.db/']]
     objects = {}
     pages = 0
     xml_ns = {'s': 'http://s3.amazonaws.com/doc/2006-03-01/'}
@@ -242,6 +247,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['prepare', 'before', 'after', 'cleanup'])
     parser.add_argument('namespace')
+    parser.add_argument('--new-namespace')
     parser.add_argument('--fixture-budget-secs', type=int, default=3600)
     arguments = parser.parse_args()
     os.environ["NOVA_FIXTURE_BUDGET_SECS"] = str(arguments.fixture_budget_secs)
@@ -255,24 +261,37 @@ def main():
     if arguments.action == "cleanup" and os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") not in (None, "null"):
         os.environ["NOVA_FIXTURE_CLEANUP_MODE"] = "true"
     _, _, budget = fixture_run.admit(env_file)
+    new_namespace = arguments.new_namespace
     if budget:
+        if (new_namespace is None or new_namespace == arguments.namespace
+                or any(resource_run(name) != budget.identity.run_id
+                       for name in [arguments.namespace, new_namespace])):
+            parser.error('shared HMS namespaces must be distinct resources of the original scratch run')
         os.environ['NOVA_FIXTURE_RUN_CONTEXT'] = json.dumps(budget.as_dict(), sort_keys=True)
         def expired(number, frame):
             raise RuntimeError('original shared fixture deadline expired')
         signal.signal(signal.SIGALRM, expired)
         signal.setitimer(signal.ITIMER_REAL, max(0.001, budget.remaining_seconds(work=arguments.action != 'cleanup')))
-        if arguments.action == 'prepare' and resource_run(arguments.namespace) != budget.identity.run_id:
-            parser.error('shared HMS namespace must belong to the original scratch run')
         os.environ['NOVA_FIXTURE_HMS_ORIGINAL_WAREHOUSE'] = os.environ['NOVAROCKS_ICEBERG_HMS_WAREHOUSE']
         os.environ['NOVAROCKS_ICEBERG_HMS_WAREHOUSE'] = budget.identity.scope_root + '/hms'
+    elif new_namespace is None:
+        new_namespace = arguments.namespace + '_new'
+    else:
+        private_run = resource_run(arguments.namespace)
+        legacy_pair = (re.fullmatch(r'iru7_[a-z0-9_]+', arguments.namespace)
+                       and re.fullmatch(r'iru7_[a-z0-9_]+', new_namespace))
+        canonical_pair = (private_run is not None and resource_run(new_namespace) == private_run)
+        if new_namespace == arguments.namespace or not (legacy_pair or canonical_pair):
+            parser.error('private HMS namespaces must be distinct iru7_ identifiers or resources of one complete run')
     if arguments.action == 'prepare' and budget:
         fixture_run.startup_sweep(env_file, budget=budget)
     evidence = workspace / 'tests/sql/.runtime/hms-evidence' / arguments.namespace
     evidence.mkdir(parents=True, exist_ok=True)
     if arguments.action in ['before', 'after']:
-        catalog = run_spark(workspace, 'snapshot', arguments.namespace)
-        objects, pages = inventory(arguments.namespace)
-        snapshot = {'catalog': catalog, 'objects': objects}
+        catalog = run_spark(workspace, 'snapshot', arguments.namespace, new_namespace=new_namespace)
+        objects, pages = inventory(arguments.namespace, new_namespace=new_namespace)
+        snapshot = {'namespace_family': [arguments.namespace, new_namespace],
+                    'catalog': catalog, 'objects': objects}
         (evidence / (arguments.action + '.json')).write_text(json.dumps(snapshot, indent=2, sort_keys=True) + '\n')
         if arguments.action == 'after':
             before = json.loads((evidence / 'before.json').read_text())
@@ -284,15 +303,15 @@ def main():
                 raise RuntimeError('before snapshot lacks the complete, paginated three-table fixture')
             print('INVENTORY_CAPTURED objects=' + str(len(objects)) + ' pages=' + str(pages))
     else:
-        run_spark(workspace, arguments.action, arguments.namespace)
+        run_spark(workspace, arguments.action, arguments.namespace, new_namespace=new_namespace)
         if arguments.action == 'cleanup':
             # Spark PURGE owns catalog teardown. Remove only remaining objects
             # in the exact random namespace prefixes, including directory markers.
-            objects, _ = inventory(arguments.namespace)
+            objects, _ = inventory(arguments.namespace, new_namespace=new_namespace)
             for uri in objects:
                 object_location = urllib.parse.urlsplit(uri)
                 s3_request(object_location.netloc, {}, method='DELETE', key=object_location.path.lstrip('/'))
-            remaining, _ = inventory(arguments.namespace)
+            remaining, _ = inventory(arguments.namespace, new_namespace=new_namespace)
             if remaining:
                 raise RuntimeError('private HMS fixture objects remain after cleanup')
         print('HMS_' + arguments.action.upper() + '_OK')
