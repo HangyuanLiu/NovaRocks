@@ -343,14 +343,29 @@ class TerminalPortRecoveryTests(unittest.TestCase):
 
 
 class CredentialFenceTests(unittest.TestCase):
-    def probe(self, value, native_exit=1):
+    def probe_output(self, output):
         backend = machine.MachineDocker()
-        output = json.dumps(value, indent=2) + f"\nNOVA_FIXTURE_FENCE_EXIT={native_exit}\n"
         with mock.patch.object(backend, "run_mc", return_value=output) as run:
             backend.assert_old_root_revoked({"saved": "old private env"})
             script = run.call_args.args[1]
             self.assertNotIn("|| true", script)
             self.assertIn("nr_fence_exit=$?", script)
+
+    def probe(self, value, native_exit=1):
+        self.probe_output(json.dumps(value, indent=2) + f"\nNOVA_FIXTURE_FENCE_EXIT={native_exit}\n")
+
+    @staticmethod
+    def denial(code="InvalidAccessKeyId"):
+        return {"status": "error", "error": {"cause": {"error": {"Code": code}}}}
+
+    @staticmethod
+    def summary():
+        return {"status": "error", "error": {
+            "message": "Unable to stat `prior/warehouse`.", "type": "fatal",
+            "cause": {"message": "Object does not exist", "error": {}}}}
+
+    def stream(self, values, native_exit=1):
+        return "\n".join(json.dumps(value, indent=2) for value in values) + f"\nNOVA_FIXTURE_FENCE_EXIT={native_exit}\n"
 
     def test_indented_native_access_rejection_proves_fence(self):
         self.probe({"status": "error", "error": {"message": "stat failed", "cause": {
@@ -367,6 +382,69 @@ class CredentialFenceTests(unittest.TestCase):
             with self.subTest(value=value, native_exit=native_exit):
                 with self.assertRaisesRegex(runtime.RuntimeFailure, "CredentialFenceUnconfirmed"):
                     self.probe(value, native_exit)
+
+    def test_native_stat_denial_stream_and_exact_final_summary_prove_fence(self):
+        # Native mc reports the S3 rejection, then stat's ObjectMissing summary.
+        self.probe_output(self.stream([self.denial(), self.summary()]))
+        self.probe_output(self.stream([self.denial(), self.denial("AccessDenied"), self.summary()]))
+        self.probe_output(self.stream([self.denial(), self.denial("InvalidToken")]))
+
+    def test_native_summary_cannot_prove_fence_or_hide_another_failure(self):
+        cases = [
+            [self.summary()],
+            [self.summary(), self.denial()],
+            [self.denial(), self.summary(), self.summary()],
+            [self.denial(), {"status": "success"}, self.summary()],
+            [self.denial(), self.denial("ConnectionRefused"), self.summary()],
+            [self.denial(), self.denial("InternalError"), self.summary()],
+            [self.denial(), self.denial("NoSuchBucket"), self.summary()],
+            [self.denial(), {"status": "error", "error": {"type": "fatal", "message": "AccessDenied"}}],
+        ]
+        for values in cases:
+            with self.subTest(values=values):
+                with self.assertRaisesRegex(runtime.RuntimeFailure, "CredentialFenceUnconfirmed"):
+                    self.probe_output(self.stream(values))
+
+    def test_summary_requires_exact_target_cause_and_shape(self):
+        for mutation in ("target", "cause", "native", "extra", "type"):
+            summary = self.summary()
+            if mutation == "target": summary["error"]["message"] = "Unable to stat `other/bucket`."
+            if mutation == "cause": summary["error"]["cause"]["message"] = "Connection refused"
+            if mutation == "native": summary["error"]["cause"]["error"]["Code"] = "InternalError"
+            if mutation == "extra": summary["error"]["extra"] = "unknown"
+            if mutation == "type": summary["error"]["type"] = "error"
+            with self.subTest(mutation=mutation):
+                with self.assertRaisesRegex(runtime.RuntimeFailure, "CredentialFenceUnconfirmed"):
+                    self.probe_output(self.stream([self.denial(), summary]))
+
+    def test_stream_requires_nonzero_native_footer_and_complete_unambiguous_json(self):
+        valid = self.stream([self.denial(), self.summary()])
+        body = valid[:valid.index("NOVA_FIXTURE_FENCE_EXIT=")]
+        cases = [
+            "NOVA_FIXTURE_FENCE_EXIT=1\n",
+            body,
+            self.stream([self.denial(), self.summary()], 0),
+            body + "NOVA_FIXTURE_FENCE_EXIT=invalid\n",
+            body + "NOVA_FIXTURE_FENCE_EXIT=256\n",
+            valid + "unknown trailing diagnostic\n",
+            json.dumps(self.denial()) + '\n{"status":"error"\nNOVA_FIXTURE_FENCE_EXIT=1\n',
+            body + 'not JSON\nNOVA_FIXTURE_FENCE_EXIT=1\n',
+            '{"status":"success","status":"error","error":{"code":"AccessDenied"}}\nNOVA_FIXTURE_FENCE_EXIT=1\n',
+            '{"status":"error","error":{"code":"AccessDenied"},"unknown":NaN}\nNOVA_FIXTURE_FENCE_EXIT=1\n',
+        ]
+        for output in cases:
+            with self.subTest(output=output):
+                with self.assertRaisesRegex(runtime.RuntimeFailure, "CredentialFenceUnconfirmed"):
+                    self.probe_output(output)
+
+    def test_auth_code_cannot_hide_native_http_server_failure(self):
+        for status in (500, 503, "403", True):
+            denial = self.denial()
+            denial["error"]["cause"]["error"]["StatusCode"] = status
+            with self.subTest(status=status):
+                with self.assertRaisesRegex(runtime.RuntimeFailure, "CredentialFenceUnconfirmed"):
+                    self.probe_output(self.stream([denial, self.summary()]))
+
 
 
 class SnapshotDeadlineTests(unittest.TestCase):

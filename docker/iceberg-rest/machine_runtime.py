@@ -362,20 +362,48 @@ class MachineDocker(runtime.Docker):
         status = lines.pop()[len(marker):]
         if not status.isdecimal() or not 0 < int(status) <= 255:
             raise runtime.RuntimeFailure("CredentialFenceUnconfirmed", "old root rejection was not observed")
-        # mc prints error objects with indentation. Parse complete JSON rather
-        # than lines or substrings in human-readable diagnostic messages.
+        # mc emits a stream of complete error objects, possibly followed by
+        # stat's fixed ObjectMissing summary. Every native error must prove an
+        # auth denial; the summary alone never proves a credential fence.
+        def unique_object(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("duplicate JSON member")
+                value[key] = item
+            return value
+
+        def invalid_constant(value):
+            raise ValueError("non-finite JSON value")
+
         try:
-            value = json.loads("\n".join(lines))
-        except (ValueError, TypeError) as error:
+            decoder = json.JSONDecoder(object_pairs_hook=unique_object, parse_constant=invalid_constant)
+            remaining = "\n".join(lines).lstrip()
+            values = []
+            while remaining:
+                value, end = decoder.raw_decode(remaining)
+                values.append(value)
+                remaining = remaining[end:].lstrip()
+        except (ValueError, TypeError, RecursionError) as error:
             raise runtime.RuntimeFailure("CredentialFenceUnconfirmed", "old root probe returned invalid JSON") from error
-        detail = value.get("error") if isinstance(value, dict) else None
-        cause = detail.get("cause") if isinstance(detail, dict) else None
-        native = cause.get("error") if isinstance(cause, dict) else None
-        code = native.get("Code") if isinstance(native, dict) else None
-        code = code or (detail.get("code") if isinstance(detail, dict) else None)
-        if not isinstance(value, dict) or value.get("status") != "error" or code not in {
-                "InvalidAccessKeyId", "AccessDenied", "SignatureDoesNotMatch", "InvalidToken"}:
+        summary = {"status": "error", "error": {
+            "message": "Unable to stat `prior/warehouse`.", "type": "fatal",
+            "cause": {"message": "Object does not exist", "error": {}}}}
+        if values and values[-1] == summary:
+            values.pop()
+        if not values:
             raise runtime.RuntimeFailure("CredentialFenceUnconfirmed", "old root rejection was not observed")
+        for value in values:
+            detail = value.get("error") if isinstance(value, dict) else None
+            cause = detail.get("cause") if isinstance(detail, dict) else None
+            native = cause.get("error") if isinstance(cause, dict) else None
+            code = native.get("Code") if isinstance(native, dict) else None
+            code = code or (detail.get("code") if isinstance(detail, dict) else None)
+            http_status = native.get("StatusCode") if isinstance(native, dict) else None
+            if not isinstance(value, dict) or value.get("status") != "error" or code not in {
+                    "InvalidAccessKeyId", "AccessDenied", "SignatureDoesNotMatch", "InvalidToken"} or (
+                    http_status is not None and (type(http_status) is not int or http_status not in {401, 403})):
+                raise runtime.RuntimeFailure("CredentialFenceUnconfirmed", "old root rejection was not observed")
 
     def run_mc(self, record, script, *, deadline=None, binary=False):
         """Register, execute and actually settle one exact transient container."""
