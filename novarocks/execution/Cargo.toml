@@ -62,3 +62,9 @@ novarocks-parser.workspace = true
 [package.metadata.novarocks.test]
 runtime-inputs = []
 env-inputs = []
+
+[package.metadata.cargo-machete]
+ignored = [
+    # Private tests include the FE dependency_artifact_storage.rs module via #[path].
+    "serde",
+]
