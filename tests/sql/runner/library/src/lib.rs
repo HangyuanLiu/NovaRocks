@@ -5730,6 +5730,9 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
     let namespace_catalogs = namespace_guard::CatalogFacts::default();
     let mut publication_catalog_fixture: Option<publication_catalog::FixtureHandle> = None;
     let fixture_primary = (|| -> Result<i32> {
+        if let Some(fixture) = isolated_rest_catalog.as_ref() {
+            namespace_catalogs.bind_fixture_storage(&fixture.rest_storage_binding())?;
+        }
         let fixture_endpoints = if let Some(fixture) = isolated_rest_catalog.as_ref() {
             FixtureEndpoints::from_isolated(
                 fixture.endpoints(),
@@ -5780,8 +5783,19 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         } else {
             None
         };
+        let publication_downstream = runner_config.values.get("iceberg_rest_uri").cloned();
         publication_catalog_fixture =
             start_publication_catalog_fixture(&mut runner_config, &suite_names)?;
+        if isolated_rest_catalog.is_some()
+            && let Some(proxy) = publication_catalog_fixture.as_ref()
+        {
+            namespace_catalogs.bind_owned_proxy_alias(
+                proxy.uri(),
+                publication_downstream
+                    .as_deref()
+                    .context("owned REST proxy omitted its physical downstream")?,
+            )?;
+        }
         let publication_catalog_control = publication_catalog_fixture
             .as_ref()
             .map(publication_catalog::FixtureHandle::control)

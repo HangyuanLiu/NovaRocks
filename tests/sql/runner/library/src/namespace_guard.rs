@@ -19,6 +19,7 @@
 use crate::types::ConnectionConfig;
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::fixture_run::{ScratchIdentity, canonical_s3};
+use novarocks_cluster_harness::isolated_iceberg_rest::{RestObjectStoreOwner, RestStorageBinding};
 use novarocks_parser::ast::{
     CatalogStatement, DmlStatement, IcebergStatement, LiteralKind, MaintenanceStatement,
     MaterializedViewStatement, ObjectName, SessionStatement, SetTarget, SetValue, SetWord,
@@ -35,7 +36,53 @@ enum Catalog {
     Other,
 }
 #[derive(Clone, Default, Debug)]
-pub(crate) struct CatalogFacts(Arc<Mutex<BTreeMap<String, Catalog>>>);
+pub(crate) struct CatalogFacts(
+    Arc<Mutex<BTreeMap<String, Catalog>>>,
+    Arc<Mutex<BTreeMap<String, RestObjectStoreOwner>>>,
+);
+impl CatalogFacts {
+    pub fn bind_fixture_storage(&self, binding: &RestStorageBinding) -> Result<()> {
+        self.bind_origins(&binding.rest_uris(), binding.owner())
+    }
+    fn bind_origins(&self, origins: &[&str], owner: RestObjectStoreOwner) -> Result<()> {
+        let mut facts = self
+            .1
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SQL REST owner facts lock poisoned"))?;
+        for origin in origins {
+            ensure!(!origin.trim().is_empty(), "owned REST endpoint is empty");
+            if let Some(previous) = facts.get(origin.trim_end_matches('/')) {
+                ensure!(
+                    *previous == owner,
+                    "owned REST endpoint changed its storage owner"
+                );
+            }
+        }
+        for origin in origins {
+            facts.insert(origin.trim_end_matches('/').to_string(), owner);
+        }
+        Ok(())
+    }
+    pub fn bind_owned_proxy_alias(&self, alias: &str, downstream: &str) -> Result<()> {
+        let owner = self
+            .1
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SQL REST owner facts lock poisoned"))?
+            .get(downstream.trim_end_matches('/'))
+            .copied()
+            .context("owned REST proxy downstream has no fixture storage binding")?;
+        self.bind_origins(&[alias], owner)
+    }
+    fn private_rest(&self, origin: &str) -> Result<bool> {
+        Ok(self
+            .1
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SQL REST owner facts lock poisoned"))?
+            .get(origin.trim_end_matches('/'))
+            == Some(&RestObjectStoreOwner::PrivateObjectStore))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct NamespaceGuard {
     identity: ScratchIdentity,
@@ -142,10 +189,14 @@ impl NamespaceGuard {
             return Ok(());
         };
         match self.catalog_fact(&catalog)? {
-            Some(Catalog::Rest(_)) => ensure!(
-                self.owned(&namespace),
-                "shared REST write requires an exact namespace of the admitted run"
-            ),
+            Some(Catalog::Rest(base)) => {
+                if !self.facts.private_rest(&base)? {
+                    ensure!(
+                        self.owned(&namespace),
+                        "shared REST write requires an exact namespace of the admitted run"
+                    );
+                }
+            }
             Some(Catalog::Hadoop(root)) if root.starts_with("s3://") => {
                 ensure!(
                     self.within(&root)?,
@@ -289,14 +340,15 @@ impl NamespaceGuard {
                         .insert(value.name.value, fact);
                 }
                 Statement::Catalog(CatalogStatement::CreateDatabase(value)) => {
-                    if let Some((catalog, namespace, _)) = self.target(&value.name, true)? {
-                        if let Some(Catalog::Rest(base)) = self.catalog_fact(&catalog)? {
-                            ensure!(
-                                self.owned(&namespace),
-                                "REST placement refused a namespace outside the original run"
-                            );
-                            self.place_namespace(&base, &namespace)?;
-                        }
+                    if let Some((catalog, namespace, _)) = self.target(&value.name, true)?
+                        && let Some(Catalog::Rest(base)) = self.catalog_fact(&catalog)?
+                        && !self.facts.private_rest(&base)?
+                    {
+                        ensure!(
+                            self.owned(&namespace),
+                            "REST placement refused a namespace outside the original run"
+                        );
+                        self.place_namespace(&base, &namespace)?;
                     }
                 }
                 Statement::Table(TableStatement::Create(value)) => {
@@ -374,6 +426,9 @@ impl NamespaceGuard {
             return Ok(());
         };
         if let Some(Catalog::Rest(base)) = self.catalog_fact(&catalog)? {
+            if self.facts.private_rest(&base)? {
+                return Ok(());
+            }
             ensure!(
                 self.owned(&namespace),
                 "REST table validation refused a foreign namespace"
@@ -463,6 +518,157 @@ mod tests {
             requests
         });
         (base, thread)
+    }
+    #[test]
+    fn exact_private_rest_owner_preserves_ordinary_names_and_does_not_relocate_tables() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut guard = guard();
+        guard
+            .facts
+            .bind_origins(&[&base], RestObjectStoreOwner::PrivateObjectStore)
+            .unwrap();
+        guard.after(&format!(r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="rest", "uri"="{base}");"#)).unwrap();
+        for sql in [
+            "CREATE DATABASE ordinary_private_namespace;",
+            "CREATE TABLE ordinary_private_namespace.t (id INT);",
+            "INSERT INTO ordinary_private_namespace.t VALUES (1);",
+        ] {
+            guard.before(sql).unwrap();
+            guard.after(sql).unwrap();
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        // An independently declared catalog does not inherit the private owner
+        // merely because it shares the invocation, loopback host or URI prefix.
+        guard.after(&format!(r#"CREATE EXTERNAL CATALOG unrelated PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="rest", "uri"="{base}/unowned");"#)).unwrap();
+        assert!(
+            guard
+                .before("CREATE DATABASE unrelated.foreign_namespace;")
+                .unwrap_err()
+                .to_string()
+                .contains("exact namespace")
+        );
+    }
+    #[test]
+    fn owned_proxy_alias_requires_an_exact_previously_bound_downstream() {
+        let facts = CatalogFacts::default();
+        assert!(
+            facts
+                .bind_owned_proxy_alias("http://127.0.0.1:38002", "http://127.0.0.1:38001")
+                .is_err()
+        );
+        assert!(!facts.private_rest("http://127.0.0.1:38002").unwrap());
+        facts
+            .bind_origins(
+                &["http://127.0.0.1:38001"],
+                RestObjectStoreOwner::PrivateObjectStore,
+            )
+            .unwrap();
+        facts
+            .bind_owned_proxy_alias("http://127.0.0.1:38002", "http://127.0.0.1:38001/")
+            .unwrap();
+        assert!(facts.private_rest("http://127.0.0.1:38002").unwrap());
+        facts
+            .bind_origins(
+                &["http://127.0.0.1:38004"],
+                RestObjectStoreOwner::MachineScratch,
+            )
+            .unwrap();
+        facts
+            .bind_owned_proxy_alias("http://127.0.0.1:38005", "http://127.0.0.1:38004")
+            .unwrap();
+        assert!(!facts.private_rest("http://127.0.0.1:38005").unwrap());
+        assert!(!facts.private_rest("http://127.0.0.1:38003").unwrap());
+        assert!(!facts.private_rest("http://127.0.0.1:38002/other").unwrap());
+        assert!(
+            facts
+                .bind_origins(
+                    &["http://127.0.0.1:38002"],
+                    RestObjectStoreOwner::MachineScratch
+                )
+                .is_err()
+        );
+        let mut guard = guard();
+        guard.facts = facts;
+        guard.after(r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="rest", "uri"="http://127.0.0.1:38002");"#).unwrap();
+        guard
+            .before("CREATE DATABASE private_through_owned_proxy;")
+            .unwrap();
+        guard
+            .after("CREATE DATABASE private_through_owned_proxy;")
+            .unwrap();
+        guard
+            .after("CREATE TABLE private_through_owned_proxy.t (id INT);")
+            .unwrap();
+    }
+    #[test]
+    fn registered_shared_storage_still_validates_actual_table_scope_in_a_private_invocation() {
+        let mut guard = guard();
+        let namespace = guard.identity.resource_name("d0000").unwrap();
+        let (base, thread) = server(vec![
+            serde_json::json!({"metadata":{"location":"s3://foreign/table"}}),
+        ]);
+        guard
+            .facts
+            .bind_origins(
+                &[&format!("{base}/private")],
+                RestObjectStoreOwner::PrivateObjectStore,
+            )
+            .unwrap();
+        guard
+            .facts
+            .bind_origins(&[&base], RestObjectStoreOwner::MachineScratch)
+            .unwrap();
+        guard.after(&format!(r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="rest", "uri"="{base}");"#)).unwrap();
+        assert!(guard.before("CREATE DATABASE catalog.foreign;").is_err());
+        assert!(
+            guard
+                .after(&format!("CREATE TABLE {namespace}.t (id INT);"))
+                .unwrap_err()
+                .to_string()
+                .contains("outside")
+        );
+        assert_eq!(thread.join().unwrap().len(), 1);
+    }
+    #[test]
+    fn private_storage_binding_does_not_bypass_original_work_or_cleanup_deadlines() {
+        let mut guard = guard();
+        guard
+            .facts
+            .bind_origins(
+                &["http://127.0.0.1:38001"],
+                RestObjectStoreOwner::PrivateObjectStore,
+            )
+            .unwrap();
+        guard.after(r#"CREATE EXTERNAL CATALOG catalog PROPERTIES ("type"="iceberg", "iceberg.catalog.type"="rest", "uri"="http://127.0.0.1:38001");"#).unwrap();
+        guard.deadline = Instant::now();
+        assert!(
+            guard
+                .before("CREATE DATABASE original_private_name;")
+                .unwrap_err()
+                .to_string()
+                .contains("clock expired")
+        );
+        let cleanup = guard.for_cleanup(Instant::now() + Duration::from_secs(10));
+        cleanup
+            .before("DROP DATABASE original_private_name;")
+            .unwrap();
+        assert!(
+            cleanup
+                .facts
+                .private_rest("http://127.0.0.1:38001")
+                .unwrap()
+        );
+        let expired_cleanup = guard.for_cleanup(Instant::now());
+        assert!(
+            expired_cleanup
+                .before("DROP DATABASE original_private_name;")
+                .is_err()
+        );
     }
     #[test]
     fn rest_catalog_aliases_follow_provider_uri_precedence() {

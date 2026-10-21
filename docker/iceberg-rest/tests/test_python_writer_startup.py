@@ -30,6 +30,32 @@ hms = load("startup_hms_fixture", "tests/sql/fixtures/iceberg-hms/fixture.py")
 
 
 class WriterStartupTests(unittest.TestCase):
+    def test_iceberg_rejected_inputs_cannot_reach_running_image_inspection(self):
+        with patch.object(iceberg.support, "run_command", side_effect=iceberg.support.FixtureError("rejected input")) as command, \
+                patch.object(iceberg.support, "read_json") as read:
+            with self.assertRaisesRegex(iceberg.support.FixtureError, "rejected input"):
+                iceberg.install_verified_images(Path("/unused/store"), object())
+            command.assert_called_once()
+            self.assertEqual(command.call_args.args[0][-2:], ["--consumer", "iceberg-rest"])
+            read.assert_not_called()
+
+    def test_iceberg_consumer_still_rejects_a_different_running_spark_image(self):
+        bom = {"images": {"minio-mc": {"alias": "minio/mc:verified"}},
+               "derived_images": {"iceberg-spark": {"image_id": "sha256:expected"}},
+               "lock_sha256": "locked"}
+        publication = {"shared_docker": True,
+                       "runtime": {"machine": {"containers": {"spark": "exact-spark"}}}}
+        runtime = SimpleNamespace(env_file=Path("/unused/publication/env.sh"))
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(iceberg.support, "read_json", side_effect=[bom, publication]), \
+                patch.object(iceberg.support, "run_command", side_effect=[
+                    SimpleNamespace(stdout="verified"), SimpleNamespace(stdout="sha256:foreign\n")]) as command:
+            with self.assertRaisesRegex(iceberg.support.FixtureError, "running Spark container differs"):
+                iceberg.install_verified_images(Path("/unused/store"), runtime)
+            self.assertEqual(command.call_args_list[0].args[0][-2:], ["--consumer", "iceberg-rest"])
+            self.assertEqual(command.call_args_list[1].args[0],
+                             ["docker", "inspect", "exact-spark", "--format", "{{.Image}}"])
+
     def test_iceberg_prepare_passes_original_budget_before_output_creation(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
             root = Path(directory)

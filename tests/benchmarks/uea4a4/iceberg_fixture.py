@@ -128,7 +128,8 @@ def render_sql(database: str, location: str, files_per_table: int) -> str:
 
 def install_verified_images(store: Path, runtime: Any) -> dict[str, Any]:
     support.run_command(
-        [str(REPO / "docker" / "fixture-inputs" / "verify.sh"), "--store", str(store)]
+        [str(REPO / "docker" / "fixture-inputs" / "verify.sh"), "--store", str(store),
+         "--consumer", "iceberg-rest"]
     )
     bom = support.read_json(store / "bom.json")
     try:

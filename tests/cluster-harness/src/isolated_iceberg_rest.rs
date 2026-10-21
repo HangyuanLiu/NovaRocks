@@ -123,6 +123,30 @@ pub struct IsolatedIcebergRestEndpoints {
     pub compose_project: String,
 }
 
+/// The physical object-store owner of an already constructed REST fixture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RestObjectStoreOwner {
+    PrivateObjectStore,
+    MachineScratch,
+}
+
+/// Credential-free owner facts captured from an actual fixture handle.
+/// Fields are private so consumers cannot mint private ownership from a URI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestStorageBinding {
+    owner: RestObjectStoreOwner,
+    rest_uri: String,
+    rest_mv_uri: String,
+}
+impl RestStorageBinding {
+    pub fn owner(&self) -> RestObjectStoreOwner {
+        self.owner
+    }
+    pub fn rest_uris(&self) -> [&str; 2] {
+        [&self.rest_uri, &self.rest_mv_uri]
+    }
+}
+
 /// Safe, immutable identity of one image actually running in the fixture.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct IsolatedIcebergRestImageIdentity {
@@ -522,6 +546,18 @@ impl IsolatedIcebergRestFixture {
 
     pub fn endpoints(&self) -> &IsolatedIcebergRestEndpoints {
         &self.endpoints
+    }
+    /// Capture storage ownership without exporting credentials or mutable state.
+    pub fn rest_storage_binding(&self) -> RestStorageBinding {
+        RestStorageBinding {
+            owner: if self.shared_machine.is_some() {
+                RestObjectStoreOwner::MachineScratch
+            } else {
+                RestObjectStoreOwner::PrivateObjectStore
+            },
+            rest_uri: self.endpoints.rest_uri.clone(),
+            rest_mv_uri: self.endpoints.rest_mv_uri.clone(),
+        }
     }
 
     fn work_limit(&self) -> Option<Instant> {
@@ -3079,6 +3115,29 @@ mod tests {
             shared_machine: None,
         };
         (temp, fixture, manifest)
+    }
+
+    #[test]
+    fn rest_storage_binding_snapshots_the_actual_owner_without_credentials() {
+        let (_root, mut fixture, _) = manifest_fixture();
+        fixture.endpoints.rest_uri = "http://127.0.0.1:38001".into();
+        fixture.endpoints.rest_mv_uri = "http://127.0.0.1:38002".into();
+        let private = fixture.rest_storage_binding();
+        assert_eq!(private.owner(), RestObjectStoreOwner::PrivateObjectStore);
+        assert_eq!(
+            private.rest_uris(),
+            ["http://127.0.0.1:38001", "http://127.0.0.1:38002"]
+        );
+        let debug = format!("{private:?}");
+        assert!(!debug.contains(&fixture.minio_root_identity.access_key_id));
+        assert!(!debug.contains(&fixture.minio_root_identity.secret_access_key));
+        fixture.shared_machine = Some(serde_json::json!({}));
+        fixture.endpoints.rest_uri = "http://127.0.0.1:48001".into();
+        let shared = fixture.rest_storage_binding();
+        assert_eq!(shared.owner(), RestObjectStoreOwner::MachineScratch);
+        assert_eq!(shared.rest_uris()[0], "http://127.0.0.1:48001");
+        assert_eq!(private.owner(), RestObjectStoreOwner::PrivateObjectStore);
+        assert_eq!(private.rest_uris()[0], "http://127.0.0.1:38001");
     }
 
     #[cfg(unix)]
