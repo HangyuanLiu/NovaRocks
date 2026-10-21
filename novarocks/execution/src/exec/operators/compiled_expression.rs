@@ -988,3 +988,42 @@ pub fn prepare_project_factory_for_test(
         None => CompiledProjectProcessorFactory::try_new_final_result_boundary(program, error)?,
     })
 }
+
+#[cfg(test)]
+mod controlled_wait_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn compiled_kernel_wait_is_registered_and_interrupted_by_the_runtime_error_owner() {
+        let error = Arc::new(RuntimeErrorState::default());
+        let original = ExecutionFailure::from(KernelFailure::InvalidProgram(
+            KernelDiagnostic::new("the original fragment stop"),
+        ));
+        let control = RuntimeKernelControl::new(Arc::clone(&error));
+        let waiter = std::thread::spawn(move || {
+            KernelEvaluationControl::wait(&control, Duration::from_secs(30))
+        });
+        let registration_deadline = Instant::now() + Duration::from_secs(3);
+        while error.waiting_count() == 0 && Instant::now() < registration_deadline {
+            std::thread::yield_now();
+        }
+        let registered = error.waiting_count() == 1;
+        // Always release the owned waiter, including a failed registration oracle.
+        error.set_error(original.clone());
+        let result = waiter.join().expect("controlled waiter exited");
+        assert!(
+            registered,
+            "the real runtime wait must register before interruption"
+        );
+        assert!(matches!(result, Err(KernelFailure::Cancelled)));
+        assert_eq!(error.waiting_count(), 0);
+        assert_eq!(error.error(), Some(original));
+        let control = RuntimeKernelControl::new(Arc::clone(&error));
+        assert!(matches!(
+            KernelEvaluationControl::wait(&control, Duration::from_secs(30)),
+            Err(KernelFailure::Cancelled)
+        ));
+        assert_eq!(error.waiting_count(), 0);
+    }
+}

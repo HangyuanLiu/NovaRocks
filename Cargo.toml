@@ -129,7 +129,7 @@ novarocks-connector-paimon = { path = "novarocks/connector/paimon", version = "0
 novarocks-connector-starrocks = { path = "novarocks/connector/starrocks", version = "0.1.0" }
 novarocks-execution = { path = "novarocks/execution", version = "0.1.0" }
 novarocks-execution-contract = { path = "novarocks/execution-contract", version = "0.1.0" }
-novarocks-failure-contract = { path = "novarocks/failure-contract" }
+novarocks-failure-contract = { path = "novarocks/failure-contract", version = "0.1.0" }
 novarocks-failpoint = { path = "novarocks/failpoint", version = "0.1.0", default-features = false }
 novarocks-frontend-application = { path = "novarocks/frontend-application", version = "0.1.0" }
 novarocks-fs = { path = "novarocks/fs", version = "0.1.0" }

@@ -852,6 +852,7 @@ impl Scenario for CatalogReadyLifecycle {
                 let installing = wait_for_cold_catalog_install(
                     context,
                     &before_cancel,
+                    cancelled,
                     "observe a held cold catalog install",
                 )?;
                 // The hold is before the provider bind, so nothing may be usable yet.
@@ -1037,6 +1038,7 @@ impl Scenario for CatalogReadyLifecycle {
                 let installing = wait_for_cold_catalog_install(
                     context,
                     &before_cold,
+                    cold,
                     "observe the cold catalog install before releasing it",
                 )?;
                 assert_no_appended_catalog_runtime(
@@ -1116,6 +1118,10 @@ impl Scenario for CatalogReadyLifecycle {
                 .context("replace warm catalog before establish-replay coverage")?;
             create_catalog(&mut control, CATALOG, &warehouse)?;
             let before_replay = backend_log_snapshots(context)?;
+            let before_ack_drop = context.handle().be_log_count(
+                CATALOG_FAILURE_BACKEND,
+                ESTABLISH_CONTEXT_ACK_DROPPED_MARKER,
+            )?;
             context.action("retry the exact cold establish after its acknowledgement is dropped");
             let rows: Vec<i64> = connector_control_plan::query(
                 context,
@@ -1135,12 +1141,17 @@ impl Scenario for CatalogReadyLifecycle {
             // The fault has to have fired. Without this the phase passes on a
             // query whose acknowledgement was never dropped, which is the shape a
             // retired fault leaves behind.
-            assert_appended_marker_on_backend(
-                &before_replay,
-                &after_replay,
+            // Fault claims print on stderr, unlike the authorized catalog
+            // observers on stdout. The owner counts each raw stream separately;
+            // no byte cursor or ordering across the two streams is inferred.
+            let after_ack_drop = context.handle().be_log_count(
                 CATALOG_FAILURE_BACKEND,
                 ESTABLISH_CONTEXT_ACK_DROPPED_MARKER,
             )?;
+            ensure!(
+                after_ack_drop.checked_sub(before_ack_drop) == Some(1),
+                "BE[{CATALOG_FAILURE_BACKEND}] must emit exactly one {ESTABLISH_CONTEXT_ACK_DROPPED_MARKER} in the selected replay window; before={before_ack_drop}, after={after_ack_drop}",
+            );
             assert_catalog_runtime_built_at_most_once(&before_replay, &after_replay, CATALOG)?;
             // A prepared task with no registered fragment must release its query
             // context at terminal settlement, not wait for the 300-second query
@@ -5409,8 +5420,11 @@ impl AwaitedRead<'_> {
     }
 }
 
-/// Waits for a Backend-log observation, bounded by the scenario deadline and
-/// by the liveness of the read that is supposed to produce it.
+/// Waits for an authorized Backend stdout observation, bounded by the scenario
+/// deadline and by the liveness of the read that is supposed to produce it.
+/// Catalog, reader and normal task markers use GrantedObservation on stdout;
+/// the ACK-drop fault is counted independently across raw streams. Combined
+/// diagnostic rendering is not an append-only observation stream.
 fn wait_for_backend_logs_while(
     context: &mut ScenarioContext,
     operation: &str,
@@ -5426,9 +5440,9 @@ fn wait_for_backend_logs_while(
                 .with_context(|| format!("waiting to {operation}"))?;
         }
         let logs = (0..context.handle().be_count())
-            .map(|index| context.handle().be_current_log_contents(index))
+            .map(|index| context.handle().be_stdout_contents(index, usize::MAX))
             .collect::<Result<Vec<_>>>()
-            .with_context(|| format!("read BE logs while waiting to {operation}"))?;
+            .with_context(|| format!("read BE stdout observations while waiting to {operation}"))?;
         if predicate(&logs)? {
             return Ok(logs);
         }
@@ -5437,24 +5451,39 @@ fn wait_for_backend_logs_while(
     }
 }
 
+/// Snapshot the same raw stdout stream the observation barriers read.
+/// Its byte cursor remains valid when stderr independently receives diagnostics.
 fn backend_log_snapshots(context: &mut ScenarioContext) -> Result<Vec<String>> {
     (0..context.handle().be_count())
-        .map(|index| context.handle().be_current_log_contents(index))
+        .map(|index| context.handle().be_stdout_contents(index, usize::MAX))
         .collect::<Result<Vec<_>>>()
-        .context("read Backend log snapshots")
+        .context("read Backend stdout observation snapshots")
 }
 
-/// The per-backend text appended to every Backend log since `before`.
+/// The per-backend stdout observations appended since `before`.
 ///
-/// A truncated log is an error rather than an empty appendix: a rotation that
-/// silently reset the window would make every absence assertion below pass.
+/// A truncated or replaced stream is an error rather than an empty appendix:
+/// silently resetting a cursor would make absence assertions pass vacuously.
 fn appended_since<'a>(logs: &'a [String], before: &[String], moment: &str) -> Result<Vec<&'a str>> {
+    ensure!(
+        logs.len() == before.len(),
+        "stdout snapshot covers {} Backends but {} are running while checking {moment}",
+        before.len(),
+        logs.len(),
+    );
     logs.iter()
         .zip(before)
         .enumerate()
         .map(|(index, (log, previous))| {
-            log.get(previous.len()..)
-                .with_context(|| format!("BE[{index}] log was truncated while checking {moment}"))
+            ensure!(
+                log.len() >= previous.len(),
+                "BE[{index}] log was truncated while checking {moment}",
+            );
+            ensure!(
+                log.starts_with(previous),
+                "BE[{index}] stdout log prefix was replaced while checking {moment}",
+            );
+            Ok(&log[previous.len()..])
         })
         .collect()
 }
@@ -5490,20 +5519,30 @@ fn catalog_instance_needle(catalog: &str) -> String {
 /// property of the plan rather than of the cluster. Requiring the marker
 /// cluster-wide waits forever on a plan that touched two of three Backends.
 ///
+/// The producing read must still be alive: an earlier SQL failure must end
+/// this pre-cancellation barrier with its actual error, not a marker timeout.
+/// This check does not belong on the post-KILL abort barrier.
+///
 /// The returned set is what every later assertion of the phase is keyed on,
 /// and it is required to be non-empty: a phase whose subject never began an
 /// install must fail here rather than pass every assertion vacuously.
 fn wait_for_cold_catalog_install(
     context: &mut ScenarioContext,
     before: &[String],
+    read: &ConnectorRead,
     operation: &str,
 ) -> Result<BTreeSet<usize>> {
-    let logs = wait_for_backend_logs(context, operation, |logs| {
-        logs.iter().zip(before).any(|(log, previous)| {
-            log.get(previous.len()..)
-                .is_some_and(|added| added.contains(CATALOG_INSTALL_STARTED))
-        })
-    })?;
+    let logs = wait_for_backend_logs_while(
+        context,
+        operation,
+        Some(AwaitedRead::new(read, "cold catalog install query")),
+        |logs| {
+            let added = appended_since(logs, before, operation)?;
+            Ok(added
+                .iter()
+                .any(|text| text.contains(CATALOG_INSTALL_STARTED)))
+        },
+    )?;
     let installing = appended_since(&logs, before, operation)?
         .into_iter()
         .enumerate()
@@ -5607,24 +5646,6 @@ fn wait_for_catalog_runtime_on_backend(
             .is_some()
     })
     .map(|_| ())
-}
-
-fn assert_appended_marker_on_backend(
-    before: &[String],
-    after: &[String],
-    backend: usize,
-    marker: &str,
-) -> Result<()> {
-    let moment = format!("{marker} on BE[{backend}]");
-    let appended = appended_since(after, before, &moment)?;
-    let added = appended
-        .get(backend)
-        .with_context(|| format!("missing BE[{backend}] log snapshot"))?;
-    ensure!(
-        added.contains(marker),
-        "BE[{backend}] did not emit {marker}, so the fault it belongs to never fired"
-    );
-    Ok(())
 }
 
 fn assert_no_appended_marker(
@@ -6070,6 +6091,27 @@ mod tests {
     }
 
     #[test]
+    fn an_early_failed_cold_read_preserves_the_actual_sql_error() {
+        let harness = read_harness();
+        harness
+            .done_tx
+            .send(Err(mysql::Error::MySqlError(mysql::MySqlError {
+                code: 1105,
+                state: "HY000".into(),
+                message: "original cold preparation failure".into(),
+            })))
+            .expect("publish original SQL failure");
+        let error = AwaitedRead::new(&harness.read, "cold catalog install query")
+            .still_running()
+            .expect_err("the producer failure must end a cold-install wait");
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("cold catalog install query ended first"));
+        assert!(rendered.contains("1105"));
+        assert!(rendered.contains("HY000"));
+        assert!(rendered.contains("original cold preparation failure"));
+    }
+
+    #[test]
     fn a_read_whose_thread_vanished_stops_the_wait_too() {
         let mut harness = read_harness();
         // Dropping the last sender is how a reader thread that died without
@@ -6143,6 +6185,46 @@ mod tests {
         // form really does go false at exactly this point.
         let (opens, closes) = reader_counts(&logs[0]);
         assert_eq!(opens, closes);
+    }
+
+    #[test]
+    fn a_first_stdout_catalog_marker_remains_complete_and_in_stream_order() {
+        let ready = "NOVAROCKS_READY role=be\n";
+        let started = format!("{CATALOG_INSTALL_STARTED} execution_id=1:2:1 catalog_count=1\n");
+        let runtime = format!("{CATALOG_RUNTIME_MATERIALIZED} catalog=fixture\n");
+        let created = format!("{TASK_CREATE_APPLIED} execution_id=1:2:1\n");
+        let expected = format!("{started}{runtime}{created}");
+        let before = vec![ready.to_string()];
+        let after = vec![format!("{ready}{expected}")];
+        let added = appended_since(&after, &before, "the first cold install").unwrap();
+        assert_eq!(added, vec![expected.as_str()]);
+        assert_eq!(
+            first_line_offset(added[0], |line| line.contains(CATALOG_INSTALL_STARTED)),
+            Some(0)
+        );
+        assert_eq!(
+            first_line_offset(added[0], |line| line.contains(CATALOG_RUNTIME_MATERIALIZED)),
+            Some(started.len())
+        );
+        assert_eq!(
+            first_line_offset(added[0], |line| line.contains(TASK_CREATE_APPLIED)),
+            Some(started.len() + runtime.len())
+        );
+    }
+
+    #[test]
+    fn a_replaced_stdout_prefix_is_rejected_even_when_its_length_did_not_shrink() {
+        let before = vec!["original\n".to_string()];
+        for replacement in [
+            "replaced\n".to_string(),
+            format!("replaced\n{CATALOG_INSTALL_STARTED}\n"),
+        ] {
+            let after = vec![replacement];
+            assert!(after[0].len() >= before[0].len());
+            let error = appended_since(&after, &before, "a replaced stream")
+                .expect_err("replacement must not invent a fresh observation window");
+            assert!(format!("{error:#}").contains("stdout log prefix was replaced"));
+        }
     }
 
     #[test]

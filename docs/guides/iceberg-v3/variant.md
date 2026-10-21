@@ -50,13 +50,15 @@ WHERE id < 1000;
 
 ## Manifest 统计限制
 
-当前 SDK 不能读取其他引擎写入的 Variant 列 bounds。包含这种统计的 manifest 加载失败时保留原始错误；表的任一历史 schema 出现过 Variant，就追加：
+当前 SDK 不能读取其他引擎写入的 Variant 列 bounds。Provider 的本地错误链保留加载失败的原始错误；表的任一历史 schema 出现过 Variant，就追加以下本地诊断：
 
 ```text
 hint: this table has had Variant columns, and NovaRocks cannot read Variant column statistics written by other engines yet, which may be related (docs/guides/iceberg-v3/variant.md)
 ```
 
-提示只表示可能相关。权限、网络与文件损坏错误也可能带此提示；原错误类别、重试资格与清理事实保持不变。删除 Variant 列不抹去历史 schema，也不保证旧 manifest 已可读。不忽略统计、不跳过失败的 manifest。
+SQL 客户端接收安全的错误描述，不能依赖这段本地提示。ConnectorUnavailable 在 split 准备阶段投影为 `query.execution.dependency`、`Execution` 和 `reason 4:8`；这个 reason 不专属于 Variant，不能单凭它确定根因。
+
+提示只表示可能相关。权限、网络与文件损坏错误也可能带此提示；它不改变 Provider 已产生的错误类别、重试资格与清理事实。删除 Variant 列不抹去历史 schema，也不保证旧 manifest 已可读。不忽略统计、不跳过失败的 manifest。
 
 ## 写入限制与恢复条件
 

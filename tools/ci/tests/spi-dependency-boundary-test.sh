@@ -57,7 +57,7 @@ write_fixture() {
   # state-store-conformance owner that used to justify it is gone.
   for dependency in arrow arrow-schema async-trait bytes novarocks-connector-contract \
       novarocks-execution novarocks-frontend-application novarocks-memory \
-      novarocks-result-contract novarocks-secret novarocks-state-store-api \
+      novarocks-result-contract novarocks-failure-contract novarocks-secret novarocks-state-store-api \
       novarocks-type-contract novarocks-types serde sha2 tokio tracing url uuid; do
     write_dependency_package "$fixture_root" "$dependency"
   done
@@ -182,12 +182,32 @@ append_dependency "$connector_chain_root/deps/novarocks-type-contract/Cargo.toml
   'novarocks-result-contract = { path = "../novarocks-result-contract" }'
 assert_accepted "$connector_chain_root"
 
-for neutral in novarocks-type-contract novarocks-result-contract; do
+for neutral in novarocks-type-contract novarocks-result-contract novarocks-failure-contract; do
   optional_neutral_root="$(new_mutation "optional-$neutral")"
   append_dependency "$optional_neutral_root/Cargo.toml" \
     "$neutral = { path = \"deps/$neutral\", optional = true }"
   assert_accepted "$optional_neutral_root"
 done
+
+# Shared failure facts are neutral; their name cannot hide a runtime or owner.
+failure_contract_root="$(new_mutation failure-contract)"
+append_dependency "$failure_contract_root/Cargo.toml" \
+  'novarocks-failure-contract = { path = "deps/novarocks-failure-contract" }'
+assert_accepted "$failure_contract_root"
+
+failure_runtime_root="$tmpdir/failure-runtime"
+cp -R "$failure_contract_root" "$failure_runtime_root"
+append_dependency "$failure_runtime_root/deps/novarocks-failure-contract/Cargo.toml" \
+  'tokio = { path = "../tokio" }'
+assert_rejected "$failure_runtime_root" \
+  "novarocks-spi normal dependency closure contains a forbidden async runtime: tokio"
+
+failure_application_root="$tmpdir/failure-application"
+cp -R "$failure_contract_root" "$failure_application_root"
+append_dependency "$failure_application_root/deps/novarocks-failure-contract/Cargo.toml" \
+  'novarocks-execution = { path = "../novarocks-execution" }'
+assert_rejected "$failure_application_root" \
+  "novarocks-spi normal dependency closure contains a forbidden application/execution owner: novarocks-execution"
 
 # Dev/build edges do not confer a normal production dependency.
 non_normal_root="$(new_mutation non-normal-runtime)"

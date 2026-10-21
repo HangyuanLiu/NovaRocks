@@ -142,6 +142,8 @@ pub struct CommandError {
     kind: CommandErrorKind,
     message: Arc<str>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
+    execution_failure: Option<crate::execution_error::ExecutionFailureInput>,
+    publication_disposition: Option<novarocks_spi::connector::LakePublicationDisposition>,
 }
 
 impl CommandError {
@@ -150,7 +152,35 @@ impl CommandError {
             kind,
             message: message.into(),
             compile_control: None,
+            execution_failure: None,
+            publication_disposition: None,
         }
+    }
+
+    /// An existing maintenance publication owner's verdict, independent of
+    /// the selected execution cause; it creates no publication identity.
+    pub fn with_publication_disposition(
+        mut self,
+        disposition: Option<novarocks_spi::connector::LakePublicationDisposition>,
+    ) -> Self {
+        self.publication_disposition = disposition;
+        self
+    }
+
+    pub fn publication_disposition(
+        &self,
+    ) -> Option<novarocks_spi::connector::LakePublicationDisposition> {
+        self.publication_disposition
+    }
+
+    pub fn from_execution_failure(input: crate::execution_error::ExecutionFailureInput) -> Self {
+        let mut error = Self::new(CommandErrorKind::Failed, input.user_error().to_string());
+        error.execution_failure = Some(input);
+        error
+    }
+
+    pub fn execution_failure(&self) -> Option<&crate::execution_error::ExecutionFailureInput> {
+        self.execution_failure.as_ref()
     }
 
     pub fn from_compile_control(error: novarocks_type_contract::CompileControlError) -> Self {
@@ -162,6 +192,14 @@ impl CommandError {
         failure.compile_control = Some(error);
         failure
     }
+    pub fn with_compile_control(
+        mut self,
+        control: Option<novarocks_type_contract::CompileControlError>,
+    ) -> Self {
+        self.compile_control = control;
+        self
+    }
+
     pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
         self.compile_control.clone()
     }

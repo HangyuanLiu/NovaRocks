@@ -8557,6 +8557,14 @@ fn root_success_seal_stops_ordinary_pumps_in_its_own_turn() {
             None,
             "an accepted root seal cannot be revoked by residual observation exhaustion"
         );
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                context,
+                crate::native::task_transport::SubscriptionState::ConnectionLossExhausted
+            ),
+            None,
+            "an accepted root seal cannot be revoked by residual observation exhaustion"
+        );
     }
     assert!(
         round
@@ -8597,6 +8605,14 @@ fn covered_exhaustion_fails_only_still_required_work_without_timing_healthy_task
         Some(SubscriptionState::BudgetExhausted),
         "a still-required leaf losing bounded transport recovery must reach the original failure owner"
     );
+    assert_eq!(
+        round.classify_covered_subscription_state(
+            leaf_context,
+            SubscriptionState::ConnectionLossExhausted
+        ),
+        Some(SubscriptionState::ConnectionLossExhausted),
+        "a still-required leaf losing bounded transport recovery must reach the original failure owner"
+    );
     for state in [
         SubscriptionState::Rejected,
         SubscriptionState::ProcessMismatch,
@@ -8629,6 +8645,13 @@ fn covered_exhaustion_of_a_stood_down_unknown_leaf_belongs_to_drain() {
         round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
         Some(SubscriptionState::BudgetExhausted)
     );
+    assert_eq!(
+        round.classify_covered_subscription_state(
+            leaf_context,
+            SubscriptionState::ConnectionLossExhausted
+        ),
+        Some(SubscriptionState::ConnectionLossExhausted)
+    );
     round
         .execution_mut()
         .stand_down_task_normally(leaf_identity)
@@ -8641,6 +8664,13 @@ fn covered_exhaustion_of_a_stood_down_unknown_leaf_belongs_to_drain() {
         round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
         None
     );
+    assert_eq!(
+        round.classify_covered_subscription_state(
+            leaf_context,
+            SubscriptionState::ConnectionLossExhausted
+        ),
+        None
+    );
     let root_context = round
         .execution()
         .task(round.root_task().task_id())
@@ -8650,9 +8680,23 @@ fn covered_exhaustion_of_a_stood_down_unknown_leaf_belongs_to_drain() {
         round.classify_covered_subscription_state(root_context, SubscriptionState::BudgetExhausted),
         Some(SubscriptionState::BudgetExhausted)
     );
+    assert_eq!(
+        round.classify_covered_subscription_state(
+            root_context,
+            SubscriptionState::ConnectionLossExhausted
+        ),
+        Some(SubscriptionState::ConnectionLossExhausted)
+    );
     round.begin_terminal_cleanup();
     assert_eq!(
         round.classify_covered_subscription_state(root_context, SubscriptionState::BudgetExhausted),
+        None
+    );
+    assert_eq!(
+        round.classify_covered_subscription_state(
+            root_context,
+            SubscriptionState::ConnectionLossExhausted
+        ),
         None
     );
 }
@@ -8694,6 +8738,14 @@ fn covered_exhaustion_respects_exact_root_evidence_before_and_after_eos() {
             Some(SubscriptionState::BudgetExhausted),
             "EOS alone cannot replace missing root terminal evidence"
         );
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                context,
+                SubscriptionState::ConnectionLossExhausted
+            ),
+            Some(SubscriptionState::ConnectionLossExhausted),
+            "EOS alone cannot replace missing root terminal evidence"
+        );
         status.publish(StatusEvent::Published(
             TaskStatus::try_new(
                 root,
@@ -8710,6 +8762,14 @@ fn covered_exhaustion_respects_exact_root_evidence_before_and_after_eos() {
         }
         assert_eq!(
             round.classify_covered_subscription_state(context, SubscriptionState::BudgetExhausted),
+            None,
+            "observed complete root evidence survives a status-stream disconnect; outstanding data-plane fetch has its own owner"
+        );
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                context,
+                SubscriptionState::ConnectionLossExhausted
+            ),
             None,
             "observed complete root evidence survives a status-stream disconnect; outstanding data-plane fetch has its own owner"
         );
@@ -8746,6 +8806,14 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
                 SubscriptionState::BudgetExhausted
             ),
             Some(SubscriptionState::BudgetExhausted),
+            "EOS does not substitute for the root's terminal output fact"
+        );
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                root_context,
+                SubscriptionState::ConnectionLossExhausted
+            ),
+            Some(SubscriptionState::ConnectionLossExhausted),
             "EOS does not substitute for the root's terminal output fact"
         );
         for (version, state, output) in [
@@ -8791,6 +8859,14 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
         assert_eq!(
             round.classify_covered_subscription_state(
                 leaf_context,
+                SubscriptionState::ConnectionLossExhausted
+            ),
+            (!result_consumer).then_some(SubscriptionState::ConnectionLossExhausted),
+            "only an attached Result consumer retires residual transport evidence before seal intake"
+        );
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                leaf_context,
                 SubscriptionState::ProcessMismatch
             ),
             Some(SubscriptionState::ProcessMismatch),
@@ -8801,6 +8877,14 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
             round.turn().unwrap();
             assert_eq!(reply.try_recv().unwrap(), Ok(()));
             assert!(round.root_success_sealed());
+            assert_eq!(
+                round.classify_covered_subscription_state(
+                    leaf_context,
+                    SubscriptionState::ConnectionLossExhausted
+                ),
+                None,
+                "an accepted success seal cannot be revoked by residual transport loss"
+            );
         }
     }
 }
@@ -8836,6 +8920,13 @@ fn covered_exhaustion_result_exception_preserves_accepted_failure_before_seal() 
         round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
         None
     );
+    assert_eq!(
+        round.classify_covered_subscription_state(
+            leaf_context,
+            SubscriptionState::ConnectionLossExhausted
+        ),
+        None
+    );
 
     let failure = TerminationDetail::Failed(novarocks_execution::task_execution::TaskFailure::new(
         novarocks_execution_contract::failure::FailureFact::new(
@@ -8862,6 +8953,14 @@ fn covered_exhaustion_result_exception_preserves_accepted_failure_before_seal() 
     assert_eq!(
         round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
         Some(SubscriptionState::BudgetExhausted),
+        "an accepted failure cannot be hidden by the completed root"
+    );
+    assert_eq!(
+        round.classify_covered_subscription_state(
+            leaf_context,
+            SubscriptionState::ConnectionLossExhausted
+        ),
+        Some(SubscriptionState::ConnectionLossExhausted),
         "an accepted failure cannot be hidden by the completed root"
     );
     let mut reply = source.begin_success_seal_request().unwrap();
@@ -8933,6 +9032,14 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
             round.classify_covered_subscription_state(
                 context,
                 crate::native::task_transport::SubscriptionState::BudgetExhausted
+            ),
+            None,
+            "retired transport evidence does not clear a real application gap"
+        );
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                context,
+                crate::native::task_transport::SubscriptionState::ConnectionLossExhausted
             ),
             None,
             "retired transport evidence does not clear a real application gap"
@@ -9700,6 +9807,13 @@ fn revoked_result_control_uses_one_deadline_even_without_eos_or_after_root_finis
             ),
             Some(crate::native::task_transport::SubscriptionState::BudgetExhausted)
         );
+        assert_eq!(
+            round.classify_covered_subscription_state(
+                root_context,
+                crate::native::task_transport::SubscriptionState::ConnectionLossExhausted
+            ),
+            Some(crate::native::task_transport::SubscriptionState::ConnectionLossExhausted)
+        );
         clock.advance(Duration::from_secs(29));
         let mut repeated = source.begin_terminal_control_request().unwrap();
         round.turn().unwrap();
@@ -9815,4 +9929,318 @@ pub(crate) fn synchronous_root_control_round() -> (
     assert!(round.result_pump_ready());
     assert!(!round.execution().root_end_of_stream_observed());
     (round, status, clock)
+}
+
+fn original_establish_observation_round() -> (
+    TaskRoundForTest,
+    Arc<ManualClock>,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    Arc<RecordingSink>,
+    OperationIntent,
+    Arc<RecordingSubscriptions>,
+) {
+    use crate::native::task_transport::TaskAckIntake;
+    use crate::task_execution::round::TaskRound;
+    let harness = Harness::new(&[0], &[0], 64);
+    let sink = Arc::clone(&harness.sink);
+    let clock = Arc::clone(&harness.clock);
+    let subscriptions = Arc::new(RecordingSubscriptions::default());
+    let intake = TaskAckIntake::new(Arc::clone(&harness.wake) as Arc<dyn StatusIntakeWake>);
+    let acks = intake.handle();
+    let mut round = TaskRound::new(
+        harness.execution,
+        intake,
+        Box::new(FakeEstablish),
+        Arc::clone(&subscriptions) as Arc<dyn crate::task_execution::round::StatusSubscriptions>,
+    );
+    round.seal_pumps();
+    round.turn().unwrap();
+    let admissions = released_admissions(&sink);
+    assert_eq!(admissions.len(), 1);
+    acks.publish(admission_ack(&admissions[0]));
+    round.turn().unwrap();
+    let mut establishes = released_establishes(&sink);
+    assert_eq!(establishes.len(), 1);
+    (
+        round,
+        clock,
+        acks,
+        sink,
+        establishes.pop().unwrap(),
+        subscriptions,
+    )
+}
+
+pub(crate) fn pre_ready_observation_round() -> (TaskRoundForTest, Arc<ManualClock>) {
+    let (round, clock, _, _, _, _) = original_establish_observation_round();
+    (round, clock)
+}
+
+pub(crate) fn manifest_preparing_observation_round() -> TaskRoundForTest {
+    let harness = Harness::new(&[0], &[0], 64);
+    let (mut round, _, acks, creates) = round_waiting_on_creates(harness);
+    for create in &creates {
+        acks.publish(accepted_create_ack(create));
+    }
+    round.turn().unwrap();
+    round
+}
+
+#[test]
+fn pre_ready_observation_keeps_original_ticket_expiry_across_unknown_replay() {
+    let (mut round, clock, acks, sink, establish, _) = original_establish_observation_round();
+    let backend = round
+        .execution()
+        .graph()
+        .contexts()
+        .next()
+        .unwrap()
+        .backend_process_id();
+    let original = round
+        .execution()
+        .pre_ready_observation_remaining(backend)
+        .unwrap();
+    assert_eq!(original, super::context_owner::ADMISSION_TICKET_VALID_FOR);
+    clock.advance(Duration::from_secs(3));
+    acks.publish(OperationAcknowledgement::transport_unknown(
+        establish.operation_id(),
+        OperationKind::UpdateQueryContext,
+    ));
+    let report = round.receive_without_dispatch().unwrap();
+    assert_eq!(report.acknowledgements, 1);
+    assert_eq!(report.operations, 0);
+    assert!(sink.take().is_empty());
+    assert_eq!(
+        round.execution().pre_ready_observation_remaining(backend),
+        Some(original - Duration::from_secs(3)),
+    );
+    round.turn().unwrap();
+    let replay = released_establishes(&sink);
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0].operation_id(), establish.operation_id());
+    clock.advance(original);
+    assert_eq!(
+        round.execution().pre_ready_observation_remaining(backend),
+        Some(Duration::ZERO)
+    );
+    assert_eq!(
+        round
+            .execution()
+            .pre_ready_observation_remaining(BackendProcessId::new_v7()),
+        None
+    );
+}
+
+#[test]
+fn receiver_only_turn_settles_original_establish_ack_without_create_or_input_work() {
+    struct NoInput;
+    impl crate::task_execution::round::TurnPump for NoInput {
+        fn name(&self) -> &'static str {
+            "no-input-during-process-observation"
+        }
+        fn drive(&mut self, _: &mut QueryTaskExecution) -> Result<usize, TaskExecutionError> {
+            panic!("receiver-only mode must not produce input");
+        }
+        fn begin_close(&mut self) {}
+        fn close_turn(&mut self) -> Result<usize, TaskExecutionError> {
+            Ok(0)
+        }
+        fn is_closed(&self) -> bool {
+            true
+        }
+        fn take_close_unresolved(
+            &mut self,
+        ) -> Option<crate::task_execution::round::PumpCloseUnresolved> {
+            None
+        }
+    }
+    let (mut round, _, acks, sink, establish, subscriptions) =
+        original_establish_observation_round();
+    round.add_pump(Box::new(NoInput));
+    acks.publish(establish_ack(&establish));
+    let report = round.receive_without_dispatch().unwrap();
+    assert_eq!(report.acknowledgements, 1);
+    assert_eq!(report.operations, 0);
+    assert_eq!(report.pumped, 0);
+    assert!(
+        sink.take().is_empty(),
+        "no create/update/lifecycle work is sent"
+    );
+    let context = *round.execution().graph().contexts().next().unwrap();
+    assert!(
+        round
+            .execution()
+            .owner(context)
+            .unwrap()
+            .establish_acknowledged()
+    );
+    assert_eq!(
+        round
+            .execution()
+            .pre_ready_observation_remaining(context.backend_process_id()),
+        None
+    );
+    assert_eq!(subscriptions.ensured.lock().unwrap().len(), 1);
+}
+
+pub(crate) fn manifest_originating_failure_observation_round() -> TaskRoundForTest {
+    use novarocks_failure_contract::FailureProjection;
+    let harness = Harness::new(&[0], &[0], 64);
+    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    for create in &creates {
+        acks.publish(accepted_create_ack(create));
+    }
+    round.turn().unwrap();
+    let root = round.root_task();
+    status.publish(StatusEvent::Published(
+        TaskStatus::try_new_with_installed(
+            root, TaskStatusVersion::new(2).unwrap(), TaskState::Failing,
+            Some(TerminationDetail::Failed(novarocks_execution_contract::TaskFailure::new_in_phase(
+                novarocks_query_application::execution_error::QueryFailureReason::PreparationFailed.failure_fact(),
+                novarocks_execution_contract::SafeDetail::truncating("original preparing Task failure"),
+                novarocks_execution_contract::TaskFailurePhase::Preparation,
+            ))),
+            TaskOutputFacts::new(false),
+            false,
+        ).unwrap(),
+    ));
+    round
+}
+
+#[test]
+fn pending_receiver_dispatches_only_owned_actor_abort_and_preserves_backpressure() {
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let context = *harness.execution.graph().contexts().next().unwrap();
+    // Retain a real ordinary admission behind the urgent Abort in the same
+    // lifecycle lane. A filtered control dispatch may not release it.
+    harness
+        .sink
+        .backpressured_lanes
+        .lock()
+        .unwrap()
+        .insert(DispatchLane::Lifecycle);
+    harness.execution.pump(&harness.establish).unwrap();
+    assert!(harness.sink.take().is_empty());
+    let ordinary_queued = harness.execution.dispatcher().queued_items();
+    assert_eq!(ordinary_queued, 1);
+    let abort =
+        OperationIntent::AbortQueryContext(novarocks_execution_contract::AbortQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+            AbortCause::QueryFailed,
+        ));
+    let operation_id = abort.operation_id();
+    let permit = harness
+        .execution
+        .try_reserve_actor_abort(&abort)
+        .unwrap()
+        .unwrap();
+    harness
+        .execution
+        .enqueue_actor_abort(abort, permit)
+        .unwrap();
+    let first = harness.execution.pump_pending_actor_aborts().unwrap();
+    assert_eq!(first.operations, 0);
+    assert!(harness.sink.take().is_empty());
+    assert_eq!(
+        harness.execution.dispatcher().queued_items(),
+        ordinary_queued + 1
+    );
+    harness.sink.backpressured_lanes.lock().unwrap().clear();
+    let sent = harness.execution.pump_pending_actor_aborts().unwrap();
+    assert_eq!(sent.operations, 1);
+    let operations = harness
+        .sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, ops)| ops)
+        .collect::<Vec<_>>();
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].operation_id(), operation_id);
+    assert_eq!(operations[0].kind(), OperationKind::AbortQueryContext);
+    assert_eq!(
+        harness.execution.dispatcher().queued_items(),
+        ordinary_queued
+    );
+    assert_eq!(
+        harness
+            .execution
+            .pump_pending_actor_aborts()
+            .unwrap()
+            .operations,
+        0
+    );
+    assert!(
+        harness.sink.take().is_empty(),
+        "ordinary admission stays retained"
+    );
+}
+
+pub(crate) fn pre_ready_expired_replay_observation_round() -> (TaskRoundForTest, TaskExecutionError)
+{
+    let (mut round, clock, acks, sink, establish, _) = original_establish_observation_round();
+    sink.backpressured_lanes
+        .lock()
+        .unwrap()
+        .insert(DispatchLane::Lifecycle);
+    acks.publish(OperationAcknowledgement::transport_unknown(
+        establish.operation_id(),
+        OperationKind::UpdateQueryContext,
+    ));
+    round.turn().unwrap();
+    assert!(sink.take().is_empty());
+    assert_eq!(round.execution().dispatcher().queued_items(), 1);
+    clock.advance(TransportBudget::DEFAULT.frontend_queue_residence());
+    let error = round.receive_without_dispatch().unwrap_err();
+    assert_eq!(round.execution().dispatcher().queued_items(), 0);
+    (round, error)
+}
+
+#[test]
+fn an_adopted_replacement_ticket_does_not_mint_an_original_observation_clock() {
+    let context = QueryContextRef::new(
+        execution_id(),
+        FrontendProcessId::new_v7(),
+        BackendProcessId::new_v7(),
+    );
+    let mut owner = QueryContextOwner::new(
+        context,
+        0,
+        NativeCompatibilityId::new([0x41; 32]),
+        admission_epoch(),
+    );
+    let received_at = MonotonicInstant::from_origin(Duration::from_secs(100));
+    owner
+        .adopt_replacement_admission(
+            QueryContextAdmissionTicketReceipt::new(
+                AdmissionTicketId::try_from_bytes([0x54; 16]).unwrap(),
+                context,
+                LeaseValidFor::new(Duration::from_secs(10)).unwrap(),
+            ),
+            received_at,
+        )
+        .unwrap();
+    // The existing admission contract still authorizes this first establish.
+    // The original request's send timestamp is not known on this Task clock,
+    // so receipt observation cannot grant another process-evidence window.
+    assert!(
+        owner
+            .establish_intent(FakeEstablish.facts_for(context).unwrap(), received_at)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(owner.pre_ready_observation_remaining(received_at), None);
+    assert_eq!(
+        owner.pre_ready_observation_remaining(received_at.saturating_add(Duration::from_secs(1))),
+        None
+    );
+}
+
+pub(crate) fn pre_ready_invalid_ack_observation_round() -> TaskRoundForTest {
+    let (round, _, acks, _, _, _) = original_establish_observation_round();
+    acks.publish(OperationAcknowledgement::transport_unknown(
+        TaskOperationId::new_v7(),
+        OperationKind::UpdateTask,
+    ));
+    round
 }

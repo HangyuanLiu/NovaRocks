@@ -87,8 +87,10 @@ EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW pir8_pf_mv_${uuid0};
 SELECT 'pir8_mv_refresh_shape_ok' AS status;
 
 -- query 6
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW pir8_pf_mv_${uuid0};
-DROP TABLE pir8_mv_cut_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE pir8_mv_cut_${uuid0}.ns_${uuid0};
-DROP CATALOG pir8_mv_cut_${uuid0};
+SET CATALOG pir8_mv_cut_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.pir8_pf_mv_${uuid0};
+DROP TABLE IF EXISTS pir8_mv_cut_${uuid0}.ns_${uuid0}.orders FORCE;
+DROP DATABASE IF EXISTS pir8_mv_cut_${uuid0}.ns_${uuid0};
+DROP CATALOG IF EXISTS pir8_mv_cut_${uuid0};

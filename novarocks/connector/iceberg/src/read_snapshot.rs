@@ -81,49 +81,8 @@ fn frozen_partition_types(
             if sources.contains_key(&field.source_id) {
                 continue;
             }
-            let mut historical = None;
-            for schema in metadata.schemas_iter() {
-                let Some(source) = schema.field_by_id(field.source_id) else {
-                    continue;
-                };
-                let Type::Primitive(ty) = source.field_type.as_ref() else {
-                    return Err(format!(
-                        "partition source {} is not primitive in retained schema {}",
-                        field.source_id,
-                        schema.schema_id()
-                    ));
-                };
-                historical = Some(match historical {
-                    None => ty.clone(),
-                    Some(previous) => legal_partition_type_join(metadata.format_version(), &previous, ty).ok_or_else(|| format!("partition source {} has incompatible retained types {previous:?} and {ty:?}", field.source_id))?,
-                });
-            }
-            let historical = historical.ok_or_else(|| {
-                format!(
-                    "partition source {} has no retained schema type evidence",
-                    field.source_id
-                )
-            })?;
-            let resolved = match query.field_by_id(field.source_id) {
-                Some(source) => {
-                    let Type::Primitive(ty) = source.field_type.as_ref() else {
-                        return Err(format!(
-                            "partition source {} is not primitive in the query schema",
-                            field.source_id
-                        ));
-                    };
-                    legal_partition_type_join(metadata.format_version(), &historical, ty)
-                        .ok_or_else(|| {
-                            format!(
-                                "query partition source {} conflicts with retained schema types",
-                                field.source_id
-                            )
-                        })?;
-                    ty.clone()
-                }
-                None => historical.clone(),
-            };
-            sources.insert(field.source_id, (resolved, historical));
+            let types = partition_source_types(metadata, query, field.source_id)?;
+            sources.insert(field.source_id, types);
         }
     }
     metadata
@@ -158,6 +117,97 @@ fn frozen_partition_types(
             Ok((spec.spec_id(), StructType::new(fields)))
         })
         .collect()
+}
+
+/// A historical type failure never replaces its creating caller's control cause.
+#[derive(Debug)]
+pub(crate) enum PartitionSourceTypeFailure<E> {
+    Semantic(String),
+    Original(E),
+}
+impl<E> From<String> for PartitionSourceTypeFailure<E> {
+    fn from(message: String) -> Self {
+        Self::Semantic(message)
+    }
+}
+
+pub(crate) fn partition_source_types(
+    metadata: &TableMetadata,
+    query: &Schema,
+    source_id: i32,
+) -> Result<(PrimitiveType, PrimitiveType), String> {
+    partition_source_types_checked(metadata, query, source_id, || {
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .map_err(|cause| match cause {
+        PartitionSourceTypeFailure::Semantic(message) => message,
+        PartitionSourceTypeFailure::Original(never) => match never {},
+    })
+}
+
+/// One exact retained-type policy shared by read domains and metadata authors.
+/// Primitive declarations own no variable-size backing; each schema lookup is
+/// observed before entry and caller failures retain their original identity.
+pub(crate) fn partition_source_types_checked<E>(
+    metadata: &TableMetadata,
+    query: &Schema,
+    source_id: i32,
+    mut active: impl FnMut() -> Result<(), E>,
+) -> Result<(PrimitiveType, PrimitiveType), PartitionSourceTypeFailure<E>> {
+    let mut historical = None;
+    for schema in metadata.schemas_iter() {
+        active().map_err(PartitionSourceTypeFailure::Original)?;
+        let Some(source) = schema.field_by_id(source_id) else {
+            continue;
+        };
+        let Type::Primitive(ty) = source.field_type.as_ref() else {
+            return Err(format!(
+                "partition source {} is not primitive in retained schema {}",
+                source_id,
+                schema.schema_id()
+            )
+            .into());
+        };
+        historical = Some(match historical {
+            None => ty.clone(),
+            Some(previous) => legal_partition_type_join(metadata.format_version(), &previous, ty)
+                .ok_or_else(|| {
+                format!(
+                    "partition source {} has incompatible retained types {previous:?} and {ty:?}",
+                    source_id
+                )
+            })?,
+        });
+    }
+    let historical = historical.ok_or_else(|| {
+        format!(
+            "partition source {} has no retained schema type evidence",
+            source_id
+        )
+    })?;
+    active().map_err(PartitionSourceTypeFailure::Original)?;
+    let resolved = match query.field_by_id(source_id) {
+        Some(source) => {
+            let Type::Primitive(ty) = source.field_type.as_ref() else {
+                return Err(format!(
+                    "partition source {} is not primitive in the query schema",
+                    source_id
+                )
+                .into());
+            };
+            legal_partition_type_join(metadata.format_version(), &historical, ty).ok_or_else(
+                || {
+                    format!(
+                        "query partition source {} conflicts with retained schema types",
+                        source_id
+                    )
+                },
+            )?;
+            ty.clone()
+        }
+        None => historical.clone(),
+    };
+    Ok((resolved, historical))
 }
 
 fn legal_partition_type_join(
@@ -780,17 +830,7 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
             ))?)?;
         }
         let logical = index.for_data(&data).map_err(|e| e.to_string())?;
-        // This bound is selected entirely from metadata. A large suffix costs
-        // no per-member work and stays a compact, conservative view.
-        let policy = if data.metrics.fields().is_empty() {
-            StatisticsPolicy::Disabled
-        } else {
-            StatisticsPolicy::MetadataBudget {
-                max_candidate_members: MAX_STATS_DELETE_MEMBERS,
-                max_field_comparisons: MAX_STATS_FIELD_COMPARISONS,
-            }
-        };
-        let deletes = logical.load_view(policy);
+        let deletes = metadata_delete_load_view(&logical);
         files.push(df.into_file(
             FinalReadFileFacts {
                 partition_spec_id: data.partition().spec_id(),
@@ -804,6 +844,21 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
         )?);
     }
     Ok(files)
+}
+
+/// The shared metadata-only policy for delete applicability and statistics pruning.
+pub(crate) fn metadata_delete_load_view(logical: &crate::delete_semantics::DeleteSet) -> LoadView {
+    // Large candidate suffixes remain compact conservative views under the
+    // original metadata budget; unknown statistics never prove disjointness.
+    let policy = if logical.data().metrics.fields().is_empty() {
+        StatisticsPolicy::Disabled
+    } else {
+        StatisticsPolicy::MetadataBudget {
+            max_candidate_members: MAX_STATS_DELETE_MEMBERS,
+            max_field_comparisons: MAX_STATS_FIELD_COMPARISONS,
+        }
+    };
+    logical.load_view(policy)
 }
 
 /// All final conversions still occur after complete manifest/delete validation.
@@ -1083,7 +1138,7 @@ impl ObservedDataFileProjection for FrozenCowDataFileProjection {
     }
 }
 
-fn resolved_partition_values(
+pub(crate) fn resolved_partition_values(
     values: &Struct,
     partition_type: &crate::iceberg::spec::StructType,
 ) -> Struct {
@@ -1093,17 +1148,29 @@ fn resolved_partition_values(
             .iter()
             .zip(partition_type.fields())
             .map(|(value, field)| match (value, field.field_type.as_ref()) {
-                (
-                    Some(Literal::Primitive(PrimitiveLiteral::Int(v))),
-                    Type::Primitive(PrimitiveType::Long),
-                ) => Some(Literal::Primitive(PrimitiveLiteral::Long(i64::from(*v)))),
-                (
-                    Some(Literal::Primitive(PrimitiveLiteral::Float(v))),
-                    Type::Primitive(PrimitiveType::Double),
-                ) => Some(Literal::double(f64::from(v.0))),
+                (Some(Literal::Primitive(value)), Type::Primitive(target)) => Some(
+                    Literal::Primitive(resolved_partition_primitive(value, target).into_owned()),
+                ),
                 _ => value.clone(),
             }),
     )
+}
+
+/// The admitted lossless partition promotions; unrelated literals remain exact
+/// and are rejected by their final typed consumer rather than coerced here.
+pub(crate) fn resolved_partition_primitive<'a>(
+    value: &'a PrimitiveLiteral,
+    target: &PrimitiveType,
+) -> std::borrow::Cow<'a, PrimitiveLiteral> {
+    match (value, target) {
+        (PrimitiveLiteral::Int(value), PrimitiveType::Long) => {
+            std::borrow::Cow::Owned(PrimitiveLiteral::Long(i64::from(*value)))
+        }
+        (PrimitiveLiteral::Float(value), PrimitiveType::Double) => {
+            std::borrow::Cow::Owned(PrimitiveLiteral::Double(f64::from(value.0).into()))
+        }
+        _ => std::borrow::Cow::Borrowed(value),
+    }
 }
 
 fn manifest_metrics_checked(
@@ -1111,6 +1178,15 @@ fn manifest_metrics_checked(
     schema: &Schema,
     budget: Option<&CaptureBudget<'_>>,
 ) -> Result<FileMetrics, ReadFailure> {
+    manifest_metrics_for_metadata(df, schema, || check_cow_active(budget))
+}
+
+/// The same manifest metric binding under the caller's original control owner.
+pub(crate) fn manifest_metrics_for_metadata<E>(
+    df: &DataFile,
+    schema: &Schema,
+    mut active: impl FnMut() -> Result<(), E>,
+) -> Result<FileMetrics, E> {
     let mut ids = std::collections::BTreeSet::new();
     for id in df
         .value_counts()
@@ -1120,12 +1196,12 @@ fn manifest_metrics_checked(
         .chain(df.lower_bounds().keys())
         .chain(df.upper_bounds().keys())
     {
-        check_cow_active(budget)?;
+        active()?;
         ids.insert(*id);
     }
     let mut fields = BTreeMap::new();
     for id in ids {
-        check_cow_active(budget)?;
+        active()?;
         let value_type = match id {
             POSITION_FILE_PATH_FIELD_ID
                 if df.content_type() == DataContentType::PositionDeletes =>
@@ -1160,8 +1236,8 @@ fn manifest_metrics_checked(
             .bind_bounds(),
         );
     }
-    check_cow_active(budget)?;
-    FileMetrics::new_checked(fields, || check_cow_active(budget))
+    active()?;
+    FileMetrics::new_checked(fields, active)
 }
 
 fn column_stats(

@@ -51,7 +51,9 @@ set @arr_str = (select array_agg(k1) from tbl);
 -- @skip_result_check=true
 -- The original 10,000-row input remains unchanged. Its roughly 850 KiB
 -- nested value exceeds the accepted 64 KiB whole-record ScalarValueV1 bound.
--- @expect_error=scalar value exceeds frozen 64 KiB record bound
+-- @expect_error=MinimumUnit layout 6:1000 extent_limit=65536
+-- @expect_sql_code=query.execution.representation
+-- @expect_sql_phase=Execution
 USE ${case_db};
 set @arr_str = (select array_agg(k1) from (select t1.k1 from tbl t1 join tbl t2 join tbl t3 join tbl t4) t);
 

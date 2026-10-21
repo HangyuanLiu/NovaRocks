@@ -42,6 +42,7 @@ pub struct MvProviderFailure {
     kind: MvProviderFailureKind,
     message: String,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
+    unavailable_implementation: Option<novarocks_sql::analyze_error::AnalyzeError>,
 }
 
 impl MvProviderFailure {
@@ -50,6 +51,7 @@ impl MvProviderFailure {
             kind,
             message: message.into(),
             compile_control: None,
+            unavailable_implementation: None,
         }
     }
 
@@ -62,6 +64,32 @@ impl MvProviderFailure {
     }
     pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
         self.compile_control.clone()
+    }
+
+    /// Retain only the typed missing-implementation cause, never diagnostic text.
+    pub fn with_unavailable_implementation(
+        mut self,
+        error: Option<novarocks_sql::analyze_error::AnalyzeError>,
+    ) -> Self {
+        if matches!(
+            self.kind,
+            MvProviderFailureKind::CommitUnknown
+                | MvProviderFailureKind::KnownCommittedFinalizeFailed
+        ) {
+            self.unavailable_implementation = None;
+            return self;
+        }
+        self.unavailable_implementation = error.filter(|error| {
+            error.kind()
+                == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation
+        });
+        self
+    }
+
+    pub fn unavailable_implementation(
+        &self,
+    ) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
+        self.unavailable_implementation.as_ref()
     }
 
     pub const fn kind(&self) -> MvProviderFailureKind {
@@ -86,7 +114,9 @@ impl MvProviderFailure {
             MvProviderFailureKind::TargetReplaced => MvProductErrorKind::TargetReplaced,
             MvProviderFailureKind::Corruption => MvProductErrorKind::Corruption,
         };
-        MvProductError::new(kind, self.message).with_compile_control(self.compile_control)
+        MvProductError::new(kind, self.message)
+            .with_compile_control(self.compile_control)
+            .with_unavailable_implementation(self.unavailable_implementation)
     }
 }
 
@@ -261,5 +291,47 @@ mod tests {
                 assert_eq!(ordinary.compile_control_error(), None);
             }
         }
+    }
+
+    #[test]
+    fn pure_admission_identity_does_not_override_provider_commit_disposition() {
+        use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
+        use novarocks_sql::{analyze_error::AnalyzeError, compiler::SqlCompileError};
+        let SqlCompileError::Analyze(analyze) =
+            SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
+                FunctionOverloadId::try_new("fixture/mv/provider/missing-pure-v1").unwrap(),
+            ))
+        else {
+            panic!("missing implementation must retain analysis identity");
+        };
+        for (provider_kind, product_kind) in [
+            (
+                MvProviderFailureKind::CommitUnknown,
+                MvProductErrorKind::CommitUnknown,
+            ),
+            (
+                MvProviderFailureKind::KnownCommittedFinalizeFailed,
+                MvProductErrorKind::KnownCommittedFinalizeFailed,
+            ),
+        ] {
+            let provider = MvProviderFailure::new(provider_kind, "publication outcome")
+                .with_unavailable_implementation(Some(analyze.clone()));
+            assert_eq!(provider.unavailable_implementation(), None);
+            let product = provider
+                .into_product_error()
+                .with_unavailable_implementation(Some(analyze.clone()));
+            assert_eq!(product.kind(), product_kind);
+            assert_eq!(product.message(), "publication outcome");
+            assert_eq!(product.unavailable_implementation(), None);
+        }
+        let diagnostic =
+            MvProviderFailure::new(MvProviderFailureKind::InvalidRequest, "Unsupported")
+                .with_unavailable_implementation(Some(AnalyzeError::internal(
+                    "UnavailableImplementation",
+                )))
+                .into_product_error();
+        assert_eq!(diagnostic.kind(), MvProductErrorKind::InvalidRequest);
+        assert_eq!(diagnostic.message(), "Unsupported");
+        assert_eq!(diagnostic.unavailable_implementation(), None);
     }
 }

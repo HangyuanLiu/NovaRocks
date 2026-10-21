@@ -274,6 +274,23 @@ pub(crate) fn suite_inputs(suite: &SuiteConfig) -> Result<Value> {
     Ok(value)
 }
 
+/// Every native SQL suite consumes this runner and its shared launch/control
+/// mechanics, independently of the suite's engine-specific assertions.
+fn native_suite_impact(manifest: &SuiteManifest) -> crate::suite_manifest::ImpactDeclaration {
+    let mut impact = manifest.impact.clone();
+    for path in [
+        "tests/sql/runner/**",
+        "tests/cluster-harness/**",
+        "tests/test-support/**",
+        "novarocks/failpoint/**",
+    ] {
+        if !impact.paths.iter().any(|declared| declared == path) {
+            impact.paths.push(path.to_owned());
+        }
+    }
+    impact
+}
+
 pub(crate) fn declarations(suites: &BTreeMap<String, SuiteConfig>) -> Result<Value> {
     let entries = suites
         .values()
@@ -288,7 +305,7 @@ pub(crate) fn declarations(suites: &BTreeMap<String, SuiteConfig>) -> Result<Val
             } else {
                 "admission"
             });
-            facts["impact"] = json!(suite.manifest.impact);
+            facts["impact"] = json!(native_suite_impact(&suite.manifest));
             facts["reuse"] = json!(suite.manifest.reuse);
             Ok(facts)
         })
@@ -986,6 +1003,68 @@ mod lifecycle_tests {
             writer,
         )
     }
+    #[test]
+    fn native_declarations_keep_suite_facts_and_cover_shared_sql_launch_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let (prepared, _) = prepared(dir.path());
+        let original = prepared.ctx.results.as_ref().unwrap().config.clone();
+        let mut suites = BTreeMap::new();
+        for (name, explicit) in [("regular", false), ("heavy", true)] {
+            let mut suite = original.clone();
+            suite.name = name.to_owned();
+            suite.manifest.impact.paths = vec![
+                "novarocks/sql/src/optimizer/**".to_owned(),
+                "tests/sql/runner/**".to_owned(),
+            ];
+            suite.manifest.explicit_only = explicit;
+            if explicit {
+                suite.manifest.heavy = Some(crate::suite_manifest::HeavyDeclaration {
+                    reason: crate::suite_manifest::HeavyReason::Cost,
+                    detail: "Existing independently selected heavy fixture".to_owned(),
+                });
+            }
+            suites.insert(name.to_owned(), suite);
+        }
+        let declared = declarations(&suites).unwrap();
+        assert_eq!(declared["suites"].as_array().unwrap().len(), suites.len());
+        for entry in declared["suites"].as_array().unwrap() {
+            let name = entry["name"].as_str().unwrap();
+            let original = &suites[name];
+            let paths = entry["impact"]["paths"].as_array().unwrap();
+            for shared in [
+                "tests/sql/runner/**",
+                "tests/cluster-harness/**",
+                "tests/test-support/**",
+                "novarocks/failpoint/**",
+            ] {
+                assert_eq!(
+                    paths
+                        .iter()
+                        .filter(|path| path.as_str() == Some(shared))
+                        .count(),
+                    1
+                );
+            }
+            assert!(
+                paths
+                    .iter()
+                    .any(|path| path.as_str() == Some("novarocks/sql/src/optimizer/**"))
+            );
+            assert_eq!(
+                entry["explicit_only"],
+                json!(original.manifest.explicit_only)
+            );
+            assert_eq!(entry["heavy"], json!(original.manifest.heavy));
+            assert_eq!(entry["reuse"], json!(original.manifest.reuse));
+            assert_eq!(entry["cases"], suite_inputs(original).unwrap()["cases"]);
+            assert_eq!(
+                original.manifest.impact.paths.len(),
+                2,
+                "native projection must not mutate the suite's own declaration"
+            );
+        }
+    }
+
     fn rows(root: &Path) -> Vec<Value> {
         fs::read_to_string(root.join("results.jsonl"))
             .unwrap()

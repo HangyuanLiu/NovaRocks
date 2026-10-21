@@ -30,7 +30,12 @@ use std::time::Duration;
 
 pub const DECLARATION_VERSION: u32 = 1;
 pub const MAX_DECLARATION_BYTES: usize = 64 * 1024;
-pub const MAX_GRANTS: usize = 64;
+// One real FE launch in the native SQL recovery suite needs 103 independently
+// bound grants, including both allowed submission attempts. Keep that launch
+// intact: rounding its finite demand up to 128 avoids synthetic role restarts.
+// The independent 64 KiB envelope bound still limits total input and parsing
+// work; grant validation and claim scans also retain this finite count bound.
+pub const MAX_GRANTS: usize = 128;
 pub const MAX_LIVENESS_FRAME_BYTES: usize = 4096;
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 pub const HEARTBEAT_LOSS: Duration = Duration::from_secs(30);
@@ -258,4 +263,63 @@ pub(crate) fn secret_matches(expected: &str, received: &str) -> bool {
         .zip(received.bytes())
         .fold(0, |diff, (a, b)| diff | (a ^ b))
         == 0
+}
+
+#[cfg(all(test, unix))]
+mod capacity_tests {
+    use super::*;
+
+    fn declaration(grants: usize) -> SessionDeclaration {
+        SessionDeclaration {
+            schema_version: DECLARATION_VERSION,
+            session_id: "capacity-session".into(),
+            launch_id: "capacity-launch".into(),
+            role: SessionRole::Fe,
+            lifetime_millis: 1000,
+            liveness_socket: PathBuf::from("/tmp/capacity.sock"),
+            handshake_secret: "abcdefghijklmnopqrstuvwxyz0123456789".into(),
+            domain_grants: (0..grants)
+                .map(|index| DomainGrant {
+                    domain: "test-domain".into(),
+                    grant_id: format!("exact-{index}"),
+                    parameters: serde_json::json!({"request":"exact"}),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn declaration_accepts_128_exact_grants_and_rejects_129() {
+        let accepted = declaration(128);
+        accepted.validate_envelope().unwrap();
+        let encoded = serde_json::to_vec(&accepted).unwrap();
+        assert!(encoded.len() <= MAX_DECLARATION_BYTES);
+        let decoded: SessionDeclaration = serde_json::from_slice(&encoded).unwrap();
+        decoded.validate_envelope().unwrap();
+        assert_eq!(decoded.domain_grants.len(), 128);
+
+        let error = declaration(129).validate_envelope().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "test-session requires a bounded nonempty grant set"
+        );
+    }
+
+    #[test]
+    fn declaration_capacity_does_not_relax_the_total_byte_bound() {
+        let mut oversized = declaration(1);
+        oversized.domain_grants[0].parameters =
+            serde_json::json!({"action":"observe","payload":"x".repeat(64 * 1024)});
+        oversized.validate_envelope().unwrap();
+        assert!(serde_json::to_vec(&oversized).unwrap().len() > MAX_DECLARATION_BYTES);
+        // Serialization must reject before opening this path. No role or test
+        // transport is created by this envelope boundary check.
+        let error = oversized.write_private(Path::new("/")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "test-session declaration exceeds its byte bound"
+        );
+    }
 }

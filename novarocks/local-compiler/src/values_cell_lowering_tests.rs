@@ -93,15 +93,23 @@ fn rows() -> Vec<Vec<Cell>> {
 }
 
 fn cast_package(chain: bool) -> Arc<FragmentPackage> {
-    let pools = pools();
-    let mut constants = ConstantPools::empty();
-    for (id, pool) in &pools {
-        constants.insert(*id, pool.clone()).unwrap();
-    }
     let types = [
         FunctionValueType::new(DataType::Int64, true),
         FunctionValueType::new(DataType::Int64, false),
     ];
+    cast_package_with_cells(pools(), &types, rows(), chain)
+}
+
+fn cast_package_with_cells(
+    pools: Vec<(ConstantPoolId, ConstantPool)>,
+    types: &[FunctionValueType],
+    rows: Vec<Vec<Cell>>,
+    chain: bool,
+) -> Arc<FragmentPackage> {
+    let mut constants = ConstantPools::empty();
+    for (id, pool) in &pools {
+        constants.insert(*id, pool.clone()).unwrap();
+    }
     let values_node = NodeId::new(u32::MAX);
     let mut builder = FragmentBuilder::new(FragmentId::new(172));
     let outputs = types
@@ -120,7 +128,7 @@ fn cast_package(chain: bool) -> Arc<FragmentPackage> {
         })
         .collect::<Vec<_>>();
     let mut cells = Vec::new();
-    for row in rows() {
+    for row in rows {
         let mut exprs = Vec::new();
         for (column, cell) in row.into_iter().enumerate() {
             let (pool, ordinal) = match cell {
@@ -144,7 +152,7 @@ fn cast_package(chain: bool) -> Arc<FragmentPackage> {
                         types[column].clone(),
                         ExprKind::Cast {
                             expr: constant,
-                            target: DataType::Int64,
+                            target: types[column].data_type().clone(),
                             decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
                             allow_throw_exception: ALLOW,
                         },
@@ -498,4 +506,78 @@ fn values_constant_cells_keep_one_complete_batch() {
     let values = values_node(&program);
     assert!(values.dynamic_cells().is_empty());
     assert_eq!(values.batch().unwrap().num_rows(), 2);
+}
+
+#[test]
+fn values_dynamic_list_cells_keep_complete_type_and_cross_pool_constant_backing() {
+    use arrow_array::{ListArray, types::Int64Type};
+    let first: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>([
+        Some(vec![Some(10), None]),
+        None,
+    ]));
+    let second: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>([
+        Some(vec![]),
+        Some(vec![Some(20)]),
+    ]));
+    let third: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>([Some(
+        vec![Some(30), Some(40)],
+    )]));
+    let pools = [first, second, third]
+        .into_iter()
+        .enumerate()
+        .map(|(index, array)| {
+            (
+                ConstantPoolId::new(index as u32),
+                checked_pool(array, true, ValueLogicalType::Physical),
+            )
+        })
+        .collect::<Vec<_>>();
+    let ty = pools[0].1.value_type().clone();
+    let package = cast_package_with_cells(
+        pools,
+        &[ty.clone()],
+        vec![
+            vec![Cell::Constant(0, 0)],
+            vec![Cell::Cast(1, 0)],
+            vec![Cell::Constant(2, 0)],
+            vec![Cell::Cast(0, 1)],
+            vec![Cell::Cast(1, 1)],
+        ],
+        false,
+    );
+    let program = compile(package, &Control::good()).unwrap();
+    let values = values_node(&program);
+    assert_eq!(
+        values
+            .dynamic_cells()
+            .iter()
+            .map(|cell| (cell.row, cell.column))
+            .collect::<Vec<_>>(),
+        vec![(1, 0), (3, 0), (4, 0)]
+    );
+    assert_eq!(
+        values.layout().schema().field(0).data_type(),
+        ty.data_type()
+    );
+    let StaticValuesBacking::Cells {
+        rows, constants, ..
+    } = values.backing()
+    else {
+        panic!("mixed List cells keep original roots and constant backing");
+    };
+    assert_eq!(rows, 5);
+    let constant = constants[0].as_any().downcast_ref::<ListArray>().unwrap();
+    assert_eq!(constant.len(), 2);
+    let actual = (0..constant.len())
+        .map(|row| {
+            let value = constant.value(row);
+            value
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(actual, vec![vec![Some(10), None], vec![Some(30), Some(40)]]);
 }

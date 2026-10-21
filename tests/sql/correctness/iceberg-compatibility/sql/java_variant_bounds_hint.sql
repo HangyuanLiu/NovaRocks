@@ -30,9 +30,15 @@ cat "$receipt_dir/run.log" >&2
 grep -E '^IRU9_(BOUNDS_OK|FIXTURE_COMPLETE)' "$receipt_dir/run.log"
 
 -- query 2
--- @expect_error=NovaRocks cannot read Variant column statistics written by other engines yet
+-- Variant-history hints remain private provider diagnostics, covered by the
+-- provider history/reader regressions. This bounds fixture retains the exact
+-- existing Unavailable fact; reason 4:8 is not a Variant-specific refusal.
+-- @expect_sql_code=query.execution.dependency
+-- @expect_sql_phase=Execution
+-- @expect_error=(reason 4:8)
 SELECT id FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_bounds_${uuid0};
 
 -- query 3
+-- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_bounds_${uuid0} FORCE;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_bounds_${uuid0} FORCE;

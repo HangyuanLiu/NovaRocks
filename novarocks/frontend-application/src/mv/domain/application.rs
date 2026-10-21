@@ -285,6 +285,7 @@ pub struct MvApplicationError {
     kind: MvApplicationErrorKind,
     message: String,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
+    unavailable_implementation: Option<novarocks_sql::analyze_error::AnalyzeError>,
 }
 
 impl MvApplicationError {
@@ -293,6 +294,7 @@ impl MvApplicationError {
             kind,
             message: message.into(),
             compile_control: None,
+            unavailable_implementation: None,
         }
     }
 
@@ -308,19 +310,25 @@ impl MvApplicationError {
                 Some(novarocks_type_contract::CompileControlError::ResourceExhausted)
             }
             novarocks_sql::compiler::SqlCompileError::Analyze(error) => error.control_error(),
+            novarocks_sql::compiler::SqlCompileError::CompilationSource(source) => Some(
+                novarocks_type_contract::CompileControlError::Source(source.clone()),
+            ),
             _ => None,
         };
-        let message = match &error {
+        let unavailable_implementation = match &error {
             novarocks_sql::compiler::SqlCompileError::Analyze(error)
                 if error.kind()
                     == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation =>
             {
-                error.to_user_error(None).to_string()
+                Some(error.clone())
             }
-            _ => error.to_string(),
+            _ => None,
         };
+        // Public SQL codes are rendered only at the final typed command boundary.
+        let message = error.to_string();
         let mut failure = Self::new(MvApplicationErrorKind::InvalidRequest, message);
         failure.compile_control = control;
+        failure.unavailable_implementation = unavailable_implementation;
         failure
     }
     pub(crate) fn with_compile_control(
@@ -332,6 +340,32 @@ impl MvApplicationError {
     }
     pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
         self.compile_control.clone()
+    }
+
+    /// Retain only the typed missing-implementation cause, never diagnostic text.
+    pub(crate) fn with_unavailable_implementation(
+        mut self,
+        error: Option<novarocks_sql::analyze_error::AnalyzeError>,
+    ) -> Self {
+        if matches!(
+            self.kind,
+            MvApplicationErrorKind::CommitUnknown
+                | MvApplicationErrorKind::KnownCommittedFinalizeFailed
+        ) {
+            self.unavailable_implementation = None;
+            return self;
+        }
+        self.unavailable_implementation = error.filter(|error| {
+            error.kind()
+                == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation
+        });
+        self
+    }
+
+    pub fn unavailable_implementation(
+        &self,
+    ) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
+        self.unavailable_implementation.as_ref()
     }
 
     pub fn kind(&self) -> MvApplicationErrorKind {
@@ -371,6 +405,7 @@ pub struct MvCreateProviderError {
     kind: MvCreateProviderErrorKind,
     message: String,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
+    unavailable_implementation: Option<novarocks_sql::analyze_error::AnalyzeError>,
 }
 
 impl MvCreateProviderError {
@@ -379,6 +414,7 @@ impl MvCreateProviderError {
             kind,
             message: message.into(),
             compile_control: None,
+            unavailable_implementation: None,
         }
     }
 
@@ -386,10 +422,17 @@ impl MvCreateProviderError {
         let failure = MvApplicationError::from_compile(error);
         let mut result = Self::new(MvCreateProviderErrorKind::Analysis, failure.message());
         result.compile_control = failure.compile_control_error();
+        result.unavailable_implementation = failure.unavailable_implementation().cloned();
         result
     }
     pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
         self.compile_control.clone()
+    }
+
+    pub fn unavailable_implementation(
+        &self,
+    ) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
+        self.unavailable_implementation.as_ref()
     }
 
     pub fn kind(&self) -> MvCreateProviderErrorKind {
@@ -506,18 +549,62 @@ mod compile_error_tests {
         let SqlCompileError::Analyze(ref analyze) = compile else {
             panic!("missing implementation must retain typed analysis identity");
         };
-        let expected = analyze.to_user_error(None).to_string();
+        let expected = analyze.to_string();
+        let expected_analyze = analyze.clone();
         let application = MvApplicationError::from_compile(compile.clone());
         let provider = MvCreateProviderError::from_compile(compile);
         assert_eq!(application.kind(), MvApplicationErrorKind::InvalidRequest);
         assert_eq!(provider.kind(), MvCreateProviderErrorKind::Analysis);
+        assert_eq!(
+            application.unavailable_implementation(),
+            Some(&expected_analyze)
+        );
+        assert_eq!(
+            provider.unavailable_implementation(),
+            Some(&expected_analyze)
+        );
         for (message, control) in [
             (application.message(), application.compile_control_error()),
             (provider.message(), provider.compile_control_error()),
         ] {
             assert_eq!(message, expected);
-            assert!(message.starts_with("[sql.analyze.unavailable_implementation] "));
+            assert!(!message.starts_with("[sql.analyze.unavailable_implementation] "));
             assert_eq!(control, None);
+        }
+    }
+
+    #[test]
+    fn mv_application_and_create_keep_the_original_compile_source() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        for original in [
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability("router".into()),
+            novarocks_plan_codec::PhysicalEncodeError::Invalid("unsupported diagnostic".into()),
+        ] {
+            let source = SharedFailureCause::new(original);
+            let fact = source.failure_fact();
+            let compile = SqlCompileError::CompilationSource(source.clone());
+            let application = MvApplicationError::from_compile(compile.clone());
+            let provider = MvCreateProviderError::from_compile(compile);
+            for control in [
+                application.compile_control_error(),
+                provider.compile_control_error(),
+            ] {
+                let Some(CompileControlError::Source(carried)) = control else {
+                    panic!("keep the original compile source");
+                };
+                assert_eq!(
+                    carried, source,
+                    "SharedFailureCause equality is Arc identity"
+                );
+                assert_eq!(carried.failure_fact(), fact);
+                assert!(
+                    carried
+                        .downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>()
+                        .is_some()
+                );
+            }
+            assert_eq!(application.unavailable_implementation(), None);
+            assert_eq!(provider.unavailable_implementation(), None);
         }
     }
 
@@ -534,6 +621,8 @@ mod compile_error_tests {
             assert_eq!(application.message(), expected);
             assert_eq!(provider.message(), expected);
             assert_eq!(application.compile_control_error(), None);
+            assert_eq!(application.unavailable_implementation(), None);
+            assert_eq!(provider.unavailable_implementation(), None);
             assert_eq!(provider.compile_control_error(), None);
         }
     }
@@ -556,6 +645,8 @@ mod compile_error_tests {
                 assert_eq!(provider.message(), expected);
                 assert_eq!(application.compile_control_error(), Some(control.clone()));
                 assert_eq!(provider.compile_control_error(), Some(control.clone()));
+                assert_eq!(application.unavailable_implementation(), None);
+                assert_eq!(provider.unavailable_implementation(), None);
                 assert_eq!(application.kind(), MvApplicationErrorKind::InvalidRequest);
                 assert_eq!(provider.kind(), MvCreateProviderErrorKind::Analysis);
             }

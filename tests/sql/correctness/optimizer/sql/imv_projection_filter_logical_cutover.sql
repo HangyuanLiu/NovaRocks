@@ -92,8 +92,10 @@ EXPLAIN REFRESH MATERIALIZED VIEW pf_mv_${uuid0};
 EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW pf_mv_${uuid0};
 
 -- query 6
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW pf_mv_${uuid0};
-DROP TABLE imv_pf_cut_${uuid0}.ns_${uuid0}.orders FORCE;
-DROP DATABASE imv_pf_cut_${uuid0}.ns_${uuid0};
-DROP CATALOG imv_pf_cut_${uuid0};
+SET CATALOG imv_pf_cut_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.pf_mv_${uuid0};
+DROP TABLE IF EXISTS imv_pf_cut_${uuid0}.ns_${uuid0}.orders FORCE;
+DROP DATABASE IF EXISTS imv_pf_cut_${uuid0}.ns_${uuid0};
+DROP CATALOG IF EXISTS imv_pf_cut_${uuid0};

@@ -108,10 +108,13 @@ pub use split_source::{
     IcebergDeleteFileFacts, IcebergPlannedDataFile, IcebergSplitSource, IcebergSplitSourceOptions,
     READ_SPLIT_TARGET_SIZE_PROPERTY, plan_change_window_splits,
 };
+pub(crate) use system_page_source::publish_read_schema_with_metadata;
 pub use system_page_source::{
     IcebergSystemPageSource, IcebergSystemTableProvider, bounds_row_type, derived_row_type_json,
-    files_relation_schema_json, partition_row_type, partitions_view_schema,
-    project_system_relation_columns, system_relation_columns, system_relation_schema,
+    files_relation_schema_json, files_relation_schema_json_with_metadata, partition_row_type,
+    partition_row_type_with_metadata, partitions_view_schema, project_system_relation_columns,
+    system_relation_columns, system_relation_columns_with_metadata, system_relation_schema,
+    system_relation_schema_with_metadata,
 };
 pub use system_table::{
     FilesTableSplit, FilesTableSplitParams, FilesTableSplitSource, FilesTableSplitSourceParams,

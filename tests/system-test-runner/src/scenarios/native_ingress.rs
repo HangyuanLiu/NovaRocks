@@ -165,7 +165,7 @@ impl Scenario for OuterPreflightRejection {
         )?;
         ensure!(
             over_ordinary.code() == tonic::Code::ResourceExhausted,
-            "oversized binary Content-Length must fail before body read, got {over_ordinary}"
+            "oversized ordinary Content-Length must fail before body read, got {over_ordinary}"
         );
         ensure!(
             over_ordinary
@@ -174,7 +174,7 @@ impl Scenario for OuterPreflightRejection {
                 == Some(&tonic::metadata::MetadataValue::from_static("body_limit")),
             "ordinary body limit rejection lost its typed ingress category"
         );
-        context.action("binary method 64 MiB Content-Length rejected before reading DATA");
+        context.action("ordinary method 64 MiB Content-Length rejected before reading DATA");
 
         let response: RawUnaryResponse<proto::ApplyTaskOperationsResponse> = raw_unary_response(
             &connector,
@@ -194,7 +194,7 @@ impl Scenario for OuterPreflightRejection {
         );
         context.action("33-item batch rejected by the raw codec resource preflight");
         let rows = read_backend_metrics(context, 0)?;
-        for class in ["binary", "control"] {
+        for class in ["ordinary", "control"] {
             let header_rejections = metric(
                 &rows,
                 "novarocks_backend_native_ingress_rejections_total",
@@ -431,7 +431,7 @@ impl Scenario for CurrentGateObservation {
         for index in 0..REQUIRED_BACKENDS {
             let rows = read_backend_metrics(context, index)?;
             let rows = rows.as_slice();
-            for class in ["binary", "control"] {
+            for class in ["ordinary", "control"] {
                 for phase in ["running", "waiting"] {
                     let used = metric(
                         rows,
@@ -516,12 +516,13 @@ impl Scenario for CurrentGateObservation {
         )?;
         let primary = (|| -> Result<()> {
             held.await_entered(context.deadline())?;
-            wait_ingress_slot(context, "binary", "running", 1.0)?;
-            context
-                .action("BE[0] binary running slot rose to one during a real held Worker closure");
+            wait_ingress_slot(context, "ordinary", "running", 1.0)?;
+            context.action(
+                "BE[0] ordinary running slot rose to one during a real held Worker closure",
+            );
             held.release_and_join()?;
-            wait_ingress_slot(context, "binary", "running", 0.0)?;
-            context.action("BE[0] binary running slot returned to zero after closure release");
+            wait_ingress_slot(context, "ordinary", "running", 0.0)?;
+            context.action("BE[0] ordinary running slot returned to zero after closure release");
             Ok(())
         })();
         held.finish_after(primary)
@@ -618,7 +619,7 @@ impl Scenario for BlockingSaturationControl {
             &read_backend_metrics(context, 0)?,
             "novarocks_backend_native_ingress_slots",
             &[
-                ("class", "binary"),
+                ("class", "ordinary"),
                 ("phase", "running"),
                 ("dimension", "limit"),
             ],
@@ -636,12 +637,12 @@ impl Scenario for BlockingSaturationControl {
         )?;
         let primary = (|| -> Result<()> {
             held.await_entered(context.deadline())?;
-            wait_ingress_slot(context, "binary", "running", 8.0)?;
-            context.action("BE[0] eight real binary Worker closures held; binary blocking pool and running gate full");
+            wait_ingress_slot(context, "ordinary", "running", 8.0)?;
+            context.action("BE[0] eight real ordinary Worker closures held; ordinary blocking pool and running gate full");
 
             held.start_waiter(&authorization, operation.clone())?;
-            wait_ingress_slot(context, "binary", "waiting", 1.0)?;
-            context.action("ninth binary request visibly waited at Native gate");
+            wait_ingress_slot(context, "ordinary", "waiting", 1.0)?;
+            context.action("ninth ordinary request visibly waited at Native gate");
 
             // No task was created in this context. A typed Worker refusal proves
             // control-lane progress without claiming that a real task was canceled.
@@ -707,7 +708,7 @@ impl Scenario for BlockingSaturationControl {
                         == Ok(proto::QueryContextState::Quiescing),
                 "task-free Quiesce did not freeze the exact empty accepted-task set: {ack:?}"
             );
-            context.action("Quiesce installed fence version one with an empty accepted-task set under binary saturation");
+            context.action("Quiesce installed fence version one with an empty accepted-task set under ordinary saturation");
 
             let release_request = control_release(releasable.clone());
             let release_id = release_request.operations[0]
@@ -753,9 +754,10 @@ impl Scenario for BlockingSaturationControl {
                 "queued ordinary probe failed after release: {:?}",
                 queued.grpc_message
             );
-            wait_ingress_slot(context, "binary", "running", 0.0)?;
-            wait_ingress_slot(context, "binary", "waiting", 0.0)?;
-            context.action("binary running/waiting returned to zero after release and queue drain");
+            wait_ingress_slot(context, "ordinary", "running", 0.0)?;
+            wait_ingress_slot(context, "ordinary", "waiting", 0.0)?;
+            context
+                .action("ordinary running/waiting returned to zero after release and queue drain");
             Ok(())
         })();
         held.finish_after(primary)
@@ -824,7 +826,7 @@ impl Scenario for AsyncSchedulingPressure {
                 &rows,
                 "novarocks_backend_native_ingress_slots",
                 &[
-                    ("class", "binary"),
+                    ("class", "ordinary"),
                     ("phase", "running"),
                     ("dimension", "used"),
                 ],
@@ -833,7 +835,7 @@ impl Scenario for AsyncSchedulingPressure {
                 &rows,
                 "novarocks_backend_native_ingress_slots",
                 &[
-                    ("class", "binary"),
+                    ("class", "ordinary"),
                     ("phase", "waiting"),
                     ("dimension", "used"),
                 ],
@@ -927,7 +929,7 @@ impl Scenario for PartialBodyDeadline {
             let rows = read_backend_metrics(context, 0)?;
             let rejected = rows.iter().any(|row| {
                 row["tags"]["metric"] == "novarocks_backend_native_ingress_rejections_total"
-                    && row["tags"]["class"] == "binary"
+                    && row["tags"]["class"] == "ordinary"
                     && row["tags"]["reason"] == "running_deadline"
                     && row["value"].as_f64().is_some_and(|value| value >= 1.0)
             });
@@ -940,8 +942,8 @@ impl Scenario for PartialBodyDeadline {
             );
             thread::yield_now();
         }
-        context.action(format!("binary half-open DATA ended after {:?} with {:?}; running_deadline count advanced (RST has no readable gRPC status)", elapsed, outcome));
-        wait_ingress_slot(context, "binary", "running", 0.0)?;
+        context.action(format!("ordinary half-open DATA ended after {:?} with {:?}; running_deadline count advanced (RST has no readable gRPC status)", elapsed, outcome));
+        wait_ingress_slot(context, "ordinary", "running", 0.0)?;
         let control: RawUnaryResponse<proto::ApplyTaskOperationsResponse> = raw_unary_response(
             &control_connector,
             CONTROL_PATH,
@@ -1708,7 +1710,7 @@ impl HeldOrdinary {
     }
 
     fn start_waiter(&mut self, authorization: &str, operation: proto::TaskOperation) -> Result<()> {
-        ensure!(self.waiter.is_none(), "binary waiter already started");
+        ensure!(self.waiter.is_none(), "ordinary waiter already started");
         let client = self.connection.client();
         let authorization = authorization.to_owned();
         let deadline = self.deadline;
@@ -1729,9 +1731,9 @@ impl HeldOrdinary {
     fn join_waiter(&mut self) -> Result<RawUnaryResponse<proto::ApplyTaskOperationsResponse>> {
         self.waiter
             .take()
-            .context("binary waiter not started")?
+            .context("ordinary waiter not started")?
             .join()
-            .map_err(|_| anyhow::anyhow!("queued binary probe panicked"))?
+            .map_err(|_| anyhow::anyhow!("queued ordinary probe panicked"))?
     }
 
     fn await_entered(&mut self, scenario_deadline: Instant) -> Result<()> {
@@ -1775,7 +1777,7 @@ impl HeldOrdinary {
             if let Some(response) = call.response.take() {
                 let joined = response
                     .join()
-                    .map_err(|_| anyhow::anyhow!("held binary probe panicked"))
+                    .map_err(|_| anyhow::anyhow!("held ordinary probe panicked"))
                     .and_then(|response| response)
                     .and_then(|response| {
                         ensure!(
@@ -1821,7 +1823,7 @@ impl HeldOrdinary {
             if let Some(response) = call.response.take() {
                 let joined = response
                     .join()
-                    .map_err(|_| anyhow::anyhow!("held binary probe panicked during cleanup"))
+                    .map_err(|_| anyhow::anyhow!("held ordinary probe panicked during cleanup"))
                     .and_then(|response| response)
                     .map(|_| ());
                 cleanup = super::native_compatibility::combine_raw_cleanup(cleanup, joined);
@@ -1830,7 +1832,7 @@ impl HeldOrdinary {
         if let Some(waiter) = self.waiter.take() {
             let joined = waiter
                 .join()
-                .map_err(|_| anyhow::anyhow!("binary waiter panicked during cleanup"))
+                .map_err(|_| anyhow::anyhow!("ordinary waiter panicked during cleanup"))
                 .and_then(|response| response)
                 .map(|_| ());
             cleanup = super::native_compatibility::combine_raw_cleanup(cleanup, joined);
@@ -1842,7 +1844,7 @@ impl HeldOrdinary {
 impl Drop for HeldOrdinary {
     fn drop(&mut self) {
         if let Err(error) = self.finish_after(Ok(())) {
-            eprintln!("Native held binary cleanup failed: {error:#}");
+            eprintln!("Native held ordinary cleanup failed: {error:#}");
         }
     }
 }
@@ -1931,7 +1933,10 @@ fn pad_ordinary(operation: proto::TaskOperation, target: usize) -> Result<Padded
     };
     let length = padding_len(target, request.encoded_len())?;
     request.padding.resize(length, 0);
-    ensure!(request.encoded_len() == target, "binary padding is inexact");
+    ensure!(
+        request.encoded_len() == target,
+        "ordinary padding is inexact"
+    );
     Ok(request)
 }
 

@@ -428,18 +428,27 @@ mod tests {
     fn oversized_role_intent_is_rejected_before_owner_publication() {
         let binary = std::env::current_exe().unwrap();
         let owner = SqlIntentOwner::default();
-        let statements = (0..22)
-            .map(|_| {
+        let maximum = novarocks_failpoint::session::MAX_GRANTS;
+        let statement_count = maximum.div_ceil(3);
+        assert!(statement_count <= 64);
+        // The FE owns one statement-observation grant plus these exact binds.
+        let statements = (0..statement_count)
+            .map(|at| {
                 let mut statement = spec("SELECT 1");
-                statement.observations =
-                    (0..3).map(|index| (index, "grpc-fragment", None)).collect();
+                let observations = (maximum - at * 3).min(3);
+                statement.observations = (0..observations)
+                    .map(|index| (index, "grpc-fragment", None))
+                    .collect();
                 statement
             })
             .collect();
-        assert!(
-            owner
-                .freeze(statements, &[], 3, &binary, deadline())
-                .is_err()
+        let error = owner
+            .freeze(statements, &[], 3, &binary, deadline())
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "test-session requires a bounded nonempty grant set"
         );
         assert!(owner.take(0).is_err());
     }

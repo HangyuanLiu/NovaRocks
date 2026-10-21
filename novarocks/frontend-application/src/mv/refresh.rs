@@ -628,6 +628,7 @@ fn product_error(error: MvProductError) -> MvApplicationError {
     };
     MvApplicationError::new(kind, error.to_string())
         .with_compile_control(error.compile_control_error())
+        .with_unavailable_implementation(error.unavailable_implementation().cloned())
 }
 
 #[cfg(novarocks_dev_controls)]
@@ -787,6 +788,7 @@ fn provider_failure(error: MvApplicationError) -> MvProviderFailure {
     };
     MvProviderFailure::new(kind, error.to_string())
         .with_compile_control(error.compile_control_error())
+        .with_unavailable_implementation(error.unavailable_implementation().cloned())
 }
 fn unavailable(message: impl Into<String>) -> MvApplicationError {
     MvApplicationError::new(MvApplicationErrorKind::Unavailable, message)
@@ -1077,5 +1079,65 @@ mod tests {
         ));
 
         assert_eq!(error.kind(), MvApplicationErrorKind::AlreadyActive);
+    }
+
+    #[test]
+    fn refresh_activation_source_survives_provider_product_and_command_bridges() {
+        use novarocks_failure_contract::{FailureProjection, SharedFailureCause};
+        use novarocks_sql::compiler::SqlCompileError;
+        use novarocks_type_contract::CompileControlError;
+        for original in [
+            novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability("router".into()),
+            novarocks_plan_codec::PhysicalEncodeError::Invalid("unsupported diagnostic".into()),
+        ] {
+            let source = SharedFailureCause::new(original);
+            let fact = source.failure_fact();
+            let application = MvApplicationError::from_compile(SqlCompileError::CompilationSource(
+                source.clone(),
+            ));
+            let terminal = product_error(provider_failure(application).into_product_error());
+            assert_eq!(terminal.kind(), MvApplicationErrorKind::InvalidRequest);
+            assert_eq!(terminal.unavailable_implementation(), None);
+            let Some(CompileControlError::Source(carried)) = terminal.compile_control_error()
+            else {
+                panic!("the provider/product bridge must retain the compile source");
+            };
+            assert_eq!(carried, source);
+            assert_eq!(carried.failure_fact(), fact);
+            let user = crate::mv::command::project_product_failure_for_test(terminal);
+            let Some(CompileControlError::Source(carried)) = user.compile_control_error() else {
+                panic!("the final command must retain the compile source");
+            };
+            assert_eq!(carried, source);
+            assert_eq!(carried.failure_fact(), fact);
+        }
+    }
+
+    #[test]
+    fn refresh_activation_refusal_survives_provider_product_and_frontend_bridges() {
+        use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
+        use novarocks_sql::{analyze_error::AnalyzeError, compiler::SqlCompileError};
+        let compile = SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
+            FunctionOverloadId::try_new("fixture/mv/activation/missing-pure-v1").unwrap(),
+        ));
+        let SqlCompileError::Analyze(expected) = &compile else {
+            panic!("missing pure implementation must be typed analysis");
+        };
+        let application = MvApplicationError::from_compile(compile.clone());
+        let terminal = product_error(provider_failure(application).into_product_error());
+        assert_eq!(terminal.kind(), MvApplicationErrorKind::InvalidRequest);
+        assert_eq!(terminal.unavailable_implementation(), Some(expected));
+        assert_eq!(terminal.compile_control_error(), None);
+
+        let ordinary = MvApplicationError::from_compile(SqlCompileError::Analyze(
+            AnalyzeError::internal("unsupported diagnostic: UnavailableImplementation"),
+        ));
+        let ordinary = product_error(provider_failure(ordinary).into_product_error());
+        assert_eq!(ordinary.kind(), MvApplicationErrorKind::InvalidRequest);
+        assert_eq!(ordinary.unavailable_implementation(), None);
+        assert_eq!(
+            ordinary.message(),
+            "unsupported diagnostic: UnavailableImplementation"
+        );
     }
 }

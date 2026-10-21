@@ -338,7 +338,15 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     let result = run_one_inner(scenario, config, scenario_root, &settlement);
     match settlement.write() {
         Ok(()) => result,
-        Err(error) => finish_exact_mysql_scenario(result.err(), Err(error), Ok(())),
+        Err(error) => {
+            let bounded = config.exact_mysql_execution_binding.is_some()
+                || config.held_native_execution_binding.is_some()
+                || result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| exact_mysql_failure_presentation(error).is_some());
+            finish_prelaunch_scenario(bounded, result.err(), Err(error), Ok(()))
+        }
     }
 }
 
@@ -351,10 +359,17 @@ fn run_one_inner(
     if let Some(reason) = scenarios::disabled_reason(scenario.name()) {
         bail!("system scenario {} is disabled: {reason}", scenario.name());
     }
+    let bounded_binding = config.exact_mysql_execution_binding.is_some()
+        || config.held_native_execution_binding.is_some();
     let mut launch_config = match scenario.launch_config(&scenario_root) {
         Ok(config) => config,
         Err(error) => {
-            return finish_exact_mysql_scenario(Some(error), Ok(()), settlement.teardown(scenario));
+            return finish_prelaunch_scenario(
+                bounded_binding,
+                Some(error),
+                Ok(()),
+                settlement.teardown(scenario),
+            );
         }
     };
     settlement.launch_config_succeeded();
@@ -365,13 +380,23 @@ fn run_one_inner(
     ) {
         Ok(clock) => clock,
         Err(error) => {
-            return finish_exact_mysql_scenario(Some(error), Ok(()), settlement.teardown(scenario));
+            return finish_prelaunch_scenario(
+                bounded_binding,
+                Some(error),
+                Ok(()),
+                settlement.teardown(scenario),
+            );
         }
     };
     let root_observation_clock = match scenario.root_observation_deadline() {
         Ok(clock) => clock,
         Err(error) => {
-            return finish_exact_mysql_scenario(Some(error), Ok(()), settlement.teardown(scenario));
+            return finish_prelaunch_scenario(
+                bounded_binding,
+                Some(error),
+                Ok(()),
+                settlement.teardown(scenario),
+            );
         }
     };
     if exact_mysql_clock.is_some() && root_observation_clock.is_some() {
@@ -387,7 +412,8 @@ fn run_one_inner(
     let scenario_deadline = match std::time::Instant::now().checked_add(config.timeout) {
         Some(deadline) => deadline,
         None => {
-            return finish_exact_mysql_scenario(
+            return finish_prelaunch_scenario(
+                bounded_original,
                 Some(anyhow::anyhow!(
                     "system original scenario deadline overflow"
                 )),
@@ -430,7 +456,12 @@ fn run_one_inner(
             return finish_exact_mysql_scenario(Some(error), Ok(()), settlement.teardown(scenario));
         }
         Err(error) => {
-            return finish_exact_mysql_scenario(Some(error), Ok(()), settlement.teardown(scenario));
+            return finish_prelaunch_scenario(
+                bounded_binding,
+                Some(error),
+                Ok(()),
+                settlement.teardown(scenario),
+            );
         }
     };
     launch_config.resolved_artifacts = Some(crate::scenario::ResolvedScenarioArtifacts {
@@ -452,7 +483,12 @@ fn run_one_inner(
     ) {
         Ok(plan) => plan,
         Err(error) => {
-            return finish_exact_mysql_scenario(Some(error), Ok(()), settlement.teardown(scenario));
+            return finish_prelaunch_scenario(
+                bounded_original,
+                Some(error),
+                Ok(()),
+                settlement.teardown(scenario),
+            );
         }
     };
 
@@ -955,6 +991,64 @@ mod tests {
     }
 }
 
+// Ordinary preparation errors retain every source and show their full diagnostics.
+// Exact and held fixtures use their bounded presentation below instead.
+struct PrelaunchScenarioFailure {
+    primary: Option<anyhow::Error>,
+    settlement: Option<anyhow::Error>,
+    fixture: Option<anyhow::Error>,
+}
+impl std::fmt::Display for PrelaunchScenarioFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("system scenario preparation failed")?;
+        if let Some(error) = &self.primary {
+            write!(f, "; primary: {error:#}")?;
+        }
+        if let Some(error) = &self.settlement {
+            write!(f, "; settlement failed: {error:#}")?;
+        }
+        if let Some(error) = &self.fixture {
+            write!(f, "; fixture teardown failed: {error:#}")?;
+        }
+        Ok(())
+    }
+}
+impl std::fmt::Debug for PrelaunchScenarioFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl std::error::Error for PrelaunchScenarioFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.primary
+            .as_ref()
+            .or(self.settlement.as_ref())
+            .or(self.fixture.as_ref())
+            .map(|error| error.as_ref())
+    }
+}
+fn finish_prelaunch_scenario(
+    bounded: bool,
+    primary: Option<anyhow::Error>,
+    settlement: Result<()>,
+    fixture: Result<()>,
+) -> Result<()> {
+    if bounded {
+        return finish_exact_mysql_scenario(primary, settlement, fixture);
+    }
+    let settlement = settlement.err();
+    let fixture = fixture.err();
+    if settlement.is_none() && fixture.is_none() {
+        return primary.map_or(Ok(()), Err);
+    }
+    Err(PrelaunchScenarioFailure {
+        primary,
+        settlement,
+        fixture,
+    }
+    .into())
+}
+
 // Preserve the actual primary and cleanup sources for this explicit fixture only.
 struct ExactMysqlScenarioFailure {
     primary: Option<anyhow::Error>,
@@ -1278,7 +1372,7 @@ mod neutral_root_prelaunch_tests {
         }
         fn launch_config(&self, _: &std::path::Path) -> Result<ScenarioLaunchConfig> {
             if matches!(self.mode, Mode::LaunchFailure) {
-                return Err(Self::error(&self.primary));
+                return Err(Self::error(&self.primary).context("prepare original fixture"));
             }
             let mut clock = self.clock.lock().unwrap();
             assert!(clock.is_none());
@@ -1311,7 +1405,7 @@ mod neutral_root_prelaunch_tests {
         fn teardown(&self) -> Result<()> {
             self.teardowns.fetch_add(1, Ordering::SeqCst);
             if matches!(self.mode, Mode::LaunchFailure | Mode::ClockFailure) {
-                Err(Self::error(&self.secondary))
+                Err(Self::error(&self.secondary).context("release original fixture"))
             } else {
                 Ok(())
             }
@@ -1352,13 +1446,47 @@ mod neutral_root_prelaunch_tests {
             let cleanup = std::fs::remove_dir_all(&root);
             assert!(cleanup.is_ok());
             let error = outcome.unwrap_err();
+            let failure = error.downcast_ref::<PrelaunchScenarioFailure>().unwrap();
+            assert_source(failure.primary.as_ref().unwrap(), &fixture.primary);
+            assert_source(failure.fixture.as_ref().unwrap(), &fixture.secondary);
+            assert!(failure.settlement.is_none());
+            assert!(exact_mysql_failure_presentation(&error).is_none());
+            let shown = format!("{error:#}");
+            assert!(shown.contains("original prelaunch component source"));
+            if matches!(mode, Mode::LaunchFailure) {
+                assert!(shown.contains(
+                    "primary: prepare original fixture: original prelaunch component source"
+                ));
+            }
+            assert!(shown.contains("fixture teardown failed: release original fixture: original prelaunch component source"));
+            assert_eq!(fixture.teardowns.load(Ordering::SeqCst), 1);
+        }
+    }
+    #[test]
+    fn explicit_exact_and_held_bindings_keep_prelaunch_errors_bounded_and_owned() {
+        for exact in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let fixture = Fixture::new(Mode::LaunchFailure);
+            let mut config = configuration(root.path());
+            if exact {
+                config.exact_mysql_execution_binding = Some(root.path().join("binding.json"));
+            } else {
+                config.held_native_execution_binding = Some(root.path().join("binding.json"));
+            }
+            let error = run_one(&fixture, &config).unwrap_err();
             let failure = error.downcast_ref::<ExactMysqlScenarioFailure>().unwrap();
             assert_source(failure.primary.as_ref().unwrap(), &fixture.primary);
             assert_source(failure.fixture.as_ref().unwrap(), &fixture.secondary);
             assert!(failure.cluster.is_none());
             assert_eq!(fixture.teardowns.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                exact_mysql_failure_presentation(&error).unwrap(),
+                "exact MySQL scenario failed: primary=true role_cleanup=false fixture_cleanup=true"
+            );
+            assert!(format!("{error:#}").contains("prepare original fixture"));
         }
     }
+
     #[test]
     fn conflicting_neutral_and_exact_clocks_refuse_before_binary_resolution() {
         let root =

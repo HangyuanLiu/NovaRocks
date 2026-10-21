@@ -124,18 +124,22 @@ SELECT COUNT(*) FROM orders WHERE region = 'nosuch';
 SELECT COUNT(*) AS c FROM orders WHERE region = 'nosuch';
 
 -- query 15
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW agg_mv;
+SET CATALOG mvrw_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_mv;
 
 -- query 16
+-- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE mvrw_${uuid0}.ns_${uuid0}.orders FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.orders FORCE;
 
 -- query 17
+-- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
+DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 18
 -- @cleanup=true
 -- @skip_result_check=true
-DROP CATALOG mvrw_${uuid0};
+DROP CATALOG IF EXISTS mvrw_${uuid0};

@@ -102,6 +102,19 @@ pub(in crate::scenarios) fn scheduler(
     )
 }
 
+pub(in crate::scenarios) fn scheduler_outcome(
+    id: &str,
+    catalog: &str,
+    namespace: &str,
+    mv: &str,
+    directory: &Path,
+) -> DomainGrant {
+    action(
+        id,
+        json!({"action":"scheduler-outcome","catalog":catalog,"namespace":namespace,"mv":mv,"directory":directory}),
+    )
+}
+
 pub(in crate::scenarios) fn transient(
     id: &str,
     catalog: &str,

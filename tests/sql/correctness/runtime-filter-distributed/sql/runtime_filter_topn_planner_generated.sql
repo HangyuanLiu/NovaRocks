@@ -17,8 +17,8 @@
 
 -- @order_sensitive=true
 -- @tags=runtime_filter,cross_process,distributed
--- The normal planner publishes a key bound from Global complete groups under
--- a Rows Partial TopN. Every accepted key retains its full SUM contribution.
+-- Default pre-aggregation TopN pruning preserves every accepted SUM contribution.
+-- A separate controlled plan retains the complete-group ordered-filter lifecycle.
 
 CREATE TABLE ${case_db}.rf_topn_source (
     k INT,
@@ -39,6 +39,22 @@ LIMIT 2;
 
 SET enable_global_runtime_filter = true;
 SET disable_optimizer_rules = '';
+-- Default numeric Partial pruning has no admitted direct-partial ordered filter.
+-- @explain_contains=LOCAL TOP-N (limit=2, offset=0) [k ASC NULLS LAST]
+-- @explain_contains=HASH AGGREGATE (LOCAL, group by: [k])
+-- @explain_contains=HASH AGGREGATE (GLOBAL, group by: [k])
+-- @explain_not_contains=domain = OrderedBound
+-- @explain_not_contains=activation = NonBlockingLive(Batch)
+-- @expect_runtime_filter_available=available
+SELECT k, SUM(v) AS total
+FROM ${case_db}.rf_topn_source
+GROUP BY k
+ORDER BY k ASC NULLS LAST
+LIMIT 2;
+
+-- Keep SplitTopN enabled and disable only the earlier local pruning rewrite.
+-- The original ordered-filter producer/consumer and runtime assertions remain.
+SET disable_optimizer_rules = 'PushDownTopNToPreAgg';
 -- @explain_contains=domain = OrderedBound(key=Int32 ASC NULLS LAST, inclusive=true)
 -- @explain_contains=producer binding 1
 -- @explain_contains=activation = NonBlockingLive(Batch)

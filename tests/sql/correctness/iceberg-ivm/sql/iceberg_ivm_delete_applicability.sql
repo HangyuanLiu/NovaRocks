@@ -28,6 +28,28 @@
 
 -- query 1
 -- @skip_result_check=true
+CREATE EXTERNAL CATALOG ice_4g_ivm_${uuid0}
+PROPERTIES (
+  "type" = "iceberg",
+  "iceberg.catalog.type" = "rest",
+  "uri" = "${iceberg_rest_uri}",
+  "warehouse" = "${iceberg_rest_warehouse}",
+  "aws.s3.endpoint" = "${oss_endpoint}",
+  "credential.object-store-metadata.consumer-role" = "frontend",
+  "credential.object-store-metadata.mode" = "static",
+  "credential.object-store-metadata.name" = "${iceberg_object_store_credential_name}",
+  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
+  "credential.object-store-data.consumer-role" = "backend",
+  "credential.object-store-data.mode" = "static",
+  "credential.object-store-data.name" = "${iceberg_object_store_credential_name}",
+  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
+  "aws.s3.region" = "us-east-1",
+  "aws.s3.enable_path_style_access" = "true"
+);
+SET CATALOG ice_4g_ivm_${uuid0};
+
+-- query 2
+-- @skip_result_check=true
 -- @result_contains=UEA4G_IVM_STAGE_0_OK
 shell: set -eu
 uea_workspace="${NOVAROCKS_WORKSPACE_ROOT:-.}"
@@ -56,26 +78,8 @@ grep -q '^UEA4G_IVM_STAGE_0_OK$' "$uea_log" || { tail -80 "$uea_log" >&2; exit 1
 grep '^UEA4G_RECEIPT ' "$uea_log" > "$uea_receipts/stage-0.jsonl"
 printf 'UEA4G_IVM_STAGE_0_OK\n'
 
--- query 2
+-- query 3
 -- @skip_result_check=true
-CREATE EXTERNAL CATALOG ice_4g_ivm_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "rest",
-  "uri" = "${iceberg_rest_uri}",
-  "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "credential.object-store-metadata.consumer-role" = "frontend",
-  "credential.object-store-metadata.mode" = "static",
-  "credential.object-store-metadata.name" = "${iceberg_object_store_credential_name}",
-  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
-  "credential.object-store-data.consumer-role" = "backend",
-  "credential.object-store-data.mode" = "static",
-  "credential.object-store-data.name" = "${iceberg_object_store_credential_name}",
-  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
-  "aws.s3.region" = "us-east-1",
-  "aws.s3.enable_path_style_access" = "true"
-);
 SET CATALOG ice_4g_ivm_${uuid0};
 USE uea4g_ivm_${uuid0};
 SET enable_materialized_view_rewrite = false;
@@ -90,13 +94,13 @@ AS SELECT id, p, value FROM base;
 REFRESH MATERIALIZED VIEW incremental_${uuid0};
 REFRESH MATERIALIZED VIEW full_${uuid0} FULL;
 
--- query 3
+-- query 4
 SELECT 'base' AS source, id, p, value FROM base
 UNION ALL SELECT 'full' AS source, id, p, value FROM full_${uuid0}
 UNION ALL SELECT 'incremental' AS source, id, p, value FROM incremental_${uuid0}
 ORDER BY source, id, p, value;
 
--- query 4
+-- query 5
 -- @skip_result_check=true
 -- @result_contains=UEA4G_IVM_STAGE_1_OK
 shell: set -eu
@@ -140,23 +144,23 @@ grep -q '^UEA4G_IVM_STAGE_1_OK$' "$uea_log" || { tail -80 "$uea_log" >&2; exit 1
 grep '^UEA4G_RECEIPT ' "$uea_log" > "$uea_receipts/stage-1.jsonl"
 printf 'UEA4G_IVM_STAGE_1_OK\n'
 
--- query 5
+-- query 6
 -- @skip_result_check=true
 -- @result_contains=source: IcebergDeltaTable
 EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW incremental_${uuid0};
 
--- query 6
+-- query 7
 -- @skip_result_check=true
 REFRESH MATERIALIZED VIEW incremental_${uuid0};
 REFRESH MATERIALIZED VIEW full_${uuid0} FULL;
 
--- query 7
+-- query 8
 SELECT 'base' AS source, id, p, value FROM base
 UNION ALL SELECT 'full' AS source, id, p, value FROM full_${uuid0}
 UNION ALL SELECT 'incremental' AS source, id, p, value FROM incremental_${uuid0}
 ORDER BY source, id, p, value;
 
--- query 8
+-- query 9
 -- @skip_result_check=true
 -- @result_contains=UEA4G_IVM_STAGE_2_OK
 shell: set -eu
@@ -194,23 +198,23 @@ grep -q '^UEA4G_IVM_STAGE_2_OK$' "$uea_log" || { tail -80 "$uea_log" >&2; exit 1
 grep '^UEA4G_RECEIPT ' "$uea_log" > "$uea_receipts/stage-2.jsonl"
 printf 'UEA4G_IVM_STAGE_2_OK\n'
 
--- query 9
+-- query 10
 -- @skip_result_check=true
 -- @result_contains=source: IcebergDeltaTable
 EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW incremental_${uuid0};
 
--- query 10
+-- query 11
 -- @skip_result_check=true
 REFRESH MATERIALIZED VIEW incremental_${uuid0};
 REFRESH MATERIALIZED VIEW full_${uuid0} FULL;
 
--- query 11
+-- query 12
 SELECT 'base' AS source, id, p, value FROM base
 UNION ALL SELECT 'full' AS source, id, p, value FROM full_${uuid0}
 UNION ALL SELECT 'incremental' AS source, id, p, value FROM incremental_${uuid0}
 ORDER BY source, id, p, value;
 
--- query 12
+-- query 13
 -- @skip_result_check=true
 -- @result_contains=UEA4G_IVM_STAGE_3_OK
 shell: set -eu
@@ -243,23 +247,23 @@ grep -q '^UEA4G_IVM_STAGE_3_OK$' "$uea_log" || { tail -80 "$uea_log" >&2; exit 1
 grep '^UEA4G_RECEIPT ' "$uea_log" > "$uea_receipts/stage-3.jsonl"
 printf 'UEA4G_IVM_STAGE_3_OK\n'
 
--- query 13
+-- query 14
 -- @skip_result_check=true
 -- @result_contains=source: IcebergDeltaTable
 EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW incremental_${uuid0};
 
--- query 14
+-- query 15
 -- @skip_result_check=true
 REFRESH MATERIALIZED VIEW incremental_${uuid0};
 REFRESH MATERIALIZED VIEW full_${uuid0} FULL;
 
--- query 15
+-- query 16
 SELECT 'base' AS source, id, p, value FROM base
 UNION ALL SELECT 'full' AS source, id, p, value FROM full_${uuid0}
 UNION ALL SELECT 'incremental' AS source, id, p, value FROM incremental_${uuid0}
 ORDER BY source, id, p, value;
 
--- query 16
+-- query 17
 -- @skip_result_check=true
 -- @result_contains=UEA4G_IVM_STAGE_4_OK
 shell: set -eu
@@ -290,27 +294,27 @@ grep -q '^UEA4G_IVM_STAGE_4_OK$' "$uea_log" || { tail -80 "$uea_log" >&2; exit 1
 grep '^UEA4G_RECEIPT ' "$uea_log" > "$uea_receipts/stage-4.jsonl"
 printf 'UEA4G_IVM_STAGE_4_OK\n'
 
--- query 17
+-- query 18
 -- @skip_result_check=true
 -- @result_contains=source: IcebergDeltaTable
 EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW incremental_${uuid0};
 
--- query 18
+-- query 19
 -- @skip_result_check=true
 REFRESH MATERIALIZED VIEW incremental_${uuid0};
 REFRESH MATERIALIZED VIEW full_${uuid0} FULL;
 
--- query 19
+-- query 20
 SELECT 'base' AS source, id, p, value FROM base
 UNION ALL SELECT 'full' AS source, id, p, value FROM full_${uuid0}
 UNION ALL SELECT 'incremental' AS source, id, p, value FROM incremental_${uuid0}
 ORDER BY source, id, p, value;
 
--- query 20
+-- query 21
 -- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW incremental_${uuid0};
-DROP MATERIALIZED VIEW full_${uuid0};
-DROP TABLE ice_4g_ivm_${uuid0}.uea4g_ivm_${uuid0}.base FORCE;
-DROP DATABASE ice_4g_ivm_${uuid0}.uea4g_ivm_${uuid0};
-DROP CATALOG ice_4g_ivm_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS uea4g_ivm_${uuid0}.incremental_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS uea4g_ivm_${uuid0}.full_${uuid0};
+DROP TABLE IF EXISTS ice_4g_ivm_${uuid0}.uea4g_ivm_${uuid0}.base FORCE;
+DROP DATABASE IF EXISTS ice_4g_ivm_${uuid0}.uea4g_ivm_${uuid0};
+DROP CATALOG IF EXISTS ice_4g_ivm_${uuid0};

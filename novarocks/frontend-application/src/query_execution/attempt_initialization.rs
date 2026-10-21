@@ -29,9 +29,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::query_execution::artifact::FragmentId;
+use novarocks_execution_contract::failure::SharedFailureCause;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::read_stack::ConnectorReadBinding;
-use novarocks_spi::connector::{ConnectorRequestContext, ConnectorRequestScope};
+use novarocks_spi::connector::{ConnectorError, ConnectorRequestContext, ConnectorRequestScope};
 
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::artifact::{PreparedDistributedQuery, ValidatedFragmentSchedule};
@@ -55,6 +56,13 @@ use novarocks_workload_control::{ResultWindowAlias, WorkScope};
 
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
+}
+
+fn failed_connector(error: ConnectorError) -> DistributedQueryError {
+    DistributedQueryError::from_source(
+        DistributedQueryErrorKind::Failed,
+        SharedFailureCause::new(error),
+    )
 }
 
 /// Credential material stays under its planning collector until every split
@@ -398,7 +406,7 @@ impl SerialAttemptInitialization for ProductionInitializationState {
             recipe.blocking_io,
             recipe.responsibility,
         )
-        .map_err(failed)?;
+        .map_err(failed_connector)?;
         Ok(OpenedAttemptSource {
             identity,
             opened: source,
@@ -652,6 +660,93 @@ mod tests {
     use novarocks_query_application::cancellation::{
         QueryCancellationReason, QueryCancellationSource,
     };
+
+    #[test]
+    fn split_open_unavailable_retains_original_source_and_only_renders_owner_safe_detail() {
+        use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+        use novarocks_spi::connector::ConnectorErrorKind;
+        use std::error::Error;
+
+        let source = ConnectorError::new(
+            ConnectorErrorKind::Unavailable,
+            "cannot read Variant column statistics; static Variant hint; private fixture locator",
+        )
+        .with_retryable_before_progress()
+        .with_cleanup_context("private cleanup locator");
+        let fact = source.failure_fact();
+        let original_message = source.message().as_ptr();
+        let original_display = source.to_string();
+        let error = failed_connector(source);
+        let shared = error
+            .source()
+            .expect("original connector source")
+            .downcast_ref::<SharedFailureCause>()
+            .expect("shared source carrier");
+        let carried = shared
+            .downcast_ref::<ConnectorError>()
+            .expect("original connector error");
+        assert_eq!(carried.message().as_ptr(), original_message);
+        assert_eq!(carried.to_string(), original_display);
+        assert!(carried.retryable_before_progress());
+        assert_eq!(carried.kind(), ConnectorErrorKind::Unavailable);
+        assert_eq!(shared.failure_fact(), fact);
+        assert_eq!(fact.class(), FailureClass::Dependency);
+        assert_eq!(fact.reason().domain(), 4);
+        assert_eq!(fact.reason().code(), 8);
+        assert_eq!(error.kind(), DistributedQueryErrorKind::Failed);
+        assert_eq!(error.compile_control_error(), None);
+        assert_eq!(error.pre_ready_topology_outcome(), None);
+        assert!(!error.requires_pre_ready_topology_observation());
+        let input = error.into_execution_failure_input();
+        assert_eq!(input.fact(), fact);
+        assert_eq!(
+            input.detail().as_str(),
+            "native attempt initialization failed in its owning domain (reason 4:8)"
+        );
+        let public = input.user_error();
+        assert_eq!(public.code().as_str(), "query.execution.dependency");
+        assert_eq!(public.message(), input.detail().as_str());
+        assert!(!public.to_string().contains("Variant"));
+        assert!(!public.to_string().contains("private"));
+    }
+
+    #[test]
+    fn split_open_source_keeps_domain_control_fact_and_original_shared_identity() {
+        use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+        use novarocks_spi::connector::ConnectorErrorKind;
+        use novarocks_type_contract::CompileControlError;
+        use std::error::Error;
+
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let original = SharedFailureCause::new(control);
+            let fact = original.failure_fact();
+            let connector =
+                ConnectorError::from_domain(ConnectorErrorKind::Unavailable, original.clone());
+            let error = failed_connector(connector);
+            let shared = error
+                .source()
+                .expect("connector source")
+                .downcast_ref::<SharedFailureCause>()
+                .expect("shared connector source");
+            let carried = shared
+                .downcast_ref::<ConnectorError>()
+                .expect("original connector error");
+            let domain = carried
+                .source()
+                .expect("domain source")
+                .downcast_ref::<SharedFailureCause>()
+                .expect("connector domain carrier");
+            assert_eq!(domain.downcast_ref::<SharedFailureCause>(), Some(&original));
+            assert_eq!(shared.failure_fact(), fact);
+            assert_ne!(fact.class(), FailureClass::Dependency);
+            assert_eq!(error.compile_control_error(), None);
+            assert_eq!(error.into_execution_failure_input().fact(), fact);
+        }
+    }
 
     fn execution_id(attempt: u64) -> QueryExecutionId {
         QueryExecutionId::new(

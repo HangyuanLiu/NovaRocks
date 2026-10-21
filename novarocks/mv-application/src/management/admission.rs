@@ -1446,6 +1446,27 @@ impl ManagementEntranceLease {
         Ok(())
     }
 
+    /// Close one publication that either stayed local or crossed the provider
+    /// boundary. A local refusal releases only its activity turn: no external
+    /// effect was created and no provider terminal may be invented for it.
+    /// All dispatched outcomes retain the ordinary effect settlement rules.
+    pub fn record_publication_terminal(
+        mut self,
+        disposition: EffectDisposition,
+    ) -> Result<(), ManagementAdmissionError> {
+        if self.request.operation != ConnectorDocumentManagementOperation::Publication {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
+        if self.dispatched.is_none() {
+            if disposition != EffectDisposition::KnownUncommitted {
+                return Err(ManagementAdmissionError::EffectNotDispatched);
+            }
+            self.activity.take();
+            return Ok(());
+        }
+        self.record_terminal(disposition)
+    }
+
     pub fn record_terminal(
         mut self,
         disposition: EffectDisposition,

@@ -1681,6 +1681,9 @@ mod tests {
 
     #[test]
     fn m07_completed_result_occurrences_supply_exact_attempt_domains() {
+        // Producer-domain propagation is independent of the unavailable to_bitmap
+        // scalar. A source-free bitmap_agg supplies the same opaque Bitmap domain;
+        // bitmap_to_string supplies a Physical domain without assuming its carrier.
         use novarocks_type_contract::ValueLogicalType as D;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1688,7 +1691,7 @@ mod tests {
             .unwrap();
         let (_root, scope) = query_scope();
         let completed = runtime.block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(
-            request_for("SELECT hll_hash('x') AS h,to_bitmap(1) AS b,percentile_hash(1.0) AS p,parse_json('{}') AS j,bitmap_to_binary(to_bitmap(1)) AS raw"), &scope,
+            request_for("SELECT hll_hash('x') AS h,bitmap_agg(1) AS b,percentile_hash(1.0) AS p,parse_json('{}') AS j,bitmap_to_string(bitmap_agg(1)) AS raw"), &scope,
         )).unwrap();
         let plan = completed.candidate().plan();
         let result = plan.result_port().unwrap();

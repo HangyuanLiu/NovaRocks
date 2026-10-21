@@ -43,7 +43,7 @@ SELECT percentile_approx_weighted(v,w,0.5) IS NULL AS empty FROM weighted_cdf_co
 SELECT percentile_approx_weighted(v,w,0.5) IS NULL AS empty FROM weighted_cdf_control WHERE w IS NULL;
 
 -- query 8
--- @expect_error=percentile weight must be non-negative
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:40)
 SELECT percentile_approx_weighted(v,-1,0.5) FROM weighted_cdf_control;
 
 -- query 9
@@ -51,6 +51,8 @@ SELECT percentile_approx_weighted(1,1,0.5) AS p FROM weighted_cdf_control;
 
 -- query 10
 -- @expect_error=compression parameter must be positive
+-- @expect_sql_code=sql.analyze.invalid_argument
+-- @expect_sql_phase=Analyze
 SELECT percentile_approx_weighted(v,w,0.5,0) FROM weighted_cdf_control;
 
 -- query 11

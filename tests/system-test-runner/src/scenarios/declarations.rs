@@ -119,6 +119,8 @@ pub(super) fn for_module(
     paths.extend([
         format!("tests/system-test-runner/src/scenarios/{module}.rs"),
         "tests/cluster-harness/**".into(),
+        "tests/test-support/**".into(),
+        "novarocks/failpoint/**".into(),
         "tests/system-test-runner/src/*.rs".into(),
         "tests/system-test-runner/src/scenarios/declarations.rs".into(),
         "novarocks/types/**".into(),
@@ -329,4 +331,27 @@ pub(super) fn for_module(
         declaration.heavy = Some(ScenarioHeavyReason { reason, detail });
     }
     declaration
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_native_scenario_declares_shared_process_and_session_owners() {
+        let scenarios = super::super::all();
+        assert!(!scenarios.is_empty());
+        for scenario in scenarios {
+            let declaration = scenario.declaration();
+            for shared in [
+                "tests/cluster-harness/**",
+                "tests/test-support/**",
+                "novarocks/failpoint/**",
+            ] {
+                assert!(
+                    declaration.impact.paths.iter().any(|path| path == shared),
+                    "{} omits its shared launch owner {shared}",
+                    scenario.name(),
+                );
+            }
+        }
+    }
 }

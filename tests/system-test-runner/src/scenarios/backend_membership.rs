@@ -17,11 +17,14 @@
 
 //! Process-boundary backend self-registration acceptance.
 
+use super::distributed_writer::{assert_commit_never_invoked, publication_terminals};
+use super::query_lifecycle::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use crate::actors::mysql as mysql_actor;
-use crate::scenario::{Scenario, ScenarioContext};
+use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::ServerHandle;
+use novarocks_failpoint::target_binding::StatementExecutionBinding;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::Shutdown;
@@ -132,8 +135,8 @@ impl Drop for RestartAfterEstablishRendezvous {
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(BackendSelfRegistration),
-        Box::new(PreReadyReplan),
-        Box::new(PreReadyDmlNoRecovery),
+        Box::new(PreReadyReplan::default()),
+        Box::new(PreReadyDmlNoRecovery::default()),
     ]
 }
 
@@ -248,7 +251,34 @@ fn query_one(context: &mut ScenarioContext, phase: &str) -> Result<()> {
     Ok(())
 }
 
-struct PreReadyReplan;
+const REPLAN_SQL: &str = "SELECT v FROM pre_ready_replan.ns.probe ORDER BY v";
+const DML_SQL: &str = "INSERT INTO pre_ready_dml.ns.orders VALUES (1, 10), (2, 20)";
+
+// Every worker is joined, including an early rendezvous/replacement error. The
+// original socket deadline still owns termination; this guard never detaches it.
+struct MembershipActor(Option<thread::JoinHandle<()>>);
+impl Drop for MembershipActor {
+    fn drop(&mut self) {
+        if let Some(actor) = self.0.take() {
+            if actor.join().is_err() {
+                eprintln!("Original membership SQL actor panicked during join");
+            }
+        }
+    }
+}
+
+fn membership_statement(sql: &str) -> StatementSpec {
+    StatementSpec {
+        sql: sql.into(),
+        faults: vec![(0, RESTART_AFTER_ESTABLISH_CONTEXT)],
+        observations: vec![(0, "grpc-fragment", Some(1))],
+    }
+}
+
+#[derive(Default)]
+struct PreReadyReplan {
+    intent: SqlIntentOwner,
+}
 
 impl Scenario for PreReadyReplan {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
@@ -262,6 +292,23 @@ impl Scenario for PreReadyReplan {
 
     fn name(&self) -> &'static str {
         "membership/pre-ready-replan"
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.intent.freeze(
+            vec![membership_statement(REPLAN_SQL)],
+            &[0],
+            cluster_size,
+            binary,
+            deadline,
+        )?))
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -310,42 +357,36 @@ impl Scenario for PreReadyReplan {
 
         let target = 0;
         let old_process_id = context.handle().backend_process_id(target)?;
-        context
-            .handle()
-            .arm_query_lifecycle_fault(target, RESTART_AFTER_ESTABLISH_CONTEXT)
-            .context("arm token-scoped BE restart after EstablishQueryContext")?;
-        let token = context
-            .handle()
-            .armed_query_lifecycle_fault_token(target, RESTART_AFTER_ESTABLISH_CONTEXT)?
-            .context("armed pre-ready restart has no token")?;
+        let selected = self.intent.take(0)?;
+        let connection = mysql_actor::connect_until(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.deadline(),
+        )?;
+        let observation = selected.arm(context, connection.connection_id(), REPLAN_SQL)?;
+        let token = selected.token.clone();
         let rendezvous = RestartAfterEstablishRendezvous::bind(&token)?;
-        let before_execution = context
-            .handle()
-            .query_lifecycle_structured_snapshot()?
-            .and_then(|snapshot| snapshot.execution_id);
         context.action(format!(
             "armed token-scoped restart after BE[{target}] EstablishQueryContext; old_process_id={old_process_id}"
         ));
-
-        let mysql_user = context.mysql_user().to_string();
-        let mysql_port = context.mysql_port();
         let (sender, receiver) = mpsc::sync_channel(1);
-        thread::spawn(move || {
-            let result = (|| -> Result<Vec<i64>> {
-                let mut connection =
-                    mysql_actor::connect(&mysql_user, mysql_port, Duration::from_secs(30))?;
+        let _actor = MembershipActor(Some(thread::spawn(move || {
+            let result: Result<Vec<i64>> = connection.run(|connection| {
                 connection
-                    .query(format!("SELECT v FROM {catalog}.ns.probe ORDER BY v"))
+                    .query(REPLAN_SQL)
                     .context("run query during pre-ready replacement")
-            })();
+            });
             let _ = sender.send(result);
-        });
+        })));
 
         let restart_ack = rendezvous.wait_for_trigger(context.deadline())?;
-        // The rendezvous establishes that this token has fired. Read its exact
-        // FE binding afterwards; the log is attribution, not synchronization.
-        let expected_attempt =
-            bound_replan_attempt(&context.handle().fe_log_contents()?, &token, target)?;
+        // The canonical owner validates the original session/process receipt.
+        // FE publishes this exact first-attempt binding before Establish runs.
+        let binding = context
+            .handle()
+            .selected_native_observation_binding(target, "grpc-fragment", &token, Some(1))?
+            .context("fired restart lacks its declared first-attempt binding")?;
+        let expected_attempt = bound_replan_attempt(&binding, &token, target)?;
 
         let deadline = context.deadline();
         context
@@ -374,16 +415,17 @@ impl Scenario for PreReadyReplan {
         let deadline = context.deadline();
         let terminal = context
             .handle()
-            .await_query_lifecycle_structured_snapshot_for_attempt(
-                expected_attempt,
-                before_execution.as_deref(),
-                deadline,
-            )
+            .await_query_lifecycle_statement_observation(&observation, true, deadline)
             .context("read terminal snapshot for re-planned statement")?;
         ensure!(
-            terminal.attempt_id == 2,
-            "pre-ready replacement snapshot mismatch: candidate={terminal:?}, before={before_execution:?}, target={expected_attempt:?}"
+            terminal.attempt_id == 2
+                && terminal.process_namespace == expected_attempt.process_namespace
+                && terminal.local_sequence == expected_attempt.local_sequence,
+            "pre-ready replacement snapshot mismatch: candidate={terminal:?}, target={expected_attempt:?}"
         );
+        context
+            .handle()
+            .drain_query_lifecycle_statement_observation(&observation)?;
         context.action(format!(
             "replaced BE[{target}] after EstablishQueryContext and observed successful statement attempt=2 completion with new_process_id={replacement_process_id}"
         ));
@@ -392,59 +434,31 @@ impl Scenario for PreReadyReplan {
 }
 
 fn bound_replan_attempt(
-    log: &str,
+    binding: &StatementExecutionBinding,
     token: &str,
     backend_index: usize,
 ) -> Result<novarocks_cluster_harness::QueryLifecycleAttemptTarget> {
-    let mut bindings = Vec::new();
-    for line in log
-        .lines()
-        .filter(|line| line.starts_with("NOVAROCKS_QUERY_FAULT_BOUND "))
-    {
-        let fields = line
-            .split_whitespace()
-            .skip(1)
-            .filter_map(|field| field.split_once('='))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        if fields.get("token").copied() != Some(token)
-            || fields.get("kind").copied() != Some(RESTART_AFTER_ESTABLISH_CONTEXT)
-            || fields.get("backend_index").copied() != Some(backend_index.to_string().as_str())
-        {
-            continue;
-        }
-        let execution = fields
-            .get("execution_id")
-            .context("bound restart fault omitted execution identity")?;
-        let parts = execution.split(':').collect::<Vec<_>>();
-        ensure!(
-            parts.len() == 3,
-            "invalid bound execution identity {execution}"
-        );
-        let namespace: i64 = parts[0]
-            .parse()
-            .context("decode bound query process namespace")?;
-        let local_sequence: u64 = parts[1]
-            .parse()
-            .context("decode bound query local sequence")?;
-        let first_attempt: u64 = parts[2].parse().context("decode bound query attempt")?;
-        ensure!(
-            local_sequence > 0 && first_attempt == 1,
-            "restart fault must bind the first statement attempt, got {execution}"
-        );
-        bindings.push(novarocks_cluster_harness::QueryLifecycleAttemptTarget {
-            process_namespace: u64::from_ne_bytes(namespace.to_ne_bytes()),
-            local_sequence,
-            attempt_id: 2,
-        });
-    }
+    binding.validate()?;
     ensure!(
-        bindings.len() == 1,
-        "expected one synchronized restart query binding for token={token} BE[{backend_index}], got {bindings:?}"
+        binding.statement_run_token == token
+            && binding.backend_index == backend_index
+            && binding.attempt_id == 1,
+        "restart binding must name the exact fired token/backend and first attempt"
     );
-    Ok(bindings[0])
+    let local_sequence =
+        u64::try_from(binding.query_id_lo).context("restart binding local sequence is negative")?;
+    ensure!(local_sequence > 0, "restart binding local sequence is zero");
+    Ok(novarocks_cluster_harness::QueryLifecycleAttemptTarget {
+        process_namespace: u64::from_ne_bytes(binding.query_id_hi.to_ne_bytes()),
+        local_sequence,
+        attempt_id: 2,
+    })
 }
 
-struct PreReadyDmlNoRecovery;
+#[derive(Default)]
+struct PreReadyDmlNoRecovery {
+    intent: SqlIntentOwner,
+}
 
 impl Scenario for PreReadyDmlNoRecovery {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
@@ -458,6 +472,23 @@ impl Scenario for PreReadyDmlNoRecovery {
 
     fn name(&self) -> &'static str {
         "membership/pre-ready-dml-no-recovery"
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.intent.freeze(
+            vec![membership_statement(DML_SQL)],
+            &[0],
+            cluster_size,
+            binary,
+            deadline,
+        )?))
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -494,40 +525,33 @@ impl Scenario for PreReadyDmlNoRecovery {
             .context("create DML target table")?;
         drop(setup);
 
+        // This scenario owns a fresh FE and runs no concurrent DML between the
+        // snapshots. The exact token-scoped observation below binds this one
+        // statement; the publication labels independently prove no commit.
+        let publication_before = publication_terminals(context, "write")?;
         let target = 0;
         let old_process_id = context.handle().backend_process_id(target)?;
-        // The same rendezvous the read case uses. `restart-after-init-ack`
-        // parked inside the retired `InitQuery` handler, which a distributed
-        // write stopped reaching once the task protocol took over admission,
-        // so arming it here left the fault with no emitter and this case
-        // waiting out its budget for `NOVAROCKS_QUERY_INIT_ACK_OBSERVED`.
-        // That handler and that fault kind have since been deleted.
-        context
-            .handle()
-            .arm_query_lifecycle_fault(target, RESTART_AFTER_ESTABLISH_CONTEXT)
-            .context("arm token-scoped BE restart after DML EstablishQueryContext")?;
-        let token = context
-            .handle()
-            .armed_query_lifecycle_fault_token(target, RESTART_AFTER_ESTABLISH_CONTEXT)?
-            .context("armed pre-ready DML restart has no token")?;
+        let selected = self.intent.take(0)?;
+        let connection = mysql_actor::connect_until(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.deadline(),
+        )?;
+        let observation = selected.arm(context, connection.connection_id(), DML_SQL)?;
+        let token = selected.token.clone();
         let rendezvous = RestartAfterEstablishRendezvous::bind(&token)?;
         context.action(format!(
             "armed token-scoped restart after BE[{target}] DML EstablishQueryContext; old_process_id={old_process_id}"
         ));
-
-        let mysql_user = context.mysql_user().to_string();
-        let mysql_port = context.mysql_port();
-        let mysql_timeout = context.remaining("connect DML execution client")?;
         let (sender, receiver) = mpsc::sync_channel(1);
-        thread::spawn(move || {
-            let result = (|| -> Result<()> {
-                let mut connection = mysql_actor::connect(&mysql_user, mysql_port, mysql_timeout)?;
+        let _actor = MembershipActor(Some(thread::spawn(move || {
+            let result = connection.run(|connection| {
                 connection
-                    .query_drop("INSERT INTO pre_ready_dml.ns.orders VALUES (1, 10), (2, 20)")
+                    .query_drop(DML_SQL)
                     .context("run DML during pre-ready replacement")
-            })();
+            });
             let _ = sender.send(result);
-        });
+        })));
 
         let restart_ack = rendezvous.wait_for_trigger(context.deadline())?;
         let deadline = context.deadline();
@@ -552,10 +576,27 @@ impl Scenario for PreReadyDmlNoRecovery {
             })?
             .expect_err("a pre-ready external-effect execution must not auto-replan");
         let error_message = format!("{error:#}");
+        // KnownUncommitted is a typed publication sidecar, not a suffix of
+        // the canonical public execution error (SEP-1).
+        let publication_after = publication_terminals(context, "write")?;
+        assert_commit_never_invoked(
+            publication_before,
+            publication_after,
+            "pre-ready DML without recovery",
+        )
+        .with_context(|| format!("verify failed DML publication: {error_message}"))?;
+
+        let deadline = context.deadline();
+        let terminal = context
+            .handle()
+            .await_query_lifecycle_statement_observation(&observation, false, deadline)?;
         ensure!(
-            error_message.contains("KnownUncommitted"),
-            "pre-ready DML without engine/provider isolation proof must return KnownUncommitted, got: {error_message}"
+            terminal.attempt_id == 1,
+            "pre-ready DML must retain its original attempt without auto-recovery, got: {terminal:?}"
         );
+        context
+            .handle()
+            .drain_query_lifecycle_statement_observation(&observation)?;
 
         let mut verify = mysql_actor::connect(
             context.mysql_user(),
@@ -588,19 +629,49 @@ impl Scenario for PreReadyDmlNoRecovery {
 
 #[cfg(test)]
 mod binding_tests {
-    use super::bound_replan_attempt;
+    use super::*;
 
     #[test]
     fn replan_binding_uses_the_exact_fired_token_backend_and_signed_namespace() {
-        let log = "NOVAROCKS_QUERY_FAULT_BOUND kind=restart-after-establish-context execution_id=41:1:1 backend_index=0 token=seed\nNOVAROCKS_QUERY_FAULT_BOUND kind=restart-after-establish-context execution_id=-11:12:1 backend_index=1 token=fired\n";
-        let target = bound_replan_attempt(log, "fired", 1).expect("exact binding");
+        let binding = StatementExecutionBinding {
+            schema_version: 1,
+            target_session_id: "original-session".into(),
+            statement_run_token: "fired".into(),
+            backend_index: 1,
+            backend_process_id: novarocks_types::BackendProcessId::new_v7().to_string(),
+            query_id_hi: -11,
+            query_id_lo: 12,
+            attempt_id: 1,
+        };
+        let target = bound_replan_attempt(&binding, "fired", 1).expect("exact binding");
         assert_eq!(
             target.process_namespace,
             u64::from_ne_bytes((-11_i64).to_ne_bytes())
         );
         assert_eq!(target.local_sequence, 12);
         assert_eq!(target.attempt_id, 2);
-        assert!(bound_replan_attempt(log, "fired", 0).is_err());
-        assert!(bound_replan_attempt(&(log.to_owned() + log), "fired", 1).is_err());
+        assert!(bound_replan_attempt(&binding, "fired", 0).is_err());
+        assert!(bound_replan_attempt(&binding, "unrelated", 1).is_err());
+        let mut later = binding.clone();
+        later.attempt_id = 2;
+        assert!(bound_replan_attempt(&later, "fired", 1).is_err());
+    }
+
+    #[test]
+    fn membership_plans_reserve_the_original_fault_and_only_an_ordinary_successor() {
+        let binary = std::env::current_exe().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for sql in [REPLAN_SQL, DML_SQL] {
+            let owner = SqlIntentOwner::default();
+            let plan = owner
+                .freeze(vec![membership_statement(sql)], &[0], 3, &binary, deadline)
+                .unwrap();
+            plan.validate_selected_intents(3).unwrap();
+            let selected = owner.take(0).unwrap();
+            assert_eq!(selected.sql, sql);
+            assert_eq!(selected.faults, vec![(0, RESTART_AFTER_ESTABLISH_CONTEXT)]);
+            assert_eq!(selected.deadline, deadline);
+            assert!(owner.take(0).is_err());
+        }
     }
 }

@@ -18,7 +18,8 @@
 use std::path::Path;
 use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use arrow_array::{Array, Int64Array};
@@ -47,68 +48,119 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(SameProducerNormalClose {
             multicast: false,
-            observation: Mutex::new(None),
+            observation: ExchangeObservationOwner::default(),
         }),
         Box::new(SameProducerNormalClose {
             multicast: true,
-            observation: Mutex::new(None),
+            observation: ExchangeObservationOwner::default(),
         }),
     ]
 }
 
 struct SameProducerNormalClose {
     multicast: bool,
-    observation: Mutex<Option<ExchangeObservation>>,
+    observation: ExchangeObservationOwner,
 }
 
-struct ExchangeObservation {
+struct FrozenExchangeObservation {
     identity: (common::UniqueId, FrontendProcessId),
-    producer: RoleLaunchReference,
+    references: Vec<RoleLaunchReference>,
     deadline: Instant,
     selected: bool,
 }
+#[derive(Default)]
+struct ExchangeObservationOwner(Mutex<Option<FrozenExchangeObservation>>);
+impl ExchangeObservationOwner {
+    fn freeze(
+        &self,
+        cluster_size: usize,
+        binary: &Path,
+        deadline: Instant,
+    ) -> Result<ClusterTestSessionPlan> {
+        let mut owner = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("exchange observation owner poisoned"))?;
+        ensure!(owner.is_none(), "exchange observation already frozen");
+        ensure!(
+            cluster_size == 3,
+            "exchange observations require native 1FE+3BE"
+        );
+        // This is the fixture producer's original request identity, allocated
+        // once before launch and then used unchanged in all three contexts.
+        let identity = RawBackendSession::declare_identity();
+        let mut plan = ClusterTestSessionPlan::new(deadline)?;
+        let root = plan.reserve_transport("exact-exchange-observations")?;
+        let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
+        plan.authorize_ordinary_launch(&frontend, binary.to_path_buf())?;
+        let mut references = Vec::new();
+        for index in 0..cluster_size {
+            let reference = plan.reserve_launch(RoleSlot::Backend(index))?;
+            plan.authorize_launch(
+                &reference,
+                vec![DomainGrant {
+                    domain: "native-observation".into(),
+                    grant_id: format!("exchange-q1-be{index}"),
+                    parameters: json!({"action":"exchange-snapshot", "root":root,
+                    "backend_index":index, "target_session_id":reference.session_id,
+                    "max_events":16384, "query_execution":{
+                        "query_id_hi":identity.0.hi, "query_id_lo":identity.0.lo, "attempt_id":1}}),
+                }],
+                vec![
+                    ("novarocks-server".into(), "test-controls".into()),
+                    ("novarocks-native-adapter".into(), "test-controls".into()),
+                ],
+            )?;
+            plan.set_launch_binary(&reference, binary.to_path_buf())?;
+            references.push(reference);
+        }
+        plan.validate_selected_intents(cluster_size)?;
+        *owner = Some(FrozenExchangeObservation {
+            identity,
+            references,
+            deadline,
+            selected: false,
+        });
+        Ok(plan)
+    }
 
-impl SameProducerNormalClose {
     fn take_identity(&self, deadline: Instant) -> Result<(common::UniqueId, FrontendProcessId)> {
         let mut owner = self
-            .observation
+            .0
             .lock()
             .map_err(|_| anyhow::anyhow!("exchange observation owner poisoned"))?;
         let frozen = owner
             .as_mut()
-            .context("exchange observation was not frozen")?;
-        ensure!(
-            !frozen.selected,
-            "exchange observation identity already selected"
-        );
+            .context("exchange observation was not frozen before launch")?;
+        ensure!(!frozen.selected, "exchange identity already selected");
         ensure!(
             frozen.deadline == deadline && Instant::now() < deadline,
-            "exchange observation original deadline changed or expired"
+            "exchange original deadline changed or expired"
         );
         frozen.selected = true;
         Ok(frozen.identity)
     }
 
-    fn verify_producer(&self, actual: BackendProcessId) -> Result<()> {
+    fn verify_backend(&self, index: usize, actual: BackendProcessId) -> Result<()> {
         let owner = self
-            .observation
+            .0
             .lock()
             .map_err(|_| anyhow::anyhow!("exchange observation owner poisoned"))?;
         let frozen = owner
             .as_ref()
             .context("exchange observation was not frozen")?;
         ensure!(
-            Instant::now() < frozen.deadline,
-            "exchange observation deadline expired"
+            frozen.selected && Instant::now() < frozen.deadline,
+            "exchange identity is not live and selected"
         );
-        let receipt = RoleProcessReceipt::read_private(&frozen.producer.process_receipt)?;
+        let reference = frozen
+            .references
+            .get(index)
+            .context("exchange backend is outside the finite plan")?;
+        let receipt = RoleProcessReceipt::read_private(&reference.process_receipt)?;
         ensure!(
-            receipt.session_id == frozen.producer.session_id,
-            "exchange producer receipt belongs to another role session"
-        );
-        ensure!(
-            receipt.backend_process()? == actual,
-            "exchange producer differs from the original declared backend process"
+            receipt.session_id == reference.session_id && receipt.backend_process()? == actual,
+            "exchange observation differs from its declared backend session/process"
         );
         Ok(())
     }
@@ -134,69 +186,17 @@ impl Scenario for SameProducerNormalClose {
 
     fn test_session_plan(
         &self,
-        _: &ScenarioLaunchConfig,
-        _: &Path,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
         cluster_size: usize,
         binary: &Path,
         deadline: Instant,
     ) -> Result<Option<ClusterTestSessionPlan>> {
-        ensure!(
-            cluster_size == 3,
-            "exchange evidence requires native 1FE+3BE"
-        );
-        let mut owner = self
-            .observation
-            .lock()
-            .map_err(|_| anyhow::anyhow!("exchange observation owner poisoned"))?;
-        ensure!(owner.is_none(), "exchange observation already frozen");
-        let identity = RawBackendSession::declare_identity();
-        let mut plan = ClusterTestSessionPlan::new(deadline)?;
-        let root = plan.reserve_transport("exchange-normal-close-observation")?;
-        let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
-        plan.authorize_ordinary_launch(&frontend, binary.to_path_buf())?;
-        for index in 0..2 {
-            let backend = plan.reserve_launch(RoleSlot::Backend(index))?;
-            plan.authorize_ordinary_launch(&backend, binary.to_path_buf())?;
-        }
-        // P is the only sender of the validated normal-close evidence.
-        let producer = plan.reserve_launch(RoleSlot::Backend(2))?;
-        let parameters = json!({
-            "action": "exchange-snapshot",
-            "root": root,
-            "backend_index": 2,
-            "target_session_id": producer.session_id,
-            "max_events": 16384,
-            "query_execution": {
-                "query_id_hi": identity.0.hi,
-                "query_id_lo": identity.0.lo,
-                "attempt_id": 1,
-            },
-        });
-        ensure!(
-            serde_json::to_vec(&parameters)?.len() <= 4096,
-            "exchange observation parameters exceed bounded input"
-        );
-        plan.authorize_launch(
-            &producer,
-            vec![DomainGrant {
-                domain: "native-observation".into(),
-                grant_id: "exchange-normal-close-p".into(),
-                parameters,
-            }],
-            vec![
-                ("novarocks-server".into(), "test-controls".into()),
-                ("novarocks-native-adapter".into(), "test-controls".into()),
-            ],
-        )?;
-        plan.set_launch_binary(&producer, binary.to_path_buf())?;
-        plan.validate_selected_intents(cluster_size)?;
-        *owner = Some(ExchangeObservation {
-            identity,
-            producer,
+        Ok(Some(self.observation.freeze(
+            cluster_size,
+            binary,
             deadline,
-            selected: false,
-        });
-        Ok(Some(plan))
+        )?))
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -205,12 +205,13 @@ impl Scenario for SameProducerNormalClose {
             "exchange evidence requires native 1FE+3BE"
         );
         let baseline = resource_snapshot(context)?;
-        let identity = self.take_identity(context.deadline())?;
         let mut sessions = Vec::new();
         let result = (|| -> Result<()> {
+            let (query_id, frontend) = self.observation.take_identity(context.deadline())?;
             sessions.push(RawBackendSession::establish_declared(
-                context, 0, identity.0, identity.1,
+                context, 0, query_id, frontend,
             )?);
+            self.observation.verify_backend(0, sessions[0].backend)?;
             sessions.push(RawBackendSession::establish_same_attempt(
                 context,
                 1,
@@ -221,10 +222,11 @@ impl Scenario for SameProducerNormalClose {
                 2,
                 &sessions[0],
             )?);
+            self.observation.verify_backend(1, sessions[1].backend)?;
+            self.observation.verify_backend(2, sessions[2].backend)?;
             let a = &sessions[0];
             let b = &sessions[1];
             let p = &sessions[2];
-            self.verify_producer(p.backend)?;
             let producer_base = RawCreate::values(&p, 3);
             let producer_identity = proto::TaskIdentity {
                 query_execution_id: producer_base.context.query_execution_id,
@@ -730,55 +732,45 @@ fn await_normal_close_marker(
 }
 
 #[cfg(test)]
-mod tests {
+mod observation_authorization_tests {
     use super::*;
 
     #[test]
-    fn normal_close_observation_uses_original_query_and_exact_producer_role() {
-        let scenario = SameProducerNormalClose {
-            multicast: false,
-            observation: Mutex::new(None),
-        };
+    fn exchange_request_identity_is_predeclared_once_and_each_process_is_exact() {
+        let owner = ExchangeObservationOwner::default();
         let deadline = Instant::now() + Duration::from_secs(10);
         let binary = std::env::current_exe().unwrap();
-        let plan = scenario
-            .test_session_plan(
-                &ScenarioLaunchConfig::default(),
-                Path::new("/tmp"),
-                3,
-                &binary,
-                deadline,
-            )
-            .unwrap()
-            .unwrap();
-        let (expected, producer) = {
-            let owner = scenario.observation.lock().unwrap();
-            let frozen = owner.as_ref().unwrap();
-            (frozen.identity, frozen.producer.clone())
-        };
+        let plan = owner.freeze(3, &binary, deadline).unwrap();
+        plan.validate_selected_intents(3).unwrap();
+        let identity = owner.0.lock().unwrap().as_ref().unwrap().identity;
         assert!(
-            scenario
+            owner
                 .take_identity(deadline + Duration::from_millis(1))
                 .is_err()
         );
-        assert_eq!(scenario.take_identity(plan.deadline()).unwrap(), expected);
-        assert!(scenario.take_identity(plan.deadline()).is_err());
-        let process = BackendProcessId::new_v7();
-        RoleProcessReceipt {
-            schema_version: 1,
-            session_id: producer.session_id.clone(),
-            launch_id: "exchange-test-launch".into(),
-            role: novarocks_failpoint::session::SessionRole::Be,
-            process_id: process.to_string(),
+        assert_eq!(owner.take_identity(deadline).unwrap(), identity);
+        assert!(owner.take_identity(deadline).is_err());
+        assert!(owner.freeze(3, &binary, deadline).is_err());
+        let references = owner.0.lock().unwrap().as_ref().unwrap().references.clone();
+        for (index, reference) in references.iter().enumerate() {
+            let process = BackendProcessId::new_v7();
+            RoleProcessReceipt {
+                schema_version: 1,
+                session_id: reference.session_id.clone(),
+                launch_id: format!("original-be{index}"),
+                role: novarocks_failpoint::session::SessionRole::Be,
+                process_id: process.to_string(),
+            }
+            .write_private(&reference.process_receipt)
+            .unwrap();
+            assert!(owner.verify_backend(index, process).is_ok());
+            assert!(
+                owner
+                    .verify_backend(index, BackendProcessId::new_v7())
+                    .is_err()
+            );
         }
-        .write_private(&producer.process_receipt)
-        .unwrap();
-        assert!(scenario.verify_producer(process).is_ok());
-        assert!(
-            scenario
-                .verify_producer(BackendProcessId::new_v7())
-                .is_err()
-        );
+        assert!(owner.verify_backend(3, BackendProcessId::new_v7()).is_err());
     }
 
     #[test]

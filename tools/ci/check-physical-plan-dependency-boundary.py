@@ -18,7 +18,7 @@
 """Verify the pure final physical-plan Cargo dependency boundary.
 
 The final physical plan is a carrier-neutral semantic contract.  It may reuse
-the neutral type, Connector and immutable constant vocabularies, but no
+the neutral type, Connector, failure-fact and immutable constant vocabularies, but no
 application, execution kernel, provider implementation, wire codec, RPC stack,
 or task runtime.
 
@@ -60,26 +60,29 @@ CONNECTOR_CONTRACT = "novarocks-connector-contract"
 CONSTANT_CONTRACT = "novarocks-constant-contract"
 RESULT_CONTRACT = "novarocks-result-contract"
 FUNCTION_CONTRACT = "novarocks-function-contract"
+FAILURE_CONTRACT = "novarocks-failure-contract"
 
 # These are allowed direct internal dependencies, not required dependencies.
 # Removing one as the contract gets smaller remains legal.
-DIRECT_INTERNAL_ALLOW_LIST = frozenset({TYPE_CONTRACT, CONNECTOR_CONTRACT, CONSTANT_CONTRACT, RESULT_CONTRACT, FUNCTION_CONTRACT})
+DIRECT_INTERNAL_ALLOW_LIST = frozenset({TYPE_CONTRACT, CONNECTOR_CONTRACT, CONSTANT_CONTRACT, RESULT_CONTRACT, FUNCTION_CONTRACT, FAILURE_CONTRACT})
 DIRECT_PACKAGE_ALLOW_LIST = frozenset(
-    {"arrow-schema", TYPE_CONTRACT, CONNECTOR_CONTRACT, CONSTANT_CONTRACT, RESULT_CONTRACT, FUNCTION_CONTRACT}
+    {"arrow-schema", TYPE_CONTRACT, CONNECTOR_CONTRACT, CONSTANT_CONTRACT, RESULT_CONTRACT, FUNCTION_CONTRACT, FAILURE_CONTRACT}
 )
 
 # Dependency direction is part of the architecture. The type contract is the
 # lower-level vocabulary; the Connector contract may consume it, but neither
 # contract may acquire physical-plan or application authority.
 INTERNAL_CONTRACT_NORMAL_ALLOW_LISTS = {
-    TYPE_CONTRACT: frozenset({"arrow-schema", RESULT_CONTRACT}),
-    RESULT_CONTRACT: frozenset(),
-    FUNCTION_CONTRACT: frozenset({TYPE_CONTRACT, CONSTANT_CONTRACT}),
+    TYPE_CONTRACT: frozenset({"arrow-schema", RESULT_CONTRACT, FAILURE_CONTRACT}),
+    RESULT_CONTRACT: frozenset({FAILURE_CONTRACT}),
+    # ADR-0187: domain facts are a dependency-free vocabulary, not a runtime.
+    FAILURE_CONTRACT: frozenset(),
+    FUNCTION_CONTRACT: frozenset({TYPE_CONTRACT, CONSTANT_CONTRACT, FAILURE_CONTRACT}),
     CONSTANT_CONTRACT: frozenset({"arrow-array", "arrow-buffer", "arrow-data",
-                                  "arrow-schema", "arrow-cast", TYPE_CONTRACT}),
+                                  "arrow-schema", "arrow-cast", TYPE_CONTRACT, FAILURE_CONTRACT}),
     # Complete public read/write recipes freeze exact Arrow schemas, while
     # arrays, decoding, storage and executable capabilities stay outside.
-    CONNECTOR_CONTRACT: frozenset({"arrow-schema", "bytes", TYPE_CONTRACT}),
+    CONNECTOR_CONTRACT: frozenset({"arrow-schema", "bytes", TYPE_CONTRACT, FAILURE_CONTRACT}),
 }
 
 # This vocabulary is used only for declared-edge diagnostics. Resolved closure

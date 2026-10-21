@@ -38,6 +38,7 @@ FUNCTION_CONTRACT = "novarocks-function-contract"
 CONSTANT_CONTRACT = "novarocks-constant-contract"
 TYPE_CONTRACT = "novarocks-type-contract"
 RESULT_CONTRACT = "novarocks-result-contract"
+FAILURE_CONTRACT = "novarocks-failure-contract"
 CONSTANT_CONTRACT = "novarocks-constant-contract"
 FUNCTION_CONTRACT = "novarocks-function-contract"
 ICEBERG_FUNCTIONS = "novarocks-connector-iceberg-functions"
@@ -54,6 +55,7 @@ FUNCTIONS_INTERNAL_CLOSURE = {
     CONSTANT_CONTRACT,
     TYPE_CONTRACT,
     RESULT_CONTRACT,
+    FAILURE_CONTRACT,
 }
 FORBIDDEN_ICEBERG_FUNCTIONS_CLOSURE = {
     EXECUTION,
@@ -216,10 +218,22 @@ def verify_dependency_boundary(metadata, repo_root):
     functions = package_by_name(metadata, FUNCTIONS)
     result_contract = package_by_name(metadata, RESULT_CONTRACT)
 
-    # This vocabulary is dependency-free, including optional, target-specific,
-    # build, and test dependencies that a normal resolved closure could omit.
-    if result_contract["dependencies"]:
-        fail(f"{RESULT_CONTRACT} must not declare dependencies")
+    # Result facts forward only the neutral domain failure vocabulary. The
+    # leaf stays dependency-free, including inactive and non-normal edges.
+    failure_contract = package_by_name(metadata, FAILURE_CONTRACT)
+    if failure_contract["dependencies"]:
+        fail(f"{FAILURE_CONTRACT} must not declare dependencies")
+    if normal_closure(metadata, FAILURE_CONTRACT) != {FAILURE_CONTRACT}:
+        fail(f"{FAILURE_CONTRACT} normal closure must be dependency-free")
+    dependencies = result_contract["dependencies"]
+    if len(dependencies) != 1 or dependencies[0]["name"] != FAILURE_CONTRACT:
+        fail(f"{RESULT_CONTRACT} may declare only the required normal {FAILURE_CONTRACT}")
+    require_exact_dependency(result_contract, FAILURE_CONTRACT, kind=None,
+                             features=set(), disable_default_features=False)
+    if dependencies[0].get("target") is not None:
+        fail(f"{RESULT_CONTRACT} {FAILURE_CONTRACT} must not be target-specific")
+    if normal_closure(metadata, RESULT_CONTRACT) != {RESULT_CONTRACT, FAILURE_CONTRACT}:
+        fail(f"{RESULT_CONTRACT} normal closure must contain only {FAILURE_CONTRACT}")
 
     # Both the runtime aggregate adapter and pure scalar HLL owner use HLL only.
     require_exact_dependency(execution, DATASKETCHES, kind=None, features={"hll"})

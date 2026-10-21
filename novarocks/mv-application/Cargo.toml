@@ -34,6 +34,7 @@ tokio = { workspace = true, features = ["rt", "sync", "time"] }
 uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
+novarocks-functions.workspace = true
 arrow-schema.workspace = true
 novarocks-catalog-application = { workspace = true }
 novarocks-state-store-testkit.workspace = true

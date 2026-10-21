@@ -1186,3 +1186,68 @@ fn window_occurrences_wide_complete_source_types_sample_actual_comparison_quantu
     );
     assert!(trace.contains(&(PHASE, 256)));
 }
+
+fn analyze_window_admission_sql(sql: &str) -> Result<(), crate::analyze_error::AnalyzeError> {
+    let functions = build_builtin_engine_function_catalog()
+        .unwrap()
+        .snapshot_for_scalar_presence();
+    let tables = crate::catalog::memory::PlannerMemoryCatalog::default();
+    let statements = novarocks_parser::parse(sql).unwrap();
+    let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
+        panic!("an authored SQL query");
+    };
+    crate::analyzer::analyze_with_function_catalog(
+        query,
+        &tables,
+        "default",
+        functions.as_ref(),
+        crate::constant::test_constant_policy(),
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .map(|_| ())
+}
+
+#[test]
+fn window_missing_profiles_are_named_at_actual_sql_binding_before_package_emission() {
+    for sql in [
+        "SELECT lead('x', 1, 1.5) OVER ()",
+        "SELECT lead(TRUE, 1, FALSE) OVER ()",
+        "SELECT min('x') OVER ()",
+        "SELECT max('x') OVER ()",
+    ] {
+        let error = analyze_window_admission_sql(sql)
+            .err()
+            .expect("static capability refusal");
+        assert_eq!(
+            error.kind(),
+            crate::analyze_error::AnalyzeErrorKind::UnavailableImplementation,
+            "{sql}"
+        );
+        assert_eq!(
+            error.code().as_str(),
+            "sql.analyze.unavailable_implementation",
+            "{sql}"
+        );
+        assert!(
+            error.span().is_some(),
+            "the original OVER call span is retained"
+        );
+    }
+    for sql in [
+        "SELECT min('x')",
+        "SELECT max('x')",
+        "SELECT min(7) OVER ()",
+        "SELECT max(7) OVER ()",
+        "SELECT lead('x') OVER ()",
+        "SELECT lag(7, 1, 0) OVER ()",
+    ] {
+        analyze_window_admission_sql(sql).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    }
+    let error = analyze_window_admission_sql("SELECT lead(missing, 1, 0) OVER ()")
+        .err()
+        .expect("unknown input column");
+    assert_eq!(
+        error.kind(),
+        crate::analyze_error::AnalyzeErrorKind::UnknownColumn
+    );
+}

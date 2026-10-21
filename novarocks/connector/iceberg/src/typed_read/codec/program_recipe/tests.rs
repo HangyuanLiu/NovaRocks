@@ -589,17 +589,17 @@ fn complete_change_window_retains_exact_required_change_sign_and_endpoint_facts(
 }
 
 #[test]
-fn complete_table_execute_rewrite_retains_two_optional_pseudo_columns_and_exact_coverage() {
+fn complete_table_execute_rewrite_retains_two_required_pseudo_columns_and_exact_coverage() {
     let fixture = rewrite_fixture();
     assert_eq!(fixture.columns.len(), 2);
-    assert!(fixture.fields.iter().all(|field| field.is_nullable()));
+    assert!(fixture.fields.iter().all(|field| !field.is_nullable()));
     assert!(matches!(
         fixture.source.artifact_coverage(),
         ConnectorReadArtifactCoverage::Exact { .. }
     ));
     assert_unchanged(&fixture.build());
     let mut wrong = fixture.clone();
-    wrong.fields[0] = Arc::new(wrong.fields[0].as_ref().clone().with_nullable(false));
+    wrong.fields[0] = Arc::new(wrong.fields[0].as_ref().clone().with_nullable(true));
     assert_provider(&wrong.build(), ConnectorCodecErrorKind::InconsistentFields);
 }
 

@@ -539,7 +539,7 @@ fn emit_decode(
             }
             let columns = required(columns, "root result node is absent", w)?;
             w.flush()?;
-            let value = novarocks_proto_codec::root_result::decode_root_contract(
+            let value = novarocks_proto_codec::root_result::decode_semantic_root_contract(
                 contract,
                 columns,
                 novarocks_proto_codec::FieldPath::root("fragment.sink.root_result"),

@@ -50,6 +50,74 @@ use novarocks_table_maintenance::{
     MaintenanceActionRequest, MaintenanceEffectId, MaintenanceTarget, OptimizeSubmission,
 };
 
+// Both public OPTIMIZE and automatic callers consume this same original
+// record. They do not reconstruct its selected failure from a state label.
+fn optimize_terminal_record_error(
+    handle: novarocks_table_maintenance::runtime::JobHandle,
+    job: novarocks_table_maintenance::OptimizeJob,
+    owner: &str,
+) -> TerminalError {
+    let message = job.error_message.unwrap_or_else(|| {
+        format!(
+            "{owner} job {} ended in state {} without an error detail",
+            handle.job_id(),
+            job.state.as_str(),
+        )
+    });
+    let state = match job.state {
+        MaintenanceJobState::PreDispatchFailed
+        | MaintenanceJobState::TargetReplaced
+        | MaintenanceJobState::CancelledBeforeDispatch => MaintenanceJobState::KnownUncommitted,
+        other => other,
+    };
+    TerminalError {
+        state,
+        message,
+        compile_control: job.compile_control,
+        execution_failure: job.execution_failure,
+    }
+}
+
+fn optimize_statement_terminal_result(
+    handle: novarocks_table_maintenance::runtime::JobHandle,
+    job: novarocks_table_maintenance::OptimizeJob,
+    cancelled: bool,
+    cancellation_error: Option<String>,
+) -> Result<(), TerminalError> {
+    let has_selected_cause = job.execution_failure.is_some()
+        || matches!(
+            &job.compile_control,
+            Some(novarocks_type_contract::CompileControlError::Source(_))
+        );
+    if job.state != MaintenanceJobState::Finished && has_selected_cause {
+        return Err(optimize_terminal_record_error(handle, job, "optimize"));
+    }
+    // The original select still requests cancellation and waits for actual
+    // exit first. Only an already selected owner cause precedes its fallback.
+    let caller_error = cancellation_error.or_else(|| {
+        cancelled
+            .then(|| "OPTIMIZE statement cancelled; optimize job has actually exited".to_string())
+    });
+    if let Some(message) = caller_error {
+        let mut error = TerminalError::from(message);
+        // These are the actual publication owner's verdicts, never inferred
+        // from Finished (which may be an effect-free plan) or from a refusal.
+        if matches!(
+            job.state,
+            MaintenanceJobState::CommitUnknown
+                | MaintenanceJobState::KnownCommittedFinalizationFailed
+        ) {
+            error.state = job.state;
+        }
+        return Err(error);
+    }
+    if job.state == MaintenanceJobState::Finished {
+        Ok(())
+    } else {
+        Err(optimize_terminal_record_error(handle, job, "optimize"))
+    }
+}
+
 pub mod admission;
 pub mod result;
 #[cfg(novarocks_dev_controls)]
@@ -260,7 +328,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                         let control = engine
                             .statement_cancellation()
                             .expect("AwaitTerminal verified statement control before submission");
-                        let wait = self.product.wait_optimize(handle);
+                        let wait = self.product.wait_optimize_terminal_record(handle);
                         tokio::pin!(wait);
                         let mut cancelled = false;
                         let mut cancellation_error = None;
@@ -277,24 +345,12 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                                 wait.await
                             },
                         }?;
-                        if let Some(error) = cancellation_error {
-                            return Err((error).into());
-                        }
-                        if cancelled {
-                            return Err(
-                                "OPTIMIZE statement cancelled; optimize job has actually exited"
-                                    .to_string()
-                                    .into(),
-                            );
-                        }
-                        if terminal != MaintenanceJobState::Finished {
-                            return Err((format!(
-                                "optimize job {} completed with terminal state {}",
-                                handle.job_id(),
-                                terminal.as_str()
-                            ))
-                            .into());
-                        }
+                        optimize_statement_terminal_result(
+                            handle,
+                            terminal,
+                            cancelled,
+                            cancellation_error,
+                        )?;
                     }
                 }
                 Ok(MaintenanceStatementResult::Ok)
@@ -417,29 +473,11 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                 commit_occurred: committed,
             });
         }
-        let message = job.error_message.unwrap_or_else(|| {
-            format!(
-                "automatic optimize job {} ended in state {} without an error detail",
-                handle.job_id(),
-                job.state.as_str()
-            )
-        });
-        Err(
-            if matches!(
-                job.state,
-                MaintenanceJobState::PreDispatchFailed
-                    | MaintenanceJobState::TargetReplaced
-                    | MaintenanceJobState::CancelledBeforeDispatch
-            ) {
-                TerminalError::known_uncommitted(message).with_compile_control(job.compile_control)
-            } else {
-                TerminalError {
-                    compile_control: job.compile_control,
-                    state: job.state,
-                    message,
-                }
-            },
-        )
+        Err(optimize_terminal_record_error(
+            handle,
+            job,
+            "automatic optimize",
+        ))
     }
 
     async fn shutdown_until(&self, deadline: Instant) -> Result<(), String> {
@@ -501,5 +539,112 @@ impl ParsedMaintenanceAction {
                 where_clause,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod optimize_terminal_record_projection_tests {
+    use super::*;
+    use novarocks_table_maintenance::runtime::JobHandle;
+    fn record(state: MaintenanceJobState) -> novarocks_table_maintenance::OptimizeJob {
+        novarocks_table_maintenance::runtime::JobRecord {
+            job_id: 71,
+            target: MaintenanceTarget {
+                catalog: "ice".into(),
+                namespace: "db".into(),
+                table: "orders".into(),
+            },
+            effect_id: None,
+            object_id: vec![1],
+            base_snapshot_id: 2,
+            state,
+            outcome: None,
+            error_message: Some("original owner failure".into()),
+            compile_control: None,
+            execution_failure: None,
+            created_at_ms: 1,
+            started_at_ms: Some(2),
+            finished_at_ms: Some(3),
+        }
+    }
+    #[test]
+    fn ordinary_optimize_consumes_original_selected_record_even_after_local_cancel() {
+        let input =
+            novarocks_query_application::session_error::QueryServiceError::from_compile_control(
+                novarocks_type_contract::CompileControlError::ResourceExhausted,
+            )
+            .execution_failure()
+            .unwrap()
+            .clone();
+        for cancelled in [false, true] {
+            let mut job = record(MaintenanceJobState::CommitUnknown);
+            job.execution_failure = Some(input.clone());
+            let error =
+                optimize_statement_terminal_result(JobHandle::new(71), job, cancelled, None)
+                    .unwrap_err();
+            assert_eq!(error.execution_failure, Some(input.clone()));
+            assert_eq!(error.state, MaintenanceJobState::CommitUnknown);
+            assert_eq!(error.message, "original owner failure");
+        }
+    }
+    #[test]
+    fn ordinary_optimize_keeps_caller_fallback_and_real_publication_without_inventing_from_finished()
+     {
+        let error = optimize_statement_terminal_result(
+            JobHandle::new(71),
+            record(MaintenanceJobState::CommitUnknown),
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.execution_failure, None);
+        assert_eq!(error.state, MaintenanceJobState::CommitUnknown);
+        assert_eq!(
+            error.message,
+            "OPTIMIZE statement cancelled; optimize job has actually exited"
+        );
+        assert!(
+            optimize_statement_terminal_result(
+                JobHandle::new(71),
+                record(MaintenanceJobState::Finished),
+                false,
+                None
+            )
+            .is_ok()
+        );
+        let error = optimize_statement_terminal_result(
+            JobHandle::new(71),
+            record(MaintenanceJobState::Finished),
+            true,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.state, MaintenanceJobState::PreDispatchFailed);
+        assert_eq!(error.execution_failure, None);
+    }
+    #[test]
+    fn ordinary_optimize_original_source_precedes_late_cancel_request_error() {
+        use novarocks_type_contract::CompileControlError;
+        let source = novarocks_failure_contract::SharedFailureCause::new(
+            novarocks_local_compiler::FragmentCompileError::Unsupported {
+                node: None,
+                feature: "provider relation other than a table",
+            },
+        );
+        let mut job = record(MaintenanceJobState::KnownUncommitted);
+        job.compile_control = Some(CompileControlError::Source(source.clone()));
+        let error = optimize_statement_terminal_result(
+            JobHandle::new(71),
+            job,
+            true,
+            Some("late cancellation request failed".into()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.compile_control,
+            Some(CompileControlError::Source(source))
+        );
+        assert_eq!(error.state, MaintenanceJobState::KnownUncommitted);
+        assert_eq!(error.message, "original owner failure");
     }
 }

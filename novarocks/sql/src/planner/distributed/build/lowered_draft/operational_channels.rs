@@ -106,7 +106,6 @@ impl From<ConstantError> for SqlOperationalProjectionError {
     fn from(error: ConstantError) -> Self {
         match error {
             ConstantError::Control(cause) => Self::Control(cause),
-            ConstantError::Limit(_) => Self::Control(CompileControlError::ResourceExhausted),
             error => Self::Constant(error),
         }
     }

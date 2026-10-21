@@ -140,22 +140,28 @@ REFRESH MATERIALIZED VIEW agg_mv_d1 WITH SYNC MODE;
 SELECT region, day, SUM(amount) FROM orders GROUP BY region, day;
 
 -- query 16
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW agg_mv_d1;
+SET CATALOG mvrw_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_mv_d1;
 
 -- query 17
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW agg_mv;
+SET CATALOG mvrw_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.agg_mv;
 
 -- query 18
+-- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE mvrw_${uuid0}.ns_${uuid0}.orders FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.orders FORCE;
 
 -- query 19
+-- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
+DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 20
 -- @cleanup=true
 -- @skip_result_check=true
-DROP CATALOG mvrw_${uuid0};
+DROP CATALOG IF EXISTS mvrw_${uuid0};

@@ -149,21 +149,22 @@ SELECT dt, sum(col_int) FROM mv_ice_tbl_${uuid0} WHERE dt>='2023-12-03' GROUP BY
 SELECT * FROM test_mv1 ORDER BY 1, 2;
 
 -- query 13
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW test_mv1;
+SET CATALOG mv_iceberg_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS mv_ice_db_${uuid0}.test_mv1;
 
 -- query 14
+-- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE mv_iceberg_${uuid0}.mv_ice_db_${uuid0}.mv_ice_tbl_${uuid0} FORCE;
+DROP TABLE IF EXISTS mv_iceberg_${uuid0}.mv_ice_db_${uuid0}.mv_ice_tbl_${uuid0} FORCE;
 
 -- query 15
--- The MV and the base table are already dropped above, so this needs no FORCE.
--- FORCE would enumerate the namespace's views, which a Hadoop catalog cannot
--- answer -- it reports Unsupported rather than fabricating an empty list.
+-- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE mv_iceberg_${uuid0}.mv_ice_db_${uuid0};
+DROP DATABASE IF EXISTS mv_iceberg_${uuid0}.mv_ice_db_${uuid0};
 
 -- query 16
 -- @cleanup=true
 -- @skip_result_check=true
-DROP CATALOG mv_iceberg_${uuid0};
+DROP CATALOG IF EXISTS mv_iceberg_${uuid0};

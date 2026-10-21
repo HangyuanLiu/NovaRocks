@@ -783,7 +783,7 @@ fn frozen_mv_target_routing_preserves_exact_provider_facts_and_generic_history()
     };
     let open = |relation: &ProviderReadRelationNeed, admitted: &AdmittedRead| {
         *provider.table.lock().unwrap() = Some(table.clone());
-        let (opened, work) = open_relation(
+        let (opened, work, metadata_kind) = open_relation(
             adapter.as_ref(),
             &session,
             &name,
@@ -795,6 +795,7 @@ fn frozen_mv_target_routing_preserves_exact_provider_facts_and_generic_history()
         assert_eq!(opened.binding(), adapter.binding());
         assert!(Arc::ptr_eq(adapter.table(&opened).unwrap(), &table));
         assert!(work.is_none());
+        assert!(metadata_kind.is_none());
         assert!(provider.table.lock().unwrap().is_none());
         std::mem::take(&mut *provider.read_opens.lock().unwrap())
     };

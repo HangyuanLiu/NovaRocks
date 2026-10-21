@@ -1504,6 +1504,9 @@ pub(crate) enum SubscriptionState {
     Resubscribing,
     /// The bounded resubscription budget ran out.
     BudgetExhausted,
+    /// The same retry budget ended after a typed original connection loss
+    /// that no subsequently accepted stream liveness repaired.
+    ConnectionLossExhausted,
     /// The backend rejected the subscription in a way resubscribing cannot
     /// repair.
     Rejected,
@@ -1522,6 +1525,7 @@ impl SubscriptionState {
             Self::Live => "live",
             Self::Resubscribing => "resubscribing",
             Self::BudgetExhausted => "budget_exhausted",
+            Self::ConnectionLossExhausted => "connection_loss_exhausted",
             Self::Rejected => "rejected",
             Self::ProcessMismatch => "process_mismatch",
             Self::QueryMismatch => "query_mismatch",
@@ -1532,7 +1536,11 @@ impl SubscriptionState {
     pub(crate) const fn is_fatal(self) -> bool {
         matches!(
             self,
-            Self::BudgetExhausted | Self::Rejected | Self::ProcessMismatch | Self::QueryMismatch
+            Self::BudgetExhausted
+                | Self::ConnectionLossExhausted
+                | Self::Rejected
+                | Self::ProcessMismatch
+                | Self::QueryMismatch
         )
     }
 }
@@ -2489,19 +2497,63 @@ fn validate_covered_event_context(
     Ok(())
 }
 
+/// Preserve the channel owner's observed IO loss before any diagnostic display.
+#[derive(Debug)]
+enum CoveredSubscriptionOpenError {
+    Channel(super::transport::ChannelAcquisitionError),
+    Rpc(tonic::Status),
+}
+impl CoveredSubscriptionOpenError {
+    fn fatal_status(&self) -> Option<&tonic::Status> {
+        match self {
+            Self::Rpc(status) if subscription_rejection_is_fatal(status) => Some(status),
+            _ => None,
+        }
+    }
+    fn observed_connection_loss(&self) -> bool {
+        match self {
+            Self::Channel(error) => error.observed_connection_loss(),
+            Self::Rpc(status) => super::transport::is_observed_connection_loss(status),
+        }
+    }
+}
+
+/// Evidence belongs to this original reconnect streak, not to a status label.
+#[derive(Default)]
+struct CoveredConnectionEvidence {
+    lost: bool,
+}
+impl CoveredConnectionEvidence {
+    fn observe_loss(&mut self, observed: bool) {
+        self.lost |= observed;
+    }
+    fn observe_liveness(&mut self) {
+        self.lost = false;
+    }
+    fn exhausted_state(&self) -> SubscriptionState {
+        if self.lost {
+            SubscriptionState::ConnectionLossExhausted
+        } else {
+            SubscriptionState::BudgetExhausted
+        }
+    }
+}
+
 async fn open_covered_subscription(
     client: &Client,
     request: &DecodedCoveredSubscription,
-) -> Result<tonic::Streaming<proto::TaskStatusStreamEvent>, tonic::Status> {
-    let request = encode_covered_subscribe_task_status(request)
-        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+) -> Result<tonic::Streaming<proto::TaskStatusStreamEvent>, CoveredSubscriptionOpenError> {
+    let request = encode_covered_subscribe_task_status(request).map_err(|error| {
+        CoveredSubscriptionOpenError::Rpc(tonic::Status::invalid_argument(error.to_string()))
+    })?;
     let mut grpc = client
         .grpc_with_channel_error(NativeRpcMethod::SubscribeTaskStatus)
         .await
-        .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+        .map_err(CoveredSubscriptionOpenError::Channel)?;
     grpc.subscribe_task_status(tonic::Request::new(request))
         .await
         .map(tonic::Response::into_inner)
+        .map_err(CoveredSubscriptionOpenError::Rpc)
 }
 
 async fn run_covered_subscription(
@@ -2517,6 +2569,7 @@ async fn run_covered_subscription(
     let mut last_generation = 0_u64;
     let jitter = std::collections::hash_map::RandomState::new();
     let mut failures = 0_u32;
+    let mut connection = CoveredConnectionEvidence::default();
     'subscription: loop {
         applied = match applied_snapshot.lock() {
             Ok(snapshot) => snapshot.clone(),
@@ -2543,9 +2596,9 @@ async fn run_covered_subscription(
             }
             opened = tokio::time::timeout(
                 COVERED_STREAM_LIVENESS_WINDOW, open_covered_subscription(&client, &applied)
-            ) => opened.unwrap_or_else(|_| Err(tonic::Status::deadline_exceeded(
+            ) => opened.unwrap_or_else(|_| Err(CoveredSubscriptionOpenError::Rpc(tonic::Status::deadline_exceeded(
                 "covered observation subscription opening exceeded its liveness budget"
-            ))),
+            )))),
         };
         match opened {
             Ok(mut stream) => {
@@ -2672,6 +2725,7 @@ async fn run_covered_subscription(
                                 );
                             }
                             if new_liveness {
+                                connection.observe_liveness();
                                 observed_liveness = true;
                                 liveness_deadline =
                                     tokio::time::Instant::now() + COVERED_STREAM_LIVENESS_WINDOW;
@@ -2683,25 +2737,31 @@ async fn run_covered_subscription(
                             set_state(&state, SubscriptionState::Rejected);
                             return;
                         }
-                        Err(_) => break,
+                        Err(status) => {
+                            connection.observe_loss(super::transport::is_observed_connection_loss(
+                                &status,
+                            ));
+                            break;
+                        }
                     }
                 }
                 if observed_liveness {
                     failures = 0;
                 }
             }
-            Err(status) if subscription_rejection_is_fatal(&status) => {
+            Err(error) if error.fatal_status().is_some() => {
+                let status = error.fatal_status().expect("fatal status was checked");
                 tracing::warn!(%context, code = ?status.code(), detail = status.message(), "covered observation subscription rejected");
                 set_state(&state, SubscriptionState::Rejected);
                 return;
             }
-            Err(_) => {}
+            Err(error) => connection.observe_loss(error.observed_connection_loss()),
         }
         // A disconnection does not erase accepted facts or manufacture a
         // local observation gap. Reconnect from the owner's applied cursors.
         failures += 1;
         if failures >= error_budget {
-            set_state(&state, SubscriptionState::BudgetExhausted);
+            set_state(&state, connection.exhausted_state());
             return;
         }
         set_state(&state, SubscriptionState::Resubscribing);
@@ -5852,6 +5912,120 @@ mod tests {
             validate_covered_event_context(&request, &versions, &event)
                 .expect("exact version and generation remain valid");
         }
+    }
+
+    #[test]
+    fn covered_connection_evidence_requires_typed_loss_and_resets_only_on_liveness() {
+        let mut evidence = CoveredConnectionEvidence::default();
+        for status in [
+            Status::unavailable("connection refused is only untrusted text"),
+            Status::deadline_exceeded("local read timeout"),
+        ] {
+            let error = CoveredSubscriptionOpenError::Rpc(status);
+            evidence.observe_loss(error.observed_connection_loss());
+            assert_eq!(
+                evidence.exhausted_state(),
+                SubscriptionState::BudgetExhausted
+            );
+        }
+        let opaque_channel = CoveredSubscriptionOpenError::Channel(
+            super::super::transport::ChannelAcquisitionError::retryable_network("connection reset"),
+        );
+        assert!(!opaque_channel.observed_connection_loss());
+        let actual = CoveredSubscriptionOpenError::Rpc(Status::from_error(Box::new(
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        )));
+        evidence.observe_loss(actual.observed_connection_loss());
+        assert_eq!(
+            evidence.exhausted_state(),
+            SubscriptionState::ConnectionLossExhausted
+        );
+        // A newly opened stream without a real liveness frame cannot clear loss.
+        evidence.observe_loss(false);
+        assert_eq!(
+            evidence.exhausted_state(),
+            SubscriptionState::ConnectionLossExhausted
+        );
+        evidence.observe_liveness();
+        assert_eq!(
+            evidence.exhausted_state(),
+            SubscriptionState::BudgetExhausted
+        );
+        evidence.observe_loss(actual.observed_connection_loss());
+        assert_eq!(
+            evidence.exhausted_state(),
+            SubscriptionState::ConnectionLossExhausted
+        );
+    }
+
+    async fn covered_terminal_after_original_transport_failure(connection_lost: bool) {
+        let backend = BackendProcessId::new_v7();
+        let mut loopback = Loopback::start().await;
+        let descriptor = loopback.descriptor(backend);
+        if connection_lost {
+            assert!(loopback.settle().await);
+        } else {
+            loopback
+                .peer
+                .expect_subscribe(SubscribeAnswer::Reject(tonic::Code::Unavailable));
+        }
+        let context = context(backend);
+        let task = identity(1, backend);
+        let intake = Arc::new(
+            ObservationIntake::new(1, 3, 3 * 4096, 4096, Arc::new(CountingWake::default()))
+                .unwrap(),
+        );
+        let role = CoveredRoleFixture::new();
+        let subscriber = CoveredTaskStatusSubscriber::new(
+            &[descriptor],
+            intake,
+            1,
+            role.runtime.clone(),
+            role.scope(),
+        )
+        .unwrap();
+        subscriber
+            .ensure(DecodedCoveredSubscription {
+                context,
+                generation: NonZeroU64::new(1).unwrap(),
+                status_cursors: vec![TaskStatusCursor::unobserved(task)],
+                task_convergence_cursors: Vec::new(),
+                context_cursor: None,
+                quiesce_cursor: None,
+                required_identities: vec![task],
+            })
+            .unwrap();
+        let expected = if connection_lost {
+            SubscriptionState::ConnectionLossExhausted
+        } else {
+            SubscriptionState::BudgetExhausted
+        };
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !subscriber
+                .state(context)
+                .is_some_and(SubscriptionState::is_fatal)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("original bounded transport failure must settle");
+        assert_eq!(subscriber.state(context), Some(expected));
+        subscriber.stop(context);
+        role.settle().await;
+        if !connection_lost {
+            assert!(loopback.settle().await);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn covered_original_closed_endpoint_retains_typed_connection_loss() {
+        covered_terminal_after_original_transport_failure(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn covered_plain_remote_unavailable_is_not_original_connection_loss() {
+        covered_terminal_after_original_transport_failure(false).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

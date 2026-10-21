@@ -666,6 +666,18 @@ impl QueryTaskExecution {
         self.owners.get(&context)
     }
 
+    /// Read an exact pre-ready context's original admission horizon using
+    /// the same Task clock that accepted its receipt, never an actor clock.
+    pub(crate) fn pre_ready_observation_remaining(
+        &self,
+        backend: BackendProcessId,
+    ) -> Option<Duration> {
+        self.owners
+            .iter()
+            .find(|(context, _)| context.backend_process_id() == backend)
+            .and_then(|(_, owner)| owner.pre_ready_observation_remaining(self.clock.now()))
+    }
+
     /// Takes contexts whose task-operation acknowledgement requires an
     /// immediate status resubscription from the frontend's held cursors.
     pub fn take_status_reconciliations(&mut self) -> BTreeSet<QueryContextRef> {
@@ -733,33 +745,7 @@ impl QueryTaskExecution {
     ) -> Result<PumpReport, TaskExecutionError> {
         self.refresh_deployment_window();
         let now = self.clock.now();
-        let expired = self.dispatcher.drain_expired(now);
-        let mut first_expiry = None;
-        for expired in expired {
-            let operation_id = expired.operation_id();
-            let kind = expired.kind();
-            let waited = expired.waited();
-            let target = self
-                .operation_targets
-                .remove(&operation_id)
-                .ok_or(TaskExecutionError::UnknownOperation)?;
-            // The dispatcher never accepted this operation, so no remote
-            // effect is possible. Roll back its owner marker before failing
-            // the attempt; cleanup can then mint the cancellation it owes.
-            if target == OperationTarget::ActorAbort {
-                self.expired_actor_aborts.push(operation_id);
-            } else {
-                self.rollback_unsent(target, operation_id);
-            }
-            first_expiry.get_or_insert(TaskExecutionError::QueueResidenceExpired {
-                operation_id,
-                kind,
-                waited,
-            });
-        }
-        if let Some(error) = first_expiry {
-            return Err(error);
-        }
+        self.expire_queued_operations(now)?;
         let mut report = PumpReport::default();
         if self.terminal_cleanup_started {
             // Terminal cleanup forbids new normal work, but the actor can
@@ -883,30 +869,96 @@ impl QueryTaskExecution {
         Ok(report)
     }
 
+    fn expire_queued_operations(
+        &mut self,
+        now: MonotonicInstant,
+    ) -> Result<(), TaskExecutionError> {
+        let expired = self.dispatcher.drain_expired(now);
+        let mut first_expiry = None;
+        for expired in expired {
+            let operation_id = expired.operation_id();
+            let kind = expired.kind();
+            let waited = expired.waited();
+            let target = self
+                .operation_targets
+                .remove(&operation_id)
+                .ok_or(TaskExecutionError::UnknownOperation)?;
+            // The dispatcher never accepted this operation, so no remote
+            // effect is possible. Roll back its owner marker before failing
+            // the attempt; cleanup can then mint the cancellation it owes.
+            if target == OperationTarget::ActorAbort {
+                self.expired_actor_aborts.push(operation_id);
+            } else {
+                self.rollback_unsent(target, operation_id);
+            }
+            first_expiry.get_or_insert(TaskExecutionError::QueueResidenceExpired {
+                operation_id,
+                kind,
+                waited,
+            });
+        }
+        if let Some(error) = first_expiry {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Dispatch only previously authorized actor Abort effects while ordinary
+    /// admission is paused. Queue deadlines, permits and settlements remain
+    /// with the same dispatcher and transport owners.
+    pub(crate) fn pump_pending_actor_aborts(&mut self) -> Result<PumpReport, TaskExecutionError> {
+        self.expire_queued_operations(self.clock.now())?;
+        let queued = self
+            .operation_targets
+            .iter()
+            .filter_map(|(&operation_id, &target)| {
+                (target == OperationTarget::ActorAbort).then_some(operation_id)
+            })
+            .collect::<Vec<_>>();
+        let mut report = PumpReport::default();
+        for operation_id in queued {
+            if let Some(batch) = self.dispatcher.take_priority_operation_batch(operation_id)
+                && !self.submit_queued_batch(batch, &mut report)?
+            {
+                break;
+            }
+        }
+        Ok(report)
+    }
+
     fn submit_queued_batches(&mut self, report: &mut PumpReport) -> Result<(), TaskExecutionError> {
         while let Some(batch) = self.dispatcher.take_batch() {
-            let acceptance = batch.acceptance();
-            let operations = batch.operations().len();
-            match self.sink.try_submit(batch) {
-                TaskOperationSubmit::Accepted => {
-                    self.dispatcher.accept(acceptance)?;
-                    report.batches += 1;
-                    report.operations += operations;
-                }
-                TaskOperationSubmit::Backpressured(batch) => {
-                    self.dispatcher.restore_backpressured(batch);
-                    // A process-level supervisor wake will schedule another
-                    // turn when capacity changes. Retrying in this turn would
-                    // only rediscover the same full hard bound and spin.
-                    break;
-                }
-                TaskOperationSubmit::Rejected { batch, reason } => {
-                    self.rollback_rejected_batch(batch)?;
-                    return Err(TaskExecutionError::Schedule(reason));
-                }
+            if !self.submit_queued_batch(batch, report)? {
+                break;
             }
         }
         Ok(())
+    }
+
+    fn submit_queued_batch(
+        &mut self,
+        batch: DispatchBatch,
+        report: &mut PumpReport,
+    ) -> Result<bool, TaskExecutionError> {
+        let acceptance = batch.acceptance();
+        let operations = batch.operations().len();
+        match self.sink.try_submit(batch) {
+            TaskOperationSubmit::Accepted => {
+                self.dispatcher.accept(acceptance)?;
+                report.batches += 1;
+                report.operations += operations;
+                Ok(true)
+            }
+            TaskOperationSubmit::Backpressured(batch) => {
+                self.dispatcher.restore_backpressured(batch);
+                // Retry only after an original capacity wake or another turn.
+                Ok(false)
+            }
+            TaskOperationSubmit::Rejected { batch, reason } => {
+                self.rollback_rejected_batch(batch)?;
+                Err(TaskExecutionError::Schedule(reason))
+            }
+        }
     }
 
     /// Records one domain fact for one task.

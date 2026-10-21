@@ -629,6 +629,48 @@ pub(crate) fn build_compiled_pipeline_graph_typed(
     Ok(PipelineGraph { pipelines, root_id })
 }
 
+/// Keeps the compiler's physical diagnostic sources through driver creation.
+struct ProfiledCompiledFactory {
+    inner: Box<dyn OperatorFactory>,
+    identity: Arc<crate::runtime::profile::CompiledOperatorProfile>,
+}
+impl OperatorFactory for ProfiledCompiledFactory {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn compiled_operator_profile(
+        &self,
+    ) -> Option<&Arc<crate::runtime::profile::CompiledOperatorProfile>> {
+        Some(&self.identity)
+    }
+    fn bind_pipeline_dop(&self, dop: i32) -> ExecutionResult<()> {
+        self.inner.bind_pipeline_dop(dop)
+    }
+    fn create(
+        &self,
+        dop: i32,
+        driver_id: i32,
+    ) -> Box<dyn crate::exec::pipeline::operator::Operator> {
+        self.inner.create(dop, driver_id)
+    }
+    fn is_source(&self) -> bool {
+        self.inner.is_source()
+    }
+    fn is_sink(&self) -> bool {
+        self.inner.is_sink()
+    }
+    #[cfg(test)]
+    fn is_edge_gated(&self) -> bool {
+        self.inner.is_edge_gated()
+    }
+    #[cfg(test)]
+    fn native_aggregate_topn_producers(
+        &self,
+    ) -> &[crate::exec::node::aggregate::AggregateTopNRuntimeFilterProducerBinding] {
+        self.inner.native_aggregate_topn_producers()
+    }
+}
+
 fn build_node(
     program: &Arc<LocalProgram>,
     id: ProgramNodeId,
@@ -643,7 +685,7 @@ fn build_node(
         )
     })?;
     let node_id = display_id(id)?;
-    match node.kind() {
+    let mut build = match node.kind() {
         ProgramNodeKind::Values { .. } => {
             let source: Box<dyn OperatorFactory> =
                 Box::new(values_source::CompiledValuesSourceFactory::try_new(
@@ -1160,7 +1202,30 @@ fn build_node(
                 id.index()
             ),
         )),
+    }?;
+    for pipeline in std::iter::once(&mut build.pipeline).chain(build.extra_pipelines.iter_mut()) {
+        pipeline.factories = pipeline
+            .factories
+            .drain(..)
+            .map(|factory| {
+                if factory.compiled_operator_profile().is_some() {
+                    return factory;
+                }
+                let label = match node.kind() {
+                    ProgramNodeKind::Values { .. } => "ValuesSource".to_string(),
+                    _ => factory.name().to_string(),
+                };
+                Box::new(ProfiledCompiledFactory {
+                    inner: factory,
+                    identity: Arc::new(crate::runtime::profile::CompiledOperatorProfile {
+                        sources: node.physical_sources().into(),
+                        label,
+                    }),
+                }) as Box<dyn OperatorFactory>
+            })
+            .collect();
     }
+    Ok(build)
 }
 
 /// UnionAll as the compiler lowers it: every input is that branch's

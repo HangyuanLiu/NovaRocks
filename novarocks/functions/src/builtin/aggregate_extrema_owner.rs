@@ -135,6 +135,11 @@ impl ExtremaOwner {
         }
     }
 }
+fn has_inline_window_state(selected: &FunctionBindingSelection) -> bool {
+    !matches!(selected.argument_types.first(),
+        Some(FunctionArgumentType::Value(source)) if source.data_type() == &DataType::Utf8)
+}
+
 impl InlineAggregateWindowKernel for PreparedExtrema {
     fn copy_state(&self, state: &ExtremaState) -> Result<ExtremaState, KernelFailure> {
         match (self, state) {
@@ -153,7 +158,7 @@ impl PureAggregateWindowImplementation for ExtremaOwner {
         contract: Arc<WindowCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedWindowKernel>, KernelFailure> {
-        if matches!(aggregate.as_ref(), PreparedExtrema::Utf8(_)) {
+        if !has_inline_window_state(contract.call().selected()) {
             control
                 .checkpoint(CompilePhase::FunctionSpecialization, 0)
                 .map_err(compile_failure)?;
@@ -237,6 +242,35 @@ impl PureFunctionMetadataOwner for ExtremaOwner {
     }
     fn implementation_declarations(&self) -> &[PureImplementationDeclaration] {
         &self.implementations
+    }
+    fn admit_selected_lifecycle_profile_observed(
+        &self,
+        selected: &FunctionBindingSelection,
+        logical_argument_count: usize,
+        lifecycle: PureCallLifecycle,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionBindingError> {
+        self.admit_selected_profile_observed(selected, logical_argument_count, control)?;
+        if lifecycle != PureCallLifecycle::AggregateWindow {
+            return Ok(());
+        }
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        work.step()?;
+        self.declaration.effect_declaration(&selected.overload)?;
+        if logical_argument_count != 1 || selected.argument_types.len() != 1 {
+            return Err(FunctionBindingError::InvalidBinding(
+                "MIN/MAX window admission requires one exact value channel".into(),
+            ));
+        }
+        let supported = has_inline_window_state(selected);
+        work.finish()?;
+        if supported {
+            Ok(())
+        } else {
+            Err(FunctionBindingError::UnavailableImplementation(
+                selected.overload.clone(),
+            ))
+        }
     }
 }
 impl FunctionEffectOwner for ExtremaOwner {

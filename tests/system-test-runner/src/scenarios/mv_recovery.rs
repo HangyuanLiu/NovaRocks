@@ -274,6 +274,27 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             original_deadline,
             vec![
                 FeLaunchIntent::MvActions(vec![
+                    control_plan::scheduler_outcome(
+                        "outcome-a",
+                        "system_mv_scheduler",
+                        "ns",
+                        "orders_mv_a",
+                        &scenario_root.join("mv-scheduler-outcomes/first/orders_mv_a"),
+                    ),
+                    control_plan::scheduler_outcome(
+                        "outcome-b",
+                        "system_mv_scheduler",
+                        "ns",
+                        "orders_mv_b",
+                        &scenario_root.join("mv-scheduler-outcomes/first/orders_mv_b"),
+                    ),
+                    control_plan::scheduler_outcome(
+                        "outcome-recovery-first",
+                        "system_mv_scheduler",
+                        "ns",
+                        "orders_mv_recovery",
+                        &scenario_root.join("mv-scheduler-outcomes/first/orders_mv_recovery"),
+                    ),
                     control_plan::scheduler(
                         "scheduler-a",
                         "system_mv_scheduler",
@@ -296,13 +317,22 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
                         &scenario_root.join("mv-scheduler-barrier"),
                     ),
                 ]),
-                FeLaunchIntent::MvActions(vec![control_plan::transient(
-                    "recovery-transient",
-                    "system_mv_scheduler",
-                    "ns",
-                    "orders_mv_recovery",
-                    &scenario_root.join("mv-scheduler-barrier"),
-                )]),
+                FeLaunchIntent::MvActions(vec![
+                    control_plan::scheduler_outcome(
+                        "outcome-recovery-second",
+                        "system_mv_scheduler",
+                        "ns",
+                        "orders_mv_recovery",
+                        &scenario_root.join("mv-scheduler-outcomes/recovery/orders_mv_recovery"),
+                    ),
+                    control_plan::transient(
+                        "recovery-transient",
+                        "system_mv_scheduler",
+                        "ns",
+                        "orders_mv_recovery",
+                        &scenario_root.join("mv-scheduler-barrier"),
+                    ),
+                ]),
             ],
         )
         .map(Some)
@@ -311,6 +341,7 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let barrier_dir = context.scenario_root().join("mv-scheduler-barrier");
+        let outcome_root = context.scenario_root().join("mv-scheduler-outcomes");
         let hold_trigger = barrier_dir.join("mvx4-scheduler-hold.trigger");
         let _hold = FileTrigger::create(&hold_trigger, "hold\n")?;
         context.action("armed scheduler admission barrier");
@@ -368,6 +399,11 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             "SELECT k1, v2 FROM orders_mv_a ORDER BY k1",
             &[(1, 10), (2, 20)],
             "wait for first scheduler MV initial catch-up",
+            SchedulerOutcomeTarget {
+                directory: outcome_root.join("first/orders_mv_a"),
+                grant_id: "outcome-a",
+                mv: "orders_mv_a",
+            },
         )?;
         wait_for_rows(
             context,
@@ -375,6 +411,11 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             "SELECT k1, v2 FROM orders_mv_b ORDER BY k1",
             &[(1, 10), (2, 20)],
             "wait for second scheduler MV initial catch-up",
+            SchedulerOutcomeTarget {
+                directory: outcome_root.join("first/orders_mv_b"),
+                grant_id: "outcome-b",
+                mv: "orders_mv_b",
+            },
         )?;
         execute(
             context,
@@ -388,6 +429,11 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             "SELECT k1, v2 FROM orders_mv_a ORDER BY k1",
             &[(1, 10), (2, 20), (3, 30)],
             "wait for first scheduler MV incremental catch-up",
+            SchedulerOutcomeTarget {
+                directory: outcome_root.join("first/orders_mv_a"),
+                grant_id: "outcome-a",
+                mv: "orders_mv_a",
+            },
         )?;
         wait_for_rows(
             context,
@@ -395,6 +441,11 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             "SELECT k1, v2 FROM orders_mv_b ORDER BY k1",
             &[(1, 10), (2, 20), (3, 30)],
             "wait for second scheduler MV incremental catch-up",
+            SchedulerOutcomeTarget {
+                directory: outcome_root.join("first/orders_mv_b"),
+                grant_id: "outcome-b",
+                mv: "orders_mv_b",
+            },
         )?;
         execute(
             context,
@@ -450,6 +501,11 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             "SELECT k1, v2 FROM orders_mv_recovery ORDER BY k1",
             &[(1, 10), (2, 20), (3, 30), (4, 40)],
             "wait for scheduler recovery to catch up durable MV",
+            SchedulerOutcomeTarget {
+                directory: outcome_root.join("recovery/orders_mv_recovery"),
+                grant_id: "outcome-recovery-second",
+                mv: "orders_mv_recovery",
+            },
         )?;
         let consumed_fault =
             barrier_dir.join("mvx4-scheduler-transient-preparation-orders_mv_recovery.consumed");
@@ -780,6 +836,7 @@ impl Scenario for MvRefreshConfigurationInterleaving {
         );
         wait_for_fe_marker(
             context,
+            &held_refresh,
             "NOVAROCKS_MV_RECOVERY_PHASE phase=data-prepared token=before-configuration-write",
             "wait for completed MV computation before configuration write",
         )?;
@@ -796,31 +853,21 @@ impl Scenario for MvRefreshConfigurationInterleaving {
         }
 
         let (started_tx, started_rx) = mpsc::sync_channel(1);
-        let (result_tx, result_rx) = mpsc::sync_channel(1);
         let user = context.mysql_user().to_string();
         let port = context.mysql_port();
         context.remaining("start concurrent MV configuration write")?;
         let deadline = context.deadline();
-        let writer_actor = thread::spawn(move || -> Result<()> {
-            let result = mysql_actor::connect_until(&user, port, deadline)?
-                .run(|writer| {
-                    writer.query_drop(format!("SET CATALOG {catalog}"))?;
-                    writer.query_drop("USE ns")?;
-                    started_tx
-                        .send(())
-                        .context("signal configuration writer readiness")?;
-                    writer.query_drop("ALTER MATERIALIZED VIEW orders_mv PAUSE REFRESH")?;
-                    Ok(())
-                })
-                .map_err(|error| format!("{error:#}"));
-            result_tx
-                .send(result)
-                .map_err(|error| anyhow::anyhow!("MV writer result owner closed: {error}"))
+        let result_rx = spawn_sql_actor(move || {
+            mysql_actor::connect_until(&user, port, deadline)?.run(|writer| {
+                writer.query_drop(format!("SET CATALOG {catalog}"))?;
+                writer.query_drop("USE ns")?;
+                started_tx
+                    .send(())
+                    .context("signal configuration writer readiness")?;
+                writer.query_drop("ALTER MATERIALIZED VIEW orders_mv PAUSE REFRESH")?;
+                Ok(())
+            })
         });
-        let result_rx = JoinedSqlResult {
-            result: result_rx,
-            actor: Mutex::new(Some(writer_actor)),
-        };
         started_rx
             .recv_timeout(context.remaining("wait for configuration writer readiness")?)
             .context("configuration writer did not reach its SQL request")?;
@@ -829,12 +876,12 @@ impl Scenario for MvRefreshConfigurationInterleaving {
         context.action("release the refresh and settle the waiting configuration write");
         match held_refresh.recv_timeout(context.remaining("receive held refresh")?) {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => bail!("held refresh failed: {error}"),
+            Ok(Err(error)) => return Err(error).context("held refresh failed"),
             Err(error) => bail!("held refresh did not finish: {error}"),
         }
         match result_rx.recv_timeout(context.remaining("receive configuration write")?) {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => bail!("concurrent configuration write failed: {error}"),
+            Ok(Err(error)) => return Err(error).context("concurrent configuration write failed"),
             Err(error) => bail!("concurrent configuration write did not finish: {error}"),
         }
         require_refresh_paused(context, &mut conn, "orders_mv", true)?;
@@ -1061,6 +1108,7 @@ impl Scenario for MvCurrentDependencyRecheck {
         );
         wait_for_fe_marker(
             context,
+            &held_refresh,
             "NOVAROCKS_MV_RECOVERY_PHASE phase=data-prepared token=before-current-dependency-recheck",
             "wait for BE computation before Current recheck",
         )?;
@@ -1074,9 +1122,13 @@ impl Scenario for MvCurrentDependencyRecheck {
         context.action("verify an externally changed D stops the old refresh before commit");
         match held_refresh.recv_timeout(context.remaining("receive stale MV refresh")?) {
             Ok(Err(error))
-                if error.to_ascii_lowercase().contains("corrupt")
-                    && error.contains(&missing_key) => {}
-            Ok(Err(error)) => bail!("stale MV refresh failed for another reason: {error}"),
+                if format!("{error:#}")
+                    .to_ascii_lowercase()
+                    .contains("corrupt")
+                    && format!("{error:#}").contains(&missing_key) => {}
+            Ok(Err(error)) => {
+                return Err(error).context("stale MV refresh failed for another reason");
+            }
             Ok(Ok(())) => bail!("stale MV refresh published after D changed"),
             Err(error) => bail!("stale MV refresh did not finish: {error}"),
         }
@@ -1376,6 +1428,7 @@ impl Scenario for MvStagedPublishedRecovery {
         );
         wait_for_fe_marker(
             context,
+            &staged_refresh,
             "NOVAROCKS_MV_RECOVERY_PHASE phase=write-committed token=staged-before-publication",
             "wait for committed-before-record barrier",
         )?;
@@ -1429,6 +1482,7 @@ impl Scenario for MvStagedPublishedRecovery {
         );
         wait_for_fe_marker(
             context,
+            &published_refresh,
             "NOVAROCKS_MV_RECOVERY_PHASE phase=publication-committed token=published-before-cleanup",
             "wait for publication recovery barrier",
         )?;
@@ -2495,15 +2549,227 @@ fn assert_rows(
     Ok(())
 }
 
+/// Retain the original domain fact in the error chain. Display is the producer's
+/// safe canonical projection, explicitly not an observed client SQL response.
+#[derive(Debug)]
+struct SchedulerRequestBlocked {
+    fact: novarocks_execution_contract::failure::FailureFact,
+    public_message: String,
+}
+impl std::fmt::Display for SchedulerRequestBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "MV scheduler request outcome: {}; original fact={:?}; recovery row oracle not reached",
+            self.public_message, self.fact
+        )
+    }
+}
+impl std::error::Error for SchedulerRequestBlocked {}
+
+fn check_scheduler_outcome(
+    directory: &Path,
+    grant_id: &str,
+    mv: &str,
+    expected: &novarocks_failpoint::target_binding::RoleProcessReceipt,
+) -> Result<()> {
+    use prost::Message;
+    use std::io::Read;
+    expected
+        .validate()
+        .context("invalid authenticated scheduler observation scope")?;
+    ensure!(
+        expected.role == novarocks_failpoint::session::SessionRole::Fe,
+        "scheduler observation expected scope is not FE"
+    );
+    let error_path = directory.join("scheduler-outcome-error.json");
+    ensure!(
+        !error_path.exists(),
+        "MV scheduler observation rejected its frozen binding; outcome UNKNOWN; {}",
+        error_path.display()
+    );
+    let path = directory.join("scheduler-outcome.json");
+    const MAX_BYTES: usize = 64 * 1024;
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("open finite scheduler outcome {}", path.display()));
+        }
+    };
+    let mut raw = Vec::new();
+    file.take(MAX_BYTES as u64 + 1)
+        .read_to_end(&mut raw)
+        .context("read bounded scheduler outcome; outcome UNKNOWN")?;
+    ensure!(
+        raw.len() <= MAX_BYTES,
+        "finite scheduler outcome is oversized; outcome UNKNOWN"
+    );
+    let record: serde_json::Value =
+        serde_json::from_slice(&raw).context("decode finite scheduler outcome; outcome UNKNOWN")?;
+    ensure!(
+        record["schema_version"] == 1
+            && record["semantic_scope"] == "scheduler-request-outcome"
+            && record["decision"] == "Blocked"
+            && record["grant_id"] == grant_id
+            && record["target"]["catalog"] == "system_mv_scheduler"
+            && record["target"]["namespace"] == "ns"
+            && record["target"]["mv"] == mv,
+        "finite scheduler outcome has a foreign target/grant or invalid shape; outcome UNKNOWN"
+    );
+    ensure!(
+        record["session_id"] == expected.session_id
+            && record["launch_id"] == expected.launch_id
+            && record["process"] == expected.process_id,
+        "finite scheduler outcome differs from the current authenticated FE session/launch/process; outcome UNKNOWN"
+    );
+    ensure!(
+        record["admission_observation_sequence"]
+            .as_u64()
+            .is_some_and(|n| n > 0),
+        "scheduler outcome has no admitted request; outcome UNKNOWN"
+    );
+    let first = &record["first_admitted_source"];
+    let blocked = &record["blocked_request_source"];
+    for key in [
+        "mv_id",
+        "target",
+        "target_object",
+        "definition_revision",
+        "interpretation_revision",
+        "configuration_revision",
+        "deployment_owner",
+        "process_incarnation",
+    ] {
+        ensure!(
+            !first[key].is_null() && first[key] == blocked[key],
+            "scheduler outcome rebound frozen target field {key}; outcome UNKNOWN"
+        );
+    }
+    for source in [first, blocked] {
+        for key in [
+            "target",
+            "target_object",
+            "metadata_version",
+            "publication_output_version",
+            "deployment_owner",
+            "process_incarnation",
+        ] {
+            ensure!(
+                source[key]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty() && s.len() <= 8192),
+                "invalid scheduler source identity; outcome UNKNOWN"
+            );
+        }
+        if !source["publication_revision"].is_null() {
+            let bytes: Vec<u8> = serde_json::from_value(source["publication_revision"].clone())
+                .context("invalid publication source revision; outcome UNKNOWN")?;
+            ensure!(
+                bytes.len() == 32,
+                "invalid publication source revision width; outcome UNKNOWN"
+            );
+        }
+        ensure!(
+            source["mv_id"].as_i64().is_some(),
+            "scheduler outcome omitted actual mv_id; outcome UNKNOWN"
+        );
+        for key in [
+            "definition_revision",
+            "interpretation_revision",
+            "configuration_revision",
+        ] {
+            let bytes: Vec<u8> = serde_json::from_value(source[key].clone())
+                .context("invalid source revision; outcome UNKNOWN")?;
+            ensure!(
+                bytes.len() == 32,
+                "invalid source revision width; outcome UNKNOWN"
+            );
+        }
+        ensure!(
+            source.get("publication_revision").is_some()
+                && source["metadata_version"].is_string()
+                && source["publication_output_version"].is_string(),
+            "scheduler outcome omitted request P/provider revision; outcome UNKNOWN"
+        );
+    }
+    for key in [
+        "actual_publication_attempt",
+        "actual_task_attempt",
+        "actual_base_snapshots",
+    ] {
+        ensure!(
+            record[key] == "NOT_OBSERVED",
+            "scheduler outcome claimed an unobserved pipeline witness; outcome UNKNOWN"
+        );
+    }
+    ensure!(
+        record["failure_identity"] == "Source",
+        "Blocked scheduler outcome lacks original typed Source identity; outcome UNKNOWN"
+    );
+    let bytes: Vec<u8> = serde_json::from_value(record["failure_fact"].clone())
+        .context("Blocked scheduler outcome has no typed Source fact; outcome UNKNOWN")?;
+    let dto = novarocks_proto_models::novarocks::FailureFact::decode(bytes.as_slice())
+        .context("invalid scheduler failure fact; outcome UNKNOWN")?;
+    let fact = novarocks_task_codec::status::decode_failure_fact(
+        &dto,
+        novarocks_proto_codec::FieldPath::root("scheduler_request_outcome").field("failure_fact"),
+    )?;
+    ensure!(
+        novarocks_task_codec::status::encode_failure_fact(fact).encode_to_vec() == bytes,
+        "scheduler outcome has noncanonical failure bytes; outcome UNKNOWN"
+    );
+    use novarocks_query_application::execution_error::{
+        ExecutionFailureInput, ExecutionFailureSite,
+    };
+    let public_message = ExecutionFailureInput::new(
+        fact,
+        novarocks_execution_contract::SafeDetail::truncating(
+            "MV scheduler request blocked; source diagnostic retained in FE role logs",
+        ),
+        ExecutionFailureSite::Coordinator,
+    )
+    .user_error()
+    .to_string();
+    ensure!(
+        record["public_message"] == public_message,
+        "scheduler outcome message disagrees with its decoded domain fact; outcome UNKNOWN"
+    );
+    Err(anyhow::Error::new(SchedulerRequestBlocked {
+        fact,
+        public_message,
+    })
+    .context(format!(
+        "actual Blocked scheduler request recorded at {}",
+        path.display()
+    )))
+}
+
+struct SchedulerOutcomeTarget {
+    directory: PathBuf,
+    grant_id: &'static str,
+    mv: &'static str,
+}
+
 fn wait_for_rows(
     context: &mut ScenarioContext,
     conn: &mut Conn,
     sql: &str,
     expected: &[(i32, i64)],
     action: &str,
+    outcome: SchedulerOutcomeTarget,
 ) -> Result<()> {
     context.action(action);
     loop {
+        let scope = context.handle().mv_scheduler_outcome_binding(
+            outcome.grant_id,
+            "system_mv_scheduler",
+            "ns",
+            outcome.mv,
+            &outcome.directory,
+        )?;
+        check_scheduler_outcome(&outcome.directory, outcome.grant_id, outcome.mv, &scope)?;
         let actual = conn.query::<(i32, i64), _>(sql);
         if let Ok(rows) = actual
             && rows == expected
@@ -2615,10 +2881,17 @@ fn clear_scheduler_markers(directory: &Path) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_fe_marker(context: &mut ScenarioContext, marker: &str, action: &str) -> Result<()> {
+fn wait_for_fe_marker(
+    context: &mut ScenarioContext,
+    producer: &JoinedSqlResult,
+    marker: &str,
+    action: &str,
+) -> Result<()> {
     context.action(action);
     loop {
-        if context.handle().fe_log_contents()?.contains(marker) {
+        if producer
+            .observe_required_marker(|| Ok(context.handle().fe_log_contents()?.contains(marker)))?
+        {
             return Ok(());
         }
         context.remaining(action)?;
@@ -2627,11 +2900,60 @@ fn wait_for_fe_marker(context: &mut ScenarioContext, marker: &str, action: &str)
 }
 
 struct JoinedSqlResult {
-    result: Receiver<std::result::Result<(), String>>,
+    result: Receiver<Result<()>>,
     actor: Mutex<Option<thread::JoinHandle<Result<()>>>>,
 }
 impl JoinedSqlResult {
-    fn recv_timeout(&self, timeout: Duration) -> Result<std::result::Result<(), String>> {
+    // Every caller holds an explicit refresh trigger until this marker. A
+    // completed SQL producer without the marker cannot still reach the barrier.
+    fn observe_required_marker(
+        &self,
+        mut marker_present: impl FnMut() -> Result<bool>,
+    ) -> Result<bool> {
+        // Keep the result untouched once the barrier is satisfied: the caller
+        // still owns its later post-mutation or post-crash result assertion.
+        if marker_present()? {
+            return Ok(true);
+        }
+        let finished = self
+            .actor
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MV SQL actor lock poisoned"))?
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished);
+        if !finished {
+            return Ok(false);
+        }
+        // Read again after producer exit, so a marker emitted between the first
+        // read and SQL completion still belongs to the satisfied barrier.
+        if marker_present()? {
+            return Ok(true);
+        }
+        match self.result.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {
+                self.join()?;
+                bail!("original MV SQL producer exited without publishing its result")
+            }
+            Ok(Err(primary)) => {
+                let primary = match self.join() {
+                    Ok(()) => primary,
+                    Err(cleanup) => {
+                        primary.context(format!("original MV actor cleanup: {cleanup:#}"))
+                    }
+                };
+                Err(primary.context("original MV SQL failed before its required FE marker"))
+            }
+            Ok(Ok(())) => {
+                self.join()?;
+                bail!("original MV SQL succeeded without reaching its required FE marker")
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.join()?;
+                bail!("original MV SQL producer closed without publishing its result")
+            }
+        }
+    }
+    fn recv_timeout(&self, timeout: Duration) -> Result<Result<()>> {
         let result = self
             .result
             .recv_timeout(timeout)
@@ -2639,11 +2961,8 @@ impl JoinedSqlResult {
         let cleanup = self.join();
         match (result, cleanup) {
             (Ok(result), Ok(())) => Ok(result),
-            (Err(primary), Err(cleanup)) => {
-                bail!("{primary:#}; original MV actor cleanup: {cleanup:#}")
-            }
-            (Ok(Err(primary)), Err(cleanup)) => {
-                bail!("{primary}; original MV actor cleanup: {cleanup:#}")
+            (Err(primary), Err(cleanup)) | (Ok(Err(primary)), Err(cleanup)) => {
+                Err(primary.context(format!("original MV actor cleanup: {cleanup:#}")))
             }
             (Err(error), _) | (_, Err(error)) => Err(error),
         }
@@ -2679,19 +2998,28 @@ fn spawn_refresh(
 ) -> JoinedSqlResult {
     let catalog = catalog.to_string();
     let mv = mv.to_string();
+    spawn_sql_actor(move || {
+        mysql_actor::connect_until(&user, port, deadline)?.run(|conn| {
+            conn.query_drop(format!("SET CATALOG {catalog}"))?;
+            conn.query_drop("USE ns")?;
+            conn.query_drop(format!("REFRESH MATERIALIZED VIEW {mv}"))?;
+            Ok(())
+        })
+    })
+}
+
+fn spawn_sql_actor(operation: impl FnOnce() -> Result<()> + Send + 'static) -> JoinedSqlResult {
     let (sender, receiver) = mpsc::sync_channel(1);
     let actor = thread::spawn(move || -> Result<()> {
-        let result = mysql_actor::connect_until(&user, port, deadline)?
-            .run(|conn| {
-                conn.query_drop(format!("SET CATALOG {catalog}"))?;
-                conn.query_drop("USE ns")?;
-                conn.query_drop(format!("REFRESH MATERIALIZED VIEW {mv}"))?;
-                Ok(())
-            })
-            .map_err(|error| format!("{error:#}"));
-        sender
-            .send(result)
-            .map_err(|error| anyhow::anyhow!("MV refresh result owner closed: {error}"))
+        match sender.send(operation()) {
+            Ok(()) => Ok(()),
+            Err(mpsc::SendError(Err(primary))) => {
+                Err(primary.context("MV SQL result owner closed before delivery"))
+            }
+            Err(mpsc::SendError(Ok(()))) => {
+                bail!("MV SQL result owner closed before delivery")
+            }
+        }
     });
     JoinedSqlResult {
         result: receiver,
@@ -2707,7 +3035,7 @@ fn expect_refresh_failure(
     context.action(action);
     let timeout = context.remaining(action)?;
     match receiver.recv_timeout(timeout) {
-        Ok(Err(error)) if !error.is_empty() => Ok(()),
+        Ok(Err(error)) if !error.to_string().is_empty() => Ok(()),
         Ok(Err(_)) => bail!("{action} returned an empty error"),
         Ok(Ok(())) => bail!("{action} unexpectedly succeeded"),
         Err(error) => bail!("{action} did not finish before deadline: {error}"),
@@ -2880,6 +3208,160 @@ mod control_plan_tests {
         assert_backends_ordinary(&value);
     }
 
+    fn scheduler_expected_receipt() -> novarocks_failpoint::target_binding::RoleProcessReceipt {
+        novarocks_failpoint::target_binding::RoleProcessReceipt {
+            schema_version: 1,
+            session_id: "original-session".into(),
+            launch_id: "original-launch".into(),
+            role: novarocks_failpoint::session::SessionRole::Fe,
+            process_id: "019be123-4567-7abc-8def-0123456789ab".into(),
+        }
+    }
+    fn scheduler_outcome_record() -> serde_json::Value {
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, domain,
+        };
+        let fact = FailureFact::new(
+            FailureClass::Unsupported,
+            FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(1).unwrap()),
+        );
+        scheduler_outcome_record_for_fact(fact)
+    }
+    fn scheduler_outcome_record_for_fact(
+        fact: novarocks_execution_contract::failure::FailureFact,
+    ) -> serde_json::Value {
+        use prost::Message;
+        let source = json!({"mv_id":7,"target":"actual target","target_object":"actual object digest",
+            "definition_revision":vec![1u8;32],"interpretation_revision":vec![2u8;32],"configuration_revision":vec![3u8;32],
+            "publication_revision":null,"metadata_version":"actual metadata revision","publication_output_version":"None",
+            "deployment_owner":"owner","process_incarnation":"incarnation"});
+        json!({"schema_version":1,"semantic_scope":"scheduler-request-outcome","decision":"Blocked",
+            "grant_id":"outcome-a","session_id":"original-session","launch_id":"original-launch","process":scheduler_expected_receipt().process_id,
+            "target":{"catalog":"system_mv_scheduler","namespace":"ns","mv":"orders_mv_a"},
+            "first_admitted_source":source,"blocked_request_source":source,"admission_observation_sequence":2,
+            "failure_identity":"Source", "failure_fact":novarocks_task_codec::status::encode_failure_fact(fact).encode_to_vec(),
+            "public_message":novarocks_query_application::execution_error::ExecutionFailureInput::new(fact,
+                novarocks_execution_contract::SafeDetail::truncating("MV scheduler request blocked; source diagnostic retained in FE role logs"),
+                novarocks_query_application::execution_error::ExecutionFailureSite::Coordinator).user_error().to_string(),
+            "actual_publication_attempt":"NOT_OBSERVED","actual_task_attempt":"NOT_OBSERVED","actual_base_snapshots":"NOT_OBSERVED"})
+    }
+    #[test]
+    fn scheduler_late_peek_preserves_typed_blocked_error_and_read_does_not_mutate() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            check_scheduler_outcome(
+                dir.path(),
+                "outcome-a",
+                "orders_mv_a",
+                &scheduler_expected_receipt()
+            )
+            .is_ok()
+        );
+        let bytes = serde_json::to_vec(&scheduler_outcome_record()).unwrap();
+        let path = dir.path().join("scheduler-outcome.json");
+        fs::write(&path, &bytes).unwrap();
+        for _ in 0..2 {
+            let error = check_scheduler_outcome(
+                dir.path(),
+                "outcome-a",
+                "orders_mv_a",
+                &scheduler_expected_receipt(),
+            )
+            .unwrap_err();
+            let blocked = error.downcast_ref::<SchedulerRequestBlocked>().unwrap();
+            assert_eq!(
+                blocked.fact.class(),
+                novarocks_execution_contract::failure::FailureClass::Unsupported
+            );
+        }
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        use novarocks_execution_contract::failure::{
+            FailureClass, FailureFact, FailureReason, domain,
+        };
+        let invariant = FailureFact::new(
+            FailureClass::Invariant,
+            FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(9).unwrap()),
+        );
+        let second = tempfile::tempdir().unwrap();
+        let record = scheduler_outcome_record_for_fact(invariant);
+        fs::write(
+            second.path().join("scheduler-outcome.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let error = check_scheduler_outcome(
+            second.path(),
+            "outcome-a",
+            "orders_mv_a",
+            &scheduler_expected_receipt(),
+        )
+        .unwrap_err();
+        let blocked = error.downcast_ref::<SchedulerRequestBlocked>().unwrap();
+        assert_eq!(blocked.fact, invariant);
+        assert_eq!(
+            blocked.public_message,
+            record["public_message"].as_str().unwrap()
+        );
+        assert!(!blocked.public_message.contains("UnsupportedCompiledShape"));
+    }
+    #[test]
+    fn scheduler_unknown_corruption_foreign_target_and_rebinding_are_not_typed_refusals() {
+        for variant in 0..12 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut record = scheduler_outcome_record();
+            match variant {
+                0 => record["failure_fact"] = serde_json::Value::Null,
+                1 => record["target"]["mv"] = json!("other"),
+                2 => {
+                    record["blocked_request_source"]["configuration_revision"] =
+                        json!(vec![9u8; 32])
+                }
+                3 => record["failure_fact"] = json!(vec![255u8]),
+                4 => record["actual_task_attempt"] = json!("invented"),
+                5 => record["session_id"] = json!("another-session"),
+                6 => record["launch_id"] = json!("another-launch"),
+                7 => record["process"] = json!("019be123-4567-7abc-8def-0123456789ac"),
+                8 => {
+                    record["public_message"] = json!("[UnsupportedCompiledShape] forged diagnostic")
+                }
+                9 => record["extra"] = json!("x".repeat(65537)),
+                10 => {
+                    use novarocks_execution_contract::failure::{
+                        FailureClass, FailureFact, FailureReason, domain,
+                    };
+                    use prost::Message;
+                    let invariant = FailureFact::new(
+                        FailureClass::Invariant,
+                        FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(9).unwrap()),
+                    );
+                    record["failure_fact"] = json!(
+                        novarocks_task_codec::status::encode_failure_fact(invariant)
+                            .encode_to_vec()
+                    );
+                    // Keep the old Unsupported display: its fact is now Invariant.
+                }
+                11 => {
+                    record["public_message"] =
+                        json!("[query.execution.invariant] forged diagnostic")
+                }
+                _ => unreachable!(),
+            }
+            fs::write(
+                dir.path().join("scheduler-outcome.json"),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+            let error = check_scheduler_outcome(
+                dir.path(),
+                "outcome-a",
+                "orders_mv_a",
+                &scheduler_expected_receipt(),
+            )
+            .unwrap_err();
+            assert!(error.downcast_ref::<SchedulerRequestBlocked>().is_none());
+        }
+    }
+
     #[test]
     fn scheduler_successor_only_receives_its_remaining_transient_action() {
         let input = PlanInputs::new();
@@ -2888,9 +3370,19 @@ mod control_plan_tests {
         assert_eq!(launches.len(), 2);
         assert_eq!(
             actions(launches[0]),
-            ["scheduler-hold", "scheduler-hold", "scheduler-hold"]
+            [
+                "scheduler-outcome",
+                "scheduler-outcome",
+                "scheduler-outcome",
+                "scheduler-hold",
+                "scheduler-hold",
+                "scheduler-hold"
+            ]
         );
-        assert_eq!(actions(launches[1]), ["transient-preparation"]);
+        assert_eq!(
+            actions(launches[1]),
+            ["scheduler-outcome", "transient-preparation"]
+        );
         assert_backends_ordinary(&value);
     }
 
@@ -2986,5 +3478,175 @@ mod control_plan_tests {
                 .to_string()
                 .contains("binary is missing")
         );
+    }
+}
+
+#[cfg(test)]
+mod refresh_marker_tests {
+    use super::*;
+
+    fn query_failure() -> anyhow::Error {
+        anyhow::Error::from(::mysql::Error::MySqlError(::mysql::MySqlError {
+            code: 1146,
+            state: "42S02".into(),
+            message: "original refresh SQL failed".into(),
+        }))
+        .context("execute original refresh")
+    }
+
+    fn assert_original_mysql_error(error: &anyhow::Error) {
+        let Some(::mysql::Error::MySqlError(actual)) = error.downcast_ref::<::mysql::Error>()
+        else {
+            panic!("original typed MySQL error missing: {error:#}");
+        };
+        assert_eq!(actual.code, 1146);
+        assert_eq!(actual.state, "42S02");
+        assert_eq!(actual.message, "original refresh SQL failed");
+    }
+
+    #[test]
+    fn pre_marker_failure_preserves_original_mysql_code_and_state() {
+        let producer = spawn_sql_actor(|| Err(query_failure()));
+        producer.join().unwrap();
+        let error = producer.observe_required_marker(|| Ok(false)).unwrap_err();
+        assert_original_mysql_error(&error);
+    }
+
+    #[test]
+    fn pre_marker_connection_failure_is_published_before_any_sql() {
+        let producer = spawn_sql_actor(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "original connect",
+            ))
+            .context("connect original refresh actor")
+        });
+        producer.join().unwrap();
+        let error = producer.observe_required_marker(|| Ok(false)).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
+    }
+
+    #[test]
+    fn successful_producer_without_required_marker_fails_instead_of_waiting() {
+        let producer = spawn_sql_actor(|| Ok(()));
+        producer.join().unwrap();
+        assert!(producer.observe_required_marker(|| Ok(false)).is_err());
+    }
+
+    #[test]
+    fn satisfied_marker_does_not_consume_successful_producer_result() {
+        let producer = spawn_sql_actor(|| Ok(()));
+        producer.join().unwrap();
+        assert!(producer.observe_required_marker(|| Ok(true)).unwrap());
+        producer.recv_timeout(Duration::ZERO).unwrap().unwrap();
+    }
+
+    #[test]
+    fn satisfied_marker_keeps_later_post_crash_failure_assertion_owned() {
+        let producer = spawn_sql_actor(|| Err(query_failure()));
+        producer.join().unwrap();
+        assert!(producer.observe_required_marker(|| Ok(true)).unwrap());
+        let error = producer.recv_timeout(Duration::ZERO).unwrap().unwrap_err();
+        assert_original_mysql_error(&error);
+    }
+
+    #[test]
+    fn in_flight_producer_waits_without_consuming_its_future_result() {
+        let (release, held) = mpsc::sync_channel(1);
+        let producer = spawn_sql_actor(move || {
+            held.recv().context("release held original SQL actor")?;
+            Ok(())
+        });
+        assert!(!producer.observe_required_marker(|| Ok(false)).unwrap());
+        release.send(()).unwrap();
+        producer.join().unwrap();
+        assert!(producer.observe_required_marker(|| Ok(true)).unwrap());
+        producer.recv_timeout(Duration::ZERO).unwrap().unwrap();
+    }
+
+    #[test]
+    fn marker_published_during_producer_completion_is_not_missing() {
+        let producer = spawn_sql_actor(|| Ok(()));
+        producer.join().unwrap();
+        let mut reads = 0;
+        assert!(
+            producer
+                .observe_required_marker(|| {
+                    reads += 1;
+                    Ok(reads == 2)
+                })
+                .unwrap()
+        );
+        assert_eq!(reads, 2);
+        producer.recv_timeout(Duration::ZERO).unwrap().unwrap();
+    }
+
+    #[test]
+    fn closed_receiver_keeps_original_mysql_error_in_producer_join() {
+        let (release, held) = mpsc::sync_channel(1);
+        let mut producer = spawn_sql_actor(move || {
+            held.recv().context("release original producer")?;
+            Err(query_failure())
+        });
+        let (replacement_sender, replacement_receiver) = mpsc::sync_channel(1);
+        drop(replacement_sender);
+        drop(std::mem::replace(
+            &mut producer.result,
+            replacement_receiver,
+        ));
+        release.send(()).unwrap();
+        let error = producer.join().unwrap_err();
+        assert_original_mysql_error(&error);
+    }
+
+    #[test]
+    fn finished_producer_with_empty_result_owner_does_not_wait_for_marker() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        // Keep a foreign sender alive so this is Empty, not Disconnected. The
+        // owned producer has already exited without delivering its result.
+        let actor = thread::spawn(|| Ok(()));
+        while !actor.is_finished() {
+            thread::yield_now();
+        }
+        let producer = JoinedSqlResult {
+            result: receiver,
+            actor: Mutex::new(Some(actor)),
+        };
+        let error = producer.observe_required_marker(|| Ok(false)).unwrap_err();
+        assert!(format!("{error:#}").contains("exited without publishing its result"));
+        assert!(producer.actor.lock().unwrap().is_none());
+        drop(sender);
+    }
+
+    #[test]
+    fn disconnected_producer_without_result_is_not_a_marker_wait() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(sender);
+        let producer = JoinedSqlResult {
+            result: receiver,
+            actor: Mutex::new(None),
+        };
+        assert!(producer.observe_required_marker(|| Ok(false)).is_err());
+    }
+
+    #[test]
+    fn panicked_producer_is_reported_before_marker_deadline() {
+        let producer = spawn_sql_actor(|| panic!("original SQL actor panic"));
+        // Wait for the real thread to exit without consuming its join result.
+        while !producer
+            .actor
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_finished()
+        {
+            thread::yield_now();
+        }
+        let error = producer.observe_required_marker(|| Ok(false)).unwrap_err();
+        assert!(format!("{error:#}").contains("original MV SQL actor panicked"));
     }
 }

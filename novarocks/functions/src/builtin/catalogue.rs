@@ -3492,6 +3492,7 @@ pub(super) fn scalar_definition_parts(
                         Some(super::bitwise_owner::effects())
                     }
                     "rand" | "random" => Some(super::rand_owner::effects()),
+                    "sleep" => Some(super::sleep_owner::effects()),
                     name if super::numeric_elementary_owner::is_installed(name) => {
                         Some(super::numeric_elementary_owner::effects())
                     }
@@ -3852,6 +3853,7 @@ pub fn contribute_builtin_functions(
                 super::bitwise_owner::definition(name, declaration, resolver)?
             }
             "rand" | "random" => super::rand_owner::definition(&name, declaration, resolver)?,
+            "sleep" => super::sleep_owner::definition(declaration, resolver)?,
             name if super::numeric_elementary_owner::is_installed(name) => {
                 super::numeric_elementary_owner::definition(name, declaration, resolver)?
             }

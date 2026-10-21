@@ -50,6 +50,7 @@ NEUTRAL_INTERNAL_PACKAGES = frozenset(
         "novarocks-secret",
         "novarocks-type-contract",
         "novarocks-result-contract",
+        "novarocks-failure-contract",
     }
 )
 

@@ -123,4 +123,173 @@ for name in decimal iceberg-mv-scheduler mv-rewrite runtime-filter-distributed s
   grep -Fx "$name" <<<"$defaults" >/dev/null
 done
 
+# Collection uses the ordinary dev classification view; quarantine is not a
+# dev/full PASS and a direct unregistered refusal remains a raw failure.
+python3 - "$test_root" <<'QUARANTINE'
+import json,sys
+from pathlib import Path
+root=Path(sys.argv[1]); value=json.loads((root/'empty.json').read_text())
+value['quarantine']=[{'unit':'sql-case:s/a','reason':'fixture capability','owner':'fixture owner','exit_condition':'restore capability','review_by':'9999-12-31'}]
+(root/'quarantine.json').write_text(json.dumps(value))
+QUARANTINE
+CI_COLLECT_ALL=true
+check fail quarantine FAIL 1
+python3 - "$test_root/fail.classification.json" <<'NO_EXCLUSION'
+import json,sys
+value=json.load(open(sys.argv[1]));assert value['membership']=={'layer':'dev','excluded':{}}
+assert value['rows'][0]['status']=='NEW_FAILURE'
+NO_EXCLUSION
+CI_COLLECT_ALL=false
+
+# Native batch fixtures exercise the shell continuation decision without Cargo.
+python3 - "$SCRIPT_DIR" "$test_root/batch" <<'RUST_FIXTURE'
+import importlib.util,shutil,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('collection_fixture',Path(sys.argv[1])/'tests/verification-collection-test.py')
+module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+case=module.Collection();fixture=case.rust(True)
+shutil.copytree(fixture.root,Path(sys.argv[2])/'rust')
+case.doCleanups()
+RUST_FIXTURE
+CI_RUN_DIR="$test_root/batch"; CI_SUMMARY="$CI_RUN_DIR/summary.md"
+ci_init_summary_state
+ci_invocation_start() { printf '%s\n' "$CI_RUN_DIR/raw.started.json"; }
+ci_invocation_finish() { return 0; }
+python3() {
+  if [ "${1:-}" = tools/ci/test-run.py ] && [ "${2:-}" = batch ]; then return 1; fi
+  command python3 "$@"
+}
+code=0; run_rust_batch_stage >/dev/null || code=$?
+[ "$code" = 1 ]
+CI_COLLECT_ALL=true; CI_COLLECTION_RESULT=0
+code=0; run_rust_batch_stage >/dev/null || code=$?
+[ "$code" = 0 ] && [ "$CI_COLLECTION_RESULT" = 1 ]
+grep -q '^wrapper_exit=1$' "$CI_RUN_DIR/rust-batch.log"
+[[ "$CI_STAGE_ROWS" == *'| workspace nextest and doctests | FAIL |'* ]]
+[[ "$CI_STAGE_ROWS" != *'| workspace nextest and doctests | PASS |'* ]]
+# An all-failure batch is still unsafe if its cleanup record is missing.
+rm "$CI_RUN_DIR/rust/doctest-run/cleanup-summary.json"
+code=0; run_rust_batch_stage >/dev/null || code=$?
+[ "$code" = 1 ]
+unset -f python3
+
+# Collection refuses partial-membership and skip modes before execution.
+for option in '--skip-cargo-test' '--skip-system-scenarios' '--suite s' '--tier smoke' '--cargo-only'; do
+  code=0
+  (parse_args --collect-all $option) >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ]
+done
+# All original stages pass, but only actual EXIT finalization may publish PASS.
+# Each failure uses the real cleanup function with bounded local owner fakes.
+cleanup_root="$test_root/cleanup-runtime"
+mkdir -p "$cleanup_root/docker/iceberg-rest"
+cat >"$cleanup_root/docker/iceberg-rest/down.sh" <<'RUNTIME'
+#!/usr/bin/env bash
+[ "$*" = '--runtime-only --purge' ] || exit 91
+exit "${FAKE_RUNTIME_EXIT:-0}"
+RUNTIME
+chmod +x "$cleanup_root/docker/iceberg-rest/down.sh"
+ci_stop_all_in_one_server() { return "${FAKE_STOP_EXIT:-0}"; }
+python3() {
+  if [[ "${1:-}" == */identity_snapshot.py ]] && [ "${2:-}" = source ]; then
+    return "${FAKE_SOURCE_EXIT:-0}"
+  fi
+  if [ "${FAKE_COLLECTION_WRITE_FAILURE:-false}" = true ] && [ "${1:-}" = - ] &&
+     [[ "${2:-}" == */collection.json ]]; then return 13; fi
+  command python3 "$@"
+}
+for mode in default collect-all; do
+  for failure in success stop runtime source incomplete early-failure; do
+    CI_RUN_DIR="$test_root/cleanup-$mode-$failure"; mkdir -p "$CI_RUN_DIR"
+    CI_SUMMARY="$CI_RUN_DIR/summary.md"
+    ci_init_summary_state
+    CI_COLLECT_ALL=false; [ "$mode" != collect-all ] || CI_COLLECT_ALL=true
+    CI_COLLECTION_REACHED_END=true; CI_RUN_REACHED_END=true; CI_COLLECTION_RESULT=0
+    CI_RUNTIME_PREPARED=true; KEEP_RUNTIME=false
+    ci_record_stage "all original stages" "PASS" "0" ""
+    ci_render_summary "PASS"
+    export FAKE_STOP_EXIT=0 FAKE_RUNTIME_EXIT=0 FAKE_SOURCE_EXIT=0 FAKE_COLLECTION_WRITE_FAILURE=false
+    expected=0; entry=0
+    case "$failure" in
+      stop) FAKE_STOP_EXIT=7; expected=1 ;;
+      runtime) FAKE_RUNTIME_EXIT=9; expected=1 ;;
+      source) FAKE_SOURCE_EXIT=11; expected=1 ;;
+      incomplete) CI_RUN_REACHED_END=false; expected=1 ;;
+      early-failure) CI_RUN_REACHED_END=false; entry=23; expected=23 ;;
+    esac
+    ci_fake_entry_status() { return "$entry"; }
+    code=0
+    (cd "$cleanup_root" && ci_fake_entry_status; cleanup) >"$CI_RUN_DIR/finalization.log" 2>&1 || code=$?
+    [ "$code" = "$expected" ]
+    status=PASS; [ "$expected" = 0 ] || status=FAIL
+    grep -Fx -- "- Status: $status" "$CI_SUMMARY" >/dev/null
+    grep -Fx "$status: $CI_SUMMARY" "$CI_RUN_DIR/finalization.log" >/dev/null
+    if [ "$status" = FAIL ]; then ! grep -Fx "PASS: $CI_SUMMARY" "$CI_RUN_DIR/finalization.log" >/dev/null; fi
+    if [ "$mode" = default ]; then
+      [ ! -f "$CI_RUN_DIR/collection.json" ]
+    else
+      command python3 - "$CI_RUN_DIR/collection.json" "$failure" "$expected" <<'CLEANUP'
+import json,sys
+value=json.load(open(sys.argv[1]));failure=sys.argv[2];code=int(sys.argv[3])
+assert value['collection_complete']==(code==0)
+assert value['exit_handler_status']==code
+assert value['run_reached_end']==(failure not in ('incomplete','early-failure'))
+assert value['cleanup']['server_stop_exit']==(7 if failure=='stop' else 0)
+assert value['cleanup']['runtime_cleanup_exit']==(9 if failure=='runtime' else 0)
+assert value['cleanup']['source_end_exit']==(11 if failure=='source' else 0)
+assert value['cleanup']['runtime_cleanup_attempted'] is True
+assert value['summary_write_exit']==0
+assert value['invocation_exit']=='caller-must-observe'
+CLEANUP
+    fi
+    grep -F "| run terminal and cleanup facts (source=$FAKE_SOURCE_EXIT stop=$FAKE_STOP_EXIT runtime=$FAKE_RUNTIME_EXIT) | $status |" "$CI_SUMMARY" >/dev/null
+  done
+done
+# Failing the extra collector record is not a successful invocation either.
+CI_RUN_DIR="$test_root/cleanup-record-failure"; mkdir -p "$CI_RUN_DIR"
+CI_SUMMARY="$CI_RUN_DIR/summary.md"; ci_init_summary_state
+CI_COLLECT_ALL=true; CI_COLLECTION_REACHED_END=true; CI_RUN_REACHED_END=true
+export FAKE_SOURCE_EXIT=0 FAKE_STOP_EXIT=0 FAKE_RUNTIME_EXIT=0 FAKE_COLLECTION_WRITE_FAILURE=true
+code=0; (cd "$cleanup_root" && cleanup) >"$CI_RUN_DIR/finalization.log" 2>&1 || code=$?
+[ "$code" = 1 ] && [ ! -f "$CI_RUN_DIR/collection.json" ]
+grep -Fx -- '- Status: FAIL' "$CI_SUMMARY" >/dev/null
+grep -F '| collection record persistence | FAIL |' "$CI_SUMMARY" >/dev/null
+# A failed source-start/init returns its original code before any fixture or
+# Cargo stage. The installed EXIT trap can render the initialized state as FAIL.
+init_failure_marker="$test_root/unexpected-init-fixture"
+code=0
+(
+  CI_COLLECT_ALL=false; CI_FROM_RUN_DIR=""; CARGO_ONLY=false
+  CI_RUN_REACHED_END=false; CI_RUNTIME_PREPARED=false
+  export FAKE_SOURCE_EXIT=0 FAKE_STOP_EXIT=0 FAKE_RUNTIME_EXIT=0 FAKE_COLLECTION_WRITE_FAILURE=false
+  init_run_dir() {
+    CI_RUN_DIR="$test_root/init-failure"; mkdir -p "$CI_RUN_DIR"
+    CI_SUMMARY="$CI_RUN_DIR/summary.md"; ci_init_summary_state
+    ci_render_summary "RUNNING"
+    return 17
+  }
+  prepare_runtime() { printf 'unexpected fixture\n' >"$init_failure_marker"; exit 72; }
+  main
+) >"$test_root/init-failure.log" 2>&1 || code=$?
+[ "$code" = 17 ] && [ ! -f "$init_failure_marker" ]
+grep -Fx -- '- Status: FAIL' "$test_root/init-failure/summary.md" >/dev/null
+! grep -Fx "PASS: $test_root/init-failure/summary.md" "$test_root/init-failure.log" >/dev/null
+# Read-only / stage-description dispatch never installs the normal-run cleanup
+# trap or starts a fixture, including --from's existing SQL-only classifier.
+readonly_marker="$test_root/unexpected-readonly-cleanup"
+for operation in from list; do
+  code=0
+  (
+    CI_COLLECT_ALL=false; CI_FROM_RUN_DIR=""; CARGO_ONLY=false
+    DISPOSITIONS_FILE="$test_root/empty.json"
+    cleanup() { printf 'unexpected cleanup\n' >"$readonly_marker"; exit 71; }
+    prepare_runtime() { printf 'unexpected fixture\n' >"$readonly_marker"; exit 72; }
+    if [ "$operation" = from ]; then main --from "$test_root/reclassify"; else main --list-stages; fi
+  ) >"$test_root/readonly-$operation.log" 2>&1 || code=$?
+  [ "$code" = 0 ] && [ ! -f "$readonly_marker" ]
+done
+
+unset -f python3
+unset FAKE_SOURCE_EXIT FAKE_STOP_EXIT FAKE_RUNTIME_EXIT FAKE_COLLECTION_WRITE_FAILURE
+
 echo 'local-full-ci-classification-test: PASS'

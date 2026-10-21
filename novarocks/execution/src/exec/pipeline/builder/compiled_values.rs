@@ -377,24 +377,45 @@ fn materialize(
         let mut opaque = |bytes| owner.observe_opaque_upper_bound(bytes);
         let mut creation = ValueSchemaCreation::new(storage.clone(), &mut request, &mut opaque);
         work.flush()?;
-        selected_copy::preflight_interleave_construction(
-            field.data_type(),
-            &sources,
-            &choices,
-            &mut creation,
-            control,
-        )
-        .map_err(copy_failure)?;
-        let mut borrowed: Vec<&dyn Array> = reserve(sources.len(), owner.as_ref(), &mut work)?;
-        for source in &sources {
-            borrowed.push(source.as_ref());
-            work.step()?;
-        }
-        work.flush()?;
-        let column = interleave(&borrowed, &choices).map_err(|source| {
-            ExecutionFailure::from_domain(ValuesConstructionFailure::Column { ordinal, source })
-        })?;
-        work.flush()?;
+        let column =
+            match selected_copy::values_copy_kind_observed(field.data_type(), || work.step())
+                .map_err(|cause| copy_failure(cause.into()))?
+            {
+                selected_copy::ValuesCopyKind::Interleave => {
+                    selected_copy::preflight_interleave_construction(
+                        field.data_type(),
+                        &sources,
+                        &choices,
+                        &mut creation,
+                        control,
+                    )
+                    .map_err(copy_failure)?;
+                    let mut borrowed: Vec<&dyn Array> =
+                        reserve(sources.len(), owner.as_ref(), &mut work)?;
+                    for source in &sources {
+                        borrowed.push(source.as_ref());
+                        work.step()?;
+                    }
+                    work.flush()?;
+                    let column = interleave(&borrowed, &choices).map_err(|error| {
+                        ExecutionFailure::from_domain(ValuesConstructionFailure::Column {
+                            ordinal,
+                            source: error,
+                        })
+                    })?;
+                    work.flush()?;
+                    column
+                }
+                selected_copy::ValuesCopyKind::Extend => {
+                    selected_copy::copy_nested_values_construction(
+                        &sources,
+                        &choices,
+                        &mut creation,
+                        control,
+                    )
+                    .map_err(copy_failure)?
+                }
+            };
         columns.push(column);
     }
     work.flush()?;

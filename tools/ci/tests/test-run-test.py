@@ -41,6 +41,21 @@ run = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(run)
 
 
+def exit_controlling_shell(terminal):
+    # Every case has a fresh shell with exactly one owned job. Reconcile that
+    # job through Bash before exit: a wrapper receipt does not reap its owner.
+    # Keep the normal stopped-job warning and the original bounded shell wait.
+    os.write(terminal, b"fg %1\nexit\n")
+
+
+def retain_pty_observation(case, trace, shell, terminal, waited):
+    case.mkdir(parents=True, exist_ok=True)
+    (case / "pty-trace.raw").write_bytes(trace)
+    (case / "pty-parent.json").write_text(json.dumps(dict(
+        shell_pid=shell, terminal_open=terminal >= 0, shell_reaped=waited),
+        indent=2) + "\n")
+
+
 class Materials(unittest.TestCase):
     def setUp(self):
         (REPO / "target").mkdir(exist_ok=True)
@@ -61,6 +76,72 @@ class Materials(unittest.TestCase):
                         target.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(source, target)
         self.temporary.cleanup()
+
+
+    def test_controlling_shell_reaps_its_stopped_owner_after_wrapper_exit(self):
+        case = self.root / "stopped-owner-after-wrapper-exit"
+        case.mkdir()
+        owner = case / "owner.py"
+        owner.write_text("import json,os,signal,sys\nfrom pathlib import Path\n"
+            "root=Path(sys.argv[1])\n"
+            "signals=[getattr(signal,n) for n in ('SIGINT','SIGQUIT','SIGHUP','SIGTERM','SIGTSTP','SIGTTIN','SIGTTOU')]\n"
+            "for number in signals: signal.signal(number,signal.SIG_IGN)\n"
+            "pid=os.posix_spawn(sys.executable,[sys.executable,'-c','pass'],os.environ,setsigdef=signals,setsigmask=())\n"
+            "child,status=os.waitpid(pid,0)\n"
+            "(root/'actual-wrapper-exit.json').write_text(json.dumps(dict(pid=pid,wait_status=status)))\n"
+            "os.kill(os.getpid(),signal.SIGSTOP)\n"
+            "(root/'owner-continued.json').write_text(json.dumps(dict(pid=os.getpid())))\n")
+        shell, terminal = pty.fork()
+        if shell == 0:
+            os.execl("/bin/bash", "bash", "--noprofile", "--norc", "-i")
+        trace = bytearray()
+        waited = False
+        def turn():
+            readable, _, _ = select.select([terminal], [], [], 0.02)
+            if readable:
+                try:
+                    trace.extend(os.read(terminal, 65536))
+                except OSError:
+                    pass
+        try:
+            command = " ".join(shlex.quote(value) for value in [sys.executable, str(owner), str(case)])
+            os.write(terminal, (command + "\n").encode())
+            receipt = case / "actual-wrapper-exit.json"
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                if receipt.is_file() and b"Stopped" in trace:
+                    break
+                turn()
+            self.assertTrue(receipt.is_file(), trace.decode(errors="replace"))
+            self.assertIn(b"Stopped", trace)
+            actual = json.loads(receipt.read_text())
+            self.assertTrue(os.WIFEXITED(actual["wait_status"]))
+            self.assertEqual(os.WEXITSTATUS(actual["wait_status"]), 0)
+            self.assertFalse((case / "owner-continued.json").exists())
+            exit_controlling_shell(terminal)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                child, status = os.waitpid(shell, os.WNOHANG)
+                if child:
+                    waited = True
+                    break
+                turn()
+            self.assertTrue(waited, "controlling shell did not reap its stopped job: " + trace.decode(errors="replace")[-3000:])
+            self.assertTrue(os.WIFEXITED(status))
+            self.assertEqual(os.WEXITSTATUS(status), 0)
+            self.assertTrue((case / "owner-continued.json").is_file())
+        finally:
+            try:
+                retain_pty_observation(case, trace, shell, terminal, waited)
+            finally:
+                if not waited:
+                    try:
+                        os.write(terminal, b"kill -TERM %1; kill -CONT %1; wait; exit\n")
+                        os.kill(shell, signal.SIGHUP)
+                    except (OSError, ProcessLookupError):
+                        pass
+                    os.waitpid(shell, 0)
+                os.close(terminal)
 
     def context(self, name="run"):
         root = self.root / name
@@ -184,6 +265,82 @@ class Materials(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result["registration_closed"])
         self.assertFalse((root / "Closed").exists())
+
+    def test_normal_domain_exit_keeps_cleanup_deadline_local_to_each_domain(self):
+        for first_exit in (0, 1):
+            with self.subTest(first_exit=first_exit):
+                executor = run.Executor()
+                clock = [1000.0]
+                with mock.patch.object(run.time, "monotonic", side_effect=lambda: clock[0]):
+                    first, first_cleanup, first_deadline = run.execute_domain(
+                        executor, self.root / ("first-" + str(first_exit)),
+                        [sys.executable, "-c", "raise SystemExit(" + str(first_exit) + ")"],
+                        "process", os.environ.copy())
+                    # This independent domain starts after the previous cleanup
+                    # budget expired. No real signal or control failure occurred.
+                    clock[0] = first_deadline + 1
+                    second, second_cleanup, second_deadline = run.execute_domain(
+                        executor, self.root / ("second-" + str(first_exit)),
+                        [sys.executable, "-c", "raise SystemExit(0)"],
+                        "process", os.environ.copy())
+                self.assertEqual(first["returncode"], first_exit)
+                self.assertEqual(first["errors"], [])
+                self.assertTrue(first_cleanup["ok"])
+                self.assertEqual(first_deadline, 1030.0)
+                self.assertEqual(second["returncode"], 0)
+                self.assertEqual(second["errors"], [])
+                self.assertEqual(second["cancelled"], [])
+                self.assertTrue(second_cleanup["ok"])
+                self.assertEqual(second_deadline, 1061.0)
+                self.assertIsNone(executor.deadline)
+
+    def test_real_cancellation_budget_is_not_renewed_by_exit_or_idle_signal(self):
+        executor = run.Executor()
+        clock = [1000.0]
+        executor.signals.append(signal.SIGTERM)
+        with mock.patch.object(run.time, "monotonic", side_effect=lambda: clock[0]):
+            result, collected, deadline = run.execute_domain(
+                executor, self.root / "real-cancel",
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                "process", os.environ.copy())
+            self.assertEqual(result["returncode"], -signal.SIGTERM)
+            self.assertEqual(result["cancelled"], [signal.SIGTERM])
+            self.assertEqual(deadline, 1030.0)
+            self.assertTrue(collected["ok"])
+            clock[0] = 1015.0
+            executor.signals.append(signal.SIGINT)
+            executor.observe_idle()
+        self.assertEqual(executor.deadline, 1030.0)
+        self.assertEqual(executor.cancelled, [signal.SIGTERM, signal.SIGINT])
+
+    def test_cancel_queued_with_actual_child_exit_still_pins_the_original_budget(self):
+        for original_deadline in (None, 1010.0):
+            with self.subTest(original_deadline=original_deadline):
+                executor = run.Executor()
+                executor.deadline = original_deadline
+                real_waitpid = os.waitpid
+                injected = []
+                def waitpid(pid, options):
+                    child, status = real_waitpid(pid, options)
+                    if child and (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
+                        self.assertFalse(injected)
+                        injected.append(True)
+                        # Model a signal arriving in the same turn as actual
+                        # exit, before Executor's final queued-signal drain.
+                        executor.signals.append(signal.SIGTERM)
+                    return child, status
+                with mock.patch.object(run.time, "monotonic", return_value=1000.0), \
+                        mock.patch.object(run.os, "waitpid", side_effect=waitpid):
+                    result, collected, deadline = run.execute_domain(
+                        executor, self.root / ("exit-cancel-" + str(original_deadline)),
+                        [sys.executable, "-c", "raise SystemExit(0)"],
+                        "process", os.environ.copy())
+                self.assertEqual(result["returncode"], 0)
+                self.assertEqual(result["cancelled"], [signal.SIGTERM])
+                self.assertEqual(executor.cancelled, [signal.SIGTERM])
+                self.assertTrue(collected["ok"])
+                self.assertEqual(deadline, original_deadline or 1030.0)
+                self.assertEqual(executor.deadline, original_deadline or 1030.0)
 
     def test_post_spawn_record_or_display_failure_still_waits_actual_child(self):
         for kind in ("record", "display"):
@@ -801,7 +958,7 @@ while True:
                     else:
                         self.assertEqual(result["cancelled"], [getattr(signal, "SIG" + event.removeprefix("doc-"))])
                     if terminal >= 0:
-                        os.write(terminal, b"exit\n")
+                        exit_controlling_shell(terminal)
                     deadline = time.monotonic() + 5
                     while time.monotonic() < deadline:
                         child, status = os.waitpid(shell, os.WNOHANG)
@@ -811,15 +968,18 @@ while True:
                         turn()
                     self.assertTrue(waited, "controlling shell did not exit")
                 finally:
-                    if not waited:
-                        try:
-                            os.write(terminal, b"kill -TERM %1; kill -CONT %1; wait; exit\n")
-                            os.kill(shell, signal.SIGHUP)
-                        except (OSError, ProcessLookupError):
-                            pass
-                        os.waitpid(shell, 0)
-                    if terminal >= 0:
-                        os.close(terminal)
+                    try:
+                        retain_pty_observation(case, trace, shell, terminal, waited)
+                    finally:
+                        if not waited:
+                            try:
+                                os.write(terminal, b"kill -TERM %1; kill -CONT %1; wait; exit\n")
+                                os.kill(shell, signal.SIGHUP)
+                            except (OSError, ProcessLookupError):
+                                pass
+                            os.waitpid(shell, 0)
+                        if terminal >= 0:
+                            os.close(terminal)
 
 
 if __name__ == "__main__":

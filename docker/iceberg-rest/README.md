@@ -39,6 +39,8 @@ docker/iceberg-rest/up.sh
 
 控制目录默认 `${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/fixture-runtime`，`NOVA_FIXTURE_RUNTIME_DIR` 可覆盖。owner locator 是控制目录加本机 daemon ID；实例的资源命名也包含该所有权命名空间。对象存储与 catalog 分别拥有项目、记录和卷；catalog 使用持久数据库，并连接到其对象存储。MinIO 恢复会重新接入全部仍有记录的 catalog 网络。
 
+共享 `up` 可分别通过 `NOVA_FIXTURE_OBJECT_STORE_TEMPLATE` 和 `NOVA_FIXTURE_CATALOG_TEMPLATE` 指定对象存储与 catalog 的 Compose 模板路径；未覆盖的一侧保留默认模板。模板内容仍进入原 owner 的模型 hash 和资源身份，变化会生成独立实例；此覆盖不改变 isolated 模式。
+
 `shared.env` 是声明输入：凭证、版本、benchmark root 和端口分配范围。`NOVA_ENV_CONFIG_FILE` 可指定其它声明文件；共享模式的服务端口由 owner 在 `NOVA_ENV_RUNTIME_PORT_START..NOVA_ENV_RUNTIME_PORT_END` 分配（默认 `28000..28999`），记录存在时恢复沿用预留。NovaRocks FE/BE listener 仍按 worktree 分配。不要以 `9000/8181/4040` 或旧 Compose 项目代替运行记录。
 
 ## 单一 publication

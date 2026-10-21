@@ -158,18 +158,22 @@ SELECT user_id, COUNT(tag_id) AS c FROM user_tags WHERE user_id = 2 GROUP BY use
 SELECT user_id, COUNT(tag_id) AS c FROM user_tags WHERE user_id > 2 GROUP BY user_id ORDER BY user_id;
 
 -- query 24
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW cnt_mv;
+SET CATALOG mvrw_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.cnt_mv;
 
 -- query 25
+-- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE mvrw_${uuid0}.ns_${uuid0}.user_tags FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.user_tags FORCE;
 
 -- query 26
+-- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
+DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 27
 -- @cleanup=true
 -- @skip_result_check=true
-DROP CATALOG mvrw_${uuid0};
+DROP CATALOG IF EXISTS mvrw_${uuid0};

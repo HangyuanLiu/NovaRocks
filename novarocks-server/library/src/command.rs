@@ -452,6 +452,10 @@ mod tests {
             !excluded.iter().any(|entry| entry["name"] == "rand"),
             "RAND has pure owners"
         );
+        assert!(
+            !excluded.iter().any(|entry| entry["name"] == "sleep"),
+            "SLEEP has a complete controlled-wait pure owner"
+        );
         assert!(excluded.iter().all(|entry| {
             entry["name"].as_str().is_some_and(|name| !name.is_empty())
                 && entry["kind"].as_str().is_some_and(|kind| !kind.is_empty())

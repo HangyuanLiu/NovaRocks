@@ -165,6 +165,7 @@ impl FrontendQueryCompilerError {
             E::ResourceExhausted => {
                 Self::Control(novarocks_type_contract::CompileControlError::ResourceExhausted)
             }
+            E::Source { source } => Self::Source(source.clone()),
             E::Analyze { error } => match error.control_error() {
                 Some(control) => Self::Control(control),
                 None => Self::Analyze(error.clone()),
@@ -1224,6 +1225,66 @@ mod compile_control_tests {
     }
 
     #[test]
+    fn actual_constant_limit_keeps_its_source_through_the_completion_session_consumer() {
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+        use novarocks_query_application::execution_error::ExecutionFailureSite;
+        use novarocks_query_application::preparation::FinalPlanCompletionError;
+        let mut policy = novarocks_plan_codec::physical_package_v2::FROZEN_CONSTANT_POLICY;
+        policy.max_rows = 0;
+        let cause = novarocks_functions::ConstantValue::from_i64(
+            Arc::new(Field::new("value", DataType::Int64, false)),
+            novarocks_functions::FunctionValueType::new(DataType::Int64, false),
+            1,
+            policy,
+            novarocks_type_contract::CompilePhase::Validate,
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            cause,
+            novarocks_functions::ConstantError::Limit(_)
+        ));
+        let expected = cause.failure_fact();
+        assert_eq!(expected.class(), FailureClass::Resource);
+        assert_eq!(expected.reason().domain(), domain::CONSTANT.get());
+        assert_eq!(expected.reason().code(), 2);
+        let compile = SqlCompileError::from(cause);
+        let SqlCompileError::CompilationSource(original) = &compile else {
+            panic!("the constant author must retain its source");
+        };
+        let original = original.clone();
+        let completion = FinalPlanCompletionError::Source {
+            source: original.clone(),
+        };
+        for error in [
+            FrontendQueryCompilerError::from_compile(compile),
+            FrontendQueryCompilerError::from_completion(&completion),
+        ] {
+            assert!(
+                matches!(&error, FrontendQueryCompilerError::Source(source) if source == &original)
+            );
+            let routed = service(error);
+            let input = routed.execution_failure().unwrap();
+            assert_eq!(input.fact(), expected);
+            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+            assert_eq!(
+                (input.descriptor().errno, input.descriptor().sqlstate),
+                (1041, "HY000")
+            );
+            assert_eq!(
+                routed.compile_control_error(),
+                Some(CompileControlError::Source(original.clone()))
+            );
+            assert_eq!(
+                routed.user_error().unwrap().phase(),
+                novarocks_user_error::ErrorPhase::Execution
+            );
+            assert_eq!(routed.user_error().unwrap().location(), None);
+        }
+    }
+
+    #[test]
     fn real_checked_decimal_overflow_keeps_1690_through_compiler_and_session() {
         use novarocks_failure_contract::FailureProjection;
         let domain = novarocks_functions::legacy_decimal::pow10_i128(39).unwrap_err();
@@ -1369,6 +1430,68 @@ mod compile_control_tests {
             assert_ne!(
                 service.kind(),
                 novarocks_query_application::session_error::QueryServiceErrorKind::Timeout
+            );
+        }
+    }
+    #[test]
+    fn comparison_source_survives_freeze_encode_and_the_actual_session_consumer() {
+        use crate::query_execution::package_freeze::PackageFreezeError;
+        use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+        use novarocks_functions::ComparisonPrepareError;
+        use novarocks_query_application::execution_error::ExecutionFailureSite;
+        use novarocks_sql::compiler::PackageSemanticsError;
+        for (original, class, public_code) in [
+            (
+                ComparisonPrepareError::Unsupported,
+                FailureClass::Unsupported,
+                "UnsupportedCompiledShape",
+            ),
+            (
+                ComparisonPrepareError::TypeMismatch,
+                FailureClass::Invariant,
+                "query.execution.invariant",
+            ),
+        ] {
+            let original_source = SharedFailureCause::new(original.clone());
+            let expected = original_source.failure_fact();
+            assert_eq!(expected.class(), class);
+            let encoded =
+                novarocks_plan_codec::PhysicalEncodeError::from(PackageFreezeError::Semantics(
+                    PackageSemanticsError::Source(original_source.clone()),
+                ));
+            let error = FrontendQueryCompilerError::from_encode(encoded);
+            let FrontendQueryCompilerError::Source(retained) = &error else {
+                panic!("the encoded source must remain typed");
+            };
+            let retained = retained.clone();
+            let Some(novarocks_plan_codec::PhysicalEncodeError::Source(freeze_source)) =
+                retained.downcast_ref::<novarocks_plan_codec::PhysicalEncodeError>()
+            else {
+                panic!("retain the actual physical encode source");
+            };
+            let Some(PackageFreezeError::Semantics(PackageSemanticsError::Source(actual))) =
+                freeze_source.downcast_ref::<PackageFreezeError>()
+            else {
+                panic!("retain the exact comparison source below its wrappers");
+            };
+            assert_eq!(actual, &original_source);
+            assert_eq!(actual.detail(), original_source.detail());
+            assert_eq!(
+                actual.downcast_ref::<ComparisonPrepareError>(),
+                Some(&original)
+            );
+            let service = service(error);
+            let failure = service.execution_failure().unwrap();
+            assert_eq!(failure.fact(), expected);
+            assert_eq!(failure.site(), ExecutionFailureSite::Coordinator);
+            assert_eq!(failure.descriptor().descriptor.code.as_str(), public_code);
+            assert_eq!(
+                service.message(),
+                format!("[{public_code}] pure compilation failed in its source domain")
+            );
+            assert_eq!(
+                service.compile_control_error(),
+                Some(CompileControlError::Source(retained))
             );
         }
     }

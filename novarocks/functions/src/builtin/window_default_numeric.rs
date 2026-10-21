@@ -34,6 +34,19 @@ pub(super) struct NumericDefaultRecipe {
 }
 
 impl NumericDefaultRecipe {
+    /// None keeps the nonnumeric conversion path; Some(false) is the original
+    /// unsupported nominal/nonnullable numeric profile.
+    pub(super) fn profile_supported(
+        source: &FunctionValueType,
+        target: &FunctionValueType,
+    ) -> Option<bool> {
+        (width(source.data_type()).is_some() && width(target.data_type()).is_some()).then(|| {
+            source.logical_type() == ValueLogicalType::Physical
+                && target.logical_type() == ValueLogicalType::Physical
+                && target.nullable()
+        })
+    }
+
     /// The caller owns type validation, the original checkpoint scope and its
     /// ordinary tail. This leaf neither converts nor retains a second FVT.
     pub(super) fn try_new(
@@ -41,14 +54,11 @@ impl NumericDefaultRecipe {
         target: &FunctionValueType,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Option<Self>, KernelFailure> {
-        let numeric = width(source.data_type()).is_some() && width(target.data_type()).is_some();
+        let profile = Self::profile_supported(source, target);
         work.step().map_err(compile_failure)?;
-        if !numeric {
+        let Some(valid) = profile else {
             return Ok(None);
-        }
-        let valid = source.logical_type() == ValueLogicalType::Physical
-            && target.logical_type() == ValueLogicalType::Physical
-            && target.nullable();
+        };
         work.step().map_err(compile_failure)?;
         if !valid {
             return Err(invalid(

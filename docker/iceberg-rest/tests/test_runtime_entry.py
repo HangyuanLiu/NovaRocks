@@ -67,6 +67,35 @@ class RendererCase(unittest.TestCase):
 
 
 class RendererTests(RendererCase):
+    def test_shared_up_overrides_each_template_without_resetting_the_other(self):
+        variables = ('NOVA_FIXTURE_OBJECT_STORE_TEMPLATE', 'NOVA_FIXTURE_CATALOG_TEMPLATE')
+        defaults = {'os': HERE / 'templates/object-store.yml', 'cat': HERE / 'templates/catalog.yml'}
+        custom = {'os': self.root / 'object-store.yml', 'cat': self.root / 'catalog.yml'}
+        for kind, path in custom.items():
+            path.write_text(defaults[kind].read_text() + '\n# Independent template input.\n')
+        for override_os, override_cat in [(False, False), (True, False), (False, True), (True, True)]:
+            with self.subTest(object_store=override_os, catalog=override_cat):
+                self.owner.templates = dict(defaults)
+                environment = {key: value for key, value in os.environ.items() if key not in variables}
+                environment.update(NOVAROCKS_WORKSPACE_ROOT=str(self.workspace),
+                                   NOVA_ENV_CONFIG_FILE=str(HERE / 'shared.env'),
+                                   NOVA_ENV_UPDATE_CURRENT='false')
+                expected = dict(defaults)
+                for kind, variable, enabled in [('os', variables[0], override_os), ('cat', variables[1], override_cat)]:
+                    if enabled:
+                        environment[variable] = str(custom[kind])
+                        expected[kind] = custom[kind].resolve()
+                with mock.patch.dict(os.environ, environment, clear=True), \
+                     mock.patch.object(runtime, 'install_signal_handlers'), \
+                     mock.patch.object(runtime, 'RuntimeOwner', return_value=self.owner), \
+                     mock.patch.object(entry, 'verify_inputs', return_value=bom()), \
+                     mock.patch.object(self.owner, 'bind', return_value={}) as bind, \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(entry.worktree_main(['up']), 0)
+                bind.assert_called_once()
+                self.assertEqual(self.owner.templates, expected)
+                self.assertEqual(bind.call_args.args[1], self.workspace / 'docker/iceberg-rest/runtime' / entry.environment_identity(self.workspace))
+
     def test_complete_publication_uses_final_paths_and_stable_database(self):
         first = self.bind()
         final = Path(first['published_dir'])
@@ -82,11 +111,11 @@ class RendererTests(RendererCase):
         be = tomllib.loads((final / 'be.toml').read_text())
         profile = fe['runtime']['frontend_constant_policy']
         self.assertEqual(profile, {
-            'max_rows': 1048576, 'max_array_nodes': 1048576,
-            'max_logical_elements': 16777216, 'max_retained_buffer_bytes': 1073741824,
-            'max_type_depth': 64, 'max_type_nodes': 4096, 'max_dictionary_depth': 64,
-            'max_metadata_bytes': 1048576, 'max_library_validation_work': 1073741824,
-            'max_library_validation_bytes': 4294967296,
+            'max_rows': 4096, 'max_array_nodes': 4096,
+            'max_logical_elements': 65536, 'max_retained_buffer_bytes': 8388608,
+            'max_type_depth': 64, 'max_type_nodes': 4096, 'max_dictionary_depth': 8,
+            'max_metadata_bytes': 65536, 'max_library_validation_work': 33554432,
+            'max_library_validation_bytes': 33554432,
         })
         self.assertNotIn('frontend_constant_policy', be['runtime'])
         self.assertEqual(fe['runtime']['query_control_task_update_rpc_timeout_ms'], 5000)

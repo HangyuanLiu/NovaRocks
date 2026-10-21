@@ -76,14 +76,14 @@ region = "us-east-1"
 enable_path_style_access = true
 
 [runtime.frontend_constant_policy]
-# Explicit author limits; these are not allocation grants or inferred defaults.
-max_rows = 1048576
-max_array_nodes = 1048576
-max_logical_elements = 16777216
-max_retained_buffer_bytes = 1073741824
+# Frozen compiled-package constant policy (ADR-0185); no deployment override.
+max_rows = 4096
+max_array_nodes = 4096
+max_logical_elements = 65536
+max_retained_buffer_bytes = 8388608
 max_type_depth = 64
 max_type_nodes = 4096
-max_dictionary_depth = 64
-max_metadata_bytes = 1048576
-max_library_validation_work = 1073741824
-max_library_validation_bytes = 4294967296
+max_dictionary_depth = 8
+max_metadata_bytes = 65536
+max_library_validation_work = 33554432
+max_library_validation_bytes = 33554432

@@ -39,9 +39,11 @@ ci_invocation_finish() {
 ci_run_recorded_logged() {
   local log="$1" kind="$2" name="$3" materials="$4"; shift 4
   local record code=0
+  CI_LAST_INVOCATION_RECORD=""
   record="$(ci_invocation_start "$kind" "$name" "$@")" || return $?
   ci_run_logged "$log" "$@" || code=$?
   ci_invocation_finish "$record" "$code" "$log" "$materials" || return $?
+  CI_LAST_INVOCATION_RECORD="${record%.started.json}.json"
   return "$code"
 }
 
@@ -136,8 +138,9 @@ ci_prepare_system_scenario_binaries() {
 # Run every default registered scenario serially, one `--only` invocation each, and
 # record an independent summary row per scenario.
 #
-# Returns non-zero on the first failing scenario. The caller decides how to fail
-# the run; this function never exits the shell itself.
+# Default: return on the first failure. Explicit collection may continue after
+# fully observed, safely cleaned-up native failures; raw results remain unchanged.
+# This function never exits the shell itself.
 ci_run_system_scenarios() {
   local runner="$1"
   local binary="$2"
@@ -148,7 +151,13 @@ ci_run_system_scenarios() {
   local cluster_size="$7"
   local timeout_secs="$8"
   local selection="${9:-}"
-  local primary_binary
+  local primary_binary first_failure=0 collect=false
+  CI_SYSTEM_COLLECTION_COMPLETE=false
+  case "${10:-fail-fast}" in
+    fail-fast) ;;
+    collect-all) collect=true ;;
+    *) echo "error: unknown scenario failure policy" >&2; return 2 ;;
+  esac
 
   local scenarios=()
   local scenario
@@ -261,6 +270,13 @@ INPUTS
     fi
     ci_invocation_finish "$record" "$code" "$log_path" "$scenario_materials" || return $?
     duration=$(($(ci_epoch) - start))
+    local collection_safe=true
+    if [ "$collect" = true ]; then
+      mkdir -p "$CI_RUN_DIR/collection/system"
+      if ! (cd "$CI_INVOCATION_LIBRARY_DIR/.." && python3 -m verification.collection invocation "${record%.started.json}.json" "$code") >"$CI_RUN_DIR/collection/system/$slug.json"; then
+        collection_safe=false
+      fi
+    fi
 
     if [ "$code" -ne 0 ]; then
       ci_record_system_scenario "$scenario" "FAIL" "$duration" "$log_path" "$artifact_dir"
@@ -268,12 +284,20 @@ INPUTS
       # an exact rerun command; preserve that tail verbatim rather than
       # rebuilding a second, weaker failure report here.
       ci_mark_failure_tail "system scenario $scenario failed" "$log_path"
-      return "$code"
+      if [ "$collect" != true ] || [ "$collection_safe" != true ]; then return "$code"; fi
+      [ "$first_failure" -ne 0 ] || first_failure="$code"
+      continue
     fi
 
+    if [ "$collection_safe" != true ]; then
+      ci_record_system_scenario "$scenario" "FAIL" "$duration" "$log_path" "$artifact_dir"
+      ci_mark_failure_tail "system scenario $scenario has incomplete collection facts" "$log_path"
+      return 1
+    fi
     ci_record_system_scenario "$scenario" "PASS" "$duration" "$log_path" "$artifact_dir"
     ci_render_summary "RUNNING"
   done
 
-  return 0
+  CI_SYSTEM_COLLECTION_COMPLETE=true
+  return "$first_failure"
 }

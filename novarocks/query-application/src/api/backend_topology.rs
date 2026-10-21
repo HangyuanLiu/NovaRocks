@@ -62,7 +62,8 @@ pub trait BackendTopologyPort: Send + Sync + 'static {
 pub type BackendTopologyService = Arc<dyn BackendTopologyPort>;
 pub type BeId = u32;
 
-/// Narrow live process-lifecycle evidence source for residual convergence.
+/// Narrow exact process-lifecycle evidence for active pre-ready observation
+/// and residual convergence.
 /// It has no snapshot, placement, or successor-scheduling capability.
 pub trait BackendProcessObservationPort: Send + Sync + 'static {
     fn subscribe_process_changes(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -82,7 +83,7 @@ pub trait BackendProcessObservationPort: Send + Sync + 'static {
 
 pub type BackendProcessObservationService = Arc<dyn BackendProcessObservationPort>;
 
-/// Live topology evidence relevant to residual attempt convergence.
+/// Exact process evidence; it does not select recovery or schedule a successor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendProcessObservation {
     /// The frozen process still owns the endpoint and is currently observable.

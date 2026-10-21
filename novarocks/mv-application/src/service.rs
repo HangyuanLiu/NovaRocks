@@ -302,6 +302,8 @@ fn settle_unpublished_stage(
     }
     match provider.abort_staged_target(operation, staged) {
         Ok(()) => primary,
+        // A failed abort is a second failure; preserve its complete diagnostic
+        // instead of replacing it with the original pure admission cause.
         Err(abort) => MvProductError::new(
             primary.kind(),
             format!("{}; staged target abort failed: {abort}", primary.message()),
@@ -311,6 +313,8 @@ fn settle_unpublished_stage(
 }
 
 fn known_committed_finalize_failure(failure: MvProviderFailure) -> MvProductError {
+    // Publication is already committed: this remains a finalization failure,
+    // even when its diagnostic originated in SQL preparation.
     MvProductError::new(
         MvProductErrorKind::KnownCommittedFinalizeFailed,
         failure.message(),

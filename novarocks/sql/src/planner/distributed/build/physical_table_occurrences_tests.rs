@@ -18,7 +18,8 @@
 use super::super::{
     expression_occurrences::{AuthoredPhysicalOccurrences, author_physical_occurrences_observed},
     physical_expression_effects::{
-        PhysicalExpressionEffectsInput, author_physical_expression_effects_observed,
+        PhysicalExpressionEffectsError, PhysicalExpressionEffectsInput,
+        author_physical_expression_effects_observed,
     },
     physical_table_requests::{
         AuthoredPhysicalTableRequest, PhysicalTableRequestError,
@@ -940,7 +941,9 @@ fn fragment_prefixes(
     success: bool,
     wide: bool,
 ) {
+    use super::super::physical_call_arguments::PhysicalArgumentError;
     use super::super::physical_fragment_effects::PhysicalFragmentEffectsError;
+    use novarocks_functions::ConstantError;
     let baseline = Control::default();
     let outcome = invoke(&baseline);
     assert_eq!(outcome.is_ok(), success, "{outcome:?}");
@@ -961,7 +964,12 @@ fn fragment_prefixes(
                 // first bounded flush; the ordinary error starts no footer.
                 assert_eq!(trace, [(PHASE, 0)]);
             }
-            PhysicalFragmentEffectsError::Control(_) => {}
+            PhysicalFragmentEffectsError::Control(_)
+            | PhysicalFragmentEffectsError::Expressions(
+                PhysicalExpressionEffectsError::Argument(PhysicalArgumentError::Constant(
+                    ConstantError::Limit(_),
+                )),
+            ) => {}
             _ => panic!("unexpected original table composition refusal: {original:?}"),
         }
         for cause in CAUSES {
@@ -982,6 +990,18 @@ fn fragment_prefixes(
                 (
                     PhysicalFragmentEffectsError::Control(actual),
                     PhysicalFragmentEffectsError::Control(original),
+                ) => assert_eq!(actual, original),
+                (
+                    PhysicalFragmentEffectsError::Expressions(
+                        PhysicalExpressionEffectsError::Argument(PhysicalArgumentError::Constant(
+                            actual @ ConstantError::Limit(_),
+                        )),
+                    ),
+                    PhysicalFragmentEffectsError::Expressions(
+                        PhysicalExpressionEffectsError::Argument(PhysicalArgumentError::Constant(
+                            original @ ConstantError::Limit(_),
+                        )),
+                    ),
                 ) => assert_eq!(actual, original),
                 _ => panic!(
                     "different original table composition refusal: {actual:?}; expected {original:?}"
@@ -1161,20 +1181,30 @@ fn table_fragment_composer_source_literal_limits_remain_primary_without_partial_
     let occurrences = fixture.occurrences();
     let parameters = SemanticParameters::try_new([]).unwrap();
     let scopes = fragment_scopes(&fixture, &occurrences);
-    assert!(matches!(
-        fragment_run(
-            &fixture,
-            &occurrences,
-            &parameters,
-            &scopes,
-            &Control::default()
-        ),
-        Err(
-            super::super::physical_fragment_effects::PhysicalFragmentEffectsError::Control(
-                CompileControlError::ResourceExhausted
-            )
-        )
-    ));
+    let error = fragment_run(
+        &fixture,
+        &occurrences,
+        &parameters,
+        &scopes,
+        &Control::default(),
+    )
+    .unwrap_err();
+    use super::super::physical_call_arguments::PhysicalArgumentError;
+    use super::super::physical_fragment_effects::PhysicalFragmentEffectsError;
+    use novarocks_failure_contract::{FailureClass, FailureProjection, domain};
+    use novarocks_functions::ConstantError;
+    let PhysicalFragmentEffectsError::Expressions(PhysicalExpressionEffectsError::Argument(
+        PhysicalArgumentError::Constant(source @ ConstantError::Limit(_)),
+    )) = &error
+    else {
+        panic!("the actual table argument must retain its original constant limit: {error:?}");
+    };
+    let expected = source.failure_fact();
+    assert_eq!(expected.class(), FailureClass::Resource);
+    assert_eq!(expected.reason().domain(), domain::CONSTANT.get());
+    assert_eq!(expected.reason().code(), 2);
+    let package = super::super::package_semantics::PackageSemanticsError::from(error);
+    assert_eq!(package.failure_fact(), expected);
     fragment_prefixes(
         |control| fragment_run(&fixture, &occurrences, &parameters, &scopes, control),
         false,

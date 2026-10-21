@@ -83,8 +83,9 @@ use crate::scan_model::{
     IcebergPhysicalPredicateValue,
 };
 use crate::schema_facts::row_lineage_enabled;
-use crate::typed_read::codec::{public_read_schema, system_public_read_schema};
+use crate::typed_read::codec::public_read_schema;
 use crate::typed_read::column_handle::{corrupt, invalid, unsupported};
+use crate::typed_read::publish_read_schema_with_metadata;
 #[cfg(test)]
 use crate::typed_read::read_static_facts::decode_sha256_hex;
 use crate::typed_read::read_static_facts::iceberg_final_static_facts;
@@ -101,8 +102,9 @@ use crate::typed_read::{
     IcebergSystemTableReference, IcebergTableExecuteHandle, IcebergTableExecuteHandleParams,
     IcebergTableExecuteProcedureHandle, IcebergTableHandle, IcebergTableHandleParams,
     REWRITE_POSITION_DELETE_OUTPUT_COLUMNS, ROW_LINEAGE_METADATA_COLUMNS, TrinoManifestFile,
-    bounds_row_type, change_op_column_handle, derived_row_type_json, files_relation_schema_json,
-    partition_row_type, plan_change_window_splits, system_relation_columns,
+    bounds_row_type, change_op_column_handle, derived_row_type_json,
+    files_relation_schema_json_with_metadata, partition_row_type_with_metadata,
+    plan_change_window_splits, system_relation_columns_with_metadata,
 };
 #[cfg(test)]
 use novarocks_spi::connector::read_stack::{
@@ -1209,20 +1211,16 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             }
             crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) => {
                 let metadata = self.system_relation_metadata(reference)?;
-                system_relation_columns(
-                    reference.system_table_type(),
-                    metadata.current_schema(),
-                    &partition_specs_of(&metadata),
-                )?
-                .into_iter()
-                .map(|column| {
-                    (
-                        column.base_column_identity().name().to_string(),
-                        column,
-                        false,
-                    )
-                })
-                .collect()
+                system_relation_columns_with_metadata(reference.system_table_type(), &metadata)?
+                    .into_iter()
+                    .map(|column| {
+                        (
+                            column.base_column_identity().name().to_string(),
+                            column,
+                            false,
+                        )
+                    })
+                    .collect()
             }
             crate::typed_read::IcebergRuntimeRelation::TableExecute(handle) => {
                 let mut columns = Vec::new();
@@ -1314,19 +1312,10 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 creation.work(1)?;
                 let metadata = self.system_relation_metadata(reference)?;
                 creation.work(1)?;
-                let count = metadata.partition_specs_iter().len();
-                let mut specs = creation.reserve(count)?;
-                for spec in metadata.partition_specs_iter() {
-                    creation.work(1)?;
-                    specs.push(spec.as_ref());
-                }
-                // The schema author borrows exact specs from the loaded metadata;
-                // no service or metadata authority is retained in public facts.
-                system_public_read_schema(
+                publish_read_schema_with_metadata(
                     reference.system_table_type(),
                     columns,
-                    metadata.current_schema(),
-                    &specs,
+                    &metadata,
                     creation,
                 )
             }
@@ -1906,9 +1895,9 @@ impl IcebergTypedBoundary {
             table_schema_json: serde_json::to_string(&table_schema).map_err(|error| {
                 corrupt(format!("iceberg table schema is not serializable: {error}"))
             })?,
-            metadata_table_schema_json: files_relation_schema_json(&table_schema, &specs)?,
+            metadata_table_schema_json: files_relation_schema_json_with_metadata(&metadata)?,
             partition_spec_jsons,
-            partition_column_type_json: partition_row_type(&table_schema, &specs)?
+            partition_column_type_json: partition_row_type_with_metadata(&metadata)?
                 .as_ref()
                 .map(derived_row_type_json)
                 .transpose()?,
