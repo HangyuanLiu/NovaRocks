@@ -44,6 +44,16 @@ pub(crate) struct SqlControlExecution {
     pub deadline: Instant,
     pub has_restarts: bool,
     pub steps: BTreeMap<(String, String, usize), StepControl>,
+    #[cfg(test)]
+    planned_launches: Vec<PlannedLaunchInspection>,
+}
+#[cfg(test)]
+#[derive(Debug)]
+struct PlannedLaunchInspection {
+    role: RoleSlot,
+    generation: usize,
+    reference: RoleLaunchReference,
+    grants: Vec<DomainGrant>,
 }
 impl SqlControlExecution {
     pub fn step(&self, suite: &str, case: &str, query: usize) -> Option<&StepControl> {
@@ -476,6 +486,8 @@ pub(crate) fn build(
                         .is_some()
             }),
         steps: BTreeMap::new(),
+        #[cfg(test)]
+        planned_launches: Vec::new(),
     };
     let mut sequence = 0usize;
     for input in inputs {
@@ -736,6 +748,13 @@ pub(crate) fn build(
             launch.grants.len(),
             novarocks_failpoint::session::MAX_GRANTS
         );
+        #[cfg(test)]
+        execution.planned_launches.push(PlannedLaunchInspection {
+            role,
+            generation,
+            reference: launch.reference.clone(),
+            grants: launch.grants.clone(),
+        });
         if launch.grants.is_empty() {
             plan.authorize_ordinary_launch(&launch.reference, binary.to_path_buf())?;
         } else {
@@ -1060,7 +1079,9 @@ mod tests {
                 .contains("overflow")
         );
         let input = inputs(
-            (0..11)
+            // Each selected statement contributes two submission attempts on
+            // three BEs. Exceed the finite bound without fixing it at 64.
+            (0..(novarocks_failpoint::session::MAX_GRANTS / (2 * 3) + 1))
                 .map(|number| {
                     step(
                         number,
@@ -1080,6 +1101,219 @@ mod tests {
                 .contains("finite role grant bound")
         );
     }
+    #[test]
+    fn distributed_resilience_preserves_real_launches_and_exact_submission_authority() {
+        let sql_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../correctness/distributed-resilience/sql");
+        let meta_re = regex::Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").unwrap();
+        let marker_re = regex::Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").unwrap();
+        let files = crate::config::list_sql_files(&sql_dir, "*.sql").unwrap();
+        assert!(!files.is_empty());
+        let cases = files
+            .iter()
+            .map(|path| {
+                crate::parser::load_sql_case_from_file(
+                    path,
+                    &meta_re,
+                    &marker_re,
+                    &std::collections::HashMap::new(),
+                )
+                .unwrap()
+                .expect("registered recovery SQL has executable steps")
+            })
+            .collect::<Vec<_>>();
+        let mut input = inputs(Vec::new());
+        input[0].suite_name = "distributed-resilience".into();
+        input[0].sql_dir = sql_dir;
+        input[0].cases = cases;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let (plan, execution) = plan(&input, file.path()).unwrap();
+        // This includes the independently bounded serialized declarations,
+        // not just the number of grants visible in the public summaries.
+        plan.validate_selected_intents(3).unwrap();
+        let launches = &execution.planned_launches;
+        let peak = launches
+            .iter()
+            .map(|launch| launch.grants.len())
+            .max()
+            .unwrap();
+        assert!(
+            peak > 64,
+            "the whole suite exercises the former capacity limit"
+        );
+        assert!(peak <= novarocks_failpoint::session::MAX_GRANTS);
+
+        let mut tokens = BTreeSet::new();
+        for ((suite, case_id, query), control) in &execution.steps {
+            assert_eq!(suite, "distributed-resilience");
+            let source = input[0]
+                .cases
+                .iter()
+                .find(|case| &case.case_id == case_id)
+                .unwrap();
+            let source = source
+                .steps
+                .iter()
+                .find(|step| &step.query_number == query)
+                .unwrap();
+            let statements = crate::session::split_sql_statements(&source.sql).unwrap();
+            let expected = (0..crate::results::step_retry_count(source))
+                .flat_map(|outer| {
+                    (0..2).flat_map({
+                        let count = statements.len();
+                        move |transient| {
+                            (0..count).map(move |statement| (outer, transient, statement))
+                        }
+                    })
+                })
+                .collect::<BTreeSet<_>>();
+            let actual = control
+                .submissions
+                .iter()
+                .map(|target| {
+                    assert!(
+                        tokens.insert(target.run_token.clone()),
+                        "submission token reused"
+                    );
+                    target
+                        .validate_sql(&statements[target.statement_index])
+                        .unwrap();
+                    (
+                        target.outer_attempt,
+                        target.transient_attempt,
+                        target.statement_index,
+                    )
+                })
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual, expected);
+            assert_eq!(control.submissions.len(), actual.len());
+        }
+        assert!(!tokens.is_empty());
+
+        // Runtime executes complete parallel cases before the sequential group.
+        // Only original restart directives can advance an exact BE launch slot.
+        let mut backend_generations = [0usize; 3];
+        let mut token_generations = BTreeMap::new();
+        for source_case in input[0]
+            .cases
+            .iter()
+            .filter(|case| !case.sequential)
+            .chain(input[0].cases.iter().filter(|case| case.sequential))
+        {
+            for source in &source_case.steps {
+                if let Some(index) = source
+                    .meta
+                    .restart_be_delay_ms
+                    .and(source.meta.kill_be_index)
+                {
+                    backend_generations[index] += 1;
+                }
+                if let Some(control) = execution.step(
+                    "distributed-resilience",
+                    &source_case.case_id,
+                    source.query_number,
+                ) {
+                    for submission in &control.submissions {
+                        token_generations
+                            .insert(submission.run_token.as_str(), backend_generations);
+                    }
+                }
+                if let Some(index) = source.meta.restart_be_after_establish_context_index {
+                    backend_generations[index] += 1;
+                }
+            }
+        }
+
+        let references = launches
+            .iter()
+            .map(|launch| (launch.reference.session_id.as_str(), launch))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(references.len(), launches.len());
+        assert_eq!(
+            launches
+                .iter()
+                .map(|launch| &launch.reference.process_receipt)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            launches.len()
+        );
+        for role in std::iter::once(RoleSlot::Frontend).chain((0..3).map(RoleSlot::Backend)) {
+            let explicit_restarts = input[0]
+                .cases
+                .iter()
+                .flat_map(|case| &case.steps)
+                .map(|step| match role {
+                    RoleSlot::Frontend => usize::from(step_restarts_fe(&step.meta)),
+                    RoleSlot::Backend(index) => {
+                        usize::from(step_restarts_be(&step.meta) == Some(index))
+                            + usize::from(
+                                step.meta.restart_be_delay_ms.and(step.meta.kill_be_index)
+                                    == Some(index),
+                            )
+                    }
+                })
+                .sum::<usize>();
+            let actual = launches
+                .iter()
+                .filter(|launch| launch.role == role)
+                .map(|launch| launch.generation)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                actual,
+                (0..=explicit_restarts).collect::<BTreeSet<_>>(),
+                "capacity must not inject a role restart"
+            );
+        }
+
+        for launch in launches {
+            for grant in &launch.grants {
+                if !matches!(grant.domain.as_str(), "native" | "native-observation") {
+                    continue;
+                }
+                let action = grant.parameters["action"].as_str().unwrap();
+                let Some(applied_action) = action.strip_prefix("bind-") else {
+                    continue;
+                };
+                assert_eq!(launch.role, RoleSlot::Frontend);
+                let target_id = grant.parameters["target_session_id"].as_str().unwrap();
+                let target = references[target_id];
+                let index = grant.parameters["backend_index"].as_u64().unwrap() as usize;
+                assert_eq!(target.role, RoleSlot::Backend(index));
+                assert_eq!(
+                    grant.parameters["target_process_receipt"],
+                    json!(target.reference.process_receipt)
+                );
+                let token = grant.parameters["statement_run_token"].as_str().unwrap();
+                assert!(tokens.contains(token));
+                assert_eq!(
+                    target.generation, token_generations[token][index],
+                    "binding must retain the original statement's exact BE launch"
+                );
+                let matching = target
+                    .grants
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.domain == grant.domain
+                            && candidate.parameters["action"] == applied_action
+                            && [
+                                "root",
+                                "backend_index",
+                                "statement_run_token",
+                                "target_session_id",
+                                "attempt_id",
+                            ]
+                            .iter()
+                            .all(|key| candidate.parameters.get(*key) == grant.parameters.get(*key))
+                    })
+                    .count();
+                assert_eq!(
+                    matching, 1,
+                    "binding must select one exact declared BE action"
+                );
+            }
+        }
+    }
+
     #[test]
     fn nomination_slots_keep_each_actual_retry_and_the_whole_outer_set_text_distinct() {
         let file = tempfile::NamedTempFile::new().unwrap();

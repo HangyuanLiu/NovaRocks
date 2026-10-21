@@ -177,6 +177,38 @@ struct FrontendDistributedRewriteSession<'a> {
     committed_receipt: Option<novarocks_spi::connector::ConnectorWriteReceipt>,
 }
 
+fn rewrite_compile_terminal(
+    error: novarocks_sql::compiler::SqlCompileError,
+) -> OptimizeTerminalError {
+    match error {
+        novarocks_sql::compiler::SqlCompileError::Cancelled => {
+            OptimizeTerminalError::from_compile_control(
+                novarocks_type_contract::CompileControlError::Cancelled,
+            )
+        }
+        novarocks_sql::compiler::SqlCompileError::DeadlineExceeded => {
+            OptimizeTerminalError::from_compile_control(
+                novarocks_type_contract::CompileControlError::DeadlineExceeded,
+            )
+        }
+        novarocks_sql::compiler::SqlCompileError::ResourceExhausted => {
+            OptimizeTerminalError::from_compile_control(
+                novarocks_type_contract::CompileControlError::ResourceExhausted,
+            )
+        }
+        novarocks_sql::compiler::SqlCompileError::Analyze(error) => match error.control_error() {
+            Some(error) => OptimizeTerminalError::from_compile_control(error),
+            None => OptimizeTerminalError::pre_dispatch_failed(error.to_string()),
+        },
+        novarocks_sql::compiler::SqlCompileError::CompilationSource(source) => {
+            OptimizeTerminalError::from_compile_control(
+                novarocks_type_contract::CompileControlError::Source(source),
+            )
+        }
+        error => OptimizeTerminalError::pre_dispatch_failed(error.to_string()),
+    }
+}
+
 impl DistributedRewriteSession for FrontendDistributedRewriteSession<'_> {
     fn plan_facts(&self) -> RewritePlanFacts {
         RewritePlanFacts {
@@ -194,30 +226,7 @@ impl DistributedRewriteSession for FrontendDistributedRewriteSession<'_> {
         let prepared = self
             .engine
             .prepare_distributed_rewrite_cohort(&self.session, cohort.cohort_id())
-            .map_err(|error| match error {
-                novarocks_sql::compiler::SqlCompileError::Cancelled => {
-                    OptimizeTerminalError::from_compile_control(
-                        novarocks_type_contract::CompileControlError::Cancelled,
-                    )
-                }
-                novarocks_sql::compiler::SqlCompileError::DeadlineExceeded => {
-                    OptimizeTerminalError::from_compile_control(
-                        novarocks_type_contract::CompileControlError::DeadlineExceeded,
-                    )
-                }
-                novarocks_sql::compiler::SqlCompileError::ResourceExhausted => {
-                    OptimizeTerminalError::from_compile_control(
-                        novarocks_type_contract::CompileControlError::ResourceExhausted,
-                    )
-                }
-                novarocks_sql::compiler::SqlCompileError::Analyze(error) => {
-                    match error.control_error() {
-                        Some(error) => OptimizeTerminalError::from_compile_control(error),
-                        None => OptimizeTerminalError::pre_dispatch_failed(error.to_string()),
-                    }
-                }
-                error => OptimizeTerminalError::pre_dispatch_failed(error.to_string()),
-            })?;
+            .map_err(rewrite_compile_terminal)?;
         let completion = prepared.finish()?;
         self.engine
             .accumulate_distributed_rewrite_group(&self.session, completion)
@@ -767,5 +776,45 @@ impl OptimizeJobExecution for FrontendOptimizeJobExecution {
             &job.target,
             effect_id,
         )
+    }
+}
+
+#[cfg(test)]
+mod rewrite_compile_projection_tests {
+    use super::*;
+    #[test]
+    fn rewrite_preparation_keeps_original_source_and_control_without_text_guessing() {
+        use novarocks_sql::compiler::SqlCompileError;
+        use novarocks_type_contract::CompileControlError;
+        let source = novarocks_failure_contract::SharedFailureCause::new(
+            novarocks_local_compiler::FragmentCompileError::Unsupported {
+                node: None,
+                feature: "provider relation other than a table",
+            },
+        );
+        let error = rewrite_compile_terminal(SqlCompileError::CompilationSource(source.clone()));
+        assert_eq!(
+            error.compile_control,
+            Some(CompileControlError::Source(source.clone()))
+        );
+        assert_eq!(error.execution_failure, None);
+        let plain = rewrite_compile_terminal(SqlCompileError::Compilation(source.to_string()));
+        assert_eq!(plain.compile_control, None);
+        for (compile, expected) in [
+            (SqlCompileError::Cancelled, CompileControlError::Cancelled),
+            (
+                SqlCompileError::DeadlineExceeded,
+                CompileControlError::DeadlineExceeded,
+            ),
+            (
+                SqlCompileError::ResourceExhausted,
+                CompileControlError::ResourceExhausted,
+            ),
+        ] {
+            assert_eq!(
+                rewrite_compile_terminal(compile).compile_control,
+                Some(expected)
+            );
+        }
     }
 }

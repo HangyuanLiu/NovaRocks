@@ -7905,10 +7905,9 @@ pub(crate) mod tests {
                 value_type: novarocks_result_contract::ScalarValueType::SignedInteger(64),
             },
         )
-        .unwrap()
-        // The compiled fixture's one output is local slot zero.
-        .bind_native_slots(&[0])
         .unwrap();
+        // The package declares semantic fields; local compilation binds the actual slot.
+        assert_eq!(scalar.source_slot(), None);
         let receipt = fixture.create(
             &descriptor,
             &Body::bounded_root(
@@ -8686,8 +8685,6 @@ pub(crate) mod tests {
                         value_type: novarocks_result_contract::ScalarValueType::SignedInteger(64),
                     },
                 )
-                .unwrap()
-                .bind_native_slots(&[0])
                 .unwrap(),
             ),
             &[],

@@ -54,7 +54,7 @@ SELECT date_slice('2020-01-01',INTERVAL 3.2 DAY) AS sliced;
 SELECT time_slice('2020-01-01',INTERVAL 2147483648 DAY) AS sliced;
 
 -- query 11
--- @expect_error=time used with time_slice can't before 0001-01-01 00:00:00
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:40)
 SELECT time_slice('0000-01-01',INTERVAL 1 DAY) AS sliced;
 
 -- query 12

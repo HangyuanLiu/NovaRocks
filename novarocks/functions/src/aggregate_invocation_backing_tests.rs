@@ -239,3 +239,83 @@ fn host_shared_last_drop_releases_actual_header_when_payload_drop_unwinds() {
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
     assert!(host.ledger.lock().unwrap().live.is_empty());
 }
+
+#[test]
+fn host_shared_unique_mutation_uses_the_original_block_without_an_allocation() {
+    let host = Arc::new(Host::default());
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let control = Control::default();
+    let mut work = EvaluationCheckpoints::new(&control);
+    let mut value = HostShared::try_new_direct(17_u64, allocator.clone(), &mut work).unwrap();
+    let attempts = host.ledger.lock().unwrap().attempts;
+    let checkpoints = control.trace.lock().unwrap().len();
+    *value.get_mut().expect("one unpublished owner") = 23;
+    assert_eq!(*value, 23);
+    assert_eq!(host.ledger.lock().unwrap().attempts, attempts);
+    assert_eq!(control.trace.lock().unwrap().len(), checkpoints);
+    drop(value);
+    assert_metadata_only(&host);
+    drop(allocator);
+    released(&host);
+}
+
+#[test]
+fn host_shared_mutation_rejects_sharing_and_recovers_after_cross_thread_clone_drop() {
+    let host = Arc::new(Host::default());
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let control = Control::default();
+    let mut work = EvaluationCheckpoints::new(&control);
+    let mut value = HostShared::try_new_direct(17_u64, allocator.clone(), &mut work).unwrap();
+    let shared = value.clone();
+    let attempts = host.ledger.lock().unwrap().attempts;
+    let checkpoints = control.trace.lock().unwrap().len();
+    assert!(value.get_mut().is_none());
+    assert_eq!(*shared, 17);
+    std::thread::spawn(move || drop(shared)).join().unwrap();
+    *value.get_mut().expect("the last clone has exited") = 29;
+    assert_eq!(*value, 29);
+    assert_eq!(host.ledger.lock().unwrap().attempts, attempts);
+    assert_eq!(control.trace.lock().unwrap().len(), checkpoints);
+    drop(value);
+    assert_metadata_only(&host);
+    drop(allocator);
+    released(&host);
+}
+
+#[test]
+fn host_shared_direct_header_and_flush_refusals_drop_the_value_once_without_a_tail() {
+    struct Payload(Arc<AtomicUsize>);
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    for cause in causes() {
+        // None refuses the real host allocation; the two checkpoints bracket
+        // its initialized ownership, before any exclusive mutation is exposed.
+        for checkpoint in [None, Some(0), Some(1)] {
+            let host = Arc::new(Host::default());
+            let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+            if checkpoint.is_none() {
+                arm_refusal(&host, 0, cause.clone());
+            }
+            let control = Control {
+                refusal: checkpoint.map(|stop| (stop, cause.clone())),
+                ..Control::default()
+            };
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut work = EvaluationCheckpoints::new(&control);
+            let result =
+                HostShared::try_new_direct(Payload(drops.clone()), allocator.clone(), &mut work);
+            assert!(matches!(result, Err(error) if error == cause));
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                control.trace.lock().unwrap().len(),
+                checkpoint.map_or(1, |stop| stop + 1)
+            );
+            assert_metadata_only(&host);
+            drop(allocator);
+            released(&host);
+        }
+    }
+}

@@ -394,6 +394,13 @@ fn compile_signed_cow(
                     encoded(ConnectorCodecCategory::ReadView),
                 ),
             },
+            metadata_kind: matches!(need.relation(), ProviderReadRelationNeed::Metadata { .. })
+                .then(|| {
+                    novarocks_spi::connector::read_stack::ConnectorReadMetadataKind::try_new(
+                        "$fixture-metadata",
+                    )
+                    .expect("fixture metadata kind")
+                }),
             work_source: ConnectorReadWorkSource::RuntimeSplits,
             selection_digest: [8; 32],
             schema: need

@@ -109,7 +109,8 @@ impl PreparedDistributedRewriteCohort {
     /// Submit the sealed connector write.
     pub fn finish(
         self,
-    ) -> Result<crate::query_execution::outcome::ConnectorWriteSessionCompletion, String> {
+    ) -> Result<crate::query_execution::outcome::ConnectorWriteSessionCompletion, TerminalError>
+    {
         let options =
             crate::query_execution::contract::synthetic_statement_query_options(&self.execution);
         let request = crate::query_execution::contract::build_request_from_finalized_execution(
@@ -122,25 +123,37 @@ impl PreparedDistributedRewriteCohort {
             &self.execution,
             None,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(rewrite_execution_terminal)?;
         let request = crate::query_execution::contract::with_connector_write_session(
             request,
             std::sync::Arc::clone(&self.write_session),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(rewrite_execution_terminal)?;
         let session_completion = self
             .query_execution
             .execute(request)
             .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
             .map(crate::query_execution::outcome::WriteExecutionOutcome::into_write_session)
-            .map_err(|error| error.to_string())?;
+            .map_err(rewrite_execution_terminal)?;
         // The dual barrier is what produces a session completion, so its
         // absence here means the write data plane never closed -- not that the
         // group happened to stage nothing.
         session_completion.ok_or_else(|| {
-            "connector staging terminal closed without a prepared write set".to_string()
+            TerminalError::pre_dispatch_failed(
+                "connector staging terminal closed without a prepared write set",
+            )
         })
     }
+}
+
+// The native attempt has already selected its failure and site. Retain that
+// input before rendering; a maintenance publication verdict is independent.
+fn rewrite_execution_terminal(
+    error: crate::query_execution::contract::DistributedQueryError,
+) -> TerminalError {
+    TerminalError::pre_dispatch_failed(error.to_string())
+        .with_compile_control(error.compile_control_error())
+        .with_execution_failure(error.execution_failure().cloned())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2513,5 +2526,46 @@ mod admitted_background_context_tests {
         assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
         drop(attempt);
         assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+}
+
+#[cfg(test)]
+mod rewrite_selected_failure_tests {
+    use super::*;
+    use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+    use novarocks_query_application::cancellation::QueryCancellationReason;
+
+    #[test]
+    fn rewrite_finish_retains_selected_input_but_does_not_infer_one_from_text() {
+        let input = novarocks_query_application::session_outcome::cancellation_failure_input(
+            QueryCancellationReason::ExplicitKill {
+                requester_connection_id: 17,
+            },
+        );
+        let error =
+            rewrite_execution_terminal(DistributedQueryError::from_execution(input.clone()));
+        assert_eq!(error.execution_failure, Some(input.clone()));
+        assert_eq!(error.compile_control, None);
+        let error = rewrite_execution_terminal(DistributedQueryError::new(
+            DistributedQueryErrorKind::Failed,
+            input.user_error().to_string(),
+        ));
+        assert_eq!(error.execution_failure, None);
+        assert_eq!(error.compile_control, None);
+    }
+    #[test]
+    fn rewrite_finish_preserves_domain_source_which_already_authors_execution_input() {
+        let source = novarocks_failure_contract::SharedFailureCause::new(
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+                "private connector source diagnostic",
+            ),
+        );
+        let original =
+            DistributedQueryError::from_source(DistributedQueryErrorKind::Failed, source);
+        let expected = original.execution_failure().unwrap().clone();
+        let terminal = rewrite_execution_terminal(original);
+        assert_eq!(terminal.execution_failure, Some(expected));
+        assert_eq!(terminal.compile_control, None);
     }
 }

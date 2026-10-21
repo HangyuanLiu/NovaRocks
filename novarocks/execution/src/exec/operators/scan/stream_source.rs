@@ -608,8 +608,8 @@ impl OperatorLifecycle for StreamScanSourceOperator {
         self.runtime_error = Some(state.error_state());
         self.filter.bind_runtime_state(state)?;
         if let Some(consumers) = self.filter.blocking() {
-            consumers.set_wait_timeout(scan_runtime_filter_wait_timeout(state));
             consumers.bind(state)?;
+            consumers.set_wait_timeout(scan_runtime_filter_wait_timeout(state));
         }
         self.output_tracker = state
             .mem_tracker()

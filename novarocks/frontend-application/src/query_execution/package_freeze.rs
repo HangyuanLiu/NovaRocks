@@ -270,4 +270,50 @@ mod error_projection_tests {
             );
         }
     }
+    #[test]
+    fn package_freeze_keeps_comparison_source_identity_fact_and_detail() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection, SharedFailureCause};
+        use novarocks_functions::ComparisonPrepareError;
+        use std::error::Error;
+        for (original, class) in [
+            (
+                ComparisonPrepareError::Unsupported,
+                FailureClass::Unsupported,
+            ),
+            (
+                ComparisonPrepareError::TypeMismatch,
+                FailureClass::Invariant,
+            ),
+        ] {
+            let source = SharedFailureCause::new(original.clone());
+            let expected = original.failure_fact();
+            let error = PhysicalEncodeError::from(PackageFreezeError::Semantics(
+                PackageSemanticsError::Source(source.clone()),
+            ));
+            assert_eq!(error.failure_fact(), expected);
+            let PhysicalEncodeError::Source(outer) = &error else {
+                panic!("freeze must retain its actual author");
+            };
+            let freeze = outer.downcast_ref::<PackageFreezeError>().unwrap();
+            let PackageFreezeError::Semantics(PackageSemanticsError::Source(actual)) = freeze
+            else {
+                panic!("comparison source identity was not retained");
+            };
+            assert_eq!(actual, &source);
+            assert_eq!(actual.detail(), source.detail());
+            assert_eq!(
+                actual.downcast_ref::<ComparisonPrepareError>(),
+                Some(&original)
+            );
+            assert_eq!(
+                actual
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<ComparisonPrepareError>(),
+                Some(&original)
+            );
+            assert_eq!(error.to_string(), source.detail());
+            assert_eq!(error.failure_fact().class(), class);
+        }
+    }
 }

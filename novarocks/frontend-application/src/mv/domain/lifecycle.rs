@@ -186,6 +186,7 @@ pub struct RefreshError {
     pub kind: RefreshErrorKind,
     pub message: String,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
+    unavailable_implementation: Option<novarocks_sql::analyze_error::AnalyzeError>,
 }
 
 impl RefreshError {
@@ -194,6 +195,7 @@ impl RefreshError {
             kind,
             message: message.into(),
             compile_control: None,
+            unavailable_implementation: None,
         }
     }
 
@@ -206,7 +208,14 @@ impl RefreshError {
             kind: RefreshErrorKind::UserError,
             message: cause.to_string(),
             compile_control: Some(cause),
+            unavailable_implementation: None,
         }
+    }
+
+    pub fn unavailable_implementation(
+        &self,
+    ) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
+        self.unavailable_implementation.as_ref()
     }
 
     pub fn user(message: impl Into<String>) -> Self {
@@ -243,19 +252,23 @@ impl From<novarocks_sql::compiler::SqlCompileError> for RefreshError {
             E::DeadlineExceeded => Some(C::DeadlineExceeded),
             E::ResourceExhausted => Some(C::ResourceExhausted),
             E::Analyze(error) => error.control_error(),
+            E::CompilationSource(source) => Some(C::Source(source.clone())),
             _ => None,
         };
-        let message = match &error {
+        let unavailable_implementation = match &error {
             novarocks_sql::compiler::SqlCompileError::Analyze(error)
                 if error.kind()
                     == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation =>
             {
-                error.to_user_error(None).to_string()
+                Some(error.clone())
             }
-            _ => error.to_string(),
+            _ => None,
         };
+        // Public SQL codes are rendered only at the final typed command boundary.
+        let message = error.to_string();
         let mut failure = Self::user(message);
         failure.compile_control = control;
+        failure.unavailable_implementation = unavailable_implementation;
         failure
     }
 }
@@ -333,11 +346,16 @@ mod tests {
         let SqlCompileError::Analyze(ref analyze) = compile else {
             panic!("missing implementation must retain typed analysis identity");
         };
-        let expected = analyze.to_user_error(None).to_string();
+        let expected = analyze.to_string();
+        let expected_analyze = analyze.clone();
         let failure = RefreshError::from(compile);
         assert_eq!(failure.message, expected);
+        assert_eq!(
+            failure.unavailable_implementation(),
+            Some(&expected_analyze)
+        );
         assert!(
-            failure
+            !failure
                 .message
                 .starts_with("[sql.analyze.unavailable_implementation] ")
         );
@@ -352,6 +370,7 @@ mod tests {
         let ordinary = RefreshError::from(ordinary);
         assert_eq!(ordinary.message, expected);
         assert_eq!(ordinary.kind, RefreshErrorKind::UserError);
+        assert_eq!(ordinary.unavailable_implementation(), None);
         assert_eq!(ordinary.compile_control_error(), None);
     }
 
@@ -368,6 +387,7 @@ mod tests {
             let error = RefreshError::from(compile);
             assert_eq!(error.message, expected);
             assert_eq!(error.compile_control_error(), Some(control));
+            assert_eq!(error.unavailable_implementation(), None);
             assert_eq!(error.kind, RefreshErrorKind::UserError);
             assert!(error.kind.should_rollback_after_commit());
             assert_eq!(

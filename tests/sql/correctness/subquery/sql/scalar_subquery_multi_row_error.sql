@@ -25,5 +25,5 @@ USE ${case_db};
 CREATE TABLE smr (k INT, v INT)
 TBLPROPERTIES ("format-version" = "3");
 INSERT INTO smr VALUES (1, 10), (1, 20);
--- @expect_error=assert_num_rows failed
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 7:316)
 SELECT (SELECT v FROM smr WHERE k = 1);

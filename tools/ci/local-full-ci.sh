@@ -33,6 +33,10 @@ RUN_MODE="stable"
 CI_TIER="full"
 CI_FROM_RUN_DIR=""
 CARGO_ONLY="false"
+CI_COLLECT_ALL="false"
+CI_COLLECTION_REACHED_END="false"
+CI_RUN_REACHED_END="false"
+CI_COLLECTION_RESULT=0
 CARGO_ONLY_CONFLICT="false"
 ALL_DISCOVERED_REQUESTED="false"
 KEEP_RUNTIME="false"
@@ -149,6 +153,10 @@ in an appended matrix fail CI.
 Options:
   --cargo-only          Run only the deterministic Cargo and repository guards.
                         This mode does not prepare runtime services or run SQL.
+  --collect-all         Collect the complete default native set after ordinary test
+                        failures with confirmed exit, identity and cleanup. Raw
+                        failures remain failures; unsafe or incomplete work stops.
+                        This is local collection, not admission or full-layer PASS.
   --all-discovered      Run every correctness suite through typed runner discovery.
   --suite <name>        Run only the named SQL suite. May be repeated.
   --tier <name>         Stable tier: smoke, targeted, or full. Default: full.
@@ -211,6 +219,11 @@ parse_args() {
     case "$1" in
       --cargo-only)
         CARGO_ONLY="true"
+        shift
+        ;;
+      --collect-all)
+        CARGO_ONLY_CONFLICT="true"
+        CI_COLLECT_ALL="true"
         shift
         ;;
       --all-discovered)
@@ -327,6 +340,17 @@ parse_args() {
     exit 2
   fi
 
+  if [ "$CI_COLLECT_ALL" = true ] && {
+    [ -n "$CI_FROM_RUN_DIR" ] || [ "$SKIP_CARGO_TEST" = true ] ||
+    [ "$SKIP_SYSTEM_SCENARIOS" = true ] || [ "$ALL_DISCOVERED_REQUESTED" = true ] ||
+    [ "${#REQUESTED_SUITES[@]}" -ne 0 ] || [ "$CI_TIER" != full ] ||
+    [ "$SQL_CLUSTER_MODE" != cross-process ] || [ "$SQL_CLUSTER_SIZE" -ne 3 ] ||
+    [ "$SYSTEM_SCENARIO_CLUSTER_SIZE" -ne 3 ];
+  }; then
+    echo "error: --collect-all requires the complete default set and native 1FE+3BE" >&2
+    exit 2
+  fi
+
   if [ "$ALL_DISCOVERED_REQUESTED" = "true" ]; then
     RUN_MODE="all-discovered"
   elif [ "${#REQUESTED_SUITES[@]}" -gt 0 ]; then
@@ -386,17 +410,76 @@ init_run_dir() {
 }
 
 cleanup() {
-  local status=$?
-  python3 "$SCRIPT_DIR/lib/identity_snapshot.py" source --repo "$REPO_ROOT" --output "$CI_RUN_DIR/identity/source-end.json" || status=1
-  ci_stop_all_in_one_server || true
+  local status=$? source_code=0 stop_code=0 runtime_code=0 runtime_attempted=false
+  local summary_code=0 collection_code=0 finalization_status=PASS final_status=PASS
+  local summary_ready=false finalization_log=""
+  if [ -n "${CI_RUN_DIR:-}" ] && [ -d "$CI_RUN_DIR" ] &&
+     [ -n "${CI_SUMMARY:-}" ] && [ -n "${CI_STARTED_EPOCH:-}" ]; then
+    summary_ready=true
+  fi
+  if [ -n "${CI_RUN_DIR:-}" ] && [ -d "$CI_RUN_DIR" ]; then
+    python3 "$SCRIPT_DIR/lib/identity_snapshot.py" source --repo "$REPO_ROOT" --output "$CI_RUN_DIR/identity/source-end.json" || source_code=$?
+  else
+    source_code=1
+  fi
+  ci_stop_all_in_one_server || stop_code=$?
 
   if [ "$CI_RUNTIME_PREPARED" = "true" ] && [ "$KEEP_RUNTIME" != "true" ]; then
+    runtime_attempted=true
     {
       echo "+ docker/iceberg-rest/down.sh --runtime-only --purge"
       docker/iceberg-rest/down.sh --runtime-only --purge
-    } >>"$CI_RUN_DIR/env.log" 2>&1 || true
+    } >>"$CI_RUN_DIR/env.log" 2>&1 || runtime_code=$?
   fi
 
+  if [ "$source_code" -ne 0 ] || [ "$stop_code" -ne 0 ] || [ "$runtime_code" -ne 0 ] ||
+     [ "${CI_RUN_REACHED_END:-false}" != true ]; then
+    [ "$status" -ne 0 ] || status=1
+    finalization_status=FAIL
+  fi
+  [ "$status" -eq 0 ] || final_status=FAIL
+  if [ "$summary_ready" = true ]; then
+    [ "$CI_COLLECT_ALL" != true ] || finalization_log="$CI_RUN_DIR/collection.json"
+    ci_record_stage "run terminal and cleanup facts (source=$source_code stop=$stop_code runtime=$runtime_code)" "$finalization_status" "0" "$finalization_log"
+    ci_render_summary "$final_status" || summary_code=$?
+  else
+    summary_code=1
+    echo "error: run summary state is incomplete at exit" >&2
+  fi
+  [ "$summary_code" -eq 0 ] || { [ "$status" -ne 0 ] || status=1; }
+
+  if [ "$CI_COLLECT_ALL" = true ] && [ -n "${CI_RUN_DIR:-}" ] && [ -d "$CI_RUN_DIR" ]; then
+    # Collection is an additional local record, never a formal receipt. The
+    # caller must still observe this invocation's actual exit independently.
+    python3 - "$CI_RUN_DIR/collection.json" "$CI_COLLECTION_REACHED_END" "$status" "$source_code" "$stop_code" "$runtime_code" "$runtime_attempted" "$KEEP_RUNTIME" "$summary_code" "${CI_RUN_REACHED_END:-false}" <<'COLLECTION' || collection_code=$?
+import json, sys
+from pathlib import Path
+path=Path(sys.argv[1])
+source,stop,runtime=map(int,sys.argv[4:7])
+summary=int(sys.argv[9])
+attempted=sys.argv[7]=='true'
+reached=sys.argv[10]=='true'
+value={'schema':1,'mode':'collect-all','collection_complete':sys.argv[2]=='true' and reached and not any((source,stop,runtime,summary)),
+       'exit_handler_status':int(sys.argv[3]),'cleanup':{'source_end_exit':source,'server_stop_exit':stop,'runtime_cleanup_exit':runtime if attempted else None,'runtime_cleanup_attempted':attempted,'keep_runtime':sys.argv[8]=='true'},
+       'run_reached_end':reached,'summary_write_exit':summary,'invocation_exit':'caller-must-observe','evidence_class':'local-collection'}
+path.write_text(json.dumps(value,indent=2)+'\n')
+COLLECTION
+    if [ "$collection_code" -ne 0 ]; then
+      [ "$status" -ne 0 ] || status=1
+      [ "$summary_ready" != true ] || ci_record_stage "collection record persistence" "FAIL" "0" "$CI_RUN_DIR/collection.json"
+    fi
+  fi
+  if [ "$summary_ready" = true ]; then
+    if [ "$collection_code" -ne 0 ] || [ "$summary_code" -ne 0 ]; then
+      [ "$summary_code" -eq 0 ] || ci_record_stage "summary persistence" "FAIL" "0" "$CI_SUMMARY"
+      ci_render_summary "FAIL" || true
+    fi
+    if [ "$status" -eq 0 ]; then
+      echo "PASS: $CI_SUMMARY"
+    else
+      echo "FAIL: $CI_SUMMARY"
+    fi
+  fi
   exit "$status"
 }
 
@@ -592,10 +675,25 @@ MATERIALS
   ci_invocation_finish "$record" "$code" "$log_path" "$materials" || return $?
   duration=$(($(ci_epoch) - start))
   printf 'wrapper_exit=%s\n' "$code" >>"$log_path"
+  local collect_safe=false
+  if [ "$CI_COLLECT_ALL" = true ]; then
+    mkdir -p "$CI_RUN_DIR/collection"
+    if (cd "$SCRIPT_DIR" && python3 -m verification.collection rust "$CI_RUN_DIR/rust" "$code") >"$CI_RUN_DIR/collection/rust.json"; then
+      collect_safe=true
+    elif [ "$code" -eq 0 ]; then
+      ci_record_stage "workspace nextest and doctests" "FAIL" "$duration" "$log_path"
+      ci_mark_failure_tail "Rust collection has incomplete exit, identity or cleanup facts" "$log_path"
+      return 1
+    fi
+  fi
   if [ "$code" -ne 0 ]; then
     ci_record_stage "workspace nextest and doctests" "FAIL" "$duration" "$log_path"
     ci_mark_failure_tail "workspace Rust batch failed; inspect its execution index" "$log_path"
     ci_render_summary "FAIL"
+    if [ "$CI_COLLECT_ALL" = true ] && [ "$collect_safe" = true ]; then
+      CI_COLLECTION_RESULT=1
+      return 0
+    fi
     return "$code"
   fi
   ci_record_stage "workspace nextest and doctests" "PASS" "$duration" "$log_path"
@@ -754,6 +852,8 @@ run_system_scenarios_stage() {
   local duration
 
   [ -x "$runner" ] && [ -x "$SYSTEM_SCENARIO_PRIMARY_BINARY" ] || return 1
+  local collection_policy=fail-fast
+  [ "$CI_COLLECT_ALL" != true ] || collection_policy=collect-all
   start="$(ci_epoch)"
   ci_run_system_scenarios \
     "$runner" \
@@ -764,13 +864,18 @@ run_system_scenarios_stage() {
     "$CI_RUN_DIR/system/artifacts" \
     "$SYSTEM_SCENARIO_CLUSTER_SIZE" \
     "$SYSTEM_SCENARIO_TIMEOUT_SECS" \
-    "$SYSTEM_SCENARIO_SELECTION"
+    "$SYSTEM_SCENARIO_SELECTION" \
+    "$collection_policy"
   code=$?
   duration=$(($(ci_epoch) - start))
 
   if [ "$code" -ne 0 ]; then
     ci_record_stage "system scenarios" "FAIL" "$duration" ""
     ci_render_summary "FAIL"
+    if [ "$CI_COLLECT_ALL" = true ] && [ "${CI_SYSTEM_COLLECTION_COMPLETE:-false}" = true ]; then
+      CI_COLLECTION_RESULT=1
+      return 0
+    fi
     exit "$code"
   fi
 
@@ -907,7 +1012,12 @@ ci_native_cross_process_suite_cluster_size() {
 
 ci_classify_sql_results() {
   local suite="$1" results="$2" output code=0
-  output="$(cd "$SCRIPT_DIR" && python3 -m verification.classification --results "$results" --dispositions "$DISPOSITIONS_FILE" --admission-membership)" || code=$?
+  local membership_args=()
+  [ "$CI_COLLECT_ALL" = true ] || membership_args=(--admission-membership)
+  output="$(cd "$SCRIPT_DIR" && python3 -m verification.classification --results "$results" --dispositions "$DISPOSITIONS_FILE" "${membership_args[@]}")" || code=$?
+  if [ "$CI_COLLECT_ALL" = true ] && [ -n "$output" ]; then
+    printf '%s\n' "$output" >"${results%.results.jsonl}.classification.json"
+  fi
   [ -n "$output" ] || { CI_SQL_RESULT_STATUS=FAIL; return 1; }
   local rows row_suite row_case row_status row_code row_reason
   rows="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print("\n".join("|".join([r["suite"],r["case"],r["status"],str((r.get("failure") or {}).get("error_code") or ""),""]) for r in d["rows"]))' <<<"$output")"
@@ -1010,6 +1120,16 @@ MATERIALS
     code=$?
     duration=$(($(ci_epoch) - start))
 
+    if [ "$CI_COLLECT_ALL" = true ]; then
+      mkdir -p "$CI_RUN_DIR/collection/sql"
+      if ! (cd "$SCRIPT_DIR" && python3 -m verification.collection sql "$results_file" "$code" --invocation "${CI_LAST_INVOCATION_RECORD:-}") >"$CI_RUN_DIR/collection/sql/${suite}.$(basename "$(dirname "$results_file")").json"; then
+        ci_record_sql_suite "$suite" "FAIL" "$duration" "$log_path"
+        ci_mark_failure_tail "SQL collection has incomplete exit, identity or cleanup facts: $suite" "$log_path"
+        ci_render_summary "FAIL"
+        exit 1
+      fi
+      [ "$code" -eq 0 ] || CI_COLLECTION_RESULT=1
+    fi
     local status classification_code=0
     ci_classify_sql_results "$suite" "$results_file" || classification_code=$?
     status="$CI_SQL_RESULT_STATUS"
@@ -1018,6 +1138,7 @@ MATERIALS
     ci_record_sql_suite "$suite" "$status" "$duration" "$log_path"
     if [ "$classification_code" -ne 0 ]; then
       failed=1
+      [ "$CI_COLLECT_ALL" != true ] || CI_COLLECTION_RESULT=1
       if [ -z "$CI_FAILURE_TAIL" ]; then ci_mark_failure_tail "SQL suite requires attention: $suite" "$log_path"; fi
     fi
     ci_render_summary "RUNNING"
@@ -1025,6 +1146,7 @@ MATERIALS
 
   if [ "$failed" -ne 0 ]; then
     ci_render_summary "FAIL"
+    [ "$CI_COLLECT_ALL" != true ] || return 0
     exit 1
   fi
 }
@@ -1152,6 +1274,16 @@ MATERIALS
     code=$?
     duration=$(($(ci_epoch) - start))
 
+    if [ "$CI_COLLECT_ALL" = true ]; then
+      mkdir -p "$CI_RUN_DIR/collection/sql"
+      if ! (cd "$SCRIPT_DIR" && python3 -m verification.collection sql "$results_file" "$code" --invocation "${CI_LAST_INVOCATION_RECORD:-}") >"$CI_RUN_DIR/collection/sql/${suite}.$(basename "$(dirname "$results_file")").json"; then
+        ci_record_sql_suite "$suite" "FAIL" "$duration" "$log_path"
+        ci_mark_failure_tail "SQL collection has incomplete exit, identity or cleanup facts: $suite" "$log_path"
+        ci_render_summary "FAIL"
+        exit 1
+      fi
+      [ "$code" -eq 0 ] || CI_COLLECTION_RESULT=1
+    fi
     local status classification_code=0
     ci_classify_sql_results "$suite" "$results_file" || classification_code=$?
     status="$CI_SQL_RESULT_STATUS"
@@ -1160,6 +1292,7 @@ MATERIALS
       ci_record_sql_suite "native-cross-process:$suite" "$status" "$duration" "$log_path"
     else
       failed=1
+      [ "$CI_COLLECT_ALL" != true ] || CI_COLLECTION_RESULT=1
       if [ "$NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED" = "1" ]; then
         ci_record_sql_suite "native-cross-process:$suite" "FAIL" "$duration" "$log_path"
         if [ -z "$CI_FAILURE_TAIL" ]; then
@@ -1174,6 +1307,7 @@ MATERIALS
 
   if [ "$failed" -ne 0 ] && [ "$NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED" = "1" ]; then
     ci_render_summary "FAIL"
+    [ "$CI_COLLECT_ALL" != true ] || return 0
     exit 1
   fi
 }
@@ -1269,15 +1403,15 @@ main() {
     exit 0
   fi
 
-  init_run_dir
   trap cleanup EXIT
+  init_run_dir || return $?
   validate_explicit_suites_early
 
   if [ "$CARGO_ONLY" = "true" ]; then
     run_cargo_gates || return $?
-    ci_render_summary "PASS"
-    echo "PASS: $CI_SUMMARY"
-    exit 0
+    CI_RUN_REACHED_END=true
+    ci_render_summary "RUNNING"
+    return 0
   fi
 
   trap cleanup EXIT
@@ -1297,11 +1431,27 @@ main() {
     ci_record_stage "standalone" "SKIP" "0" ""
     ci_render_summary "RUNNING"
   fi
-  run_sql_suites
-  run_native_cross_process_sql_suites
+  if [ "$CI_COLLECT_ALL" = true ]; then
+    run_sql_suites || return $?
+    run_native_cross_process_sql_suites || return $?
+  else
+    run_sql_suites
+    run_native_cross_process_sql_suites
+  fi
 
-  ci_render_summary "PASS"
-  echo "PASS: $CI_SUMMARY"
+  CI_RUN_REACHED_END=true
+  if [ "$CI_COLLECT_ALL" = true ]; then
+    CI_COLLECTION_REACHED_END=true
+    if [ "$CI_COLLECTION_RESULT" -ne 0 ]; then
+      ci_render_summary "FAIL"
+      echo "Collection stages finished with raw failures or classification obligations; final status follows cleanup: $CI_SUMMARY"
+      return "$CI_COLLECTION_RESULT"
+    fi
+  fi
+  # Every normal run publishes its final status only after actual source-end
+  # and cleanup; read-only dispatch paths return before installing this trap.
+  ci_render_summary "RUNNING"
+  return 0
 }
 
 if [ "${1:-}" != "--source-only" ]; then

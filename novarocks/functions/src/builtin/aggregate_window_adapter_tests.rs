@@ -900,3 +900,89 @@ fn every_window_lifecycle_callback_keeps_the_original_cause_and_poisons_the_part
         }
     }
 }
+
+fn admit_extrema_profile(
+    fixture: &Fixture,
+    lifecycle: PureCallLifecycle,
+    control: &dyn PureCompileControl,
+) -> Result<(), FunctionBindingError> {
+    let declaration = fixture
+        .catalog
+        .pure_overload_declaration_observed(
+            &fixture.function,
+            FunctionKind::Aggregate,
+            &fixture.selected.overload,
+            &CompileControl::default(),
+        )
+        .unwrap();
+    declaration.admit_selected_lifecycle_observed(&fixture.selected, 1, lifecycle, control)
+}
+
+#[test]
+fn extrema_static_utf8_refusal_is_only_for_the_aggregate_window_lifecycle() {
+    for name in ["min", "max"] {
+        let text = Fixture::new(
+            name,
+            FunctionValueType::new(DataType::Utf8, true),
+            DecimalOverflowPolicy::ReportError,
+        );
+        admit_extrema_profile(
+            &text,
+            PureCallLifecycle::Aggregate,
+            &CompileControl::default(),
+        )
+        .unwrap();
+        let _original_group_aggregate = text.aggregate();
+        assert!(
+            matches!(admit_extrema_profile(&text,PureCallLifecycle::AggregateWindow,
+            &CompileControl::default()),Err(FunctionBindingError::UnavailableImplementation(overload))
+            if overload==text.selected.overload)
+        );
+        let fixed = Fixture::new(
+            name,
+            FunctionValueType::new(DataType::Int64, true),
+            DecimalOverflowPolicy::ReportError,
+        );
+        admit_extrema_profile(
+            &fixed,
+            PureCallLifecycle::AggregateWindow,
+            &CompileControl::default(),
+        )
+        .unwrap();
+        fixed
+            .try_window(None, false, false, &CompileControl::default())
+            .unwrap();
+    }
+}
+
+#[test]
+fn extrema_static_window_refusal_preserves_all_original_control_causes() {
+    let fixture = Fixture::new(
+        "min",
+        FunctionValueType::new(DataType::Utf8, true),
+        DecimalOverflowPolicy::ReportError,
+    );
+    let baseline = CompileControl::default();
+    assert!(matches!(
+        admit_extrema_profile(&fixture, PureCallLifecycle::AggregateWindow, &baseline),
+        Err(FunctionBindingError::UnavailableImplementation(_))
+    ));
+    let trace = baseline.trace.lock().unwrap().clone();
+    for stop in 0..trace.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = CompileControl {
+                trace: Mutex::default(),
+                refusal: Some((stop, cause.clone())),
+            };
+            assert!(
+                matches!(admit_extrema_profile(&fixture,PureCallLifecycle::AggregateWindow,&control),
+                Err(FunctionBindingError::Control(actual)) if actual==cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..=stop]);
+        }
+    }
+}

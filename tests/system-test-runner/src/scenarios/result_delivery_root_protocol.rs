@@ -579,6 +579,42 @@ mod tests {
     }
 
     #[test]
+    fn task_candidates_preserve_the_first_appended_stdout_marker_and_order() {
+        let ready = "NOVAROCKS_READY role=be grpc_port=23000\n";
+        let earlier = marker().replace("-7:23:2", "-7:22:2");
+        let baseline = format!("{ready}{earlier}");
+        let first = marker();
+        let second = marker().replace("task=17", "task=18");
+        let observed = format!("{baseline}{first}{second}");
+        let candidates = parse_created_task_candidates(&[baseline], &[observed], 0).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0], parse_created_line(first.trim_end()).unwrap());
+        assert_eq!(
+            candidates[1],
+            parse_created_line(second.trim_end()).unwrap()
+        );
+    }
+
+    #[test]
+    fn task_candidates_reject_shrunk_or_replaced_stdout_prefixes() {
+        let baseline = "NOVAROCKS_READY role=be\n";
+        let same_size_replacement = baseline.replace("READY", "OTHER");
+        assert_eq!(same_size_replacement.len(), baseline.len());
+        for observed in [
+            baseline[..baseline.len() - 1].to_owned(),
+            same_size_replacement,
+            format!("unexpected prefix\n{baseline}{}", marker()),
+        ] {
+            let error =
+                parse_created_task_candidates(&[baseline.into()], &[observed], 0).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "backend log was replaced instead of appended"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_replaced_logs_missing_duplicate_and_wrong_backend_markers() {
         assert!(parse_unique_created_task(&["old\n".into()], &[marker()], 0).is_err());
         assert!(parse_unique_created_task(&["".into()], &["".into()], 0).is_err());

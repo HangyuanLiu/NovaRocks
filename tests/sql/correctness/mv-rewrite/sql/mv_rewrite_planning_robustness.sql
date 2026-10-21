@@ -197,42 +197,52 @@ SELECT region, SUM(amount) FROM part_sales GROUP BY region;
 SELECT region, SUM(amount) AS s FROM part_sales GROUP BY region ORDER BY region;
 
 -- query 25
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW part_mv;
+SET CATALOG mvrw_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.part_mv;
 
 -- query 26
 -- @skip_result_check=true
 USE ns2_${uuid0};
 
 -- query 27
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW xns_mv;
+SET CATALOG mvrw_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns2_${uuid0}.xns_mv;
 
 -- query 28
 -- @skip_result_check=true
 USE ns_${uuid0};
 
 -- query 29
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW sales_full_mv;
+SET CATALOG mvrw_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.sales_full_mv;
 
 -- query 30
+-- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE mvrw_${uuid0}.ns_${uuid0}.part_sales FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.part_sales FORCE;
 
 -- query 31
+-- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE mvrw_${uuid0}.ns_${uuid0}.sales_data FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.sales_data FORCE;
 
 -- query 32
+-- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE mvrw_${uuid0}.ns2_${uuid0};
+DROP DATABASE IF EXISTS mvrw_${uuid0}.ns2_${uuid0};
 
 -- query 33
+-- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
+DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 34
 -- @cleanup=true
 -- @skip_result_check=true
-DROP CATALOG mvrw_${uuid0};
+DROP CATALOG IF EXISTS mvrw_${uuid0};

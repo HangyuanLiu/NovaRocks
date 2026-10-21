@@ -42,6 +42,8 @@ use crate::query_execution::schedule::FragmentInstancePlacement;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ParticipantObservationFailure {
     Transport(&'static str),
+    /// Original typed connection loss survived the bounded covered reconnect.
+    ConnectionLost,
     IdentityViolation(&'static str),
 }
 
@@ -49,6 +51,7 @@ impl ParticipantObservationFailure {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Transport(state) | Self::IdentityViolation(state) => state,
+            Self::ConnectionLost => "connection_lost",
         }
     }
 }
@@ -702,6 +705,13 @@ impl TaskExecutionError {
                 QueryFailureReason::TransportDeadline,
                 ExecutionFailureSite::Coordinator,
             ),
+            Self::ParticipantUnobservable {
+                backend,
+                state: ParticipantObservationFailure::ConnectionLost,
+            } => (
+                QueryFailureReason::BackendLost,
+                ExecutionFailureSite::Backend { process: *backend },
+            ),
             Self::PreReadyEstablishTransportUnknown { backend }
             | Self::ParticipantUnobservable {
                 backend,
@@ -881,6 +891,53 @@ mod canonical_input_tests {
             assert!(input.fact().resource().is_none());
         }
     }
+    #[test]
+    fn only_original_covered_connection_loss_requests_exact_process_recovery() {
+        use novarocks_query_application::api::NativeAttemptTopologyRequirement;
+        use novarocks_query_application::coordination::AttemptFailureClass;
+        let backend = BackendProcessId::new_v7();
+        let actual = TaskExecutionError::ParticipantUnobservable {
+            backend,
+            state: ParticipantObservationFailure::ConnectionLost,
+        }
+        .preparation_input();
+        assert_eq!(
+            actual.fact(),
+            QueryFailureReason::BackendLost.failure_fact()
+        );
+        assert_eq!(
+            actual.site(),
+            ExecutionFailureSite::Backend { process: backend }
+        );
+        assert_eq!(
+            actual.attempt_class(),
+            AttemptFailureClass::RecoverableInfrastructure
+        );
+        assert_eq!(
+            actual.topology_requirement(),
+            NativeAttemptTopologyRequirement::ExcludeProcess(backend)
+        );
+        for state in ["budget_exhausted", "rejected", "connection_lost"] {
+            let unknown = TaskExecutionError::ParticipantUnobservable {
+                backend,
+                state: ParticipantObservationFailure::Transport(state),
+            }
+            .preparation_input();
+            assert_eq!(
+                unknown.fact(),
+                QueryFailureReason::ObservationLost.failure_fact()
+            );
+            assert_eq!(
+                unknown.attempt_class(),
+                AttemptFailureClass::ExecutionFailure
+            );
+            assert_eq!(
+                unknown.topology_requirement(),
+                NativeAttemptTopologyRequirement::LiveSnapshot
+            );
+        }
+    }
+
     #[test]
     fn unknown_establish_and_expired_local_queue_do_not_invent_backend_loss() {
         let backend = BackendProcessId::new_v7();

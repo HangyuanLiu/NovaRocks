@@ -174,6 +174,46 @@ jq '
 assert_rejected "$execution_contract_extra" \
   "novarocks-execution-contract internal normal dependencies must be exactly"
 
+# The new failure fact owner is required, not an arbitrary extra neutral edge.
+for owner in novarocks-execution-contract novarocks-result-contract; do
+  missing_failure="$tmpdir/$owner-missing-failure-contract.json"
+  jq --arg owner "$owner" '
+    (.packages[] | select(.name == $owner) | .dependencies) |= map(
+      select(.name != "novarocks-failure-contract")
+    )
+  ' "$base_metadata" >"$missing_failure"
+  if [ "$owner" = novarocks-execution-contract ]; then
+    assert_rejected "$missing_failure" \
+      "$owner internal normal dependencies must be exactly"
+  else
+    assert_rejected "$missing_failure" \
+      "$owner normal dependencies must be exactly: novarocks-failure-contract"
+  fi
+
+  optional_failure="$tmpdir/$owner-optional-failure-contract.json"
+  jq --arg owner "$owner" '
+    (.packages[] | select(.name == $owner) | .dependencies[] |
+      select(.name == "novarocks-failure-contract") | .optional) = true
+  ' "$base_metadata" >"$optional_failure"
+  assert_rejected "$optional_failure" \
+    "$owner must directly declare required normal dependency novarocks-failure-contract"
+done
+
+result_missing_failure_edge="$tmpdir/result-missing-failure-edge.json"
+drop_normal_resolve_edge novarocks-result-contract novarocks-failure-contract \
+  "$result_missing_failure_edge"
+assert_rejected "$result_missing_failure_edge" \
+  "novarocks-result-contract normal dependency closure must be exactly: novarocks-failure-contract"
+
+result_extra_internal="$tmpdir/result-extra-internal.json"
+jq '
+  (.packages[] | select(.name == "novarocks-result-contract") | .dependencies) += [{
+    name: "novarocks-types", kind: null, optional: false
+  }]
+' "$base_metadata" >"$result_extra_internal"
+assert_rejected "$result_extra_internal" \
+  "novarocks-result-contract normal dependencies must be exactly: novarocks-failure-contract"
+
 result_contract_direct="$tmpdir/result-contract-direct.json"
 jq '
   (.packages[] | select(.name == "novarocks-result-contract") | .dependencies) += [{
@@ -201,15 +241,57 @@ result_contract_missing_resolved_failure="$tmpdir/result-contract-missing-resolv
 drop_normal_resolve_edge novarocks-result-contract novarocks-failure-contract \
   "$result_contract_missing_resolved_failure"
 assert_rejected "$result_contract_missing_resolved_failure" \
-  "novarocks-result-contract normal dependency closure must contain only: novarocks-failure-contract"
+  "novarocks-result-contract normal dependency closure must be exactly: novarocks-failure-contract"
 grep -Fq "missing: novarocks-failure-contract" "$result_contract_missing_resolved_failure.stderr"
 
 for forbidden in novarocks-proto-models novarocks-execution tonic; do
   result_contract_closure="$tmpdir/result-contract-${forbidden}.json"
   add_normal_resolve_edge novarocks-result-contract "$forbidden" "$result_contract_closure"
   assert_rejected "$result_contract_closure" \
-    "novarocks-result-contract normal dependency closure must contain only: novarocks-failure-contract"
+    "novarocks-result-contract normal dependency closure must be exactly: novarocks-failure-contract"
   grep -Fq "$forbidden" "$result_contract_closure.stderr"
+done
+
+# FailureContract stays below every runtime and wire owner. An inactive
+# optional external declaration is forbidden even when resolve omits its edge.
+for dependency in bytes novarocks-execution novarocks-worker novarocks-native-adapter; do
+  for optional in true false; do
+    failure_direct="$tmpdir/failure-direct-$dependency-$optional.json"
+    jq --arg dependency "$dependency" --argjson optional "$optional" '
+      (.packages[] | select(.name == "novarocks-failure-contract") | .dependencies) += [{
+        name: $dependency, kind: null, optional: $optional
+      }]
+    ' "$base_metadata" >"$failure_direct"
+    assert_rejected "$failure_direct" \
+      "novarocks-failure-contract must not declare normal dependencies: $dependency"
+  done
+done
+
+for forbidden in bytes novarocks-types novarocks-proto-models novarocks-execution novarocks-worker novarocks-native-adapter tonic; do
+  failure_closure="$tmpdir/failure-closure-$forbidden.json"
+  add_normal_resolve_edge novarocks-failure-contract "$forbidden" "$failure_closure"
+  assert_rejected "$failure_closure" \
+    "novarocks-failure-contract normal dependency closure must be empty:"
+  grep -Fq "$forbidden" "$failure_closure.stderr"
+done
+
+# A second hop must not hide a forbidden runtime/wire owner behind Types.
+# These are independent graph mutations; declarations remain the clean base.
+for forbidden in novarocks-execution novarocks-worker novarocks-native-adapter novarocks-proto-models; do
+  failure_transitive="$tmpdir/failure-transitive-$forbidden.json"
+  add_normal_resolve_edge novarocks-failure-contract novarocks-types "$failure_transitive"
+  types_id="$(package_id novarocks-types)"
+  forbidden_id="$(package_id "$forbidden")"
+  jq --arg types_id "$types_id" --arg forbidden_id "$forbidden_id" '
+    (.resolve.nodes[] | select(.id == $types_id) | .deps) += [{
+      name: "native_wire_boundary_transitive_mutation",
+      pkg: $forbidden_id, dep_kinds: [{kind: null, target: null}]
+    }]
+  ' "$failure_transitive" >"$failure_transitive.updated"
+  mv "$failure_transitive.updated" "$failure_transitive"
+  assert_rejected "$failure_transitive" \
+    "novarocks-failure-contract normal dependency closure must be empty:"
+  grep -Fq "$forbidden" "$failure_transitive.stderr"
 done
 
 task_codec_execution="$tmpdir/task-codec-execution.json"
@@ -298,7 +380,7 @@ for forbidden in novarocks-proto-models novarocks-execution; do
     }]
   ' "$base_metadata" >"$failure_contract_closure"
   assert_rejected "$failure_contract_closure" \
-    "novarocks-execution-contract normal dependency closure contains forbidden packages:"
+    "novarocks-failure-contract must not declare normal dependencies:"
   grep -Fq "$forbidden" "$failure_contract_closure.stderr"
 done
 

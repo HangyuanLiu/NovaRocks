@@ -455,6 +455,10 @@ pub enum FinalPlanCompletionError {
     Compiler {
         message: Arc<str>,
     },
+    /// The original compiler domain cause, without reclassifying its fact.
+    Source {
+        source: novarocks_execution_contract::failure::SharedFailureCause,
+    },
     /// A statement the analyzer rejected, kept as the analyzer stated it.
     ///
     /// Its code, its phase and the place in the text it points at are what a
@@ -494,11 +498,19 @@ impl fmt::Display for FinalPlanCompletionError {
                 formatter.write_str("final plan completion resource budget was exhausted")
             }
             Self::Analyze { error } => error.fmt(formatter),
+            Self::Source { source } => source.fmt(formatter),
         }
     }
 }
 
-impl std::error::Error for FinalPlanCompletionError {}
+impl std::error::Error for FinalPlanCompletionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Source { source } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 fn access_error(error: FinalPlanAccessError) -> FinalPlanCompletionError {
     FinalPlanCompletionError::AccessCoverage {
@@ -527,6 +539,9 @@ fn compiler_error(error: novarocks_sql::compiler::SqlCompileError) -> FinalPlanC
         }
         novarocks_sql::compiler::SqlCompileError::Analyze(error) => {
             FinalPlanCompletionError::Analyze { error }
+        }
+        novarocks_sql::compiler::SqlCompileError::CompilationSource(source) => {
+            FinalPlanCompletionError::Source { source }
         }
         error => FinalPlanCompletionError::Compiler {
             message: Arc::from(error.to_string()),
@@ -578,6 +593,60 @@ mod tests {
             compiler_error(SqlCompileError::ResourceExhausted),
             FinalPlanCompletionError::ResourceExhausted
         );
+    }
+
+    #[test]
+    fn actual_constant_limit_keeps_the_same_source_through_completion() {
+        use arrow::array::{Array, Int64Array};
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_execution_contract::failure::{FailureClass, FailureProjection, domain};
+        use novarocks_physical_plan::{ConstantError, ConstantPolicy, ConstantPool, ValueType};
+        use novarocks_sql::compiler::{SqlCompileError, SqlCompileProgressError};
+        let source = ConstantPool::try_new(
+            Arc::new(Field::new("value", DataType::Int64, false)),
+            ValueType::new(DataType::Int64, false),
+            Int64Array::from(vec![1, 2]).to_data(),
+            ConstantPolicy {
+                max_rows: 1,
+                max_array_nodes: 8,
+                max_logical_elements: 8,
+                max_retained_buffer_bytes: 4096,
+                max_type_depth: 8,
+                max_type_nodes: 8,
+                max_dictionary_depth: 8,
+                max_metadata_bytes: 32768,
+                max_library_validation_work: 1 << 20,
+                max_library_validation_bytes: 1 << 20,
+            },
+            novarocks_type_contract::CompilePhase::Validate,
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap_err();
+        assert!(matches!(source, ConstantError::Limit(_)));
+        let expected = source.failure_fact();
+        assert_eq!(expected.class(), FailureClass::Resource);
+        assert_eq!(expected.reason().domain(), domain::CONSTANT.get());
+        assert_eq!(expected.reason().code(), 2);
+        let compile = SqlCompileError::from(source);
+        let SqlCompileError::CompilationSource(original) = &compile else {
+            panic!("the constant author must keep its original source");
+        };
+        let original = original.clone();
+        for completion in [
+            compiler_error(compile.clone()),
+            compiler_progress_error(SqlCompileProgressError::Compile(compile)),
+        ] {
+            assert!(std::error::Error::source(&completion).is_some());
+            let FinalPlanCompletionError::Source { source } = completion else {
+                panic!("completion must preserve the original compiler source");
+            };
+            assert_eq!(source, original);
+            assert_eq!(source.failure_fact(), expected);
+            assert!(matches!(
+                source.downcast_ref::<ConstantError>(),
+                Some(ConstantError::Limit(_))
+            ));
+        }
     }
 
     struct NoFactSource {

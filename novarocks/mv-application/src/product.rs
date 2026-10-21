@@ -211,6 +211,7 @@ pub struct MvProductError {
     kind: MvProductErrorKind,
     message: String,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
+    unavailable_implementation: Option<novarocks_sql::analyze_error::AnalyzeError>,
 }
 
 impl MvProductError {
@@ -219,6 +220,7 @@ impl MvProductError {
             kind,
             message: message.into(),
             compile_control: None,
+            unavailable_implementation: None,
         }
     }
 
@@ -231,6 +233,31 @@ impl MvProductError {
     }
     pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
         self.compile_control.clone()
+    }
+
+    /// Retain only the typed missing-implementation cause, never diagnostic text.
+    pub fn with_unavailable_implementation(
+        mut self,
+        error: Option<novarocks_sql::analyze_error::AnalyzeError>,
+    ) -> Self {
+        if matches!(
+            self.kind,
+            MvProductErrorKind::CommitUnknown | MvProductErrorKind::KnownCommittedFinalizeFailed
+        ) {
+            self.unavailable_implementation = None;
+            return self;
+        }
+        self.unavailable_implementation = error.filter(|error| {
+            error.kind()
+                == novarocks_sql::analyze_error::AnalyzeErrorKind::UnavailableImplementation
+        });
+        self
+    }
+
+    pub fn unavailable_implementation(
+        &self,
+    ) -> Option<&novarocks_sql::analyze_error::AnalyzeError> {
+        self.unavailable_implementation.as_ref()
     }
 
     pub const fn kind(&self) -> MvProductErrorKind {

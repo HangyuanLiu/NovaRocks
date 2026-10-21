@@ -1373,6 +1373,14 @@ mod scalar_domain_tests {
 
     #[test]
     fn m07_window_final_compiler_scalar_proof_matches_the_frozen_output() {
+        // This oracle checks the window output domain and frozen scalar proof, not
+        // to_bitmap or variant_get availability. Installed bitmap_agg and an exact
+        // NULL Variant declaration supply the same opaque/Variant input domains.
+        // Pure LEAD/LAG defaults support only existing numeric/Utf8 profiles:
+        // Json uses a neutral NULL; mixed physical carriers exercise both default
+        // conversions, and Variant uses the installed two-argument source path.
+        // The semantic-only value-supplier and Variant-default tests above retain
+        // the mixed nominal/default rules independently of pure CPU admission.
         use crate::compiler::{
             DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
             SqlCompileIntent, SqlCompileProgress, SqlCompiler, SqlFinalPlanCompileRequest,
@@ -1391,7 +1399,7 @@ mod scalar_domain_tests {
                 V::Json,
             ),
             (
-                "select last_value(to_bitmap(1)) over ()",
+                "with q as (select bitmap_agg(1) b) select last_value(b) over () from q",
                 D::Bitmap,
                 V::Opaque(O::Bitmap),
             ),
@@ -1406,27 +1414,32 @@ mod scalar_domain_tests {
                 V::Json,
             ),
             (
-                "select lag(parse_json('{}'),1,'plain') over ()",
+                "select lag(parse_json('{}'),1,null) over ()",
                 D::Json,
                 V::Json,
             ),
             (
-                "select lead('plain',1,parse_json('{}')) over ()",
+                "select lead('plain',1,cast(7 as bigint)) over ()",
                 D::Plain,
                 V::String,
             ),
             (
-                "select first_value(cast(variant_get(cast(null as variant),'$.a') as variant)) over ()",
+                "select lag(cast(7 as bigint),1,'2') over ()",
+                D::Plain,
+                V::SignedInteger(64),
+            ),
+            (
+                "select first_value(cast(null as variant)) over ()",
                 D::Variant,
                 V::Variant,
             ),
             (
-                "with q as (select variant_get(cast(null as variant),'$.a') as v) select lead(v,1,cast(v as variant)) over () from q",
+                "with q as (select cast(null as variant) as v) select lead(v,1) over () from q",
                 D::Variant,
                 V::Variant,
             ),
             (
-                "with q as (select variant_get(cast(null as variant),'$.a') as v) select lag(v,1,cast(v as variant)) over () from q",
+                "with q as (select cast(null as variant) as v) select lag(v,1) over () from q",
                 D::Variant,
                 V::Variant,
             ),

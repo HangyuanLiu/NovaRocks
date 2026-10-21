@@ -1374,6 +1374,8 @@ pub struct ProviderReadStaticContract {
     pub sql_binding: SqlTableBindingId,
     pub request: ProviderReadRequestBinding,
     pub read: ProviderReadReference,
+    /// Exact provider metadata kind accepted while opening this frozen read.
+    pub metadata_kind: Option<novarocks_spi::connector::read_stack::ConnectorReadMetadataKind>,
     pub work_source: ConnectorReadWorkSource,
     pub selection_digest: [u8; 32],
     pub schema: Box<[ProviderReadColumnFact]>,
@@ -1390,6 +1392,7 @@ impl fmt::Debug for ProviderReadStaticContract {
             .field("sql_binding", &self.sql_binding)
             .field("request", &self.request)
             .field("relation_kind", &self.read.relation.kind())
+            .field("metadata_kind", &self.metadata_kind)
             .field("work_source", &self.work_source)
             .field("schema_columns", &self.schema.len())
             .field("predicate_guarantees", &self.predicates.len())
@@ -2614,6 +2617,11 @@ fn validate_provider_contract(
     if contract.read.relation.kind() != need.relation.relation_kind() {
         return Err(CompletionProtocolError::ProviderRelationKindMismatch { id: need.id });
     }
+    if contract.metadata_kind.is_some()
+        != matches!(need.relation, ProviderReadRelationNeed::Metadata { .. })
+    {
+        return Err(CompletionProtocolError::ProviderRelationKindMismatch { id: need.id });
+    }
     let read_binding = &contract.read.binding;
     if read_binding.descriptor().instance_id != *read_binding.catalog_handle().catalog_name()
         || !provider_payload_matches_binding(
@@ -3142,6 +3150,12 @@ fn provider_fact_bytes(fact: &ProviderReadFact) -> Result<u64, CompletionProtoco
                 &contract.request.predicates,
             ),
             provider_reference_bytes(&contract.read),
+            checked_size(
+                contract
+                    .metadata_kind
+                    .as_ref()
+                    .map_or(0, |kind| kind.as_str().len()),
+            ),
             Ok(schema),
             Ok(predicates),
             provider_properties_bytes(&contract.provided_properties),
@@ -3800,6 +3814,13 @@ mod tests {
                     encoded(&binding, ConnectorCodecCategory::ReadView, payload_sentinel),
                 ),
             },
+            metadata_kind: matches!(need.relation(), ProviderReadRelationNeed::Metadata { .. })
+                .then(|| {
+                    novarocks_spi::connector::read_stack::ConnectorReadMetadataKind::try_new(
+                        "$fixture-metadata",
+                    )
+                    .expect("fixture metadata kind")
+                }),
             work_source: ConnectorReadWorkSource::RuntimeSplits,
             selection_digest: [8; 32],
             schema: Box::from([ProviderReadColumnFact::new(
@@ -4312,6 +4333,41 @@ mod tests {
                 CompletionResource::ExchangeBytes
             ))
         ));
+    }
+
+    #[test]
+    fn metadata_kind_is_an_exact_provider_fact_and_only_metadata_reads_carry_it() {
+        use novarocks_spi::connector::read_stack::ConnectorReadMetadataKind;
+        let data = provider_need(1, DataType::Int64, &[], None);
+        let mut wrong_data = provider_contract(&data, b"private");
+        wrong_data.metadata_kind = Some(ConnectorReadMetadataKind::try_new("$snapshots").unwrap());
+        assert!(matches!(
+            ProviderReadFact::negotiated(&data, wrong_data),
+            Err(CompletionProtocolError::ProviderRelationKindMismatch { .. })
+        ));
+        let mut metadata = data.clone();
+        metadata.relation = ProviderReadRelationNeed::Metadata {
+            relation: TableIdentity::new("iceberg", "db", "orders"),
+            kind: MetadataTableKind::Snapshots,
+            version: ProviderReadVersionNeed::Current,
+        };
+        let mut exact = provider_contract(&metadata, b"private");
+        exact.metadata_kind = Some(ConnectorReadMetadataKind::try_new("$snapshots").unwrap());
+        let fact = ProviderReadFact::negotiated(&metadata, exact.clone()).unwrap();
+        assert_eq!(
+            fact.contract().metadata_kind.as_ref().unwrap().as_str(),
+            "$snapshots"
+        );
+        let full_bytes = provider_fact_bytes(&fact).unwrap();
+        exact.metadata_kind = None;
+        assert!(matches!(
+            ProviderReadFact::negotiated(&metadata, exact),
+            Err(CompletionProtocolError::ProviderRelationKindMismatch { .. })
+        ));
+        let mut longer = fact.clone();
+        longer.contract.metadata_kind =
+            Some(ConnectorReadMetadataKind::try_new("$snapshots-extra").unwrap());
+        assert_eq!(provider_fact_bytes(&longer).unwrap() - full_bytes, 6);
     }
 
     #[test]

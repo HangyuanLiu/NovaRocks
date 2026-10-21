@@ -262,11 +262,15 @@ fn visit(
         .iter()
         .find(|child| child.name == COMMON_METRICS)
     {
-        match parse_plan_node_id(&node.name) {
+        let (plan_node_id, label) = match &node.compiled_operator {
+            Some(identity) => (identity.single_plan_node_id(), identity.label.clone()),
+            None => (parse_plan_node_id(&node.name), operator_label(&node.name)),
+        };
+        match plan_node_id {
             Some(plan_node_id) => {
                 let key = OperatorKey {
                     plan_node_id,
-                    operator: operator_label(&node.name),
+                    operator: label,
                 };
                 let entry = merged.entry(key).or_default();
                 entry.absorb(common);
@@ -418,6 +422,35 @@ mod tests {
         assert_eq!(entries[0].input_rows(), Some(0));
         assert_eq!(entries[0].output_rows(), Some(500));
         assert_eq!(entries[0].wall_time(), Some(Duration::from_nanos(7_000)));
+    }
+
+    #[test]
+    fn compiled_identity_survives_merge_without_reading_display_names() {
+        use crate::runtime::profile::CompiledOperatorProfile;
+        use novarocks_local_program::DiagnosticSourceNodeId;
+        use std::sync::Arc;
+        let profile = RuntimeProfile::new("fragment");
+        add_operator(&profile, "misleading (plan_node_id=999)", 3, 5, 7);
+        let operator = profile.get_child("misleading (plan_node_id=999)").unwrap();
+        operator.set_compiled_operator(Arc::new(CompiledOperatorProfile {
+            sources: Box::from([DiagnosticSourceNodeId::new(42)]),
+            label: "ValuesSource".into(),
+        }));
+        let merged = RuntimeProfile::merge_isomorphic_profiles(&[profile.clone(), profile]);
+        let result = project_operator_statistics(&merged.to_native_tree());
+        assert_eq!(result.statistics().len(), 1);
+        assert_eq!(result.statistics()[0].plan_node_id(), 42);
+        assert_eq!(result.statistics()[0].operator().as_str(), "ValuesSource");
+        assert_eq!(result.statistics()[0].output_rows(), Some(10));
+        let mut fused = (*operator.compiled_operator().unwrap()).clone();
+        fused.sources = Box::from([
+            DiagnosticSourceNodeId::new(42),
+            DiagnosticSourceNodeId::new(43),
+        ]);
+        operator.set_compiled_operator(Arc::new(fused));
+        let result = project_operator_statistics(&operator.to_native_tree());
+        assert!(result.is_empty());
+        assert_eq!(result.unattributed_operators(), 1);
     }
 
     /// The memory hierarchy is not read as a second set of operators.

@@ -440,7 +440,7 @@ mod tests {
         };
         let columns = REWRITE_POSITION_DELETE_OUTPUT_COLUMNS
             .map(|(name, metadata)| {
-                IcebergColumnHandle::base_column(&NestedField::optional(
+                IcebergColumnHandle::base_column(&NestedField::required(
                     metadata.field_id(),
                     name,
                     Type::Primitive(metadata.declared_type()),

@@ -68,6 +68,7 @@ enum QueryServiceErrorBody {
 pub struct QueryServiceError {
     body: QueryServiceErrorBody,
     publication_terminal: Option<LakePublicationTerminal>,
+    maintenance_publication_disposition: Option<LakePublicationDisposition>,
     compile_control: Option<novarocks_type_contract::CompileControlError>,
 }
 
@@ -89,6 +90,7 @@ impl QueryServiceError {
                 message: message.into(),
             },
             publication_terminal: None,
+            maintenance_publication_disposition: None,
             compile_control: None,
         }
     }
@@ -99,6 +101,7 @@ impl QueryServiceError {
         Self {
             body: QueryServiceErrorBody::User { error, message },
             publication_terminal: None,
+            maintenance_publication_disposition: None,
             compile_control: None,
         }
     }
@@ -115,6 +118,7 @@ impl QueryServiceError {
                 message,
             },
             publication_terminal: None,
+            maintenance_publication_disposition: None,
             compile_control: None,
         }
     }
@@ -136,6 +140,7 @@ impl QueryServiceError {
                 message: message.into(),
             },
             publication_terminal: Some(terminal),
+            maintenance_publication_disposition: None,
             compile_control: None,
         }
     }
@@ -173,6 +178,41 @@ impl QueryServiceError {
         }
         self.publication_terminal = Some(terminal);
         self
+    }
+
+    /// Forward only the original maintenance owner's terminal knowledge.
+    /// A disposition alone grants no publication identity or retry authority.
+    /// The selected input, descriptor and phase are retained without rewriting.
+    pub fn attach_maintenance_publication_disposition(
+        mut self,
+        disposition: LakePublicationDisposition,
+    ) -> Self {
+        // This is one original owner's frozen terminal verdict, not a new
+        // observation/update channel. Reapplying it cannot duplicate rendering.
+        if self.maintenance_publication_disposition.is_some() {
+            return self;
+        }
+        let message = match &mut self.body {
+            QueryServiceErrorBody::Message { message, .. }
+            | QueryServiceErrorBody::User { message, .. }
+            | QueryServiceErrorBody::Execution { message, .. } => message,
+        };
+        let label = match disposition {
+            LakePublicationDisposition::KnownUncommitted => None,
+            LakePublicationDisposition::CommitUnknown => Some("CommitUnknown"),
+            LakePublicationDisposition::KnownCommitted => Some("KnownCommitted"),
+        };
+        if let Some(label) = label {
+            use std::fmt::Write;
+            write!(message, " (maintenance publication disposition={label} do_not_retry=true; do not retry statement)")
+                .expect("writing to a String cannot fail");
+        }
+        self.maintenance_publication_disposition = Some(disposition);
+        self
+    }
+
+    pub fn maintenance_publication_disposition(&self) -> Option<LakePublicationDisposition> {
+        self.maintenance_publication_disposition
     }
 
     pub fn with_compile_control(
@@ -535,5 +575,43 @@ mod publication_message_tests {
             execution_public_message(&application),
             Cow::Borrowed("application")
         ));
+    }
+}
+
+#[cfg(test)]
+mod maintenance_publication_companion_tests {
+    use super::*;
+    #[test]
+    fn maintenance_disposition_neither_reauthors_cause_nor_invents_publication_identity() {
+        let original = QueryServiceError::from_compile_control(
+            novarocks_type_contract::CompileControlError::ResourceExhausted,
+        );
+        let input = original.execution_failure().unwrap().clone();
+        for disposition in [
+            LakePublicationDisposition::KnownUncommitted,
+            LakePublicationDisposition::CommitUnknown,
+            LakePublicationDisposition::KnownCommitted,
+        ] {
+            let service = original
+                .clone()
+                .attach_maintenance_publication_disposition(disposition);
+            assert_eq!(service.execution_failure(), Some(&input));
+            assert_eq!(service.user_error(), original.user_error());
+            assert_eq!(service.kind(), original.kind());
+            assert_eq!(
+                service.maintenance_publication_disposition(),
+                Some(disposition)
+            );
+            assert_eq!(service.publication_terminal(), None);
+            assert_eq!(
+                service.message().contains("do not retry statement"),
+                disposition.do_not_retry()
+            );
+            let repeated = service
+                .clone()
+                .attach_maintenance_publication_disposition(disposition);
+            assert_eq!(repeated.message(), service.message());
+            assert_eq!(repeated.execution_failure(), Some(&input));
+        }
     }
 }

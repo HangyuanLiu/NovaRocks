@@ -851,6 +851,39 @@ pub fn decode_root_contract(
     input_columns: usize,
     path: FieldPath,
 ) -> Result<RootOutputContract, ProtocolError> {
+    decode_root_contract_with_scalar_decoder(
+        value,
+        input_columns,
+        path,
+        crate::scalar_result::decode_scalar_schema,
+    )
+}
+
+/// Decode the task-independent package declaration. Local compilation supplies
+/// the sole physical source slot; native transport retains its strict decoder.
+pub fn decode_semantic_root_contract(
+    value: &wire::RootOutputContract,
+    input_columns: usize,
+    path: FieldPath,
+) -> Result<RootOutputContract, ProtocolError> {
+    decode_root_contract_with_scalar_decoder(
+        value,
+        input_columns,
+        path,
+        crate::scalar_result::decode_semantic_result_scalar_schema,
+    )
+}
+
+fn decode_root_contract_with_scalar_decoder(
+    value: &wire::RootOutputContract,
+    input_columns: usize,
+    path: FieldPath,
+    decode_scalar: fn(
+        &wire::ScalarSchema,
+        usize,
+        FieldPath,
+    ) -> Result<novarocks_result_contract::ScalarSchema, ProtocolError>,
+) -> Result<RootOutputContract, ProtocolError> {
     let profile = decode_profile(value.profile_id, path.clone().field("profile_id"))?;
     let kind = decode_kind(
         value
@@ -871,7 +904,7 @@ pub fn decode_root_contract(
             RootOutputKind::InternalFacts(InternalResultDomain::ScalarValueV1),
             None,
             Some(schema),
-        ) => FrozenRootOutput::ScalarValue(crate::scalar_result::decode_scalar_schema(
+        ) => FrozenRootOutput::ScalarValue(decode_scalar(
             schema,
             input_columns,
             path.clone().field("scalar_schema"),
@@ -890,4 +923,70 @@ pub fn decode_root_contract(
         }
     };
     Ok(RootOutputContract::new(profile, output))
+}
+
+#[cfg(test)]
+mod root_contract_binding_tests {
+    use super::*;
+    use novarocks_result_contract::{ScalarField, ScalarSchema, ScalarValueType};
+
+    fn scalar() -> RootOutputContract {
+        RootOutputContract::new(
+            RootProfileId::V1,
+            FrozenRootOutput::ScalarValue(
+                ScalarSchema::try_new(ScalarField {
+                    nullable: true,
+                    value_type: ScalarValueType::SignedInteger(64),
+                })
+                .unwrap(),
+            ),
+        )
+    }
+
+    #[test]
+    fn package_root_defers_scalar_slot_binding_and_native_transport_requires_it() {
+        let expected = scalar();
+        let unbound = encode_root_contract(&expected);
+        let path = FieldPath::root("root");
+        assert_eq!(
+            decode_semantic_root_contract(&unbound, 1, path.clone()).unwrap(),
+            expected
+        );
+        assert!(decode_root_contract(&unbound, 1, path.clone()).is_err());
+        let FrozenRootOutput::ScalarValue(schema) = expected.output() else {
+            panic!("scalar root");
+        };
+        let bound = RootOutputContract::new(
+            RootProfileId::V1,
+            FrozenRootOutput::ScalarValue(schema.clone().bind_native_slots(&[37]).unwrap()),
+        );
+        let encoded = encode_root_contract(&bound);
+        assert_eq!(
+            decode_root_contract(&encoded, 1, path.clone()).unwrap(),
+            bound
+        );
+        assert!(decode_semantic_root_contract(&encoded, 1, path).is_err());
+    }
+
+    #[test]
+    fn semantic_root_keeps_the_exact_width_profile_and_purpose_guards() {
+        let valid = encode_root_contract(&scalar());
+        for width in [0, 2] {
+            assert!(decode_semantic_root_contract(&valid, width, FieldPath::root("root")).is_err());
+        }
+        let mut invalid_profile = valid.clone();
+        invalid_profile.profile_id = 0;
+        let mut wrong_purpose = valid.clone();
+        wrong_purpose.output_kind = Some(encode_kind(RootOutputKind::CountOnly));
+        let mut missing_tree = valid;
+        missing_tree
+            .scalar_schema
+            .as_mut()
+            .unwrap()
+            .field_nodes
+            .clear();
+        for invalid in [invalid_profile, wrong_purpose, missing_tree] {
+            assert!(decode_semantic_root_contract(&invalid, 1, FieldPath::root("root")).is_err());
+        }
+    }
 }

@@ -1,4 +1,4 @@
--- query 3
+-- query 4
 source	id	p	value
 base	1	1	one
 base	2	1	dup
@@ -16,7 +16,7 @@ incremental	2	1	dup
 incremental	3	1	three
 incremental	4	1	four
 
--- query 7
+-- query 8
 source	id	p	value
 base	1	1	one
 base	2	1	new-two
@@ -34,7 +34,7 @@ incremental	3	1	three
 incremental	4	1	four
 incremental	6	1	six
 
--- query 11
+-- query 12
 source	id	p	value
 base	1	1	one
 base	3	1	three
@@ -46,7 +46,7 @@ incremental	1	1	one
 incremental	3	1	three
 incremental	4	1	four
 
--- query 15
+-- query 16
 source	id	p	value
 base	1	1	one
 base	3	1	three
@@ -58,7 +58,7 @@ incremental	1	1	one
 incremental	3	1	three
 incremental	4	1	four
 
--- query 19
+-- query 20
 source	id	p	value
 base	7	1	seven
 base	8	1	eight

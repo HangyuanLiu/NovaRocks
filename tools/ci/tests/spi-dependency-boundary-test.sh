@@ -198,6 +198,26 @@ for neutral in novarocks-type-contract novarocks-result-contract novarocks-failu
   assert_accepted "$optional_neutral_root"
 done
 
+# Shared failure facts are neutral; their name cannot hide a runtime or owner.
+failure_contract_root="$(new_mutation failure-contract)"
+append_dependency "$failure_contract_root/Cargo.toml" \
+  'novarocks-failure-contract = { path = "deps/novarocks-failure-contract" }'
+assert_accepted "$failure_contract_root"
+
+failure_runtime_root="$tmpdir/failure-runtime"
+cp -R "$failure_contract_root" "$failure_runtime_root"
+append_dependency "$failure_runtime_root/deps/novarocks-failure-contract/Cargo.toml" \
+  'tokio = { path = "../tokio" }'
+assert_rejected "$failure_runtime_root" \
+  "novarocks-spi normal dependency closure contains a forbidden async runtime: tokio"
+
+failure_application_root="$tmpdir/failure-application"
+cp -R "$failure_contract_root" "$failure_application_root"
+append_dependency "$failure_application_root/deps/novarocks-failure-contract/Cargo.toml" \
+  'novarocks-execution = { path = "../novarocks-execution" }'
+assert_rejected "$failure_application_root" \
+  "novarocks-spi normal dependency closure contains a forbidden application/execution owner: novarocks-execution"
+
 # Dev/build edges do not confer a normal production dependency.
 non_normal_root="$(new_mutation non-normal-runtime)"
 append_dependency "$non_normal_root/Cargo.toml" '[dev-dependencies]'

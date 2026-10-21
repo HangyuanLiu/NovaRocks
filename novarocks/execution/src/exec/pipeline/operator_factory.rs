@@ -33,6 +33,12 @@ use super::operator::Operator;
 pub trait OperatorFactory: Send + Sync {
     fn name(&self) -> &str;
 
+    fn compiled_operator_profile(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::runtime::profile::CompiledOperatorProfile>> {
+        None
+    }
+
     /// Freeze the actual built pipeline geometry before any driver is
     /// instantiated. Host-owned bounded sinks use this to count completion
     /// after sort/gather collapse without guessing the configured DOP.

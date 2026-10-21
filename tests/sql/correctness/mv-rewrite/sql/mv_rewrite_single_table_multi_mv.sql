@@ -150,22 +150,28 @@ SELECT user_id, SUM(tag_id) FROM user_tags GROUP BY user_id;
 SELECT user_id, SUM(tag_id) AS total FROM user_tags GROUP BY user_id ORDER BY user_id;
 
 -- query 19
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW coarse_mv;
+SET CATALOG mvrw_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.coarse_mv;
 
 -- query 20
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW fine_mv;
+SET CATALOG mvrw_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS ns_${uuid0}.fine_mv;
 
 -- query 21
+-- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE mvrw_${uuid0}.ns_${uuid0}.user_tags FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.user_tags FORCE;
 
 -- query 22
+-- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
+DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 23
 -- @cleanup=true
 -- @skip_result_check=true
-DROP CATALOG mvrw_${uuid0};
+DROP CATALOG IF EXISTS mvrw_${uuid0};

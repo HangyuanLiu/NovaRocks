@@ -1577,7 +1577,7 @@ fn execute_target_query_with_selected_control(
         Some(session.connection_id()),
         fault_deadline,
         || {
-            session.execute_query_with_before_submit(
+            let result = session.execute_query_with_before_submit(
                 query_timeout,
                 sql,
                 db,
@@ -1616,7 +1616,14 @@ fn execute_target_query_with_selected_control(
                     }
                     Ok(())
                 },
-            )
+            );
+            if fault_injection::has_fault(meta) && !result.0 {
+                eprintln!(
+                    "target query before fault verification failed: {}",
+                    result.2
+                );
+            }
+            result
         },
     )
     .unwrap_or_else(|error| {

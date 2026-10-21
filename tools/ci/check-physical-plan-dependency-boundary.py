@@ -18,7 +18,7 @@
 """Verify the pure final physical-plan Cargo dependency boundary.
 
 The final physical plan is a carrier-neutral semantic contract.  It may reuse
-the neutral type, Connector and immutable constant vocabularies, but no
+the neutral type, Connector, failure-fact and immutable constant vocabularies, but no
 application, execution kernel, provider implementation, wire codec, RPC stack,
 or task runtime.
 
@@ -75,6 +75,7 @@ DIRECT_PACKAGE_ALLOW_LIST = frozenset(
 INTERNAL_CONTRACT_NORMAL_ALLOW_LISTS = {
     TYPE_CONTRACT: frozenset({"arrow-schema", RESULT_CONTRACT, FAILURE_CONTRACT}),
     RESULT_CONTRACT: frozenset({FAILURE_CONTRACT}),
+    # ADR-0187: domain facts are a dependency-free vocabulary, not a runtime.
     FAILURE_CONTRACT: frozenset(),
     FUNCTION_CONTRACT: frozenset({TYPE_CONTRACT, CONSTANT_CONTRACT, FAILURE_CONTRACT}),
     CONSTANT_CONTRACT: frozenset({"arrow-array", "arrow-buffer", "arrow-data",

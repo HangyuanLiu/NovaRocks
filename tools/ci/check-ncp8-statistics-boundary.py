@@ -239,6 +239,10 @@ def verify_dependency_boundary(metadata, repo_root):
     # including build/dev/optional/target declarations omitted by normal closure.
     if failure_contract["dependencies"]:
         fail(f"{FAILURE_CONTRACT} must not declare dependencies")
+    if normal_closure(metadata, FAILURE_CONTRACT) != {FAILURE_CONTRACT}:
+        fail(f"{FAILURE_CONTRACT} normal closure must be dependency-free")
+    if normal_closure(metadata, RESULT_CONTRACT) != {RESULT_CONTRACT, FAILURE_CONTRACT}:
+        fail(f"{RESULT_CONTRACT} normal closure must contain only {FAILURE_CONTRACT}")
 
     # Both the runtime aggregate adapter and pure scalar HLL owner use HLL only.
     require_exact_dependency(execution, DATASKETCHES, kind=None, features={"hll"})

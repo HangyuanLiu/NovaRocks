@@ -604,12 +604,42 @@ impl OperationDispatcher {
         self.take_backend_lane_batch(backend, lane_index)
     }
 
+    /// Takes only one already-queued exact head operation. Pending process
+    /// observation uses this for actor-owned Abort, so ordinary lifecycle
+    /// work cannot hitch a ride even though it shares the same lane.
+    pub(super) fn take_priority_operation_batch(
+        &mut self,
+        operation_id: TaskOperationId,
+    ) -> Option<DispatchBatch> {
+        let (backend, lane) = self.backends.iter().find_map(|(&backend, queues)| {
+            queues.lanes.iter().enumerate().find_map(|(lane, queued)| {
+                queued
+                    .front()
+                    .filter(|entry| entry.intent.operation_id() == operation_id)
+                    .map(|_| (backend, lane))
+            })
+        })?;
+        let queues = self.backends.get_mut(&backend)?;
+        if queues.credits[lane] == 0 {
+            queues.credits[lane] = self.budget.permits_for(LANES[lane]);
+        }
+        self.take_backend_lane_batch_limited(backend, lane, 1)
+    }
+
     fn take_backend_lane_batch(
         &mut self,
         backend: BackendProcessId,
         lane: usize,
     ) -> Option<DispatchBatch> {
-        let max_items = self.transport.max_batch_items();
+        self.take_backend_lane_batch_limited(backend, lane, self.transport.max_batch_items())
+    }
+
+    fn take_backend_lane_batch_limited(
+        &mut self,
+        backend: BackendProcessId,
+        lane: usize,
+        max_items: usize,
+    ) -> Option<DispatchBatch> {
         let max_bytes = self.transport.max_batch_encoded_bytes();
         let (operations, queue_permits, queued_bytes, queued_at) = {
             let queues = self.backends.get_mut(&backend)?;

@@ -108,31 +108,31 @@ select time_slice('2023-12-31 03:12:04',interval 2147483647 second);
 
 -- query 17
 -- disable_function_fold_constants=off: date before 0001-01-01
--- @expect_error=time used with time_slice can't before 0001-01-01 00:00:00
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:40)
 USE ${case_db};
 set disable_function_fold_constants=off;
 select time_slice('0000-01-01',interval 5 year);
 
 -- query 18
--- @expect_error=time used with time_slice can't before 0001-01-01 00:00:00
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:40)
 USE ${case_db};
 set disable_function_fold_constants=off;
 select time_slice('0000-01-01',interval 5 month);
 
 -- query 19
--- @expect_error=time used with time_slice can't before 0001-01-01 00:00:00
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:40)
 USE ${case_db};
 set disable_function_fold_constants=off;
 select time_slice('0000-01-01',interval 5 day);
 
 -- query 20
--- @expect_error=time used with time_slice can't before 0001-01-01 00:00:00
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:40)
 USE ${case_db};
 set disable_function_fold_constants=off;
 select time_slice('0000-01-01',interval 5 quarter);
 
 -- query 21
--- @expect_error=time used with time_slice can't before 0001-01-01 00:00:00
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:40)
 USE ${case_db};
 set disable_function_fold_constants=off;
 select time_slice('0000-01-01',interval 5 week);
@@ -310,31 +310,31 @@ select time_slice('2023-12-31 03:12:04',interval 2147483647 second);
 
 -- query 54
 -- disable_function_fold_constants=on: date before 0001-01-01
--- @expect_error=time used with time_slice can't before 0001-01-01 00:00:00
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:40)
 USE ${case_db};
 set disable_function_fold_constants=on;
 select time_slice('0000-01-01',interval 5 year);
 
 -- query 55
--- @expect_error=time used with time_slice can't before 0001-01-01 00:00:00
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:40)
 USE ${case_db};
 set disable_function_fold_constants=on;
 select time_slice('0000-01-01',interval 5 month);
 
 -- query 56
--- @expect_error=time used with time_slice can't before 0001-01-01 00:00:00
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:40)
 USE ${case_db};
 set disable_function_fold_constants=on;
 select time_slice('0000-01-01',interval 5 day);
 
 -- query 57
--- @expect_error=time used with time_slice can't before 0001-01-01 00:00:00
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:40)
 USE ${case_db};
 set disable_function_fold_constants=on;
 select time_slice('0000-01-01',interval 5 quarter);
 
 -- query 58
--- @expect_error=time used with time_slice can't before 0001-01-01 00:00:00
+-- @expect_error=[query.execution.invalid_data] Data failure (reason 1:40)
 USE ${case_db};
 set disable_function_fold_constants=on;
 select time_slice('0000-01-01',interval 5 week);

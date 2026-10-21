@@ -407,13 +407,39 @@ impl MaintenanceCommandConsumer for FrontendMaintenanceCommandConsumer {
                         context.execution(),
                         command_context.connector_context(),
                     )
-                    .map_err(|error| match error.compile_control {
-                        Some(control) => CommandError::from_compile_control(control),
-                        None => CommandError::from(error.message),
-                    }),
+                    .map_err(maintenance_command_error),
             },
         )
     }
+}
+
+fn maintenance_command_error(
+    error: novarocks_table_maintenance::runtime::TerminalError,
+) -> CommandError {
+    use novarocks_spi::connector::LakePublicationDisposition;
+    use novarocks_table_maintenance::runtime::MaintenanceJobState;
+    // Only the publication owner's original terminal state provides this fact.
+    // A capability refusal cannot prove that a publication was uncommitted.
+    let disposition = match error.state {
+        MaintenanceJobState::KnownUncommitted => Some(LakePublicationDisposition::KnownUncommitted),
+        MaintenanceJobState::CommitUnknown => Some(LakePublicationDisposition::CommitUnknown),
+        MaintenanceJobState::KnownCommittedFinalizationFailed => {
+            Some(LakePublicationDisposition::KnownCommitted)
+        }
+        _ => None,
+    };
+    let control = error.compile_control;
+    let command = if let Some(input) = error.execution_failure {
+        CommandError::from_execution_failure(input)
+    } else {
+        match control.clone() {
+            Some(control) => CommandError::from_compile_control(control),
+            None => CommandError::from(error.message),
+        }
+    };
+    command
+        .with_compile_control(control)
+        .with_publication_disposition(disposition)
 }
 
 /// Builds the role-local product adapters at Frontend role composition.
@@ -748,6 +774,13 @@ enum RoutedExecutionError {
         input: novarocks_query_application::execution_error::ExecutionFailureInput,
         terminal: Option<novarocks_spi::connector::LakePublicationTerminal>,
         compile_control: Option<novarocks_type_contract::CompileControlError>,
+        maintenance_publication_disposition:
+            Option<novarocks_spi::connector::LakePublicationDisposition>,
+    },
+    MaintenancePublication {
+        message: String,
+        disposition: novarocks_spi::connector::LakePublicationDisposition,
+        compile_control: Option<novarocks_type_contract::CompileControlError>,
     },
     Engine(String),
     Control(novarocks_type_contract::CompileControlError),
@@ -782,6 +815,7 @@ fn routed_distributed_query_failure(
         input: error.into_execution_failure_input(),
         terminal: None,
         compile_control,
+        maintenance_publication_disposition: None,
     }
 }
 
@@ -798,6 +832,7 @@ fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExe
                 input,
                 terminal: error.publication_terminal().cloned(),
                 compile_control: error.compile_control_error(),
+                maintenance_publication_disposition: None,
             };
         }
         if let Some(failure) = error.take_cow_failure() {
@@ -849,13 +884,30 @@ fn routed_execution_service_error(error: RoutedExecutionError) -> QueryServiceEr
             input,
             terminal,
             compile_control,
+            maintenance_publication_disposition,
         } => {
             let mut service = QueryServiceError::from_execution_failure(input)
                 .with_compile_control(compile_control);
+            if let Some(disposition) = maintenance_publication_disposition {
+                service = service.attach_maintenance_publication_disposition(disposition);
+            }
             if let Some(terminal) = terminal {
                 service = service.attach_publication_terminal(terminal);
             }
             service
+        }
+        RoutedExecutionError::MaintenancePublication {
+            message,
+            disposition,
+            compile_control,
+        } => {
+            let service = match compile_control.clone() {
+                Some(control) => QueryServiceError::from_compile_control(control),
+                None => internal_error(message),
+            };
+            service
+                .with_compile_control(compile_control)
+                .attach_maintenance_publication_disposition(disposition)
         }
         RoutedExecutionError::Control(error) => QueryServiceError::from_compile_control(error),
         RoutedExecutionError::Engine(error) => internal_error(error),
@@ -881,6 +933,13 @@ fn selected_execution_or_worker_fallback(
         Err(error @ RoutedExecutionError::Execution { .. }) => {
             routed_execution_service_error(error)
         }
+        Err(RoutedExecutionError::MaintenancePublication {
+            disposition,
+            compile_control,
+            ..
+        }) => fallback
+            .with_compile_control(compile_control)
+            .attach_maintenance_publication_disposition(disposition),
         Err(RoutedExecutionError::Publication {
             terminal,
             compile_control,
@@ -1032,11 +1091,44 @@ async fn execute_product_statement(
     let result = router
         .execute(command, request_context, command_context)
         .await
-        .map_err(|error| match error.compile_control_error() {
-            Some(control) => RoutedExecutionError::Control(control),
-            None => RoutedExecutionError::Engine(error.to_string()),
-        });
+        .map_err(product_command_error);
     Ok((result, execution_owner))
+}
+
+fn product_command_error(error: CommandError) -> RoutedExecutionError {
+    let disposition = error.publication_disposition();
+    let control = error.compile_control_error();
+    let input = error.execution_failure().cloned().or_else(|| {
+        // An original Source is already owner-selected, unlike a local caller
+        // control fallback. Keep that existing projector and its same fact.
+        match (&disposition, &control) {
+            (Some(_), Some(control @ novarocks_type_contract::CompileControlError::Source(_))) => {
+                QueryServiceError::from_compile_control(control.clone())
+                    .execution_failure()
+                    .cloned()
+            }
+            _ => None,
+        }
+    });
+    if let Some(input) = input {
+        return RoutedExecutionError::Execution {
+            input,
+            terminal: None,
+            compile_control: control,
+            maintenance_publication_disposition: disposition,
+        };
+    }
+    if let Some(disposition) = disposition {
+        return RoutedExecutionError::MaintenancePublication {
+            message: error.to_string(),
+            disposition,
+            compile_control: control,
+        };
+    }
+    match control {
+        Some(control) => RoutedExecutionError::Control(control),
+        None => RoutedExecutionError::Engine(error.to_string()),
+    }
 }
 
 fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
@@ -4348,6 +4440,7 @@ mod tests {
                 input: input.clone(),
                 terminal: Some(terminal.clone()),
                 compile_control: None,
+                maintenance_publication_disposition: None,
             }),
             cancellation_error(QueryCancellationReason::DeadlineExceeded { timeout_ms: 1 }),
         );
@@ -4403,6 +4496,7 @@ mod tests {
                 input,
                 terminal: actual,
                 compile_control,
+                maintenance_publication_disposition,
             }) = result
             else {
                 panic!("the originating input, publication and rich source must survive")
@@ -4418,6 +4512,7 @@ mod tests {
                 input: input.clone(),
                 terminal: actual,
                 compile_control,
+                maintenance_publication_disposition,
             });
             assert_eq!(service.execution_failure(), Some(&input));
             assert_eq!(service.user_error(), Some(&input.user_error()));
@@ -5846,5 +5941,153 @@ mod tests {
             with_query_hints(QueryOptions::from_proto(Default::default()), &session, None);
         assert!(restored.as_proto().allow_throw_exception);
         assert!(session.sql_mode().group_concat_legacy());
+    }
+}
+
+#[cfg(test)]
+mod maintenance_selected_failure_tests {
+    use super::*;
+    use novarocks_execution_contract::{SafeDetail, TaskFailurePhase, TaskIdentity};
+    use novarocks_failure_contract::FailureProjection;
+    use novarocks_query_application::execution_error::{
+        ExecutionFailureInput, ExecutionFailureSite,
+    };
+    use novarocks_table_maintenance::runtime::{MaintenanceJobState, TerminalError};
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+
+    fn selected_input() -> ExecutionFailureInput {
+        let identity = TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(91, 18), AttemptId::new(1).unwrap()).unwrap(),
+            StageId::new(2).unwrap(),
+            TaskId::new(3).unwrap(),
+            BackendProcessId::new_v7(),
+        );
+        ExecutionFailureInput::new(
+            novarocks_local_compiler::FragmentCompileError::Unsupported {
+                node: None,
+                feature: "provider relation other than a table",
+            }
+            .failure_fact(),
+            SafeDetail::new("local fragment capability admission failed").unwrap(),
+            ExecutionFailureSite::Task {
+                identity,
+                phase: TaskFailurePhase::Preparation,
+            },
+        )
+    }
+
+    #[test]
+    fn maintenance_native_selected_input_reaches_sql_without_text_reclassification() {
+        let input = selected_input();
+        let terminal = TerminalError::known_uncommitted("private native diagnostic")
+            .with_execution_failure(Some(input.clone()));
+        let service = routed_execution_service_error(product_command_error(
+            maintenance_command_error(terminal),
+        ));
+        assert_eq!(service.execution_failure(), Some(&input));
+        assert_eq!(
+            service.user_error().unwrap().code(),
+            input.user_error().code()
+        );
+        assert!(service.message().starts_with("[UnsupportedCompiledShape]"));
+        assert!(!service.message().contains("private native diagnostic"));
+        // The same text without the selected input is not evidence.
+        let text = maintenance_command_error(TerminalError::known_uncommitted(
+            input.user_error().to_string(),
+        ));
+        assert_eq!(text.execution_failure(), None);
+    }
+
+    #[test]
+    fn maintenance_selected_input_and_publication_verdict_both_reach_sql() {
+        use novarocks_spi::connector::LakePublicationDisposition;
+        for (state, disposition, label) in [
+            (
+                MaintenanceJobState::CommitUnknown,
+                LakePublicationDisposition::CommitUnknown,
+                "CommitUnknown",
+            ),
+            (
+                MaintenanceJobState::KnownCommittedFinalizationFailed,
+                LakePublicationDisposition::KnownCommitted,
+                "KnownCommitted",
+            ),
+            (
+                MaintenanceJobState::KnownUncommitted,
+                LakePublicationDisposition::KnownUncommitted,
+                "KnownUncommitted",
+            ),
+        ] {
+            let input = selected_input();
+            let control = novarocks_type_contract::CompileControlError::ResourceExhausted;
+            let mut terminal = TerminalError::known_uncommitted("private publication detail")
+                .with_execution_failure(Some(input.clone()))
+                .with_compile_control(Some(control.clone()));
+            terminal.state = state;
+            let command = maintenance_command_error(terminal);
+            assert_eq!(command.execution_failure(), Some(&input));
+            assert_eq!(command.publication_disposition(), Some(disposition));
+            let service = routed_execution_service_error(product_command_error(command));
+            assert_eq!(service.execution_failure(), Some(&input));
+            assert_eq!(service.compile_control_error(), Some(control));
+            assert_eq!(
+                service.maintenance_publication_disposition(),
+                Some(disposition)
+            );
+            assert_eq!(service.publication_terminal(), None); // No invented identity/header.
+            assert_eq!(
+                service.user_error().unwrap().code(),
+                input.user_error().code()
+            );
+            assert!(service.message().starts_with("[UnsupportedCompiledShape]"));
+            assert!(!service.message().contains("private publication detail"));
+            assert_eq!(
+                service.message().contains("do not retry statement"),
+                disposition.do_not_retry()
+            );
+            if disposition.do_not_retry() {
+                assert!(service.message().contains(label));
+            }
+        }
+        // An untyped message is still not evidence of an execution cause.
+        let command = maintenance_command_error(TerminalError::commit_unknown(
+            "original publication verdict",
+        ));
+        assert_eq!(command.execution_failure(), None);
+        assert_eq!(
+            command.publication_disposition(),
+            Some(LakePublicationDisposition::CommitUnknown)
+        );
+        assert!(command.to_string().contains("original publication verdict"));
+        let service = routed_execution_service_error(product_command_error(command));
+        assert_eq!(service.execution_failure(), None);
+        assert_eq!(
+            service.maintenance_publication_disposition(),
+            Some(LakePublicationDisposition::CommitUnknown)
+        );
+        assert!(service.message().contains("original publication verdict"));
+        assert!(service.message().contains("do not retry statement"));
+    }
+    #[test]
+    fn maintenance_untyped_publication_survives_original_caller_control_fallback() {
+        use novarocks_spi::connector::LakePublicationDisposition;
+        let command =
+            maintenance_command_error(TerminalError::commit_unknown("original abort uncertainty"));
+        let fallback =
+            cancellation_error(QueryCancellationReason::DeadlineExceeded { timeout_ms: 1 });
+        let expected = fallback.execution_failure().cloned();
+        let service = selected_execution_or_worker_fallback(
+            Err(product_command_error(command)),
+            fallback.clone(),
+        );
+        assert_eq!(service.execution_failure(), expected.as_ref());
+        assert_eq!(service.kind(), fallback.kind());
+        assert_eq!(
+            service.maintenance_publication_disposition(),
+            Some(LakePublicationDisposition::CommitUnknown)
+        );
+        assert!(service.message().contains("do not retry statement"));
     }
 }

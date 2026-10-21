@@ -708,8 +708,10 @@ fn values_wide_real_rows_observe_quantum_and_preserve_all_rows() {
 }
 
 #[test]
-fn values_cross_pool_nested_copy_refuses_explicitly_without_resource_or_control_fallback() {
-    let field = Arc::new(Field::new("payload", DataType::Int64, false));
+fn values_cross_pool_nested_copy_keeps_exact_fields_values_and_control_failures() {
+    let field = Arc::new(Field::new("payload", DataType::Int64, false).with_metadata(
+        HashMap::from([("nested.unknown".into(), "keep-cross-pool".into())]),
+    ));
     let array: ArrayRef = Arc::new(StructArray::new(
         vec![field].into(),
         vec![Arc::new(Int64Array::from(vec![10, 20]))],
@@ -721,11 +723,43 @@ fn values_cross_pool_nested_copy_refuses_explicitly_without_resource_or_control_
     let package = build(&[first, second], &[vec![(0, 1)], vec![(1, 0)]], &[0], false);
     let lowered = lower(&package, &Control::good()).unwrap();
     let baseline = Control::good();
-    assert!(
-        matches!(direct(&package, &lowered, &baseline), Err(FragmentCompileError::Unsupported {
-        node: Some(node), feature: "Values combined copy carrier lacks selected-copy preflight",
-    }) if node == NodeId::new(u32::MAX))
+    let (kind, _) = direct(&package, &lowered, &baseline).unwrap();
+    let ProgramNodeKind::Values { values } = kind else {
+        panic!("Values");
+    };
+    let output = values
+        .batch()
+        .unwrap()
+        .column(0)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    assert_eq!(
+        output.data_type(),
+        package
+            .fragment()
+            .values()
+            .values()
+            .next()
+            .unwrap()
+            .ty
+            .data_type()
     );
+    assert_eq!(
+        output
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .as_ref(),
+        &[20, 10]
+    );
+    assert_eq!(output.fields()[0].name(), "payload");
+    assert!(!output.fields()[0].is_nullable());
+    // Values exposes the frozen, metadata-free execution layout. The copy
+    // owner preserves source annotations before this sole normalization step.
+    assert!(output.fields()[0].metadata().is_empty());
     let trace = baseline.trace();
     for position in 1..=trace.len() {
         for cause in [

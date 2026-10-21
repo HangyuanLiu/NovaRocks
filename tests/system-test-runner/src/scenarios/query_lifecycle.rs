@@ -9,6 +9,7 @@ use novarocks_cluster_harness::{
     QueryLifecycleStructuredSnapshot, ServerHandle,
     native_fault_proxy::{ProxyDirection, ProxyMode},
 };
+use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureReason, domain};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, mpsc};
@@ -302,6 +303,56 @@ fn start_partitioned_read(
     })
 }
 
+fn ordinary_frontend_has_test_controls(records: &serde_json::Value) -> Result<bool> {
+    let mut captures = records
+        .as_array()
+        .context("ordinary peer build captures are not an array")?
+        .iter()
+        .filter(|record| record["launch_capture"] == "fe.build-info.json");
+    let capture = captures
+        .next()
+        .context("ordinary peer omitted its original FE build capture")?;
+    ensure!(
+        captures.next().is_none(),
+        "ordinary peer repeats its FE build capture"
+    );
+    let info = &capture["build_info"];
+    ensure!(
+        info["schema_version"] == 1 && info["package"] == "novarocks-server",
+        "ordinary peer FE build identity is invalid"
+    );
+    let mut owners = info["capabilities"]
+        .as_array()
+        .context("ordinary FE omitted owner capabilities")?
+        .iter()
+        .filter(|owner| owner["owner"] == "novarocks-frontend-application");
+    let owner = owners
+        .next()
+        .context("ordinary FE omitted application capabilities")?;
+    ensure!(
+        owners.next().is_none(),
+        "ordinary FE repeats application capabilities"
+    );
+    let capabilities = owner["compiled_capabilities"]
+        .as_array()
+        .context("ordinary FE capabilities are invalid")?;
+    ensure!(
+        capabilities.iter().all(serde_json::Value::is_string),
+        "ordinary FE capability is not a string"
+    );
+    Ok(capabilities
+        .iter()
+        .any(|capability| capability == "test-controls"))
+}
+
+fn ordinary_call_refusal_matches(message: &str, controls_compiled: bool) -> bool {
+    if controls_compiled {
+        message.contains("MV test CALL requires explicit authorization")
+    } else {
+        message.contains("unsupported") && message.contains("novarocks_imv_stateless_rebuild")
+    }
+}
+
 #[derive(Default)]
 struct DistributedBaseline {
     intent: SqlIntentOwner,
@@ -339,6 +390,8 @@ impl DistributedBaseline {
                 "ordinary baseline requires native 1FE+3BE, got 1FE+{}BE",
                 peer.be_count()
             );
+            let controls_compiled =
+                ordinary_frontend_has_test_controls(&peer.build_information_evidence()?)?;
             let baseline = peer
                 .query_execution_resource_snapshot()?
                 .context("binary baseline peer did not expose the public query-resource oracle")?;
@@ -359,7 +412,7 @@ impl DistributedBaseline {
                                 ensure!(
                                     error.code == 1105
                                         && error.state == "HY000"
-                                        && error.message == "MV test CALL requires explicit authorization",
+                                        && ordinary_call_refusal_matches(&error.message, controls_compiled),
                                     "ordinary test-only CALL returned another SQL failure: {error}"
                                 );
                             }
@@ -750,12 +803,14 @@ struct Nid2Fence {
     marker: &'static str,
     /// What the misstated value was, for the accepted-action line.
     subject: &'static str,
+    /// An exact typed preparation failure expected for this statement, if set.
+    expected_failure_fact: Option<FailureFact>,
     /// Substrings the client-visible error must carry.
     ///
-    /// Both halves matter. The first is the shape of the refusal --- which
-    /// `TaskExecutionError` variant answered --- and the second names the fence
-    /// inside it, so a statement that failed for an unrelated reason cannot
-    /// satisfy the case. A bare `expect_err` would have been satisfied by any
+    /// Both halves matter. The canonical public code and safe detail must
+    /// agree with the expected projection. A token-scoped backend marker and,
+    /// where set, the exact statement failure additionally bind the fence.
+    /// A bare `expect_err` would have been satisfied by any
     /// failure at all, including one the fault did not cause.
     error_fragments: &'static [&'static str],
 }
@@ -837,7 +892,11 @@ impl Scenario for Nid2CreateRejected {
                 fault: "create-task-rejected-after-apply",
                 marker: "NOVAROCKS_TASK_CREATE_REJECTED_AFTER_APPLY",
                 subject: "a CreateTask rejection answered after the task was admitted",
-                error_fragments: &["failed closed", "runner-owned CreateTask rejection"],
+                expected_failure_fact: None,
+                error_fragments: &[
+                    "[query.execution.invariant]",
+                    "runner-owned CreateTask rejection",
+                ],
             },
         )
     }
@@ -924,7 +983,8 @@ impl Scenario for Nid2CreateReceiptForeignTask {
                 fault: "create-task-receipt-foreign-task",
                 marker: "NOVAROCKS_TASK_CREATE_RECEIPT_FOREIGN_TASK",
                 subject: "a CreateTask acknowledgement naming a task the request never addressed",
-                error_fragments: &["failed closed", "InvalidStateOrRequest"],
+                expected_failure_fact: None,
+                error_fragments: &["[query.execution.invariant]", "InvalidStateOrRequest"],
             },
         )
     }
@@ -1007,7 +1067,16 @@ impl Scenario for Nid2ForeignStatusProcess {
                 fault: "task-status-foreign-process",
                 marker: "NOVAROCKS_TASK_STATUS_FOREIGN_PROCESS",
                 subject: "a task status event naming a backend process other than its own",
-                error_fragments: &["no longer observable", "process_mismatch"],
+                // QueryFailureReason::PreparationProtocol is the SEP-1
+                // projection of a fatal non-transport participant violation.
+                expected_failure_fact: Some(FailureFact::new(
+                    FailureClass::Invariant,
+                    FailureReason::new(domain::QUERY, std::num::NonZeroU16::new(9).unwrap()),
+                )),
+                error_fragments: &[
+                    "[query.execution.invariant]",
+                    "frontend task protocol could not continue",
+                ],
             },
         )
     }
@@ -1034,20 +1103,27 @@ fn run_nid2_fence(
         context.mysql_port(),
         context.deadline(),
     )?;
-    selected.arm(context, connection.connection_id(), NID2_FENCE_QUERY)?;
+    let observation = selected.arm(context, connection.connection_id(), NID2_FENCE_QUERY)?;
     let tokens = vec![selected.token.clone(); REQUIRED_BACKENDS];
     context.action(format!(
         "armed NID-2 {} across every Backend participant with tokens {tokens:?}",
         fence.fault
     ));
 
-    let observed = observe_nid2_fence(context, fence, &tokens, &mut connection);
+    let observed = observe_nid2_fence(context, fence, &tokens, &observation, &mut connection);
     let cleared = context
         .handle()
         .clear_query_lifecycle_faults()
         .with_context(|| format!("clear {} tokens", fence.fault));
     let closed = connection.finish();
-    let cleanup = crate::scenarios::paimon::scan_statement_actor::combine(cleared, closed);
+    let drained = context
+        .handle()
+        .drain_query_lifecycle_statement_observation(&observation)
+        .context("drain NID-2 statement observation");
+    let cleanup = crate::scenarios::paimon::scan_statement_actor::combine(
+        crate::scenarios::paimon::scan_statement_actor::combine(cleared, closed),
+        drained,
+    );
     let (backend, error) =
         crate::scenarios::paimon::scan_statement_actor::combine(observed, cleanup)?;
     await_resource_convergence(context, &baseline)?;
@@ -1064,6 +1140,7 @@ fn observe_nid2_fence(
     context: &mut ScenarioContext,
     fence: &Nid2Fence,
     tokens: &[String],
+    observation: &novarocks_cluster_harness::QueryLifecycleStatementObservation,
     connection: &mut mysql::Conn,
 ) -> Result<(usize, String)> {
     let error = match connection.query::<i64, _>(NID2_FENCE_QUERY) {
@@ -1088,35 +1165,39 @@ fn observe_nid2_fence(
     // early. The previous form read once and accepted any nonzero count, which
     // could be satisfied by an earlier scenario's marker in the same log.
     let backend = await_token_scoped_marker(context, fence.marker, tokens)?;
+    if let Some(expected) = fence.expected_failure_fact {
+        let deadline = context.deadline();
+        let terminal = context
+            .handle()
+            .await_query_lifecycle_statement_observation(observation, false, deadline)
+            .context("read exact NID-2 statement failure")?;
+        ensure!(
+            terminal.attempt_id == 1
+                && terminal.failure_fact == Some(expected)
+                && terminal.failure_site
+                    == Some(novarocks_cluster_harness::QueryLifecycleFailureSite::Coordinator),
+            "{} must retain the original attempt's exact preparation failure {expected:?}, got {terminal:?}",
+            fence.fault,
+        );
+    }
     Ok((backend, error))
 }
 
-/// Arms one fault on every backend and returns each arming's token.
-///
-/// Every backend is armed because the fence is not about placement: the
-/// scheduler places this query's tasks without regard to where an arming sits,
-/// and a query with no split assignment can establish a single context. Arming
-/// one backend would make the case a coin flip on which one that is. Each arm
-/// carries its own token, which is what keeps the assertion scoped to this
-/// scenario rather than to whatever the shared backend logs already hold.
+/// Select the finite all-backend fault set for this exact connected submission.
+/// No trigger file or fresh token may nominate an unrelated next statement.
 pub(super) fn arm_on_every_backend(
     context: &mut ScenarioContext,
+    selected: &SelectedStatement,
     fault: &'static str,
-) -> Result<Vec<String>> {
-    let mut tokens = Vec::with_capacity(REQUIRED_BACKENDS);
-    for backend_index in 0..REQUIRED_BACKENDS {
-        context
-            .handle()
-            .arm_query_lifecycle_fault(backend_index, fault)
-            .with_context(|| format!("arm {fault} for BE[{backend_index}]"))?;
-        let token = context
-            .handle()
-            .armed_query_lifecycle_fault_token(backend_index, fault)
-            .with_context(|| format!("read the {fault} token armed for BE[{backend_index}]"))?
-            .with_context(|| format!("armed {fault} for BE[{backend_index}] has no token"))?;
-        tokens.push(token);
-    }
-    Ok(tokens)
+    connection_id: u32,
+    sql: &str,
+) -> Result<novarocks_cluster_harness::QueryLifecycleStatementObservation> {
+    ensure!(
+        selected.faults.len() == REQUIRED_BACKENDS
+            && (0..REQUIRED_BACKENDS).all(|index| selected.faults.contains(&(index, fault))),
+        "all-backend arming differs from the exact finite fault set"
+    );
+    selected.arm(context, connection_id, sql)
 }
 
 /// Waits until some backend logged `marker` carrying one of `tokens`.
@@ -1326,13 +1407,6 @@ pub(super) fn resource_snapshot(
         .context("cross-process harness did not expose the query-resource oracle")
 }
 
-pub(super) fn latest_execution_id(context: &mut ScenarioContext) -> Result<Option<String>> {
-    Ok(context
-        .handle()
-        .query_lifecycle_structured_snapshot()?
-        .and_then(|snapshot| snapshot.execution_id))
-}
-
 fn execute_baseline_query(connection: &mut mysql::Conn, ordinal: &str) -> Result<()> {
     let rows: Vec<i64> = connection
         .query(BASELINE_QUERY)
@@ -1342,17 +1416,6 @@ fn execute_baseline_query(connection: &mut mysql::Conn, ordinal: &str) -> Result
         "{ordinal} distributed baseline query returned unexpected rows: {rows:?}"
     );
     Ok(())
-}
-
-pub(super) fn await_terminal_snapshot(
-    context: &mut ScenarioContext,
-    before_execution_id: Option<&str>,
-) -> Result<QueryLifecycleStructuredSnapshot> {
-    let deadline = context.deadline();
-    context
-        .handle()
-        .await_query_lifecycle_structured_snapshot_after(before_execution_id, deadline)
-        .context("await a new typed query lifecycle terminal snapshot")
 }
 
 fn assert_process_attribution(snapshots: &[&QueryLifecycleStructuredSnapshot]) -> Result<()> {
@@ -1485,4 +1548,49 @@ pub(super) fn await_resource_convergence(
 
 fn bounded_io_timeout(context: &ScenarioContext, operation: &str) -> Result<Duration> {
     Ok(context.remaining(operation)?.min(IO_TIMEOUT_CAP))
+}
+
+#[cfg(test)]
+mod ordinary_call_authorization_tests {
+    use super::*;
+
+    fn captures(capabilities: serde_json::Value) -> serde_json::Value {
+        serde_json::json!([{"launch_capture":"fe.build-info.json", "build_info":{
+            "schema_version":1, "package":"novarocks-server", "capabilities":[{
+                "owner":"novarocks-frontend-application", "compiled_capabilities":capabilities
+            }]
+        }}])
+    }
+
+    #[test]
+    fn ordinary_negative_call_uses_the_actual_frontend_capability_without_granting_mv() {
+        assert!(
+            ordinary_frontend_has_test_controls(&captures(serde_json::json!(["test-controls"])))
+                .unwrap()
+        );
+        assert!(!ordinary_frontend_has_test_controls(&captures(serde_json::json!([]))).unwrap());
+        assert!(ordinary_frontend_has_test_controls(&serde_json::json!([])).is_err());
+        assert!(ordinary_frontend_has_test_controls(&captures(serde_json::json!([7]))).is_err());
+        let duplicate = captures(serde_json::json!([]))[0].clone();
+        assert!(
+            ordinary_frontend_has_test_controls(&serde_json::json!([duplicate, duplicate]))
+                .is_err()
+        );
+        let authorized_only = "MV test CALL requires explicit authorization";
+        let uncompiled = "unsupported procedure novarocks_imv_stateless_rebuild";
+        assert!(ordinary_call_refusal_matches(authorized_only, true));
+        assert!(!ordinary_call_refusal_matches(uncompiled, true));
+        assert!(ordinary_call_refusal_matches(uncompiled, false));
+        assert!(!ordinary_call_refusal_matches(authorized_only, false));
+        for controls in [true, false] {
+            assert!(!ordinary_call_refusal_matches(
+                "permission denied",
+                controls
+            ));
+            assert!(!ordinary_call_refusal_matches(
+                "unsupported unrelated_procedure",
+                controls
+            ));
+        }
+    }
 }

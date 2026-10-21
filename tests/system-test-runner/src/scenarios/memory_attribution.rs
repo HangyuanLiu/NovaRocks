@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Native process observation acceptance; query/R1 wiring belongs to later MEM steps.
+//! Native process observation; physical query/R1 attribution remains unwired.
+//! Real account lifecycle lane records exist independently of physical attribution.
 use crate::actors::{mysql as mysql_actor, mysql_stream::MysqlStream};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use crate::scenarios::query_lifecycle::native_sql_controls::{SqlIntentOwner, StatementSpec};
@@ -168,10 +169,10 @@ impl Scenario for ObservationFamilies {
         fs::write(
             context.scenario_root().join("memory-attribution.json"),
             serde_json::to_vec_pretty(
-                &serde_json::json!({"schema_version":1,"production_lane_wiring":false,"during_query":during,"after_cancel":after}),
+                &serde_json::json!({"schema_version":2,"physical_attribution_wiring":false,"during_query":during,"after_cancel":after}),
             )?,
         )?;
-        context.action("verified both process bands, all bounded attribution families, zero unwired query/residual/service lanes and lifecycle faults on each independent BE");
+        context.action("verified both process bands, finite lifecycle lane records, zero unwired query/residual/service physical attribution and lifecycle faults on each independent BE");
         Ok(())
     }
 }
@@ -256,11 +257,14 @@ fn scrape_cluster(context: &mut ScenarioContext) -> Result<Vec<Sample>> {
                         true,
                     )?;
                 }
+                // Domain creation owns a real lifecycle record even when no
+                // physical allocation is attributed through that lane. These
+                // bounded-prefix samples are not a quiescent leak oracle.
                 for production in ["producing", "sealed", "stopped"] {
                     check(
                         "novarocks_backend_memory_lane_records",
                         &[("class", class), ("production", production)],
-                        true,
+                        false,
                     )?;
                 }
             }

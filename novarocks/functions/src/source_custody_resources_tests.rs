@@ -577,10 +577,17 @@ fn source_custody_resources_primitive_requests_have_a_source_independent_closed_
         .unwrap()
         .request_facts();
     // Three Vec<Buffer> tables (T, W, D), two validation tables, one
-    // pointer-sized custodian Arc, Bytes upper Arc, and primitive rebox Arc.
+    // custodian Arc (the actual Buffer plus one shared-owner pointer), Bytes
+    // upper Arc, and primitive rebox Arc. Derive the closed payload layout
+    // from those source fields, independently of the production pricing API.
+    let custodian = Layout::new::<Buffer>()
+        .extend(Layout::new::<usize>())
+        .unwrap()
+        .0
+        .pad_to_align();
     let expected = 3 * size_of::<Buffer>()
         + 2 * size_of::<BufferSpec>()
-        + arc_layout(Layout::new::<usize>()).unwrap().size()
+        + arc_layout(custodian).unwrap().size()
         + 64
         + arc_layout(Layout::new::<Int64Array>()).unwrap().size();
     assert_eq!(facts.global().bytes(), expected);

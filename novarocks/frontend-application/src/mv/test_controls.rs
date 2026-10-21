@@ -60,6 +60,10 @@ enum Action {
         target: Target,
         directory: PathBuf,
     },
+    SchedulerOutcome {
+        target: Target,
+        directory: PathBuf,
+    },
     TransientPreparation {
         target: Target,
         directory: PathBuf,
@@ -78,6 +82,104 @@ struct AuthorizedAction {
     action: Action,
     frozen_input: Mutex<Option<StatementInputNomination>>,
     frozen_nomination: Mutex<Option<StatementWorkNomination>>,
+    scheduler_outcome: Mutex<SchedulerOutcomeState>,
+}
+
+// This is a finite request-outcome observation, not a publication or Task attempt.
+#[derive(Clone)]
+struct SchedulerRequestIdentity {
+    mv_id: i64,
+    source: novarocks_mv_application::persistence::definition::MvAcceleratorSourceRevision,
+}
+impl SchedulerRequestIdentity {
+    fn same_binding(&self, other: &Self) -> bool {
+        self.mv_id == other.mv_id
+            && self.source.target == other.source.target
+            && self.source.target_object_id == other.source.target_object_id
+            && self.source.definition_revision == other.source.definition_revision
+            && self.source.interpretation_revision == other.source.interpretation_revision
+            && self.source.configuration_revision == other.source.configuration_revision
+            && self.source.deployment_owner == other.source.deployment_owner
+            && self.source.process_incarnation == other.source.process_incarnation
+    }
+    fn document(&self) -> serde_json::Value {
+        let source = &self.source;
+        serde_json::json!({
+            "mv_id": self.mv_id,
+            "target": format!("{:?}", source.target),
+            "target_object": format!("{:?}", source.target_object_id),
+            "definition_revision": source.definition_revision.as_bytes(),
+            "interpretation_revision": source.interpretation_revision.as_bytes(),
+            "configuration_revision": source.configuration_revision.as_bytes(),
+            "publication_revision": source.publication_revision.as_ref().map(|p| p.as_bytes()),
+            "metadata_version": format!("{:?}", source.metadata_version),
+            "publication_output_version": format!("{:?}", source.publication_output_version),
+            "deployment_owner": format!("{:?}", source.deployment_owner),
+            "process_incarnation": format!("{:?}", source.process_incarnation),
+        })
+    }
+}
+#[derive(Default)]
+struct SchedulerOutcomeState {
+    first: Option<SchedulerRequestIdentity>,
+    next_sequence: u64,
+    published: bool,
+}
+/// Created only on the actual admitted scheduler branch and returned to that
+/// same local call after complete. The sequence is observation-local only.
+pub(crate) struct SchedulerOutcomeRequest {
+    action_index: usize,
+    request: SchedulerRequestIdentity,
+    sequence: u64,
+    process: ProcessBinding,
+    session_id: String,
+    launch_id: String,
+    grant_id: String,
+}
+
+const SCHEDULER_OUTCOME_MAX_BYTES: usize = 64 * 1024;
+
+struct SchedulerDocumentWriter(Vec<u8>);
+impl std::io::Write for SchedulerDocumentWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > SCHEDULER_OUTCOME_MAX_BYTES.saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other(
+                "finite scheduler observation exceeds its byte bound",
+            ));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn publish_scheduler_document(
+    directory: &Path,
+    name: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    use std::io::Write;
+    let mut encoded = SchedulerDocumentWriter(Vec::new());
+    serde_json::to_writer(&mut encoded, value)
+        .map_err(|e| format!("encode bounded MV observation: {e}"))?;
+    std::fs::create_dir_all(directory)
+        .map_err(|e| format!("create MV observation directory: {e}"))?;
+    let pending = directory.join(format!(".{name}.pending"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending)
+        .map_err(|e| format!("create finite MV observation: {e}"))?;
+    file.write_all(&encoded.0)
+        .map_err(|e| format!("write finite MV observation: {e}"))?;
+    file.sync_all()
+        .map_err(|e| format!("flush finite MV observation: {e}"))?;
+    // Publish a complete inode without replacing an existing immutable slot.
+    std::fs::hard_link(&pending, directory.join(name))
+        .map_err(|e| format!("publish finite MV observation: {e}"))?;
+    std::fs::remove_file(&pending).map_err(|e| format!("remove MV observation staging name: {e}"))
 }
 
 pub struct MvRewriteStatementTarget {
@@ -195,6 +297,7 @@ impl MvTestControls {
                 action,
                 frozen_input: Mutex::new(None),
                 frozen_nomination: Mutex::new(None),
+                scheduler_outcome: Mutex::new(SchedulerOutcomeState::default()),
             });
         }
         Ok(Self { process, actions })
@@ -490,6 +593,176 @@ impl MvTestControls {
         Ok(cancellation.is_cancelled())
     }
 
+    /// Pin the first real admitted object and D/L/C. P and provider versions
+    /// may advance through successful refreshes; each request retains its own
+    /// complete immutable source revision until that same call completes.
+    pub(crate) fn scheduler_request_admitted(
+        &self,
+        target: &novarocks_sql::planning::mv::SqlMvTarget,
+        mv_id: i64,
+        source: &novarocks_mv_application::persistence::definition::MvAcceleratorSourceRevision,
+    ) -> Result<Option<SchedulerOutcomeRequest>, String> {
+        for (action_index, action) in self.actions.iter().enumerate() {
+            let Action::SchedulerOutcome {
+                target: expected,
+                directory,
+            } = &action.action
+            else {
+                continue;
+            };
+            if !expected.matches(
+                target.catalog.as_deref().unwrap_or(""),
+                &target.database,
+                &target.name,
+            ) {
+                continue;
+            }
+            if !action.grant.cancellation().is_active() {
+                return Err("MV scheduler observation authorization is closed".into());
+            }
+            let mut state = action
+                .scheduler_outcome
+                .lock()
+                .map_err(|_| "MV scheduler observation lock poisoned")?;
+            if state.published {
+                return Ok(None);
+            }
+            let request = SchedulerRequestIdentity {
+                mv_id,
+                source: source.clone(),
+            };
+            if let Some(first) = &state.first {
+                if !first.same_binding(&request) {
+                    publish_scheduler_document(
+                        directory,
+                        "scheduler-outcome-error.json",
+                        &serde_json::json!({
+                            "schema_version":1,"status":"UNKNOWN","reason":"scheduler target binding changed",
+                            "grant_id":action.grant.grant_id(),"first_admitted_source":first.document(),"rejected_source":request.document(),
+                        }),
+                    )?;
+                    state.published = true;
+                    return Err("MV scheduler observation cannot rebind its frozen target".into());
+                }
+            } else {
+                if directory.join("scheduler-outcome.json").exists()
+                    || directory.join("scheduler-outcome-error.json").exists()
+                {
+                    return Err("MV scheduler observation slot is not fresh".into());
+                }
+                state.first = Some(request.clone());
+            }
+            state.next_sequence = state
+                .next_sequence
+                .checked_add(1)
+                .ok_or("MV scheduler observation sequence exhausted")?;
+            return Ok(Some(SchedulerOutcomeRequest {
+                action_index,
+                request,
+                sequence: state.next_sequence,
+                process: self.process,
+                session_id: action.grant.cancellation().session_id().to_owned(),
+                launch_id: action.grant.cancellation().launch_id().to_owned(),
+                grant_id: action.grant.grant_id().to_owned(),
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Observe only the decision returned by the actual scheduler.complete.
+    /// Success, transient backoff, and NoChange do not claim or consume the slot.
+    pub(crate) fn scheduler_request_completed(
+        &self,
+        admitted: SchedulerOutcomeRequest,
+        decision: &novarocks_mv_application::scheduler_runtime::MvRefreshRuntimeDecision,
+    ) -> Result<(), String> {
+        use novarocks_execution_contract::failure::FailureProjection;
+        use novarocks_query_application::execution_error::{
+            ExecutionFailureInput, ExecutionFailureSite,
+        };
+        use novarocks_type_contract::CompileControlError;
+        use prost::Message;
+        if !matches!(
+            decision,
+            novarocks_mv_application::scheduler_runtime::MvRefreshRuntimeDecision::Blocked { .. }
+        ) {
+            return Ok(());
+        }
+        let action = self
+            .actions
+            .get(admitted.action_index)
+            .ok_or("MV scheduler observation has no grant")?;
+        let Action::SchedulerOutcome { target, directory } = &action.action else {
+            return Err("MV scheduler observation grant mismatch".into());
+        };
+        let scope = action.grant.cancellation();
+        if admitted.process != self.process
+            || admitted.session_id != scope.session_id()
+            || admitted.launch_id != scope.launch_id()
+            || admitted.grant_id != action.grant.grant_id()
+        {
+            return Err("MV scheduler observation belongs to another exact launch".into());
+        }
+        if !action.grant.cancellation().is_active() {
+            return Err("MV scheduler observation authorization is closed".into());
+        }
+        let mut state = action
+            .scheduler_outcome
+            .lock()
+            .map_err(|_| "MV scheduler observation lock poisoned")?;
+        if state.published {
+            return Ok(());
+        }
+        let first = state
+            .first
+            .as_ref()
+            .ok_or("MV scheduler outcome has no actual admission")?;
+        if !first.same_binding(&admitted.request) {
+            return Err("MV scheduler outcome changed its admitted target".into());
+        }
+        let mut claim = action
+            .grant
+            .claim_once(self.process)
+            .map_err(|e| e.to_string())?;
+        let (fact, public_message) = match decision.compile_control_error() {
+            Some(CompileControlError::Source(source)) => {
+                let fact = source.failure_fact();
+                // SafeDetail is bounded, not a redactor. Do not copy arbitrary
+                // Source text into a new artifact; existing role logs retain it.
+                let input = ExecutionFailureInput::new(
+                    fact,
+                    novarocks_execution_contract::SafeDetail::truncating(
+                        "MV scheduler request blocked; source diagnostic retained in FE role logs",
+                    ),
+                    ExecutionFailureSite::Coordinator,
+                );
+                (
+                    Some(novarocks_task_codec::status::encode_failure_fact(fact).encode_to_vec()),
+                    Some(input.user_error().to_string()),
+                )
+            }
+            _ => (None, None),
+        };
+        let cancellation = action.grant.cancellation();
+        let document = serde_json::json!({
+            "schema_version":1,"semantic_scope":"scheduler-request-outcome","decision":"Blocked",
+            "grant_id":action.grant.grant_id(),"session_id":cancellation.session_id(),"launch_id":cancellation.launch_id(),"process":self.process.process_id(),
+            "target":{"catalog":target.catalog,"namespace":target.namespace,"mv":target.mv},
+            "first_admitted_source":first.document(),"blocked_request_source":admitted.request.document(),
+            "admission_observation_sequence":admitted.sequence,
+            "failure_identity":if fact.is_some() { "Source" } else { "UNKNOWN" },
+            "failure_fact":fact,"public_message":public_message,
+            "message_scope":"safe canonical projection; not original Source text or client SQL response",
+            "actual_publication_attempt":"NOT_OBSERVED","actual_task_attempt":"NOT_OBSERVED","actual_base_snapshots":"NOT_OBSERVED",
+        });
+        // Record the actual authorized event before publishing its payload.
+        // An observation failure may not leave a successfully readable typed slot.
+        claim.record_hit().map_err(|e| e.to_string())?;
+        publish_scheduler_document(directory, "scheduler-outcome.json", &document)?;
+        state.published = true;
+        Ok(())
+    }
+
     pub(crate) fn transient_preparation(
         &self,
         catalog: &str,
@@ -638,6 +911,16 @@ fn same_selection(left: &Action, right: &Action) -> bool {
             Action::TransientPreparation { target: b, .. },
         ) => a == b,
         (
+            Action::SchedulerOutcome {
+                target: a,
+                directory: x,
+            },
+            Action::SchedulerOutcome {
+                target: b,
+                directory: y,
+            },
+        ) => a == b || x == y,
+        (
             Action::Rewrite {
                 statement_run_token: a,
                 ..
@@ -682,9 +965,10 @@ fn parse_action(value: &serde_json::Value) -> Result<Action, String> {
             "directory",
             "token",
         ],
-        "known-committed-hold" | "scheduler-hold" | "transient-preparation" => {
-            &["action", "catalog", "namespace", "mv", "directory"]
-        }
+        "known-committed-hold"
+        | "scheduler-hold"
+        | "scheduler-outcome"
+        | "transient-preparation" => &["action", "catalog", "namespace", "mv", "directory"],
         "rewrite-hold" => &[
             "action",
             "catalog",
@@ -780,6 +1064,10 @@ fn parse_action(value: &serde_json::Value) -> Result<Action, String> {
             directory: directory()?,
         },
         "scheduler-hold" => Action::Scheduler {
+            target,
+            directory: directory()?,
+        },
+        "scheduler-outcome" => Action::SchedulerOutcome {
             target,
             directory: directory()?,
         },
@@ -891,6 +1179,291 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             self.close();
             std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    mod scheduler_outcome_tests {
+        use super::*;
+        use novarocks_execution_contract::failure::{FailureClass, FailureProjection};
+        use novarocks_mv_application::persistence::definition::{
+            MvAcceleratorSourceRevision, test_source_revision,
+        };
+        use novarocks_mv_application::scheduler_runtime::{
+            MvRefreshFailure, MvRefreshRuntimeDecision,
+        };
+        use novarocks_type_contract::CompileControlError;
+        use prost::Message;
+
+        struct Fixture {
+            session: TestSession,
+            controls: MvTestControls,
+            directory: PathBuf,
+        }
+        impl Fixture {
+            fn new() -> Self {
+                let directory =
+                    PathBuf::from("/tmp").join(format!("nr-mv-outcome-{}", uuid::Uuid::now_v7()));
+                let session = TestSession::new(
+                    vec![
+                        json!({"action":"scheduler-outcome","catalog":"ice","namespace":"sales","mv":"orders","directory":directory}),
+                    ],
+                    SessionRole::Fe,
+                    30000,
+                );
+                let controls = session.controls().unwrap();
+                Self {
+                    session,
+                    controls,
+                    directory,
+                }
+            }
+            fn target() -> novarocks_sql::planning::mv::SqlMvTarget {
+                novarocks_sql::planning::mv::SqlMvTarget {
+                    catalog: Some("ice".into()),
+                    database: "sales".into(),
+                    name: "orders".into(),
+                }
+            }
+            fn source() -> MvAcceleratorSourceRevision {
+                test_source_revision(
+                    "ice",
+                    "sales",
+                    "orders",
+                    novarocks_spi::connector::ConnectorTableObjectId::try_new(
+                        bytes::Bytes::from_static(b"object-a"),
+                    )
+                    .unwrap(),
+                    None,
+                )
+            }
+            fn admit(&self, source: &MvAcceleratorSourceRevision) -> SchedulerOutcomeRequest {
+                self.controls
+                    .scheduler_request_admitted(&Self::target(), 7, source)
+                    .unwrap()
+                    .unwrap()
+            }
+            fn record(&self) -> Value {
+                serde_json::from_slice(
+                    &std::fs::read(self.directory.join("scheduler-outcome.json")).unwrap(),
+                )
+                .unwrap()
+            }
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                if self.directory.exists() {
+                    std::fs::remove_dir_all(&self.directory).unwrap();
+                }
+            }
+        }
+        fn blocked(source: Option<CompileControlError>) -> MvRefreshRuntimeDecision {
+            use novarocks_mv_application::scheduler::MvSchedulerConfig;
+            use novarocks_mv_application::scheduler_runtime::{
+                MvRefreshDisposition, MvRefreshSchedulerRuntime,
+            };
+            let mut scheduler = MvRefreshSchedulerRuntime::<i64, ()>::new(MvSchedulerConfig::new(
+                true, 1, 1, 10, 40,
+            ));
+            let decision = scheduler.record(
+                &7,
+                MvRefreshDisposition::InvalidDefinition(MvRefreshFailure::new(
+                    "[UnsupportedCompiledShape] untrusted diagnostic only",
+                    source,
+                )),
+                100,
+            );
+            assert!(matches!(decision, MvRefreshRuntimeDecision::Blocked { .. }));
+            decision
+        }
+        fn capability() -> CompileControlError {
+            CompileControlError::Source(novarocks_failure_contract::SharedFailureCause::new(
+                novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability("router".into()),
+            ))
+        }
+        fn fact(record: &Value) -> novarocks_execution_contract::failure::FailureFact {
+            let bytes: Vec<u8> = serde_json::from_value(record["failure_fact"].clone()).unwrap();
+            let dto =
+                novarocks_proto_models::novarocks::FailureFact::decode(bytes.as_slice()).unwrap();
+            novarocks_task_codec::status::decode_failure_fact(
+                &dto,
+                novarocks_proto_codec::FieldPath::root("test"),
+            )
+            .unwrap()
+        }
+        #[test]
+        fn actual_admission_success_and_transient_do_not_consume_later_blocked_slot() {
+            let fixture = Fixture::new();
+            let source = Fixture::source();
+            fixture
+                .controls
+                .scheduler_request_completed(
+                    fixture.admit(&source),
+                    &MvRefreshRuntimeDecision::Success,
+                )
+                .unwrap();
+            fixture
+                .controls
+                .scheduler_request_completed(
+                    fixture.admit(&source),
+                    &MvRefreshRuntimeDecision::TransientBackoff {
+                        error: "temporarily unavailable".into(),
+                        retry_at_ms: 20,
+                    },
+                )
+                .unwrap();
+            assert!(!fixture.directory.join("scheduler-outcome.json").exists());
+            let mut next = source.clone();
+            next.publication_revision = Some(novarocks_mv_application::persistence::identity::DocumentRevision::from_canonical_bytes(b"new P"));
+            let original = capability();
+            let CompileControlError::Source(cause) = &original else {
+                unreachable!()
+            };
+            fixture
+                .controls
+                .scheduler_request_completed(fixture.admit(&next), &blocked(Some(original.clone())))
+                .unwrap();
+            let record = fixture.record();
+            assert_eq!(fact(&record), cause.failure_fact());
+            assert_eq!(fact(&record).class(), FailureClass::Unsupported);
+            assert!(record["first_admitted_source"]["publication_revision"].is_null());
+            assert!(!record["blocked_request_source"]["publication_revision"].is_null());
+            assert_eq!(record["admission_observation_sequence"], 3);
+            assert_eq!(record["actual_publication_attempt"], "NOT_OBSERVED");
+            assert!(!record.to_string().contains("untrusted diagnostic"));
+        }
+        #[test]
+        fn first_blocked_is_immutable_and_late_peek_does_not_rearm_or_execute() {
+            let mut fixture = Fixture::new();
+            let source = Fixture::source();
+            let admitted_before_terminal = fixture.admit(&source);
+            fixture
+                .controls
+                .scheduler_request_completed(fixture.admit(&source), &blocked(Some(capability())))
+                .unwrap();
+            let bytes = std::fs::read(fixture.directory.join("scheduler-outcome.json")).unwrap();
+            fixture
+                .controls
+                .scheduler_request_completed(admitted_before_terminal, &blocked(None))
+                .unwrap();
+            assert_eq!(
+                bytes,
+                std::fs::read(fixture.directory.join("scheduler-outcome.json")).unwrap()
+            );
+            assert!(
+                fixture
+                    .controls
+                    .scheduler_request_admitted(&Fixture::target(), 7, &source)
+                    .unwrap()
+                    .is_none()
+            );
+            fixture.session.close();
+            assert_eq!(fixture.record()["decision"], "Blocked");
+            assert_eq!(
+                bytes,
+                std::fs::read(fixture.directory.join("scheduler-outcome.json")).unwrap()
+            );
+        }
+        #[test]
+        fn missing_source_and_invalid_source_never_become_capability_from_text() {
+            for source in [
+                None,
+                Some(CompileControlError::Source(
+                    novarocks_failure_contract::SharedFailureCause::new(
+                        novarocks_plan_codec::PhysicalEncodeError::Invalid(
+                            "unsupported router".into(),
+                        ),
+                    ),
+                )),
+            ] {
+                let fixture = Fixture::new();
+                fixture
+                    .controls
+                    .scheduler_request_completed(
+                        fixture.admit(&Fixture::source()),
+                        &blocked(source.clone()),
+                    )
+                    .unwrap();
+                let record = fixture.record();
+                if source.is_none() {
+                    assert!(record["failure_fact"].is_null());
+                    assert!(record["public_message"].is_null());
+                } else {
+                    assert_ne!(fact(&record).class(), FailureClass::Unsupported);
+                }
+            }
+        }
+        #[test]
+        fn recreated_object_and_changed_configuration_cannot_rebind_frozen_target() {
+            for configuration in [false, true] {
+                let fixture = Fixture::new();
+                let mut changed = Fixture::source();
+                drop(fixture.admit(&changed));
+                if configuration {
+                    changed.configuration_revision = novarocks_mv_application::persistence::identity::DocumentRevision::from_canonical_bytes(b"different C");
+                } else {
+                    changed.target_object_id =
+                        novarocks_spi::connector::ConnectorTableObjectId::try_new(
+                            bytes::Bytes::from_static(b"object-b"),
+                        )
+                        .unwrap();
+                }
+                assert!(
+                    fixture
+                        .controls
+                        .scheduler_request_admitted(&Fixture::target(), 7, &changed)
+                        .is_err()
+                );
+                assert!(
+                    fixture
+                        .directory
+                        .join("scheduler-outcome-error.json")
+                        .exists()
+                );
+                assert!(!fixture.directory.join("scheduler-outcome.json").exists());
+            }
+        }
+        #[test]
+        fn oversized_document_is_refused_before_any_observation_file_is_created() {
+            let fixture = Fixture::new();
+            let value = json!({"payload":"x".repeat(SCHEDULER_OUTCOME_MAX_BYTES + 1)});
+            assert!(
+                publish_scheduler_document(&fixture.directory, "scheduler-outcome.json", &value)
+                    .is_err()
+            );
+            assert!(!fixture.directory.exists());
+        }
+
+        #[test]
+        fn wrong_target_foreign_launch_and_closed_grant_cannot_capture_a_terminal() {
+            let mut fixture = Fixture::new();
+            let mut target = Fixture::target();
+            target.name = "other".into();
+            assert!(
+                fixture
+                    .controls
+                    .scheduler_request_admitted(&target, 7, &Fixture::source())
+                    .unwrap()
+                    .is_none()
+            );
+            let foreign = Fixture::new();
+            assert!(
+                fixture
+                    .controls
+                    .scheduler_request_completed(
+                        foreign.admit(&Fixture::source()),
+                        &blocked(Some(capability()))
+                    )
+                    .is_err()
+            );
+            let admitted = fixture.admit(&Fixture::source());
+            fixture.session.close();
+            assert!(
+                fixture
+                    .controls
+                    .scheduler_request_completed(admitted, &blocked(Some(capability())))
+                    .is_err()
+            );
+            assert!(!fixture.directory.join("scheduler-outcome.json").exists());
         }
     }
 

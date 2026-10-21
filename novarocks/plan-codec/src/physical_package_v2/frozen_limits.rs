@@ -99,9 +99,13 @@ const SOURCE: usize = 128 * MIB;
 /// Bytes one namespace may request.
 const REQUEST: usize = 512 * MIB;
 const COEXIST: usize = SOURCE + REQUEST;
-/// Work bounds: some namespace work grows with records times declared source
-/// bytes, and one constant record's with the declared source bytes alone, so
-/// a fixed cap would refuse ordinary packages.
+/// Finite cumulative-model ceiling shared by namespaces and record readers.
+/// Reader source work includes the complete retained invoice, not just the
+/// payload: flat work starts above 6*SOURCE; recursive work above
+/// (6*type_nodes+2)*SOURCE and adds type-path/metadata-name-group terms. Body,
+/// schema, request and coexistence limits remain independently enforced.
+/// Actual input-derived formulas use checked arithmetic and parent observation;
+/// arithmetic overflow or this ceiling's exhaustion remains typed Control.
 const WORK: usize = usize::MAX / 4;
 
 const fn properties() -> PhysicalPropertyProjectionLimits {
@@ -411,7 +415,7 @@ const fn frozen_decode_limits() -> PackageDecodeLimits {
             flat_reader: FlatReaderProjectionLimits {
                 max_new_allocation_request_bytes: 128 * MIB,
                 max_coexisting_source_and_request_bytes: 4 * GIB,
-                max_cumulative_library_work: 512 * MIB,
+                max_cumulative_library_work: WORK,
             },
             recursive_stream: RecursiveStreamProjectionLimits {
                 max_input_bytes: 16 * MIB,
@@ -426,7 +430,7 @@ const fn frozen_decode_limits() -> PackageDecodeLimits {
             recursive_reader: RecursiveReaderProjectionLimits {
                 max_new_allocation_request_bytes: 128 * MIB,
                 max_coexisting_source_and_request_bytes: 4 * GIB,
-                max_cumulative_library_work: GIB,
+                max_cumulative_library_work: WORK,
             },
         },
         constants: encode.constants,
@@ -497,6 +501,20 @@ mod tests {
         );
         assert!(decode.wire.max_input_bytes <= encode.max_wire_bytes);
         assert_eq!(decode.constant_policy, FROZEN_CONSTANT_POLICY);
+        assert_eq!(
+            decode
+                .constant_records
+                .flat_reader
+                .max_cumulative_library_work,
+            WORK
+        );
+        assert_eq!(
+            decode
+                .constant_records
+                .recursive_reader
+                .max_cumulative_library_work,
+            WORK
+        );
         assert_eq!(encode.constants.max_cumulative_library_work, usize::MAX / 4);
         assert_eq!(decode.constants.max_cumulative_library_work, usize::MAX / 4);
         for record in [
@@ -504,6 +522,273 @@ mod tests {
             encode.constant_records.recursive.flat,
         ] {
             assert_eq!(record.max_cumulative_library_work, usize::MAX / 4);
+        }
+    }
+
+    fn constant_reader_fixture(
+        recursive: bool,
+    ) -> (Vec<u8>, std::sync::Arc<arrow::datatypes::Field>) {
+        use arrow::{
+            array::{Array, ArrayRef, Int64Array, StructArray},
+            datatypes::{Field, Schema},
+            ipc::writer::StreamWriter,
+            record_batch::RecordBatch,
+        };
+        use std::sync::Arc;
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(7), None]));
+        let values: ArrayRef = if recursive {
+            Arc::new(StructArray::from(vec![(
+                Arc::new(Field::new("child", arrow::datatypes::DataType::Int64, true)),
+                values,
+            )]))
+        } else {
+            values
+        };
+        let field = Arc::new(Field::new("constant", values.data_type().clone(), true));
+        let schema = Arc::new(Schema::new(vec![field.clone()]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut bytes, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        (bytes, field)
+    }
+
+    fn flat_reader_model(
+        source: usize,
+        limits: FlatReaderProjectionLimits,
+        control: &dyn PureCompileControl,
+    ) -> Result<
+        crate::ipc_flat_stream_v2::FlatReaderResourceFacts,
+        crate::ipc_flat_stream_v2::FlatReaderError,
+    > {
+        use crate::ipc_flat_stream_v2::{FlatReaderError, preflight_flat_constant_stream};
+        use novarocks_type_contract::{CompileCheckpoints, FunctionValueType};
+        let decode = PackageDecodeLimits::FROZEN;
+        let (bytes, field) = constant_reader_fixture(false);
+        let value_type = FunctionValueType::new(field.data_type().clone(), true);
+        let stream = preflight_flat_constant_stream(
+            &bytes,
+            &field,
+            decode.constant_records.flat_stream,
+            &decode.verifier,
+            &Control,
+        )
+        .map_err(crate::ipc_flat_stream_v2::FlatPoolResourceError::from)?;
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+        let prepared = stream.prepare_pool_borrowed_observed(
+            field.clone(),
+            &value_type,
+            source,
+            FROZEN_CONSTANT_POLICY,
+            limits,
+            &mut |_| Ok::<(), FlatReaderError>(()),
+            &mut work,
+        )?;
+        let facts = *prepared.facts();
+        drop(prepared);
+        work.finish()?;
+        Ok(facts)
+    }
+
+    fn recursive_reader_model(
+        source: usize,
+        limits: RecursiveReaderProjectionLimits,
+        control: &dyn PureCompileControl,
+    ) -> Result<
+        crate::ipc_recursive_stream_v2::RecursiveReaderResourceFacts,
+        crate::ipc_flat_stream_v2::FlatReaderError,
+    > {
+        use crate::ipc_flat_stream_v2::{FlatPoolResourceError, FlatReaderError};
+        use crate::ipc_recursive_stream_v2::preflight_recursive_constant_stream;
+        use novarocks_type_contract::{CompileCheckpoints, FunctionValueType};
+        let decode = PackageDecodeLimits::FROZEN;
+        let (bytes, field) = constant_reader_fixture(true);
+        let value_type = FunctionValueType::new(field.data_type().clone(), true);
+        let stream = preflight_recursive_constant_stream(
+            &bytes,
+            &field,
+            decode.constant_records.recursive_stream,
+            &decode.verifier,
+            &Control,
+        )
+        .map_err(FlatPoolResourceError::from)?;
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+        let prepared = stream.prepare_pool_borrowed_observed(
+            field.clone(),
+            &value_type,
+            source,
+            FROZEN_CONSTANT_POLICY,
+            limits,
+            &mut |_| Ok::<(), FlatReaderError>(()),
+            &mut work,
+        )?;
+        let facts = *prepared.facts();
+        drop(prepared);
+        work.finish()?;
+        Ok(facts)
+    }
+
+    /// These two-row IPCs have tiny bodies. The real declared source invoice,
+    /// including opaque metadata bucket backing, still enters the original
+    /// complete numerical author. No 128-MiB source allocation is fabricated.
+    #[test]
+    fn frozen_reader_work_covers_real_flat_and_recursive_models_at_the_package_source_floor() {
+        use crate::ipc_flat_stream_v2::{FlatPoolResourceError, FlatReaderError};
+        let decode = PackageDecodeLimits::FROZEN;
+        let flat_limits = decode.constant_records.flat_reader;
+        let nested_limits = decode.constant_records.recursive_reader;
+        let flat = flat_reader_model(SOURCE, flat_limits, &Control).unwrap();
+        let nested = recursive_reader_model(SOURCE, nested_limits, &Control).unwrap();
+        // Independent lower bounds from the original source-walk contracts:
+        // flat >=6S; the recursive Struct+child has N=2, hence >=14S.
+        assert!(flat.cumulative_library_work_upper_bound > 6 * SOURCE);
+        assert!(nested.cumulative_library_work_upper_bound > 14 * SOURCE);
+        assert!(flat.cumulative_library_work_upper_bound > 512 * MIB);
+        assert!(nested.cumulative_library_work_upper_bound > GIB);
+        assert!(
+            flat.cumulative_library_work_upper_bound <= flat_limits.max_cumulative_library_work
+        );
+        assert!(
+            nested.cumulative_library_work_upper_bound <= nested_limits.max_cumulative_library_work
+        );
+        assert!(
+            flat.new_allocation_request_bytes_upper_bound
+                <= flat_limits.max_new_allocation_request_bytes
+        );
+        assert!(
+            nested.new_allocation_request_bytes_upper_bound
+                <= nested_limits.max_new_allocation_request_bytes
+        );
+        for error in [
+            flat_reader_model(
+                SOURCE,
+                FlatReaderProjectionLimits {
+                    max_cumulative_library_work: 512 * MIB,
+                    ..flat_limits
+                },
+                &Control,
+            )
+            .err()
+            .unwrap(),
+            recursive_reader_model(
+                SOURCE,
+                RecursiveReaderProjectionLimits {
+                    max_cumulative_library_work: GIB,
+                    ..nested_limits
+                },
+                &Control,
+            )
+            .err()
+            .unwrap(),
+        ] {
+            assert!(matches!(
+                error,
+                FlatReaderError::Projection(FlatPoolResourceError::Control(
+                    CompileControlError::ResourceExhausted
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn frozen_reader_model_cap_and_checked_overflow_remain_typed_control() {
+        use crate::ipc_flat_stream_v2::{FlatPoolResourceError, FlatReaderError};
+        let decode = PackageDecodeLimits::FROZEN;
+        // Checked numerical overflow is distinct from a larger allocation
+        // allowance: no original reader or constant pool is materialized.
+        let flat = FlatReaderProjectionLimits {
+            max_new_allocation_request_bytes: usize::MAX,
+            max_coexisting_source_and_request_bytes: usize::MAX,
+            max_cumulative_library_work: usize::MAX,
+        };
+        let nested = RecursiveReaderProjectionLimits {
+            max_new_allocation_request_bytes: usize::MAX,
+            max_coexisting_source_and_request_bytes: usize::MAX,
+            max_cumulative_library_work: usize::MAX,
+        };
+        for error in [
+            flat_reader_model(usize::MAX / 2, flat, &Control)
+                .err()
+                .unwrap(),
+            recursive_reader_model(usize::MAX / 2, nested, &Control)
+                .err()
+                .unwrap(),
+            flat_reader_model(
+                SOURCE,
+                FlatReaderProjectionLimits {
+                    max_new_allocation_request_bytes: 0,
+                    ..decode.constant_records.flat_reader
+                },
+                &Control,
+            )
+            .err()
+            .unwrap(),
+            recursive_reader_model(
+                SOURCE,
+                RecursiveReaderProjectionLimits {
+                    max_new_allocation_request_bytes: 0,
+                    ..decode.constant_records.recursive_reader
+                },
+                &Control,
+            )
+            .err()
+            .unwrap(),
+        ] {
+            assert!(matches!(
+                error,
+                FlatReaderError::Projection(FlatPoolResourceError::Control(
+                    CompileControlError::ResourceExhausted
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn frozen_reader_work_keeps_the_original_control_cause_without_footer() {
+        use crate::ipc_flat_stream_v2::{FlatPoolResourceError, FlatReaderError};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Refuse {
+            calls: AtomicUsize,
+            cause: CompileControlError,
+        }
+        impl PureCompileControl for Refuse {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    Err(self.cause.clone())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let decode = PackageDecodeLimits::FROZEN;
+        for recursive in [false, true] {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let control = Refuse {
+                    calls: AtomicUsize::new(0),
+                    cause: cause.clone(),
+                };
+                let result = if recursive {
+                    recursive_reader_model(
+                        SOURCE,
+                        decode.constant_records.recursive_reader,
+                        &control,
+                    )
+                    .map(|_| ())
+                } else {
+                    flat_reader_model(SOURCE, decode.constant_records.flat_reader, &control)
+                        .map(|_| ())
+                };
+                assert!(matches!(result, Err(FlatReaderError::Projection(
+                    FlatPoolResourceError::Control(actual))) if actual == cause));
+                assert_eq!(control.calls.load(Ordering::SeqCst), 2);
+            }
         }
     }
 

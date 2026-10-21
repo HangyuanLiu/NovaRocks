@@ -105,6 +105,8 @@ SPARK_SQL
 printf 'SPARK_MV_SCHEMA_OK\n'
 
 -- query 9
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW mv_nr_interop_${uuid0};
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.mv_interop_base_${uuid0} FORCE;
+SET CATALOG iceberg_compat_${suite_uuid0};
+DROP MATERIALIZED VIEW IF EXISTS nr_compat_${suite_uuid0}.mv_nr_interop_${uuid0};
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.mv_interop_base_${uuid0} FORCE;

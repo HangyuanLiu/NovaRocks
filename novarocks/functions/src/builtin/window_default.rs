@@ -62,7 +62,76 @@ fn numeric(ty: &DataType) -> bool {
     )
 }
 
+#[derive(Clone, Copy)]
+enum DefaultProfile {
+    Numeric,
+    Identity,
+    Null,
+    Parse,
+    Format,
+}
+#[derive(Clone, Copy)]
+enum UnsupportedDefaultProfile {
+    Target,
+    Numeric,
+    Conversion,
+}
+impl UnsupportedDefaultProfile {
+    fn failure(self) -> KernelFailure {
+        invalid(match self {
+            Self::Target => "window default requires an implemented nullable result domain",
+            Self::Numeric => {
+                "window numeric default requires Physical carriers and a nullable result"
+            }
+            Self::Conversion => "window default conversion profile is unsupported",
+        })
+    }
+}
+fn default_profile(
+    source: &FunctionValueType,
+    target: &FunctionValueType,
+) -> Result<DefaultProfile, UnsupportedDefaultProfile> {
+    if !target.nullable() || !(numeric(target.data_type()) || target.data_type() == &DataType::Utf8)
+    {
+        return Err(UnsupportedDefaultProfile::Target);
+    }
+    if let Some(supported) = NumericDefaultRecipe::profile_supported(source, target) {
+        return if supported {
+            Ok(DefaultProfile::Numeric)
+        } else {
+            Err(UnsupportedDefaultProfile::Numeric)
+        };
+    }
+    let physical = source.logical_type() == ValueLogicalType::Physical
+        && target.logical_type() == ValueLogicalType::Physical;
+    if source.data_type() == target.data_type() && source.logical_type() == target.logical_type() {
+        Ok(DefaultProfile::Identity)
+    } else if source.data_type() == &DataType::Null
+        && source.logical_type() == ValueLogicalType::Physical
+    {
+        Ok(DefaultProfile::Null)
+    } else if physical
+        && source.data_type() == &DataType::Utf8
+        && target.data_type() == &DataType::Int64
+    {
+        Ok(DefaultProfile::Parse)
+    } else if physical
+        && source.data_type() == &DataType::Int64
+        && target.data_type() == &DataType::Utf8
+    {
+        Ok(DefaultProfile::Format)
+    } else {
+        Err(UnsupportedDefaultProfile::Conversion)
+    }
+}
+
 impl DefaultValueRecipe {
+    /// The exact type-only decision also used by the original preparation body.
+    /// It does not inspect defaults, offsets, frames or partition payload.
+    pub(super) fn supports_profile(source: &FunctionValueType, target: &FunctionValueType) -> bool {
+        default_profile(source, target).is_ok()
+    }
+
     pub(super) fn try_new(
         source: &FunctionValueType,
         target: &FunctionValueType,
@@ -73,39 +142,20 @@ impl DefaultValueRecipe {
         let result = (|| {
             validate_type_observed(source, &mut work)?;
             validate_type_observed(target, &mut work)?;
-            let supported_target = target.nullable()
-                && (numeric(target.data_type()) || target.data_type() == &DataType::Utf8);
+            let profile = default_profile(source, target);
             work.step().map_err(compile_failure)?;
-            if !supported_target {
-                return Err(invalid(
-                    "window default requires an implemented nullable result domain",
-                ));
-            }
-            let physical = source.logical_type() == ValueLogicalType::Physical
-                && target.logical_type() == ValueLogicalType::Physical;
-            let numeric_recipe = NumericDefaultRecipe::try_new(source, target, &mut work)?;
-            let conversion = if let Some(recipe) = numeric_recipe {
-                Conversion::Numeric(recipe)
-            } else if source.data_type() == target.data_type()
-                && source.logical_type() == target.logical_type()
-            {
-                Conversion::Identity
-            } else if source.data_type() == &DataType::Null
-                && source.logical_type() == ValueLogicalType::Physical
-            {
-                Conversion::Null
-            } else if physical
-                && source.data_type() == &DataType::Utf8
-                && target.data_type() == &DataType::Int64
-            {
-                Conversion::Parse
-            } else if physical
-                && source.data_type() == &DataType::Int64
-                && target.data_type() == &DataType::Utf8
-            {
-                Conversion::Format
-            } else {
-                return Err(invalid("window default conversion profile is unsupported"));
+            let conversion = match profile.map_err(UnsupportedDefaultProfile::failure)? {
+                DefaultProfile::Numeric => {
+                    let recipe = NumericDefaultRecipe::try_new(source, target, &mut work)?
+                        .ok_or_else(|| {
+                            internal("numeric window default lost its admitted profile")
+                        })?;
+                    Conversion::Numeric(recipe)
+                }
+                DefaultProfile::Identity => Conversion::Identity,
+                DefaultProfile::Null => Conversion::Null,
+                DefaultProfile::Parse => Conversion::Parse,
+                DefaultProfile::Format => Conversion::Format,
             };
             work.step().map_err(compile_failure)?;
             // Only admitted flat carriers reach these clones. No nested Field,

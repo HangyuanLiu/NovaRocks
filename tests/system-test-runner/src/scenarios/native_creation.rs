@@ -49,11 +49,13 @@ use super::native_compatibility::{
     raw_acquire_admission_ticket, raw_apply_task_operations_until, raw_establish,
     raw_operation_envelope, raw_unary, raw_unary_response, raw_unary_until,
 };
-use super::query_lifecycle::native_sql_controls::{SqlIntentOwner, StatementSpec};
+use super::query_lifecycle::native_sql_controls::{
+    SelectedStatement, SqlIntentOwner, StatementSpec,
+};
 use super::query_lifecycle::{
     NID2_FENCE_QUERY, arm_on_every_backend, assert_two_sleep_rows, await_backend_exit,
-    await_fresh_task_create, await_resource_convergence, await_terminal_snapshot,
-    await_token_scoped_marker, latest_execution_id, resource_snapshot,
+    await_fresh_task_create, await_resource_convergence, await_token_scoped_marker,
+    resource_snapshot,
 };
 
 #[path = "raw_creation_controls.rs"]
@@ -79,7 +81,7 @@ const CREATE_PAYLOADS_RETAINED: &str = "novarocks_task_create_payloads_retained"
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(FrozenReplayAndMembership::default()),
-        Box::new(CreationPayloadLifetime),
+        Box::new(CreationPayloadLifetime::default()),
         Box::new(FixedPlanRecovery::default()),
         Box::new(NormalCloseCapacity {
             byte_limited: false,
@@ -1101,7 +1103,26 @@ fn await_count(
 /// whose acknowledgement is lost retains its payload until ownership is
 /// proved by covered Installed/terminal facts or an exact replay; it is never
 /// frozen or applied twice. A cancelled statement releases everything it froze.
-struct CreationPayloadLifetime;
+#[derive(Default)]
+struct CreationPayloadLifetime {
+    intent: SqlIntentOwner,
+}
+
+fn creation_statement(sql: &str, attempts: &[u64], fault: Option<&'static str>) -> StatementSpec {
+    StatementSpec {
+        sql: sql.into(),
+        faults: fault.map_or_else(Vec::new, |kind| {
+            (0..REQUIRED_BACKENDS).map(|index| (index, kind)).collect()
+        }),
+        observations: (0..REQUIRED_BACKENDS)
+            .flat_map(|index| {
+                attempts
+                    .iter()
+                    .map(move |&attempt| (index, "grpc-fragment", Some(attempt)))
+            })
+            .collect(),
+    }
+}
 
 impl Scenario for CreationPayloadLifetime {
     fn declaration(&self) -> crate::scenario::ScenarioDeclaration {
@@ -1117,6 +1138,27 @@ impl Scenario for CreationPayloadLifetime {
         "native-creation/creation-payload-lifetime"
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &std::path::Path,
+        cluster_size: usize,
+        binary: &std::path::Path,
+        deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.intent.freeze(
+            vec![
+                creation_statement(NID2_FENCE_QUERY, &[1], None),
+                creation_statement(BASELINE_QUERY, &[1], Some("create-task-ack-drop")),
+                creation_statement(NID2_FENCE_QUERY, &[1], None),
+            ],
+            &[],
+            cluster_size,
+            binary,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_snapshot(context)?;
@@ -1124,7 +1166,7 @@ impl Scenario for CreationPayloadLifetime {
         context.action(format!("idle frontend creation gauges: {idle:?}"));
 
         // Exact acknowledgements release the payload mid-statement.
-        let pending = PendingRead::start(context, NID2_FENCE_QUERY)?;
+        let pending = PendingRead::start(context, self.intent.take(0)?)?;
         let mut peak_payloads = 0;
         loop {
             let now = FrontendCreationGauges::scrape(context)?;
@@ -1165,8 +1207,9 @@ impl Scenario for CreationPayloadLifetime {
         let before = FrontendCreationGauges::scrape(context)?;
         let applied_before = backend_marker_total(context, CREATE_APPLIED)?;
         let idempotent_before = backend_marker_total(context, CREATE_IDEMPOTENT)?;
-        let tokens = arm_on_every_backend(context, "create-task-ack-drop")?;
-        let result = run_baseline_query(context);
+        let selected = self.intent.take(1)?;
+        let tokens = vec![selected.token.clone(); REQUIRED_BACKENDS];
+        let result = run_baseline_query(context, &selected);
         let cleared = context
             .handle()
             .clear_query_lifecycle_faults()
@@ -1199,7 +1242,7 @@ impl Scenario for CreationPayloadLifetime {
         let created_before = (0..context.handle().be_count())
             .map(|index| context.handle().be_log_count(index, CREATE_APPLIED))
             .collect::<Result<Vec<_>>>()?;
-        let pending = PendingRead::start(context, NID2_FENCE_QUERY)?;
+        let pending = PendingRead::start(context, self.intent.take(2)?)?;
         await_fresh_task_create(context, &created_before)?;
         let deadline = context.deadline();
         context
@@ -1300,11 +1343,18 @@ fn backend_marker_total(context: &mut ScenarioContext, marker: &str) -> Result<u
     Ok(total)
 }
 
-fn run_baseline_query(context: &mut ScenarioContext) -> Result<()> {
+fn run_baseline_query(context: &mut ScenarioContext, selected: &SelectedStatement) -> Result<()> {
     let mut connection = mysql_actor::connect_until(
         context.mysql_user(),
         context.mysql_port(),
         context.deadline(),
+    )?;
+    let observation = arm_on_every_backend(
+        context,
+        selected,
+        "create-task-ack-drop",
+        connection.connection_id(),
+        BASELINE_QUERY,
     )?;
     let rows: Vec<i64> = connection
         .query(BASELINE_QUERY)
@@ -1314,11 +1364,19 @@ fn run_baseline_query(context: &mut ScenarioContext) -> Result<()> {
         "the baseline read returned {rows:?} instead of [1, 2]"
     );
     connection.finish()?;
+    let deadline = context.deadline();
+    context
+        .handle()
+        .await_query_lifecycle_statement_observation(&observation, true, deadline)?;
+    context
+        .handle()
+        .drain_query_lifecycle_statement_observation(&observation)?;
     Ok(())
 }
 
 /// One statement running on its own connection, cancellable by id.
 struct PendingRead {
+    observation: novarocks_cluster_harness::QueryLifecycleStatementObservation,
     thread: Option<thread::JoinHandle<Result<()>>>,
     connection_id: u32,
     done: mpsc::Receiver<Result<Vec<i64>, mysql::Error>>,
@@ -1339,38 +1397,33 @@ impl Drop for PendingRead {
 }
 
 impl PendingRead {
-    fn start(context: &mut ScenarioContext, sql: &'static str) -> Result<Self> {
-        let (id_tx, id_rx) = mpsc::sync_channel(1);
+    fn start(context: &mut ScenarioContext, selected: SelectedStatement) -> Result<Self> {
         let (done_tx, done) = mpsc::sync_channel(1);
-        let user = context.mysql_user().to_owned();
-        let port = context.mysql_port();
-        context.remaining("connect the delayed read")?;
-        let deadline = context.deadline();
+        let connection = mysql_actor::connect_for_cancellation_until(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.deadline(),
+        )?;
+        let connection_id = connection.connection_id();
+        let observation = selected.arm(context, connection_id, &selected.sql)?;
+        let sql = selected.sql;
         let thread = thread::Builder::new()
             .name("native-creation-read".to_owned())
             .spawn(move || -> Result<()> {
-                mysql_actor::connect_for_cancellation_until(&user, port, deadline)?.run(
-                    |connection| {
-                        id_tx
-                            .send(connection.connection_id())
-                            .context("publish the delayed read connection id")?;
-                        let outcome = connection.query(sql);
-                        done_tx
-                            .send(outcome)
-                            .context("publish the delayed read result")
-                    },
-                )
+                connection.run(|connection| {
+                    let outcome = connection.query(sql);
+                    done_tx
+                        .send(outcome)
+                        .context("publish the delayed read result")
+                })
             })
             .context("start the delayed read")?;
-        let mut pending = Self {
+        Ok(Self {
+            observation,
             thread: Some(thread),
-            connection_id: 0,
+            connection_id,
             done,
-        };
-        pending.connection_id = id_rx
-            .recv_timeout(context.remaining("receive the delayed read connection id")?)
-            .context("the delayed read ended before publishing its connection id")?;
-        Ok(pending)
+        })
     }
 
     fn still_running(&self) -> bool {
@@ -1423,30 +1476,17 @@ impl Scenario for FixedPlanRecovery {
 
     fn test_session_plan(
         &self,
-        _: &ScenarioLaunchConfig,
-        _: &std::path::Path,
+        _launch: &ScenarioLaunchConfig,
+        _root: &std::path::Path,
         cluster_size: usize,
         binary: &std::path::Path,
         deadline: std::time::Instant,
     ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
-        let clean = StatementSpec {
-            sql: NID2_FENCE_QUERY.into(),
-            faults: Vec::new(),
-            observations: (0..cluster_size)
-                .map(|index| (index, "grpc-fragment", Some(1)))
-                .collect(),
-        };
-        let recovery = StatementSpec {
-            sql: NID2_FENCE_QUERY.into(),
-            faults: Vec::new(),
-            observations: (0..cluster_size)
-                .flat_map(|index| {
-                    [1, 2].map(move |attempt| (index, "grpc-fragment", Some(attempt)))
-                })
-                .collect(),
-        };
         Ok(Some(self.intent.freeze(
-            vec![clean, recovery],
+            vec![
+                creation_statement(NID2_FENCE_QUERY, &[1], None),
+                creation_statement(NID2_FENCE_QUERY, &[1, 2], None),
+            ],
             &[0, 1, 2],
             cluster_size,
             binary,
@@ -1460,18 +1500,9 @@ impl Scenario for FixedPlanRecovery {
         let idle = FrontendCreationGauges::scrape(context)?;
 
         // The reference: how many static plans one clean run freezes.
-        let mut clean = mysql_actor::connect_until(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.deadline(),
-        )?;
-        let clean_observation =
-            self.intent
-                .take(0)?
-                .arm(context, clean.connection_id(), NID2_FENCE_QUERY)?;
-        let rows: Vec<i64> = clean
-            .query(NID2_FENCE_QUERY)
-            .context("the clean delayed read failed")?;
+        let pending = PendingRead::start(context, self.intent.take(0)?)?;
+        let clean_observation = pending.observation.clone();
+        let rows = pending.finish(context)?;
         ensure!(rows.len() == 2, "the clean read returned {rows:?}");
         let deadline = context.deadline();
         let clean_terminal = context
@@ -1480,7 +1511,6 @@ impl Scenario for FixedPlanRecovery {
         context
             .handle()
             .drain_query_lifecycle_statement_observation(&clean_observation)?;
-        clean.finish()?;
         ensure!(
             clean_terminal.attempt_id == 1,
             "the clean read unexpectedly ran attempt {}",
@@ -1527,7 +1557,6 @@ impl Scenario for FixedPlanRecovery {
         context
             .handle()
             .drain_query_lifecycle_statement_observation(&recovery_observation)?;
-        stream.shutdown()?;
         ensure!(
             terminal.attempt_id == 2,
             "the read must complete on replacement attempt 2, got attempt {}",
@@ -2351,4 +2380,79 @@ fn observe_terminal_stop_and_fence_with_failure(
             result
         }).await.context("covered terminal/actual-stop probe exhausted its scenario deadline")?
     })
+}
+
+#[cfg(test)]
+mod finite_sql_authorization_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn creation_payload_submissions_are_distinct_and_only_the_second_has_the_fault() {
+        let scenario = CreationPayloadLifetime::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let plan = scenario
+            .test_session_plan(
+                &ScenarioLaunchConfig::default(),
+                std::path::Path::new("/unused"),
+                3,
+                &std::env::current_exe().unwrap(),
+                deadline,
+            )
+            .unwrap()
+            .unwrap();
+        plan.validate_selected_intents(3).unwrap();
+        let first = scenario.intent.take(0).unwrap();
+        let lost_ack = scenario.intent.take(1).unwrap();
+        let canceled = scenario.intent.take(2).unwrap();
+        assert_eq!(first.sql, NID2_FENCE_QUERY);
+        assert_eq!(canceled.sql, first.sql);
+        assert_ne!(first.token, canceled.token);
+        assert_eq!(lost_ack.sql, BASELINE_QUERY);
+        assert_eq!(
+            lost_ack.faults,
+            (0..3)
+                .map(|index| (index, "create-task-ack-drop"))
+                .collect::<Vec<_>>()
+        );
+        assert!(first.faults.is_empty() && canceled.faults.is_empty());
+        assert_eq!(first.deadline, deadline);
+        assert!(scenario.intent.take(1).is_err());
+        assert!(scenario.intent.take(3).is_err());
+    }
+
+    #[test]
+    fn fixed_plan_recovery_keeps_explicit_attempts_without_reusing_a_submission() {
+        let scenario = FixedPlanRecovery::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let plan = scenario
+            .test_session_plan(
+                &ScenarioLaunchConfig::default(),
+                std::path::Path::new("/unused"),
+                3,
+                &std::env::current_exe().unwrap(),
+                deadline,
+            )
+            .unwrap()
+            .unwrap();
+        plan.validate_selected_intents(3).unwrap();
+        let first = scenario.intent.take(0).unwrap();
+        let recovery = scenario.intent.take(1).unwrap();
+        assert_eq!(first.sql, NID2_FENCE_QUERY);
+        assert_eq!(first.sql, recovery.sql);
+        assert_ne!(first.token, recovery.token);
+        assert!(first.faults.is_empty() && recovery.faults.is_empty());
+        assert!(scenario.intent.take(1).is_err());
+        let spec = creation_statement(NID2_FENCE_QUERY, &[1, 2], None);
+        assert_eq!(
+            spec.observations,
+            (0..3)
+                .flat_map(|index| [1, 2].map(move |attempt| (
+                    index,
+                    "grpc-fragment",
+                    Some(attempt)
+                )))
+                .collect::<Vec<_>>()
+        );
+    }
 }

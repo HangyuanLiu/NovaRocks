@@ -26,6 +26,9 @@ use novarocks_type_contract::ValueLogicalType;
 
 #[test]
 fn public_sql_map_subscript_preserves_largeint_key_identity() {
+    // The lookup must retain the complete LargeInt key/value declarations.
+    // Installed map_agg supplies those same declarations without depending on
+    // the unavailable scalar map constructor; keep all lookup/nullability oracles.
     for (sql, carrier, domain) in [
         (
             "SELECT map_agg(CAST('11111' AS LARGEINT), CAST('2024-09-01 18:00:00' AS DATETIME))[11111]",
@@ -33,17 +36,17 @@ fn public_sql_map_subscript_preserves_largeint_key_identity() {
             ValueLogicalType::Physical,
         ),
         (
-            "SELECT map(CAST('11111' AS LARGEINT), CAST('9223372036854775808' AS LARGEINT))[11111]",
+            "SELECT map_agg(CAST('11111' AS LARGEINT), CAST('9223372036854775808' AS LARGEINT))[11111]",
             DataType::FixedSizeBinary(16),
             ValueLogicalType::LargeInt,
         ),
         (
-            "SELECT map(CAST('11111' AS LARGEINT), CAST('9223372036854775808' AS LARGEINT))[NULL]",
+            "SELECT map_agg(CAST('11111' AS LARGEINT), CAST('9223372036854775808' AS LARGEINT))[NULL]",
             DataType::FixedSizeBinary(16),
             ValueLogicalType::LargeInt,
         ),
         (
-            "SELECT m[k] FROM (SELECT map(CAST('11111' AS LARGEINT), 'selected') AS m, 11111 AS k) q",
+            "SELECT m[k] FROM (SELECT map_agg(CAST('11111' AS LARGEINT), 'selected') AS m, 11111 AS k) q",
             DataType::Utf8,
             ValueLogicalType::Physical,
         ),

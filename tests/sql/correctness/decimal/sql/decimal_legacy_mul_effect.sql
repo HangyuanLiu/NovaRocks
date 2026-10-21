@@ -35,12 +35,18 @@ SET sql_mode='ALLOW_THROW_EXCEPTION';
 
 -- query 4
 -- @skip_result_check=true
--- @expect_error=The 'mul' operation involving decimal values overflows
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.numeric_out_of_range
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
 SELECT CAST(a*2 AS VARCHAR) AS v FROM ${case_db}.legacy_mul_effect;
 
 -- query 5
 -- @skip_result_check=true
--- @expect_error=The 'mul' operation involving decimal values overflows
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.numeric_out_of_range
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
 SELECT k FROM (SELECT k,a*2 AS unreferenced FROM ${case_db}.legacy_mul_effect) s;
 
 -- query 6
@@ -48,12 +54,18 @@ SELECT k FROM (SELECT k,a+2 AS unreferenced FROM ${case_db}.legacy_mul_effect) s
 
 -- query 7
 -- @skip_result_check=true
--- @expect_error=numeric type cast involving decimal overflows
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.numeric_out_of_range
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
 SELECT CAST(a AS DECIMAL(3,0)) AS narrowed FROM ${case_db}.legacy_mul_effect;
 
 -- query 8
 -- @skip_result_check=true
--- @expect_error=numeric type cast involving decimal overflows
+-- @expect_error_tier=target
+-- @expect_sql_code=query.execution.numeric_out_of_range
+-- @expect_sql_phase=Execution
+-- @expect_error=ERROR 1690 (22003): [query.execution.numeric_out_of_range]
 SELECT k FROM (SELECT k,CAST(a AS DECIMAL(3,0)) AS unreferenced FROM ${case_db}.legacy_mul_effect) s;
 
 -- query 9

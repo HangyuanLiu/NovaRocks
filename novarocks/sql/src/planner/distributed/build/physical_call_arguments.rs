@@ -45,7 +45,6 @@ impl From<ConstantError> for PhysicalArgumentError {
     fn from(error: ConstantError) -> Self {
         match error {
             ConstantError::Control(cause) => Self::Control(cause),
-            ConstantError::Limit(_) => Self::Control(CompileControlError::ResourceExhausted),
             other => Self::Constant(other),
         }
     }
@@ -57,10 +56,28 @@ impl From<ConstantReferenceError> for PhysicalArgumentError {
             | ConstantReferenceError::Constant(ConstantError::Control(cause)) => {
                 Self::Control(cause)
             }
-            ConstantReferenceError::Constant(ConstantError::Limit(_)) => {
-                Self::Control(CompileControlError::ResourceExhausted)
-            }
             other => Self::Reference(other),
+        }
+    }
+}
+
+impl PhysicalArgumentError {
+    pub(crate) fn is_constant_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::Constant(ConstantError::Limit(_))
+                | Self::Reference(ConstantReferenceError::Constant(ConstantError::Limit(_)))
+        )
+    }
+
+    /// Consume only the exact limit carrier; preserve all other argument errors.
+    pub(crate) fn into_constant_limit(self) -> Result<ConstantError, Self> {
+        match self {
+            Self::Constant(error @ ConstantError::Limit(_))
+            | Self::Reference(ConstantReferenceError::Constant(error @ ConstantError::Limit(_))) => {
+                Ok(error)
+            }
+            other => Err(other),
         }
     }
 }

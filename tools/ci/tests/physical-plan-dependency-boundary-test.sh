@@ -353,6 +353,61 @@ append_dependency "$connector_schema_root" connector-contract \
   "arrow-schema = \"=${ARROW_SCHEMA_VERSION}\""
 assert_accepted "$connector_schema_root"
 
+# Failure facts may be consumed by the neutral owners above, but must remain
+# dependency-free themselves, including otherwise admitted carrier packages.
+failure_carrier_root="$(new_mutation failure-carrier)"
+append_dependency "$failure_carrier_root" failure-contract \
+  "bytes = \"=${BYTES_VERSION}\""
+assert_rejected "$failure_carrier_root" \
+  "novarocks-failure-contract declares normal dependencies outside its exact owner allow-list" \
+  "bytes"
+
+failure_wire_root="$(new_mutation failure-wire)"
+append_dependency "$failure_wire_root" failure-contract \
+  'wire = { package = "tonic", path = "../tonic" }'
+assert_rejected "$failure_wire_root" \
+  "novarocks-failure-contract declares normal dependencies outside its exact owner allow-list" \
+  "resolved normal/build dependency closure contains forbidden wire/RPC capability" \
+  "tonic"
+
+failure_optional_root="$(new_mutation failure-optional-wire)"
+append_dependency "$failure_optional_root" failure-contract \
+  'wire = { package = "tonic", path = "../tonic", optional = true }'
+assert_rejected "$failure_optional_root" \
+  "novarocks-failure-contract must remain dependency-free" \
+  "novarocks-failure-contract declares optional normal dependencies" \
+  "novarocks-failure-contract declares normal dependencies outside its exact owner allow-list"
+
+failure_target_root="$(new_mutation failure-inactive-runtime)"
+append_dependency_section "$failure_target_root" failure-contract \
+  'target.'"'"'cfg(target_os="none")'"'"'.dependencies' \
+  'novarocks-execution = { path = "../execution" }'
+assert_rejected "$failure_target_root" \
+  "novarocks-failure-contract declares target-specific normal dependencies" \
+  "novarocks-execution"
+
+failure_dev_root="$(new_mutation failure-dev)"
+append_dependency_section "$failure_dev_root" failure-contract dev-dependencies \
+  'novarocks-execution = { path = "../execution" }'
+assert_rejected "$failure_dev_root" \
+  "novarocks-failure-contract declared dev dependencies contains forbidden application/execution owner" \
+  "novarocks-failure-contract declares dev dependencies" \
+  "novarocks-execution"
+
+# A same-name local package outside the audited workspace authority must not
+# gain admission just because the new neutral vocabulary name is permitted.
+failure_identity_root="$(new_mutation failure-foreign-identity)"
+write_package "$failure_identity_root" failure-contract-v2 novarocks-failure-contract
+replace_text "$failure_identity_root/crates/failure-contract-v2/Cargo.toml" \
+  'version = "0.1.0"' 'version = "0.2.0"'
+replace_text "$failure_identity_root/crates/physical-plan/Cargo.toml" \
+  'novarocks-failure-contract = { path = "../failure-contract" }' \
+  'novarocks-failure-contract = { path = "../failure-contract-v2" }'
+assert_rejected "$failure_identity_root" \
+  "package identities outside the exact audited allow-list" \
+  "novarocks-failure-contract v0.2.0" \
+  "crates/failure-contract-v2/Cargo.toml"
+
 # A forbidden application owner declared directly must be rejected.
 direct_root="$(new_mutation direct-application)"
 append_dependency "$direct_root" physical-plan \
@@ -421,13 +476,6 @@ append_dependency "$failure_runtime_root" failure-contract 'tonic = { path = "..
 assert_rejected "$failure_runtime_root" \
   "novarocks-failure-contract must remain dependency-free" \
   "resolved normal/build dependency closure contains forbidden wire/RPC capability"
-
-failure_optional_root="$(new_mutation failure-optional-runtime)"
-append_dependency "$failure_optional_root" failure-contract \
-  'rpc = { package = "tonic", path = "../tonic", optional = true }'
-assert_rejected "$failure_optional_root" \
-  "novarocks-failure-contract must remain dependency-free" \
-  "novarocks-failure-contract declares optional normal dependencies"
 
 failure_target_root="$(new_mutation failure-inactive-target-runtime)"
 append_dependency_section "$failure_target_root" failure-contract \

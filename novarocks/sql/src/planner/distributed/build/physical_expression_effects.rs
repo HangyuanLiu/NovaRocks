@@ -506,7 +506,17 @@ fn compose_expression_effects_observed<'source>(
         }
         Ok(AuthoredPhysicalExpressionEffects { summaries, calls })
     })();
-    if matches!(&result, Err(PhysicalExpressionEffectsError::Control(_))) {
+    let primary_constant = match &result {
+        Err(PhysicalExpressionEffectsError::Argument(argument))
+        | Err(PhysicalExpressionEffectsError::Request(PhysicalScalarRequestError::Argument(
+            argument,
+        )))
+        | Err(PhysicalExpressionEffectsError::WindowRequest(
+            PhysicalWindowRequestError::Argument(argument),
+        )) => argument.is_constant_limit(),
+        _ => false,
+    };
+    if primary_constant || matches!(&result, Err(PhysicalExpressionEffectsError::Control(_))) {
         return result;
     }
     work.finish()?;

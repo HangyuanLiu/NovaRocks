@@ -52,6 +52,7 @@ use uuid::Uuid;
 struct CreateEffects {
     events: Mutex<Vec<&'static str>>,
     fail_stage: bool,
+    fail_abort: bool,
     fail_publish: Option<MvProviderFailureKind>,
     fail_projection: bool,
     fail_known_committed_projection: bool,
@@ -115,6 +116,12 @@ impl MvCreateProviderPort for CreateEffects {
         _staged: &MvStagedTarget,
     ) -> Result<(), MvProviderFailure> {
         self.record("abort");
+        if self.fail_abort {
+            return Err(MvProviderFailure::new(
+                MvProviderFailureKind::Unavailable,
+                "abort failed",
+            ));
+        }
         Ok(())
     }
 
@@ -687,4 +694,68 @@ fn unit_only_product_refuses_refresh_without_readiness() {
     let attempt = service.reserve_refresh_attempt();
     let result = service.begin_refresh_publication(&create_command().target, &attempt);
     assert!(matches!(result, Err(e) if e.kind() == MvProductErrorKind::Unavailable));
+}
+
+#[test]
+fn a_typed_admission_refusal_does_not_skip_staged_target_abort() {
+    use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
+    use novarocks_sql::compiler::SqlCompileError;
+    let SqlCompileError::Analyze(analyze) =
+        SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
+            FunctionOverloadId::try_new("fixture/mv/stage/missing-pure-v1").unwrap(),
+        ))
+    else {
+        panic!("missing implementation must retain analysis identity");
+    };
+    let message = analyze.to_string();
+    for fail_abort in [false, true] {
+        let effects = CreateEffects {
+            fail_abort,
+            ..Default::default()
+        };
+        let primary = MvProviderFailure::new(MvProviderFailureKind::InvalidRequest, &message)
+            .with_unavailable_implementation(Some(analyze.clone()));
+        let staged = MvStagedTarget {
+            target: create_command().target,
+            staged_operation_id: operation().operation_id,
+        };
+        let failure = super::settle_unpublished_stage(operation(), &effects, &staged, primary);
+        assert_eq!(effects.events(), ["abort"]);
+        assert_eq!(failure.kind(), MvProductErrorKind::InvalidRequest);
+        assert_eq!(failure.compile_control_error(), None);
+        if fail_abort {
+            assert_eq!(failure.unavailable_implementation(), None);
+            assert_eq!(
+                failure.message(),
+                format!("{message}; staged target abort failed: abort failed")
+            );
+        } else {
+            assert_eq!(failure.unavailable_implementation(), Some(&analyze));
+            assert_eq!(failure.message(), message);
+        }
+    }
+}
+
+#[test]
+fn a_committed_finalization_failure_cannot_become_a_pure_admission_refusal() {
+    use novarocks_functions::{FunctionBindingError, FunctionOverloadId};
+    use novarocks_sql::compiler::SqlCompileError;
+    let SqlCompileError::Analyze(analyze) =
+        SqlCompileError::from(FunctionBindingError::UnavailableImplementation(
+            FunctionOverloadId::try_new("fixture/mv/finalization/missing-pure-v1").unwrap(),
+        ))
+    else {
+        panic!("missing implementation must retain analysis identity");
+    };
+    let message = analyze.to_string();
+    let failure = super::known_committed_finalize_failure(
+        MvProviderFailure::new(MvProviderFailureKind::InvalidRequest, &message)
+            .with_unavailable_implementation(Some(analyze)),
+    );
+    assert_eq!(
+        failure.kind(),
+        MvProductErrorKind::KnownCommittedFinalizeFailed
+    );
+    assert_eq!(failure.unavailable_implementation(), None);
+    assert_eq!(failure.message(), message);
 }
