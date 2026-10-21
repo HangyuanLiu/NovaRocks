@@ -513,7 +513,7 @@ def main(argv=None) -> int:
                   env_file=args.manifest.resolve().with_name("env.sh"), budget_seconds=args.fixture_budget_secs)
     except fixture_runtime.RuntimeFailure as error:
         print(f"REST MV ENVIRONMENT ERROR: {error}", file=sys.stderr)
-        return 75 if error.code in {"RunBudgetRejected", "MachineUnavailable"} else 2
+        return 75 if error.code in {"RunBudgetRejected", "FixturePrerequisiteMissing", "MachineUnavailable"} else 2
     except ContractFailure as error:
         print(f"REST MV CONTRACT FAILED: {error}", file=sys.stderr)
         return 1

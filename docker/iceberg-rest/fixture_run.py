@@ -456,7 +456,7 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except runtime.RuntimeFailure as error:
         print(str(error), file=sys.stderr)
-        raise SystemExit(75 if error.code in {"RunBudgetRejected", "MachineUnavailable"} else 1)
+        raise SystemExit(75 if error.code in {"RunBudgetRejected", "FixturePrerequisiteMissing", "MachineUnavailable"} else 1)
     except (ValueError, TypeError, KeyError):
         print("RunBudgetRejected: invalid fixture run input", file=sys.stderr)
         raise SystemExit(75)
