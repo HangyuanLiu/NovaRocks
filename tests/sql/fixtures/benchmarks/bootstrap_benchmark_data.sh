@@ -531,7 +531,8 @@ if ! make dsdgen OS=LINUX >/tmp/novarocks-tpcds-dsdgen-build.log 2>&1; then
   cat /tmp/novarocks-tpcds-dsdgen-build.log >&2
   exit 1
 fi
-./dsdgen -DIR '$tmp_dir/raw' -SCALE '$generator_scale' -FORCE Y
+# Keep dsdgen's fixed-size option buffers independent of the full scratch path.
+./dsdgen -DIR '../../raw' -SCALE '$generator_scale' -FORCE Y
 EOF
       ;;
     *)
