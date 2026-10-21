@@ -350,6 +350,14 @@ fn source_custody_resources_all_builtin_empty_carriers_and_nominal_metadata() {
 }
 #[test]
 fn source_custody_resources_nonempty_offset_nested_view_union_and_validation_carriers() {
+    // The actual recursive custody path, including metadata-only children and
+    // empty List offsets, must fit the SAME preconstruction request packet.
+    for array in crate::source_custody_direct_tests::nested_custody_cases() {
+        check(array.clone());
+        check(array.slice(1, 1));
+        check(array.slice(0, 0));
+    }
+
     check((Arc::new(Int64Array::from(vec![Some(9), None, Some(3)])) as ArrayRef).slice(1, 2));
     check(
         (Arc::new(BooleanArray::from(vec![Some(true), None, Some(false)])) as ArrayRef).slice(1, 2),

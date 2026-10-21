@@ -738,6 +738,10 @@ fn p05_decimal_unsigned_width_limits_and_wide_rescale_policy() {
                 .unwrap(),
         ),
     );
+    // D256 retains the pinned Arrow grammar: trim, empty integer/fraction
+    // parts, then scale padding give coefficient0 for empty/blank input.
+    // The separate D128 owner deliberately preprocesses these to NULL; its
+    // actual contrast remains text_parsers_preserve_invalid_null_and_decimal_rounding.
     p05_selected_value_case(
         Arc::new(StringArray::from(vec![
             Some("1.25"),
@@ -751,8 +755,8 @@ fn p05_decimal_unsigned_width_limits_and_wide_rescale_policy() {
             Decimal256Array::from(vec![
                 Some(arrow_buffer::i256::from_i128(13)),
                 Some(arrow_buffer::i256::from_i128(-13)),
-                None,
-                None,
+                Some(arrow_buffer::i256::ZERO),
+                Some(arrow_buffer::i256::ZERO),
                 None,
                 None,
             ])
@@ -893,8 +897,25 @@ fn p05_timestamp_units_and_time_native_carriers_preserve_exact_counts() {
             Arc::new(Int64Array::from(vec![Some(123456), None])),
         );
         p05_selected_value_case(
-            source,
+            source.clone(),
             Arc::new(Float64Array::from(vec![Some(123456.0), None])),
+        );
+        // The same raw count, not epoch seconds, becomes coefficient12345600.
+        p05_selected_value_case(
+            source.clone(),
+            Arc::new(
+                Decimal128Array::from(vec![Some(12345600), None])
+                    .with_precision_and_scale(38, 2)
+                    .unwrap(),
+            ),
+        );
+        p05_selected_value_case(
+            source,
+            Arc::new(
+                Decimal256Array::from(vec![Some(arrow_buffer::i256::from_i128(12345600)), None])
+                    .with_precision_and_scale(76, 2)
+                    .unwrap(),
+            ),
         );
     }
     for source in [
@@ -920,6 +941,8 @@ fn p05_timestamp_units_and_time_native_carriers_preserve_exact_counts() {
         Arc::new(Time64MicrosecondArray::from(vec![Some(1_000_000), None])),
         Arc::new(StringArray::from(vec![Some("00:00:01"), None])),
     );
+    p05_timestamp_decimal_overflow_selected_cases();
+    p05_timestamp_decimal_preparation_contract();
 }
 
 #[test]
@@ -948,15 +971,73 @@ fn p05_list_and_large_list_retag_keep_offsets_nulls_and_metadata_independently()
         } else {
             DataType::LargeList(child)
         };
+        // Pure declarations canonicalize List role names/annotations. Keep
+        // that original metadata-only case explicitly classified as Identity.
+        // A genuine child NULL widening additionally creates a distinct exact
+        // frozen layout and exercises the actual structural execution author.
+        let canonical_target = if matches!(target, DataType::List(_)) {
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
+        } else {
+            DataType::LargeList(Arc::new(Field::new("item", DataType::Int32, true)))
+        };
+        let required_child = Arc::new(Field::new("item", DataType::Int32, false));
+        let structural_source: ArrayRef =
+            if let Some(list) = source.as_any().downcast_ref::<ListArray>() {
+                Arc::new(
+                    ListArray::try_new(
+                        required_child,
+                        list.offsets().clone(),
+                        list.values().clone(),
+                        list.nulls().cloned(),
+                    )
+                    .unwrap(),
+                )
+            } else {
+                let list = source.as_any().downcast_ref::<LargeListArray>().unwrap();
+                Arc::new(
+                    LargeListArray::try_new(
+                        required_child,
+                        list.offsets().clone(),
+                        list.values().clone(),
+                        list.nulls().cloned(),
+                    )
+                    .unwrap(),
+                )
+            };
         for (policy, allow) in p05_modes() {
-            let r = recipe(source.data_type().clone(), target.clone(), policy, allow);
-            assert!(
-                r.uses_selected_array(),
-                "this exercises the new structural author"
+            let metadata_only = recipe(source.data_type().clone(), target.clone(), policy, allow);
+            assert!(matches!(&metadata_only.body, CastBody::Identity));
+            assert_eq!(metadata_only.source_type().data_type(), &canonical_target);
+            assert_eq!(metadata_only.result_type().data_type(), &canonical_target);
+            let r = recipe(
+                structural_source.data_type().clone(),
+                target.clone(),
+                policy,
+                allow,
             );
+            assert!(matches!(&r.body, CastBody::SelectedArray(Body::Structure)));
+            assert!(r.uses_selected_array());
+            assert_eq!(r.result_type().data_type(), &canonical_target);
             let selected = [0, 1, 2];
-            let result = output(&r, &source, Selection::try_sparse(3, &selected).unwrap());
-            assert_eq!(result.values().data_type(), &target);
+            let result = output(
+                &r,
+                &structural_source,
+                Selection::try_sparse(3, &selected).unwrap(),
+            );
+            assert_eq!(result.values().data_type(), &canonical_target);
+            let field = match result.values().data_type() {
+                DataType::List(field) | DataType::LargeList(field) => field,
+                _ => panic!("exact List carrier"),
+            };
+            assert_eq!(field.name(), "item");
+            assert!(field.is_nullable());
+            assert_eq!(field.metadata().capacity(), 0);
+            let original_field = match &target {
+                DataType::List(field) | DataType::LargeList(field) => field,
+                _ => unreachable!(),
+            };
+            assert_eq!(original_field.name(), "renamed");
+            assert_eq!(original_field.metadata()["owner"], "p05-target");
             assert!(result.values().is_null(1));
             assert!(result.errors().is_empty());
             let (offsets, values): (Vec<i64>, &ArrayRef) =
@@ -984,7 +1065,11 @@ fn p05_list_and_large_list_retag_keep_offsets_nulls_and_metadata_independently()
                 &[1, 2, 3]
             );
             let rows = [2];
-            let sparse = output(&r, &source, Selection::try_sparse(3, &rows).unwrap());
+            let sparse = output(
+                &r,
+                &structural_source,
+                Selection::try_sparse(3, &rows).unwrap(),
+            );
             assert_eq!(sparse.values().len(), 1);
             assert!(!sparse.values().is_null(0));
             let sparse_values =
@@ -1040,13 +1125,48 @@ fn p05_struct_parent_null_and_metadata_follow_actual_by_name_permutation() {
         ]
         .into(),
     );
+    // Struct field names are semantic correspondence; provider annotations
+    // remain in the original request but not in the execution layout.
+    let canonical_target = DataType::Struct(
+        vec![
+            Arc::new(Field::new("b", DataType::FixedSizeBinary(4), true)),
+            Arc::new(Field::new("a", DataType::Int32, true)),
+        ]
+        .into(),
+    );
     // Every target name exists: output b,a is a permutation, not ordinal
     // relabeling. The selected NULL parent remains NULL independent of children.
     for (policy, allow) in p05_modes() {
         let r = recipe(source.data_type().clone(), target.clone(), policy, allow);
+        assert!(matches!(&r.body, CastBody::SelectedArray(Body::Structure)));
+        assert_eq!(r.result_type().data_type(), &canonical_target);
         let rows = [1, 2];
         let result = output(&r, &source, Selection::try_sparse(3, &rows).unwrap());
-        assert_eq!(result.values().data_type(), &target);
+        assert_eq!(result.values().data_type(), &canonical_target);
+        let DataType::Struct(fields) = result.values().data_type() else {
+            panic!("exact Struct")
+        };
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+        assert!(fields.iter().all(|field| field.metadata().capacity() == 0));
+        let DataType::Struct(original_fields) = &target else {
+            unreachable!()
+        };
+        assert_eq!(
+            original_fields
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+        for field in original_fields {
+            assert_eq!(field.metadata()["owner"], "p05-target");
+        }
         assert!(result.errors().is_empty());
         let values = result
             .values()
@@ -1073,5 +1193,169 @@ fn p05_struct_parent_null_and_metadata_follow_actual_by_name_permutation() {
                 .value(1),
             3
         );
+    }
+}
+
+fn p05_timestamp_decimal_overflow_selected_cases() {
+    let raw = vec![
+        Some(123_i64),
+        Some(-123),
+        Some(0),
+        None,
+        Some(1000),
+        Some(-1000),
+    ];
+    let input: ArrayRef = Arc::new(TimestampMicrosecondArray::from(raw));
+    let sparse = [1, 3, 4];
+    let empty = [];
+    let targets = [
+        DataType::Decimal128(5, 2),
+        DataType::Decimal256(5, 2),
+        DataType::Decimal128(5, -2),
+        DataType::Decimal256(5, -2),
+    ];
+    for target in targets {
+        let scale = match &target {
+            DataType::Decimal128(_, s) | DataType::Decimal256(_, s) => *s,
+            _ => unreachable!(),
+        };
+        let expected_full: Vec<Option<i128>> = if scale == 2 {
+            // Raw counts 123/-123 become coefficients +/-12300. Counts
+            // +/-1000 need six digits, so precision5 returns typed NULL.
+            vec![Some(12300), Some(-12300), Some(0), None, None, None]
+        } else {
+            // Raw integer counts /100 truncate toward zero at scale=-2.
+            vec![Some(1), Some(-1), Some(0), None, Some(10), Some(-10)]
+        };
+        let expected_sparse = if scale == 2 {
+            vec![Some(-12300), None, None]
+        } else {
+            vec![Some(-1), None, Some(10)]
+        };
+        assert!(!novarocks_type_contract::is_checked_decimal_numeric_cast(
+            input.data_type(),
+            &target
+        ));
+        for (policy, allow) in [
+            (DecimalOverflowPolicy::OutputNull, false),
+            (DecimalOverflowPolicy::OutputNull, true),
+            (DecimalOverflowPolicy::ReportError, false),
+            (DecimalOverflowPolicy::ReportError, true),
+        ] {
+            let r = recipe(input.data_type().clone(), target.clone(), policy, allow);
+            for (selection, coefficients) in [
+                (Selection::all(6), expected_full.clone()),
+                (
+                    Selection::try_sparse(6, &sparse).unwrap(),
+                    expected_sparse.clone(),
+                ),
+                (Selection::try_sparse(6, &empty).unwrap(), vec![]),
+            ] {
+                let actual = output(&r, &input, selection);
+                let expected: ArrayRef = match &target {
+                    DataType::Decimal128(p, s) => Arc::new(
+                        Decimal128Array::from(coefficients)
+                            .with_precision_and_scale(*p, *s)
+                            .unwrap(),
+                    ),
+                    DataType::Decimal256(p, s) => Arc::new(
+                        Decimal256Array::from(
+                            coefficients
+                                .into_iter()
+                                .map(|v| v.map(arrow_buffer::i256::from_i128))
+                                .collect::<Vec<_>>(),
+                        )
+                        .with_precision_and_scale(*p, *s)
+                        .unwrap(),
+                    ),
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    actual.selection().iter().collect::<Vec<_>>(),
+                    selection.iter().collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    actual.values().to_data(),
+                    expected.to_data(),
+                    "{:?} -> {target:?} {policy:?} allow={allow}",
+                    input.data_type()
+                );
+                // Timestamp is not in the existing checked-decimal source
+                // classifier. Do not add ReportError/ALLOW row errors here.
+                assert!(actual.errors().is_empty());
+            }
+        }
+    }
+}
+
+fn p05_timestamp_decimal_preparation_contract() {
+    let context = ExpressionEffectContext {
+        use_id: novarocks_type_contract::ExpressionUseId::new(805),
+        domain: novarocks_type_contract::EvaluationDomainId::new(5),
+        demand: novarocks_type_contract::EvaluationDemand::Value,
+    };
+    for target in [DataType::Decimal128(5, 2), DataType::Decimal256(5, 2)] {
+        for (policy, allow) in [
+            (DecimalOverflowPolicy::OutputNull, false),
+            (DecimalOverflowPolicy::OutputNull, true),
+            (DecimalOverflowPolicy::ReportError, false),
+            (DecimalOverflowPolicy::ReportError, true),
+        ] {
+            for source_nullable in [false, true] {
+                for target_nullable in [false, true] {
+                    let source = FunctionValueType::new(
+                        DataType::Timestamp(TimeUnit::Microsecond, None),
+                        source_nullable,
+                    );
+                    let result = FunctionValueType::new(target.clone(), target_nullable);
+                    let actual = PreparedCastRecipe::try_new(
+                        CastOperation::Carrier,
+                        &source,
+                        &result,
+                        policy,
+                        allow,
+                        &Control,
+                    );
+                    if !target_nullable {
+                        assert_eq!(actual, Err(CastPrepareError::TypeMismatch));
+                    } else {
+                        let r = actual.unwrap();
+                        assert!(r.uses_selected_array());
+                        assert_eq!(r.source_type(), &source);
+                        assert_eq!(r.result_type(), &result);
+                        assert_eq!(r.policy(), policy);
+                        assert_eq!(r.allow_throw_exception(), allow);
+                        assert!(
+                            r.own_effects(context)
+                                .for_use(context)
+                                .unwrap()
+                                .may_raise_row_error
+                        );
+                        assert!(carrier_cast_can_produce_null_with_policy(
+                            source.data_type(),
+                            &target,
+                            policy,
+                            allow
+                        ));
+                    }
+                }
+            }
+            // No timezone policy is invented by this carrier-only profile.
+            let zoned = FunctionValueType::new(
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                true,
+            );
+            assert_eq!(
+                PreparedCastRecipe::try_new(
+                    CastOperation::Carrier,
+                    &zoned,
+                    &FunctionValueType::new(target.clone(), true),
+                    policy,
+                    allow,
+                    &Control
+                ),
+                Err(CastPrepareError::Unsupported)
+            );
+        }
     }
 }

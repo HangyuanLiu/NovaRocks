@@ -175,6 +175,7 @@ fn source_metadata_graph<'source, W: MetadataWork>(
     // Do not run unused legacy envelope arithmetic on the request route.
     let mut child_bytes = pricing.is_none().then_some(0usize);
     let mut child_requests = pricing.map(|_| RequestSummary::empty());
+    let mut descendant_has_custody_buffer = false;
     let body = if pricing.is_some() {
         Some(actual_rebox_layout(array)?)
     } else {
@@ -185,6 +186,9 @@ fn source_metadata_graph<'source, W: MetadataWork>(
     macro_rules! accumulate {
         ($result:expr) => {{
             let result = $result;
+            if let Some(bufferless) = result.bufferless_root {
+                descendant_has_custody_buffer |= !bufferless;
+            }
             if let Some(bytes) = &mut child_bytes {
                 *bytes = plus(
                     *bytes,
@@ -306,6 +310,8 @@ fn source_metadata_graph<'source, W: MetadataWork>(
         DataType::RunEndEncoded(ends, _) => {
             buffers = 0;
             children = 2;
+            // The implicit run-end primitive child always has a data Buffer.
+            descendant_has_custody_buffer = true;
             // Arrow's run-end child is a primitive array with one data buffer
             // and no null bitmap. Values use their own actual dynamic structure.
             if let Some(bytes) = &mut child_bytes {
@@ -423,7 +429,9 @@ fn source_metadata_graph<'source, W: MetadataWork>(
     };
     let bufferless_root = pricing.map(|_| {
         let effective_nulls = array.nulls().is_some_and(|nulls| nulls.null_count() != 0);
-        buffers == 0 && children == 0 && !effective_nulls
+        // Match the real recursive wrapping route: child metadata without
+        // any physical Buffer needs the SAME one root custody wrapper.
+        buffers == 0 && !descendant_has_custody_buffer && !effective_nulls
     });
     Ok(SourceGraphResult {
         legacy,

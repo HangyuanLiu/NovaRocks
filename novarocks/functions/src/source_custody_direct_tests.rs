@@ -19,7 +19,11 @@
 use crate::kernel_control::{internal, invalid};
 use crate::opaque_memory::{OpaqueAllocationHost, OpaqueRetainedCharge};
 use crate::*;
-use arrow_array::{Array, ArrayRef, Int64Array, NullArray, StringArray, StructArray};
+use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, Int32Array, Int64Array, ListArray, NullArray, StringArray,
+    StructArray,
+};
+use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
 use std::{
     alloc::Layout,
@@ -173,42 +177,89 @@ pub(crate) fn direct_run(
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     Ok(())
 }
+// Pure source data only: no output/expected value is calculated by this fixture.
+pub(crate) fn nested_custody_cases() -> [ArrayRef; 5] {
+    let nulls: ArrayRef = Arc::new(StructArray::new(
+        vec![Arc::new(Field::new("nulls", DataType::Null, true))].into(),
+        vec![Arc::new(NullArray::new(3))],
+        None,
+    ));
+    let nested: ArrayRef = Arc::new(StructArray::new(
+        vec![Arc::new(Field::new(
+            "inner",
+            nulls.data_type().clone(),
+            false,
+        ))]
+        .into(),
+        vec![nulls.clone()],
+        None,
+    ));
+    let fixed: ArrayRef = Arc::new(FixedSizeListArray::new(
+        Arc::new(Field::new("item", DataType::Null, true)),
+        2,
+        Arc::new(NullArray::new(6)),
+        None,
+    ));
+    // Three empty lists still have the real offset Buffer; it must own custody.
+    let lists: ArrayRef = Arc::new(ListArray::new(
+        Arc::new(Field::new("item", DataType::Null, true)),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 0, 0, 0])),
+        Arc::new(NullArray::new(0)),
+        None,
+    ));
+    let mixed: ArrayRef = Arc::new(StructArray::new(
+        vec![
+            Arc::new(Field::new("nulls", DataType::Null, true)),
+            Arc::new(Field::new("values", DataType::Int32, false)),
+        ]
+        .into(),
+        vec![
+            Arc::new(NullArray::new(3)),
+            Arc::new(Int32Array::from(vec![7, 11, 13])),
+        ],
+        None,
+    ));
+    [nulls, nested, fixed, lists, mixed]
+}
+
 #[test]
 fn source_custody_direct_every_host_and_checkpoint_preserves_seven_causes_without_footer() {
-    let array: ArrayRef = Arc::new(StringArray::from(vec![
+    let original: ArrayRef = Arc::new(StringArray::from(vec![
         Some("original"),
         None,
         Some("last"),
     ]));
-    let host = Arc::new(Host::default());
-    let control = Control::default();
-    direct_run(&array, host.clone(), &control).unwrap();
-    let requests = host.ledger.lock().unwrap().events.len();
-    let checkpoints = control.trace.lock().unwrap().len();
-    host.zero();
-    for cause in causes() {
-        for stop in 0..requests {
-            let host = Arc::new(Host::default());
-            host.ledger.lock().unwrap().refusal = Some((stop, cause.clone()));
-            assert_eq!(
-                direct_run(&array, host.clone(), &Control::default()),
-                Err(cause.clone())
-            );
-            assert_eq!(host.ledger.lock().unwrap().events.len(), stop + 1);
-            host.zero();
-        }
-        for stop in 0..checkpoints {
-            let host = Arc::new(Host::default());
-            let control = Control {
-                refusal: Some((stop, cause.clone())),
-                ..Control::default()
-            };
-            assert_eq!(
-                direct_run(&array, host.clone(), &control),
-                Err(cause.clone())
-            );
-            assert_eq!(control.trace.lock().unwrap().len(), stop + 1);
-            host.zero();
+    for array in std::iter::once(original).chain(nested_custody_cases()) {
+        let host = Arc::new(Host::default());
+        let control = Control::default();
+        direct_run(&array, host.clone(), &control).unwrap();
+        let requests = host.ledger.lock().unwrap().events.len();
+        let checkpoints = control.trace.lock().unwrap().len();
+        host.zero();
+        for cause in causes() {
+            for stop in 0..requests {
+                let host = Arc::new(Host::default());
+                host.ledger.lock().unwrap().refusal = Some((stop, cause.clone()));
+                assert_eq!(
+                    direct_run(&array, host.clone(), &Control::default()),
+                    Err(cause.clone())
+                );
+                assert_eq!(host.ledger.lock().unwrap().events.len(), stop + 1);
+                host.zero();
+            }
+            for stop in 0..checkpoints {
+                let host = Arc::new(Host::default());
+                let control = Control {
+                    refusal: Some((stop, cause.clone())),
+                    ..Control::default()
+                };
+                assert_eq!(
+                    direct_run(&array, host.clone(), &control),
+                    Err(cause.clone())
+                );
+                assert_eq!(control.trace.lock().unwrap().len(), stop + 1);
+                host.zero();
+            }
         }
     }
 }
@@ -288,48 +339,64 @@ fn source_custody_direct_same_host_and_complete_peak_are_required_before_publica
 #[test]
 fn source_custody_direct_buffer_and_child_aliases_keep_original_owner_until_cross_thread_drop() {
     let fields = vec![Arc::new(Field::new("value", DataType::Int64, true))].into();
-    let array: ArrayRef = Arc::new(StructArray::new(
+    let original: ArrayRef = Arc::new(StructArray::new(
         fields,
         vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]))],
         None,
     ));
-    let host = Arc::new(Host::default());
-    let control = Control::default();
-    let drops = Arc::new(AtomicUsize::new(0));
-    let mut work = EvaluationCheckpoints::new(&control);
-    let source =
-        SourceBackingOwner::try_from_owned_direct(Owner(drops.clone()), host.clone(), &mut work)
+    let [_, _, _, lists, mixed] = nested_custody_cases();
+    let empty_lists: ArrayRef = Arc::new(StructArray::new(
+        vec![Arc::new(Field::new(
+            "lists",
+            lists.data_type().clone(),
+            false,
+        ))]
+        .into(),
+        vec![lists],
+        None,
+    ));
+    for (array, child_ordinal) in [(original, 0), (empty_lists, 0), (mixed, 1)] {
+        let host = Arc::new(Host::default());
+        let control = Control::default();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut work = EvaluationCheckpoints::new(&control);
+        let source = SourceBackingOwner::try_from_owned_direct(
+            Owner(drops.clone()),
+            host.clone(),
+            &mut work,
+        )
+        .unwrap();
+        let prepared = PreparedSourceCustody::prepare(&array, &mut work).unwrap();
+        let charge = OpaqueRetainedCharge::try_new(host.clone()).unwrap();
+        let mut reservation = charge
+            .reserve_operation(prepared.request_facts().global_peak_upper())
             .unwrap();
-    let prepared = PreparedSourceCustody::prepare(&array, &mut work).unwrap();
-    let charge = OpaqueRetainedCharge::try_new(host.clone()).unwrap();
-    let mut reservation = charge
-        .reserve_operation(prepared.request_facts().global_peak_upper())
-        .unwrap();
-    let result = prepared
-        .retain(&source, &mut reservation, &mut work)
-        .unwrap();
-    drop(reservation);
-    drop(charge);
-    drop(source);
-    drop(array);
-    let sliced = result.slice(1, 1);
-    let child = sliced
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .unwrap()
-        .column(0)
-        .clone();
-    let data = child.to_data();
-    let last = data.buffers()[0].clone();
-    drop(child);
-    drop(data);
-    drop(sliced);
-    drop(result);
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
-    assert!(host.ledger.lock().unwrap().opaque > 0);
-    std::thread::spawn(move || drop(last)).join().unwrap();
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
-    host.zero();
+        let result = prepared
+            .retain(&source, &mut reservation, &mut work)
+            .unwrap();
+        drop(reservation);
+        drop(charge);
+        drop(source);
+        drop(array);
+        let sliced = result.slice(1, 1);
+        let child = sliced
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column(child_ordinal)
+            .clone();
+        let data = child.to_data();
+        let last = data.buffers()[0].clone();
+        drop(child);
+        drop(data);
+        drop(sliced);
+        drop(result);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(host.ledger.lock().unwrap().opaque > 0);
+        std::thread::spawn(move || drop(last)).join().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        host.zero();
+    }
 }
 #[test]
 fn source_custody_direct_bufferless_root_slice_pins_but_data_and_childless_buffers_do_not() {
@@ -340,7 +407,10 @@ fn source_custody_direct_bufferless_root_slice_pins_but_data_and_childless_buffe
             3,
             Some(arrow_buffer::NullBuffer::new_valid(3)),
         )) as ArrayRef,
-    ] {
+    ]
+    .into_iter()
+    .chain(nested_custody_cases().into_iter().take(3))
+    {
         let host = Arc::new(Host::default());
         let control = Control::default();
         let drops = Arc::new(AtomicUsize::new(0));
@@ -374,34 +444,6 @@ fn source_custody_direct_bufferless_root_slice_pins_but_data_and_childless_buffe
         assert_eq!(data.len(), 3);
         assert_eq!(into_data.len(), 3);
     }
-    let array: ArrayRef = Arc::new(StructArray::new(
-        vec![Arc::new(Field::new("nulls", DataType::Null, true))].into(),
-        vec![Arc::new(NullArray::new(3))],
-        None,
-    ));
-    let host = Arc::new(Host::default());
-    let control = Control::default();
-    let mut work = EvaluationCheckpoints::new(&control);
-    let drops = Arc::new(AtomicUsize::new(0));
-    let source =
-        SourceBackingOwner::try_from_owned_direct(Owner(drops.clone()), host.clone(), &mut work)
-            .unwrap();
-    let prepared = PreparedSourceCustody::prepare(&array, &mut work).unwrap();
-    let charge = OpaqueRetainedCharge::try_new(host.clone()).unwrap();
-    let mut reservation = charge
-        .reserve_operation(prepared.request_facts().global_peak_upper())
-        .unwrap();
-    let result = prepared
-        .retain(&source, &mut reservation, &mut work)
-        .unwrap();
-    drop(reservation);
-    drop(charge);
-    drop(source);
-    drop(array);
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
-    host.zero();
-    assert_eq!(result.len(), 3);
-    assert_eq!(result.to_data().child_data().len(), 1);
 }
 
 #[test]

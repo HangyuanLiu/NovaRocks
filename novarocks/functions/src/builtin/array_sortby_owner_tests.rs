@@ -1100,9 +1100,17 @@ fn array_sortby_public_constant_view_rejects_changed_pool_shape_before_original_
             &Control::default(),
         )
         .unwrap_err();
-    assert!(matches!(error,
-        ScalarInvocationFailure::Kernel(KernelFailure::InvalidProgram(ref cause))
-        if cause.message() == "evaluated argument length differs from its explicit shape"));
+    let ScalarInvocationFailure::Kernel(cause) = error else {
+        panic!("changed pool shape must fail on the outer kernel channel");
+    };
+    crate::kernel_control::test_contract::exact(
+        &cause,
+        crate::EvaluationContractError::ArgumentLength,
+    );
+    assert_eq!(
+        cause.to_string(),
+        "evaluated argument length differs from its explicit shape"
+    );
     assert!(kernel.is_failed());
     assert!(matches!(
         kernel.evaluate_scoped(

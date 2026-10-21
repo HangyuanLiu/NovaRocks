@@ -1502,13 +1502,15 @@ mod tests {
         let json_array =
             crate::array_projection::normalize_execution_array(json_pool.array()).unwrap();
         let shortened = value_array.slice(0, 2);
-        for (view, message) in [
+        for (view, contract, message) in [
             (
                 crate::CanonicalConstantView::from_authored_projection(&json_value, &json_array),
+                None,
                 "constant argument differs from its exact logical type or nullability",
             ),
             (
                 crate::CanonicalConstantView::from_authored_projection(&value, &shortened),
+                Some(crate::EvaluationContractError::ArgumentLength),
                 "evaluated argument length differs from its explicit shape",
             ),
         ] {
@@ -1551,9 +1553,18 @@ mod tests {
                     &control,
                 )
                 .unwrap_err();
-            assert!(
-                matches!(error, crate::ScalarInvocationFailure::Kernel(KernelFailure::InvalidProgram(ref cause)) if cause.message() == message)
-            );
+            let crate::ScalarInvocationFailure::Kernel(cause) = error else {
+                panic!("invalid constant view must fail on the outer kernel channel");
+            };
+            if let Some(contract) = contract {
+                crate::kernel_control::test_contract::exact(&cause, contract);
+                assert_eq!(cause.to_string(), message);
+            } else {
+                assert!(
+                    matches!(cause, KernelFailure::InvalidProgram(ref diagnostic)
+                    if diagnostic.message() == message)
+                );
+            }
             assert!(instance.is_failed());
             drop(instance);
             assert_eq!(host.typed.load(Ordering::Relaxed), 0);

@@ -86,9 +86,7 @@ pub(super) fn arrow_profile(source: &DataType, result: &DataType) -> bool {
                 result,
                 DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
             ))
-        || (matches!(source, DataType::Timestamp(_, None))
-            && numeric(result)
-            && !matches!(result, DataType::Decimal128(..) | DataType::Decimal256(..)))
+        || (matches!(source, DataType::Timestamp(_, None)) && numeric(result))
         || (matches!(source, DataType::Time64(_) | DataType::Time32(_))
             && matches!(
                 result,
