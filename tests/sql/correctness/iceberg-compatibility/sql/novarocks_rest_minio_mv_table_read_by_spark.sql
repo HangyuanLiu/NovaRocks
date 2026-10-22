@@ -27,10 +27,10 @@
 -- narrative walkthrough of this contract.
 
 -- query 1
-CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0};
+CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
 
 -- query 2
-CREATE TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.mv_interop_base_${uuid0} (
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.mv_interop_base_${uuid0} (
   id BIGINT,
   amount INT
 ) TBLPROPERTIES (
@@ -39,7 +39,7 @@ CREATE TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.mv_interop_b
 );
 
 -- query 3
-INSERT INTO iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.mv_interop_base_${uuid0}
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.mv_interop_base_${uuid0}
 VALUES
   (1, 10),
   (2, 20),
@@ -48,7 +48,7 @@ VALUES
 -- query 4
 -- @skip_result_check=true
 SET CATALOG iceberg_compat_${suite_uuid0};
-USE nr_compat_${suite_uuid0};
+USE ${case_db};
 CREATE MATERIALIZED VIEW mv_nr_interop_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES('storage_engine' = 'iceberg')
@@ -75,7 +75,7 @@ tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-mv-table-read-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
 SELECT id, amount
-FROM ice_rest.nr_compat_${suite_uuid0}.mv_nr_interop_${uuid0}
+FROM ice_rest.${case_db}.mv_nr_interop_${uuid0}
 ORDER BY id;
 SPARK_SQL
 view_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql")"
@@ -98,7 +98,7 @@ shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-mv-schema-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-DESCRIBE ice_rest.nr_compat_${suite_uuid0}.mv_nr_interop_${uuid0};
+DESCRIBE ice_rest.${case_db}.mv_nr_interop_${uuid0};
 SPARK_SQL
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql" \
   | grep -F "__nova_base_row_id" >/dev/null
@@ -108,5 +108,5 @@ printf 'SPARK_MV_SCHEMA_OK\n'
 -- @cleanup=true
 -- @skip_result_check=true
 SET CATALOG iceberg_compat_${suite_uuid0};
-DROP MATERIALIZED VIEW IF EXISTS nr_compat_${suite_uuid0}.mv_nr_interop_${uuid0};
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.mv_interop_base_${uuid0} FORCE;
+DROP MATERIALIZED VIEW IF EXISTS ${case_db}.mv_nr_interop_${uuid0};
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_interop_base_${uuid0} FORCE;

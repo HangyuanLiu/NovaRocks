@@ -15,6 +15,8 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
+-- @catalog=iceberg_compat_${suite_uuid0}
+
 CREATE EXTERNAL CATALOG IF NOT EXISTS `iceberg_compat_${suite_uuid0}`
 PROPERTIES (
     "type"="iceberg",

@@ -25,15 +25,15 @@ shell: set -eu
 receipt_parent="${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/experiments/iceberg-variant"
 mkdir -p "$receipt_parent"
 receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
-"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode unshredded --namespace nr_compat_${suite_uuid0} --table java_variant_unshredded_${uuid0} --output "$receipt_dir"
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode unshredded --namespace ${case_db} --table java_variant_unshredded_${uuid0} --output "$receipt_dir"
 
 -- query 2
-SELECT id,variant_typeof(v) AS kind FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_unshredded_${uuid0} ORDER BY id;
+SELECT id,variant_typeof(v) AS kind FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_unshredded_${uuid0} ORDER BY id;
 
 -- query 3
 SELECT id,variant_get(v,'$.nested.a','int') AS nested_a
-FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_unshredded_${uuid0} WHERE try_variant_get(v,'$.a','int')=42 ORDER BY id;
+FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_unshredded_${uuid0} WHERE try_variant_get(v,'$.a','int')=42 ORDER BY id;
 
 -- query 4
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_unshredded_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_unshredded_${uuid0} FORCE;

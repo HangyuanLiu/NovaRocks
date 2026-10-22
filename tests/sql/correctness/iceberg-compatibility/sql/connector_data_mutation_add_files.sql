@@ -25,11 +25,15 @@
 shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-c2-add-files-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
-cat > "$tmp_sql" <<'SPARK_SQL'
-CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_compat_${suite_uuid0};
+raw_parquet_warehouse='${iceberg_test_warehouse}'
+case "$raw_parquet_warehouse" in
+  s3://*) raw_parquet_warehouse="s3a://${raw_parquet_warehouse#s3://}" ;;
+esac
+cat > "$tmp_sql" <<SPARK_SQL
+CREATE NAMESPACE IF NOT EXISTS ice_rest.${case_db};
 
-DROP TABLE IF EXISTS ice_rest.nr_compat_${suite_uuid0}.c2_add_files_${uuid0};
-CREATE TABLE ice_rest.nr_compat_${suite_uuid0}.c2_add_files_${uuid0} (
+DROP TABLE IF EXISTS ice_rest.${case_db}.c2_add_files_${uuid0};
+CREATE TABLE ice_rest.${case_db}.c2_add_files_${uuid0} (
   new_id BIGINT,
   new_note STRING
 ) USING iceberg
@@ -39,7 +43,7 @@ TBLPROPERTIES (
   'schema.name-mapping.default' = '[{"field-id":1,"names":["new_id","old_id"]},{"field-id":2,"names":["new_note","old_note"]}]'
 );
 
-INSERT OVERWRITE DIRECTORY 's3a://warehouse/c2-add-files-${uuid0}'
+INSERT OVERWRITE DIRECTORY '$raw_parquet_warehouse/c2-add-files-${uuid0}'
 USING parquet
 SELECT old_note, old_id
 FROM VALUES
@@ -47,7 +51,7 @@ FROM VALUES
   ('beta', CAST(22 AS BIGINT))
 AS source(old_note, old_id);
 
-INSERT OVERWRITE DIRECTORY 's3a://warehouse/c2-add-files-no-mapping-${uuid0}'
+INSERT OVERWRITE DIRECTORY '$raw_parquet_warehouse/c2-add-files-no-mapping-${uuid0}'
 USING parquet
 SELECT old_note, old_id
 FROM VALUES
@@ -62,12 +66,12 @@ printf 'SPARK_SQL_OK\n'
 -- @be_log_not_contains=NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED
 -- @be_log_not_contains=NOVAROCKS_TASK_CREATE_APPLIED
 -- @be_log_not_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
-ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_${uuid0}
-  ADD FILES FROM 's3://warehouse/c2-add-files-${uuid0}';
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_${uuid0}
+  ADD FILES FROM '${iceberg_test_warehouse}/c2-add-files-${uuid0}';
 
 -- query 3
 SELECT new_id, new_note
-FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_${uuid0}
+FROM iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_${uuid0}
 ORDER BY new_id;
 
 -- query 4
@@ -75,39 +79,39 @@ ORDER BY new_id;
 -- RegisteredFilesNotLive dependency against the exact target-ref live set;
 -- no frontend source-scope ledger is a correctness authority.
 -- @expect_error=Broken { dependency: RegisteredFilesNotLive
-ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_${uuid0}
-  ADD FILES FROM 's3://warehouse/c2-add-files-${uuid0}';
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_${uuid0}
+  ADD FILES FROM '${iceberg_test_warehouse}/c2-add-files-${uuid0}';
 
 -- query 5
 -- @skip_result_check=true
-CREATE TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_partitioned_${uuid0}
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_partitioned_${uuid0}
   (id BIGINT) PARTITION BY (id)
   TBLPROPERTIES ("format-version" = "2");
 
 -- query 6
 -- @expect_error=unpartitioned
-ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_partitioned_${uuid0}
-  ADD FILES FROM 's3://warehouse/c2-add-files-${uuid0}';
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_partitioned_${uuid0}
+  ADD FILES FROM '${iceberg_test_warehouse}/c2-add-files-${uuid0}';
 
 -- query 7
 -- @skip_result_check=true
-CREATE TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_no_mapping_${uuid0}
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_no_mapping_${uuid0}
   (new_id BIGINT, new_note VARCHAR)
   TBLPROPERTIES ("format-version" = "2");
 
 -- query 8
 -- @expect_error=schema.name-mapping.default
-ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_no_mapping_${uuid0}
-  ADD FILES FROM 's3://warehouse/c2-add-files-no-mapping-${uuid0}';
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_no_mapping_${uuid0}
+  ADD FILES FROM '${iceberg_test_warehouse}/c2-add-files-no-mapping-${uuid0}';
 
 -- query 9
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_${uuid0} FORCE;
 
 -- query 10
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_partitioned_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_partitioned_${uuid0} FORCE;
 
 -- query 11
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_no_mapping_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.c2_add_files_no_mapping_${uuid0} FORCE;

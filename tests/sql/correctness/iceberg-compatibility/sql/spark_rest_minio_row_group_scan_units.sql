@@ -26,15 +26,15 @@ shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-row-group-units-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_compat_${suite_uuid0};
-DROP TABLE IF EXISTS ice_rest.nr_compat_${suite_uuid0}.row_group_units_${uuid0};
-CREATE TABLE ice_rest.nr_compat_${suite_uuid0}.row_group_units_${uuid0} (id BIGINT, payload STRING)
+CREATE NAMESPACE IF NOT EXISTS ice_rest.${case_db};
+DROP TABLE IF EXISTS ice_rest.${case_db}.row_group_units_${uuid0};
+CREATE TABLE ice_rest.${case_db}.row_group_units_${uuid0} (id BIGINT, payload STRING)
 USING iceberg
 TBLPROPERTIES (
   'format-version' = '3',
   'write.format.default' = 'parquet',
   'write.parquet.row-group-size-bytes' = '65536');
-INSERT INTO ice_rest.nr_compat_${suite_uuid0}.row_group_units_${uuid0}
+INSERT INTO ice_rest.${case_db}.row_group_units_${uuid0}
 SELECT id, sha2(CAST(id AS STRING), 256)
 FROM range(0, 50000, 1, 1) AS source(id);
 SPARK_SQL
@@ -43,7 +43,7 @@ printf 'SPARK_SQL_OK\n'
 
 -- query 2
 SELECT count(*) AS n_data_files
-FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.row_group_units_${uuid0}$files
+FROM iceberg_compat_${suite_uuid0}.${case_db}.row_group_units_${uuid0}$files
 WHERE content = 0;
 
 -- query 3
@@ -51,8 +51,8 @@ WHERE content = 0;
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE,19
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN,19
 SELECT count(*) AS rows
-FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.row_group_units_${uuid0};
+FROM iceberg_compat_${suite_uuid0}.${case_db}.row_group_units_${uuid0};
 
 -- query 4
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.row_group_units_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.row_group_units_${uuid0} FORCE;

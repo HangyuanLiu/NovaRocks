@@ -22,10 +22,10 @@
 -- query 1
 -- @skip_result_check=true
 SET CATALOG iceberg_compat_${suite_uuid0};
-CREATE DATABASE IF NOT EXISTS nr_compat_${suite_uuid0};
-USE nr_compat_${suite_uuid0};
+CREATE DATABASE IF NOT EXISTS ${case_db};
+USE ${case_db};
 DROP MATERIALIZED VIEW IF EXISTS mv_direct_read_${uuid0};
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.mv_direct_base_${uuid0} FORCE;
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_direct_base_${uuid0} FORCE;
 CREATE TABLE mv_direct_base_${uuid0} (
   id BIGINT,
   metric INT
@@ -53,12 +53,12 @@ select_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-v3-mv-direct-read-select-X
 trap 'rm -f "$describe_sql" "$select_sql"' EXIT
 
 cat > "$describe_sql" <<'SPARK_SQL'
-DESCRIBE TABLE ice_rest.nr_compat_${suite_uuid0}.mv_direct_read_${uuid0};
+DESCRIBE TABLE ice_rest.${case_db}.mv_direct_read_${uuid0};
 SPARK_SQL
 
 cat > "$select_sql" <<'SPARK_SQL'
 SELECT id, metric
-FROM ice_rest.nr_compat_${suite_uuid0}.mv_direct_read_${uuid0}
+FROM ice_rest.${case_db}.mv_direct_read_${uuid0}
 ORDER BY id;
 SPARK_SQL
 
@@ -89,5 +89,5 @@ printf 'SPARK_SQL_OK\n'
 -- @cleanup=true
 -- @skip_result_check=true
 SET CATALOG iceberg_compat_${suite_uuid0};
-DROP MATERIALIZED VIEW IF EXISTS nr_compat_${suite_uuid0}.mv_direct_read_${uuid0};
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.mv_direct_base_${uuid0} FORCE;
+DROP MATERIALIZED VIEW IF EXISTS ${case_db}.mv_direct_read_${uuid0};
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.mv_direct_base_${uuid0} FORCE;

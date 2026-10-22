@@ -462,6 +462,25 @@ class CredentialFenceTests(unittest.TestCase):
 
 
 class SnapshotDeadlineTests(unittest.TestCase):
+    def test_command_expiry_before_dispatch_retains_exact_readonly_fact(self):
+        backend = machine.MachineDocker()
+        backend.operation_deadline = 99.0
+        backend.maintenance_fd = 42
+        for args, readonly in ((["info"], True), (["container", "inspect", "owned"], True),
+                               (["container", "rm", "owned"], False)):
+            with self.subTest(args=args), \
+                    mock.patch.object(machine.time, "monotonic", return_value=100.0), \
+                    mock.patch.object(runtime.Docker, "command") as command, \
+                    mock.patch.object(machine.subprocess, "Popen") as spawn, \
+                    mock.patch.object(runtime, "atomic_json") as journal:
+                with self.assertRaises(machine.MachineCommandDeadlineExpired) as caught:
+                    backend.command(args)
+                self.assertEqual(caught.exception.code, "RunBudgetExpired")
+                self.assertIs(caught.exception.readonly_not_dispatched, readonly)
+                command.assert_not_called()
+                spawn.assert_not_called()
+                journal.assert_not_called()
+
     def test_short_lock_deadline_does_not_shorten_validation_or_outer_run_clock(self):
         backend = Backend()
         with tempfile.TemporaryDirectory() as directory:
@@ -783,6 +802,46 @@ class MachineTests(unittest.TestCase):
                 failure.readonly_deadline_settled = evidence
                 with mock.patch.object(self.backend, "healthy", side_effect=failure):
                     self.assert_code(code, lambda:self.owner.sweep(deadline=time.monotonic()+1))
+
+    def test_sweep_defers_readonly_command_not_dispatched_after_lock_window(self):
+        state = self.start()
+        backend = machine.MachineDocker()
+        backend.maintenance_fd = 42
+        now = [100.0]
+        original_deadline = 190.0
+        self.backend.operation_deadline = original_deadline
+        def health_after_window(record):
+            # The lock succeeded before the window elapsed. The next readonly
+            # command must not be mistaken for expiry of the enclosing run.
+            now[0] = 105.0
+            backend.operation_deadline = self.backend.operation_deadline
+            return backend.command(["container", "inspect", "owned"])
+        with mock.patch.object(machine.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(self.backend, "healthy", side_effect=health_after_window), \
+                mock.patch.object(machine.subprocess, "Popen") as spawn, \
+                mock.patch.object(runtime, "atomic_json") as journal:
+            with self.assertRaisesRegex(runtime.RuntimeFailure, "ScratchSweepTimeout") as caught:
+                self.owner.sweep(deadline=105.0)
+        self.assertIsInstance(caught.exception.__cause__, machine.MachineCommandDeadlineExpired)
+        self.assertTrue(caught.exception.__cause__.readonly_not_dispatched)
+        self.assertEqual(self.backend.operation_deadline, original_deadline)
+        self.assertEqual(self.owner.read_saved_state(), state)
+        self.assertNotIn(("sweep", True), self.backend.events)
+        spawn.assert_not_called()
+        journal.assert_not_called()
+
+    def test_sweep_never_defers_before_dispatch_mutation_recovery_or_unknown(self):
+        self.start()
+        for condition in ("mutation", "recovery", "unknown"):
+            with self.subTest(condition=condition):
+                error = machine.MachineCommandDeadlineExpired(readonly=condition != "mutation")
+                failing = "settle_operations" if condition == "recovery" else "healthy"
+                pending = [("owned-journal", {"phase":"command-unknown"})] if condition == "unknown" else []
+                with mock.patch.object(self.backend, failing, side_effect=error), \
+                        mock.patch.object(self.backend, "unsettled_operations", return_value=pending):
+                    with self.assertRaises(machine.MachineCommandDeadlineExpired) as caught:
+                        self.owner.sweep(deadline=time.monotonic()+1)
+                self.assertIs(caught.exception, error)
 
     def test_sweep_daemon_observation_runs_under_the_same_maintenance_lock(self):
         self.start()
