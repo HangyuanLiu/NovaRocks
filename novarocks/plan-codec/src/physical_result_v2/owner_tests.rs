@@ -698,3 +698,160 @@ fn caller_result_single_semantic_scalar_source_roundtrips_both_explicit_states()
         }
     });
 }
+
+#[test]
+fn caller_result_overlapping_source_floors_accept_exact_union_and_reject_missing_backing() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    fixture.with_tokens(&c, |values, read| {
+        for (width, long_name) in [(1, false), (1024, false), (1, true)] {
+            let mut input = fixture.single(0);
+            input.output.columns = vec![p::ValueId::new(0); width].into_boxed_slice();
+            input.fields = (0..width)
+                .map(|index| p::ResultField {
+                    domain: p::ResultValueDomain::Plain,
+                    name: if long_name {
+                        "x".repeat(VALUE_SOURCE + 64).into()
+                    } else {
+                        format!("v{index}").into()
+                    },
+                    alias: Some("result_alias".into()),
+                    value: p::ValueId::new(0),
+                    ty: fixture.roots[0].1.clone(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let ids = vec![0; width];
+            let source_names: usize = input
+                .fields
+                .iter()
+                .map(|field| field.name.len() + field.alias.as_ref().map_or(0, |v| v.len()))
+                .sum();
+            // Independent actual ResultPort loan geometry. The value namespace's
+            // original whole-source invoice already includes these same loans.
+            let result_floor = std::mem::size_of::<p::ResultPort>()
+                + Layout::array::<p::ValueId>(width).unwrap().size()
+                + Layout::array::<p::ResultField>(width).unwrap().size()
+                + Layout::array::<u32>(ids.len()).unwrap().size()
+                + source_names;
+            let namespace_floor = values.retained_floor_header().unwrap();
+            let source = namespace_floor.max(result_floor);
+            let encode_at = |source| {
+                let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Encode)?;
+                let mut parent = |_: &NodeProjectionFacts| Ok(());
+                let result = prepare_result_encode_in(
+                    Some(&input),
+                    &ids,
+                    values,
+                    source,
+                    limits(),
+                    &mut parent,
+                    &mut work,
+                )
+                .and_then(|prepared| prepared.emit_in(&mut parent, &mut work));
+                finish(work, result)
+            };
+            c.arm(None);
+            let encoded = encode_at(source).unwrap().0.unwrap();
+            assert_eq!(encoded.fields.len(), width);
+            for incomplete in [namespace_floor - 1, result_floor - 1] {
+                c.arm(None);
+                assert!(matches!(encode_at(incomplete), Err(Error::InvalidShape(_))));
+            }
+            let output = encoded.output.as_ref().unwrap();
+            let result_floor = std::mem::size_of::<wire::ResultPort>()
+                + Layout::array::<u32>(output.value_ids.capacity())
+                    .unwrap()
+                    .size()
+                + Layout::array::<wire::ResultField>(encoded.fields.capacity())
+                    .unwrap()
+                    .size()
+                + encoded
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        field.name.capacity() + field.alias.as_ref().map_or(0, String::capacity)
+                    })
+                    .sum::<usize>();
+            let namespace_floor = read.retained_floor_header().unwrap();
+            let source = namespace_floor.max(result_floor);
+            let decode_at = |source| {
+                let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Decode)?;
+                let mut parent = |_: &NodeProjectionFacts| Ok(());
+                let result = prepare_result_decode_in(
+                    Some(&encoded),
+                    read,
+                    source,
+                    limits(),
+                    &mut parent,
+                    &mut work,
+                )
+                .and_then(|prepared| prepared.emit_in(&mut parent, &mut work));
+                finish(work, result)
+            };
+            c.arm(None);
+            assert_eq!(decode_at(source).unwrap().0, Some(input.clone()));
+            for incomplete in [namespace_floor - 1, result_floor - 1] {
+                c.arm(None);
+                assert!(matches!(decode_at(incomplete), Err(Error::InvalidShape(_))));
+            }
+        }
+    });
+}
+
+#[test]
+fn caller_result_shared_source_preserves_original_parent_refusal_without_footer() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    fixture.with_tokens(&c, |values, read| {
+        let input = fixture.single(0);
+        let encoded = encode(Some(&input), &[0], values, SOURCE, limits(), &c)
+            .unwrap()
+            .0
+            .unwrap();
+        for cause in CAUSES {
+            for decode in [false, true] {
+                c.arm(None);
+                let phase = if decode {
+                    CompilePhase::Decode
+                } else {
+                    CompilePhase::Encode
+                };
+                let mut work = CompileCheckpoints::try_new(&c, phase).unwrap();
+                let mut origin_trace = None;
+                let mut calls = 0;
+                let mut parent = |_: &NodeProjectionFacts| {
+                    calls += 1;
+                    origin_trace = Some(c.trace());
+                    Err(cause.clone())
+                };
+                let result = if decode {
+                    prepare_result_decode_in(
+                        Some(&encoded),
+                        read,
+                        SOURCE,
+                        limits(),
+                        &mut parent,
+                        &mut work,
+                    )
+                    .map(|_| ())
+                } else {
+                    prepare_result_encode_in(
+                        Some(&input),
+                        &[0],
+                        values,
+                        SOURCE,
+                        limits(),
+                        &mut parent,
+                        &mut work,
+                    )
+                    .map(|_| ())
+                };
+                let result = finish(work, result);
+                assert!(matches!(result, Err(Error::Control(actual)) if actual == cause));
+                assert_eq!(calls, 1);
+                assert_eq!(Some(c.trace()), origin_trace);
+            }
+        }
+    });
+}

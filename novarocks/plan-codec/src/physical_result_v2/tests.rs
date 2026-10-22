@@ -789,16 +789,22 @@ fn result_all_six_nonzero_axes_and_source_capacity_have_exact_boundaries() {
         raw.fields.reserve_exact(256);
         raw.output.as_mut().unwrap().value_ids.reserve_exact(256);
         raw.fields[0].name.reserve_exact(4096);
-        let known = add(
-            read.retained_invoice_floor().unwrap(),
-            wire_floor(&raw, raw.output.as_ref().unwrap()).unwrap(),
-        )
-        .unwrap()
+        // The original wire ResultPort is inside the namespace's whole-source
+        // invoice. Keep its independently measured backing floor without
+        // adding the same original source a second time.
+        let result_floor = std::mem::size_of::<wire::ResultPort>()
+            + Layout::array::<u32>(raw.output.as_ref().unwrap().value_ids.capacity())
+                .unwrap()
+                .size()
+            + Layout::array::<wire::ResultField>(raw.fields.capacity())
+                .unwrap()
+                .size()
             + raw
                 .fields
                 .iter()
                 .map(|f| f.name.capacity() + f.alias.as_ref().map_or(0, String::capacity))
                 .sum::<usize>();
+        let known = read.retained_invoice_floor().unwrap().max(result_floor);
         decode(Some(&raw), read, known, limits(), &c).unwrap();
         assert!(matches!(
             prepare_result_decode(
