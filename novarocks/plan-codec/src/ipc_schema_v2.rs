@@ -286,7 +286,7 @@ pub(crate) fn initial_writer_request_facts(
         limits.max_string_bytes,
         "IPC schema string envelope exceeded",
     )?;
-    let prefix = policy.numeric(writer_resources::prefix_initial(field, source))?;
+    let prefix = policy.numeric(writer_resources::prefix_initial(field, source, 1))?;
     let mut initial = Counts {
         fields: 1,
         metadata_entries: field.metadata().len(),
@@ -887,7 +887,15 @@ fn verify_single_field_schema_profile_with_host_in<H>(
         )?;
     }
     source_floor(expected, source)?;
-    let prefix = policy.numeric(writer_resources::prefix_initial(expected, source))?;
+    let prefix = policy.numeric(writer_resources::prefix_initial(
+        expected,
+        source,
+        if crate::ipc_flat_batch_v2::layout(expected.data_type()).is_ok() {
+            1
+        } else {
+            novarocks_type_contract::MAX_VALUE_TYPE_NODES
+        },
+    ))?;
     let mut admission = Admission {
         parent: Some(admit),
         source,
