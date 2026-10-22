@@ -807,6 +807,43 @@ mod tests {
         )]))
     }
     #[test]
+    fn optimize_status_binds_only_the_catalog_in_qualified_from() {
+        let symbols = symbols();
+        let mapped = symbols.lookup("owned").unwrap();
+        for (sql, expected) in [
+            (
+                "SHOW ALTER TABLE OPTIMIZE FROM owned.ns WHERE TableName = 'owned' ORDER BY CreateTime DESC LIMIT 1",
+                format!(
+                    "SHOW ALTER TABLE OPTIMIZE FROM {mapped}.ns WHERE TableName = 'owned' ORDER BY CreateTime DESC LIMIT 1"
+                ),
+            ),
+            (
+                "SHOW ALTER TABLE OPTIMIZE FROM `owned`.`namespace.with.dot` WHERE TableName = 'owned.ns.t'",
+                format!(
+                    "SHOW ALTER TABLE OPTIMIZE FROM `{mapped}`.`namespace.with.dot` WHERE TableName = 'owned.ns.t'"
+                ),
+            ),
+            (
+                "SHOW ALTER TABLE OPTIMIZE FROM owned WHERE TableName = 'owned.ns.t'",
+                "SHOW ALTER TABLE OPTIMIZE FROM owned WHERE TableName = 'owned.ns.t'".into(),
+            ),
+            (
+                "SHOW ALTER TABLE OPTIMIZE FROM `owned.ns`",
+                "SHOW ALTER TABLE OPTIMIZE FROM `owned.ns`".into(),
+            ),
+            (
+                "SHOW ALTER TABLE OPTIMIZE FROM external.ns WHERE TableName = 'owned'",
+                "SHOW ALTER TABLE OPTIMIZE FROM external.ns WHERE TableName = 'owned'".into(),
+            ),
+            (
+                "SHOW ALTER TABLE OPTIMIZE WHERE TableName = 'owned'",
+                "SHOW ALTER TABLE OPTIMIZE WHERE TableName = 'owned'".into(),
+            ),
+        ] {
+            assert_eq!(symbols.rewrite_source(sql).unwrap(), expected);
+        }
+    }
+    #[test]
     fn qualified_database_control_maps_only_its_typed_catalog_span() {
         let symbols = symbols();
         let mapped = symbols.lookup("owned").unwrap();
