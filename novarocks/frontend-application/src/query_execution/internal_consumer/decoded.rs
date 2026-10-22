@@ -638,7 +638,7 @@ async fn wait_statistics(
     }
 }
 
-fn cancelled(reason: QueryCancellationReason) -> QueryExecutionError {
+pub(super) fn cancelled(reason: QueryCancellationReason) -> QueryExecutionError {
     use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
     use novarocks_query_application::execution_error::{
         ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,

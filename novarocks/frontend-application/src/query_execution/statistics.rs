@@ -43,16 +43,83 @@ use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryRequest,
 };
 
-const MAX_STATISTICS_ROOT_ROWS: usize = 4096;
-
-fn charge_statistics_body_bytes(current: usize, body_bytes: usize) -> Result<usize, String> {
-    let charged = current
-        .checked_add(body_bytes)
-        .ok_or_else(|| "statistics Root body budget overflow".to_string())?;
-    if charged > novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES {
-        return Err("statistics Root body budget exceeded".into());
+/// Rejection from the original statistics decoder. Typed producers retain
+/// their concrete source; local contract diagnostics have no invented fact.
+#[derive(Debug)]
+pub enum StatisticsDecodeFailure {
+    Connector(novarocks_spi::connector::ConnectorError),
+    // Includes the codec author's cumulative body and row budget refusals.
+    Record(novarocks_native_adapter::root_statistics_codec::StatisticsCodecError),
+    Framing(novarocks_native_adapter::root_record_assembly::RootRecordFramingError),
+    Contract(String),
+}
+impl From<novarocks_spi::connector::ConnectorError> for StatisticsDecodeFailure {
+    fn from(error: novarocks_spi::connector::ConnectorError) -> Self {
+        Self::Connector(error)
     }
-    Ok(charged)
+}
+impl From<novarocks_native_adapter::root_record_assembly::RootRecordFramingError>
+    for StatisticsDecodeFailure
+{
+    fn from(error: novarocks_native_adapter::root_record_assembly::RootRecordFramingError) -> Self {
+        Self::Framing(error)
+    }
+}
+impl From<novarocks_native_adapter::root_record_assembly::RootRecordAssemblyError<Self>>
+    for StatisticsDecodeFailure
+{
+    fn from(
+        error: novarocks_native_adapter::root_record_assembly::RootRecordAssemblyError<Self>,
+    ) -> Self {
+        match error {
+            novarocks_native_adapter::root_record_assembly::RootRecordAssemblyError::Framing(
+                error,
+            ) => Self::Framing(error),
+            novarocks_native_adapter::root_record_assembly::RootRecordAssemblyError::Sink(
+                error,
+            ) => error,
+        }
+    }
+}
+impl From<String> for StatisticsDecodeFailure {
+    fn from(detail: String) -> Self {
+        Self::Contract(detail)
+    }
+}
+impl From<&str> for StatisticsDecodeFailure {
+    fn from(detail: &str) -> Self {
+        Self::Contract(detail.to_owned())
+    }
+}
+impl std::fmt::Display for StatisticsDecodeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connector(error) => std::fmt::Display::fmt(error, formatter),
+            Self::Record(error) => write!(formatter, "statistics Root record: {error}"),
+            Self::Framing(error) => std::fmt::Display::fmt(error, formatter),
+            Self::Contract(detail) => formatter.write_str(detail),
+        }
+    }
+}
+impl std::error::Error for StatisticsDecodeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Connector(error) => Some(error),
+            Self::Record(error) => Some(error),
+            Self::Framing(error) => Some(error),
+            Self::Contract(_) => None,
+        }
+    }
+}
+
+fn charge_statistics_body_bytes(
+    current: usize,
+    body_bytes: usize,
+) -> Result<usize, StatisticsDecodeFailure> {
+    novarocks_native_adapter::root_statistics_codec::StatisticsCodecTotals::checked_body_total(
+        current, body_bytes,
+    )
+    .map_err(StatisticsDecodeFailure::Record)
 }
 
 #[cfg(test)]
@@ -559,7 +626,7 @@ impl StatisticsRootResultDecoder {
     pub fn apply_chunk(
         &mut self,
         chunk: &novarocks_execution::exec::chunk::Chunk,
-    ) -> Result<(), String> {
+    ) -> Result<(), StatisticsDecodeFailure> {
         if self.root_eof {
             return Err("statistics Root emitted a trailing batch after EOF".into());
         }
@@ -587,16 +654,14 @@ impl StatisticsRootResultDecoder {
         if schema.as_ref() != &expected_schema {
             return Err(format!(
                 "statistics Root schema mismatch: expected {expected_schema:?}, received {schema:?}"
-            ));
+            )
+            .into());
         }
-        if self
-            .observed
-            .len()
-            .checked_add(batch.num_rows())
-            .is_none_or(|rows| rows > MAX_STATISTICS_ROOT_ROWS)
-        {
-            return Err("statistics Root row budget exceeded".into());
-        }
+        novarocks_native_adapter::root_statistics_codec::StatisticsCodecTotals::checked_row_total(
+            self.observed.len(),
+            batch.num_rows(),
+        )
+        .map_err(StatisticsDecodeFailure::Record)?;
         let input_fields = batch
             .column(0)
             .as_any()
@@ -652,7 +717,7 @@ impl StatisticsRootResultDecoder {
     /// Backend, under the same identity, membership and body rules.
     /// Validate complete local domain consumption before the coordinator
     /// records End. This count is relation rows, not affected write rows.
-    pub(crate) fn check_relay_end(&self, output_rows: u64) -> Result<(), String> {
+    pub(crate) fn check_relay_end(&self, output_rows: u64) -> Result<(), StatisticsDecodeFailure> {
         self.relay_assembly.finish()?;
         if output_rows != self.relayed_record_count {
             return Err("internal root End differs from decoded record count".into());
@@ -662,7 +727,7 @@ impl StatisticsRootResultDecoder {
 
     /// Accept a relayed body into the prepaid 32 MiB assembly share. A complete
     /// record is validated before this call returns and its receipt may finish.
-    pub(crate) fn apply_relay_body(&mut self, body: &[u8]) -> Result<(), String> {
+    pub(crate) fn apply_relay_body(&mut self, body: &[u8]) -> Result<(), StatisticsDecodeFailure> {
         if self.root_eof {
             return Err("statistics Root emitted a trailing body after EOF".into());
         }
@@ -670,7 +735,7 @@ impl StatisticsRootResultDecoder {
             &mut self.relay_assembly,
             RootRecordAssembly::new(RootRecordDomain::Statistics, 32 * 1024 * 1024),
         );
-        let result = assembly.push(body, |record| {
+        let result = assembly.push(body, |record| -> Result<(), StatisticsDecodeFailure> {
             self.apply_record(record)?;
             self.relayed_record_count = self
                 .relayed_record_count
@@ -679,21 +744,23 @@ impl StatisticsRootResultDecoder {
             Ok(())
         });
         self.relay_assembly = assembly;
-        result
+        result.map_err(StatisticsDecodeFailure::from)
     }
 
-    pub fn apply_record(&mut self, record: &[u8]) -> Result<(), String> {
+    pub fn apply_record(&mut self, record: &[u8]) -> Result<(), StatisticsDecodeFailure> {
         if self.root_eof {
             return Err("statistics Root emitted a trailing record after EOF".into());
         }
-        if self.observed.len() >= MAX_STATISTICS_ROOT_ROWS {
-            return Err("statistics Root row budget exceeded".into());
-        }
+        novarocks_native_adapter::root_statistics_codec::StatisticsCodecTotals::checked_row_total(
+            self.observed.len(),
+            1,
+        )
+        .map_err(StatisticsDecodeFailure::Record)?;
         let view =
             novarocks_native_adapter::root_statistics_codec::StatisticsArtifactRecordView::parse(
                 record,
             )
-            .map_err(|error| format!("statistics Root record: {error}"))?;
+            .map_err(StatisticsDecodeFailure::Record)?;
         self.apply_artifact(view.field_ids().collect(), view.blob_type(), view.body())
     }
 
@@ -702,21 +769,23 @@ impl StatisticsRootResultDecoder {
         field_ids: Vec<i32>,
         blob_type: &str,
         body: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<(), StatisticsDecodeFailure> {
         if field_ids.iter().collect::<BTreeSet<_>>().len() != field_ids.len() {
             return Err("statistics Root input_fields contains a duplicate field ID".into());
         }
         let identity = StatisticsArtifactIdentity::try_new(field_ids, blob_type)
-            .map_err(|error| error.to_string())?;
+            .map_err(StatisticsDecodeFailure::Connector)?;
         if !self.expected.contains(&identity) {
             return Err(format!(
                 "statistics Root emitted unexpected artifact identity {identity:?}"
-            ));
+            )
+            .into());
         }
         if self.observed.contains_key(&identity) {
             return Err(format!(
                 "statistics Root emitted duplicate artifact identity {identity:?}"
-            ));
+            )
+            .into());
         }
         self.body_bytes = charge_statistics_body_bytes(self.body_bytes, body.len())?;
         let draft = StatisticsArtifactDraft::try_new(
@@ -725,7 +794,7 @@ impl StatisticsRootResultDecoder {
             bytes::Bytes::copy_from_slice(body),
             BTreeMap::new(),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(StatisticsDecodeFailure::Connector)?;
         let draft = match &self.retention {
             Some(retention) => draft.attach_guard(retention.spi_guard()),
             None => draft,
@@ -734,7 +803,7 @@ impl StatisticsRootResultDecoder {
         Ok(())
     }
 
-    pub fn observe_root_eof(&mut self) -> Result<(), String> {
+    pub fn observe_root_eof(&mut self) -> Result<(), StatisticsDecodeFailure> {
         self.relay_assembly.finish()?;
         if std::mem::replace(&mut self.root_eof, true) {
             return Err("statistics Root emitted duplicate EOF".into());
@@ -742,14 +811,14 @@ impl StatisticsRootResultDecoder {
         Ok(())
     }
 
-    pub fn observe_execution_success(&mut self) -> Result<(), String> {
+    pub fn observe_execution_success(&mut self) -> Result<(), StatisticsDecodeFailure> {
         if std::mem::replace(&mut self.execution_succeeded, true) {
             return Err("statistics execution success was observed twice".into());
         }
         Ok(())
     }
 
-    pub fn finish(self) -> Result<Vec<StatisticsArtifactDraft>, String> {
+    pub fn finish(self) -> Result<Vec<StatisticsArtifactDraft>, StatisticsDecodeFailure> {
         if !self.root_eof {
             return Err("statistics Root EOF was not observed".into());
         }
@@ -761,7 +830,8 @@ impl StatisticsRootResultDecoder {
             let missing = self.expected.difference(&observed).collect::<Vec<_>>();
             return Err(format!(
                 "statistics Root artifact membership is incomplete; missing {missing:?}"
-            ));
+            )
+            .into());
         }
         Ok(self.observed.into_values().collect())
     }
@@ -1008,7 +1078,7 @@ mod tests {
             assembly
                 .push(body, |record| {
                     records.push(record.to_vec());
-                    Ok(())
+                    Ok::<(), std::convert::Infallible>(())
                 })
                 .unwrap();
         }
@@ -1052,6 +1122,7 @@ mod tests {
             decoder
                 .observe_root_eof()
                 .unwrap_err()
+                .to_string()
                 .contains("unfinished")
         );
         assert!(!decoder.root_eof);
@@ -1060,7 +1131,13 @@ mod tests {
         assert!(!decoder.root_eof);
         decoder.check_relay_end(1).unwrap();
         decoder.observe_root_eof().unwrap();
-        assert!(decoder.finish().unwrap_err().contains("all-success"));
+        assert!(
+            decoder
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("all-success")
+        );
         let mut decoder = StatisticsRootResultDecoder::new([expected]);
         decoder.apply_relay_body(&record).unwrap();
         decoder.observe_root_eof().unwrap();
@@ -1126,7 +1203,7 @@ mod tests {
                 &[],
             )]))
             .expect("second batch");
-        assert!(decoder.finish().unwrap_err().contains("EOF"));
+        assert!(decoder.finish().unwrap_err().to_string().contains("EOF"));
 
         let mut decoder = StatisticsRootResultDecoder::new([
             identity(1, "apache-datasketches-theta-v1"),
@@ -1139,7 +1216,13 @@ mod tests {
             ]))
             .expect("batch");
         decoder.observe_root_eof().expect("EOF");
-        assert!(decoder.finish().unwrap_err().contains("all-success"));
+        assert!(
+            decoder
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("all-success")
+        );
 
         let mut decoder = StatisticsRootResultDecoder::new([
             identity(1, "apache-datasketches-theta-v1"),
@@ -1170,6 +1253,7 @@ mod tests {
                     &[]
                 )]))
                 .unwrap_err()
+                .to_string()
                 .contains("unexpected")
         );
 
@@ -1191,13 +1275,20 @@ mod tests {
                     &[]
                 )]))
                 .unwrap_err()
+                .to_string()
                 .contains("duplicate")
         );
 
         let mut missing = StatisticsRootResultDecoder::new([expected.clone()]);
         missing.observe_root_eof().expect("EOF");
         missing.observe_execution_success().expect("all-success");
-        assert!(missing.finish().unwrap_err().contains("incomplete"));
+        assert!(
+            missing
+                .finish()
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete")
+        );
 
         let mut trailing = StatisticsRootResultDecoder::new([expected]);
         trailing.observe_root_eof().expect("EOF");
@@ -1205,6 +1296,7 @@ mod tests {
             trailing
                 .apply_chunk(&chunk(&[]))
                 .unwrap_err()
+                .to_string()
                 .contains("trailing")
         );
     }
@@ -1236,6 +1328,7 @@ mod tests {
                     &[("ndv", "1")],
                 )]))
                 .unwrap_err()
+                .to_string()
                 .contains("properties must be empty")
         );
     }
@@ -1251,6 +1344,155 @@ mod tests {
         assert_eq!(
             charged,
             novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_COLUMNS * MAX_COMPACT_THETA_BYTES
+        );
+    }
+
+    fn original_statistics_source(
+        error: super::StatisticsDecodeFailure,
+    ) -> novarocks_failure_contract::SharedFailureCause {
+        use crate::query_execution::internal_consumer::domain_state::InternalDomainFailure;
+        match InternalDomainFailure::from(error) {
+            InternalDomainFailure::Source(source) => source,
+            InternalDomainFailure::Diagnostic(_) => panic!("an original typed source was erased"),
+        }
+    }
+
+    #[test]
+    fn arrow_identity_failure_retains_the_original_connector_source() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use novarocks_spi::connector::ConnectorError;
+        let expected = StatisticsArtifactIdentity::try_new(vec![-1], "theta-v1").unwrap_err();
+        let mut decoder = StatisticsRootResultDecoder::new([identity(1, "theta-v1")]);
+        let source = original_statistics_source(
+            decoder
+                .apply_chunk(&chunk(&[(&[-1], "theta-v1", b"body", &[])]))
+                .unwrap_err(),
+        );
+        assert_eq!(source.downcast_ref::<ConnectorError>(), Some(&expected));
+        assert_eq!(source.failure_fact(), expected.failure_fact());
+        assert_eq!(source.failure_fact().class(), FailureClass::Data);
+        assert!(decoder.observed.is_empty());
+    }
+
+    #[test]
+    fn relayed_header_limit_retains_the_original_codec_resource_source() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use novarocks_native_adapter::root_statistics_codec::StatisticsCodecError;
+        let body_bytes = novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES + 1;
+        let mut header = Vec::from(*b"STA1");
+        for word in [(24 + 4 + 1 + body_bytes) as u32, 1, 1, body_bytes as u32, 0] {
+            header.extend_from_slice(&word.to_le_bytes());
+        }
+        let mut decoder = StatisticsRootResultDecoder::new([identity(1, "x")]);
+        let source = original_statistics_source(decoder.apply_relay_body(&header).unwrap_err());
+        assert_eq!(
+            source.downcast_ref::<StatisticsCodecError>(),
+            Some(&StatisticsCodecError::BodyLimit)
+        );
+        assert_eq!(
+            source.failure_fact(),
+            StatisticsCodecError::BodyLimit.failure_fact()
+        );
+        assert_eq!(source.failure_fact().class(), FailureClass::Resource);
+        assert_eq!(decoder.relayed_record_count, 0);
+        assert!(decoder.observed.is_empty());
+    }
+
+    #[test]
+    fn relayed_record_sink_failure_retains_the_original_codec_data_source() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use novarocks_native_adapter::root_statistics_codec::StatisticsCodecError;
+        let mut record = Vec::from(*b"STA1");
+        for word in [29u32, 1, 1, 0, 0] {
+            record.extend_from_slice(&word.to_le_bytes());
+        }
+        record.extend_from_slice(&0i32.to_le_bytes());
+        record.push(b'x');
+        let mut decoder = StatisticsRootResultDecoder::new([identity(1, "x")]);
+        let source = original_statistics_source(decoder.apply_relay_body(&record).unwrap_err());
+        assert_eq!(
+            source.downcast_ref::<StatisticsCodecError>(),
+            Some(&StatisticsCodecError::FieldIds)
+        );
+        assert_eq!(
+            source.failure_fact(),
+            StatisticsCodecError::FieldIds.failure_fact()
+        );
+        assert_eq!(source.failure_fact().class(), FailureClass::Data);
+        assert_eq!(decoder.relayed_record_count, 0);
+        assert!(decoder.observed.is_empty());
+    }
+
+    #[test]
+    fn statistics_body_budget_preserves_typed_overflow_and_exceeded_refusals() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use novarocks_native_adapter::root_statistics_codec::StatisticsCodecError;
+        use novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES;
+        let limit = MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES;
+        assert_eq!(charge_statistics_body_bytes(limit - 1, 1).unwrap(), limit);
+        assert_eq!(charge_statistics_body_bytes(limit, 0).unwrap(), limit);
+        for (current, additional) in [(limit, 1), (usize::MAX, 1)] {
+            let source = original_statistics_source(
+                charge_statistics_body_bytes(current, additional).unwrap_err(),
+            );
+            assert_eq!(
+                source.downcast_ref::<StatisticsCodecError>(),
+                Some(&StatisticsCodecError::BodyLimit)
+            );
+            assert_eq!(
+                source.failure_fact(),
+                StatisticsCodecError::BodyLimit.failure_fact()
+            );
+            assert_eq!(source.failure_fact().class(), FailureClass::Resource);
+        }
+    }
+
+    #[test]
+    fn statistics_row_budget_preserves_the_typed_refusal_after_the_supported_limit() {
+        use novarocks_failure_contract::{FailureClass, FailureProjection};
+        use novarocks_native_adapter::root_statistics_codec::{
+            StatisticsCodecError, StatisticsCodecTotals,
+        };
+        use novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_ARTIFACTS;
+        let limit = MAX_CONNECTOR_STATISTICS_ARTIFACTS;
+        let mut decoder =
+            StatisticsRootResultDecoder::new((1..=limit).map(|field| identity(field as i32, "x")));
+        let record = |field: i32| {
+            let mut record = Vec::from(*b"STA1");
+            for word in [29u32, 1, 1, 0, 0] {
+                record.extend_from_slice(&word.to_le_bytes());
+            }
+            record.extend_from_slice(&field.to_le_bytes());
+            record.push(b'x');
+            record
+        };
+        for field in 1..=limit {
+            decoder.apply_relay_body(&record(field as i32)).unwrap();
+        }
+        assert_eq!(decoder.observed.len(), limit);
+        assert_eq!(decoder.relayed_record_count, limit as u64);
+        decoder.apply_chunk(&chunk(&[])).unwrap();
+        let record_error = decoder.apply_relay_body(&record(1)).unwrap_err();
+        let chunk_error = decoder
+            .apply_chunk(&chunk(&[(&[1], "x", b"", &[])]))
+            .unwrap_err();
+        for error in [record_error, chunk_error] {
+            let source = original_statistics_source(error);
+            assert_eq!(
+                source.downcast_ref::<StatisticsCodecError>(),
+                Some(&StatisticsCodecError::RowLimit)
+            );
+            assert_eq!(
+                source.failure_fact(),
+                StatisticsCodecError::RowLimit.failure_fact()
+            );
+            assert_eq!(source.failure_fact().class(), FailureClass::Resource);
+        }
+        assert_eq!(decoder.observed.len(), limit);
+        assert_eq!(decoder.relayed_record_count, limit as u64);
+        assert_eq!(
+            StatisticsCodecTotals::checked_row_total(usize::MAX, 1),
+            Err(StatisticsCodecError::RowLimit)
         );
     }
 }

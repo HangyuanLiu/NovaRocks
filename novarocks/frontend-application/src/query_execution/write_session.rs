@@ -58,6 +58,12 @@ use crate::query_execution::write_result::DecodedPreparedWriteSet;
 use novarocks_catalog_application::ConnectorWriteStackLease;
 use novarocks_plan_codec::SealedWriteTargets;
 
+#[path = "write_computation.rs"]
+mod computation;
+pub(crate) use computation::{
+    AcceptedWriteSegment, SessionDecodedWriteSegment, WriteComputationDecode, WriteReceivingPort,
+};
+
 /// What a session has already decided. Recorded so a second, different
 /// decision is refused rather than silently issuing two external effects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +89,13 @@ enum WritePublicationState {
 
 /// One distributed write's frontend session.
 pub(crate) struct ConnectorWriteSession {
+    decode_origin: Arc<()>,
+    statistics_expected: Arc<
+        std::collections::BTreeSet<(
+            WriteTargetOrdinal,
+            novarocks_spi::connector::StatisticsArtifactIdentity,
+        )>,
+    >,
     lease: ConnectorWriteStackLease,
     plan: ConnectorWriteSessionPlan,
     /// Only an invisible staged target may be sealed without a distributed
@@ -137,8 +150,15 @@ pub(crate) struct ConnectorWriteSession {
 struct AccumulatedWriteSet {
     rows: WriteRowCountAccumulator,
     ledger: PreparedWriteSetLedger,
-    fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
+    fragments: Vec<(
+        WriteTargetOrdinal,
+        novarocks_spi::connector::write_stack::ConnectorCommitFragment,
+    )>,
     statistics: Vec<novarocks_spi::connector::write_stack::WriteStatisticsArtifact>,
+    statistics_identities: std::collections::BTreeSet<(
+        WriteTargetOrdinal,
+        novarocks_spi::connector::StatisticsArtifactIdentity,
+    )>,
     statistics_body_bytes: usize,
     statistics_property_bytes: usize,
     retention: Option<crate::query_execution::internal_result_cpu::InternalResultRetention>,
@@ -268,6 +288,21 @@ impl ConnectorWriteSession {
         request.context = context_for_write_begin(request.context, &catalog_properties)?;
         let plan = lease.session().begin_write(request)?;
         Ok(Self {
+            decode_origin: Arc::new(()),
+            statistics_expected: Arc::new(
+                plan.targets()
+                    .iter()
+                    .flat_map(|target| {
+                        target
+                            .statistics()
+                            .requirements()
+                            .iter()
+                            .map(move |requirement| {
+                                (target.ordinal(), requirement.artifact().clone())
+                            })
+                    })
+                    .collect(),
+            ),
             lease,
             plan,
             implicit_empty_staged_create,
@@ -309,6 +344,21 @@ impl ConnectorWriteSession {
             ));
         }
         Ok(Self {
+            decode_origin: Arc::new(()),
+            statistics_expected: Arc::new(
+                plan.targets()
+                    .iter()
+                    .flat_map(|target| {
+                        target
+                            .statistics()
+                            .requirements()
+                            .iter()
+                            .map(move |requirement| {
+                                (target.ordinal(), requirement.artifact().clone())
+                            })
+                    })
+                    .collect(),
+            ),
             lease,
             plan,
             implicit_empty_staged_create: false,
@@ -510,48 +560,6 @@ impl ConnectorWriteSession {
         ))
     }
 
-    /// Turn canonical fragments into provider values this generation owns.
-    fn interpret_parts(
-        &self,
-        row_count: u64,
-        fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
-    ) -> Result<ConnectorPreparedWriteSet, ConnectorError> {
-        use novarocks_proto_codec::FieldPath;
-        use novarocks_proto_codec::connector_write::ValidatedCommitFragment;
-        use prost::Message;
-
-        let decoder = self.lease.fragment_decoder();
-        let mut decoded = Vec::with_capacity(fragments.len());
-        for (index, (target, bytes)) in fragments.into_iter().enumerate() {
-            let raw =
-                write_dto::ConnectorCommitFragment::decode(bytes.as_slice()).map_err(|error| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::CorruptData,
-                        format!(
-                            "prepared write set fragment {index} is not a commit fragment: {error}"
-                        ),
-                    )
-                })?;
-            // Re-validated at the trust boundary even though the producer and
-            // the root already did: a frontend that trusted a backend's
-            // validation could not notice a backend that got it wrong.
-            let validated = ValidatedCommitFragment::parse(
-                raw,
-                FieldPath::root("prepared_write_set").index(index),
-            )
-            .map_err(|error| {
-                ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
-            })?;
-            let fragment = decoder
-                .decode_commit_fragment(&validated)
-                .map_err(|error| {
-                    ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
-                })?;
-            decoded.push((target, fragment));
-        }
-        ConnectorPreparedWriteSet::try_new(row_count, decoded, &self.expected_targets())
-    }
-
     /// Project the visible-row effect of one complete MV write before binding
     /// its publication. The provider interprets its own exact fragments; the
     /// generic affected-row count retains its original meaning.
@@ -561,7 +569,12 @@ impl ConnectorWriteSession {
         previous: Option<u64>,
         context: &ConnectorRequestContext,
     ) -> Result<Option<u64>, ConnectorError> {
-        let decoded = self.interpret_parts(prepared.row_count(), prepared.fragments().to_vec())?;
+        let decoded = self
+            .computation_decode(&self.expected_targets())?
+            .interpret_borrowed(prepared.row_count(), prepared.fragments())
+            .map_err(
+                crate::query_execution::write_result::RootWriteDecodeFailure::into_connector_error,
+            )?;
         self.logical_rows_after_prepared(&decoded, previous, context)
     }
 
@@ -612,122 +625,14 @@ impl ConnectorWriteSession {
         &self,
         prepared: DecodedPreparedWriteSet,
     ) -> Result<(), ConnectorError> {
-        // Refuse after a terminal decision: a set arriving then belongs to work
-        // this session already answered for.
-        if self.lock_terminal()?.is_some() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector write session already reached a terminal decision",
-            ));
-        }
-        let mut accumulated = self.lock_accumulated()?;
-        let (row_count, fragments, statistics, retention) = prepared.into_parts();
-        if let (Some(current), Some(incoming)) = (&accumulated.retention, &retention) {
-            if !current.is_same_admission(incoming) {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "write union received a different result allowance or attribution",
-                ));
-            }
-        } else if accumulated.retention.is_some() && retention.is_none()
-            || accumulated.retention.is_none()
-                && retention.is_some()
-                && (!accumulated.fragments.is_empty() || !accumulated.statistics.is_empty())
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "write union cannot mix governed and legacy payload ownership",
-            ));
-        }
-        let mut next_rows = accumulated.rows;
-        next_rows.add(row_count)?;
-        let mut next_ledger = accumulated.ledger;
-        for (_, bytes) in &fragments {
-            next_ledger.reserve_fragment(bytes.len())?;
-        }
-        let expected = self
-            .plan
-            .targets()
-            .iter()
-            .flat_map(|target| {
-                target
-                    .statistics()
-                    .requirements()
-                    .iter()
-                    .map(move |requirement| (target.ordinal(), requirement.artifact().clone()))
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut observed = accumulated
-            .statistics
-            .iter()
-            .map(|artifact| (artifact.target(), artifact.draft().identity().clone()))
-            .collect::<std::collections::BTreeSet<_>>();
-        if accumulated
-            .statistics
-            .len()
-            .checked_add(statistics.len())
-            .is_none_or(|count| {
-                count > novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_ARTIFACTS
-            })
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "write session statistics artifact count exceeded its limit",
-            ));
-        }
-        let mut next_body_bytes = accumulated.statistics_body_bytes;
-        let mut next_property_bytes = accumulated.statistics_property_bytes;
-        for artifact in &statistics {
-            let key = (artifact.target(), artifact.draft().identity().clone());
-            if !expected.contains(&key) || !observed.insert(key) {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "write session accumulated an unknown or duplicate statistics artifact",
-                ));
-            }
-            next_body_bytes = next_body_bytes
-                .checked_add(artifact.draft().body().len())
-                .filter(|bytes| {
-                    *bytes <= novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES
-                })
-                .ok_or_else(|| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::ResourceExhausted,
-                        "write session statistics body bytes exceeded their limit",
-                    )
-                })?;
-            let property_bytes =
-                artifact
-                    .draft()
-                    .properties()
-                    .iter()
-                    .try_fold(0usize, |total, (key, value)| {
-                        total
-                            .checked_add(key.len())
-                            .and_then(|sum| sum.checked_add(value.len()))
-                    });
-            next_property_bytes = property_bytes
-                .and_then(|bytes| next_property_bytes.checked_add(bytes))
-                .filter(|bytes| {
-                    *bytes <= novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES
-                })
-                .ok_or_else(|| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::ResourceExhausted,
-                        "write session statistics property bytes exceeded their limit",
-                    )
-                })?;
-        }
-        if accumulated.retention.is_none() {
-            accumulated.retention = retention;
-        }
-        accumulated.rows = next_rows;
-        accumulated.ledger = next_ledger;
-        accumulated.fragments.extend(fragments);
-        accumulated.statistics_body_bytes = next_body_bytes;
-        accumulated.statistics_property_bytes = next_property_bytes;
-        accumulated.statistics.extend(statistics);
-        Ok(())
+        drop(self.receiving_terminal_guard()?);
+        let segment = self
+            .computation_decode(&self.expected_targets())?
+            .interpret(prepared)
+            .map_err(
+                crate::query_execution::write_result::RootWriteDecodeFailure::into_connector_error,
+            )?;
+        self.accept_interpreted(segment).map(|_| ())
     }
 
     /// Perform the one external commit over everything accumulated so far.
@@ -778,7 +683,8 @@ impl ConnectorWriteSession {
                 accumulated.retention.take(),
             )
         };
-        let prepared = self.interpret_parts(row_count, fragments)?;
+        let prepared =
+            ConnectorPreparedWriteSet::try_new(row_count, fragments, &self.expected_targets())?;
         self.finish_invocations.fetch_add(1, Ordering::SeqCst);
         let outcome = self
             .lease
@@ -1456,6 +1362,7 @@ pub(crate) mod tests {
 
     #[derive(Default)]
     pub(crate) struct Recorded {
+        decoded_fragments: usize,
         pub(crate) begin: usize,
         capture_begin_context: bool,
         begin_context: Option<ConnectorRequestContext>,
@@ -1688,6 +1595,7 @@ pub(crate) mod tests {
 
     struct FakeDecoder {
         adapter: WriteRuntimeAdapter<FakeProvider>,
+        recorded: Arc<Mutex<Recorded>>,
     }
 
     impl ConnectorWriteFragmentWireDecoder for FakeDecoder {
@@ -1700,6 +1608,7 @@ pub(crate) mod tests {
             _fragment: &ConnectorEncodedPayload,
         ) -> Result<ConnectorCommitFragment, novarocks_spi::connector::ConnectorCodecError>
         {
+            self.recorded.lock().unwrap().decoded_fragments += 1;
             Ok(self.adapter.wrap_commit_fragment(FakeFragment(0)))
         }
     }
@@ -1791,7 +1700,10 @@ pub(crate) mod tests {
             Arc::new(UnusedLegacyControl),
             session_control,
             Arc::new(FakeEncoder { payload_bytes }),
-            Arc::new(FakeDecoder { adapter }),
+            Arc::new(FakeDecoder {
+                adapter,
+                recorded: Arc::clone(&recorded),
+            }),
         );
         let lease = novarocks_catalog_application::test_support::write_stack_lease(
             novarocks_spi::connector::ConnectorControlRuntimeId::new(),
@@ -1826,7 +1738,10 @@ pub(crate) mod tests {
             Arc::new(UnusedLegacyControl),
             session_control,
             Arc::new(FakeEncoder { payload_bytes: 16 }),
-            Arc::new(FakeDecoder { adapter }),
+            Arc::new(FakeDecoder {
+                adapter,
+                recorded: Arc::clone(&recorded),
+            }),
         );
         let lease = novarocks_catalog_application::test_support::write_stack_lease(
             novarocks_spi::connector::ConnectorControlRuntimeId::new(),
@@ -2601,6 +2516,63 @@ pub(crate) mod tests {
     /// find, a relation the decoder cannot read, a set the session refuses --
     /// is exactly the kind of defect no single unit test can see.
     #[test]
+    fn computation_receiving_decodes_once_and_retains_original_window_until_commit() {
+        let (_control, root, binding, capacity) =
+            crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+        let fixture = fixture(1, 16);
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        let decoded = fixture
+            .session
+            .computation_decode(&[target])
+            .unwrap()
+            .interpret(
+                DecodedPreparedWriteSet::for_test(7, vec![(target, commit_fragment_bytes())])
+                    .with_test_capacity(&binding),
+            )
+            .unwrap();
+        assert_eq!(fixture.recorded.lock().unwrap().decoded_fragments, 1);
+        assert_eq!(fixture.session.finish_invocations(), 0);
+        let accepted = fixture.session.receiving_port().accept(decoded).unwrap();
+        assert!(accepted.belongs_to(&fixture.session));
+        assert_eq!(accepted.row_count(), 7);
+        assert!(!accepted.is_empty());
+        drop(binding);
+        root.owner.complete();
+        root.business.release();
+        assert_eq!(capacity.snapshot().held_positions[2], 1);
+        let _ = fixture
+            .session
+            .finish_accumulated(request_context())
+            .unwrap();
+        assert_eq!(
+            fixture.recorded.lock().unwrap().decoded_fragments,
+            1,
+            "publication cannot decode again"
+        );
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
+    #[test]
+    fn computation_receiving_rejects_a_different_original_session_before_union_mutation() {
+        let first = fixture(1, 16);
+        let second = fixture(1, 16);
+        let target = WriteTargetOrdinal::try_new(0).unwrap();
+        let decoded = first
+            .session
+            .computation_decode(&[target])
+            .unwrap()
+            .interpret(DecodedPreparedWriteSet::for_test(
+                7,
+                vec![(target, commit_fragment_bytes())],
+            ))
+            .unwrap();
+        assert!(second.session.receiving_port().accept(decoded).is_err());
+        assert_eq!(second.session.accumulated_row_count().unwrap(), 0);
+        assert_eq!(second.session.finish_invocations(), 0);
+    }
+
+    #[test]
     fn the_frontend_write_path_composes_from_begin_to_commit() {
         use crate::query_execution::write_barrier::WriteCommitBarrier;
         use novarocks_plan_codec::SealedWriteTargets;
@@ -2856,23 +2828,33 @@ pub(crate) mod tests {
         // Each query stays far inside the entry budget; together they exceed
         // it. Charging per query would have accepted every one of them.
         let per_query = MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES / 2;
+        let fragment = commit_fragment_bytes();
         for _ in 0..2 {
             fixture
                 .session
                 .accumulate(DecodedPreparedWriteSet::for_test(
                     0,
-                    vec![(target, Vec::new()); per_query],
+                    vec![(target, fragment.clone()); per_query],
                 ))
                 .expect("within the union budget");
         }
+        assert_eq!(
+            fixture.session.lock_accumulated().unwrap().fragments.len(),
+            MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES,
+        );
         let error = fixture
             .session
             .accumulate(DecodedPreparedWriteSet::for_test(
                 0,
-                vec![(target, Vec::new())],
+                vec![(target, fragment)],
             ))
             .expect_err("over the union budget");
         assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        assert_eq!(
+            fixture.session.lock_accumulated().unwrap().fragments.len(),
+            MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES,
+            "a refused next segment cannot mutate the existing union",
+        );
     }
 
     #[test]

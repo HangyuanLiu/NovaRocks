@@ -709,7 +709,10 @@ async fn run_logical_execution(
     if let Err(error) = request.validate_internal_consumer() {
         return fail_uninstalled_start(pending_owner, reply, error);
     }
-    let (description, native_seed, internal_consumer) = request.into_parts();
+    if let Err(error) = request.validate_result_capacity(&scope) {
+        return fail_uninstalled_start(pending_owner, reply, error);
+    }
+    let (description, native_seed, internal_consumer, result_capacity) = request.into_parts();
     let internal = internal_consumer.is_some();
     let description = Arc::new(description);
     // Activation is one-shot: the plan chosen by preparation and completion is
@@ -759,7 +762,7 @@ async fn run_logical_execution(
     };
     let mut session =
         match opened.and_then(|session| open_acceptance.accept(session).map_err(Into::into)) {
-            Ok(session) => session,
+            Ok(session) => session.with_result_capacity(result_capacity),
             Err(error) => {
                 return fail_uninstalled_start(pending_owner, reply, native_open_error(error));
             }
@@ -3286,6 +3289,11 @@ mod tests {
             .try_acquire(scope, novarocks_workload_control::ResultWindowClass::Client)
             .unwrap();
         attempts.bind_window(window.retain_alias());
+        let result_capacity = crate::admitted_query_context::QueryResultCapacityBinding::try_new(
+            scope,
+            window.retain_alias(),
+        )
+        .unwrap();
         let output = OutputContract::from_completed_plan(
             crate::api::QueryExecutionKind::Read,
             candidate.plan(),
@@ -3309,6 +3317,8 @@ mod tests {
             replacements,
             attempts,
         )
+        .with_result_capacity(result_capacity)
+        .unwrap()
     }
 
     #[derive(Clone)]
@@ -3485,6 +3495,136 @@ mod tests {
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         (control, root)
+    }
+
+    #[derive(Debug)]
+    struct CaptureAdmittedCapacityPort {
+        captured: Option<oneshot::Sender<NativeAttemptPreparationRequest>>,
+    }
+    impl NativeAttemptPreparationPort for CaptureAdmittedCapacityPort {
+        fn prepare(
+            &mut self,
+            request: NativeAttemptPreparationRequest,
+        ) -> NativeAttemptPreparationFuture {
+            self.captured.take().unwrap().send(request).unwrap();
+            Box::pin(async {
+                Err(
+                    NativeAttemptPreparationFailure::from_input(fixture_execution_input(
+                        "observed original preparation request",
+                    ))
+                    .into(),
+                )
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_capacity_reaches_original_request_and_survives_failed_start() {
+        use crate::admitted_query_context::QueryResultCapacityBinding;
+        use std::future::Future;
+        let (control, root) = governance();
+        let scope = root.owner.scope();
+        let capacity = scope.result_capacity().unwrap();
+        let window = capacity
+            .try_acquire(
+                &scope,
+                novarocks_workload_control::ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let original = QueryResultCapacityBinding::try_new(&scope, window.retain_alias()).unwrap();
+        let activity = original.begin_result_activity().unwrap();
+        let (captured, received) = oneshot::channel();
+        let request = completion_request(CaptureAdmittedCapacityPort {
+            captured: Some(captured),
+        })
+        .with_result_capacity(original.clone())
+        .unwrap();
+        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            QueryProcessNamespace::new(0x75),
+            FrontendProcessId::new_v7(),
+            supervisor_config(),
+        );
+        let result = client.start(request, root.owner).await;
+        assert!(result.is_err());
+        let issued = received.await.unwrap();
+        supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let observed = issued.result_capacity().expect("original admitted binding");
+        assert!(
+            observed
+                .window_alias()
+                .shares_capacity_with(&original.window_alias())
+        );
+        assert!(observed.window_alias().is_for_scope(&scope));
+        // An activity started through the original binding remains visible
+        // through the actual request. Reconstructing from an alias would fail.
+        let mut exited = Box::pin(observed.result_activities_exited());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(exited.as_mut().poll(&mut context).is_pending());
+        drop(activity);
+        exited.await;
+        drop((original, window));
+        assert_eq!(capacity.snapshot().held_positions[2], 1);
+        drop(issued);
+        assert_eq!(capacity.snapshot().held_positions[2], 0);
+        root.business.release();
+        scope.wait_released().await;
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+    }
+
+    #[tokio::test]
+    async fn foreign_runtime_capacity_is_rejected_before_native_open() {
+        use crate::admitted_query_context::QueryResultCapacityBinding;
+        let (control, root) = governance();
+        let (foreign_control, foreign_root) = governance();
+        let scope = root.owner.scope();
+        let foreign_scope = foreign_root.owner.scope();
+        assert_eq!(
+            scope.id(),
+            foreign_scope.id(),
+            "runtime identity must also be checked"
+        );
+        let capacity = foreign_scope.result_capacity().unwrap();
+        let window = capacity
+            .try_acquire(
+                &foreign_scope,
+                novarocks_workload_control::ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let original =
+            QueryResultCapacityBinding::try_new(&foreign_scope, window.retain_alias()).unwrap();
+        let request = completion_request(UnreachablePreparationPort)
+            .with_result_capacity(original.clone())
+            .unwrap();
+        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
+            Handle::current(),
+            Arc::new(PanickingOpenNativePort),
+            QueryProcessNamespace::new(0x76),
+            FrontendProcessId::new_v7(),
+            supervisor_config(),
+        );
+        let Err(error) = client.start(request, root.owner).await else {
+            panic!("a foreign runtime binding cannot open Native work");
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::InvalidRequest);
+        assert_eq!(capacity.snapshot().held_positions[2], 1);
+        drop((original, window));
+        assert_eq!(capacity.snapshot().held_positions[2], 0);
+        root.business.release();
+        foreign_root.owner.complete();
+        foreign_root.business.release();
+        supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        scope.wait_released().await;
+        foreign_scope.wait_released().await;
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+        assert_eq!(foreign_control.snapshot().root_responsibilities, 0);
     }
 
     #[tokio::test]

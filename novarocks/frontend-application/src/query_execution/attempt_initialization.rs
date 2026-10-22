@@ -80,6 +80,27 @@ pub(crate) enum RoundCredentialLeaseSource {
 }
 
 impl RoundCredentialLeaseSource {
+    /// A component fixture uses the original one-shot Native drain implementation.
+    #[cfg(all(test, novarocks_dev_controls))]
+    pub(crate) fn test_into_credential_leases(
+        self,
+    ) -> Result<QueryCredentialLeases, DistributedQueryError> {
+        self.into_credential_leases()
+    }
+
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn test_statement_nomination(
+        &self,
+    ) -> Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>> {
+        match self {
+            Self::Reservation {
+                reservation: Some(reservation),
+                ..
+            } => reservation.test_statement_nomination(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn fresh(execution: QueryExecutionId) -> Self {
         Self::Fresh {
             collector: AttemptCredentialLeaseCollector::new(execution),

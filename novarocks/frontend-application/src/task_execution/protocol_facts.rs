@@ -545,7 +545,7 @@ pub(crate) struct WriteProtocolTracker {
     frozen: Arc<FrozenAttemptProtocol>,
     binding: AttemptProtocolBinding,
     revision: u64,
-    failure: bool,
+    failure: Option<SelectedTaskTermination>,
     tracker: WriteCompletionTracker,
 }
 impl WriteProtocolTracker {
@@ -561,7 +561,7 @@ impl WriteProtocolTracker {
             frozen: Arc::clone(&changes.frozen),
             binding: changes.binding,
             revision: 0,
-            failure: false,
+            failure: None,
             tracker: WriteCompletionTracker::try_new(
                 changes.frozen.root,
                 changes.frozen.writers.iter().copied(),
@@ -595,12 +595,15 @@ impl WriteProtocolTracker {
                 self.tracker.observe_status(status);
             }
         }
-        self.failure = changes.failure.is_some();
+        self.failure = changes.failure.clone();
         self.revision = changes.revision;
         Ok(())
     }
+    pub(crate) fn selected_failure(&self) -> Option<&SelectedTaskTermination> {
+        self.failure.as_ref()
+    }
     pub(crate) fn execution_verdict(&self) -> WriteVerdict {
-        self.tracker.execution_verdict(self.failure)
+        self.tracker.execution_verdict(self.failure.is_some())
     }
 }
 fn protocol_error(message: &'static str) -> TaskExecutionError {

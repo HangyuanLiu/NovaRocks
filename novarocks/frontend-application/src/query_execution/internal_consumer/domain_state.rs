@@ -50,6 +50,34 @@ impl From<novarocks_spi::connector::ConnectorError> for InternalDomainFailure {
         Self::Source(novarocks_failure_contract::SharedFailureCause::new(source))
     }
 }
+impl From<crate::query_execution::write_result::RootWriteDecodeFailure> for InternalDomainFailure {
+    fn from(error: crate::query_execution::write_result::RootWriteDecodeFailure) -> Self {
+        let (message, source) = error.into_parts();
+        match source {
+            Some(source) => Self::Source(source),
+            None => Self::Diagnostic(message),
+        }
+    }
+}
+impl From<crate::query_execution::statistics::StatisticsDecodeFailure> for InternalDomainFailure {
+    fn from(error: crate::query_execution::statistics::StatisticsDecodeFailure) -> Self {
+        use crate::query_execution::statistics::StatisticsDecodeFailure;
+        use novarocks_failure_contract::SharedFailureCause;
+        use novarocks_native_adapter::root_record_assembly::RootRecordFramingError;
+        match error {
+            StatisticsDecodeFailure::Connector(source) => Self::from(source),
+            StatisticsDecodeFailure::Record(source)
+            | StatisticsDecodeFailure::Framing(RootRecordFramingError::Statistics(source)) => {
+                Self::Source(SharedFailureCause::new(source))
+            }
+            StatisticsDecodeFailure::Framing(source) => {
+                Self::Source(SharedFailureCause::new(source))
+            }
+            StatisticsDecodeFailure::Contract(detail) => Self::Diagnostic(detail),
+        }
+    }
+}
+
 impl InternalDomainFailure {
     pub(crate) fn execution_input(
         &self,
@@ -73,12 +101,17 @@ impl InternalDomainFailure {
 pub(crate) enum InternalDomainState {
     Statistics(StatisticsRootResultDecoder),
     Write(RootWriteResultDecoder),
+    WriteComputation {
+        decoder: RootWriteResultDecoder,
+        decode: crate::query_execution::write_session::WriteComputationDecode,
+    },
     Cow(Box<CowMatchRootConsumer>),
 }
 
 pub(crate) enum InternalDomainCompletion {
     Statistics(StatisticsRootResultDecoder),
     Write(DecodedPreparedWriteSet),
+    WriteDecoded(crate::query_execution::write_session::SessionDecodedWriteSegment),
     Cow(ConnectorRowMutationSelection),
 }
 
@@ -92,6 +125,7 @@ pub(crate) enum InternalDomainSlot {
         end: RootResultEnd,
     },
     StatisticsFinished(Vec<StatisticsArtifactDraft>),
+    WriteAccepted(crate::query_execution::write_session::AcceptedWriteSegment),
 }
 impl InternalDomainSlot {
     pub(crate) fn receipt(&self) -> Option<u64> {
@@ -123,7 +157,8 @@ impl InternalDomainSlot {
             InternalDomainState::Statistics(decoder) => decoder
                 .apply_relay_body(body)
                 .map_err(InternalDomainFailure::from),
-            InternalDomainState::Write(decoder) => decoder
+            InternalDomainState::Write(decoder)
+            | InternalDomainState::WriteComputation { decoder, .. } => decoder
                 .apply_relay_body(body)
                 .map_err(InternalDomainFailure::from),
             InternalDomainState::Cow(consumer) => consumer
@@ -149,6 +184,15 @@ impl InternalDomainSlot {
                 decoder.observe_root_eof()?;
                 InternalDomainCompletion::Statistics(decoder)
             }
+            InternalDomainState::WriteComputation {
+                mut decoder,
+                decode,
+            } => {
+                decoder.check_relay_end(end.output_rows)?;
+                decoder.observe_root_eof()?;
+                let prepared = decode.interpret(decoder.finish()?)?;
+                InternalDomainCompletion::WriteDecoded(prepared)
+            }
             InternalDomainState::Write(mut decoder) => {
                 decoder.check_relay_end(end.output_rows)?;
                 decoder.observe_root_eof()?;
@@ -171,6 +215,27 @@ impl InternalDomainSlot {
         };
         decoder.observe_execution_success()?;
         Ok(Self::StatisticsFinished(decoder.finish()?))
+    }
+    pub(crate) fn accept_write(
+        self,
+        receiving: crate::query_execution::write_session::WriteReceivingPort,
+    ) -> Result<Self, InternalDomainFailure> {
+        let Self::Eof {
+            completion: InternalDomainCompletion::WriteDecoded(segment),
+            ..
+        } = self
+        else {
+            return Err("write receiving requires its original checked End".into());
+        };
+        Ok(Self::WriteAccepted(receiving.accept(segment)?))
+    }
+    pub(crate) fn into_accepted_write(
+        self,
+    ) -> Result<crate::query_execution::write_session::AcceptedWriteSegment, String> {
+        match self {
+            Self::WriteAccepted(accepted) => Ok(accepted),
+            _ => Err("write domain has no original accepted segment".into()),
+        }
     }
     pub(crate) fn into_write(self) -> Result<DecodedPreparedWriteSet, String> {
         match self {

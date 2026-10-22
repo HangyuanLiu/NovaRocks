@@ -71,20 +71,20 @@ impl TaskResultTransport for UnavailableFinalInfo {
     }
 }
 
-struct OriginalAttempt {
-    round: TaskRound,
-    acks: TaskAckIntakeHandle,
-    release: Option<OperationIntent>,
-    pending_upstream: Option<crate::task_execution::tests::ManifestReleaseTail>,
-    scope: novarocks_workload_control::WorkScope,
-    capacity: novarocks_workload_control::ResultCapacityHandle,
+pub(crate) struct OriginalAttempt {
+    pub(crate) round: TaskRound,
+    pub(crate) acks: TaskAckIntakeHandle,
+    pub(crate) release: Option<OperationIntent>,
+    pub(crate) pending_upstream: Option<crate::task_execution::tests::ManifestReleaseTail>,
+    pub(crate) scope: novarocks_workload_control::WorkScope,
+    pub(crate) capacity: novarocks_workload_control::ResultCapacityHandle,
     clock: Arc<ManualClock>,
-    plan: PlanSeal,
-    root: TaskIdentity,
+    pub(crate) plan: PlanSeal,
+    pub(crate) root: TaskIdentity,
     context: QueryContextRef,
-    logical: LogicalExecutionTestHarness,
+    pub(crate) logical: LogicalExecutionTestHarness,
     // This stands for the original Native active behavior's strong custody.
-    native_credentials: Arc<AttemptCredentialStorage>,
+    pub(crate) native_credentials: Arc<AttemptCredentialStorage>,
     diagnostics: TaskFinalInfoCollector,
     _control: WorkloadControl,
     business: BusinessPermit,
@@ -110,8 +110,35 @@ impl OriginalAttempt {
         let execution =
             QueryExecutionId::new(QueryId::new(0x92, 0x31), AttemptId::new(attempt).unwrap())
                 .unwrap();
+        Self::new_bound(
+            execution,
+            transport,
+            description,
+            plan,
+            pending,
+            None,
+            false,
+        )
+        .await
+    }
+    pub(crate) async fn new_bound(
+        execution: QueryExecutionId,
+        transport: Arc<dyn TaskResultTransport>,
+        description: novarocks_query_application::preparation::FrozenExecutionDescription,
+        plan: PlanSeal,
+        pending: bool,
+        native_credentials: Option<Arc<AttemptCredentialStorage>>,
+        writers: bool,
+    ) -> (Self, AttemptHandoffResources, InternalConsumerActivation) {
         let (mut round, acks, release, pending_upstream, clock, protocol, establish_facts) =
-            if pending {
+            if writers {
+                assert!(pending);
+                let (round, acks, tail, clock, protocol, facts) =
+                    crate::task_execution::tests::manifest_pending_write_with_protocol_fixture(
+                        execution, plan,
+                    );
+                (round, acks, None, Some(tail), clock, protocol, facts)
+            } else if pending {
                 let (round, acks, tail, clock, protocol, facts) =
                     crate::task_execution::tests::manifest_pending_release_with_protocol_fixture(
                         execution, plan,
@@ -156,7 +183,7 @@ impl OriginalAttempt {
         round.install_abort_effect_intake(abort_intake);
         let config = LogicalExecutionActorConfig::single_attempt_completion(
             execution,
-            ExecutionEffect::None,
+            description.effect(),
             NonZeroUsize::new(8).unwrap(),
             vec![context],
             NonZeroUsize::new(2).unwrap(),
@@ -190,7 +217,8 @@ impl OriginalAttempt {
         let mut diagnostics =
             TaskFinalInfoCollector::new(transport, true, &round, Arc::new(CountingWake::default()));
         let profile = diagnostics.enable_profile_observation().unwrap();
-        let native_credentials = original_credentials(execution);
+        let native_credentials =
+            native_credentials.unwrap_or_else(|| original_credentials(execution));
         let resources = AttemptHandoffResources::new(
             protocol,
             Some(Arc::clone(&native_credentials)),
@@ -218,7 +246,7 @@ impl OriginalAttempt {
             activation,
         )
     }
-    fn bind_original_drive(&mut self, producer: &mut AttemptHandoffProducer) {
+    pub(crate) fn bind_original_drive(&mut self, producer: &mut AttemptHandoffProducer) {
         let drive = self.logical.native_attempt_drive();
         self.round.bind_protocol_drive(&drive).unwrap();
         producer.bind(&drive).unwrap();
@@ -262,7 +290,7 @@ impl OriginalAttempt {
         assert!(self.diagnostics.is_closed());
         assert!(self.diagnostics.all_terminal_observed());
     }
-    async fn finish(mut self) {
+    pub(crate) async fn finish(mut self) {
         if let Some(release) = self.release.as_ref() {
             let OperationIntent::ReleaseQueryContext(request) = release else {
                 unreachable!("the fixture returns its original Release")

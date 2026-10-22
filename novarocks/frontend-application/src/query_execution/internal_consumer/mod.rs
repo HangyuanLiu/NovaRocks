@@ -22,6 +22,7 @@ pub(crate) mod decoded;
 pub(crate) mod domain_cpu;
 pub(crate) mod domain_state;
 pub(crate) mod profile;
+pub(crate) mod write;
 
 #[cfg(all(test, novarocks_dev_controls))]
 pub(crate) mod test_fixture;

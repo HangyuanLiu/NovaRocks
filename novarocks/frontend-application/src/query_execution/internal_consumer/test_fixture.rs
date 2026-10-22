@@ -50,8 +50,36 @@ pub(crate) fn internal_statistics_description() -> (
     ))
 }
 
+pub(crate) fn internal_write_description() -> (
+    FrozenExecutionDescription,
+    novarocks_query_application::api::PlanSeal,
+) {
+    internal_description_with_policy(
+        novarocks_result_contract::FrozenRootOutput::InternalFacts(
+            novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+        ),
+        QueryExecutionKind::Write,
+        ExecutionEffect::External,
+    )
+}
+
 fn internal_description(
     root_output: novarocks_result_contract::FrozenRootOutput,
+) -> (
+    FrozenExecutionDescription,
+    novarocks_query_application::api::PlanSeal,
+) {
+    internal_description_with_policy(
+        root_output,
+        QueryExecutionKind::Statistics,
+        ExecutionEffect::None,
+    )
+}
+
+fn internal_description_with_policy(
+    root_output: novarocks_result_contract::FrozenRootOutput,
+    kind: QueryExecutionKind,
+    effect: ExecutionEffect,
 ) -> (
     FrozenExecutionDescription,
     novarocks_query_application::api::PlanSeal,
@@ -100,15 +128,13 @@ fn internal_description(
         &novarocks_sql::compiler::SqlCompileControl::unbounded(),
     )
     .unwrap();
-    let output =
-        OutputContract::from_completed_candidate(QueryExecutionKind::Statistics, &candidate)
-            .unwrap();
+    let output = OutputContract::from_completed_candidate(kind, &candidate).unwrap();
     let description = FrozenExecutionDescription::for_completed_plan(
-        QueryExecutionKind::Statistics,
+        kind,
         candidate,
         Vec::new(),
         output,
-        ExecutionEffect::None,
+        effect,
         RecoveryMode::NoRecovery,
         Vec::new(),
         FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
@@ -128,6 +154,15 @@ fn internal_description(
 /// terminal resolver. Tests compare Arc identity and print no secret material.
 pub(crate) fn original_credentials(execution: QueryExecutionId) -> Arc<AttemptCredentialStorage> {
     let collector = AttemptCredentialLeaseCollector::new(execution);
+    offer_original_credentials(collector.as_ref());
+    collector
+        .into_credential_leases()
+        .unwrap()
+        .into_attempt_storage_resolver()
+        .expect("original vended table")
+}
+
+pub(crate) fn offer_original_credentials(sink: &dyn ConnectorVendedCredentialLeaseSink) {
     let properties = CatalogProperties::new(
         CatalogHandle::new(
             ConnectorInstanceId::try_from_canonical("catalog.handoff").unwrap(),
@@ -160,12 +195,6 @@ pub(crate) fn original_credentials(execution: QueryExecutionId) -> Arc<AttemptCr
         None,
     )
     .unwrap();
-    collector
-        .offer_vended_s3_credential_lease(&properties, contribution)
+    sink.offer_vended_s3_credential_lease(&properties, contribution)
         .unwrap();
-    collector
-        .into_credential_leases()
-        .unwrap()
-        .into_attempt_storage_resolver()
-        .expect("original vended table")
 }

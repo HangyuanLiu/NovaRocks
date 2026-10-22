@@ -206,7 +206,7 @@ pub(crate) fn attempt_handoff_mailbox() -> (AttemptHandoffOfferPort, AttemptHand
 }
 
 impl AttemptHandoffOfferPort {
-    /// Called once by factory.create(execution), before projection makes any
+    /// Called once by the exact request's dormant factory, before projection makes any
     /// attempt resource live. A later admitted attempt can replace only the
     /// unclaimed directory offer, not a consumer's captured independent cell.
     pub(crate) fn reserve(
@@ -526,4 +526,4 @@ mod tests {
 
 #[cfg(all(test, novarocks_dev_controls))]
 #[path = "attempt_handoff_component_tests.rs"]
-mod component_tests;
+pub(crate) mod component_tests;

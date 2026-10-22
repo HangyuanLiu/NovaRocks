@@ -25,6 +25,7 @@ use super::{
     ComputationReadyToken, InternalComputationConsumer, NativeAttemptPreparationPort,
     NativeLogicalExecutionSeed,
 };
+use crate::admitted_query_context::QueryResultCapacityBinding;
 use crate::coordination::{AbortQueryContextEffectPort, ReplacementQualificationEffectPort};
 use crate::preparation::{ExecutionFinishBoundary, FrozenExecutionDescription};
 
@@ -37,6 +38,7 @@ pub struct QueryExecutionRequest {
     description: FrozenExecutionDescription,
     native_seed: NativeLogicalExecutionSeed,
     internal_consumer: Option<Arc<dyn InternalComputationConsumer>>,
+    result_capacity: Option<QueryResultCapacityBinding>,
 }
 
 impl QueryExecutionRequest {
@@ -68,7 +70,41 @@ impl QueryExecutionRequest {
             description,
             native_seed,
             internal_consumer: None,
+            result_capacity: None,
         }
+    }
+
+    /// Retains the original admitted runtime binding outside the Native seed.
+    /// Cloning this binding preserves its original result-activity authority.
+    pub fn with_result_capacity(
+        mut self,
+        capacity: QueryResultCapacityBinding,
+    ) -> Result<Self, QueryExecutionError> {
+        if self.result_capacity.is_some() {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "logical execution result capacity is already bound",
+            ));
+        }
+        self.result_capacity = Some(capacity);
+        Ok(self)
+    }
+
+    pub(crate) fn validate_result_capacity(
+        &self,
+        scope: &novarocks_workload_control::WorkScope,
+    ) -> Result<(), QueryExecutionError> {
+        if self
+            .result_capacity
+            .as_ref()
+            .is_some_and(|capacity| !capacity.window_alias().is_for_scope(scope))
+        {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "logical execution result capacity belongs to a foreign work scope",
+            ));
+        }
+        Ok(())
     }
 
     /// Registers the fixed application consumer for an internal computation.
@@ -119,6 +155,7 @@ impl QueryExecutionRequest {
             description,
             native_seed,
             internal_consumer: None,
+            result_capacity: None,
         })
     }
 
@@ -132,13 +169,19 @@ impl QueryExecutionRequest {
         FrozenExecutionDescription,
         NativeLogicalExecutionSeed,
         Option<Arc<dyn InternalComputationConsumer>>,
+        Option<QueryResultCapacityBinding>,
     ) {
         assert_eq!(
             self.description.plan_identity(),
             self.native_seed.plan(),
             "executable request must retain its atomically issued Native seed"
         );
-        (self.description, self.native_seed, self.internal_consumer)
+        (
+            self.description,
+            self.native_seed,
+            self.internal_consumer,
+            self.result_capacity,
+        )
     }
 }
 

@@ -38,6 +38,7 @@ use novarocks_workload_control::WorkId;
 
 use super::ExecutionSchedulingFacts;
 use super::{QueryExecutionError, QueryExecutionErrorKind};
+use crate::admitted_query_context::QueryResultCapacityBinding;
 use crate::coordination::{
     AbortQueryContextEffectPort, AcceptedRootStatusSource, AttemptSchedule, NativeAttemptDrive,
     ReplacementQualificationEffectPort, ReplacementWorkerAdmissionEvidence,
@@ -790,7 +791,10 @@ impl LogicalNativeOpenRequest {
             ticket: self.ticket,
             aborts: self.seed.aborts,
             replacements: self.seed.replacements,
-            attempts: Some(self.seed.attempts),
+            attempts: Some(NativeAttemptPreparationState {
+                port: self.seed.attempts,
+                result_capacity: None,
+            }),
         })
     }
 
@@ -822,7 +826,22 @@ pub struct LogicalNativeSession {
     ticket: Arc<LogicalNativeTicket>,
     aborts: Arc<dyn AbortQueryContextEffectPort>,
     replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
-    attempts: Option<Box<dyn NativeAttemptPreparationPort>>,
+    attempts: Option<NativeAttemptPreparationState>,
+}
+
+/// Explicit preparation custody. It is never shared by the logical ticket or
+/// the opaque Native seed, and retires before remote convergence begins.
+struct NativeAttemptPreparationState {
+    port: Box<dyn NativeAttemptPreparationPort>,
+    result_capacity: Option<QueryResultCapacityBinding>,
+}
+impl fmt::Debug for NativeAttemptPreparationState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeAttemptPreparationState")
+            .field("port", &self.port)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -843,6 +862,19 @@ impl LogicalNativeOpenAcceptance {
 }
 
 impl LogicalNativeSession {
+    /// The supervisor moves the validated start binding here only after the
+    /// original Native open ticket is accepted. The seed never receives it.
+    pub(crate) fn with_result_capacity(
+        mut self,
+        capacity: Option<QueryResultCapacityBinding>,
+    ) -> Self {
+        self.attempts
+            .as_mut()
+            .expect("newly accepted preparation owner")
+            .result_capacity = capacity;
+        self
+    }
+
     pub(crate) fn issue_attempt(
         &self,
         execution: QueryExecutionId,
@@ -853,9 +885,10 @@ impl LogicalNativeSession {
         ),
         NativeExecutionContractError,
     > {
-        if self.attempts.is_none() {
-            return Err(NativeExecutionContractError::AttemptPreparationRetired);
-        }
+        let preparation = self
+            .attempts
+            .as_ref()
+            .ok_or(NativeExecutionContractError::AttemptPreparationRetired)?;
         if execution.query_id() != self.ticket.initial_execution.query_id() {
             return Err(NativeExecutionContractError::DifferentLogicalQuery);
         }
@@ -866,6 +899,7 @@ impl LogicalNativeSession {
                 attempt_ticket: Arc::clone(&attempt_ticket),
                 execution,
                 topology_requirement: NativeAttemptTopologyRequirement::LiveSnapshot,
+                result_capacity: preparation.result_capacity.clone(),
             },
             NativeAttemptPreparationAcceptance::new(&self.ticket, attempt_ticket, execution),
         ))
@@ -876,7 +910,7 @@ impl LogicalNativeSession {
         request: NativeAttemptPreparationRequest,
     ) -> NativeAttemptPreparationFuture {
         match self.attempts.as_mut() {
-            Some(attempts) => attempts.prepare(request),
+            Some(attempts) => attempts.port.prepare(request),
             None => Box::pin(async {
                 Err(NativeExecutionContractError::AttemptPreparationRetired.into())
             }),
@@ -942,6 +976,7 @@ pub struct NativeAttemptPreparationRequest {
     logical_ticket: Arc<LogicalNativeTicket>,
     attempt_ticket: Arc<AttemptTicket>,
     execution: QueryExecutionId,
+    result_capacity: Option<QueryResultCapacityBinding>,
 }
 
 impl fmt::Debug for NativeAttemptPreparationRequest {
@@ -954,6 +989,12 @@ impl fmt::Debug for NativeAttemptPreparationRequest {
 }
 
 impl NativeAttemptPreparationRequest {
+    /// Borrows the same runtime binding retained by the admitted start owner.
+    /// Factories may retain it only in this attempt's concrete runtime owners.
+    pub fn result_capacity(&self) -> Option<&QueryResultCapacityBinding> {
+        self.result_capacity.as_ref()
+    }
+
     pub const fn topology_requirement(&self) -> NativeAttemptTopologyRequirement {
         self.topology_requirement
     }

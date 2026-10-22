@@ -65,6 +65,7 @@ enum Operation {
     Body(Arc<RetainedRootReply>),
     End(RootResultEnd),
     FinishStatistics,
+    AcceptWrite(crate::query_execution::write_session::WriteReceivingPort),
 }
 
 impl Operation {
@@ -73,6 +74,7 @@ impl Operation {
             Self::Body(reply) => slot.apply_body(reply),
             Self::End(end) => slot.finish_eof(end),
             Self::FinishStatistics => slot.finish_statistics(),
+            Self::AcceptWrite(receiving) => slot.accept_write(receiving),
         }
     }
 }
@@ -126,6 +128,14 @@ impl DomainCpuCustody {
 
     pub(crate) async fn finish_statistics(&self) -> Result<(), QueryExecutionError> {
         self.start(Operation::FinishStatistics)?;
+        self.receipt().await
+    }
+
+    pub(crate) async fn accept_write(
+        &self,
+        receiving: crate::query_execution::write_session::WriteReceivingPort,
+    ) -> Result<(), QueryExecutionError> {
+        self.start(Operation::AcceptWrite(receiving))?;
         self.receipt().await
     }
 

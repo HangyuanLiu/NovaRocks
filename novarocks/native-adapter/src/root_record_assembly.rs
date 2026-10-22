@@ -49,20 +49,100 @@ impl RootRecordDomain {
     }
 
     /// The complete record length its validated header declares.
-    fn record_bytes(self, prefix: &[u8]) -> Result<usize, String> {
+    fn record_bytes(self, prefix: &[u8]) -> Result<usize, RootRecordFramingError> {
         match self {
             Self::WriteCommit => WriteCommitRecordHeader::parse(prefix)
                 .map(WriteCommitRecordHeader::record_bytes)
-                .map_err(|error| error.to_string()),
+                .map_err(RootRecordFramingError::Write),
             Self::Statistics => StatisticsArtifactHeader::parse(prefix)
                 .map(StatisticsArtifactHeader::record_bytes)
-                .map_err(|error| error.to_string()),
+                .map_err(RootRecordFramingError::Statistics),
             Self::CowSelection => CowSelectionRecordHeader::parse(prefix)
-                .map_err(|error| error.to_string())
+                .map_err(RootRecordFramingError::Cow)
                 .and_then(|header| {
                     usize::try_from(header.record_bytes())
-                        .map_err(|_| "COW selection record length exceeds usize".to_string())
+                        .map_err(|_| RootRecordFramingError::LengthOverflow)
                 }),
+        }
+    }
+}
+
+/// Technical framing facts retain their original codec producer. The
+/// caller's domain error stays distinct from a framing error.
+#[derive(Debug)]
+pub enum RootRecordFramingError {
+    Write(crate::root_write_commit_codec::WriteCommitCodecError),
+    Statistics(crate::root_statistics_codec::StatisticsCodecError),
+    Cow(crate::root_cow_selection_codec::CowSelectionCodecError),
+    Capacity { requested: usize, limit: usize },
+    Incomplete,
+    LengthOverflow,
+}
+impl std::fmt::Display for RootRecordFramingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Write(e) => e.fmt(f),
+            Self::Statistics(e) => e.fmt(f),
+            Self::Cow(e) => e.fmt(f),
+            Self::Capacity { requested, limit } => write!(
+                f,
+                "domain record declares {requested} bytes, beyond its {limit} byte assembly bound"
+            ),
+            Self::Incomplete => f.write_str("root stream ended inside an unfinished domain record"),
+            Self::LengthOverflow => f.write_str("domain record length exceeds usize"),
+        }
+    }
+}
+impl std::error::Error for RootRecordFramingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Write(error) => Some(error),
+            Self::Statistics(error) => Some(error),
+            Self::Cow(error) => Some(error),
+            Self::Capacity { .. } | Self::Incomplete | Self::LengthOverflow => None,
+        }
+    }
+}
+impl novarocks_execution_contract::failure::FailureProjection for RootRecordFramingError {
+    fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
+        use novarocks_execution_contract::failure::*;
+        match self {
+            Self::Write(e) => e.failure_fact(),
+            Self::Statistics(e) => e.failure_fact(),
+            Self::Cow(e) => e.failure_fact(),
+            Self::Capacity { .. } => FailureFact::new(
+                FailureClass::Resource,
+                FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(221).unwrap()),
+            ),
+            Self::Incomplete => FailureFact::new(
+                FailureClass::Data,
+                FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(222).unwrap()),
+            ),
+            Self::LengthOverflow => FailureFact::new(
+                FailureClass::Representation,
+                FailureReason::new(domain::NATIVE, std::num::NonZeroU16::new(223).unwrap()),
+            ),
+        }
+    }
+}
+#[derive(Debug)]
+pub enum RootRecordAssemblyError<E> {
+    Framing(RootRecordFramingError),
+    Sink(E),
+}
+impl<E: std::fmt::Display> std::fmt::Display for RootRecordAssemblyError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Framing(e) => e.fmt(f),
+            Self::Sink(e) => e.fmt(f),
+        }
+    }
+}
+impl<E: std::error::Error + 'static> std::error::Error for RootRecordAssemblyError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Framing(error) => Some(error),
+            Self::Sink(error) => Some(error),
         }
     }
 }
@@ -95,18 +175,20 @@ impl RootRecordAssembly {
 
     /// Feed one relayed body. Each complete record is passed to `sink` in
     /// order; a record still incomplete at the end of `body` is kept.
-    pub fn push(
+    pub fn push<E>(
         &mut self,
         mut body: &[u8],
-        mut sink: impl FnMut(&[u8]) -> Result<(), String>,
-    ) -> Result<(), String> {
+        mut sink: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), RootRecordAssemblyError<E>> {
         let header = self.domain.header_bytes();
         while !body.is_empty() {
             if self.partial.is_empty() && body.len() >= header {
                 // A whole record inside this body needs no copy.
-                let length = self.checked_length(&body[..header])?;
+                let length = self
+                    .checked_length(&body[..header])
+                    .map_err(RootRecordAssemblyError::Framing)?;
                 if body.len() >= length {
-                    sink(&body[..length])?;
+                    sink(&body[..length]).map_err(RootRecordAssemblyError::Sink)?;
                     body = &body[length..];
                     continue;
                 }
@@ -121,7 +203,9 @@ impl RootRecordAssembly {
                 if self.partial.len() < header {
                     continue;
                 }
-                let length = self.checked_length(&self.partial[..header])?;
+                let length = self
+                    .checked_length(&self.partial[..header])
+                    .map_err(RootRecordAssemblyError::Framing)?;
                 self.partial.reserve_exact(length - self.partial.len());
                 self.needed = Some(length);
             }
@@ -130,7 +214,7 @@ impl RootRecordAssembly {
             self.partial.extend_from_slice(&body[..take]);
             body = &body[take..];
             if self.partial.len() == needed {
-                sink(&self.partial)?;
+                sink(&self.partial).map_err(RootRecordAssemblyError::Sink)?;
                 self.partial = Vec::new();
                 self.needed = None;
             }
@@ -139,21 +223,21 @@ impl RootRecordAssembly {
     }
 
     /// The stream's End: no record may remain unfinished.
-    pub fn finish(&self) -> Result<(), String> {
+    pub fn finish(&self) -> Result<(), RootRecordFramingError> {
         if self.partial.is_empty() {
             Ok(())
         } else {
-            Err("root stream ended inside an unfinished domain record".to_string())
+            Err(RootRecordFramingError::Incomplete)
         }
     }
 
-    fn checked_length(&self, prefix: &[u8]) -> Result<usize, String> {
+    fn checked_length(&self, prefix: &[u8]) -> Result<usize, RootRecordFramingError> {
         let length = self.domain.record_bytes(prefix)?;
         if length > self.max_record_bytes {
-            return Err(format!(
-                "domain record declares {length} bytes, beyond its {} byte assembly bound",
-                self.max_record_bytes
-            ));
+            return Err(RootRecordFramingError::Capacity {
+                requested: length,
+                limit: self.max_record_bytes,
+            });
         }
         Ok(length)
     }

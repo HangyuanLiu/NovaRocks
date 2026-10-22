@@ -34,6 +34,7 @@ use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
 #[cfg(test)]
 use novarocks_query_application::api::QueryExecutionErrorKind;
+use novarocks_query_application::admitted_query_context::QueryResultCapacityBinding;
 use novarocks_query_application::api::{
     ActivatedNativeAttempt, ActiveNativeAttemptOwner, CancellationView, DormantNativeAttemptOwner,
     LogicalExecutionNativePort, LogicalNativeOpenFuture, LogicalNativeOpenRequest,
@@ -962,6 +963,25 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
         >,
     ) -> QueryExecutionFuture {
         let (description, template, options) = read.into_parts();
+        let result_capacity = match result_window
+            .map(|window| QueryResultCapacityBinding::try_new(&owner.scope(), window))
+            .transpose()
+        {
+            Ok(capacity) => capacity,
+            Err(error) => {
+                return Box::pin(async move {
+                    Err(QueryExecutionError::from_execution(
+                        ExecutionFailureInput::new(
+                            error.failure_fact(),
+                            SafeDetail::truncating(
+                                "logical execution result capacity binding failed",
+                            ),
+                            ExecutionFailureSite::Coordinator,
+                        ),
+                    ))
+                });
+            }
+        };
         self.start_native(
             FrontendLogicalLaunch {
                 description,
@@ -970,7 +990,7 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
                 internal: None,
             },
             owner,
-            result_window,
+            result_capacity,
             None,
             #[cfg(novarocks_dev_controls)]
             observation,
@@ -980,7 +1000,7 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
         &self,
         computation: PreparedLogicalComputation,
         owner: WorkOwner,
-        result_window: novarocks_workload_control::ResultWindowAlias,
+        result_capacity: QueryResultCapacityBinding,
         reservation: Option<novarocks_query_application::api::ReservedExecutionIdentity>,
         #[cfg(novarocks_dev_controls)] observation: Option<
             crate::preparation_diagnostics::StatementObservationHandle,
@@ -1008,7 +1028,7 @@ impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
                 }),
             },
             owner,
-            Some(result_window),
+            Some(result_capacity),
             reservation,
             #[cfg(novarocks_dev_controls)]
             observation,
@@ -1021,7 +1041,7 @@ impl FrontendNativeLogicalExecutionLauncher {
         &self,
         launch: FrontendLogicalLaunch,
         owner: WorkOwner,
-        result_window: Option<novarocks_workload_control::ResultWindowAlias>,
+        result_capacity: Option<QueryResultCapacityBinding>,
         reservation: Option<novarocks_query_application::api::ReservedExecutionIdentity>,
         #[cfg(novarocks_dev_controls)] observation: Option<
             crate::preparation_diagnostics::StatementObservationHandle,
@@ -1064,9 +1084,9 @@ impl FrontendNativeLogicalExecutionLauncher {
                 ))
             });
         }
-        if result_window
+        if result_capacity
             .as_ref()
-            .is_some_and(|window| !window.is_for_scope(&owner.scope()))
+            .is_some_and(|capacity| !capacity.window_alias().is_for_scope(&owner.scope()))
         {
             return Box::pin(async {
                 Err(QueryExecutionError::from_execution(
@@ -1100,11 +1120,20 @@ impl FrontendNativeLogicalExecutionLauncher {
                     .error()
                     .clone()
             })
-            .and_then(|carrier| ProductionRootDelivery::bind(carrier, result_window))
-        {
+            .and_then(|carrier| {
+                ProductionRootDelivery::bind(
+                    carrier,
+                    result_capacity
+                        .as_ref()
+                        .map(QueryResultCapacityBinding::window_alias),
+                )
+            }) {
             Ok(delivery) => delivery,
             Err(error) => return Box::pin(async move { Err(error) }),
         };
+        // Validate the carrier before any Native work, but retain its runtime
+        // capacity only in the explicit QA start binding below.
+        drop(delivery);
         // The Native seed borrows this FA-private handoff port; it never
         // retains attempt credentials. The statement/domain owner must keep
         // the strong custody registered before preparation and through open.
@@ -1117,15 +1146,11 @@ impl FrontendNativeLogicalExecutionLauncher {
             aborts.closure_epoch(),
         );
         let factory = ProductionDormantAttemptFactory {
-            projection: ProductionManifestAttemptProjection {
-                runtime: self.runtime.clone(),
-                work_scope: owner.scope(),
-                options,
-                aborts: Arc::clone(&aborts),
-                delivery,
-                diagnostics,
-                initial_credentials,
-            },
+            runtime: self.runtime.clone(),
+            options,
+            aborts: Arc::clone(&aborts),
+            diagnostics,
+            initial_credentials,
             replacements: replacements.clone(),
             handoffs,
         };
@@ -1152,6 +1177,13 @@ impl FrontendNativeLogicalExecutionLauncher {
             replacement_port,
             attempts,
         );
+        let request = match result_capacity {
+            Some(capacity) => match request.with_result_capacity(capacity) {
+                Ok(request) => request,
+                Err(error) => return Box::pin(async move { Err(error) }),
+            },
+            None => request,
+        };
         let request = match consumer {
             Some(consumer) => match request.with_internal_consumer(consumer) {
                 Ok(request) => request,
@@ -1306,7 +1338,7 @@ pub(crate) trait FrontendDormantAttemptFactory: std::fmt::Debug + Send + 'static
 
     fn create(
         &mut self,
-        execution: novarocks_types::QueryExecutionId,
+        request: &NativeAttemptPreparationRequest,
     ) -> Result<Self::Behavior, NativeAttemptPreparationError>;
 
     fn register_candidate(
@@ -1393,7 +1425,11 @@ impl ProjectedManifestAttempt {
 
 #[derive(Clone)]
 struct ProductionDormantAttemptFactory {
-    projection: ProductionManifestAttemptProjection,
+    runtime: FrontendNativeLogicalExecutionRuntime,
+    options: Arc<ResolvedQueryOptions>,
+    aborts: Arc<LogicalAbortRouter>,
+    diagnostics: ComputationDiagnostics,
+    initial_credentials: Option<Weak<InitialComputationCredentials>>,
     replacements: LogicalReplacementQualificationPort,
     handoffs: Option<Arc<AttemptHandoffOfferPort>>,
 }
@@ -1411,21 +1447,42 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
 
     fn create(
         &mut self,
-        execution: novarocks_types::QueryExecutionId,
+        request: &NativeAttemptPreparationRequest,
     ) -> Result<Self::Behavior, NativeAttemptPreparationError> {
+        let capacity = request.result_capacity().ok_or_else(|| {
+            attempt_failure(
+                QueryFailureReason::PreparationProtocol,
+                "the admitted attempt has no result capacity",
+            )
+        })?;
+        let carrier = request
+            .description()
+            .row_carrier()
+            .map_err(|error| attempt_failure(QueryFailureReason::PreparationProtocol, error))?;
+        let delivery = ProductionRootDelivery::bind(carrier, Some(capacity.window_alias()))
+            .map_err(|error| attempt_failure(QueryFailureReason::PreparationProtocol, error))?;
+        let projection = ProductionManifestAttemptProjection {
+            runtime: self.runtime.clone(),
+            work_scope: capacity.scope().clone(),
+            options: Arc::clone(&self.options),
+            aborts: Arc::clone(&self.aborts),
+            delivery,
+            diagnostics: self.diagnostics.clone(),
+            initial_credentials: self.initial_credentials.clone(),
+        };
         let handoff = self
             .handoffs
             .as_ref()
-            .map(|offers| offers.reserve(execution))
+            .map(|offers| offers.reserve(request.execution()))
             .transpose()
             .map_err(|error| NativeAttemptPreparationError::from(handoff_failure(error)))?;
         Ok(FrontendTaskProtocolDormantBehavior::new(
             RegisteredManifestAttemptProjection {
-                base: self.projection.clone(),
+                base: projection,
                 handoff,
             },
             ManifestAttemptCompletion::AcceptedRootSuccessSeal,
-            Arc::clone(&self.projection.runtime.lifecycle_diagnostics),
+            Arc::clone(&self.runtime.lifecycle_diagnostics),
         ))
     }
 
@@ -2486,7 +2543,7 @@ where
                     .map_err(|error| {
                         attempt_failure(QueryFailureReason::PreparationProtocol, error.to_string())
                     })?;
-            let behavior = state.dormant_factory.create(request.execution())?;
+            let behavior = state.dormant_factory.create(&request)?;
             let owner = SnapshotBoundDormantAttemptOwner::new(inputs, behavior);
             #[cfg(novarocks_dev_controls)]
             let owner = {
@@ -2628,8 +2685,8 @@ mod tests {
 
     use super::{
         AttemptFailureClass, FrontendActiveAttemptBehavior, FrontendDormantAttemptBehavior,
-        FrontendDormantAttemptFactory, QueryExecutionErrorKind, RetainedAttemptInputs,
-        SnapshotBoundDormantAttemptOwner, attempt_runtime_failure, failed_context_allows_successor,
+        QueryExecutionErrorKind, RetainedAttemptInputs, SnapshotBoundDormantAttemptOwner,
+        attempt_runtime_failure, failed_context_allows_successor,
         wait_for_failed_context_isolation,
     };
     use crate::query_execution::artifact::ManifestBoundNativeAttemptInputs;
@@ -3136,44 +3193,17 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct AdversarialFactory {
-        replacement_backend: BackendProcessId,
-    }
-
-    impl FrontendDormantAttemptFactory for AdversarialFactory {
-        type Behavior = AdversarialBehavior;
-
-        fn create(
-            &mut self,
-            _execution: novarocks_types::QueryExecutionId,
-        ) -> Result<Self::Behavior, NativeAttemptPreparationError> {
-            Ok(AdversarialBehavior {
-                replacement_backends: vec![self.replacement_backend],
-            })
-        }
-    }
-
     #[test]
-    fn adversarial_factory_cannot_replace_snapshot_derived_eligible_backends() {
+    fn adversarial_behavior_cannot_replace_snapshot_derived_eligible_backends() {
         let captured = BackendProcessId::new_v7();
         let replacement = BackendProcessId::new_v7();
-        let mut factory = AdversarialFactory {
-            replacement_backend: replacement,
-        };
         let owner = SnapshotBoundDormantAttemptOwner::new(
             CapturedInputs {
                 eligible_backends: vec![captured],
             },
-            factory
-                .create(
-                    novarocks_types::QueryExecutionId::new(
-                        novarocks_types::QueryId::new(91, 7),
-                        novarocks_types::AttemptId::new(1).unwrap(),
-                    )
-                    .unwrap(),
-                )
-                .expect("adversarial behavior"),
+            AdversarialBehavior {
+                replacement_backends: vec![replacement],
+            },
         );
 
         assert_eq!(owner.retained_eligible_backends(), &[captured]);

@@ -45,7 +45,9 @@ use novarocks_native_adapter::root_cow_selection_codec::{
     COW_SELECTION_MAX_RECORD_BYTES, CowSelectionCodecError, CowSelectionRecordHeader,
     CowSelectionRecordKind, CowSelectionStreamDecoder,
 };
-use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
+use novarocks_native_adapter::root_record_assembly::{
+    RootRecordAssembly, RootRecordAssemblyError, RootRecordDomain, RootRecordFramingError,
+};
 
 const DELETE_EFFECT_TAG: i8 = 1;
 const REPLACE_EFFECT_TAG: i8 = 2;
@@ -561,7 +563,7 @@ impl RelayedCowSelectionCollector {
     }
 
     pub fn check_end(&self, output_rows: u64) -> Result<(), ConnectorError> {
-        self.assembly.finish().map_err(invalid_match)?;
+        self.assembly.finish().map_err(cow_framing_error)?;
         if self.collector.row_count() != output_rows {
             return Err(invalid_match(
                 "COW selection row count differs from Root End",
@@ -593,48 +595,22 @@ impl RelayedCowSelectionCollector {
             declarations,
             conversions,
         } = self;
-        // Keep the collector's own error kind (cancellation, deadline,
-        // budget) rather than flattening it through the assembly sink.
-        let mut collector_error = None;
         let pushed = assembly.push(body, |record| {
-            let header =
-                CowSelectionRecordHeader::parse(record).map_err(|error| error.to_string())?;
+            let header = CowSelectionRecordHeader::parse(record).map_err(cow_codec_error)?;
             if header.kind() == CowSelectionRecordKind::Batch {
                 // Refuse the declaration before the private codec creates Arrow buffers.
-                collector.check_next_batch(header.rows()).map_err(|error| {
-                    let message = error.to_string();
-                    collector_error = Some(error);
-                    message
-                })?;
+                collector.check_next_batch(header.rows())?;
             }
             let decoded = match retention.as_ref() {
                 Some(guard) => decoder.apply_owned_record_with_guard(record, guard.clone()),
                 None => decoder.apply_owned_record(record),
             };
-            let Some(batch) = decoded.map_err(|error| {
-                let message = format!("decode relayed COW selection record: {error}");
-                if matches!(
-                    error,
-                    CowSelectionCodecError::SourceLimit
-                        | CowSelectionCodecError::SchemaLimit
-                        | CowSelectionCodecError::BatchLimit
-                        | CowSelectionCodecError::RecordLimit
-                        | CowSelectionCodecError::ScratchLimit
-                ) {
-                    collector_error = Some(ConnectorError::new(
-                        ConnectorErrorKind::ResourceExhausted,
-                        message.clone(),
-                    ));
-                }
-                message
-            })?
-            else {
+            let Some(batch) = decoded.map_err(cow_codec_error)? else {
                 let width = decoder.schema().map_or(0, |relayed| relayed.fields().len());
                 if width != schema.fields().len() {
-                    return Err(
-                        "relayed COW selection schema width differs from its signed contract"
-                            .to_string(),
-                    );
+                    return Err(invalid_match(
+                        "relayed COW selection schema width differs from its signed contract",
+                    ));
                 }
                 return Ok(());
             };
@@ -647,32 +623,22 @@ impl RelayedCowSelectionCollector {
                 declarations,
                 conversions,
                 &mut |_| collector.check_control(),
-            )
-            .map_err(|error| {
-                let message = error.to_string();
-                collector_error = Some(error);
-                message
-            })?;
-            collector.push_owned(batch).map_err(|error| {
-                let message = error.to_string();
-                collector_error = Some(error);
-                message
-            })
+            )?;
+            collector.push_owned(batch)
         });
-        if let Some(error) = collector_error {
-            conversions.clear();
-            return Err(error);
-        }
         if pushed.is_err() {
             conversions.clear();
         }
-        pushed.map_err(invalid_match)
+        pushed.map_err(|error| match error {
+            RootRecordAssemblyError::Sink(error) => error,
+            RootRecordAssemblyError::Framing(error) => cow_framing_error(error),
+        })
     }
 
     /// The stream's End: no record may remain unfinished.
     pub fn finish(mut self) -> Result<ConnectorRowMutationSelection, ConnectorError> {
         self.conversions.clear();
-        self.assembly.finish().map_err(invalid_match)?;
+        self.assembly.finish().map_err(cow_framing_error)?;
         // Schema-only streams retain the decoder's holder until the whole
         // selection has its own holder, including its empty indices.
         let _decoder_schema = self.decoder.finish_with_guard();
@@ -1028,6 +994,25 @@ fn decode_effect(value: i8) -> Result<ConnectorRowMutationEffect, ConnectorError
         REPLACE_EFFECT_TAG => Ok(ConnectorRowMutationEffect::Replace),
         INSERT_EFFECT_TAG => Ok(ConnectorRowMutationEffect::Insert),
         _ => Err(invalid_match("row-mutation effect tag is unknown")),
+    }
+}
+
+fn cow_codec_error<E>(error: E) -> ConnectorError
+where
+    E: std::error::Error + novarocks_failure_contract::FailureProjection + Send + Sync + 'static,
+{
+    use novarocks_failure_contract::FailureClass;
+    let kind = match error.failure_fact().class() {
+        FailureClass::Resource => ConnectorErrorKind::ResourceExhausted,
+        _ => ConnectorErrorKind::CorruptData,
+    };
+    ConnectorError::from_domain(kind, error)
+}
+
+fn cow_framing_error(error: RootRecordFramingError) -> ConnectorError {
+    match error {
+        RootRecordFramingError::Cow(error) => cow_codec_error(error),
+        other => cow_codec_error(other),
     }
 }
 
@@ -1439,6 +1424,7 @@ mod tests {
 
     #[test]
     fn relayed_selection_refuses_oversized_records_truncation_and_cancellation() {
+        use novarocks_failure_contract::FailureProjection;
         let one = batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)]);
         let stream = relayed_stream(std::slice::from_ref(&one));
         let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
@@ -1465,7 +1451,24 @@ mod tests {
         let mut grown = batch_record[..40].to_vec();
         grown[8..16].copy_from_slice(&((budget as u64) + 1).to_le_bytes());
         let error = small.push_body(&grown).unwrap_err();
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        assert_eq!(
+            error.failure_fact(),
+            RootRecordFramingError::Capacity {
+                requested: budget + 1,
+                limit: budget,
+            }
+            .failure_fact()
+        );
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+            .unwrap();
+        assert!(matches!(
+            source.downcast_ref::<RootRecordFramingError>(),
+            Some(RootRecordFramingError::Capacity { requested, limit })
+                if *requested == budget + 1 && *limit == budget
+        ));
         assert!(small.assembly_bytes() <= 32, "{}", small.assembly_bytes());
 
         // End inside an unfinished record is refused.
@@ -1476,9 +1479,35 @@ mod tests {
         )
         .unwrap();
         truncated.push_body(&stream[..stream.len() - 1]).unwrap();
+        let error = truncated.finish().unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
         assert_eq!(
-            truncated.finish().unwrap_err().kind(),
-            ConnectorErrorKind::InvalidRequest
+            error.failure_fact(),
+            RootRecordFramingError::Incomplete.failure_fact()
+        );
+
+        // A complete record reaches the actual codec sink without erasing its
+        // concrete cause through the generic framing callback.
+        let mut malformed_schema = stream[..schema_record].to_vec();
+        malformed_schema[32] = u8::MAX;
+        let mut malformed = RelayedCowSelectionCollector::try_new(
+            context(Arc::clone(&cancellation), 1 << 20),
+            None,
+            selection_schema(),
+        )
+        .unwrap();
+        let error = malformed.push_body(&malformed_schema).unwrap_err();
+        assert_eq!(
+            error.failure_fact(),
+            CowSelectionCodecError::MalformedSchema.failure_fact()
+        );
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<novarocks_failure_contract::SharedFailureCause>()
+            .unwrap();
+        assert_eq!(
+            source.downcast_ref::<CowSelectionCodecError>(),
+            Some(&CowSelectionCodecError::MalformedSchema)
         );
 
         // The collector's own cancellation kind survives the relay sink.

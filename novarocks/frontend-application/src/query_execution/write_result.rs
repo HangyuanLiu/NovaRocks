@@ -69,12 +69,116 @@ use novarocks_spi::connector::{
     StatisticsArtifactIdentity,
 };
 
-pub(crate) type RootWriteResultParts = (
-    u64,
-    Vec<(WriteTargetOrdinal, Vec<u8>)>,
-    Vec<WriteStatisticsArtifact>,
-    Option<InternalResultRetention>,
-);
+/// Source-preserving rejection from the original write decoder.
+#[derive(Debug)]
+pub(crate) struct RootWriteDecodeFailure {
+    message: String,
+    source: Option<novarocks_failure_contract::SharedFailureCause>,
+}
+impl RootWriteDecodeFailure {
+    pub(crate) fn source<E>(error: E) -> Self
+    where
+        E: std::error::Error
+            + novarocks_failure_contract::FailureProjection
+            + Send
+            + Sync
+            + 'static,
+    {
+        let source = novarocks_failure_contract::SharedFailureCause::new(error);
+        Self {
+            message: source.to_string(),
+            source: Some(source),
+        }
+    }
+    pub(crate) fn context(mut self, context: &'static str) -> Self {
+        self.message = format!("{context}: {}", self.message);
+        self
+    }
+    #[cfg(test)]
+    fn contains(&self, text: &str) -> bool {
+        self.message.contains(text)
+    }
+}
+impl From<String> for RootWriteDecodeFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            source: None,
+        }
+    }
+}
+impl From<&str> for RootWriteDecodeFailure {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+impl From<novarocks_native_adapter::root_record_assembly::RootRecordFramingError>
+    for RootWriteDecodeFailure
+{
+    fn from(error: novarocks_native_adapter::root_record_assembly::RootRecordFramingError) -> Self {
+        match error {
+            novarocks_native_adapter::root_record_assembly::RootRecordFramingError::Write(
+                error,
+            ) => Self::source(error),
+            other => Self::source(other),
+        }
+    }
+}
+impl
+    From<
+        novarocks_native_adapter::root_record_assembly::RootRecordAssemblyError<
+            RootWriteDecodeFailure,
+        >,
+    > for RootWriteDecodeFailure
+{
+    fn from(
+        error: novarocks_native_adapter::root_record_assembly::RootRecordAssemblyError<Self>,
+    ) -> Self {
+        match error {
+            novarocks_native_adapter::root_record_assembly::RootRecordAssemblyError::Framing(
+                error,
+            ) => Self::from(error),
+            novarocks_native_adapter::root_record_assembly::RootRecordAssemblyError::Sink(
+                error,
+            ) => error,
+        }
+    }
+}
+impl std::fmt::Display for RootWriteDecodeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(f)
+    }
+}
+impl std::error::Error for RootWriteDecodeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+impl RootWriteDecodeFailure {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        String,
+        Option<novarocks_failure_contract::SharedFailureCause>,
+    ) {
+        (self.message, self.source)
+    }
+    pub(crate) fn into_connector_error(self) -> novarocks_spi::connector::ConnectorError {
+        let (message, source) = self.into_parts();
+        match source {
+            Some(source) => novarocks_spi::connector::ConnectorError::from_domain(
+                novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                source,
+            ),
+            None => novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                message,
+            ),
+        }
+    }
+}
 
 /// A complete prepared write set, still in canonical carrier form.
 ///
@@ -273,8 +377,7 @@ impl RootWriteResultDecoder {
         Ok(decoder)
     }
 
-    #[cfg(test)]
-    pub(crate) fn apply_chunk(&mut self, chunk: &Chunk) -> Result<(), String> {
+    pub(crate) fn apply_chunk(&mut self, chunk: &Chunk) -> Result<(), RootWriteDecodeFailure> {
         if self.root_eof {
             return Err("write Root emitted a trailing batch after EOF".into());
         }
@@ -284,7 +387,8 @@ impl RootWriteResultDecoder {
                 "write Root schema mismatch: expected {:?}, received {:?}",
                 self.contract.schema.arrow_schema(),
                 schema
-            ));
+            )
+            .into());
         }
         let columns = chunk.columns();
         let kinds = downcast::<Int8Array>(&columns[ROOT_WRITE_RESULT_KIND_INDEX], "kind")?;
@@ -307,10 +411,11 @@ impl RootWriteResultDecoder {
 
         for row in 0..chunk.len() {
             if kinds.is_null(row) {
-                return Err("root write result row has no kind".to_string());
+                return Err("root write result row has no kind".to_string().into());
             }
-            let kind = RootRowKind::from_wire(kinds.value(row))
-                .map_err(|error| format!("root write result row kind: {error}"))?;
+            let kind = RootRowKind::from_wire(kinds.value(row)).map_err(|error| {
+                RootWriteDecodeFailure::source(error).context("root write result row kind")
+            })?;
             let field_values = if input_fields.is_null(row) {
                 None
             } else {
@@ -378,7 +483,7 @@ impl RootWriteResultDecoder {
 
     /// Validate complete local domain consumption before the coordinator
     /// records End. This count is relation rows, not affected write rows.
-    pub(crate) fn check_relay_end(&self, output_rows: u64) -> Result<(), String> {
+    pub(crate) fn check_relay_end(&self, output_rows: u64) -> Result<(), RootWriteDecodeFailure> {
         self.relay_assembly.finish()?;
         if output_rows != self.relayed_record_count {
             return Err("internal root End differs from decoded record count".into());
@@ -388,7 +493,7 @@ impl RootWriteResultDecoder {
 
     /// Accept a relayed body into the prepaid 32 MiB assembly share. A complete
     /// record is validated before this call returns and its receipt may finish.
-    pub(crate) fn apply_relay_body(&mut self, body: &[u8]) -> Result<(), String> {
+    pub(crate) fn apply_relay_body(&mut self, body: &[u8]) -> Result<(), RootWriteDecodeFailure> {
         if self.root_eof {
             return Err("write Root emitted a trailing body after EOF".into());
         }
@@ -402,20 +507,20 @@ impl RootWriteResultDecoder {
                 .relayed_record_count
                 .checked_add(1)
                 .ok_or("internal root record count overflow")?;
-            Ok(())
+            Ok::<(), RootWriteDecodeFailure>(())
         });
         self.relay_assembly = assembly;
-        result
+        result.map_err(Into::into)
     }
 
     /// Apply one complete PreparedWriteCommitV1 record relayed from the
     /// Backend. The same row rules apply as for the Arrow relation.
-    pub(crate) fn apply_record(&mut self, record: &[u8]) -> Result<(), String> {
+    pub(crate) fn apply_record(&mut self, record: &[u8]) -> Result<(), RootWriteDecodeFailure> {
         if self.root_eof {
             return Err("write Root emitted a trailing record after EOF".into());
         }
         let view = WriteCommitRecordView::parse(record)
-            .map_err(|error| format!("write Root record: {error}"))?;
+            .map_err(|error| RootWriteDecodeFailure::source(error).context("write Root record"))?;
         let header = view.header();
         let kind = header.kind();
         let artifact = kind == RootRowKind::ArtifactDraft;
@@ -438,7 +543,7 @@ impl RootWriteResultDecoder {
         })
     }
 
-    fn apply_row(&mut self, row: RootWriteRow<'_>) -> Result<(), String> {
+    fn apply_row(&mut self, row: RootWriteRow<'_>) -> Result<(), RootWriteDecodeFailure> {
         let RootWriteRow {
             kind,
             target,
@@ -462,45 +567,59 @@ impl RootWriteResultDecoder {
                     properties_len: pairs.as_ref().map(Vec::len),
                 },
             )
-            .map_err(|error| format!("write Root row shape: {error}"))?;
+            .map_err(|error| {
+                RootWriteDecodeFailure::source(error).context("write Root row shape")
+            })?;
 
         match kind {
             RootRowKind::Summary => {
                 let count = count.expect("validated above");
-                let count = row_count_from_wire(count)
-                    .map_err(|error| format!("write Root row count: {error}"))?;
-                self.rows
-                    .add(count)
-                    .map_err(|error| format!("write Root row count: {error}"))?;
+                let count = row_count_from_wire(count).map_err(|error| {
+                    RootWriteDecodeFailure::source(error).context("write Root row count")
+                })?;
+                self.rows.add(count).map_err(|error| {
+                    RootWriteDecodeFailure::source(error).context("write Root row count")
+                })?;
             }
             RootRowKind::PreparedFragment => {
-                let target = target_ordinal_from_wire(target.expect("validated above"))
-                    .map_err(|error| format!("write Root target ordinal: {error}"))?;
+                let target = target_ordinal_from_wire(target.expect("validated above")).map_err(
+                    |error| {
+                        RootWriteDecodeFailure::source(error).context("write Root target ordinal")
+                    },
+                )?;
                 if !self.contract.expected_targets.contains(&target) {
                     return Err(format!(
                         "write Root names target {} outside this query's frozen set",
                         target.get()
-                    ));
+                    )
+                    .into());
                 }
                 let fragment = fragment.expect("validated above");
                 self.ledger
                     .reserve_fragment(fragment.len())
-                    .map_err(|error| format!("prepared write set budget: {error}"))?;
+                    .map_err(|error| {
+                        RootWriteDecodeFailure::source(error).context("prepared write set budget")
+                    })?;
                 self.fragments.push((target, fragment.to_vec()));
             }
             RootRowKind::ArtifactDraft => {
-                let target = target_ordinal_from_wire(target.expect("validated above"))
-                    .map_err(|error| format!("write Root artifact target: {error}"))?;
+                let target = target_ordinal_from_wire(target.expect("validated above")).map_err(
+                    |error| {
+                        RootWriteDecodeFailure::source(error).context("write Root artifact target")
+                    },
+                )?;
                 if !self.contract.expected_targets.contains(&target) {
                     return Err(format!(
                         "write Root artifact names target {} outside this query's frozen set",
                         target.get()
-                    ));
+                    )
+                    .into());
                 }
                 let field_values = field_values.expect("validated above");
                 let pairs = pairs.expect("validated above");
-                validate_artifact_draft_nested_values(&field_values, &pairs)
-                    .map_err(|error| format!("write Root artifact values: {error}"))?;
+                validate_artifact_draft_nested_values(&field_values, &pairs).map_err(|error| {
+                    RootWriteDecodeFailure::source(error).context("write Root artifact values")
+                })?;
                 let field_ids = field_values
                     .into_iter()
                     .map(|field| field.expect("validated non-null field"))
@@ -509,22 +628,31 @@ impl RootWriteResultDecoder {
                     field_ids.clone(),
                     blob_type.expect("validated above"),
                 )
-                .map_err(|error| format!("write Root artifact identity: {error}"))?;
+                .map_err(|error| {
+                    RootWriteDecodeFailure::source(error).context("write Root artifact identity")
+                })?;
                 let key = (target, identity.clone());
                 if !self.contract.expected_artifacts.contains(&key) {
                     return Err(format!(
                         "write Root emitted an unexpected artifact for target {}: {identity:?}",
                         target.get()
-                    ));
+                    )
+                    .into());
                 }
                 if self.statistics.contains_key(&key) {
                     return Err(format!(
                         "write Root emitted a duplicate artifact for target {}: {identity:?}",
                         target.get()
-                    ));
+                    )
+                    .into());
                 }
                 if self.statistics.len() >= MAX_CONNECTOR_STATISTICS_ARTIFACTS {
-                    return Err("write Root statistics artifact budget exceeded".into());
+                    return Err(RootWriteDecodeFailure::source(
+                        novarocks_spi::connector::ConnectorError::new(
+                            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+                            "write Root statistics artifact budget exceeded",
+                        ),
+                    ));
                 }
                 let body = body.expect("validated above");
                 self.body_bytes = charge_total(
@@ -541,7 +669,14 @@ impl RootWriteResultDecoder {
                     row_property_bytes = row_property_bytes
                         .checked_add(key.len())
                         .and_then(|total| total.checked_add(value.len()))
-                        .ok_or_else(|| "write Root property budget overflow".to_string())?;
+                        .ok_or_else(|| {
+                            RootWriteDecodeFailure::source(
+                                novarocks_spi::connector::ConnectorError::new(
+                                    novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+                                    "write Root property budget overflow",
+                                ),
+                            )
+                        })?;
                     property_map.insert(key.to_string(), value.to_string());
                 }
                 self.property_bytes = charge_total(
@@ -556,7 +691,9 @@ impl RootWriteResultDecoder {
                     bytes::Bytes::copy_from_slice(body),
                     property_map,
                 )
-                .map_err(|error| format!("write Root artifact draft: {error}"))?;
+                .map_err(|error| {
+                    RootWriteDecodeFailure::source(error).context("write Root artifact draft")
+                })?;
                 let draft = match &self.retention {
                     Some(retention) => draft.attach_guard(retention.spi_guard()),
                     None => draft,
@@ -568,7 +705,7 @@ impl RootWriteResultDecoder {
         Ok(())
     }
 
-    pub(crate) fn observe_root_eof(&mut self) -> Result<(), String> {
+    pub(crate) fn observe_root_eof(&mut self) -> Result<(), RootWriteDecodeFailure> {
         self.relay_assembly.finish()?;
         if std::mem::replace(&mut self.root_eof, true) {
             return Err("write Root emitted duplicate EOF".into());
@@ -576,13 +713,13 @@ impl RootWriteResultDecoder {
         Ok(())
     }
 
-    pub(crate) fn finish(self) -> Result<DecodedPreparedWriteSet, String> {
+    pub(crate) fn finish(self) -> Result<DecodedPreparedWriteSet, RootWriteDecodeFailure> {
         if !self.root_eof {
             return Err("write Root EOF was not observed".into());
         }
-        self.membership
-            .finish()
-            .map_err(|error| format!("write Root membership: {error}"))?;
+        self.membership.finish().map_err(|error| {
+            RootWriteDecodeFailure::source(error).context("write Root membership")
+        })?;
         let observed = self.statistics.keys().cloned().collect::<BTreeSet<_>>();
         if observed != self.contract.expected_artifacts {
             let missing = self
@@ -592,7 +729,8 @@ impl RootWriteResultDecoder {
                 .collect::<Vec<_>>();
             return Err(format!(
                 "write Root artifact membership is incomplete; missing {missing:?}"
-            ));
+            )
+            .into());
         }
         Ok(DecodedPreparedWriteSet {
             row_count: self.rows.get(),
@@ -608,12 +746,20 @@ fn charge_total(
     additional: usize,
     limit: usize,
     label: &str,
-) -> Result<usize, String> {
-    let total = current
-        .checked_add(additional)
-        .ok_or_else(|| format!("{label} budget overflow"))?;
+) -> Result<usize, RootWriteDecodeFailure> {
+    let total = current.checked_add(additional).ok_or_else(|| {
+        RootWriteDecodeFailure::source(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+            format!("{label} budget overflow"),
+        ))
+    })?;
     if total > limit {
-        return Err(format!("{label} budget exceeded"));
+        return Err(RootWriteDecodeFailure::source(
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+                format!("{label} budget exceeded"),
+            ),
+        ));
     }
     Ok(total)
 }
@@ -630,7 +776,7 @@ fn downcast<'a, T: 'static>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use arrow::array::builder::{
@@ -792,6 +938,25 @@ mod tests {
         .expect("root relation chunk")
     }
 
+    /// Backend record encoder with the original session's real outer envelope.
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn component_write_body(fragment: Vec<u8>) -> Vec<u8> {
+        records(vec![
+            Row {
+                kind: RootRowKind::PREPARED_FRAGMENT,
+                target: Some(0),
+                row_count: None,
+                fragment: Some(fragment),
+                input_fields: None,
+                blob_type: None,
+                body: None,
+                properties: None,
+            },
+            summary(3),
+        ])
+        .concat()
+    }
+
     fn targets(count: u32) -> Vec<WriteTargetOrdinal> {
         (0..count)
             .map(|ordinal| WriteTargetOrdinal::try_new(ordinal).expect("bounded ordinal"))
@@ -806,8 +971,10 @@ mod tests {
     }
 
     fn finish(mut decoder: RootWriteResultDecoder) -> Result<DecodedPreparedWriteSet, String> {
-        decoder.observe_root_eof()?;
-        decoder.finish()
+        decoder
+            .observe_root_eof()
+            .map_err(|error| error.to_string())?;
+        decoder.finish().map_err(|error| error.to_string())
     }
 
     fn exact_decoder() -> RootWriteResultDecoder {
@@ -847,12 +1014,47 @@ mod tests {
             assembly
                 .push(body, |record| {
                     out.push(record.to_vec());
-                    Ok(())
+                    Ok::<(), std::convert::Infallible>(())
                 })
                 .unwrap();
         }
         assembly.finish().unwrap();
         out
+    }
+
+    #[test]
+    fn relayed_record_sink_keeps_original_resource_fact_through_domain_projection() {
+        use novarocks_failure_contract::FailureProjection;
+        let original = PreparedWriteSetLedger::new()
+            .reserve_fragment(
+                novarocks_spi::connector::write_stack::MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1,
+            )
+            .unwrap_err();
+        let expected = original.failure_fact();
+        let body = records(vec![summary(1)]).remove(0);
+        let mut assembly = RootRecordAssembly::new(RootRecordDomain::WriteCommit, 1 << 20);
+        let rejected = assembly
+            .push(&body, |_| {
+                Err::<(), RootWriteDecodeFailure>(RootWriteDecodeFailure::source(original.clone()))
+            })
+            .unwrap_err();
+        let failure = RootWriteDecodeFailure::from(rejected);
+        assert_eq!(failure.source.as_ref().unwrap().failure_fact(), expected);
+        let domain =
+            crate::query_execution::internal_consumer::domain_state::InternalDomainFailure::from(
+                failure,
+            );
+        assert_eq!(domain.execution_input().unwrap().fact(), expected);
+        let crate::query_execution::internal_consumer::domain_state::InternalDomainFailure::Source(
+            source,
+        ) = domain
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            source.downcast_ref::<novarocks_spi::connector::ConnectorError>(),
+            Some(&original)
+        );
     }
 
     #[test]
@@ -1020,12 +1222,16 @@ mod tests {
         fact: CompletionFact,
     ) -> Result<(), String> {
         match fact {
-            CompletionFact::RootRows => decoder.apply_chunk(&chunk(vec![
-                summary(7),
-                fragment(0, 3),
-                artifact(0, 11, "theta-v1", b"sketch"),
-            ])),
-            CompletionFact::RootEof => decoder.observe_root_eof(),
+            CompletionFact::RootRows => decoder
+                .apply_chunk(&chunk(vec![
+                    summary(7),
+                    fragment(0, 3),
+                    artifact(0, 11, "theta-v1", b"sketch"),
+                ]))
+                .map_err(|error| error.to_string()),
+            CompletionFact::RootEof => decoder
+                .observe_root_eof()
+                .map_err(|error| error.to_string()),
             CompletionFact::ExecutionAllSuccess => {
                 barrier.observe_execution_terminals(true);
                 Ok(())
@@ -1051,7 +1257,7 @@ mod tests {
         for fact in order {
             observe_completion_fact(&mut decoder, &mut barrier, *fact)?;
         }
-        let prepared = decoder.finish()?;
+        let prepared = decoder.finish().map_err(|error| error.to_string())?;
         barrier.observe_prepared_write_set(prepared);
         barrier
             .into_committable()

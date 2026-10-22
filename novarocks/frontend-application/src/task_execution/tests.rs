@@ -7826,7 +7826,41 @@ pub(crate) struct ManifestReleaseTail {
     split_delivery: Arc<super::split_transport::SplitDeliveryBridge>,
 }
 impl ManifestReleaseTail {
+    /// Real Task status intake authors the writer proof; no actor state is assigned.
+    #[cfg(novarocks_dev_controls)]
+    pub(crate) fn publish_original_writer_success(&self, round: &mut TaskRoundForTest) {
+        assert!(!self.upstream.is_empty());
+        for &identity in &self.upstream {
+            self.status.publish(StatusEvent::Published(
+                TaskStatus::try_new(
+                    identity,
+                    TaskStatusVersion::new(3).unwrap(),
+                    TaskState::Finished,
+                    None,
+                    TaskOutputFacts::new(true),
+                )
+                .unwrap(),
+            ));
+        }
+        round
+            .turn()
+            .expect("the original status owner accepts writer success");
+    }
+
     pub(crate) fn observe_original_consumed_end(
+        &self,
+        round: &mut TaskRoundForTest,
+        data_packets: u64,
+    ) {
+        self.observe_original_consumed_packets(round, data_packets);
+        self.begin_original_convergence(
+            round,
+            Some(&novarocks_query_application::api::NativeAttemptTerminal::Completed),
+        );
+    }
+
+    /// Record only receipts that the real consumer has already completed.
+    pub(crate) fn observe_original_consumed_packets(
         &self,
         round: &mut TaskRoundForTest,
         data_packets: u64,
@@ -7836,11 +7870,15 @@ impl ManifestReleaseTail {
                 .consume_root_result_packet(sequence, sequence == data_packets)
                 .expect("only actual consumed original packets precede this EOS");
         }
-        super::manifest_round::begin_convergence(
-            round,
-            &self.split_delivery,
-            Some(&novarocks_query_application::api::NativeAttemptTerminal::Completed),
-        );
+    }
+
+    /// Invoke the original convergence author after the actual cut or failure.
+    pub(crate) fn begin_original_convergence(
+        &self,
+        round: &mut TaskRoundForTest,
+        terminal: Option<&novarocks_query_application::api::NativeAttemptTerminal>,
+    ) {
+        super::manifest_round::begin_convergence(round, &self.split_delivery, terminal);
         assert!(!round.attempt_drained());
         assert!(
             round
@@ -8025,9 +8063,44 @@ impl ManifestReleaseTail {
     }
 }
 
+#[cfg(novarocks_dev_controls)]
+pub(crate) fn manifest_pending_write_with_protocol_fixture(
+    execution: QueryExecutionId,
+    plan: novarocks_query_application::api::PlanSeal,
+) -> (
+    TaskRoundForTest,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    ManifestReleaseTail,
+    Arc<ManualClock>,
+    super::protocol_facts::AttemptProtocolFactsReceiver,
+    Vec<(OperationIntent, OperationAcknowledgement)>,
+) {
+    let (round, acks, tail, clock, protocol, facts) = manifest_pending_release_fixture_with_writers(
+        manifest_protocol_harness(execution),
+        Some(plan),
+        true,
+    );
+    (round, acks, tail, clock, protocol.unwrap(), facts)
+}
+
 fn manifest_pending_release_fixture(
     harness: Harness,
     plan: Option<novarocks_query_application::api::PlanSeal>,
+) -> (
+    TaskRoundForTest,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    ManifestReleaseTail,
+    Arc<ManualClock>,
+    Option<super::protocol_facts::AttemptProtocolFactsReceiver>,
+    Vec<(OperationIntent, OperationAcknowledgement)>,
+) {
+    manifest_pending_release_fixture_with_writers(harness, plan, false)
+}
+
+fn manifest_pending_release_fixture_with_writers(
+    harness: Harness,
+    plan: Option<novarocks_query_application::api::PlanSeal>,
+    declare_upstream_writers: bool,
 ) -> (
     TaskRoundForTest,
     crate::native::task_transport::TaskAckIntakeHandle,
@@ -8043,9 +8116,24 @@ fn manifest_pending_release_fixture(
         round_waiting_on_creates_with_establish_trace(harness, Some(&mut facts));
     let split_delivery =
         super::split_transport::SplitDeliveryBridge::for_graph(round.execution().graph());
+    // Freeze a nonempty declaration from the original graph before source transfer.
+    let writers = if declare_upstream_writers {
+        round
+            .execution()
+            .graph()
+            .tasks()
+            .filter(|task| task.identity() != round.root_task())
+            .map(|task| task.fragment_id())
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    if declare_upstream_writers {
+        assert!(!writers.is_empty());
+    }
     let protocol = plan.map(|plan| {
         round
-            .install_protocol_facts(plan, &BTreeSet::new())
+            .install_protocol_facts(plan, &writers)
             .expect("original protocol before root transfer")
     });
     let _root_source = round
