@@ -46,7 +46,7 @@ docker/iceberg-rest/fixture-runtime.sh --timeout 5 sweep
 
 `start` 幂等恢复同一输入定义，版本不同要求显式 `upgrade`。首次维护可在 start 后传 `--config /absolute/machine.json`；JSON字段为 `ports`、`policy`、`benchmark_root`、`minio_volume`。端口是准确固定配置，默认 MinIO API/console=28000/28001、REST/rest-mv=28002/28003、Spark UI=28004、HMS接入槽=28005；冲突报错，不扫描替代端口。FE/BE listener 仍由 worktree/harness 分配。`shared.env` 属于 worktree/private 输入，不是机器端口、root凭证或维护状态的权威。
 
-完整 version 包含协议、验证后的有效 BOM/derived 定义、实际 image ID、机器模板和配置，不把时间、cache路径或可变tag当版本。generation标记一次实际激活。升级先持稳定维护锁并保存maintenance，再停止共享writer、持久化新材料并轮换旧root、撤销run IAM/STS；确认旧root被真实拒绝后，在准确MinIO在线时清理scratch。benchmark全部对象保留，随后只删除准确REST数据库卷、切换服务，核实资源/image/端点/健康后才提交ready。失败留maintenance；未知mutation不伪结算。明确的daemon端口终态失败也须在同一保存的维护意图下重新检查准确资源才可重试。
+完整 version 包含协议、验证后的有效 BOM/derived 定义、实际 image ID、机器模板和配置，不把时间、cache路径或可变tag当版本。generation标记一次实际激活。升级先持稳定维护锁并保存maintenance，再停止共享writer、持久化新材料并轮换旧root、撤销run IAM/STS；确认旧root被真实拒绝后，先移除准确旧REST实例及数据库卷，原生确认absence并持久记录catalog屏障，再保持准确MinIO在线清理scratch。benchmark全部对象保留；切换服务、核实资源/image/端点/健康后才提交ready。固定REST恢复后旧请求仍可能成功重建scratch，不承诺这些请求失效。失败留maintenance；未知mutation不伪结算。明确的daemon端口终态失败也须在同一保存的维护意图下重新检查准确资源才可重试。
 
 已有 MinIO 卷只有维护者明确指定准确来源才可迁入，原卷和全部 benchmark 数据保留；不猜“最近一个”。历史版本化项目、旧 `nr-iceberg-rest` / `nr-iceberg-hive` 资源不自动认领、迁移或删除。首次切换须先记录资源/数据清单和维护窗口。
 
@@ -88,15 +88,22 @@ docker/iceberg-rest/up.sh --prepare-only
 
 每次共享运行在首次scratch副作用前准入完整预算，SQL/System参数为 `--fixture-budget-secs`（默认3600）；Spark/直接producer使用同名参数或 `NOVA_FIXTURE_BUDGET_SECS`。机器默认 max-run86400、清理预留300、TTL604800秒。嵌套shell、重试、重启继承同一 `NOVA_FIXTURE_RUN_CONTEXT` 与原绝对期限，不能重新计时。超上限在副作用前BLOCKED，已准入超时为FAIL。
 
-run名称为 `nr_scratch_<13digit epoch_ms>_<32lowerhex>`，资源suffix最多5字符。对象位于 `<worktree-prefix>/scratch/<run-id>/...`；REST namespace/table和临时目录携带同一身份。SQL保留原CREATE及oracle，再在首个表/view写入前设置并GET核实原run namespace location，并检查实际table location。Hadoop可变warehouse绑定run root；已有只读READY保持准确原warehouse。
+run名称为 `nr_scratch_<13digit epoch_ms>_<32lowerhex>`，共享namespace为完整run ID加 `_` 和最多5字符用途后缀。`NOVA_FIXTURE_RUN_STORAGE` 与原预算分开，开始前固定三个范围：原worktree/run目录根、REST warehouse下的 `<run-id>_` 名称前缀、rest-mv warehouse下的同类前缀。目录根用单个尾 `/`，名称前缀的 `_` 后不加 `/`。原生JDBC默认建表使用服务端warehouse/namespace，不继承namespace location；SQL与Java原行为不改。普通表/view、同运行rename、显式位置及CTAS统一核对所属运行范围，客户端warehouse只约束显式CTAS。Hadoop可变warehouse绑定run root，已有只读READY保持原绑定。
+
+共享REST/Spark使用共享凭证，运行IAM只约束使用运行凭证的writer。Python/Rust按准确MinIO owner核实继承投影；s3a仅作为同绑定比较别名。原始控制字符、重复斜杠、dot组件及歧义URI拒绝，不折叠成其他S3 key。
+
+发布前按bucket/key组件核实REST、rest-mv、benchmark与准确worktree/private基础根不相交，交叠即拒绝；公共祖先不是删除域。CTAS与vended的明确运行子根可以位于原运行根内，不能据此扩大独立基础根或删除范围。
 
 实际写入入口在首次副作用前执行一次显式启动清扫，固定原publication与原预算，最多使用5秒或原工作剩余期限。只清过期scratch；确认完成退出的清扫超时保留pending供后续继续，I/O/权限/清理错误仍失败。通用context准入和READY `--check`保持只读。
 
-运行结束精确清理本run，失败保留登记和原始退出。显式sweep有总期限，以原生时间/名称/准确scope分类TTL遗留；无法确认的资源不删除。自定义benchmark root、祖先/后代及所有对象（包括staging）先保护。TTL不代替正常teardown。status显示最近一次scratch观察的采样时间、count/oldest、部分枚举和activation适用范围；未观察为UNKNOWN。
+独立运行结束确认writer实际退出后，先清两个REST服务中该运行所有条目与namespace并确认不存在，再撤销IAM，最后清原根及实际枚举出的合法namespace目录。catalog/IAM失败或未知保留文件。同运行rename可保留旧目录，不能只凭一个namespace消失清文件。嵌套producer将文件责任交原外层owner并明确记录deferred；失败保留登记和原始退出。显式sweep有总期限，以原生时间/名称/准确scope分类TTL遗留；无法确认的资源不删除。自定义benchmark root、祖先/后代及所有对象（包括staging）先保护。TTL不代替正常teardown。未知namespace命名不回收；status显示其数量及最近scratch观察的采样时间、count/oldest、部分枚举和activation适用范围；未观察为UNKNOWN。
 
 ```bash
 export NOVA_FIXTURE_RUN_CONTEXT="$(python3 docker/iceberg-rest/fixture_run.py context --env-file "$NOVA_ENV_REST_ENV_FILE" --fixture-budget-secs 3600)"
+export NOVA_FIXTURE_RUN_STORAGE="$(python3 docker/iceberg-rest/fixture_run.py storage --env-file "$NOVA_ENV_REST_ENV_FILE")"
 docker/iceberg-rest/spark-sql.sh "$NOVAROCKS_SPARK_V3_SMOKE_SQL"
+# The outer owner invokes this only after all of its writers have exited.
+python3 docker/iceberg-rest/fixture_run.py cleanup-run --env-file "$NOVA_ENV_REST_ENV_FILE"
 ```
 
 共享Spark wrapper固定实际container ID，并由容器内原进程owner管理准确run进程组；杀宿主Docker客户端不等于JVM退出。工作期到后TERM/KILL，保留未reap leader直至真实组退出；逾期清理保持失败，不能把完整期限到当成退出。另一运行及共享Spark容器不因此停止。

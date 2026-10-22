@@ -7,7 +7,7 @@ supersedes: [ADR-0165]
 superseded-by: null
 date: 2026-10-21
 provenance:
-  - "accepted design: TST-G18 revision 3 and approved implementation plan revision 1"
+  - "accepted design: TST-G18 revision 5 and approved implementation plan revision 3"
 code-anchors:
   - "docker/iceberg-rest/machine_runtime.py (MachineOwner, MachineDocker)"
   - "docker/iceberg-rest/machine_operation.py (CommandOwner)"
@@ -30,7 +30,7 @@ code-anchors:
 
 完整version由验证后的有效BOM、derived定义、实际image ID、模板、协议及服务配置产生，排除供给时间、路径和可变tag。activation generation区分实际切换。ADR-0155继续拥有联网供给与本地verify；普通worktree up只附着健康ready同版本机器，不能provision、启动、修复或升级。
 
-维护者显式start/upgrade。升级先保存maintenance，停止共享REST/Spark写者，持久化新访问材料并轮换旧root、撤销run IAM/STS；确认旧root确实拒绝后，在准确MinIO在线时清理已分类scratch。整个MinIO卷和benchmark全部对象保留，REST状态卷按准确归属删除，再切换服务、验证资源/镜像/端点/健康，最后提交ready。普通attach不能越过提交点。失败保留准确意图和maintenance；真正未知的mutation不能凭单次不存在或新snapshot猜成功。
+维护者显式start/upgrade。升级先保存maintenance，停止共享REST/Spark写者，持久化新访问材料并轮换旧root、撤销run IAM/STS；确认旧root确实拒绝后，先按准确旧容器ID移除已退出REST实例与其状态卷，原生核实absence并持久记录离线catalog屏障，再在准确MinIO在线时清理已分类scratch。整个MinIO卷和benchmark全部对象保留；purge完成后恢复目标activation不再删除已创建的新catalog，最后核实资源/镜像/端点/健康并提交ready。普通attach不能越过提交点。失败保留准确意图和maintenance；真正未知的mutation不能凭单次不存在或新snapshot猜成功。
 
 维护锁由原机器owner及短命命令监护者持有。owner消失后，监护者停止后续派发，并保持CLI leader未reap直至原进程组实际退出；mc还须确认准确临时容器消失。超时和发出KILL均不代替实际退出。明确的daemon端口终态拒绝仅能在同一保存维护意图、真实CLI组退出、准确source/target资源重新核验后允许重试，不直接ready。
 
@@ -40,9 +40,15 @@ worktree publication以完整文件集合的内容身份保存，落盘后只原
 
 实际writer启动显式做有界过期sweep，使用原预算与固定publication；通用预算准入和READY只读检查不做清扫。
 
-scratch名称保留13位epoch毫秒及32位随机token，资源suffix最多5字符；S3对象在原worktree/run root内，REST实际namespace/table/view location须验证。IAM compact user由完整run/purpose确定推导，policy保留完整身份及准确scope。正常结束精确清理并保留错误；TTL sweep只回收可证明的遗留，不按worktree活性猜测。未知shape、歧义映射、权限和部分枚举都不能扩大删除权。自定义benchmark根、祖先/后代及全部对象先保护。
+scratch名称保留13位epoch毫秒及32位随机token，共享namespace必须是完整57字符run ID加下划线及最多5字符用途后缀，裸run ID不属于namespace语法。运行开始前确定原worktree/run目录根、两个REST服务warehouse下的run名称字面前缀，共三个范围；CTAS与显式普通位置位于原运行根。`NOVA_FIXTURE_RUN_STORAGE` schema1独立于原预算JSON，继承时核实准确machine、MinIO卷、version/generation，不能从metadata位置、namespace集合或通配符增加删除权。比较按bucket/key组件，绑定相同MinIO才允许s3a比较别名；原始控制字符、重复斜杠、dot组件、歧义编码与query/fragment拒绝，不改实际I/O URI。
 
-SQL的原CREATE及golden仍执行；runner在首个表/view写入前设置并GET核实scratch namespace location，再核实实际table位置，不增加产品SQL语法。可变Hadoop warehouse绑定run root；只读prepared dataset继续按ADR-0173 check准确READY与原warehouse，不自动供给或重绑定。
+发布前按bucket/key组件校验REST、rest-mv、benchmark与准确worktree/private基础根两两不相交，交叠即拒绝。公共祖先不构成删除域；明确属于原运行根的CTAS与vended私有子根允许包含，不扩大独立基础根或清理权限。
+
+SQL原CREATE/golden和现有Java保持；JdbcCatalog普通表/view使用服务端warehouse的原生目录，不设置或依赖namespace location继承。普通表/view、同运行跨namespace rename、显式位置和CTAS使用统一运行范围谓词。默认位置等形状只由各具体测试断言。客户端REST warehouse仅在运行根下约束显式CTAS；可变Hadoop warehouse绑定run root，READY保持原绑定及check-only。
+
+正常与TTL清扫先完整枚举两个共享REST服务中该运行所有namespace/table/view，校验实际位置，table non-purge删除条目和namespace，再核实整运行catalog均不存在。只有这一屏障及原运行IAM撤销都完成，才能递归清理原根与准确warehouse下实际枚举、完整语法匹配的目录。删除、枚举、撤销失败或结果未知保留文件；单个namespace消失不能放行跨namespace rename的旧目录。未知命名永不自动清理，status报告数量与枚举完整性；benchmark全部对象及其祖先/后代保护。停机升级用确认的准确旧状态卷absence替代在线catalog屏障，不请求已停REST。
+
+共享REST和Spark使用共享凭证；运行IAM只约束实际使用它的writer。其余隔离依靠完整命名、统一位置校验、原预算与清理。独立运行owner确认writer退出后清整运行；嵌套producer只释放自己的catalog条目，文件责任交原外层owner，receipt明确deferred。TTL不掩盖正常teardown违约，也不按worktree活性猜测。Iceberg1.10.1没有unique-table-location配置，同名重建可复用目录，不能用目录名代替表代次。
 
 私有stock/publication-hook保留独立REST及其原生命周期。vended只共享准确MinIO，私有网络避免REST DNS alias冲突；真实STS双身份及原key/token/expiry语义保留。私有writer先退出，才清原run IAM/对象；未确认退出时保留失败登记。HMS只接入机器网络并保留自己的Derby卷；ADR-0169的HMS永久只读裁决不变。
 
@@ -50,7 +56,9 @@ SQL的原CREATE及golden仍执行；runner在首个表/view写入前设置并GET
 
 普通up自动按当前checkout重建固定服务会中断未知消费者，因此维护必须显式。继续并存多版本共享栈不能约束资源增长，因此退役其locator/绑定/stop-delete管理协议。所有测试改私有栈会丢失共享并发义务，因此只保留已明确需要的私有profile。持有者租约、统一reaper和自动历史删除引入另一个活性/数据权威，当前不采用。
 
-升级会使旧消费者失败，scratch不能靠git回滚；没有透明迁移。benchmark与整个MinIO保留卷须以真实对象清单及内容校验核对，READY标记本身不够。旧项目/卷不自动认领或删除，首次迁移要有准确保留清单和维护窗口。新机器若使用空卷，需要显式供给所需READY；输入缺失不改称测试成功。
+升级会使旧直接S3凭证失败，scratch不能靠git回滚；固定无认证REST恢复后可能接受旧请求并重建scratch，不保证旧REST请求拒绝，也没有代理/代次URI或透明迁移。benchmark与整个MinIO保留卷须以真实对象清单及内容校验核对，READY标记本身不够。旧项目/卷不自动认领或删除，首次迁移要有准确保留清单和维护窗口。新机器若使用空卷，需要显式供给所需READY；输入缺失不改称测试成功。
+
+共享catalog仍存在MV discovery的list/load与别的运行teardown并发时NotFound导致catalog隔离的产品风险。catalog优先删除避免长期悬空条目，但不消除该竞态；原始失败保留，产品修复归UEA-7B或独立任务。
 
 ## 验证与重新评估
 

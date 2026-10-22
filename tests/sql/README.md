@@ -43,7 +43,7 @@ sql_runner="$(ci_bound_binary novarocks-sql-test)"
   --cluster-mode cross-process --cluster-size 3 -j 1
 ```
 
-共享fixture由机器owner显式start/upgrade，普通up只附着ready同版本机器。SQL在首次scratch或私有fixture副作用前准入 `--fixture-budget-secs`（默认3600），继承原run ID与完整期限，工作期只能收窄，原完整期限内预留清理；超上限BLOCKED，准入后到期FAIL。namespace使用完整run身份与有限ordinal，保留原CREATE/golden，在写表前验证原run实际location。嵌套shell/retry/role restart不续期；只读READY继续原warehouse与check-only。见 [ADR-0191](../../docs/adr/ADR-0191-machine-shared-fixture-and-bounded-scratch.md)。
+共享fixture由机器owner显式start/upgrade，普通up只附着ready同版本机器。SQL在首次scratch或私有fixture副作用前准入 `--fixture-budget-secs`（默认3600），继承原run ID与完整期限，工作期只能收窄，原完整期限内预留清理；超上限BLOCKED，准入后到期FAIL。namespace使用完整run身份与有限ordinal，保留原CREATE/golden；不写namespace location，JDBC默认表/view、rename、显式位置和CTAS统一验证属于固定三范围。独立原生运行确认角色及producer退出后按整运行catalog→IAM→文件顺序清理；嵌套/外部server保留原owner责任与deferred事实。嵌套shell/retry/role restart不续期；只读READY继续原warehouse与check-only。见 [ADR-0191](../../docs/adr/ADR-0191-machine-shared-fixture-and-bounded-scratch.md)。
 
 `--list-suites` 列出所有注册套件，包括 explicit-only；`--list-declarations` 输出 schema 1 的 suite impact、环境输入、reuse 初始状态/范围、重项依据与 case 清单，不启动集群。`--suite all` 按 suite manifest 排除 explicit-only 和 DISABLED，构成常规 SQL 集合的原生来源。`--list-extensions` 不启动集群。默认配置不提供完整 fixture 端点，不能用旧环境补造缺项。隔离 REST 套件由 runner 启停私有 fixture，准备和测试分离，见 [fixture 操作](../../docker/iceberg-rest/README.md)。
 

@@ -706,9 +706,9 @@ SQL.
 
 `docker/iceberg-rest/down.sh --runtime-only` 发布unbound，保留固定锁、SQLite及旧不可变publication。共享 `--purge` 不删除整个worktree的S3前缀；正常运行按原身份精确清理，崩溃遗留由显式 `fixture-runtime.sh sweep` 按TTL回收。benchmark根及全部对象（包括staging）受保护，不能按旧owner/data_locations删除。共享模式拒绝 `down.sh --docker/--volumes`。
 
-机器维护使用 `docker/iceberg-rest/fixture-runtime.sh [--root <control-root>] start/status/upgrade/sweep`，不再提供多版本stop/delete或owner locator协议。升级保存maintenance，停止共享writers、轮换旧root并撤销原IAM/STS后，在MinIO在线时清理准确scratch；删除准确REST状态卷，切换并核实健康才提交ready。失败保持maintenance，真实unknown不猜成功；历史项目/网络/卷不自动接管或删除。HMS拥有自己的项目与Derby卷，只接入机器的外部网络；私有stock/publication-hook保留原生命周期，vended只共享准确MinIO。
+机器维护使用 `docker/iceberg-rest/fixture-runtime.sh [--root <control-root>] start/status/upgrade/sweep`，不再提供多版本stop/delete或owner locator协议。升级保存maintenance，停止共享writers、轮换旧root并撤销原IAM/STS后，先移除准确旧REST实例/状态卷，确认absence并持久记录catalog屏障，再保持MinIO在线清理准确scratch，切换并核实健康才提交ready。失败保持maintenance，真实unknown不猜成功；历史项目/网络/卷不自动接管或删除。HMS拥有自己的项目与Derby卷，只接入机器的外部网络；私有stock/publication-hook保留原生命周期，vended只共享准确MinIO。
 
-SQL/System/Spark/直接producer在首次scratch副作用前准入整次预算，默认3600秒、不得超过机器max-run（默认86400），原完整期限内预留300秒清理；嵌套继承同一run ID与期限。到期由原进程owner停止真实writer、确认退出并保留清理失败，不能只杀Docker客户端。scratch资源保留完整时间/run ID，实际namespace/table location必须位于原run root；只读READY warehouse保持原绑定。TTL默认604800秒，不替代正常teardown。
+SQL/System/Spark/直接producer在首次scratch副作用前准入整次预算，默认3600秒、不得超过机器max-run（默认86400），原完整期限内预留300秒清理；嵌套继承同一run ID与期限。到期由原进程owner停止真实writer、确认退出并保留清理失败，不能只杀Docker客户端。scratch资源保留完整时间/run ID，`NOVA_FIXTURE_RUN_STORAGE`在开始前固定原run root与两个REST warehouse的run名称前缀；JDBC默认表/view位置、rename、显式位置与CTAS统一检查属于这三个范围，不依赖namespace location继承。正常/TTL递归删除文件前须完成跨两个共享REST的整运行catalog屏障及IAM撤销；未知命名不自动删除，共享Spark凭证不受运行IAM全面约束。只读READY warehouse保持原绑定。TTL默认604800秒，不替代正常teardown。
 
 真实验收基准仍为 1FE+3BE；all-in-one 只作 smoke。fixture verify 和测试不自行下载或构建缺失输入，BOM 前置条件失败为 BLOCKED（75），端口/身份/生命周期失败为 VERIFY FAILED。
 
