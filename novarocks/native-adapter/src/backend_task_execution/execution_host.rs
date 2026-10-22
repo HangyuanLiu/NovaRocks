@@ -669,6 +669,19 @@ impl NativeTaskExecutionHost {
         // Fixed local facts only: no metadata text or query-id metric labels.
         tracing::debug!(resource_scope = "be-type-materialization", receipt = ?metadata_journal, "type materialization resource receipt");
         tracing::debug!(resource_scope = "project-compile-metadata", receipt = ?project_journal, "Project compilation resource receipt");
+        // The typed invariant reason is static local compiler vocabulary.
+        // Keep arbitrary error/provider details out of diagnostics and the wire.
+        if let Err(CompiledPackageError::Compile(
+            novarocks_local_compiler::FragmentCompileError::Invalid(reason),
+        )) = &compiled
+        {
+            tracing::warn!(
+                task = %identity,
+                pipeline_dop = descriptor.pipeline_dop().get(),
+                reason = *reason,
+                "local compiler rejected a fragment invariant"
+            );
+        }
         let compiled = compiled.map_err(|error| compiled_package_rejection(identity, error))?;
         let program = compiled.program();
         let runtime_filters = &compiled.runtime_filters;
