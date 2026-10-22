@@ -61,10 +61,10 @@ use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::lifecycle_diagnostics::{
     FrontendLifecycleDiagnostics, QueryLifecycleConvergenceReader,
 };
-use crate::query_execution::logical_read::LogicalReadLauncher;
+use crate::query_execution::logical_execution::LogicalExecutionLauncher;
 use crate::query_execution::native_execution_adapter::{
-    FrontendLogicalExecutionNativePort, FrontendNativeLogicalExecutionRuntime,
-    FrontendNativeLogicalReadLauncher,
+    FrontendLogicalExecutionNativePort, FrontendNativeLogicalExecutionLauncher,
+    FrontendNativeLogicalExecutionRuntime,
 };
 use crate::topology::{ClusterBackendOpenConfig, ClusterBackendService};
 use crate::workload_lifecycle::{
@@ -1975,7 +1975,7 @@ impl FrontendApplicationHost {
     /// immutable role products. The returned launcher owns no process
     /// lifecycle state; it only joins the Host-owned execution runtime with
     /// the role's fixed topology and data-plane capabilities.
-    pub(crate) fn build_logical_read_launcher(&self) -> Arc<dyn LogicalReadLauncher> {
+    pub(crate) fn build_logical_execution_launcher(&self) -> Arc<dyn LogicalExecutionLauncher> {
         let topology = Arc::clone(self.topology());
         let config = self.query_runtime;
         let native_runtime = FrontendNativeLogicalExecutionRuntime::new(
@@ -1998,10 +1998,10 @@ impl FrontendApplicationHost {
                 .with_test_controls(session.native.clone(), session.observation.clone()),
             None => native_runtime,
         };
-        Arc::new(FrontendNativeLogicalReadLauncher::new(
+        Arc::new(FrontendNativeLogicalExecutionLauncher::new(
             self.logical_execution_client(),
             native_runtime,
-        )) as Arc<dyn LogicalReadLauncher>
+        )) as Arc<dyn LogicalExecutionLauncher>
     }
 
     #[allow(

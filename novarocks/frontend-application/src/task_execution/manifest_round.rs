@@ -56,7 +56,7 @@ use crate::native::task_transport::{
 use crate::query_execution::artifact::{TaskManifestBinding, ValidatedNativeSubmission};
 use crate::query_execution::split_assignment::TaskUpdateTransport;
 use crate::query_execution::split_assignment_round::{
-    RoundSplitAssignmentPlan, SplitAssignmentRoundGuard,
+    RoundSplitAssignmentPlan, SplitAssignmentFailureSource, SplitAssignmentRoundGuard,
 };
 use novarocks_coordination_contract::MonotonicClock;
 use novarocks_query_application::api::BackendProcessObservationService;
@@ -83,6 +83,7 @@ pub(crate) struct ManifestAssembledRound {
     pub(crate) round: TaskRound,
     pub(crate) split_delivery: Arc<SplitDeliveryBridge>,
     pub(crate) actor_gate: ActorGateOwner,
+    protocol_facts: Option<super::protocol_facts::AttemptProtocolFactsReceiver>,
     convergence: NativeAttemptConvergenceOwner,
     notify: Arc<tokio::sync::Notify>,
     terminal: Option<NativeAttemptTerminal>,
@@ -90,6 +91,8 @@ pub(crate) struct ManifestAssembledRound {
     /// Only an exact Establish transport-unknown may await independent
     /// process replacement within its original admission receipt horizon.
     pending_pre_ready_unknown: Option<novarocks_types::BackendProcessId>,
+    split_failure: Option<SplitAssignmentFailureSource>,
+    profile_diagnostics: Option<super::profile_diagnostics::TaskFinalInfoCollector>,
 }
 
 /// The completion fact this Task owner must wait for before it reports the
@@ -110,6 +113,13 @@ pub(crate) fn assemble_manifest_round(
 ) -> Result<ManifestAssembledRound, TaskExecutionError> {
     let notify = Arc::new(tokio::sync::Notify::new());
     let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
+    // Freeze declaration before submissions are consumed; never infer writers
+    // from the subset of Task statuses that happens to report writer facts.
+    let writer_fragments = submissions
+        .iter()
+        .filter(|submission| submission.declares_table_writer())
+        .map(ValidatedNativeSubmission::fragment_id)
+        .collect::<std::collections::BTreeSet<_>>();
     let mut plans = SubmissionFragmentPlans::index_manifest(submissions, manifest)?;
     let graph = build_task_graph_from_manifest(manifest, &mut plans, transport.transport_budget)?;
     let split_delivery = SplitDeliveryBridge::for_graph(&graph);
@@ -201,7 +211,7 @@ pub(crate) fn assemble_manifest_round(
     if let Some(admissions) = replacement_admissions {
         execution.adopt_replacement_admissions(&admissions)?;
     }
-    let round = TaskRound::new_covered(
+    let mut round = TaskRound::new_covered(
         execution,
         acks,
         Box::new(establish),
@@ -211,17 +221,21 @@ pub(crate) fn assemble_manifest_round(
     .observing(Arc::clone(&split_delivery) as Arc<dyn AcknowledgementObserver>)
     .observing(actor_observer)
     .with_connector_blocking_io(connector_blocking_io);
+    let protocol_facts = round.install_protocol_facts(manifest.plan(), &writer_fragments)?;
     let convergence =
         NativeAttemptConvergenceOwner::new(&round, convergence_source, convergence_targets)?;
     Ok(ManifestAssembledRound {
         round,
         split_delivery,
         actor_gate,
+        protocol_facts: Some(protocol_facts),
         convergence,
         notify,
         terminal: None,
         pending_terminal: None,
         pending_pre_ready_unknown: None,
+        split_failure: None,
+        profile_diagnostics: None,
     })
 }
 
@@ -242,14 +256,38 @@ impl ManifestAssembledRound {
         plan: RoundSplitAssignmentPlan,
         data_runtime: FrontendDataRuntime,
     ) -> Option<SplitAssignmentRoundGuard> {
-        SplitAssignmentRoundGuard::install(
+        let guard = SplitAssignmentRoundGuard::install(
             &mut self.round,
             execution,
             plan,
             Arc::clone(&self.split_delivery) as Arc<dyn TaskUpdateTransport>,
             data_runtime,
             Arc::new(NotifyWake::new(Arc::clone(&self.notify))) as Arc<dyn StatusIntakeWake>,
-        )
+        );
+        self.split_failure = guard
+            .as_ref()
+            .map(SplitAssignmentRoundGuard::failure_source);
+        guard
+    }
+
+    pub(crate) fn install_profile_diagnostics(
+        &mut self,
+        transport: Arc<dyn crate::native::fragment_transport::TaskResultTransport>,
+    ) -> Result<super::profile_diagnostics::ProfileDiagnosticObserver, TaskExecutionError> {
+        if self.profile_diagnostics.is_some() {
+            return Err(TaskExecutionError::Schedule(
+                "profile diagnostics are already installed".to_owned(),
+            ));
+        }
+        let mut collector = super::profile_diagnostics::TaskFinalInfoCollector::new(
+            transport,
+            true,
+            &self.round,
+            Arc::new(NotifyWake::new(Arc::clone(&self.notify))),
+        );
+        let observer = collector.enable_profile_observation()?;
+        self.profile_diagnostics = Some(collector);
+        Ok(observer)
     }
 
     pub(crate) fn abort_wake(&self) -> Arc<dyn StatusIntakeWake> {
@@ -261,6 +299,25 @@ impl ManifestAssembledRound {
     /// projection; this owner never constructs a second actor port.
     pub(crate) fn install_abort_effect_intake(&mut self, intake: NativeAbortEffectIntake) {
         self.round.install_abort_effect_intake(intake);
+    }
+
+    /// Installs one manifest-validated RF, credential, or split-source pump.
+    pub(crate) fn install_pump(&mut self, pump: Box<dyn TurnPump>) {
+        self.round.add_pump(pump);
+    }
+
+    /// Completes C3's runtime-resource attachment. A round cannot turn before
+    /// this explicit declaration, including when the exact pump set is empty.
+    pub(crate) fn seal_runtime_owners(&mut self) {
+        self.round.seal_pumps();
+    }
+
+    /// Transfer only this attempt's original receiver to its fixed FA consumer.
+    /// A replacement owns a distinct pair, not a shared "latest" projection.
+    pub(crate) fn take_protocol_facts(
+        &mut self,
+    ) -> Option<super::protocol_facts::AttemptProtocolFactsReceiver> {
+        self.protocol_facts.take()
     }
 
     pub(crate) fn take_root_status_source(&mut self) -> Option<AcceptedRootStatusSource> {
@@ -314,6 +371,10 @@ impl ManifestAssembledRound {
         if self.pending_terminal.is_none()
             || (self.pending_pre_ready_unknown.is_some() && unknown.is_none())
         {
+            tracing::warn!(
+                ?error,
+                "Task protocol recorded its original attempt failure"
+            );
             self.pending_pre_ready_unknown = unknown;
             self.pending_terminal = Some(task_protocol_failure(error));
         }
@@ -355,6 +416,11 @@ impl ManifestAssembledRound {
         cancellation: CancellationView,
         completion: ManifestAttemptCompletion,
     ) -> NativeAttemptTerminal {
+        // The actual QA running capability binds facts before any Task turn.
+        // Refusing a foreign drive never overwrites this owner's memoized result.
+        if let Err(error) = self.round.bind_protocol_drive(drive) {
+            return task_protocol_failure(error);
+        }
         if let Some(terminal) = &self.terminal {
             return terminal.clone();
         }
@@ -383,6 +449,15 @@ impl ManifestAssembledRound {
                     false
                 }
             };
+            // Read the original source's failure on ordinary and pending
+            // pre-ready turns. A normally exhausted source is not a failure.
+            if let Some(error) = self
+                .split_failure
+                .as_ref()
+                .and_then(SplitAssignmentFailureSource::failure)
+            {
+                self.record_protocol_failure(TaskExecutionError::SplitAssignment(error));
+            }
             let success_sealed = completion == ManifestAttemptCompletion::AcceptedRootSuccessSeal
                 && self.round.accepted_root_success_sealed();
             if success_sealed {
@@ -496,7 +571,40 @@ impl ManifestAssembledRound {
         &mut self,
         request: NativeActiveConvergenceRequest,
     ) -> Result<NativeActiveConvergenceClosure, StatementNativeHealthFailure> {
-        let mode = if matches!(self.terminal, Some(NativeAttemptTerminal::Completed)) {
+        if let Some(ready) = request.computation_ready() {
+            self.round
+                .verify_computation_ready(ready)
+                .map_err(|error| {
+                    StatementNativeHealthFailure::actual_exit_unproven(
+                        "Native convergence rejected a foreign computation cut",
+                        Arc::new(error),
+                    )
+                })?;
+            if let Some(diagnostics) = self.profile_diagnostics.as_mut() {
+                diagnostics
+                    .begin_profile_observation(ready)
+                    .map_err(|error| {
+                        StatementNativeHealthFailure::actual_exit_unproven(
+                            "Native convergence could not bind its original diagnostic observation",
+                            Arc::new(error),
+                        )
+                    })?;
+                if let Some(deadline) = diagnostics.observation_deadline() {
+                    self.round
+                        .execution_mut()
+                        .retain_profile_diagnostics_until(deadline);
+                }
+            }
+        } else if let Some(diagnostics) = self.profile_diagnostics.as_mut() {
+            // Initialization or execution failed before computation readiness.
+            // There is no diagnostic window to invent or extend.
+            diagnostics.stop_starting();
+        }
+        let mode = if matches!(self.terminal, Some(NativeAttemptTerminal::Failed(_))) {
+            NativeAttemptConvergenceMode::Cleanup
+        } else if request.computation_ready().is_some()
+            || matches!(self.terminal, Some(NativeAttemptTerminal::Completed))
+        {
             NativeAttemptConvergenceMode::Normal
         } else {
             NativeAttemptConvergenceMode::Cleanup
@@ -508,6 +616,7 @@ impl ManifestAssembledRound {
                 mode,
                 request,
                 &self.notify,
+                self.profile_diagnostics.as_mut(),
             )
             .await
     }
@@ -536,7 +645,7 @@ pub(super) fn begin_convergence(
     super::attempt_convergence::begin_convergence(round, split_delivery, mode);
 }
 
-fn task_protocol_failure(error: TaskExecutionError) -> NativeAttemptTerminal {
+pub(crate) fn task_protocol_failure(error: TaskExecutionError) -> NativeAttemptTerminal {
     NativeAttemptTerminal::Failed(NativeAttemptPreparationFailure::from_input(
         error.preparation_input(),
     ))
@@ -787,11 +896,14 @@ mod tests {
             round,
             split_delivery,
             actor_gate,
+            protocol_facts: None,
             convergence,
             notify: Arc::new(tokio::sync::Notify::new()),
             terminal: None,
             pending_terminal: None,
             pending_pre_ready_unknown: None,
+            split_failure: None,
+            profile_diagnostics: None,
         };
         assembled.convergence.begin(
             &mut assembled.round,
@@ -882,11 +994,14 @@ mod tests {
             round,
             split_delivery,
             actor_gate,
+            protocol_facts: None,
             convergence,
             notify: Arc::new(tokio::sync::Notify::new()),
             terminal: Some(NativeAttemptTerminal::Completed),
             pending_terminal: None,
             pending_pre_ready_unknown: None,
+            split_failure: None,
+            profile_diagnostics: None,
         };
         assembled.convergence.begin(
             &mut assembled.round,
@@ -1191,11 +1306,14 @@ mod tests {
                 round,
                 split_delivery,
                 actor_gate,
+                protocol_facts: None,
                 convergence,
                 notify: Arc::new(tokio::sync::Notify::new()),
                 terminal: None,
                 pending_terminal: None,
                 pending_pre_ready_unknown: None,
+                split_failure: None,
+                profile_diagnostics: None,
             };
             let terminal = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -1411,11 +1529,14 @@ mod tests {
             round,
             split_delivery,
             actor_gate,
+            protocol_facts: None,
             convergence,
             notify: Arc::new(tokio::sync::Notify::new()),
             terminal: None,
             pending_terminal: None,
             pending_pre_ready_unknown: None,
+            split_failure: None,
+            profile_diagnostics: None,
         };
         assembled.record_protocol_failure(TaskExecutionError::PreReadyEstablishTransportUnknown {
             backend: context.backend_process_id(),
@@ -1634,6 +1755,201 @@ mod tests {
             failure.topology_requirement(),
             novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
         );
+        drop(assembled);
+        drop(drive);
+        finish_pending_actor(logical, context).await;
+    }
+
+    #[tokio::test]
+    async fn pending_pre_ready_keeps_close_diagnostics_without_replacing_original_uncertainty() {
+        use crate::query_execution::split_assignment::SplitAssignmentDriverError;
+        use crate::query_execution::split_assignment_round::failure_observation_plan;
+        use novarocks_execution_contract::failure::FailureProjection;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let (round, clock) = super::super::tests::pre_ready_observation_round();
+        let context = *round.execution().graph().contexts().next().unwrap();
+        let (logical, drive, cancellation, _, _abort) = terminal_regression_drive(context).await;
+        assert_eq!(cancellation.deadline(), None);
+        let process = Arc::new(PendingProcessObservation::new(
+            context.backend_process_id(),
+            BackendProcessObservation::Current,
+        ));
+        let mut assembled = pending_pre_ready_round(round, process.clone());
+        let Some(NativeAttemptTerminal::Failed(original)) = &assembled.pending_terminal else {
+            panic!("the original Establish uncertainty must already exist");
+        };
+        let original_input = original.input().clone();
+        let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let (release, released) = std::sync::mpsc::channel();
+        let (plan, enumerations, closes) = failure_observation_plan(
+            context.query_execution_id(),
+            data_runtime.connector_blocking_io().clone(),
+            Some(released),
+        );
+        let guard = assembled
+            .install_split_assignment(context.query_execution_id(), plan, data_runtime)
+            .unwrap();
+        let original_source = guard.failure_source();
+        assembled.round.begin_input_close();
+        let cleanup_then_expire = async {
+            while process.calls.load(Ordering::SeqCst) == 0 || closes.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            release.send(()).unwrap();
+            while !guard.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            assert!(original_source.failure().is_none());
+            // Require another real pending turn after close returned. The run
+            // must still await its own Establish evidence, rather than ending
+            // because an unrelated cleanup diagnostic arrived.
+            let calls_after_close = process.calls.load(Ordering::SeqCst);
+            while process.calls.load(Ordering::SeqCst) <= calls_after_close {
+                tokio::task::yield_now().await;
+            }
+            clock.advance(super::super::context_owner::ADMISSION_TICKET_VALID_FOR);
+        };
+        let (terminal, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                assembled.run(
+                    &drive,
+                    cancellation,
+                    ManifestAttemptCompletion::AcceptedRootSuccessSeal
+                ),
+                cleanup_then_expire
+            )
+        })
+        .await
+        .unwrap();
+        let NativeAttemptTerminal::Failed(failure) = terminal else {
+            panic!("expected the original bounded Establish uncertainty");
+        };
+        assert_eq!(failure.input(), &original_input);
+        assert_eq!(failure.class(), AttemptFailureClass::ExecutionFailure);
+        assert_eq!(
+            failure.topology_requirement(),
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
+        );
+        assert!(guard.failure().is_none());
+        assert!(original_source.failure().is_none());
+        assert_eq!(enumerations.load(Ordering::SeqCst), 0);
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert!(assembled.round.pumps_closed());
+        let cleanup = guard.finish_after_attempt(false).unwrap_err();
+        assert!(matches!(
+            cleanup,
+            SplitAssignmentDriverError::SourceClose { .. }
+        ));
+        let input = cleanup.execution_failure().unwrap();
+        let provider = novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+            "diagnostic only",
+        );
+        assert_eq!(input.fact(), provider.failure_fact());
+        assert_eq!(
+            input.detail().as_str(),
+            "closing the connector split source failed"
+        );
+        assert_eq!(
+            assembled
+                .round
+                .take_pump_close_error()
+                .unwrap()
+                .preparation_input(),
+            input
+        );
+        assembled.round.receive_without_dispatch().unwrap();
+        assert!(assembled.round.take_pump_close_error().is_none());
+        drop(assembled);
+        drop(drive);
+        finish_pending_actor(logical, context).await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_manifest_run_preserves_the_original_enumeration_fact_without_backend_recovery()
+     {
+        use crate::query_execution::split_assignment::SplitAssignmentDriverError;
+        use crate::query_execution::split_assignment_round::failure_observation_plan;
+        use novarocks_execution_contract::failure::FailureProjection;
+        use novarocks_query_application::execution_error::QueryFailureReason;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let (round, _) = super::super::tests::pre_ready_observation_round();
+        let context = *round.execution().graph().contexts().next().unwrap();
+        let (logical, drive, cancellation, _, _abort) = terminal_regression_drive(context).await;
+        let mut assembled = pending_pre_ready_round(round, Arc::new(UnusedConvergenceSource));
+        assembled.pending_terminal = None;
+        assembled.pending_pre_ready_unknown = None;
+        let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let (plan, enumerations, closes) = failure_observation_plan(
+            context.query_execution_id(),
+            data_runtime.connector_blocking_io().clone(),
+            None,
+        );
+        let guard = assembled
+            .install_split_assignment(context.query_execution_id(), plan, data_runtime)
+            .unwrap();
+        let original_source = guard.failure_source();
+        assert!(original_source.failure().is_none());
+        let terminal = tokio::time::timeout(
+            Duration::from_secs(2),
+            assembled.run(
+                &drive,
+                cancellation,
+                ManifestAttemptCompletion::AcceptedRootSuccessSeal,
+            ),
+        )
+        .await
+        .unwrap();
+        let NativeAttemptTerminal::Failed(failure) = terminal else {
+            panic!("expected the installed source's enumeration failure");
+        };
+        let original = guard.failure().unwrap();
+        assert!(matches!(
+            original,
+            SplitAssignmentDriverError::SourceEnumeration { .. }
+        ));
+        assert_eq!(original_source.failure(), Some(original.clone()));
+        assert_eq!(failure.input(), &original.execution_failure().unwrap());
+        let provider = novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+            "diagnostic only",
+        );
+        assert_eq!(failure.input().fact(), provider.failure_fact());
+        assert_ne!(
+            failure.input().fact(),
+            QueryFailureReason::SplitAssignmentFailed.failure_fact()
+        );
+        assert_ne!(
+            failure.input().fact().reason(),
+            QueryFailureReason::BackendLost.failure_fact().reason()
+        );
+        assert_eq!(
+            failure.input().detail().as_str(),
+            "enumerating the connector split source failed"
+        );
+        assert!(!failure.error().message().contains("opaque provider text"));
+        assert_eq!(failure.class(), AttemptFailureClass::ResourceGovernance);
+        assert_eq!(
+            failure.topology_requirement(),
+            novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
+        );
+        assert_eq!(enumerations.load(Ordering::SeqCst), 1);
+        // Selecting the original failure is earlier than its cleanup. Retain
+        // the same pump and guard until the original close job actually exits.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !guard.is_finished() || !assembled.round.pumps_closed() {
+                assembled.round.receive_without_dispatch().unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(guard.finish_after_attempt(false).unwrap_err(), original);
         drop(assembled);
         drop(drive);
         finish_pending_actor(logical, context).await;

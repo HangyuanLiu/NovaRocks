@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use super::internal_result::{InternalDomainFailure, InternalDomainSlot, InternalDomainState};
 use super::root_result_relay::{RelayedRootAnswer, RelayedRootPolls};
 use crate::native::fragment_transport::{
-    FinalTaskInfoRead, NativeTaskResultTransport, TaskReadGrace, TaskResultTransport,
+    NativeTaskResultTransport, TaskReadGrace, TaskResultTransport,
 };
 use crate::query_execution::artifact::{
     RuntimeFilterDeploymentReadyDistributedQuery, ValidatedNativeSubmission,
@@ -45,6 +45,9 @@ use crate::query_execution::profile::ProfileTerminalBuilder;
 #[cfg(test)]
 use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
 use crate::query_execution::split_assignment::TaskUpdateTransport;
+use crate::query_execution::statistics::completion::{
+    statistics_all_success_error, statistics_tasks_are_terminal,
+};
 use crate::task_execution::sources::AttemptEstablishFacts;
 use crate::task_execution::termination::render_termination_detail;
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
@@ -64,9 +67,7 @@ use super::query_registry::{
 };
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use super::statement_native_attempt::StatementNativeAttempt;
-use super::task_round::{
-    AssembledRound, AttemptPumps, AttemptTransport, assemble_round, install_attempt_pumps,
-};
+use super::task_round::{AssembledRound, AttemptTransport, assemble_round};
 use crate::metrics::{
     observe_pre_ready_replan, observe_waiting_for_backend, record_pre_ready_effect_gate,
     record_pre_ready_replan,
@@ -89,7 +90,9 @@ use crate::task_execution::attempt_convergence::{
     NativeAttemptConvergenceMode, NativeAttemptConvergenceOwner, NativeAttemptConvergenceTarget,
     advance_task_round,
 };
-use crate::task_execution::completion::{WriteCompletionTracker, WriteVerdict, accept_final_info};
+use crate::task_execution::attempt_pumps::{AttemptPumps, install_attempt_pumps};
+use crate::task_execution::completion::{WriteCompletionTracker, WriteVerdict};
+use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
 use crate::task_execution::graph::TaskNode;
 
@@ -106,7 +109,7 @@ use crate::task_execution::round::TaskRound;
 use crate::task_execution::split_transport::SplitDeliveryBridge;
 use crate::task_execution::status_intake::{CondvarWake, StatusIntakeWake};
 use novarocks_execution::task_execution::{
-    AbortCause, FinalTaskInfo, MaxWait, OperationKind, TaskIdentity, TaskState, TerminationDetail,
+    AbortCause, MaxWait, OperationKind, TaskIdentity, TaskState, TerminationDetail,
 };
 use novarocks_query_application::api::StatementNativeAttemptOwner;
 
@@ -1230,7 +1233,6 @@ impl FrontendDistributedQueryCoordinator {
         install_attempt_pumps(
             &mut round,
             AttemptPumps {
-                execution_id,
                 feedback_state: Arc::clone(&feedback_state),
                 declared_feedback_channels: feedback_declaration.channels().len(),
                 reads: Arc::clone(&result_transport) as Arc<dyn TaskDynamicFilterReads>,
@@ -2768,99 +2770,6 @@ fn statement_deadline_for_request(
         })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct StatisticsTaskCompletionFact {
-    identity: TaskIdentity,
-    terminal: bool,
-    success_compatible_terminal: bool,
-    state: Option<TaskState>,
-    failure_cause: Option<TerminationDetail>,
-}
-
-fn statistics_tasks_are_terminal(round: &TaskRound) -> bool {
-    round.execution().graph().tasks().all(|task| {
-        round
-            .execution()
-            .task(task.task_id())
-            .is_some_and(|remote| remote.is_terminal())
-    })
-}
-
-fn statistics_all_success_error(round: &TaskRound) -> Option<DistributedQueryError> {
-    let facts = round
-        .execution()
-        .graph()
-        .tasks()
-        .map(|task| {
-            let remote = round.execution().task(task.task_id());
-            StatisticsTaskCompletionFact {
-                identity: task.identity(),
-                terminal: remote.is_some_and(|remote| remote.is_terminal()),
-                success_compatible_terminal: remote
-                    .and_then(|remote| remote.status())
-                    .is_some_and(|status| status.is_success_compatible_terminal()),
-                state: remote.map(|remote| remote.task_state()),
-                failure_cause: remote
-                    .and_then(|remote| remote.status())
-                    .and_then(|status| status.termination())
-                    .cloned(),
-            }
-        })
-        .collect::<Vec<_>>();
-    statistics_all_success_failure_message(&facts, round.failure_cause()).map(|message| {
-        DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
-    })
-}
-
-fn statistics_all_success_failure_message(
-    facts: &[StatisticsTaskCompletionFact],
-    round_failure_cause: Option<&TerminationDetail>,
-) -> Option<String> {
-    let incompatible = facts
-        .iter()
-        .filter(|fact| !statistics_task_is_success_compatible(fact))
-        .map(format_statistics_task_completion_fact)
-        .collect::<Vec<_>>();
-    if incompatible.is_empty() && round_failure_cause.is_none() {
-        return None;
-    }
-    Some(format!(
-        "statistics execution did not reach a success-compatible terminal set; \
-         incompatible_tasks=[{}]; round_failure_cause={}",
-        incompatible.join(", "),
-        render_termination_detail(round_failure_cause),
-    ))
-}
-
-/// Whether this task's terminal is compatible with the already-complete Root
-/// result remaining successful.
-///
-/// The Root reached `FINISHED` before this predicate can run. A non-root task
-/// may then be stood down with `UPSTREAM_NO_LONGER_NEEDED`: the Root aggregate
-/// has already consumed every sender through exchange EOS, so that terminal
-/// closes work the result no longer depends on. An abort, a failure, a missing
-/// status, or a task that has not reached a terminal still refuses statistics
-/// publication.
-fn statistics_task_is_success_compatible(fact: &StatisticsTaskCompletionFact) -> bool {
-    fact.terminal && fact.success_compatible_terminal
-}
-
-fn format_statistics_task_completion_fact(fact: &StatisticsTaskCompletionFact) -> String {
-    let execution_id = fact.identity.query_execution_id();
-    format!(
-        "{{identity={{query_id={}, attempt_id={}, stage_id={}, task_id={}, \
-         backend_process_id={}}}, terminal={}, state={}, failure_cause={}}}",
-        execution_id.query_id(),
-        execution_id.attempt_id().get(),
-        fact.identity.stage_id(),
-        fact.identity.task_id(),
-        fact.identity.backend_process_id(),
-        fact.terminal,
-        fact.state.map_or("MISSING", TaskState::as_str),
-        render_termination_detail(fact.failure_cause.as_ref()),
-    )
-}
-
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
 }
@@ -3028,9 +2937,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        QueryIdSource, StatisticsTaskCompletionFact, UniqueQueryIdSource,
-        fail_closed_one_shot_topology_retry, pre_ready_topology_validation_error,
-        statistics_all_success_failure_message,
+        FrontendBackendSnapshot, FrontendDistributedQueryCoordinator, FrontendFragmentScheduler,
+        QueryIdSource, UniqueQueryIdSource, fail_closed_one_shot_topology_retry,
+        pre_ready_topology_validation_error,
     };
 
     use crate::query_execution::contract::{
@@ -3106,176 +3015,6 @@ mod tests {
         let carried = DistributedQueryError::from_execution(input.clone());
         assert_eq!(carried.execution_failure(), Some(&input));
         assert_eq!(carried.into_execution_failure_input(), input);
-    }
-
-    #[test]
-    fn statistics_failure_preserves_every_incompatible_task_and_round_cause() {
-        let execution_id = QueryExecutionId::new(
-            QueryId::new(7, 11),
-            AttemptId::new(2).expect("nonzero attempt"),
-        )
-        .expect("nonzero execution identity");
-        let stage_id = StageId::new(3).expect("nonzero stage");
-        let finished_identity = TaskIdentity::new(
-            execution_id,
-            stage_id,
-            TaskId::new(1).expect("nonzero task"),
-            BackendProcessId::new_v7(),
-        );
-        let failed_identity = TaskIdentity::new(
-            execution_id,
-            stage_id,
-            TaskId::new(2).expect("nonzero task"),
-            BackendProcessId::new_v7(),
-        );
-        let aborted_identity = TaskIdentity::new(
-            execution_id,
-            stage_id,
-            TaskId::new(3).expect("nonzero task"),
-            BackendProcessId::new_v7(),
-        );
-        let task_failure = TerminationDetail::Failed(TaskFailure::new(
-            novarocks_execution_contract::failure::FailureFact::new(
-                novarocks_execution_contract::failure::FailureClass::Resource,
-                novarocks_execution_contract::failure::FailureReason::new(
-                    std::num::NonZeroU16::new(u16::MAX).unwrap(),
-                    std::num::NonZeroU16::new(5).unwrap(),
-                ),
-            ),
-            SafeDetail::new("memory pool exhausted").expect("bounded safe detail"),
-        ));
-        let facts = vec![
-            StatisticsTaskCompletionFact {
-                identity: finished_identity,
-                terminal: true,
-                success_compatible_terminal: true,
-                state: Some(TaskState::Finished),
-                failure_cause: None,
-            },
-            StatisticsTaskCompletionFact {
-                identity: failed_identity,
-                terminal: true,
-                success_compatible_terminal: false,
-                state: Some(TaskState::Failed),
-                failure_cause: Some(task_failure.clone()),
-            },
-            StatisticsTaskCompletionFact {
-                identity: aborted_identity,
-                terminal: true,
-                success_compatible_terminal: false,
-                state: Some(TaskState::Aborted),
-                failure_cause: Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
-            },
-        ];
-
-        let message = statistics_all_success_failure_message(&facts, Some(&task_failure))
-            .expect("non-finished tasks reject statistics completion");
-        assert!(!message.contains("task_id=1,"));
-        assert!(message.contains(&format!(
-            "identity={{query_id={}, attempt_id=2, stage_id=3, task_id=2, backend_process_id={}}}, terminal=true, state=FAILED, failure_cause=FAILED(category=RESOURCE_EXHAUSTED, phase=EXECUTION, detail=memory pool exhausted)",
-            execution_id.query_id(),
-            failed_identity.backend_process_id(),
-        )));
-        assert!(message.contains(&format!(
-            "identity={{query_id={}, attempt_id=2, stage_id=3, task_id=3, backend_process_id={}}}, terminal=true, state=ABORTED, failure_cause=ABORTED(cause=PEER_TASK_FAILED)",
-            execution_id.query_id(),
-            aborted_identity.backend_process_id(),
-        )));
-        assert!(message.ends_with(
-            "round_failure_cause=FAILED(category=RESOURCE_EXHAUSTED, phase=EXECUTION, detail=memory pool exhausted)"
-        ));
-        assert!(
-            statistics_all_success_failure_message(&facts[..1], None).is_none(),
-            "a FINISHED task set with no round failure is successful"
-        );
-    }
-
-    #[test]
-    fn statistics_accepts_only_the_closed_success_compatible_cancel_terminal() {
-        let execution_id = QueryExecutionId::new(
-            QueryId::new(13, 17),
-            AttemptId::new(1).expect("nonzero attempt"),
-        )
-        .expect("nonzero execution identity");
-        let stage_id = StageId::new(2).expect("nonzero stage");
-        let finished_root = StatisticsTaskCompletionFact {
-            identity: TaskIdentity::new(
-                execution_id,
-                stage_id,
-                TaskId::new(1).expect("nonzero task"),
-                BackendProcessId::new_v7(),
-            ),
-            terminal: true,
-            success_compatible_terminal: true,
-            state: Some(TaskState::Finished),
-            failure_cause: None,
-        };
-        let canceled_producer = StatisticsTaskCompletionFact {
-            identity: TaskIdentity::new(
-                execution_id,
-                stage_id,
-                TaskId::new(2).expect("nonzero task"),
-                BackendProcessId::new_v7(),
-            ),
-            terminal: true,
-            success_compatible_terminal: true,
-            state: Some(TaskState::Canceled),
-            failure_cause: Some(TerminationDetail::Canceled(
-                CancelReason::UpstreamNoLongerNeeded,
-            )),
-        };
-        assert!(
-            statistics_all_success_failure_message(
-                &[finished_root.clone(), canceled_producer],
-                None,
-            )
-            .is_none(),
-            "a producer stood down after Root EOF is success-compatible"
-        );
-
-        let aborted_producer = StatisticsTaskCompletionFact {
-            identity: TaskIdentity::new(
-                execution_id,
-                stage_id,
-                TaskId::new(3).expect("nonzero task"),
-                BackendProcessId::new_v7(),
-            ),
-            terminal: true,
-            success_compatible_terminal: false,
-            state: Some(TaskState::Aborted),
-            failure_cause: Some(TerminationDetail::Aborted(AbortCause::QueryFailed)),
-        };
-        let message =
-            statistics_all_success_failure_message(&[finished_root, aborted_producer], None)
-                .expect("query cancellation is not a success-compatible stand-down");
-        assert!(message.contains("ABORTED(cause=QUERY_FAILED)"));
-    }
-
-    #[test]
-    fn statistics_does_not_classify_a_cancel_until_it_reaches_terminal() {
-        let execution_id = QueryExecutionId::new(
-            QueryId::new(19, 23),
-            AttemptId::new(1).expect("nonzero attempt"),
-        )
-        .expect("nonzero execution identity");
-        let canceling = StatisticsTaskCompletionFact {
-            identity: TaskIdentity::new(
-                execution_id,
-                StageId::new(2).expect("nonzero stage"),
-                TaskId::new(1).expect("nonzero task"),
-                BackendProcessId::new_v7(),
-            ),
-            terminal: false,
-            success_compatible_terminal: false,
-            state: Some(TaskState::Canceling),
-            failure_cause: Some(TerminationDetail::Canceled(
-                CancelReason::UpstreamNoLongerNeeded,
-            )),
-        };
-        let message = statistics_all_success_failure_message(&[canceling], None)
-            .expect("a canceling task is not yet classifiable as success");
-        assert!(message.contains("terminal=false"));
-        assert!(message.contains("state=CANCELING"));
     }
 
     #[test]
@@ -4597,27 +4336,24 @@ fn observe_write_statuses(round: &TaskRound, tracker: &mut WriteCompletionTracke
     }
 }
 
-/// Reads the bounded final info of every terminal task of this attempt.
-///
-/// Final info is observation only: success and failure are decided by
-/// `TaskStatus` alone, so a task that cannot answer costs diagnostics and
-/// nothing else. That is why a failed read is logged and skipped rather than
-/// failing a query that already completed.
+/// Temporary observation adapter for the old coordinator caller. All final
+/// info futures and validation remain in the single Task Execution collector.
+/// P06 removes this adapter with the synchronous coordinator.
 pub(super) struct FinalTaskInfoCollector {
-    transport: Arc<dyn TaskResultTransport>,
-    pub(super) collected: Vec<FinalTaskInfo>,
-    unread: VecDeque<TaskIdentity>,
-    pending: Option<FinalTaskInfoReadJob>,
-    enabled: bool,
-    accepting: bool,
+    inner: crate::task_execution::profile_diagnostics::TaskFinalInfoCollector,
     wake: Arc<CondvarWake>,
     runtime: FrontendDataRuntime,
 }
-struct FinalTaskInfoReadJob {
-    observed: novarocks_execution_contract::TaskStatus,
-    future: std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<FinalTaskInfoRead, String>> + Send>,
-    >,
+impl std::ops::Deref for FinalTaskInfoCollector {
+    type Target = crate::task_execution::profile_diagnostics::TaskFinalInfoCollector;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl std::ops::DerefMut for FinalTaskInfoCollector {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
 }
 impl FinalTaskInfoCollector {
     fn new(
@@ -4628,114 +4364,25 @@ impl FinalTaskInfoCollector {
         runtime: FrontendDataRuntime,
     ) -> Self {
         Self {
-            transport,
-            collected: Vec::new(),
-            unread: if enabled {
-                round
-                    .execution()
-                    .graph()
-                    .tasks()
-                    .map(TaskNode::identity)
-                    .collect()
-            } else {
-                VecDeque::new()
-            },
-            pending: None,
-            enabled,
-            accepting: true,
+            inner: crate::task_execution::profile_diagnostics::TaskFinalInfoCollector::new(
+                transport,
+                enabled,
+                round,
+                wake.clone(),
+            ),
             wake,
             runtime,
         }
     }
-    /// Poll once on the original role runtime when the synchronous statement
-    /// worker drives. The same async RPC future stays in this collector.
     fn observe(&mut self, round: &TaskRound) {
-        if !self.enabled {
-            return;
-        }
         let runtime = self.runtime.clone();
         let wake = Arc::clone(&self.wake);
         let _ = runtime.block_on(std::future::poll_fn(|_| {
             let waker = std::task::Waker::from(Arc::clone(&wake));
             let mut cx = std::task::Context::from_waker(&waker);
-            self.poll_observe(round, &mut cx);
+            self.inner.poll_observe(round, &mut cx);
             std::task::Poll::Ready(())
         }));
-    }
-    pub(super) fn stop_starting(&mut self) {
-        self.accepting = false;
-    }
-    pub(super) fn is_closed(&self) -> bool {
-        self.pending.is_none()
-    }
-    pub(super) fn all_terminal_observed(&self) -> bool {
-        // Only the exact frozen Tasks whose terminal was observed can leave
-        // this frontier. Disabled diagnostics do not manufacture that proof.
-        self.enabled && self.unread.is_empty() && self.pending.is_none()
-    }
-    /// At most one bounded final-info read is in flight. Starting it records
-    /// its exact observed Task and original transport in self before Pending.
-    pub(super) fn poll_observe(&mut self, round: &TaskRound, cx: &mut std::task::Context<'_>) {
-        use std::task::Poll;
-        if !self.enabled {
-            return;
-        }
-        if self.pending.is_none() && self.accepting {
-            // Inspect at most the original unread frontier once this turn.
-            // Already-observed Tasks never re-enter the search prefix.
-            let mut next = None;
-            for _ in 0..self.unread.len() {
-                let identity = self.unread.pop_front().expect("unread frontier item");
-                let observed = round.execution().task(identity.task_id()).and_then(|task| {
-                    (task.identity() == identity && task.is_terminal())
-                        .then(|| task.status().cloned())
-                        .flatten()
-                });
-                if let Some(observed) = observed {
-                    next = Some(observed);
-                    break;
-                }
-                self.unread.push_back(identity);
-            }
-            if let Some(observed) = next {
-                let identity = observed.identity();
-                let transport = Arc::clone(&self.transport);
-                self.pending = Some(FinalTaskInfoReadJob {
-                    observed,
-                    future: Box::pin(async move { transport.final_task_info(identity).await }),
-                });
-            }
-        }
-        let Some(job) = self.pending.as_mut() else {
-            return;
-        };
-        let result = match job.future.as_mut().poll(cx) {
-            Poll::Pending => return,
-            Poll::Ready(result) => result,
-        };
-        let job = self.pending.take().expect("same original final-info read");
-        let identity = job.observed.identity();
-        match result {
-            Ok(FinalTaskInfoRead::Available(info)) => {
-                match accept_final_info(&job.observed, info.as_ref()) {
-                    Ok(()) => self.collected.push(*info),
-                    Err(error) => {
-                        tracing::warn!(task = %identity, %error, "Final task info disagrees with the observed terminal")
-                    }
-                }
-            }
-            Ok(FinalTaskInfoRead::Unavailable(outcome)) => {
-                tracing::debug!(task = %identity, ?outcome, "Final task info is unavailable")
-            }
-            Err(error) => {
-                tracing::warn!(task = %identity, %error, "Final task info could not be read")
-            }
-        }
-        if self.accepting && !self.unread.is_empty() {
-            // The original waiter may have consumed the RPC wake before this
-            // Ready poll. Continue serial collection without a timer turn.
-            self.wake.wake();
-        }
     }
 }
 
@@ -4781,7 +4428,7 @@ fn abort_task_round(round: &mut TaskRound, reason: &str) {
 #[cfg(test)]
 mod final_task_info_exit_tests {
     use futures::future::BoxFuture;
-    use std::collections::VecDeque;
+    use std::collections::{BTreeSet, VecDeque};
     use std::future::poll_fn;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Waker};
@@ -5015,12 +4662,16 @@ mod final_task_info_exit_tests {
         use std::future::Future;
         let (mut round, acks, release) =
             crate::task_execution::tests::manifest_normal_release_ack_regression_fixture();
-        let identities = round
+        let frozen = round
             .execution()
             .graph()
             .tasks()
             .map(|task| task.identity())
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
+        // Diagnostic requests follow the original accepted terminal frontier.
+        // Their order is independent of planner ordinals, but coverage is exact.
+        let identities = round.execution().accepted_terminal_tasks().to_vec();
+        assert_eq!(identities.iter().copied().collect::<BTreeSet<_>>(), frozen);
         assert!(identities.len() > 1);
         assert!(identities.iter().all(|identity| {
             round
@@ -5085,7 +4736,7 @@ mod final_task_info_exit_tests {
         let mut disabled = FinalTaskInfoCollector::new(transport, false, &round, wake, runtime);
         disabled.poll_observe(&round, &mut cx);
         assert_eq!(
-            disabled.unread.capacity(),
+            disabled.unread.len(),
             0,
             "non-profile attempts allocate no task frontier"
         );

@@ -175,7 +175,8 @@ struct FrontendRoleProducts {
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     query_control: novarocks_query_application::session_control::QueryControlService,
     query_execution: crate::query_execution::service::QueryExecutionService,
-    logical_read_launcher: Arc<dyn crate::query_execution::logical_read::LogicalReadLauncher>,
+    logical_execution_launcher:
+        Arc<dyn crate::query_execution::logical_execution::LogicalExecutionLauncher>,
     topology: novarocks_query_application::api::BackendTopologyService,
     role: novarocks_types::ClusterRole,
     view_service: Arc<dyn novarocks_query_application::view::ViewService>,
@@ -342,7 +343,7 @@ async fn build_frontend_role_products(
             .map_err(FrontendApplicationError::server)?;
     }
     let query_execution = host.build_query_execution_service()?;
-    let logical_read_launcher = host.build_logical_read_launcher();
+    let logical_execution_launcher = host.build_logical_execution_launcher();
     let topology = host.backend_topology_port();
     let role = host.execution_role();
     let mv_repository = host.take_mv_repository_for_role_product_construction()?;
@@ -559,7 +560,7 @@ async fn build_frontend_role_products(
         typed_connector_control,
         query_control,
         query_execution,
-        logical_read_launcher,
+        logical_execution_launcher,
         topology,
         role,
         view_service,
@@ -723,7 +724,7 @@ fn build_frontend_query_session_factory_from_role_products(
         products.query_control.clone(),
         client_connection_control,
         query_execution,
-        Arc::clone(&products.logical_read_launcher),
+        Arc::clone(&products.logical_execution_launcher),
         host.workload_root_admission(),
         role,
         topology,

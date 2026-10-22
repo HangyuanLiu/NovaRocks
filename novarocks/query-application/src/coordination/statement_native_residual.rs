@@ -629,8 +629,28 @@ impl StatementNativeResidualRegistry {
             ));
         }
     }
+    pub(crate) fn record_root_ack_join_failure(&self, error: tokio::task::JoinError) {
+        if error.is_panic() {
+            self.record_health(
+                "optional root ACK task panicked after actual local exit",
+                Some(error.into_panic()),
+            );
+        } else {
+            self.record_health_cause(
+                "optional root ACK task was cancelled after actual local exit",
+                Arc::new(error),
+            );
+        }
+    }
     pub(crate) fn record_unproven_exit(&self, failure: StatementNativeHealthFailure) {
         let (message, cause) = failure.into_parts();
+        self.record_health_cause(message, cause);
+    }
+    fn record_health_cause(
+        &self,
+        message: &'static str,
+        cause: Arc<dyn std::error::Error + Send + Sync>,
+    ) {
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.health.is_none() {
             state.health = Some(OriginalHealth {

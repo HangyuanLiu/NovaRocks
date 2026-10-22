@@ -49,9 +49,13 @@ mod internal_supervisor_tests {
         cleanup_entered: AtomicBool,
         cleanup_completed: AtomicBool,
         active_dropped: AtomicBool,
+        final_ack_gate: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        final_ack_entered: AtomicBool,
         native_failure: std::sync::Mutex<Option<ExecutionFailureInput>>,
         replacement_failure: std::sync::Mutex<Option<ExecutionFailureInput>>,
         preparations: AtomicU64,
+        convergence_ready: std::sync::Mutex<Option<Option<ComputationReadyToken>>>,
+        convergence_deadline: std::sync::Mutex<Option<Instant>>,
         release_run: tokio::sync::Notify,
         release_cleanup: tokio::sync::Notify,
     }
@@ -149,7 +153,7 @@ mod internal_supervisor_tests {
         )
     }
 
-    struct CountEndPort;
+    struct CountEndPort(Arc<InternalAttemptSignals>);
 
     impl crate::api::BoundedRootReadPort for CountEndPort {
         fn read(
@@ -166,7 +170,19 @@ mod internal_supervisor_tests {
                     > + Send,
             >,
         > {
+            let signals = Arc::clone(&self.0);
+            let final_ack_gate = if request.wanted().is_none() {
+                signals.final_ack_gate.lock().unwrap().take()
+            } else {
+                None
+            };
             Box::pin(async move {
+                if request.wanted().is_none() {
+                    signals.final_ack_entered.store(true, Ordering::SeqCst);
+                    if let Some(gate) = final_ack_gate {
+                        gate.await.unwrap();
+                    }
+                }
                 assert_eq!(request.kind(), RootOutputKind::CountOnly);
                 let outcome = match request.wanted() {
                     Some(sequence) => {
@@ -277,7 +293,7 @@ mod internal_supervisor_tests {
                             payload: None,
                         })
                     } else {
-                        Arc::new(CountEndPort)
+                        Arc::new(CountEndPort(Arc::clone(&signals)))
                     };
                 let binding = super::super::super::RootRelayBinding {
                     port,
@@ -378,9 +394,29 @@ mod internal_supervisor_tests {
 
         fn converge<'a>(
             &'a mut self,
-            _: NativeActiveConvergenceRequest,
+            request: NativeActiveConvergenceRequest,
         ) -> NativeActiveAttemptConvergenceFuture<'a> {
             Box::pin(async move {
+                {
+                    let mut original = self.signals.convergence_ready.lock().unwrap();
+                    let ready = request.computation_ready();
+                    if let Some(first) = *original {
+                        assert_eq!(
+                            first, ready,
+                            "convergence reentry cannot replace the original Ready cut"
+                        );
+                    } else {
+                        *original = Some(ready);
+                    }
+                    let mut deadline = self.signals.convergence_deadline.lock().unwrap();
+                    if let Some(first) = *deadline {
+                        assert!(
+                            request.remote_observation_deadline() <= first,
+                            "convergence reentry cannot renew its budget"
+                        );
+                    }
+                    *deadline = Some(request.remote_observation_deadline());
+                }
                 self.signals.cleanup_entered.store(true, Ordering::SeqCst);
                 self.signals.release_cleanup.notified().await;
                 self.signals.cleanup_completed.store(true, Ordering::SeqCst);
@@ -393,95 +429,144 @@ mod internal_supervisor_tests {
 
     #[tokio::test]
     async fn actual_internal_consumer_returns_ready_before_native_run_and_cleanup() {
-        let (control, root) = governance();
-        let scope = root.owner.scope();
-        let window = scope
-            .result_capacity()
-            .unwrap()
-            .try_acquire(
-                &scope,
-                novarocks_workload_control::ResultWindowClass::Internal,
-            )
-            .unwrap();
-        let signals = Arc::new(InternalAttemptSignals::default());
-        let consumer = Arc::new(CheckedCountConsumer::default());
-        let request = internal_count_request(InternalCountPreparation {
-            backend: BackendProcessId::new_v7(),
-            window: TestWindow(window.retain_alias()),
-            signals: Arc::clone(&signals),
-        })
-        .with_internal_consumer(Arc::new(ObservedCountConsumer(Arc::clone(&consumer))))
-        .unwrap();
-        drop(window);
-        let cut = MonotonicInstant::from_origin(Duration::from_secs(91));
-        let config = supervisor_config();
-        let (mut supervisor, client) = LogicalExecutionSupervisor::with_clock(
-            Handle::current(),
-            Arc::new(BindingNativePort),
-            QueryProcessNamespace::new(0x6e),
-            FrontendProcessId::new_v7(),
-            config,
-            Arc::new(FixedComputationClock(cut)),
-        );
-        let mut handle =
-            tokio::time::timeout(Duration::from_secs(5), client.start(request, root.owner))
-                .await
-                .expect("internal readiness must not wait for held Native work")
-                .unwrap();
-        let token = *handle
-            .ready_token()
-            .expect("internal execution returns its accepted cut");
-        assert!(handle.take_output().is_none());
-        assert_eq!(token.cut(), cut);
-        assert_eq!(
-            token.diagnostic_deadline(),
-            cut.saturating_add(config.diagnostic_timeout)
-        );
-        assert_eq!(
-            token.convergence_deadline(),
-            cut.saturating_add(config.remote_cleanup_timeout)
-        );
-        assert_eq!(token.end().output_rows, INTERNAL_ROWS);
-        assert!(consumer.decoded.load(Ordering::SeqCst));
-        assert!(signals.run_entered.load(Ordering::SeqCst));
-        assert!(!signals.run_returned.load(Ordering::SeqCst));
-        assert!(!signals.cleanup_completed.load(Ordering::SeqCst));
-        assert!(!signals.active_dropped.load(Ordering::SeqCst));
-        assert_eq!(supervisor.registry.active_native_custody_count(), 1);
-
-        handle.request_cancel().unwrap();
-        tokio::task::yield_now().await;
-        assert_eq!(handle.ready_token(), Some(&token));
-        assert_eq!(
-            consumer
-                .ready_observation
-                .lock()
+        for shutdown_before_ack_exit in [false, true] {
+            let (control, root) = governance();
+            let scope = root.owner.scope();
+            let window = scope
+                .result_capacity()
                 .unwrap()
-                .as_ref()
-                .expect("the registered consumer retains the actor's actual readiness observer")
-                .borrow()
-                .as_ref(),
-            Some(&Ok(token))
-        );
-        assert!(!signals.cleanup_completed.load(Ordering::SeqCst));
-        assert!(!signals.active_dropped.load(Ordering::SeqCst));
-        signals.release_run.notify_one();
-        signals.release_cleanup.notify_one();
-        drop(handle);
-        root.business.release();
-        supervisor
-            .shutdown_until(Instant::now() + Duration::from_secs(5))
+                .try_acquire(
+                    &scope,
+                    novarocks_workload_control::ResultWindowClass::Internal,
+                )
+                .unwrap();
+            let signals = Arc::new(InternalAttemptSignals::default());
+            let (release_ack, ack_gate) = tokio::sync::oneshot::channel();
+            *signals.final_ack_gate.lock().unwrap() = Some(ack_gate);
+            let consumer = Arc::new(CheckedCountConsumer::default());
+            let request = internal_count_request(InternalCountPreparation {
+                backend: BackendProcessId::new_v7(),
+                window: TestWindow(window.retain_alias()),
+                signals: Arc::clone(&signals),
+            })
+            .with_internal_consumer(Arc::new(ObservedCountConsumer(Arc::clone(&consumer))))
+            .unwrap();
+            drop(window);
+            let cut = MonotonicInstant::from_origin(Duration::from_secs(91));
+            let config = supervisor_config();
+            let (mut supervisor, client) = LogicalExecutionSupervisor::with_clock(
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(0x6e),
+                FrontendProcessId::new_v7(),
+                config,
+                Arc::new(FixedComputationClock(cut)),
+            );
+            let mut handle =
+                tokio::time::timeout(Duration::from_secs(5), client.start(request, root.owner))
+                    .await
+                    .expect("internal readiness must not wait for held Native work")
+                    .unwrap();
+            let token = *handle
+                .ready_token()
+                .expect("internal execution returns its accepted cut");
+            assert!(handle.take_output().is_none());
+            assert_eq!(token.cut(), cut);
+            assert_eq!(
+                token.diagnostic_deadline(),
+                cut.saturating_add(config.diagnostic_timeout)
+            );
+            assert_eq!(
+                token.convergence_deadline(),
+                cut.saturating_add(config.remote_cleanup_timeout)
+            );
+            assert_eq!(token.end().output_rows, INTERNAL_ROWS);
+            assert!(consumer.decoded.load(Ordering::SeqCst));
+            assert!(signals.run_entered.load(Ordering::SeqCst));
+            assert!(!signals.run_returned.load(Ordering::SeqCst));
+            assert!(!signals.cleanup_completed.load(Ordering::SeqCst));
+            assert!(!signals.active_dropped.load(Ordering::SeqCst));
+            assert_eq!(supervisor.registry.active_native_custody_count(), 1);
+
+            handle.request_cancel().unwrap();
+            tokio::task::yield_now().await;
+            assert_eq!(handle.ready_token(), Some(&token));
+            assert_eq!(
+                consumer
+                    .ready_observation
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .expect("the registered consumer retains the actor's actual readiness observer")
+                    .borrow()
+                    .as_ref(),
+                Some(&Ok(token))
+            );
+            assert!(!signals.cleanup_completed.load(Ordering::SeqCst));
+            assert!(!signals.active_dropped.load(Ordering::SeqCst));
+            signals.release_run.notify_one();
+            signals.release_cleanup.notify_one();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !signals.active_dropped.load(Ordering::SeqCst)
+                    || !signals.final_ack_entered.load(Ordering::SeqCst)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
             .unwrap();
-        acknowledge_all_control(&control);
-        tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
+            assert!(signals.cleanup_completed.load(Ordering::SeqCst));
+            assert_eq!(
+                supervisor.registry.active_native_custody_count(),
+                1,
+                "Native closure and logical readiness cannot retire the pending ACK tail"
+            );
+            assert_eq!(supervisor.registry.root_ack_tail_count(), 1);
+            assert_eq!(handle.ready_token(), Some(&token));
+            if shutdown_before_ack_exit {
+                assert!(matches!(
+                    supervisor.shutdown_until(Instant::now()).await,
+                    Err(LogicalExecutionSupervisorShutdownError::DeadlineExceeded)
+                ));
+                assert_eq!(
+                    supervisor.registry.root_ack_tail_count(),
+                    1,
+                    "a bounded shutdown wait retains the same unfinished ACK join"
+                );
+            }
+            release_ack.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while supervisor.registry.active_native_custody_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
             .unwrap();
-        assert_eq!(*consumer.accepted.lock().unwrap(), Some(token));
-        assert!(signals.cleanup_entered.load(Ordering::SeqCst));
-        assert!(signals.cleanup_completed.load(Ordering::SeqCst));
-        assert!(signals.active_dropped.load(Ordering::SeqCst));
-        assert_eq!(supervisor.registry.active_native_custody_count(), 0);
+            assert_eq!(
+                supervisor.registry.root_ack_tail_count(),
+                0,
+                "both ordinary and shutdown process loops join the original ACK tail"
+            );
+            drop(handle);
+            root.business.release();
+            supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap();
+            acknowledge_all_control(&control);
+            tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
+                .await
+                .unwrap();
+            assert_eq!(*consumer.accepted.lock().unwrap(), Some(token));
+            assert_eq!(
+                *signals.convergence_ready.lock().unwrap(),
+                Some(Some(token))
+            );
+            assert!(signals.cleanup_entered.load(Ordering::SeqCst));
+            assert!(signals.cleanup_completed.load(Ordering::SeqCst));
+            assert!(signals.active_dropped.load(Ordering::SeqCst));
+            assert_eq!(supervisor.registry.active_native_custody_count(), 0);
+        }
     }
 
     #[tokio::test]

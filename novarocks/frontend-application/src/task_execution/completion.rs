@@ -212,7 +212,10 @@ impl std::fmt::Display for WriteVerdict {
 pub struct WriteCompletionTracker {
     writers: BTreeSet<TaskIdentity>,
     root_finish: TaskIdentity,
-    statuses: BTreeMap<TaskIdentity, TaskStatus>,
+    // Each original writer remains here until its current status satisfies
+    // this owner's success-compatible rule. Verdicts never rescan completed writers.
+    pending_writers: BTreeMap<TaskIdentity, TaskState>,
+    root_state: TaskState,
     undeclared_writers: BTreeSet<TaskIdentity>,
 }
 
@@ -232,10 +235,15 @@ impl WriteCompletionTracker {
                 "a distributed write declares no writer task".to_owned(),
             ));
         }
+        let pending_writers = writers
+            .iter()
+            .map(|&writer| (writer, TaskState::Planned))
+            .collect();
         Ok(Self {
             writers,
             root_finish,
-            statuses: BTreeMap::new(),
+            pending_writers,
+            root_state: TaskState::Planned,
             undeclared_writers: BTreeSet::new(),
         })
     }
@@ -251,9 +259,21 @@ impl WriteCompletionTracker {
     /// a writer invalidates the declared set.
     pub fn observe_status(&mut self, status: &TaskStatus) {
         let identity = status.identity();
-        let is_declared = self.writers.contains(&identity) || identity == self.root_finish;
-        if is_declared {
-            self.statuses.insert(identity, status.clone());
+        let is_writer = self.writers.contains(&identity);
+        if identity == self.root_finish {
+            self.root_state = status.state();
+        }
+        if is_writer {
+            if status.state() == TaskState::Finished
+                || (status.state() == TaskState::Canceled
+                    && status.is_success_compatible_terminal())
+            {
+                self.pending_writers.remove(&identity);
+            } else {
+                self.pending_writers.insert(identity, status.state());
+            }
+        }
+        if is_writer || identity == self.root_finish {
             return;
         }
         if status.writer().is_some() {
@@ -273,34 +293,13 @@ impl WriteCompletionTracker {
         if let Some(&undeclared) = self.undeclared_writers.iter().next() {
             return WriteVerdict::UndeclaredWriter(undeclared);
         }
-        for task in self.writers.iter().copied() {
-            // An unobserved task is `PLANNED` here rather than absent: not
-            // having heard from a writer is not evidence that it finished.
-            let Some(status) = self.statuses.get(&task) else {
-                return WriteVerdict::TaskNotFinished {
-                    task,
-                    state: TaskState::Planned,
-                };
-            };
-            if status.state() == TaskState::Finished {
-                continue;
-            }
-            if status.state() == TaskState::Canceled && status.is_success_compatible_terminal() {
-                continue;
-            }
-            return WriteVerdict::TaskNotFinished {
-                task,
-                state: status.state(),
-            };
+        if let Some((&task, &state)) = self.pending_writers.first_key_value() {
+            return WriteVerdict::TaskNotFinished { task, state };
         }
-        let root_state = self
-            .statuses
-            .get(&self.root_finish)
-            .map_or(TaskState::Planned, TaskStatus::state);
-        if root_state != TaskState::Finished {
+        if self.root_state != TaskState::Finished {
             return WriteVerdict::TaskNotFinished {
                 task: self.root_finish,
-                state: root_state,
+                state: self.root_state,
             };
         }
         WriteVerdict::Complete

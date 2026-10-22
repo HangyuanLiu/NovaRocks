@@ -273,6 +273,7 @@ pub(crate) struct TaskRound {
     connector_blocking_io: Option<ConnectorBlockingIoSupervisor>,
     root_status_sender: Option<AcceptedRootStatusSender>,
     root_status_source: Option<AcceptedRootStatusSource>,
+    protocol_facts: Option<super::protocol_facts::AttemptProtocolFactsPublisher>,
     /// Result consumes root output; other intents retain their Task evidence.
     result_consumer_attached: bool,
     pending_success_seal:
@@ -339,6 +340,7 @@ impl TaskRound {
             connector_blocking_io: None,
             root_status_sender: Some(root_status_sender),
             root_status_source: Some(root_status_source),
+            protocol_facts: None,
             result_consumer_attached: false,
             pending_success_seal: None,
             abort_effect_intake: None,
@@ -349,6 +351,58 @@ impl TaskRound {
             normal_drain_started: false,
             terminal_cleanup_started: false,
         }
+    }
+
+    pub(crate) fn install_protocol_facts(
+        &mut self,
+        plan: novarocks_query_application::api::PlanSeal,
+        writer_fragments: &BTreeSet<crate::query_execution::artifact::FragmentId>,
+    ) -> Result<super::protocol_facts::AttemptProtocolFactsReceiver, TaskExecutionError> {
+        if self.protocol_facts.is_some() || self.root_status_source.is_none() {
+            return Err(TaskExecutionError::Schedule(
+                "protocol facts must be installed once before root source transfer".to_owned(),
+            ));
+        }
+        let (publisher, receiver) =
+            super::protocol_facts::AttemptProtocolFactsPublisher::for_graph(
+                plan,
+                self.execution.graph(),
+                writer_fragments,
+            )?;
+        self.protocol_facts = Some(publisher);
+        Ok(receiver)
+    }
+
+    pub(crate) fn bind_protocol_drive(
+        &mut self,
+        drive: &novarocks_query_application::coordination::NativeAttemptDrive,
+    ) -> Result<(), TaskExecutionError> {
+        if let Some(publisher) = self.protocol_facts.as_mut() {
+            publisher.bind(drive)?;
+            publisher.publish(&mut self.execution, self.success_sealed)?;
+        }
+        Ok(())
+    }
+
+    fn publish_protocol_facts(&mut self) -> Result<(), TaskExecutionError> {
+        if let Some(publisher) = self.protocol_facts.as_mut() {
+            publisher.publish(&mut self.execution, self.success_sealed)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_computation_ready(
+        &self,
+        ready: novarocks_query_application::api::ComputationReadyToken,
+    ) -> Result<(), TaskExecutionError> {
+        self.protocol_facts
+            .as_ref()
+            .ok_or_else(|| {
+                TaskExecutionError::Schedule(
+                    "computation cut has no original Native protocol binding".to_owned(),
+                )
+            })?
+            .verify_computation_ready(ready)
     }
 
     fn legacy_subscriber(&self) -> &dyn StatusSubscriptions {
@@ -611,19 +665,26 @@ impl TaskRound {
             || self.terminal_cleanup_started
             || self.execution.failure_cause().is_some()
         {
-            // Local close must still advance even when an unrelated ACK or
-            // observation below returns an error on this turn.
             for pump in &mut self.pumps {
                 pump.begin_close();
-                // A completed local job may publish a new domain error at
-                // the same cut as its exit proof. Observe that once too.
-                match pump.owner.close_turn() {
-                    Ok(moved) => report.pumped += moved,
-                    Err(error) if !pump.close_error_observed && pump.close_error.is_none() => {
-                        pump.close_error = Some(error);
-                    }
-                    Err(_) => {}
+            }
+        }
+        // Input close progresses independently of remote drain or cleanup:
+        // Profile can retain remote diagnostics after stopping local inputs.
+        // Advance every original close owner before any ACK/status error can
+        // return from this turn, without treating a close error as exit proof.
+        for pump in &mut self.pumps {
+            if !pump.closing {
+                continue;
+            }
+            // A completed local job may publish a new domain error at
+            // the same cut as its exit proof. Observe that once too.
+            match pump.owner.close_turn() {
+                Ok(moved) => report.pumped += moved,
+                Err(error) if !pump.close_error_observed && pump.close_error.is_none() => {
+                    pump.close_error = Some(error);
                 }
+                Err(_) => {}
             }
         }
         if !self.pumps_sealed {
@@ -780,6 +841,10 @@ impl TaskRound {
         if !status.resubscribe {
             self.try_settle_success_seal()?;
         }
+        // All accepted statuses and the selected failure latch have folded;
+        // include a seal accepted at this same serial cut. Idle turns retain
+        // the previous revision/Arc without cloning the full Task status set.
+        self.publish_protocol_facts()?;
         for context in self.execution.take_covered_reconciliations() {
             if self.needs_covered_observation(context)
                 && let Some(subscriber) = &self.covered_subscriber

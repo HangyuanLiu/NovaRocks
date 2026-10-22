@@ -241,16 +241,34 @@ impl NativeAttemptConvergenceOwner {
         mode: NativeAttemptConvergenceMode,
         request: NativeActiveConvergenceRequest,
         notify: &tokio::sync::Notify,
+        mut profile: Option<&mut super::profile_diagnostics::TaskFinalInfoCollector>,
     ) -> Result<NativeActiveConvergenceClosure, StatementNativeHealthFailure> {
         let deadline = self.retain_remote_deadline(request.remote_observation_deadline());
         loop {
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            if let Some(profile) = profile.as_deref_mut() {
+                let now = round.execution().monotonic_now();
+                let cancelled = request.cancellation().reason().is_some();
+                let round_poll = &mut *round;
+                let profile_poll = &mut *profile;
+                std::future::poll_fn(move |cx| {
+                    profile_poll.poll_profile_observation(round_poll, now, cancelled, cx);
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                if profile.observation_deadline().is_none() {
+                    round.execution_mut().release_profile_diagnostics();
+                }
+            }
             self.begin(round, split_delivery, mode);
             self.observe_local_close(round)?;
             self.observe_remote_closure(round, deadline);
             if round.pumps_closed()
+                && profile.as_ref().is_none_or(|profile| {
+                    profile.is_closed() && profile.observation_deadline().is_none()
+                })
                 && let Some(closure) = &self.remote_closure
             {
                 return Ok(closure.clone());
@@ -261,13 +279,18 @@ impl NativeAttemptConvergenceOwner {
                 mode,
                 request.cancellation().reason().is_some(),
             ) {
-                Ok(NativeAttemptConvergenceStep::Ready) => true,
+                // A retained remote fact is not fresh progress while an
+                // independent original diagnostic read still has to exit.
+                Ok(NativeAttemptConvergenceStep::Ready(_)) => false,
                 Ok(NativeAttemptConvergenceStep::Pending { moved }) => moved,
                 Err(_) => false,
             };
             self.observe_local_close(round)?;
             self.observe_remote_closure(round, deadline);
             if round.pumps_closed()
+                && profile.as_ref().is_none_or(|profile| {
+                    profile.is_closed() && profile.observation_deadline().is_none()
+                })
                 && let Some(closure) = &self.remote_closure
             {
                 return Ok(closure.clone());
@@ -833,6 +856,7 @@ mod tests {
                 NativeAttemptConvergenceMode::Cleanup,
                 request,
                 &notify,
+                None,
             ),
         )
         .await
@@ -854,6 +878,7 @@ mod tests {
                     std::time::Instant::now(),
                 ),
                 &notify,
+                None,
             ),
         )
         .await
@@ -873,6 +898,7 @@ mod tests {
                     std::time::Instant::now() + std::time::Duration::from_secs(60),
                 ),
                 &notify,
+                None,
             ),
         )
         .await
@@ -964,4 +990,6 @@ mod tests {
             &[(context.backend_process_id(), contribution)]
         );
     }
+
+    include!("attempt_convergence_diagnostic_exit_tests.rs");
 }

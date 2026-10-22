@@ -22,6 +22,8 @@
 //! unpivot/result operators. This module retains the frozen expectations and
 //! validates the Root result stream before the provider session may finish.
 
+pub(crate) mod completion;
+
 use novarocks_native_adapter::root_record_assembly::{RootRecordAssembly, RootRecordDomain};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

@@ -37,11 +37,9 @@ use crate::native::task_transport::{
 };
 use crate::query_execution::artifact::ValidatedNativeSubmission;
 use crate::query_execution::schedule::SchedulingPlan;
-use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::task_execution::clock::ProcessMonotonicClock;
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::QueryTaskExecution;
-use crate::task_execution::feedback_pump::{DynamicFilterFeedbackPump, TaskDynamicFilterReads};
 use crate::task_execution::graph::{TaskGraphInputs, build_task_graph};
 use crate::task_execution::intent::TaskOperationSink;
 use crate::task_execution::round::{AcknowledgementObserver, TaskRound};
@@ -76,41 +74,6 @@ pub(crate) struct AttemptTransport {
 pub(crate) struct AssembledRound {
     pub(crate) round: TaskRound,
     pub(crate) split_delivery: Arc<SplitDeliveryBridge>,
-}
-
-/// Everything the two per-attempt feedback loops are built from.
-///
-/// It is one struct rather than seven parameters so the one call site cannot
-/// silently drop a fact by reordering: every field here is a loop's only
-/// source, and a loop with a missing source is a loop that never runs.
-pub(crate) struct AttemptPumps {
-    pub(crate) execution_id: QueryExecutionId,
-    pub(crate) feedback_state: Arc<RuntimeFilterFeedbackState>,
-    /// How many feedback channels the sealed filter deployment declared.
-    pub(crate) declared_feedback_channels: usize,
-    pub(crate) reads: Arc<dyn TaskDynamicFilterReads>,
-}
-
-/// Installs one attempt's per-turn owners and declares the set complete.
-///
-/// One loop now, not two. The credential rotation owner used to be installed
-/// here and returned so the caller could stop it during the drain; a consumer
-/// that renews for itself has nothing for a coordinator turn to drive, so
-/// there is nothing to stop (CAD-1 D3).
-pub(crate) fn install_attempt_pumps(round: &mut TaskRound, pumps: AttemptPumps) {
-    // The dynamic filter reader closes the loop the connector split sources
-    // are already waiting on. Without it every channel stays pending, each
-    // source waits out its own initial cap and then enumerates unpruned --
-    // which changes pruning and latency but no rows, so no result assertion
-    // anywhere can see its absence.
-    if let Some(pump) = DynamicFilterFeedbackPump::new(
-        pumps.feedback_state,
-        pumps.reads,
-        pumps.declared_feedback_channels,
-    ) {
-        round.add_pump(Box::new(pump));
-    }
-    round.seal_pumps();
 }
 
 /// Builds the runner for one attempt.

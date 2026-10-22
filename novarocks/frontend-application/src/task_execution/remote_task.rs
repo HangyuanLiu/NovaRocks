@@ -637,11 +637,28 @@ impl RemoteTask {
         update: TaskDomainUpdate,
         queue_permit: Box<dyn TaskOperationQueuePermit>,
     ) -> Result<UpdateAdmission, TaskExecutionError> {
-        if self.normal_stand_down && !is_destination_close(&update) {
-            return Ok(UpdateAdmission::DiscardedTerminal);
-        }
-        if matches!(self.state, RemoteTaskState::Terminal) || self.awaiting_terminal_status {
-            return Ok(UpdateAdmission::DiscardedTerminal);
+        if (self.normal_stand_down && !is_destination_close(&update))
+            || matches!(self.state, RemoteTaskState::Terminal)
+            || self.awaiting_terminal_status
+        {
+            // Only this original Task owner can distinguish withdrawn demand
+            // from an observed failure or a terminal outcome still awaiting its
+            // status. Normal input withdrawal never replaces a contrary cause.
+            let normal_withdrawal = self.normal_stand_down
+                && self
+                    .status
+                    .as_ref()
+                    .and_then(TaskStatus::termination)
+                    .is_none_or(TerminationDetail::is_success_compatible);
+            let normal_terminal = self
+                .status
+                .as_ref()
+                .is_some_and(TaskStatus::is_success_compatible_terminal);
+            return Ok(if normal_withdrawal || normal_terminal {
+                UpdateAdmission::DiscardedNoLongerNeeded
+            } else {
+                UpdateAdmission::DiscardedTerminal
+            });
         }
         let expected_receipt = self.admit_domain(&update)?;
         self.pending.push_back(PendingUpdate {
@@ -1498,6 +1515,10 @@ mod destination_close_tests {
 pub enum UpdateAdmission {
     /// The fact is queued and will be sent when this task may send.
     Queued,
-    /// The task is terminal, so the fact was discarded.
+    /// The original owner withdrew normal input demand or accepted a
+    /// success-compatible terminal. This is not a Task success or exit proof.
+    DiscardedNoLongerNeeded,
+    /// Input is closed without a positive normal-completion fact, including
+    /// an observed failure or a terminal outcome still awaiting its status.
     DiscardedTerminal,
 }

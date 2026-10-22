@@ -336,8 +336,16 @@ pub struct QueryTaskExecution {
     status_reconciliations: BTreeSet<QueryContextRef>,
     covered_reconciliations: BTreeSet<QueryContextRef>,
     normal_drain_started: bool,
+    profile_release_deadline: Option<MonotonicInstant>,
     terminal_cleanup_started: bool,
     failure: TerminationLatch,
+    accepted_protocol_revision: u64,
+    // One ordinal per frozen Task, appended only on its first accepted terminal.
+    // Diagnostic readers keep their own cursor; no idle graph scan is needed.
+    accepted_terminal_tasks: Vec<TaskIdentity>,
+    accepted_terminal_seen: BTreeSet<TaskIdentity>,
+    accepted_protocol_dirty_tasks: BTreeSet<TaskId>,
+    accepted_protocol_writer_evidence: BTreeMap<TaskId, Arc<TaskStatus>>,
     read: ReadCompletionTracker,
     required_evidence_deadlines: BTreeMap<TaskIdentity, MonotonicInstant>,
     required_result_terminal_control_deadline: Option<MonotonicInstant>,
@@ -608,8 +616,14 @@ impl QueryTaskExecution {
             status_reconciliations: BTreeSet::new(),
             covered_reconciliations: BTreeSet::new(),
             normal_drain_started: false,
+            profile_release_deadline: None,
             terminal_cleanup_started: false,
             failure: TerminationLatch::open(),
+            accepted_protocol_revision: 0,
+            accepted_terminal_tasks: Vec::new(),
+            accepted_terminal_seen: BTreeSet::new(),
+            accepted_protocol_dirty_tasks: BTreeSet::new(),
+            accepted_protocol_writer_evidence: BTreeMap::new(),
             read,
             required_evidence_deadlines: BTreeMap::new(),
             required_result_terminal_control_deadline: None,
@@ -649,6 +663,21 @@ impl QueryTaskExecution {
 
     pub const fn graph(&self) -> &TaskGraph {
         &self.graph
+    }
+
+    pub(crate) fn monotonic_now(&self) -> MonotonicInstant {
+        self.clock.now()
+    }
+
+    pub(crate) fn retain_profile_diagnostics_until(&mut self, deadline: MonotonicInstant) {
+        self.profile_release_deadline = Some(
+            self.profile_release_deadline
+                .map_or(deadline, |old| old.min(deadline)),
+        );
+    }
+
+    pub(crate) fn release_profile_diagnostics(&mut self) {
+        self.profile_release_deadline = None;
     }
 
     #[cfg(test)]
@@ -719,6 +748,83 @@ impl QueryTaskExecution {
             complete: self.owners.values().all(QueryContextOwner::is_released),
             #[cfg(test)]
             contexts: self.owners.len(),
+        }
+    }
+
+    pub(crate) const fn accepted_protocol_revision(&self) -> u64 {
+        self.accepted_protocol_revision
+    }
+
+    pub(crate) fn accepted_terminal_tasks(&self) -> &[TaskIdentity] {
+        &self.accepted_terminal_tasks
+    }
+
+    pub(crate) fn accepted_protocol_task_changes(&self) -> &BTreeSet<TaskId> {
+        &self.accepted_protocol_dirty_tasks
+    }
+
+    pub(crate) fn clear_accepted_protocol_task_changes(&mut self) {
+        self.accepted_protocol_dirty_tasks.clear();
+    }
+
+    pub(crate) fn accepted_protocol_writer_witness(
+        &self,
+        task: TaskId,
+    ) -> Option<&Arc<TaskStatus>> {
+        self.accepted_protocol_writer_evidence.get(&task)
+    }
+
+    fn note_accepted_protocol_task(
+        &mut self,
+        identity: TaskIdentity,
+    ) -> Result<(), TaskExecutionError> {
+        let task_id = identity.task_id();
+        if !self
+            .accepted_protocol_writer_evidence
+            .contains_key(&task_id)
+            && let Some(status) = self
+                .task(task_id)
+                .and_then(RemoteTask::status)
+                .filter(|status| status.writer().is_some())
+        {
+            // One original accepted writer witness per frozen Task. A later
+            // coalesced status cannot erase the undeclared-writer evidence.
+            let witness = Arc::new(status.clone());
+            self.accepted_protocol_writer_evidence
+                .insert(task_id, witness);
+        }
+        if self
+            .task(task_id)
+            .and_then(RemoteTask::status)
+            .is_some_and(|status| status.is_terminal())
+            && self.accepted_terminal_seen.insert(identity)
+        {
+            self.accepted_terminal_tasks.push(identity);
+        }
+        self.accepted_protocol_dirty_tasks.insert(task_id);
+        self.note_accepted_protocol_change()
+    }
+
+    fn note_accepted_protocol_change(&mut self) -> Result<(), TaskExecutionError> {
+        self.accepted_protocol_revision = self
+            .accepted_protocol_revision
+            .checked_add(1)
+            .ok_or_else(|| {
+                TaskExecutionError::Schedule(
+                    "accepted protocol owner revision exhausted".to_owned(),
+                )
+            })?;
+        Ok(())
+    }
+
+    fn latch_accepted_task_failure(
+        &mut self,
+        identity: TaskIdentity,
+        detail: TerminationDetail,
+    ) -> Result<(), TaskExecutionError> {
+        match self.failure.latch(identity, detail) {
+            LatchOutcome::Won | LatchOutcome::Refined(_) => self.note_accepted_protocol_change(),
+            LatchOutcome::Lost(_) => Ok(()),
         }
     }
 
@@ -846,7 +952,10 @@ impl QueryTaskExecution {
                     intent,
                 ));
             }
-            if release_ready.get(&context) == Some(&true)
+            if !self
+                .profile_release_deadline
+                .is_some_and(|deadline| !now.has_reached(deadline))
+                && release_ready.get(&context) == Some(&true)
                 && let Some(intent) = owner.release_intent(now)
             {
                 lifecycle.push(AdmissionCandidate::minted(
@@ -1330,7 +1439,10 @@ impl QueryTaskExecution {
                     .owners
                     .get(&context)
                     .is_some_and(QueryContextOwner::establish_acknowledged);
+                let previous_status = task.status().map(TaskStatus::version);
                 let settlement = task.on_create_ack(ack, self.clock.now(), context_established)?;
+                let accepted_status_changed =
+                    previous_status != task.status().map(TaskStatus::version);
                 if !matches!(settlement, CreateSettlement::Created) {
                     if let CreateSettlement::FailedClosed(_) = settlement {
                         return Err(TaskExecutionError::OperationFailed {
@@ -1352,9 +1464,14 @@ impl QueryTaskExecution {
                 {
                     owner.note_create_owned();
                 }
+                // An applied Create ACK can adopt its original TaskStatus;
+                // this path does not contribute to StatusReport.accepted.
+                if accepted_status_changed {
+                    self.note_accepted_protocol_task(identity)?;
+                }
                 self.reconcile_destination_input(identity)?;
                 self.settle_task_drain(stage_id, task_id);
-                self.accept_task_failure(identity);
+                self.accept_task_failure(identity)?;
                 Ok(())
             }
             OperationKind::UpdateTask => match task.on_update_ack(ack)? {
@@ -2104,24 +2221,30 @@ impl QueryTaskExecution {
             .expect("the stage was just located");
         let task = stage.task_mut(task_id).expect("the task was just located");
         let was_owned = task.create_ownership_proven();
-        match task.observe_status(status)? {
-            StatusObservation::Accept => report.accepted += 1,
-            _ => report.ignored += 1,
-        }
+        let accepted = match task.observe_status(status)? {
+            StatusObservation::Accept => {
+                report.accepted += 1;
+                true
+            }
+            _ => {
+                report.ignored += 1;
+                false
+            }
+        };
         let became_owned = !was_owned && task.create_ownership_proven();
         let installed = task.installed();
         if became_owned && let Some(owner) = self.owners.get_mut(&task.context()) {
             owner.note_create_owned();
         }
-        if let Some(terminal) = task.terminal_report() {
+        let terminal = task.terminal_report();
+        if accepted {
+            self.note_accepted_protocol_task(identity)?;
+        }
+        if let Some(terminal) = terminal {
             if let Some(detail) = &terminal.termination
                 && !detail.is_success_compatible()
-                && matches!(
-                    self.failure.latch(identity, detail.clone()),
-                    LatchOutcome::Won
-                )
             {
-                // The first cause wins and is the one every observer sees.
+                self.latch_accepted_task_failure(identity, detail.clone())?;
             }
             report.terminal.push(terminal);
         }
@@ -2129,11 +2252,11 @@ impl QueryTaskExecution {
             self.reconcile_destination_input(identity)?;
         }
         self.settle_task_drain(stage_id, task_id);
-        self.accept_task_failure(identity);
+        self.accept_task_failure(identity)?;
         Ok(())
     }
 
-    fn accept_task_failure(&mut self, identity: TaskIdentity) {
+    fn accept_task_failure(&mut self, identity: TaskIdentity) -> Result<(), TaskExecutionError> {
         let detail = self
             .task_by_identity_ref(identity)
             .and_then(|task| task.status())
@@ -2141,11 +2264,12 @@ impl QueryTaskExecution {
             .filter(|detail| !detail.is_success_compatible())
             .cloned();
         if let Some(detail) = detail {
-            self.failure.latch(identity, detail);
+            self.latch_accepted_task_failure(identity, detail)?;
             // Freeze normal admission in the fact's own serial turn. Returning
             // W cannot authorize another Create after the attempt has failed.
             self.begin_terminal_cleanup();
         }
+        Ok(())
     }
 
     /// Publishes one task's drain facts to its context owner, once each.

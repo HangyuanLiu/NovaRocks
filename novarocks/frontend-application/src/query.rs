@@ -38,7 +38,7 @@ use crate::query_execution::dml::delete::DeleteEngine;
 use crate::query_execution::dml::insert::InsertEngine;
 use crate::query_execution::dml::mutation::MutationEngine;
 use crate::query_execution::dml::truncate::TruncateEngine;
-use crate::query_execution::logical_read::LogicalReadLauncher;
+use crate::query_execution::logical_execution::LogicalExecutionLauncher;
 use crate::query_execution::maintenance::command::{
     MaintenanceCommandExecutor, MaintenanceReadCommandExecutor,
 };
@@ -1145,7 +1145,7 @@ pub struct FrontendQueryService {
     query_control: QueryControlService,
     client_connection_control: Arc<dyn ClientConnectionControlPort>,
     query_execution: QueryExecutionService,
-    logical_read_launcher: Arc<dyn LogicalReadLauncher>,
+    logical_execution_launcher: Arc<dyn LogicalExecutionLauncher>,
     workload_root_admission: RootAdmissionHandle,
     role: ClusterRole,
     topology: BackendTopologyService,
@@ -1199,7 +1199,7 @@ impl FrontendQueryService {
         query_control: QueryControlService,
         client_connection_control: Arc<dyn ClientConnectionControlPort>,
         query_execution: QueryExecutionService,
-        logical_read_launcher: Arc<dyn LogicalReadLauncher>,
+        logical_execution_launcher: Arc<dyn LogicalExecutionLauncher>,
         workload_root_admission: RootAdmissionHandle,
         role: ClusterRole,
         topology: BackendTopologyService,
@@ -1235,7 +1235,7 @@ impl FrontendQueryService {
             query_control,
             client_connection_control,
             query_execution,
-            logical_read_launcher,
+            logical_execution_launcher,
             workload_root_admission,
             role,
             topology,
@@ -1893,7 +1893,7 @@ impl FrontendQuerySession {
                     None => None,
                 };
                 let start = {
-                    self.service.logical_read_launcher.start(
+                    self.service.logical_execution_launcher.start(
                         read,
                         child,
                         result_window,
@@ -2030,7 +2030,7 @@ impl FrontendQuerySession {
             .take_execution_owner()
             .expect("governed query start transfers its root owner exactly once");
         let start = {
-            self.service.logical_read_launcher.start(
+            self.service.logical_execution_launcher.start(
                 read,
                 owner,
                 statement.result_window_alias(),

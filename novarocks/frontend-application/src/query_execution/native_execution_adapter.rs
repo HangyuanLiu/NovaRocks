@@ -41,8 +41,8 @@ use novarocks_query_application::api::{
     NativeActiveConvergenceRequest, NativeAttemptActivationFailure, NativeAttemptActivationFuture,
     NativeAttemptConvergenceFuture, NativeAttemptPreparationError, NativeAttemptPreparationFailure,
     NativeAttemptPreparationFuture, NativeAttemptPreparationPort, NativeAttemptPreparationRequest,
-    NativeAttemptRunFuture, QueryExecutionClient, QueryExecutionError, QueryExecutionFuture,
-    QueryExecutionRequest,
+    NativeAttemptRunFuture, NativeAttemptTerminal, QueryExecutionClient, QueryExecutionError,
+    QueryExecutionFuture, QueryExecutionRequest,
 };
 use novarocks_query_application::coordination::{
     AbortQueryContextEffectAdmission, AbortQueryContextEffectPort, AbortQueryContextIssueIdentity,
@@ -52,7 +52,8 @@ use novarocks_query_application::coordination::{
     ReplacementQualificationEffectAdmission, ReplacementQualificationEffectPort,
     ReplacementQualificationEffectReservation, ReplacementQualificationEffectSubmission,
     ReplacementQualificationFailure, ReplacementQualificationIdentity,
-    ReplacementQualificationRequest, RootRelayBinding, RootRelayFrontier,
+    ReplacementQualificationRequest, ReplacementWorkerAdmissionEvidence, RootRelayBinding,
+    RootRelayFrontier,
 };
 use novarocks_query_application::execution_error::{
     ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
@@ -62,7 +63,6 @@ use novarocks_types::NativeCompatibilityId;
 use novarocks_workload_control::WorkOwner;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 
-use crate::coordinator::task_round::{AttemptPumps, install_attempt_pumps};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
@@ -81,14 +81,20 @@ use crate::query_execution::attempt_initialization::{
 };
 use crate::query_execution::completion::PreparedLogicalRead;
 use crate::query_execution::contract::{DistributedQueryError, ResolvedQueryOptions};
+use crate::query_execution::internal_consumer::attempt_handoff::{
+    AttemptHandoffOfferPort, AttemptHandoffProducer, AttemptHandoffResources,
+};
 use crate::query_execution::lifecycle_plan::QueryInitOptions;
-use crate::query_execution::logical_read::LogicalReadLauncher;
+use crate::query_execution::logical_execution::{
+    ComputationDiagnostics, LogicalExecutionLauncher, PreparedLogicalComputation,
+};
 use crate::query_execution::split_assignment_round::SplitAssignmentRoundGuard;
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::task_execution::abort_effect::{NativeAbortEffectAdapter, NativeAbortEffectIntake};
+use crate::task_execution::attempt_pumps::{AttemptPumps, install_attempt_pumps};
 use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
 use crate::task_execution::intent::{
     AckPayload, DispatchBatch, OperationIntent, TaskOperationQueueAdmission, TaskOperationSink,
@@ -911,12 +917,12 @@ impl FrontendNativeLogicalExecutionRuntime {
 }
 
 #[derive(Clone)]
-pub(crate) struct FrontendNativeLogicalReadLauncher {
+pub(crate) struct FrontendNativeLogicalExecutionLauncher {
     client: QueryExecutionClient,
     runtime: FrontendNativeLogicalExecutionRuntime,
 }
 
-impl FrontendNativeLogicalReadLauncher {
+impl FrontendNativeLogicalExecutionLauncher {
     pub(crate) const fn new(
         client: QueryExecutionClient,
         runtime: FrontendNativeLogicalExecutionRuntime,
@@ -925,7 +931,25 @@ impl FrontendNativeLogicalReadLauncher {
     }
 }
 
-impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
+struct FrontendLogicalLaunch {
+    description: novarocks_query_application::preparation::FrozenExecutionDescription,
+    template: PreparedDistributedAttemptTemplate,
+    options: Arc<ResolvedQueryOptions>,
+    internal: Option<InternalNativeRegistration>,
+}
+struct InternalNativeRegistration {
+    consumer: Arc<dyn novarocks_query_application::api::InternalComputationConsumer>,
+    handoffs: Arc<AttemptHandoffOfferPort>,
+    diagnostics: ComputationDiagnostics,
+}
+
+impl LogicalExecutionLauncher for FrontendNativeLogicalExecutionLauncher {
+    fn reserve_identity(
+        &self,
+    ) -> Result<novarocks_query_application::api::ReservedExecutionIdentity, QueryExecutionError>
+    {
+        self.client.reserve_identity()
+    }
     fn start(
         &self,
         read: PreparedLogicalRead,
@@ -936,6 +960,83 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
         >,
     ) -> QueryExecutionFuture {
         let (description, template, options) = read.into_parts();
+        self.start_native(
+            FrontendLogicalLaunch {
+                description,
+                template,
+                options,
+                internal: None,
+            },
+            owner,
+            result_window,
+            None,
+            #[cfg(novarocks_dev_controls)]
+            observation,
+        )
+    }
+    fn start_computation(
+        &self,
+        computation: PreparedLogicalComputation,
+        owner: WorkOwner,
+        result_window: novarocks_workload_control::ResultWindowAlias,
+        reservation: Option<novarocks_query_application::api::ReservedExecutionIdentity>,
+        #[cfg(novarocks_dev_controls)] observation: Option<
+            crate::preparation_diagnostics::StatementObservationHandle,
+        >,
+    ) -> QueryExecutionFuture {
+        let PreparedLogicalComputation {
+            description,
+            template,
+            options,
+            consumer,
+            handoffs,
+            diagnostics,
+        } = computation;
+        self.start_native(
+            FrontendLogicalLaunch {
+                description,
+                template,
+                options,
+                internal: Some(InternalNativeRegistration {
+                    consumer,
+                    handoffs,
+                    diagnostics,
+                }),
+            },
+            owner,
+            Some(result_window),
+            reservation,
+            #[cfg(novarocks_dev_controls)]
+            observation,
+        )
+    }
+}
+
+impl FrontendNativeLogicalExecutionLauncher {
+    fn start_native(
+        &self,
+        launch: FrontendLogicalLaunch,
+        owner: WorkOwner,
+        result_window: Option<novarocks_workload_control::ResultWindowAlias>,
+        reservation: Option<novarocks_query_application::api::ReservedExecutionIdentity>,
+        #[cfg(novarocks_dev_controls)] observation: Option<
+            crate::preparation_diagnostics::StatementObservationHandle,
+        >,
+    ) -> QueryExecutionFuture {
+        let FrontendLogicalLaunch {
+            description,
+            template,
+            options,
+            internal,
+        } = launch;
+        let (consumer, handoffs, diagnostics) = match internal {
+            Some(InternalNativeRegistration {
+                consumer,
+                handoffs,
+                diagnostics,
+            }) => (Some(consumer), Some(handoffs), diagnostics),
+            None => (None, None, ComputationDiagnostics::None),
+        };
         if result_window
             .as_ref()
             .is_some_and(|window| !window.is_for_scope(&owner.scope()))
@@ -945,7 +1046,7 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
                     ExecutionFailureInput::new(
                         QueryFailureReason::PreparationProtocol.failure_fact(),
                         SafeDetail::truncating(
-                            "logical read result window belongs to a foreign scope",
+                            "logical execution result window belongs to a foreign scope",
                         ),
                         ExecutionFailureSite::Coordinator,
                     ),
@@ -958,7 +1059,7 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
                     ExecutionFailureInput::new(
                         QueryFailureReason::PreparationProtocol.failure_fact(),
                         SafeDetail::truncating(
-                            "prepared logical read Native template has a foreign plan seal",
+                            "prepared logical execution Native template has a foreign plan seal",
                         ),
                         ExecutionFailureSite::Coordinator,
                     ),
@@ -990,8 +1091,10 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
                 options,
                 aborts: Arc::clone(&aborts),
                 delivery,
+                diagnostics,
             },
             replacements: replacements.clone(),
+            handoffs,
         };
         let attempts = FrontendNativeAttemptPreparationPort::new(
             template,
@@ -1016,7 +1119,17 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
             replacement_port,
             attempts,
         );
-        self.client.start(request, owner)
+        let request = match consumer {
+            Some(consumer) => match request.with_internal_consumer(consumer) {
+                Ok(request) => request,
+                Err(error) => return Box::pin(async move { Err(error) }),
+            },
+            None => request,
+        };
+        match reservation {
+            Some(reservation) => self.client.start_reserved(request, owner, reservation),
+            None => self.client.start(request, owner),
+        }
     }
 }
 
@@ -1027,6 +1140,7 @@ struct ProductionManifestAttemptProjection {
     options: Arc<ResolvedQueryOptions>,
     aborts: Arc<LogicalAbortRouter>,
     delivery: ProductionRootDelivery,
+    diagnostics: ComputationDiagnostics,
 }
 
 impl std::fmt::Debug for ProductionManifestAttemptProjection {
@@ -1063,7 +1177,7 @@ impl ProductionRootDelivery {
                     QueryExecutionError::from_execution(ExecutionFailureInput::new(
                         QueryFailureReason::PreparationProtocol.failure_fact(),
                         SafeDetail::truncating(
-                            "relayed logical read requires its admitted result window",
+                            "relayed logical execution requires its admitted result window",
                         ),
                         ExecutionFailureSite::Coordinator,
                     ))
@@ -1077,7 +1191,7 @@ impl ProductionRootDelivery {
                         ExecutionFailureInput::new(
                             QueryFailureReason::PreparationProtocol.failure_fact(),
                             SafeDetail::truncating(
-                                "relayed logical read window differs from its frozen output class",
+                                "relayed logical execution window differs from its frozen output class",
                             ),
                             ExecutionFailureSite::Coordinator,
                         ),
@@ -1156,7 +1270,10 @@ pub(crate) trait FrontendDormantAttemptBehavior<M = ManifestBoundNativeAttemptIn
 pub(crate) trait FrontendDormantAttemptFactory: std::fmt::Debug + Send + 'static {
     type Behavior: FrontendDormantAttemptBehavior<ManifestBoundNativeAttemptInputs>;
 
-    fn create(&mut self) -> Result<Self::Behavior, NativeAttemptPreparationError>;
+    fn create(
+        &mut self,
+        execution: novarocks_types::QueryExecutionId,
+    ) -> Result<Self::Behavior, NativeAttemptPreparationError>;
 
     fn register_candidate(
         &mut self,
@@ -1207,8 +1324,12 @@ pub(crate) struct ProjectedManifestAttempt {
     round: ManifestAssembledRound,
     rows: Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)>,
     _prepared: Option<TaskExecutionPreparedQuery>,
+    _credential_storage:
+        Option<Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>>,
     _split_assignment: Option<SplitAssignmentRoundGuard>,
     _abort_route: Option<LogicalAbortRoute>,
+    handoff: Option<AttemptHandoffProducer>,
+    profile_observer: Option<crate::task_execution::profile_diagnostics::ProfileDiagnosticObserver>,
 }
 
 impl ProjectedManifestAttempt {
@@ -1217,6 +1338,9 @@ impl ProjectedManifestAttempt {
         binding: FrontendRootRowsRuntime,
         statuses: AcceptedRootStatusSource,
         prepared: TaskExecutionPreparedQuery,
+        credential_storage: Option<
+            Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>,
+        >,
         split_assignment: Option<SplitAssignmentRoundGuard>,
         abort_route: LogicalAbortRoute,
     ) -> Self {
@@ -1224,8 +1348,11 @@ impl ProjectedManifestAttempt {
             round,
             rows: Some((binding, statuses)),
             _prepared: Some(prepared),
+            _credential_storage: credential_storage,
             _split_assignment: split_assignment,
             _abort_route: Some(abort_route),
+            handoff: None,
+            profile_observer: None,
         }
     }
 }
@@ -1234,6 +1361,7 @@ impl ProjectedManifestAttempt {
 struct ProductionDormantAttemptFactory {
     projection: ProductionManifestAttemptProjection,
     replacements: LogicalReplacementQualificationPort,
+    handoffs: Option<Arc<AttemptHandoffOfferPort>>,
 }
 
 impl std::fmt::Debug for ProductionDormantAttemptFactory {
@@ -1245,11 +1373,23 @@ impl std::fmt::Debug for ProductionDormantAttemptFactory {
 }
 
 impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
-    type Behavior = FrontendTaskProtocolDormantBehavior<ProductionManifestAttemptProjection>;
+    type Behavior = FrontendTaskProtocolDormantBehavior<RegisteredManifestAttemptProjection>;
 
-    fn create(&mut self) -> Result<Self::Behavior, NativeAttemptPreparationError> {
+    fn create(
+        &mut self,
+        execution: novarocks_types::QueryExecutionId,
+    ) -> Result<Self::Behavior, NativeAttemptPreparationError> {
+        let handoff = self
+            .handoffs
+            .as_ref()
+            .map(|offers| offers.reserve(execution))
+            .transpose()
+            .map_err(|error| NativeAttemptPreparationError::from(handoff_failure(error)))?;
         Ok(FrontendTaskProtocolDormantBehavior::new(
-            self.projection.clone(),
+            RegisteredManifestAttemptProjection {
+                base: self.projection.clone(),
+                handoff,
+            },
             ManifestAttemptCompletion::AcceptedRootSuccessSeal,
             Arc::clone(&self.projection.runtime.lifecycle_diagnostics),
         ))
@@ -1261,6 +1401,73 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
         snapshot: &novarocks_query_application::api::BackendTopologySnapshot,
     ) -> Result<(), NativeAttemptPreparationError> {
         self.replacements.register_candidate(execution, snapshot)
+    }
+}
+
+/// The fixed factory reserves this attempt's independent handoff cell before
+/// projection. Borrowed initialization never owns a replacement's resource cell.
+struct RegisteredManifestAttemptProjection {
+    base: ProductionManifestAttemptProjection,
+    handoff: Option<AttemptHandoffProducer>,
+}
+impl std::fmt::Debug for RegisteredManifestAttemptProjection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredManifestAttemptProjection")
+            .field("base", &self.base)
+            .finish_non_exhaustive()
+    }
+}
+impl FrontendManifestAttemptProjection for RegisteredManifestAttemptProjection {
+    fn project<'a>(
+        &'a mut self,
+        prepared: PreparedDistributedQuery,
+        manifest: &'a TaskManifestBinding,
+        replacement_admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
+        cancellation: CancellationView,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<ProjectedManifestAttempt, NativeAttemptActivationFailure>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let mut projected = self
+                .base
+                .project(prepared, manifest, replacement_admissions, cancellation)
+                .await?;
+            if let Some(handoff) = self.handoff.as_mut() {
+                let protocol = projected.round.take_protocol_facts().ok_or_else(|| {
+                    projection_message(
+                        "internal Native attempt lost its original protocol receiver",
+                    )
+                })?;
+                handoff
+                    .stage(
+                        manifest.execution(),
+                        projected.round.round.root_task(),
+                        manifest.plan(),
+                        AttemptHandoffResources::new(
+                            protocol,
+                            projected._credential_storage.clone(),
+                            projected.profile_observer.take(),
+                        ),
+                    )
+                    .map_err(|error| NativeAttemptActivationFailure::new(handoff_failure(error)))?;
+                projected.handoff = self.handoff.take();
+            }
+            Ok(projected)
+        })
+    }
+    fn converge<'a>(
+        &'a mut self,
+        cancellation: CancellationView,
+    ) -> NativeAttemptConvergenceFuture<'a> {
+        if let Some(handoff) = self.handoff.as_mut() {
+            handoff.retire_unclaimed();
+        }
+        self.base.converge(cancellation)
     }
 }
 
@@ -1414,7 +1621,7 @@ impl ProductionManifestAttemptProjection {
             .into_parts();
         if !root_fetch.uses_result_buffer() {
             return Err(projection_message(
-                "logical read root does not own a Native result buffer",
+                "logical execution root does not own a Native result buffer",
             ));
         }
 
@@ -1441,11 +1648,10 @@ impl ProductionManifestAttemptProjection {
             task_prepared.init_options().credential_leases(),
         )
         .map_err(|error| projection_message(error.to_string()))?;
-        // Taken so the attempt keeps one owner of the vended material and the
-        // connectors' planning route is re-pointed at it. Held to the end of
-        // this call so neither that route nor a write session's commit finds it
-        // already dropped.
-        let _credential_storage = task_prepared.take_terminal_storage_resolver();
+        // Preserve the original capability beyond projection. Its planning
+        // route and material remain attached to this exact attempt until the
+        // domain result transfers them to its publication owner.
+        let credential_storage = task_prepared.take_terminal_storage_resolver();
         let backends = manifest
             .contexts()
             .iter()
@@ -1487,7 +1693,6 @@ impl ProductionManifestAttemptProjection {
         install_attempt_pumps(
             &mut round.round,
             AttemptPumps {
-                execution_id: execution,
                 feedback_state: feedback,
                 declared_feedback_channels: feedback_declaration.channels().len(),
                 reads: Arc::clone(&result_transport) as Arc<dyn TaskDynamicFilterReads>,
@@ -1498,8 +1703,10 @@ impl ProductionManifestAttemptProjection {
                 .install(execution, self.runtime.abort_capacity, round.abort_wake())?;
         round.install_abort_effect_intake(abort_intake);
         let root_status = round.take_root_status_source().ok_or_else(|| {
-            projection_message("logical read Task round has no accepted root status source")
+            projection_message("logical execution Task round has no accepted root status source")
         })?;
+        let result_transport_for_diagnostics = Arc::clone(&result_transport)
+            as Arc<dyn crate::native::fragment_transport::TaskResultTransport>;
         let root_binding = match &self.delivery {
             ProductionRootDelivery::Relayed {
                 kind,
@@ -1521,14 +1728,33 @@ impl ProductionManifestAttemptProjection {
                 }
             }
         };
-        Ok(ProjectedManifestAttempt::production_rows(
+        let profile_observer = match self.diagnostics {
+            ComputationDiagnostics::None => None,
+            ComputationDiagnostics::Profile => Some(
+                round
+                    .install_profile_diagnostics(result_transport_for_diagnostics)
+                    .map_err(|error| projection_message(error.to_string()))?,
+            ),
+        };
+        let mut attempt = ProjectedManifestAttempt::production_rows(
             round,
             root_binding,
             root_status,
             task_prepared,
+            credential_storage,
             split_assignment,
             abort_route,
-        ))
+        );
+        attempt.profile_observer = profile_observer;
+        Ok(attempt)
+    }
+}
+
+/// Preserve the handoff author's typed local invariant failure through Native.
+fn handoff_failure(error: QueryExecutionError) -> NativeAttemptPreparationFailure {
+    match error.execution_failure() {
+        Some(input) => NativeAttemptPreparationFailure::from_input(input.clone()),
+        None => attempt_runtime_failure(QueryFailureReason::PreparationProtocol, error),
     }
 }
 
@@ -1643,9 +1869,12 @@ pub(crate) struct FrontendTaskProtocolActiveBehavior {
     attempt: ManifestAssembledRound,
     completion: ManifestAttemptCompletion,
     rows: Option<(FrontendRootRowsRuntime, AcceptedRootStatusSource)>,
-    _prepared: Option<TaskExecutionPreparedQuery>,
-    _split_assignment: Option<SplitAssignmentRoundGuard>,
-    _abort_route: Option<LogicalAbortRoute>,
+    prepared: Option<TaskExecutionPreparedQuery>,
+    credential_storage:
+        Option<Arc<crate::query_execution::lifecycle_plan::AttemptCredentialStorage>>,
+    split_assignment: Option<SplitAssignmentRoundGuard>,
+    abort_route: Option<LogicalAbortRoute>,
+    handoff: Option<AttemptHandoffProducer>,
     lifecycle_diagnostics:
         Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
 }
@@ -1671,16 +1900,21 @@ impl FrontendTaskProtocolActiveBehavior {
             round,
             rows,
             _prepared: prepared,
+            _credential_storage: credential_storage,
             _split_assignment: split_assignment,
             _abort_route: abort_route,
+            handoff,
+            profile_observer: _,
         } = attempt;
         Self {
             attempt: round,
             completion,
             rows,
-            _prepared: prepared,
-            _split_assignment: split_assignment,
-            _abort_route: abort_route,
+            prepared,
+            credential_storage,
+            split_assignment,
+            abort_route,
+            handoff,
             lifecycle_diagnostics,
         }
     }
@@ -1697,7 +1931,17 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
         drive: &'a NativeAttemptDrive,
         cancellation: CancellationView,
     ) -> NativeAttemptRunFuture<'a> {
-        Box::pin(self.attempt.run(drive, cancellation, self.completion))
+        Box::pin(async move {
+            if let Err(error) = self.attempt.round.bind_protocol_drive(drive) {
+                return crate::task_execution::manifest_round::task_protocol_failure(error);
+            }
+            if let Some(handoff) = self.handoff.as_mut()
+                && let Err(error) = handoff.bind(drive)
+            {
+                return NativeAttemptTerminal::Failed(handoff_failure(error));
+            }
+            self.attempt.run(drive, cancellation, self.completion).await
+        })
     }
 
     fn converge<'a>(
@@ -1707,6 +1951,9 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
     ) -> NativeActiveAttemptConvergenceFuture<'a> {
         let execution_id = inputs.execution_id();
         Box::pin(async move {
+            if let Some(handoff) = self.handoff.as_mut() {
+                handoff.retire_unclaimed();
+            }
             let convergence = self.attempt.converge(request).await?;
             if self.lifecycle_diagnostics.is_enabled() {
                 let observed_failure = self.attempt.observed_failure();
@@ -2181,7 +2428,7 @@ where
                     .map_err(|error| {
                         attempt_failure(QueryFailureReason::PreparationProtocol, error.to_string())
                     })?;
-            let behavior = state.dormant_factory.create()?;
+            let behavior = state.dormant_factory.create(request.execution())?;
             let owner = SnapshotBoundDormantAttemptOwner::new(inputs, behavior);
             #[cfg(novarocks_dev_controls)]
             let owner = {
@@ -2839,7 +3086,10 @@ mod tests {
     impl FrontendDormantAttemptFactory for AdversarialFactory {
         type Behavior = AdversarialBehavior;
 
-        fn create(&mut self) -> Result<Self::Behavior, NativeAttemptPreparationError> {
+        fn create(
+            &mut self,
+            _execution: novarocks_types::QueryExecutionId,
+        ) -> Result<Self::Behavior, NativeAttemptPreparationError> {
             Ok(AdversarialBehavior {
                 replacement_backends: vec![self.replacement_backend],
             })
@@ -2857,7 +3107,15 @@ mod tests {
             CapturedInputs {
                 eligible_backends: vec![captured],
             },
-            factory.create().expect("adversarial behavior"),
+            factory
+                .create(
+                    novarocks_types::QueryExecutionId::new(
+                        novarocks_types::QueryId::new(91, 7),
+                        novarocks_types::AttemptId::new(1).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .expect("adversarial behavior"),
         );
 
         assert_eq!(owner.retained_eligible_backends(), &[captured]);

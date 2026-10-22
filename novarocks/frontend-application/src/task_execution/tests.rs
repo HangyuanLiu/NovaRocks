@@ -4187,7 +4187,7 @@ fn production_close_reducer_explores_authorized_unknown_receiver_interleavings()
                 .execution
                 .enqueue_task_update(closed.task_id(), split_update(SCAN_NODE, 1, false),)
                 .unwrap(),
-            UpdateAdmission::DiscardedTerminal,
+            UpdateAdmission::DiscardedNoLongerNeeded,
             "{trace:?}: late ownership restored ordinary input"
         );
         closes += observed_closes;
@@ -7569,6 +7569,18 @@ fn round_waiting_on_creates(
     crate::native::task_transport::TaskAckIntakeHandle,
     Vec<OperationIntent>,
 ) {
+    round_waiting_on_creates_with_establish_trace(harness, None)
+}
+
+fn round_waiting_on_creates_with_establish_trace(
+    harness: Harness,
+    mut trace: Option<&mut Vec<(OperationIntent, OperationAcknowledgement)>>,
+) -> (
+    TaskRoundForTest,
+    crate::task_execution::status_intake::StatusIntakeHandle,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    Vec<OperationIntent>,
+) {
     use crate::native::task_transport::TaskAckIntake;
     use crate::task_execution::round::TaskRound;
 
@@ -7602,9 +7614,19 @@ fn round_waiting_on_creates(
         for intent in released {
             match intent.kind() {
                 OperationKind::AcquireQueryContextAdmissionTicket => {
-                    acks.publish(admission_ack(&intent));
+                    let ack = admission_ack(&intent);
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.push((intent.clone(), ack.clone()));
+                    }
+                    acks.publish(ack);
                 }
-                OperationKind::UpdateQueryContext => acks.publish(establish_ack(&intent)),
+                OperationKind::UpdateQueryContext => {
+                    let ack = establish_ack(&intent);
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.push((intent.clone(), ack.clone()));
+                    }
+                    acks.publish(ack);
+                }
                 OperationKind::CreateTask => creates.push(intent),
                 kind => panic!("attempt startup unexpectedly released {kind}"),
             }
@@ -7623,11 +7645,155 @@ pub(crate) fn manifest_normal_release_ack_regression_fixture() -> (
     crate::native::task_transport::TaskAckIntakeHandle,
     OperationIntent,
 ) {
-    let harness = Harness::new(&[0], &[0], 64);
+    let (round, acks, release, _) = manifest_normal_release_ack_with_clock_regression_fixture();
+    (round, acks, release)
+}
+
+pub(crate) fn manifest_normal_release_ack_with_clock_regression_fixture() -> (
+    TaskRoundForTest,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    OperationIntent,
+    Arc<ManualClock>,
+) {
+    let (round, acks, release, clock, _, _) =
+        manifest_normal_release_ack_fixture(Harness::new(&[0], &[0], 64), None);
+    (round, acks, release, clock)
+}
+
+/// The original graph/operations with their accepted ACK author facts retained
+/// for the separately installed QA actor in integration tests.
+#[cfg(novarocks_dev_controls)]
+pub(crate) fn manifest_normal_release_ack_with_actor_facts_fixture() -> (
+    TaskRoundForTest,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    OperationIntent,
+    Arc<ManualClock>,
+    Vec<(OperationIntent, OperationAcknowledgement)>,
+) {
+    let (round, acks, release, clock, _, facts) =
+        manifest_normal_release_ack_fixture(Harness::new(&[0], &[0], 64), None);
+    (round, acks, release, clock, facts)
+}
+
+/// Replays only accepted original fixture facts through QA's public test seam.
+/// No operation, ticket, context or payload is regenerated here.
+#[cfg(novarocks_dev_controls)]
+pub(crate) async fn settle_original_actor_establish_facts(
+    logical: &novarocks_query_application::test_support::LogicalExecutionTestHarness,
+    facts: Vec<(OperationIntent, OperationAcknowledgement)>,
+) {
+    let mut admission = BTreeMap::new();
+    for (intent, ack) in facts {
+        assert_eq!(intent.operation_id(), ack.operation_id());
+        match intent {
+            OperationIntent::AcquireQueryContextAdmissionTicket(request) => {
+                let AckPayload::AdmissionTicket(ticket) = ack.payload() else {
+                    panic!("original admission ACK has its ticket")
+                };
+                let settlement =
+                    novarocks_query_application::coordination::AdmissionIssueSettlement::applied(
+                        ack.operation_id(),
+                        ack.worker_outcome().unwrap(),
+                        *ticket,
+                    )
+                    .unwrap();
+                assert!(
+                    admission
+                        .insert(request.context(), (request, settlement))
+                        .is_none()
+                );
+            }
+            OperationIntent::EstablishQueryContext(request) => {
+                let (original, settlement) = admission
+                    .remove(&request.context())
+                    .expect("original admission preceded this Establish");
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    logical.settle_original_applied_establish(
+                        original,
+                        settlement,
+                        request,
+                        ack.operation_id(),
+                        ack.worker_outcome().unwrap(),
+                    ),
+                )
+                .await
+                .expect("test-only watchdog: replay original admission/Establish facts")
+                .unwrap();
+            }
+            _ => panic!("fixture trace contains an unrelated operation"),
+        }
+    }
+    assert!(
+        admission.is_empty(),
+        "every original admission has its original Establish"
+    );
+}
+
+/// The original lifecycle fixture with its caller execution and facts installed
+/// before the root source is transferred. No production constructor is added.
+#[cfg(novarocks_dev_controls)]
+pub(crate) fn manifest_normal_release_ack_with_protocol_fixture(
+    execution: QueryExecutionId,
+    plan: novarocks_query_application::api::PlanSeal,
+) -> (
+    TaskRoundForTest,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    OperationIntent,
+    Arc<ManualClock>,
+    super::protocol_facts::AttemptProtocolFactsReceiver,
+    Vec<(OperationIntent, OperationAcknowledgement)>,
+) {
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let edges = chain_edges();
+    let graph = build_task_graph(
+        TaskGraphInputs::from_schedule(
+            execution,
+            FrontendProcessId::new_v7(),
+            &schedule,
+            &edges,
+            &processes,
+            TransportBudget::DEFAULT,
+        ),
+        &mut FakePlans::new(&schedule, &edges, 64),
+    )
+    .expect("the caller execution builds one original graph");
+    let (round, acks, release, clock, protocol, facts) =
+        manifest_normal_release_ack_fixture(Harness::from_graph(graph), Some(plan));
+    (
+        round,
+        acks,
+        release,
+        clock,
+        protocol.expect("original receiver installed once"),
+        facts,
+    )
+}
+
+fn manifest_normal_release_ack_fixture(
+    harness: Harness,
+    plan: Option<novarocks_query_application::api::PlanSeal>,
+) -> (
+    TaskRoundForTest,
+    crate::native::task_transport::TaskAckIntakeHandle,
+    OperationIntent,
+    Arc<ManualClock>,
+    Option<super::protocol_facts::AttemptProtocolFactsReceiver>,
+    Vec<(OperationIntent, OperationAcknowledgement)>,
+) {
     let sink = Arc::clone(&harness.sink);
-    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    let clock = Arc::clone(&harness.clock);
+    let mut facts = Vec::new();
+    let (mut round, status, acks, creates) =
+        round_waiting_on_creates_with_establish_trace(harness, Some(&mut facts));
     let split_delivery =
         super::split_transport::SplitDeliveryBridge::for_graph(round.execution().graph());
+    let protocol = plan.map(|plan| {
+        round
+            .install_protocol_facts(plan, &BTreeSet::new())
+            .expect("original protocol before root transfer")
+    });
     let _root_source = round
         .take_root_status_source()
         .expect("the result owner takes the root projection");
@@ -7641,7 +7807,9 @@ pub(crate) fn manifest_normal_release_ack_regression_fixture() -> (
         .flat_map(|(_, operations)| operations)
     {
         if let OperationIntent::EstablishQueryContext(_) = intent {
-            acks.publish(establish_ack(&intent));
+            let ack = establish_ack(&intent);
+            facts.push((intent.clone(), ack.clone()));
+            acks.publish(ack);
         }
     }
     round.turn().expect("the context establish settles");
@@ -7792,7 +7960,14 @@ pub(crate) fn manifest_normal_release_ack_regression_fixture() -> (
         round.execution().attempt_drain_facts()
     );
     assert_eq!(releases.len(), 1, "the drained context must be released");
-    (round, acks, releases.pop().expect("one original Release"))
+    (
+        round,
+        acks,
+        releases.pop().expect("one original Release"),
+        clock,
+        protocol,
+        facts,
+    )
 }
 
 #[test]
@@ -8153,10 +8328,285 @@ fn a_runner_refuses_to_turn_until_its_per_turn_owners_are_declared() {
     round.turn().expect("a declared attempt turns");
 }
 
+// A real pending close future retains its capture until the original job
+// completes. The test controls completion, never the owner's exit predicate.
+struct PumpCloseCapture(Arc<AtomicUsize>);
+
+impl Drop for PumpCloseCapture {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct GatedPumpClose {
+    name: &'static str,
+    closing: bool,
+    job: Option<
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), TaskExecutionError>> + Send>>,
+    >,
+    close_turns: Arc<AtomicUsize>,
+}
+
+struct PumpCloseControl {
+    completion: Option<tokio::sync::oneshot::Sender<Result<(), TaskExecutionError>>>,
+    close_turns: Arc<AtomicUsize>,
+    capture_drops: Arc<AtomicUsize>,
+}
+
+impl PumpCloseControl {
+    fn complete(&mut self, outcome: Result<(), TaskExecutionError>) {
+        self.completion
+            .take()
+            .expect("the original close completes once")
+            .send(outcome)
+            .expect("the original close owner remains present");
+    }
+}
+
+impl crate::task_execution::round::TurnPump for GatedPumpClose {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn drive(&mut self, _: &mut QueryTaskExecution) -> Result<usize, TaskExecutionError> {
+        panic!("input production resumed after begin_input_close");
+    }
+
+    fn begin_close(&mut self) {
+        self.closing = true;
+    }
+
+    fn close_turn(&mut self) -> Result<usize, TaskExecutionError> {
+        assert!(self.closing, "the original close must have been requested");
+        self.close_turns.fetch_add(1, Ordering::SeqCst);
+        let Some(job) = self.job.as_mut() else {
+            return Ok(0);
+        };
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match job.as_mut().poll(&mut context) {
+            std::task::Poll::Pending => Ok(0),
+            std::task::Poll::Ready(outcome) => {
+                self.job = None;
+                outcome.map(|()| 1)
+            }
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.job.is_none()
+    }
+
+    fn take_close_unresolved(
+        &mut self,
+    ) -> Option<crate::task_execution::round::PumpCloseUnresolved> {
+        None
+    }
+}
+
+fn gated_pump_close(name: &'static str) -> (GatedPumpClose, PumpCloseControl) {
+    let (completion, completed) = tokio::sync::oneshot::channel();
+    let close_turns = Arc::new(AtomicUsize::new(0));
+    let capture_drops = Arc::new(AtomicUsize::new(0));
+    let capture = PumpCloseCapture(Arc::clone(&capture_drops));
+    let job = Box::pin(async move {
+        let outcome = completed.await.expect("original close completion");
+        drop(capture);
+        outcome
+    });
+    (
+        GatedPumpClose {
+            name,
+            closing: false,
+            job: Some(job),
+            close_turns: Arc::clone(&close_turns),
+        },
+        PumpCloseControl {
+            completion: Some(completion),
+            close_turns,
+            capture_drops,
+        },
+    )
+}
+
+#[test]
+fn input_close_advances_all_original_jobs_while_ack_and_status_remain_live() {
+    let harness = Harness::new(&[0], &[0], 64);
+    let (mut round, status, acks, creates) = round_waiting_on_creates(harness);
+    let (failed, mut failed_control) = gated_pump_close("original-close-error");
+    let (pending, mut pending_control) = gated_pump_close("original-close-pending");
+    round.add_pump(Box::new(failed));
+    round.add_pump(Box::new(pending));
+    round.begin_input_close();
+
+    let original_error = TaskExecutionError::Schedule("original close domain failure".to_owned());
+    failed_control.complete(Err(original_error.clone()));
+    for create in &creates {
+        acks.publish(accepted_create_ack(create));
+    }
+    status.publish(StatusEvent::Published(
+        TaskStatus::try_new(
+            round.root_task(),
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Running,
+            None,
+            TaskOutputFacts::new(false),
+        )
+        .unwrap(),
+    ));
+    // No normal drain, terminal cleanup, or attempt failure starts this close.
+    let report = round
+        .turn()
+        .expect("local close cannot block protocol progress");
+    assert_eq!(report.acknowledgements, creates.len());
+    assert_eq!(report.status_events, 1);
+    assert!(round.failure_cause().is_none());
+    assert_eq!(failed_control.close_turns.load(Ordering::SeqCst), 1);
+    assert_eq!(pending_control.close_turns.load(Ordering::SeqCst), 1);
+    assert_eq!(failed_control.capture_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(pending_control.capture_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(round.take_pump_close_error(), Some(original_error));
+    assert!(round.take_pump_close_error().is_none());
+    assert!(
+        !round.pumps_closed(),
+        "a close error cannot close the pending peer"
+    );
+    assert!(!round.pump_close_progress_settled());
+
+    round.receive_without_dispatch().unwrap();
+    assert_eq!(pending_control.close_turns.load(Ordering::SeqCst), 2);
+    assert_eq!(pending_control.capture_drops.load(Ordering::SeqCst), 0);
+    assert!(round.take_pump_close_error().is_none());
+    assert!(
+        !round.pumps_closed(),
+        "another turn is not actual exit evidence"
+    );
+
+    pending_control.complete(Ok(()));
+    let report = round.receive_without_dispatch().unwrap();
+    assert_eq!(report.pumped, 1);
+    assert_eq!(pending_control.close_turns.load(Ordering::SeqCst), 3);
+    assert_eq!(pending_control.capture_drops.load(Ordering::SeqCst), 1);
+    assert!(round.pumps_closed());
+    assert!(round.pump_close_progress_settled());
+    assert!(round.take_pump_close_error().is_none());
+    assert!(round.failure_cause().is_none());
+}
+
+#[test]
+fn input_close_progress_precedes_an_unrelated_ack_error() {
+    let mut round = pre_ready_invalid_ack_observation_round();
+    let (failed, mut failed_control) = gated_pump_close("close-before-ack-error");
+    let (peer, mut peer_control) = gated_pump_close("peer-close-before-ack-error");
+    round.add_pump(Box::new(failed));
+    round.add_pump(Box::new(peer));
+    round.begin_input_close();
+    let original_error = TaskExecutionError::Schedule("retained original close failure".to_owned());
+    failed_control.complete(Err(original_error.clone()));
+    peer_control.complete(Ok(()));
+
+    assert!(matches!(
+        round.turn(),
+        Err(TaskExecutionError::UnknownOperation)
+    ));
+    assert_eq!(failed_control.close_turns.load(Ordering::SeqCst), 1);
+    assert_eq!(peer_control.close_turns.load(Ordering::SeqCst), 1);
+    assert_eq!(failed_control.capture_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(peer_control.capture_drops.load(Ordering::SeqCst), 1);
+    assert!(
+        round.pumps_closed(),
+        "both original futures actually returned"
+    );
+    assert_eq!(round.take_pump_close_error(), Some(original_error));
+    assert!(round.take_pump_close_error().is_none());
+    round.receive_without_dispatch().unwrap();
+    assert!(round.take_pump_close_error().is_none());
+}
+
+#[test]
+fn closing_the_feedback_pump_releases_waiters_and_fences_late_feedback() {
+    use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
+    use crate::task_execution::feedback_pump::DynamicFilterFeedbackPump;
+    use crate::task_execution::round::TurnPump;
+
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let task = TaskId::new(1).unwrap();
+    let publisher = harness.identity(task).backend_process_id();
+    let feedback = Arc::new(
+        RuntimeFilterFeedbackState::new(execution_id(), feedback_declaration(publisher))
+            .expect("feedback state"),
+    );
+    let reads = Arc::new(RecordingFilterReads::default());
+    let mut pump = DynamicFilterFeedbackPump::new(
+        Arc::clone(&feedback),
+        Arc::clone(&reads) as Arc<dyn crate::task_execution::feedback_pump::TaskDynamicFilterReads>,
+        1,
+    )
+    .unwrap();
+    harness.publish_with_filters(
+        task,
+        TaskState::Running,
+        None,
+        false,
+        Some(DynamicFilterAdvertisement::new(
+            DomainVersion::new(1).unwrap(),
+            1,
+        )),
+    );
+    assert!(feedback.is_initial_wait_blocked(SCAN_NODE, [7]));
+    let observed = feedback.generation();
+    let waiting_feedback = Arc::clone(&feedback);
+    let (entered, entry) = std::sync::mpsc::channel();
+    let (finished, finish) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        entered.send(()).unwrap();
+        // Recheck the predicate after a spurious wake. A lost close wake must
+        // not leave the split source waiting for this much longer budget.
+        while waiting_feedback.generation() == observed {
+            waiting_feedback.wait_for_change(observed, Duration::from_secs(30));
+        }
+        finished.send(()).unwrap();
+    });
+    let entered = entry.recv_timeout(Duration::from_secs(5));
+    let pending = finish.try_recv();
+    pump.begin_close();
+    let woken = finish.recv_timeout(Duration::from_secs(5));
+    if woken.is_err() {
+        // A regression must still release and join this real fixture waiter.
+        feedback.close();
+    }
+    waiter.join().expect("feedback waiter exits");
+    entered.expect("the feedback waiter entered");
+    assert!(matches!(pending, Err(std::sync::mpsc::TryRecvError::Empty)));
+    woken.expect("pump close must release the original feedback waiter");
+
+    assert!(pump.is_closed());
+    assert!(!feedback.is_initial_wait_blocked(SCAN_NODE, [7]));
+    let closed_generation = feedback.generation();
+    assert_eq!(closed_generation, observed + 1);
+    pump.begin_close();
+    pump.close_turn().unwrap();
+    assert_eq!(
+        feedback.generation(),
+        closed_generation,
+        "close is idempotent"
+    );
+    assert_eq!(pump.drive(&mut harness.execution).unwrap(), 0);
+    assert!(
+        reads.requested().is_empty(),
+        "closing cannot start a late fetch"
+    );
+    feedback
+        .admit_task_feedback(&feedback_envelope(7, [9; 32], exact_domain(41)), publisher)
+        .expect("closed feedback ignores a late update");
+    assert_eq!(feedback.generation(), closed_generation);
+    assert!(!feedback.is_initial_wait_blocked(SCAN_NODE, [7]));
+    assert!(feedback.configure(feedback_declaration(publisher)).is_err());
+}
+
 #[test]
 fn an_attempt_with_no_channel_and_no_vended_credential_installs_no_owner() {
-    use crate::coordinator::task_round::{AttemptPumps, install_attempt_pumps};
     use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
+    use crate::task_execution::attempt_pumps::{AttemptPumps, install_attempt_pumps};
 
     // The other half of the supply rule: "declared zero" must stay reachable,
     // or every query without runtime filters would fail its first turn.
@@ -8168,7 +8618,6 @@ fn an_attempt_with_no_channel_and_no_vended_credential_installs_no_owner() {
     install_attempt_pumps(
         &mut round,
         AttemptPumps {
-            execution_id: execution_id(),
             feedback_state: feedback,
             declared_feedback_channels: 0,
             reads: Arc::new(RecordingFilterReads::default())
@@ -10136,3 +10585,536 @@ pub(crate) fn pre_ready_invalid_ack_observation_round() -> TaskRoundForTest {
     ));
     round
 }
+
+mod accepted_terminal_index_tests {
+    use super::*;
+    use novarocks_coordination_contract::StatusObservation;
+    use novarocks_execution_contract::{
+        SafeDetail, TaskFailure, TaskFailurePhase, TaskResourceFacts,
+    };
+
+    fn originating_failure(detail: &str, phase: TaskFailurePhase) -> TerminationDetail {
+        TerminationDetail::Failed(TaskFailure::new_in_phase(
+            novarocks_execution_contract::failure::FailureFact::new(
+                novarocks_execution_contract::failure::FailureClass::Data,
+                novarocks_execution_contract::failure::FailureReason::new(
+                    std::num::NonZeroU16::new(u16::MAX).unwrap(),
+                    std::num::NonZeroU16::new(1).unwrap(),
+                ),
+            ),
+            SafeDetail::new(detail).unwrap(),
+            phase,
+        ))
+    }
+
+    fn apply_snapshot(
+        harness: &mut Harness,
+        status: TaskStatus,
+    ) -> Result<usize, TaskExecutionError> {
+        assert_eq!(
+            harness
+                .execution
+                .intake()
+                .handle()
+                .publish(StatusEvent::Published(status)),
+            StatusIntakeAdmission::Enqueued,
+        );
+        harness
+            .execution
+            .apply_status(64)
+            .map(|report| report.accepted)
+    }
+
+    #[test]
+    fn create_ack_indexes_its_first_terminal_once_without_waiting_for_status_stream() {
+        for preparation_failure in [false, true] {
+            let mut harness = Harness::new(&[0], &[0], 64);
+            let create = creates_of(harness.establish_all(Duration::from_secs(30)))
+                .into_iter()
+                .next()
+                .unwrap();
+            let identity = create_identity(&create);
+            assert!(harness.execution.accepted_terminal_tasks().is_empty());
+            let (state, cause, output, installed) = if preparation_failure {
+                (
+                    TaskState::Failed,
+                    Some(originating_failure(
+                        "original preparation failure",
+                        TaskFailurePhase::Preparation,
+                    )),
+                    TaskOutputFacts::default(),
+                    false,
+                )
+            } else {
+                (TaskState::Finished, None, TaskOutputFacts::new(true), true)
+            };
+            let original = TaskStatus::try_new_with_installed(
+                identity,
+                TaskStatusVersion::FIRST,
+                state,
+                cause.clone(),
+                output,
+                installed,
+            )
+            .unwrap();
+            let ack = OperationAcknowledgement::new(
+                create.operation_id(),
+                OperationKind::CreateTask,
+                OperationOutcome::Accepted,
+                AckPayload::Create(CreateTaskReceipt::new(
+                    identity,
+                    Vec::new(),
+                    original.clone(),
+                )),
+            );
+            harness.execution.acknowledge(&ack).unwrap();
+            assert_eq!(harness.execution.accepted_terminal_tasks(), &[identity]);
+            assert_eq!(
+                harness.execution.task(identity.task_id()).unwrap().status(),
+                Some(&original)
+            );
+            let revision = harness.execution.accepted_protocol_revision();
+            assert!(revision > 0);
+
+            // A settled operation is no longer an authority. Keep its original
+            // UnknownOperation behavior instead of treating it as a new event.
+            assert!(matches!(
+                harness.execution.acknowledge(&ack),
+                Err(TaskExecutionError::UnknownOperation)
+            ));
+            assert_eq!(apply_snapshot(&mut harness, original.clone()).unwrap(), 0);
+            assert_eq!(harness.execution.accepted_terminal_tasks(), &[identity]);
+            assert_eq!(harness.execution.accepted_protocol_revision(), revision);
+
+            // Terminal snapshots are immutable, including metric-only changes.
+            // Higher versions must be rejected, not accepted as duplicate work.
+            let changed_metrics = TaskStatus::try_new_with_installed(
+                identity,
+                TaskStatusVersion::new(2).unwrap(),
+                state,
+                cause,
+                output,
+                installed,
+            )
+            .unwrap()
+            .with_resources(TaskResourceFacts::empty().with_cpu_time(Duration::from_millis(7)));
+            assert!(matches!(
+                apply_snapshot(&mut harness, changed_metrics),
+                Err(TaskExecutionError::Observation(
+                    StatusObservation::TerminalOverwrite
+                ))
+            ));
+            assert_eq!(harness.execution.accepted_terminal_tasks(), &[identity]);
+            assert_eq!(harness.execution.accepted_protocol_revision(), revision);
+            assert_eq!(
+                harness.execution.task(identity.task_id()).unwrap().status(),
+                Some(&original)
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_status_first_terminal_preserves_exact_coverage_order_and_late_create_ack() {
+        let mut harness = Harness::new(&[0], &[0], 64);
+        let creates = creates_of(harness.establish_all(Duration::from_secs(30)));
+        let frozen = harness
+            .execution
+            .graph()
+            .tasks()
+            .map(|task| task.identity())
+            .collect::<Vec<_>>();
+        assert_eq!(creates.len(), frozen.len());
+        let order = frozen.iter().copied().rev().collect::<Vec<_>>();
+        assert_ne!(
+            order, frozen,
+            "the fixture must distinguish accepted order from graph order"
+        );
+        let stream_first = order[0];
+        for create in &creates {
+            if create_identity(create) != stream_first {
+                harness
+                    .create_ack(create, OperationOutcome::Accepted)
+                    .unwrap();
+            }
+        }
+        assert!(harness.execution.accepted_terminal_tasks().is_empty());
+        let mut expected = Vec::new();
+        for identity in order {
+            let terminal = TaskStatus::try_new(
+                identity,
+                TaskStatusVersion::new(3).unwrap(),
+                TaskState::Finished,
+                None,
+                TaskOutputFacts::new(true),
+            )
+            .unwrap();
+            assert_eq!(apply_snapshot(&mut harness, terminal.clone()).unwrap(), 1);
+            expected.push(identity);
+            assert_eq!(
+                harness.execution.accepted_terminal_tasks(),
+                expected.as_slice()
+            );
+            let revision = harness.execution.accepted_protocol_revision();
+            assert_eq!(apply_snapshot(&mut harness, terminal.clone()).unwrap(), 0);
+            assert_eq!(
+                harness.execution.accepted_terminal_tasks(),
+                expected.as_slice()
+            );
+            assert_eq!(harness.execution.accepted_protocol_revision(), revision);
+            if identity == stream_first {
+                let create = creates
+                    .iter()
+                    .find(|create| create_identity(create) == identity)
+                    .unwrap();
+                let old_ack = accepted_create_ack(create);
+                harness.execution.acknowledge(&old_ack).unwrap();
+                assert_eq!(
+                    harness.execution.accepted_terminal_tasks(),
+                    expected.as_slice()
+                );
+                assert_eq!(harness.execution.accepted_protocol_revision(), revision);
+                assert_eq!(
+                    harness.execution.task(identity.task_id()).unwrap().status(),
+                    Some(&terminal)
+                );
+                assert!(matches!(
+                    harness.execution.acknowledge(&old_ack),
+                    Err(TaskExecutionError::UnknownOperation)
+                ));
+            }
+        }
+        let indexed = harness.execution.accepted_terminal_tasks();
+        assert_eq!(indexed, expected.as_slice());
+        assert_eq!(indexed.len(), frozen.len());
+        assert_eq!(
+            indexed.iter().copied().collect::<BTreeSet<_>>(),
+            frozen.iter().copied().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            indexed.iter().copied().collect::<BTreeSet<_>>().len(),
+            indexed.len()
+        );
+        harness.execution.apply_status(64).unwrap();
+        assert_eq!(
+            harness.execution.accepted_terminal_tasks(),
+            expected.as_slice()
+        );
+    }
+
+    #[test]
+    fn live_metrics_and_derived_refinement_create_only_the_first_terminal_ordinal() {
+        let mut harness = Harness::new(&[0], &[0], 64);
+        let identity = harness.identity(harness.stage_tasks(1)[0]);
+        let derived = TerminationDetail::Aborted(AbortCause::PeerTaskFailed);
+        for version in [2, 3] {
+            let live = TaskStatus::try_new(
+                identity,
+                TaskStatusVersion::new(version).unwrap(),
+                TaskState::Aborting,
+                Some(derived.clone()),
+                TaskOutputFacts::default(),
+            )
+            .unwrap()
+            .with_resources(
+                TaskResourceFacts::empty().with_cpu_time(Duration::from_millis(version)),
+            );
+            assert_eq!(apply_snapshot(&mut harness, live).unwrap(), 1);
+            assert!(harness.execution.accepted_terminal_tasks().is_empty());
+        }
+        let failure = originating_failure("original runtime failure", TaskFailurePhase::Execution);
+        let terminal = TaskStatus::try_new(
+            identity,
+            TaskStatusVersion::new(9).unwrap(),
+            TaskState::Failed,
+            Some(failure.clone()),
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        assert_eq!(apply_snapshot(&mut harness, terminal.clone()).unwrap(), 1);
+        assert_eq!(harness.execution.accepted_terminal_tasks(), &[identity]);
+        assert_eq!(
+            harness.execution.selected_task_failure().unwrap().detail(),
+            &failure
+        );
+        let revision = harness.execution.accepted_protocol_revision();
+        assert_eq!(apply_snapshot(&mut harness, terminal.clone()).unwrap(), 0);
+        assert_eq!(harness.execution.accepted_protocol_revision(), revision);
+
+        // The allowed live derived refinement does not authorize changing an
+        // already terminal Task to a different originating failure afterwards.
+        let overwrite = TaskStatus::try_new(
+            identity,
+            TaskStatusVersion::new(10).unwrap(),
+            TaskState::Failed,
+            Some(originating_failure(
+                "replacement runtime failure",
+                TaskFailurePhase::Execution,
+            )),
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            apply_snapshot(&mut harness, overwrite),
+            Err(TaskExecutionError::Observation(
+                StatusObservation::TerminalOverwrite
+            ))
+        ));
+        assert_eq!(harness.execution.accepted_terminal_tasks(), &[identity]);
+        assert_eq!(harness.execution.accepted_protocol_revision(), revision);
+        assert_eq!(
+            harness.execution.task(identity.task_id()).unwrap().status(),
+            Some(&terminal)
+        );
+        assert_eq!(
+            harness.execution.selected_task_failure().unwrap().detail(),
+            &failure
+        );
+    }
+
+    #[test]
+    fn attempt_failure_refinement_indexes_only_the_new_terminal_task() {
+        let mut harness = Harness::new(&[0], &[0], 64);
+        let peer = harness.identity(harness.stage_tasks(1)[0]);
+        let origin = harness.identity(harness.stage_tasks(2)[0]);
+        let peer_terminal = TaskStatus::try_new(
+            peer,
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Aborted,
+            Some(TerminationDetail::Aborted(AbortCause::PeerTaskFailed)),
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            apply_snapshot(&mut harness, peer_terminal.clone()).unwrap(),
+            1
+        );
+        assert_eq!(harness.execution.accepted_terminal_tasks(), &[peer]);
+        assert!(
+            harness
+                .execution
+                .selected_task_failure()
+                .unwrap()
+                .detail()
+                .is_derived()
+        );
+        let first_revision = harness.execution.accepted_protocol_revision();
+        let original_failure =
+            originating_failure("different task origin", TaskFailurePhase::Execution);
+        let origin_terminal = TaskStatus::try_new(
+            origin,
+            TaskStatusVersion::new(2).unwrap(),
+            TaskState::Failed,
+            Some(original_failure.clone()),
+            TaskOutputFacts::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            apply_snapshot(&mut harness, origin_terminal.clone()).unwrap(),
+            1
+        );
+        assert_eq!(harness.execution.accepted_terminal_tasks(), &[peer, origin]);
+        assert!(harness.execution.accepted_protocol_revision() > first_revision);
+        assert_eq!(
+            harness
+                .execution
+                .selected_task_failure()
+                .unwrap()
+                .identity(),
+            origin
+        );
+        assert_eq!(
+            harness.execution.selected_task_failure().unwrap().detail(),
+            &original_failure
+        );
+        let selected_revision = harness.execution.accepted_protocol_revision();
+        for duplicate in [peer_terminal, origin_terminal] {
+            assert_eq!(apply_snapshot(&mut harness, duplicate).unwrap(), 0);
+            assert_eq!(harness.execution.accepted_terminal_tasks(), &[peer, origin]);
+            assert_eq!(
+                harness.execution.accepted_protocol_revision(),
+                selected_revision
+            );
+            assert_eq!(
+                harness
+                    .execution
+                    .selected_task_failure()
+                    .unwrap()
+                    .identity(),
+                origin
+            );
+        }
+    }
+}
+
+#[test]
+fn protocol_owner_revision_tracks_ack_status_and_skips_idempotent_and_idle_folds() {
+    let mut harness = Harness::new(&[0], &[0], 64);
+    assert_eq!(harness.execution.accepted_protocol_revision(), 0);
+    let creates = harness.establish_all(Duration::from_secs(30));
+    assert_eq!(harness.execution.accepted_protocol_revision(), 0);
+    let create = creates
+        .into_iter()
+        .find(|intent| matches!(intent, OperationIntent::CreateTask(_)))
+        .expect("the established graph releases an original Create");
+    harness
+        .create_ack(&create, OperationOutcome::Accepted)
+        .unwrap();
+    let revision = harness.execution.accepted_protocol_revision();
+    assert!(
+        revision > 0,
+        "Create ACK's actual status must invalidate protocol projection"
+    );
+    let OperationIntent::CreateTask(request) = create else {
+        unreachable!()
+    };
+    let original = harness
+        .execution
+        .task(request.identity().task_id())
+        .unwrap()
+        .status()
+        .unwrap()
+        .clone();
+    harness
+        .execution
+        .intake()
+        .handle()
+        .publish(StatusEvent::Published(original));
+    let report = harness.execution.apply_status(64).unwrap();
+    assert_eq!(report.accepted, 0);
+    assert_eq!(harness.execution.accepted_protocol_revision(), revision);
+    harness.execution.apply_status(64).unwrap();
+    assert_eq!(harness.execution.accepted_protocol_revision(), revision);
+}
+
+#[test]
+fn protocol_owner_revision_keeps_failure_refinement_without_root_status_change() {
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let peer = harness.identity(harness.stage_tasks(1)[0]);
+    let origin = harness.identity(harness.stage_tasks(2)[0]);
+    let root = harness.execution.graph().root_identity();
+    let publish = |harness: &Harness, identity, cause| {
+        harness
+            .execution
+            .intake()
+            .handle()
+            .publish(StatusEvent::Published(
+                TaskStatus::try_new(
+                    identity,
+                    TaskStatusVersion::new(2).unwrap(),
+                    TaskState::Aborted,
+                    Some(TerminationDetail::Aborted(cause)),
+                    TaskOutputFacts::default(),
+                )
+                .unwrap(),
+            ));
+    };
+    publish(&harness, peer, AbortCause::PeerTaskFailed);
+    harness.execution.apply_status(64).unwrap();
+    let derived = harness.execution.accepted_protocol_revision();
+    assert!(
+        harness
+            .execution
+            .selected_task_failure()
+            .unwrap()
+            .detail()
+            .is_derived()
+    );
+    assert!(
+        harness
+            .execution
+            .task(root.task_id())
+            .unwrap()
+            .status()
+            .is_none()
+    );
+    publish(&harness, origin, AbortCause::QueryFailed);
+    harness.execution.apply_status(64).unwrap();
+    let authoritative = harness.execution.accepted_protocol_revision();
+    assert!(authoritative > derived);
+    assert_eq!(
+        harness
+            .execution
+            .selected_task_failure()
+            .unwrap()
+            .identity(),
+        origin
+    );
+    assert!(
+        !harness
+            .execution
+            .selected_task_failure()
+            .unwrap()
+            .detail()
+            .is_derived()
+    );
+    assert!(
+        harness
+            .execution
+            .task(root.task_id())
+            .unwrap()
+            .status()
+            .is_none()
+    );
+    publish(&harness, peer, AbortCause::PeerTaskFailed);
+    harness.execution.apply_status(64).unwrap();
+    assert_eq!(
+        harness.execution.accepted_protocol_revision(),
+        authoritative
+    );
+}
+
+#[test]
+fn protocol_owner_keeps_one_original_writer_witness_across_a_coalesced_status_fold() {
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let identity = harness.identity(harness.stage_tasks(1)[0]);
+    let original = TaskStatus::try_new(
+        identity,
+        TaskStatusVersion::new(1).unwrap(),
+        TaskState::Running,
+        None,
+        TaskOutputFacts::default(),
+    )
+    .unwrap()
+    .with_writer(novarocks_execution_contract::TaskWriterFacts::empty());
+    let later = TaskStatus::try_new(
+        identity,
+        TaskStatusVersion::new(2).unwrap(),
+        TaskState::Finished,
+        None,
+        TaskOutputFacts::new(true),
+    )
+    .unwrap();
+    harness
+        .execution
+        .intake()
+        .handle()
+        .publish(StatusEvent::Published(original.clone()));
+    harness
+        .execution
+        .intake()
+        .handle()
+        .publish(StatusEvent::Published(later));
+    let report = harness.execution.apply_status(64).unwrap();
+    assert_eq!(report.accepted, 2);
+    assert!(
+        harness
+            .execution
+            .task(identity.task_id())
+            .unwrap()
+            .status()
+            .unwrap()
+            .writer()
+            .is_none()
+    );
+    assert_eq!(
+        harness
+            .execution
+            .accepted_protocol_writer_witness(identity.task_id())
+            .unwrap()
+            .as_ref(),
+        &original
+    );
+    assert_eq!(harness.execution.accepted_protocol_task_changes().len(), 1);
+}
+
+include!("split_delivery_local_terminal_tests.rs");

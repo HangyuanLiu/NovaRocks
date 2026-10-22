@@ -392,6 +392,7 @@ impl NativeAttemptConvergence {
 pub struct NativeActiveConvergenceRequest {
     cancellation: CancellationView,
     absolute_remote_deadline: std::time::Instant,
+    computation_ready: Option<super::ComputationReadyToken>,
 }
 impl NativeActiveConvergenceRequest {
     pub fn new(
@@ -401,6 +402,7 @@ impl NativeActiveConvergenceRequest {
         Self {
             cancellation,
             absolute_remote_deadline,
+            computation_ready: None,
         }
     }
     pub fn cancellation(&self) -> &CancellationView {
@@ -408,6 +410,25 @@ impl NativeActiveConvergenceRequest {
     }
     pub const fn remote_observation_deadline(&self) -> std::time::Instant {
         self.absolute_remote_deadline
+    }
+
+    /// The actor's original accepted computation fact. This is neither a
+    /// Native Task success declaration nor permission to publish output.
+    pub const fn computation_ready(&self) -> Option<super::ComputationReadyToken> {
+        self.computation_ready
+    }
+
+    pub(crate) fn with_computation_ready(
+        mut self,
+        token: Option<super::ComputationReadyToken>,
+    ) -> Self {
+        self.computation_ready = token;
+        self
+    }
+
+    pub(crate) fn with_remote_observation_deadline(mut self, deadline: std::time::Instant) -> Self {
+        self.absolute_remote_deadline = self.absolute_remote_deadline.min(deadline);
+        self
     }
 }
 

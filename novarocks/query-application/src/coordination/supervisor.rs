@@ -580,6 +580,9 @@ async fn run_supervisor(
         if *shutdown.borrow() {
             break;
         }
+        // This fixed-budget turn is independent of which select source wins.
+        // Continuous starts cannot starve already-owned root ACK joins.
+        registry.progress_root_ack_tails();
         for task in registry.statement_native_ready_tasks() {
             logical_tasks.spawn(task);
         }
@@ -596,6 +599,16 @@ async fn run_supervisor(
             _ = registry.statement_native_changed() => {}
             command = starts.recv() => {
                 let Some(command) = command else { break };
+                // Shutdown may change after select inspected its higher-priority
+                // branch. Recheck before dispatching this accepted owner.
+                if *shutdown.borrow() {
+                    command.owner.complete_after_terminal_cancel_settled();
+                    let _ = command.reply.send(Err(QueryExecutionError::new(
+                        QueryExecutionErrorKind::Rejected,
+                        "logical execution supervisor shut down before starting the accepted request",
+                    )));
+                    break;
+                }
                 logical_tasks.spawn(run_logical_execution(
                     command,
                     Arc::clone(&native),
@@ -622,6 +635,7 @@ async fn run_supervisor(
                     }
                 }
             }
+            _ = registry.root_ack_tail_changed() => {}
         }
     }
 
@@ -635,13 +649,17 @@ async fn run_supervisor(
         )));
     }
     loop {
+        registry.progress_root_ack_tails();
         for task in registry.statement_native_ready_tasks() {
             logical_tasks.spawn(task);
         }
         if let Some(error) = registry.statement_native_health() {
             task_failure.get_or_insert(error);
         }
-        if logical_tasks.is_empty() && registry.statement_native_count() == 0 {
+        if logical_tasks.is_empty()
+            && registry.statement_native_count() == 0
+            && registry.root_ack_tail_count() == 0
+        {
             break;
         }
         tokio::select! {
@@ -659,6 +677,7 @@ async fn run_supervisor(
                     }
                 }
             }
+            _ = registry.root_ack_tail_changed() => {}
         }
     }
     task_failure.map_or(Ok(()), Err)
@@ -1499,7 +1518,7 @@ async fn converge_residual_rows_attempts(
 }
 
 async fn drive_rows_attempt_until_pump_decision(
-    active: &mut dyn ActiveNativeAttemptOwner,
+    active: &mut SupervisedActiveNativeOwner,
     drive: &NativeAttemptDrive,
     cancellation: novarocks_workload_control::CancellationView,
     running: super::RunningAttemptPermit,
@@ -1511,6 +1530,15 @@ async fn drive_rows_attempt_until_pump_decision(
     internal: &mut Option<InternalExecutionConsumer>,
     consumers: &mut JoinSet<Result<(), QueryExecutionError>>,
 ) -> (Result<super::LogicalConclusion, ResultPumpFailure>,) {
+    let root_ack = match active.reserve_root_ack_tail(running.identity(), root) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            return (Err(super::result_pump::pump_failure(
+                running,
+                super::result_pump::contract_failure(error),
+            )),);
+        }
+    };
     let mut ready = if let Some(internal) = internal.as_ref() {
         let activation = match running.bind_internal_consumer(root).await {
             Ok(activation) => activation,
@@ -1552,7 +1580,7 @@ async fn drive_rows_attempt_until_pump_decision(
     };
     let (terminal_sender, terminal_source) = super::native_attempt_terminal_channel();
     let mut terminal_sender = Some(terminal_sender);
-    let native_run = catch_future_panic(async { active.run(drive, cancellation).await });
+    let native_run = catch_future_panic(async { active.as_mut().run(drive, cancellation).await });
     let pump_ready = ready.clone();
     let pump = async move {
         if let Some(ready) = pump_ready {
@@ -1563,6 +1591,7 @@ async fn drive_rows_attempt_until_pump_decision(
                 runtime.binding,
                 runtime.statuses,
                 terminal_source,
+                root_ack,
                 ready,
             )
             .await
@@ -1574,6 +1603,7 @@ async fn drive_rows_attempt_until_pump_decision(
                 runtime.binding,
                 runtime.statuses,
                 terminal_source,
+                root_ack,
             )
             .await
         }
@@ -1741,7 +1771,7 @@ async fn supervise_rows_inner(
         }
         let drive = NativeAttemptDrive::new(&attempt.running);
         let (pump_result,) = drive_rows_attempt_until_pump_decision(
-            attempt.active.as_mut(),
+            &mut attempt.active,
             &drive,
             scope.cancellation().map_err(work_error)?,
             attempt.running,
@@ -1756,6 +1786,7 @@ async fn supervise_rows_inner(
         .await;
         attempt.active.begin_terminal_cut(Instant::now());
         if let Some(token) = internal.as_ref().and_then(|internal| internal.accepted) {
+            attempt.active.retain_computation_ready(token)?;
             // Consume the budget established at the actor cut. Time spent
             // handing off the ready result cannot renew remote observation.
             let remaining = token
@@ -2483,7 +2514,6 @@ async fn converge_active_request(
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
 ) -> (ActiveAttemptConvergence, Instant) {
-    let cancellation = request.cancellation().clone();
     let mut deadline = request.remote_observation_deadline();
     let mut shutdown_cut = false;
     loop {
@@ -2505,10 +2535,11 @@ async fn converge_active_request(
         let turn = {
             let convergence = super::catch_native_convergence_panic(async {
                 owner
-                    .converge(NativeActiveConvergenceRequest::new(
-                        cancellation.clone(),
-                        turn_deadline,
-                    ))
+                    .converge(
+                        request
+                            .clone()
+                            .with_remote_observation_deadline(turn_deadline),
+                    )
                     .await
             });
             tokio::pin!(convergence);

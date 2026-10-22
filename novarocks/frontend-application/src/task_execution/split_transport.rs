@@ -280,9 +280,14 @@ impl SplitDeliveryBridge {
     ) -> Result<(), SplitDeliveryError> {
         let outcome = match admitted {
             Ok(UpdateAdmission::Queued) => return self.expect_live(delivery),
-            // The destination is terminal, so the fact was dropped before it
-            // could reach a backend. Nothing was established remotely and
-            // resending cannot change that.
+            Ok(UpdateAdmission::DiscardedNoLongerNeeded) => {
+                DeliveryOutcome::DestinationFinished(format!(
+                    "the original owner no longer needs input for task {}",
+                    self.task_of(delivery)?
+                ))
+            }
+            // A missing or contrary Task fact cannot become normal completion
+            // merely because this input was discarded before remote dispatch.
             Ok(UpdateAdmission::DiscardedTerminal) => DeliveryOutcome::Local(format!(
                 "task update discarded: task {} is terminal",
                 self.task_of(delivery)?

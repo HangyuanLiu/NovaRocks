@@ -534,6 +534,18 @@ impl LogicalExecutionRuntimeRegistryHandle {
         self.inner.statement_native.len()
     }
 
+    pub(crate) fn progress_root_ack_tails(&self) {
+        self.inner.active_native.poll_root_ack_tails();
+    }
+
+    pub(crate) async fn root_ack_tail_changed(&self) {
+        self.inner.active_native.root_ack_tail_changed().await;
+    }
+
+    pub(crate) fn root_ack_tail_count(&self) -> usize {
+        self.inner.active_native.root_ack_tail_count()
+    }
+
     pub(crate) fn close_statement_native_admission(&self) {
         self.inner.statement_native.close();
     }

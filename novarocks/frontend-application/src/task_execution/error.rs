@@ -61,6 +61,7 @@ impl ParticipantObservationFailure {
 pub enum TaskExecutionError {
     /// A local owner has already projected its own fact and safe detail.
     Execution(novarocks_query_application::execution_error::ExecutionFailureInput),
+    SplitAssignment(crate::query_execution::split_assignment::SplitAssignmentDriverError),
     /// The original logical owner refused this operation; preserve its reason
     /// and normal stop observation instead of reconstructing it from text.
     Actor(novarocks_query_application::coordination::LogicalExecutionActorError),
@@ -362,6 +363,7 @@ impl fmt::Display for TaskExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Execution(input) => formatter.write_str(input.detail().as_str()),
+            Self::SplitAssignment(error) => write!(formatter, "split assignment failed: {error}"),
             Self::NativeTransport(error) => write!(
                 formatter,
                 "native Task transport construction failed: {error}"
@@ -608,6 +610,17 @@ impl TaskExecutionError {
         };
         match self {
             Self::Execution(input) => return input.clone(),
+            Self::SplitAssignment(error) => {
+                return error.execution_failure().unwrap_or_else(|| {
+                    ExecutionFailureInput::new(
+                        QueryFailureReason::SplitAssignmentFailed.failure_fact(),
+                        SafeDetail::truncating(
+                            "split assignment could not deliver the frozen input",
+                        ),
+                        ExecutionFailureSite::Coordinator,
+                    )
+                });
+            }
             Self::NativeTransport(error) => {
                 return ExecutionFailureInput::new(
                     error.failure_fact(),
@@ -781,6 +794,126 @@ mod canonical_input_tests {
             BackendProcessId::new_v7(),
         )
     }
+
+    #[test]
+    fn split_source_failures_preserve_the_original_neutral_input_including_resource_facts() {
+        use crate::query_execution::split_assignment::{ScanNodeKey, SplitAssignmentDriverError};
+        use novarocks_query_application::api::NativeAttemptPreparationFailure;
+        use novarocks_query_application::execution_error::ExecutionFailureInput;
+
+        let fact = FailureFact::new(
+            FailureClass::Resource,
+            FailureReason::new(domain::CONNECTOR, std::num::NonZeroU16::new(30).unwrap()),
+        )
+        .with_resource(ResourceFacts {
+            request_scope: Some(ResourceScope::Request),
+            constraint_scope: Some(ResourceScope::Process),
+            dimension: ResourceDimension::Positions,
+            requested: Some(2),
+            required_growth: None,
+            limit: Some(1),
+            live: Some(1),
+            committed: None,
+        });
+        let detail = SafeDetail::truncating("original split source failure fact");
+        let original =
+            ExecutionFailureInput::new(fact, detail.clone(), ExecutionFailureSite::Coordinator);
+        for split_error in [
+            SplitAssignmentDriverError::SourceClose {
+                scan: ScanNodeKey::new(1, 7),
+                fact,
+                detail: detail.clone(),
+            },
+            SplitAssignmentDriverError::SourceEnumeration {
+                scan: ScanNodeKey::new(1, 7),
+                fact,
+                detail: detail.clone(),
+            },
+        ] {
+            let projected = TaskExecutionError::SplitAssignment(split_error).preparation_input();
+            assert_eq!(projected, original);
+            assert_ne!(
+                projected.fact(),
+                QueryFailureReason::SplitAssignmentFailed.failure_fact()
+            );
+            let failure = NativeAttemptPreparationFailure::from_input(projected);
+            assert_eq!(failure.input(), &original);
+            assert_eq!(failure.error().execution_failure(), Some(&original));
+            assert_eq!(
+                failure.class(),
+                novarocks_coordination_contract::AttemptFailureClass::ResourceGovernance
+            );
+            assert_eq!(
+                failure.topology_requirement(),
+                novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
+            );
+        }
+    }
+
+    #[test]
+    fn plain_split_failures_are_distinct_nonrecoverable_facts_with_fixed_safe_detail() {
+        use crate::query_execution::connector_domain::SplitAssignmentError;
+        use crate::query_execution::split_assignment::{
+            AssignmentTarget, ScanNodeKey, SplitAssignmentDriverError,
+        };
+        use novarocks_query_application::api::NativeAttemptPreparationFailure;
+
+        let scan = ScanNodeKey::new(1, 7);
+        let target = AssignmentTarget {
+            backend_idx: 0,
+            fragment_instance_id: novarocks_types::UniqueId::new(11, 12),
+        };
+        let raw = "BackendLost: private provider token must never be a recovery signal";
+        for error in [
+            SplitAssignmentDriverError::Closed,
+            SplitAssignmentDriverError::DeliveryInProgress,
+            SplitAssignmentDriverError::NoAdmittedTask { scan },
+            SplitAssignmentDriverError::Assignment(SplitAssignmentError::AlreadyTerminal {
+                plan_node_id: 7,
+            }),
+            SplitAssignmentDriverError::Transport {
+                target: target.clone(),
+                detail: raw.to_owned(),
+            },
+            SplitAssignmentDriverError::Rejected {
+                target,
+                reason: raw.to_owned(),
+                detail: raw.to_owned(),
+            },
+            SplitAssignmentDriverError::SplitSource {
+                scan: Some(scan),
+                detail: raw.to_owned(),
+            },
+        ] {
+            let input = TaskExecutionError::SplitAssignment(error).preparation_input();
+            assert_eq!(
+                input.fact(),
+                QueryFailureReason::SplitAssignmentFailed.failure_fact()
+            );
+            assert_eq!(input.fact().reason().code(), 176);
+            assert_ne!(
+                input.fact().reason(),
+                QueryFailureReason::BackendLost.failure_fact().reason()
+            );
+            assert_eq!(
+                input.detail().as_str(),
+                "split assignment could not deliver the frozen input"
+            );
+            assert_eq!(input.site(), ExecutionFailureSite::Coordinator);
+            let failure = NativeAttemptPreparationFailure::from_input(input.clone());
+            assert_eq!(
+                failure.class(),
+                novarocks_coordination_contract::AttemptFailureClass::ExecutionFailure
+            );
+            assert_eq!(
+                failure.topology_requirement(),
+                novarocks_query_application::api::NativeAttemptTopologyRequirement::LiveSnapshot
+            );
+            assert_eq!(failure.error().execution_failure(), Some(&input));
+            assert!(!failure.error().message().contains(raw));
+        }
+    }
+
     #[test]
     fn domain_operation_keeps_original_fact_detail_and_exact_operation_identity() {
         let context = context();

@@ -1002,6 +1002,7 @@ pub(crate) async fn run_root_relay(
     binding: RootRelayBinding,
     statuses: AcceptedRootStatusSource,
     native_terminal: NativeAttemptTerminalSource,
+    root_ack: super::RootAckTailReservation,
 ) -> Result<LogicalConclusion, ResultPumpFailure> {
     run_root_relay_core(
         permit,
@@ -1010,6 +1011,7 @@ pub(crate) async fn run_root_relay(
         binding,
         statuses,
         native_terminal,
+        root_ack,
         None,
     )
     .await
@@ -1024,6 +1026,7 @@ pub(crate) async fn run_internal_root_relay(
     binding: RootRelayBinding,
     statuses: AcceptedRootStatusSource,
     native_terminal: NativeAttemptTerminalSource,
+    root_ack: super::RootAckTailReservation,
     ready: watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>,
 ) -> Result<LogicalConclusion, ResultPumpFailure> {
     run_root_relay_core(
@@ -1033,6 +1036,7 @@ pub(crate) async fn run_internal_root_relay(
         binding,
         statuses,
         native_terminal,
+        root_ack,
         Some(ready),
     )
     .await
@@ -1045,6 +1049,7 @@ async fn run_root_relay_core(
     binding: RootRelayBinding,
     statuses: AcceptedRootStatusSource,
     native_terminal: NativeAttemptTerminalSource,
+    root_ack: super::RootAckTailReservation,
     ready: Option<watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>>,
 ) -> Result<LogicalConclusion, ResultPumpFailure> {
     let RootRelayBinding {
@@ -1285,9 +1290,7 @@ async fn run_root_relay_core(
         )
     {
         let ack = port.read(request, window.clone());
-        tokio::spawn(async move {
-            let _ = ack.await;
-        });
+        root_ack.start(ack);
     }
     // The local End consumption proof: every data item's delivery completed.
     if let Err(error) = runtime.observer.observe_local_root_end(root, end).await {
@@ -1482,7 +1485,7 @@ pub fn paced_root_read(
     })
 }
 
-fn pump_failure(
+pub(crate) fn pump_failure(
     permit: RunningAttemptPermit,
     failure: RootResultFetchFailure,
 ) -> ResultPumpFailure {
@@ -1673,7 +1676,7 @@ fn relay_failure(root: TaskIdentity, error: super::RootRelayError) -> RootResult
     ))
 }
 
-fn contract_failure(error: QueryExecutionError) -> RootResultFetchFailure {
+pub(crate) fn contract_failure(error: QueryExecutionError) -> RootResultFetchFailure {
     if let Some(input) = error.execution_failure() {
         return RootResultFetchFailure::from_input(input.clone());
     }
@@ -2496,6 +2499,23 @@ mod tests {
         drop((stream, actor, owner, window));
     }
 
+    async fn run_root_relay(
+        permit: RunningAttemptPermit,
+        root: TaskIdentity,
+        scope: WorkScope,
+        binding: RootRelayBinding,
+        statuses: AcceptedRootStatusSource,
+        terminal: NativeAttemptTerminalSource,
+    ) -> Result<LogicalConclusion, ResultPumpFailure> {
+        let (tail_owner, tail) =
+            super::super::native_active_custody::root_ack_test_fixture(permit.identity(), root);
+        let result =
+            super::run_root_relay(permit, root, scope, binding, statuses, terminal, tail).await;
+        tail_owner.close_native();
+        tail_owner.drain().await;
+        result
+    }
+
     // ---- Backend-encoded root relay ----
 
     use novarocks_execution_contract::root_result::{
@@ -2511,12 +2531,14 @@ mod tests {
     struct ScriptedRootPort {
         requests: Mutex<Vec<RootResultRead>>,
         outcomes: Mutex<VecDeque<RootReadOutcome>>,
+        final_ack_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     }
     impl ScriptedRootPort {
         fn new(outcomes: Vec<RootReadOutcome>) -> Arc<Self> {
             Arc::new(Self {
                 requests: Mutex::new(Vec::new()),
                 outcomes: Mutex::new(outcomes.into()),
+                final_ack_gate: Mutex::new(None),
             })
         }
         fn requests(&self) -> Vec<(Option<u64>, u64)> {
@@ -2536,6 +2558,11 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<RetainedRootReply, RootResultFetchFailure>> + Send>>
         {
             self.requests.lock().unwrap().push(request.clone());
+            let final_ack_gate = if request.wanted().is_none() {
+                self.final_ack_gate.lock().unwrap().take()
+            } else {
+                None
+            };
             let outcome = self.outcomes.lock().unwrap().pop_front().unwrap_or(
                 if request.wanted().is_none() {
                     RootReadOutcome::AckOnly
@@ -2552,6 +2579,9 @@ mod tests {
             };
             let long_poll = matches!(reply.outcome, RootReadOutcome::NotReady);
             Box::pin(async move {
+                if let Some(gate) = final_ack_gate {
+                    gate.await.unwrap();
+                }
                 if long_poll {
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
@@ -2802,15 +2832,22 @@ mod tests {
             rows_data(1, &[5, 0, 0, 0, b'a', b'b'], None),
             rows_data(2, &[b'c', b'd', b'e', 1, 0, 0, 0, b'f'], Some((3, 2))),
         ]);
+        let (release_ack, ack_gate) = tokio::sync::oneshot::channel();
+        *port.final_ack_gate.lock().unwrap() = Some(ack_gate);
+        let capacity = scope.result_capacity().unwrap();
+        let (tail_owner, tail) =
+            super::super::native_active_custody::root_ack_test_fixture(permit.identity(), root);
         let (_terminal_sender, terminal_source) = native_attempt_terminal_channel();
-        let relay = tokio::spawn(run_root_relay(
+        let relay = tokio::spawn(super::run_root_relay(
             permit,
             root,
             scope,
             relay_binding(root, Arc::clone(&port), &window),
             statuses,
             terminal_source,
+            tail,
         ));
+        drop(window);
         let first = next_segment(&mut stream).await;
         assert_eq!(first.sequence(), ResultPacketSequence::new(0));
         assert_eq!(first.rows(), 0);
@@ -2846,7 +2883,19 @@ mod tests {
             LogicalConclusion::Succeeded
         );
         assert_eq!(&port.requests()[..2], &[(Some(1), 0), (Some(2), 0)]);
-        drop((stream, actor, owner, window));
+        tail_owner.close_native();
+        assert!(
+            tail_owner.retained(),
+            "client EOF is independent of the pending original ACK"
+        );
+        assert_eq!(capacity.snapshot().held_positions, [1, 0, 0, 0]);
+        release_ack.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), tail_owner.drain())
+            .await
+            .unwrap();
+        assert!(!tail_owner.retained());
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        drop((stream, actor, owner));
     }
 
     #[tokio::test]

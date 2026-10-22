@@ -270,6 +270,8 @@ impl RoundSplitAssignment {
     pub(crate) fn enumerate_source(
         mut request: RoundSplitEnumerationRequest,
     ) -> RoundSplitEnumerationResult {
+        use novarocks_execution_contract::{SafeDetail, failure::FailureProjection};
+        use novarocks_query_application::execution_error::QueryFailureReason;
         let scan = request.source.scan;
         let batch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let Some(dynamic_filter) = request.dynamic_filter.as_ref() else {
@@ -289,14 +291,16 @@ impl RoundSplitAssignment {
                 .next_batch(DEFAULT_PUMP_BATCH_SIZE, dynamic_filter)
                 .map(Some)
         }))
-        .map_err(|_| SplitAssignmentDriverError::SplitSource {
-            scan: Some(scan),
-            detail: "split source panicked while enumerating".to_owned(),
+        .map_err(|_| SplitAssignmentDriverError::SourceEnumeration {
+            scan,
+            fact: QueryFailureReason::SplitAssignmentFailed.failure_fact(),
+            detail: SafeDetail::truncating("the connector split source panicked while enumerating"),
         })
         .and_then(|batch| {
-            batch.map_err(|error| SplitAssignmentDriverError::SplitSource {
-                scan: Some(scan),
-                detail: error.to_string(),
+            batch.map_err(|error| SplitAssignmentDriverError::SourceEnumeration {
+                scan,
+                fact: error.failure_fact(),
+                detail: SafeDetail::truncating("enumerating the connector split source failed"),
             })
         });
         RoundSplitEnumerationResult {
