@@ -402,13 +402,36 @@ Install the pinned local tool with:
 cargo install cargo-machete --version 0.9.2 --locked
 ```
 
-Global Clippy currently reports warnings without `-D warnings`.
+The `cargo clippy` stage is strict for workspace members:
+`ci_main_cargo clippy --all-targets -- -D warnings`. The wrapper fixes
+`--workspace --profile dev --locked` and the worktree `target/`. Its effective
+Cargo command is:
+
+```bash
+cargo clippy --workspace --profile dev --locked --target-dir target --all-targets -- -D warnings
+```
+
+Strictness is scoped to this CI stage, not a workspace-wide
+`warnings = "deny"`, `#![deny(warnings)]`, or `RUSTFLAGS` policy. The arguments
+after `--` are passed to Clippy; dependencies outside the workspace are not
+thereby made Clippy targets.
+
+The shared baseline follows only the relaxations common to Databend and
+RisingWave: `[workspace.lints.clippy] result_large_err = "allow"` and the root
+`clippy.toml` value `too-many-arguments-threshold = 10`. `large_enum_variant`
+and `type_complexity` retain Clippy's defaults; project-specific relaxations
+from only one comparison project are not adopted. New local exceptions use
+`#[expect(lint, reason = "...")]`, not `#[allow]`, so an obsolete exception
+becomes visible. A `rust-toolchain.toml` upgrade must fix newly emitted lints
+or justify a baseline adjustment under the same alignment rule.
+
 `novarocks-native-trust` separately denies `clippy::disallowed_methods` and
 `clippy::disallowed_types` at the crate root; its local `clippy.toml` forbids
 configuration-source/filesystem APIs and direct Tonic endpoint connections.
-Clippy reads the nearest `clippy.toml`; configurations do not merge. If a root
-configuration is added or changed, copy its entries into
-native-trust's configuration too, so the nearer file does not hide them.
+Clippy reads the nearest `clippy.toml`; configurations do not merge. The root
+file sets the argument threshold to 10, and native-trust's nearer file repeats
+that value alongside its local restrictions. If the root configuration changes,
+copy its shared entries into native-trust's configuration too.
 
 ## Focused verification
 

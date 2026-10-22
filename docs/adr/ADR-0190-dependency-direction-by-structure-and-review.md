@@ -14,6 +14,9 @@ partially-supersedes:
     scope: "Guard identity and test-authority rules; versions stay owned by the root manifest and Cargo.lock"
   - id: ADR-0179
     scope: "Permanent dependency-graph boundary guard; publication lifecycle decisions remain active"
+partially-superseded-by:
+  - id: ADR-0194
+    scope: "Only the statement that global Clippy remains warning-only and strictness is deferred; dependency governance, resource estimation, and all other conclusions remain active"
 date: 2026-10-21
 provenance:
   - "discussion: 2026-10-20 dependency governance through Rust generic mechanisms"
