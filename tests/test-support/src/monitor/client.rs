@@ -866,6 +866,45 @@ mod tests {
     }
 
     #[test]
+    fn lifetime_expiry_never_masks_an_incomplete_final_or_cleanup_violation() {
+        for (cleanup_complete, owner_lost, errors) in [
+            (false, false, serde_json::json!([])),
+            (true, false, serde_json::json!(["original cleanup failure"])),
+            (true, true, serde_json::json!([])),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "nr-final-expiry-cleanup-{}",
+                run_retention::unique()
+            ));
+            let (mut monitor, completion) = monitor_fixture(&root);
+            let final_frame = serde_json::json!({
+                "schema":1, "event":"Final", "status_raw":0,
+                "owner_lost":owner_lost, "cleanup_complete":cleanup_complete,
+                "errors":errors, "lifetime_expired":true
+            });
+            // Reuse the client verdict fixture, not a deliberately broken
+            // managed process registered with the outer formal cleanup owner.
+            OpenOptions::new()
+                .append(true)
+                .open(root.join("record.jsonl"))
+                .unwrap()
+                .write_all(format!("{final_frame}\n").as_bytes())
+                .unwrap();
+            completion.send(Ok(ExitStatus::from_raw(0))).unwrap();
+            let error = monitor
+                .wait(Instant::now() + std::time::Duration::from_secs(1))
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("cleanup violation"),
+                "{error:#}"
+            );
+            assert!(!error.is::<PayloadLifetimeExpired>(), "{error:#}");
+            drop(monitor);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn post_write_query_error_prevents_another_query_but_preserves_cleanup_control() {
         let path = std::env::temp_dir().join(format!("nr-query-write-{}", run_retention::unique()));
         let mut control = OpenOptions::new()

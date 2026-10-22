@@ -1121,6 +1121,13 @@ fn admitted_lifetime_stops_writes_while_the_owner_remains_alive() {
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(fs::metadata(writes).unwrap().len(), size);
     assert_pid_reaped(process.pid());
+    assert_eq!(record["cleanup_complete"], true, "{record}");
+    assert_eq!(record["errors"], serde_json::json!([]), "{record}");
+    drop(process);
+    assert!(
+        !root.join("caller-drop-error.txt").exists(),
+        "an explicitly observed lifetime failure must not become a second cleanup failure"
+    );
 }
 
 #[test]
@@ -1148,11 +1155,9 @@ fn admitted_lifetime_escalates_term_ignoring_group_and_observes_descendants_exit
     let error = process
         .wait_for_successful_exit_until(now + Duration::from_secs(7))
         .unwrap_err();
-    // Expiration is always a failure. If actual exit crosses the complete
-    // clock, retain the separate incomplete fact instead of waiving it.
     assert!(
-        format!("{error:#}").contains("deadline expired")
-            || format!("{error:#}").contains("cleanup violation")
+        error.is::<novarocks_test_support::PayloadLifetimeExpired>(),
+        "{error:#}"
     );
     let text = fs::read_to_string(root.join("record.jsonl")).unwrap();
     let record: serde_json::Value = text
@@ -1190,6 +1195,12 @@ fn admitted_lifetime_escalates_term_ignoring_group_and_observes_descendants_exit
         "descendant is still executing: {state}"
     );
     assert_pid_reaped(process.pid());
+    assert_eq!(record["errors"], serde_json::json!([]), "{record}");
+    drop(process);
+    assert!(
+        !root.join("caller-drop-error.txt").exists(),
+        "an explicitly observed lifetime failure must not become a second cleanup failure"
+    );
 }
 
 #[test]
@@ -1233,9 +1244,16 @@ fn repeated_lifetime_configuration_only_narrows_original_clocks() {
         "{error:#}"
     );
     assert!(Instant::now() < now + Duration::from_secs(6));
-    assert_eq!(
-        final_record(process.diagnostic_root())["lifetime_expired"],
-        true
+    let root = process.diagnostic_root().to_owned();
+    let record = final_record(&root);
+    assert_eq!(record["lifetime_expired"], true);
+    assert_eq!(record["cleanup_complete"], true, "{record}");
+    assert_eq!(record["owner_lost"], false, "{record}");
+    assert_eq!(record["errors"], serde_json::json!([]), "{record}");
+    drop(process);
+    assert!(
+        !root.join("caller-drop-error.txt").exists(),
+        "an explicitly observed lifetime failure must not become a second cleanup failure"
     );
 }
 
