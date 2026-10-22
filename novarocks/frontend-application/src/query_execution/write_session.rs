@@ -246,7 +246,7 @@ impl ConnectorWriteSession {
     fn begin_validated(
         lease: ConnectorWriteStackLease,
         catalog_properties: novarocks_spi::connector::CatalogProperties,
-        request: ConnectorWriteBeginRequest,
+        mut request: ConnectorWriteBeginRequest,
         finish_publication: WritePublicationState,
     ) -> Result<Self, ConnectorError> {
         let implicit_empty_staged_create = matches!(
@@ -265,6 +265,7 @@ impl ConnectorWriteSession {
                 if declaration.technique()
                     == novarocks_spi::connector::ConnectorManagedPublicationTechnique::MetadataOnly
         );
+        request.context = context_for_write_begin(request.context, &catalog_properties)?;
         let plan = lease.session().begin_write(request)?;
         Ok(Self {
             lease,
@@ -1093,6 +1094,20 @@ fn ensure_finish_context_active(context: &ConnectorRequestContext) -> Result<(),
     Ok(())
 }
 
+/// Bind only an already-admitted attempt sink to the retained write generation.
+/// The owned context preserves its deadline, stop and request/storage capabilities.
+/// COW callers must cover this properties clone before entering this helper.
+fn context_for_write_begin(
+    context: ConnectorRequestContext,
+    catalog_properties: &novarocks_spi::connector::CatalogProperties,
+) -> Result<ConnectorRequestContext, ConnectorError> {
+    if context.vended_credential_lease_sink().is_some() {
+        context.with_vended_credential_lease_collection(catalog_properties.clone())
+    } else {
+        Ok(context)
+    }
+}
+
 /// Open one distributed write's session on a write stack already pinned to the
 /// generation that planned it.
 ///
@@ -1119,7 +1134,7 @@ pub(crate) fn begin_connector_write_session(
 pub(crate) fn begin_cow_connector_write_session(
     lease: ConnectorWriteStackLease,
     write_lease: &novarocks_spi::connector::ConnectorWriteLease,
-    request: ConnectorWriteBeginRequest,
+    mut request: ConnectorWriteBeginRequest,
     original: novarocks_spi::connector::ConnectorOriginalResultScope,
     existing_caller_upper: u64,
 ) -> Result<Arc<ConnectorWriteSession>, crate::query_execution::dml::mutation_flow::CowFailure> {
@@ -1132,9 +1147,11 @@ pub(crate) fn begin_cow_connector_write_session(
     let Some(properties) = write_lease.catalog_properties() else {
         return Err(CowFailure::missing_catalog_identity_bound(original));
     };
-    // CatalogProperties::clone allocates exactly two Vec backings; all
-    // entries share their Arc strings. Cover the actual lease projection and
-    // Arc<Self> before either is allocated, separately from request context.
+    // Each CatalogProperties::clone allocates two Vec backings; entries share
+    // their Arc strings. Cover the session projection, the collection projection
+    // when a sink exists, and Arc<Self> before any of them are allocated. The
+    // caller already covered the original request context clone separately.
+    let property_copies = 1 + usize::from(request.context.vended_credential_lease_sink().is_some());
     let extra = properties
         .execution_properties()
         .len()
@@ -1148,6 +1165,7 @@ pub(crate) fn begin_cow_connector_write_session(
                 >())
                 .and_then(|bindings| bytes.checked_add(bindings))
         })
+        .and_then(|bytes| bytes.checked_mul(property_copies))
         .and_then(|bytes| bytes.checked_add(std::mem::size_of::<ConnectorWriteSession>()))
         .and_then(|bytes| {
             bytes.checked_add(
@@ -1174,6 +1192,14 @@ pub(crate) fn begin_cow_connector_write_session(
             novarocks_spi::connector::ConnectorCowBeginFailure::new(cause.into(), original),
         ));
     }
+    request.context = match context_for_write_begin(request.context, properties) {
+        Ok(context) => context,
+        Err(error) => {
+            return Err(CowFailure::checked_begin(
+                novarocks_spi::connector::ConnectorCowBeginFailure::new(error.into(), original),
+            ));
+        }
+    };
     ConnectorWriteSession::begin_cow_checked(
         lease,
         properties.clone(),
@@ -1432,6 +1458,9 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct Recorded {
         pub(crate) begin: usize,
+        capture_begin_context: bool,
+        begin_context: Option<ConnectorRequestContext>,
+        cow_begin_upper: Option<u64>,
         pub(crate) finish: usize,
         pub(crate) abort: usize,
         pub(crate) reconcile: usize,
@@ -1497,6 +1526,12 @@ pub(crate) mod tests {
                     original,
                 ));
             }
+            {
+                let mut recorded = self.recorded.lock().expect("recorded");
+                if recorded.capture_begin_context {
+                    recorded.cow_begin_upper = Some(existing_caller_upper);
+                }
+            }
             match self.begin_write(request) {
                 Ok(plan) => Ok(novarocks_spi::connector::ConnectorCowBeginPlan::new(
                     plan,
@@ -1516,9 +1551,15 @@ pub(crate) mod tests {
 
         fn begin_write(
             &self,
-            _request: ConnectorWriteBeginRequest,
+            request: ConnectorWriteBeginRequest,
         ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
-            self.recorded.lock().expect("recorded").begin += 1;
+            {
+                let mut recorded = self.recorded.lock().expect("recorded");
+                recorded.begin += 1;
+                if recorded.capture_begin_context {
+                    recorded.begin_context = Some(request.context);
+                }
+            }
             let commit = self.adapter.wrap_commit_handle(FakeCommit);
             let targets = (0..self.targets)
                 .map(|index| {
@@ -3025,5 +3066,8 @@ pub(crate) mod tests {
 
         assert_eq!(accounting.holds(), 0);
         assert!(accounting.leases_cleared());
+    }
+    mod begin_context_tests {
+        include!("write_session_begin_context_tests.rs");
     }
 }
