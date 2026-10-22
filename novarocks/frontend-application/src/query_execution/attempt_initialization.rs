@@ -43,7 +43,7 @@ use crate::query_execution::lifecycle_plan::{
 };
 use crate::query_execution::split_assignment_round::{
     OpenRoundSplitSources, OpenedRoundSplitSource, RoundSplitAssignmentPlan,
-    RoundSplitSourceRecipe, assignment_endpoints, assignment_targets, open_round_split_source,
+    RoundSplitSourceRecipe, assignment_targets, open_round_split_source,
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::task_execution::blocking_io::{
@@ -80,19 +80,6 @@ pub(crate) enum RoundCredentialLeaseSource {
 }
 
 impl RoundCredentialLeaseSource {
-    #[cfg(novarocks_dev_controls)]
-    pub(crate) fn test_statement_nomination(
-        &self,
-    ) -> Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>> {
-        match self {
-            Self::Reservation {
-                reservation: Some(reservation),
-                ..
-            } => reservation.test_statement_nomination(),
-            _ => None,
-        }
-    }
-
     pub(crate) fn fresh(execution: QueryExecutionId) -> Self {
         Self::Fresh {
             collector: AttemptCredentialLeaseCollector::new(execution),
@@ -142,7 +129,7 @@ impl RoundCredentialLeaseSource {
         self.publish_observed();
         match &mut self {
             Self::Frozen(leases) => Ok(std::mem::replace(leases, QueryCredentialLeases::empty())),
-            Self::Fresh { collector, .. } => collector.into_credential_leases(),
+            Self::Fresh { collector, .. } => collector.drain_credential_leases(),
             Self::Reservation { reservation, .. } => reservation
                 .take()
                 .expect("attempt reservation is consumed exactly once")
@@ -447,7 +434,6 @@ impl SerialAttemptInitialization for ProductionInitializationState {
                 sources,
                 self.retry_policy,
                 self.initial_dynamic_filter_wait_cap,
-                assignment_endpoints(&self.schedule),
                 self.blocking_io,
             )
         });

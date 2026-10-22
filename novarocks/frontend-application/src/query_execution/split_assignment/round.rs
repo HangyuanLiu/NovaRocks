@@ -38,7 +38,6 @@ use super::driver::{
 use super::transport::TaskUpdateTransport;
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
-use novarocks_spi::connector::CatalogHandle;
 
 /// How many splits one batch pulls from a source.
 ///
@@ -48,6 +47,7 @@ pub(crate) const DEFAULT_PUMP_BATCH_SIZE: usize = 256;
 
 /// How long the pump waits when no source could make progress.
 const IDLE_PUMP_BACKOFF: std::time::Duration = std::time::Duration::from_millis(2);
+#[cfg(test)]
 pub(crate) const DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP: Duration = Duration::from_secs(1);
 
 /// One typed scan's split source, with the scan it feeds.
@@ -85,7 +85,7 @@ pub(crate) struct RoundSplitAssignment {
 
 /// What one admitted synchronous split-source operation produced.
 pub(crate) enum RoundSplitEnumeration {
-    Ready(RoundSplitEnumerationRequest),
+    Ready(Box<RoundSplitEnumerationRequest>),
     /// Every remaining source is temporarily blocked by feedback or task
     /// backpressure. The owner parks outside Connector admission.
     Idle(Duration),
@@ -139,20 +139,6 @@ impl RoundSplitAssignment {
             .flatten()
             .filter_map(|source| source.source.join_pin())
             .collect()
-    }
-    pub(crate) fn profile_snapshot(&self) -> SplitSourceProfile {
-        self.sources
-            .iter()
-            .flatten()
-            .fold(SplitSourceProfile::default(), |mut total, source| {
-                let next = source.source.profile_snapshot();
-                total.files_considered =
-                    total.files_considered.saturating_add(next.files_considered);
-                total.files_pruned = total.files_pruned.saturating_add(next.files_pruned);
-                total.files_expanded = total.files_expanded.saturating_add(next.files_expanded);
-                total.splits_emitted = total.splits_emitted.saturating_add(next.splits_emitted);
-                total
-            })
     }
     pub(crate) fn new(
         execution_id: QueryExecutionId,
@@ -270,13 +256,15 @@ impl RoundSplitAssignment {
         let source = self.sources[index]
             .take()
             .expect("the selected source remains owned by the round");
-        Ok(RoundSplitEnumeration::Ready(RoundSplitEnumerationRequest {
-            slot: index,
-            source,
-            dynamic_filter,
-            started_at: self.started_at,
-            initial_dynamic_filter_wait_cap: self.initial_dynamic_filter_wait_cap,
-        }))
+        Ok(RoundSplitEnumeration::Ready(Box::new(
+            RoundSplitEnumerationRequest {
+                slot: index,
+                source,
+                dynamic_filter,
+                started_at: self.started_at,
+                initial_dynamic_filter_wait_cap: self.initial_dynamic_filter_wait_cap,
+            },
+        )))
     }
 
     /// Performs the only Connector call in one ordinary blocking job.
@@ -486,7 +474,6 @@ pub(crate) type RoundSplitAssignmentStop = SplitAssignmentStop;
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use novarocks_proto_codec::connector_read::ConnectorReadCodecError;
     use novarocks_spi::connector::ConnectorError;
     use novarocks_spi::connector::read_stack::{
         ConnectorReadDynamicFilterSnapshot, ConnectorReadSplit, ConnectorReadSplitSource,

@@ -27,12 +27,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
 use arrow::array::{Array, BinaryArray, Int32Array, ListArray, MapArray, StringArray};
-use arrow::datatypes::{DataType, Field, Fields, Schema};
+use arrow::datatypes::Schema;
+#[cfg(test)]
+use arrow::datatypes::{DataType, Field, Fields};
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorRequestContext,
-    StatisticsArtifactDraft, StatisticsArtifactIdentity, StatisticsDataVersion,
-    StatisticsRequiredAggregation,
+    StatisticsArtifactDraft, StatisticsArtifactIdentity, StatisticsRequiredAggregation,
 };
 
 use crate::query_execution::contract::{
@@ -51,10 +53,12 @@ fn charge_statistics_body_bytes(current: usize, body_bytes: usize) -> Result<usi
     Ok(charged)
 }
 
+#[cfg(test)]
 fn artifact_input_fields_type() -> DataType {
     DataType::List(Arc::new(Field::new("item", DataType::Int32, false)))
 }
 
+#[cfg(test)]
 fn artifact_properties_type() -> DataType {
     DataType::Map(
         Arc::new(Field::new(
@@ -70,44 +74,18 @@ fn artifact_properties_type() -> DataType {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StatisticsExecutionMode {
-    SynchronousWait,
-    /// A process-owned statistics job has reached its collection query
-    /// attempt. This is intentionally not the business job identity and not
-    /// the provider publication identity.
-    BackgroundCollectionAttempt,
-}
-
-impl StatisticsExecutionMode {
-    pub const fn statement_cancellation_terminates_execution(self) -> bool {
-        matches!(self, Self::SynchronousWait)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatisticsExecutionPolicy {
-    mode: StatisticsExecutionMode,
     attempt_timeout: Duration,
 }
 
 impl StatisticsExecutionPolicy {
-    pub fn try_new(
-        mode: StatisticsExecutionMode,
-        attempt_timeout: Duration,
-    ) -> Result<Self, DistributedQueryError> {
+    pub fn try_new(attempt_timeout: Duration) -> Result<Self, DistributedQueryError> {
         if attempt_timeout.is_zero() {
             return Err(contract_violation(
                 "statistics attempt timeout must be greater than zero",
             ));
         }
-        Ok(Self {
-            mode,
-            attempt_timeout,
-        })
-    }
-
-    pub const fn mode(self) -> StatisticsExecutionMode {
-        self.mode
+        Ok(Self { attempt_timeout })
     }
 
     pub const fn attempt_timeout(self) -> Duration {
@@ -119,7 +97,6 @@ impl StatisticsExecutionPolicy {
 /// and every required execution terminal have both been observed.
 pub struct StatisticsCollectionProgram {
     table: novarocks_spi::connector::ConnectorTableHandle,
-    data_version: StatisticsDataVersion,
     read_version_ordinal: i64,
     required: Vec<StatisticsRequiredAggregation>,
     policy: StatisticsExecutionPolicy,
@@ -128,7 +105,6 @@ pub struct StatisticsCollectionProgram {
 impl StatisticsCollectionProgram {
     pub fn try_new(
         table: novarocks_spi::connector::ConnectorTableHandle,
-        data_version: StatisticsDataVersion,
         read_version_ordinal: Option<i64>,
         required: Vec<StatisticsRequiredAggregation>,
         policy: StatisticsExecutionPolicy,
@@ -165,7 +141,6 @@ impl StatisticsCollectionProgram {
         }
         Ok(Self {
             table,
-            data_version,
             read_version_ordinal,
             required,
             policy,
@@ -178,10 +153,6 @@ impl StatisticsCollectionProgram {
 
     pub fn table(&self) -> &novarocks_spi::connector::ConnectorTableHandle {
         &self.table
-    }
-
-    pub fn data_version(&self) -> &StatisticsDataVersion {
-        &self.data_version
     }
 
     pub const fn read_version_ordinal(&self) -> i64 {
@@ -529,15 +500,8 @@ fn admit_statistics_scan_binding(
                     version_ordinal,
                     crate::catalog_application::query_bindings::QueryScanMaterialization {
                         table: program.table().clone(),
-                        catalog_handle: planning_lease
-                            .binding()
-                            .catalog_handle()
-                            .map_err(|error| error.to_string())?
-                            .clone(),
-                        schema: input_schema.clone(),
                         selector: ConnectorReadSelector::SnapshotId(version_ordinal),
                         mv_partition_selection: None,
-                        statistics_pin: None,
                         planning_lease: planning_lease.clone(),
                     },
                 )]),
@@ -589,6 +553,7 @@ impl StatisticsRootResultDecoder {
         }
     }
 
+    #[cfg(test)]
     pub fn apply_chunk(
         &mut self,
         chunk: &novarocks_execution::exec::chunk::Chunk,
@@ -839,9 +804,7 @@ mod tests {
         required: Vec<novarocks_spi::connector::StatisticsRequiredAggregation>,
     ) -> Result<super::StatisticsCollectionProgram, super::DistributedQueryError> {
         use bytes::Bytes;
-        use novarocks_spi::connector::{
-            ConnectorInstanceId, ConnectorTableHandle, StatisticsDataVersion,
-        };
+        use novarocks_spi::connector::{ConnectorInstanceId, ConnectorTableHandle};
 
         super::StatisticsCollectionProgram::try_new(
             ConnectorTableHandle::try_new(
@@ -849,15 +812,10 @@ mod tests {
                 Bytes::from_static(b"table"),
             )
             .expect("checked table handle"),
-            StatisticsDataVersion::try_new(Bytes::from_static(b"data-v1"))
-                .expect("checked data version"),
             Some(7),
             required,
-            super::StatisticsExecutionPolicy::try_new(
-                super::StatisticsExecutionMode::SynchronousWait,
-                std::time::Duration::from_secs(30),
-            )
-            .expect("bounded attempt policy"),
+            super::StatisticsExecutionPolicy::try_new(std::time::Duration::from_secs(30))
+                .expect("bounded attempt policy"),
         )
     }
 
@@ -954,7 +912,9 @@ mod tests {
         }
     }
 
-    fn chunk(rows: &[(&[i32], &str, &[u8], &[(&str, &str)])]) -> Chunk {
+    type StatisticsArtifactTestRow<'a> = (&'a [i32], &'a str, &'a [u8], &'a [(&'a str, &'a str)]);
+
+    fn chunk(rows: &[StatisticsArtifactTestRow<'_>]) -> Chunk {
         let schema = Arc::new(Schema::new(vec![
             Field::new("input_fields", super::artifact_input_fields_type(), false),
             Field::new("blob_type", DataType::Utf8, false),

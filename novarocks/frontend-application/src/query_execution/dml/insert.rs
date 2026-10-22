@@ -31,21 +31,11 @@ use crate::catalog_application::resolver::TargetBackend;
 use crate::connector::backend::ResolvedTable;
 use crate::query_execution::dml::iceberg_writer;
 use crate::query_execution::kernels::DmlExecutionKernel;
-use novarocks_parser::ast::{Insert, Query};
+use novarocks_parser::ast::Query;
 use novarocks_proto_codec::lifecycle::QueryOptions;
-use novarocks_query_application::admitted_query_context::{QueryExecutionContext, RequestContext};
+use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{ConnectorWriteOperationId, LakePublicationId};
 use novarocks_sql::semantic::ObjectName;
-
-/// One admitted INSERT statement at the frontend route boundary.
-pub struct InsertRequest<'a> {
-    /// SQLP-5 owns INSERT family and capability facts. `source` below may
-    /// only be sliced through spans carried by this statement.
-    pub statement: &'a Insert,
-    pub source: &'a str,
-    pub context: &'a RequestContext,
-    pub query_options: Option<&'a QueryOptions>,
-}
 
 /// A target name before catalog/backend resolution.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -357,13 +347,7 @@ impl InsertEngine for DmlExecutionKernel {
             namespace: namespace.clone(),
             table: table.clone(),
         };
-        let resolved = ResolvedTable {
-            catalog,
-            namespace,
-            table,
-            columns,
-            statistics_pin: None,
-        };
+        let resolved = ResolvedTable { columns };
         let source = request.source;
         let overwrite_mode = match request.overwrite_mode {
             InsertOverwriteMode::Append => iceberg_writer::IcebergWriteMode::Append,

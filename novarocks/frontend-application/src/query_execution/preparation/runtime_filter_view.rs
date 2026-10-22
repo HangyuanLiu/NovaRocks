@@ -88,19 +88,6 @@ impl RuntimeFilterReductionFacts {
     }
 }
 
-pub enum RuntimeFilterBindingRoleFacts {
-    Producer {
-        contribution_kinds: Vec<RuntimeFilterContributionKind>,
-        completion_requirement: RuntimeFilterCompletionRequirement,
-        target: RuntimeFilterProducerTarget,
-    },
-    Consumer {
-        capabilities: Vec<RuntimeFilterArtifactCapability>,
-        activation: RuntimeFilterConsumerActivation,
-        target: RuntimeFilterConsumerTarget,
-    },
-}
-
 #[derive(Clone, Copy)]
 pub enum RuntimeFilterContributionKind {
     ValueDomainDelta,
@@ -194,48 +181,6 @@ pub enum RuntimeFilterLateApplyGranularity {
 }
 
 #[derive(Clone, Copy)]
-pub enum RuntimeFilterProducerTarget {
-    JoinBuildKey { ordinal: u32 },
-    AggregateTopNKey { group_key_ordinal: u32, limit: u32 },
-}
-
-impl RuntimeFilterProducerTarget {
-    fn from_attempt(value: attempt_facts::AttemptRuntimeFilterProducerTarget) -> Self {
-        match value {
-            attempt_facts::AttemptRuntimeFilterProducerTarget::JoinBuildKey { ordinal } => {
-                Self::JoinBuildKey { ordinal }
-            }
-            attempt_facts::AttemptRuntimeFilterProducerTarget::AggregateTopNKey {
-                group_key_ordinal,
-                limit,
-            } => Self::AggregateTopNKey {
-                group_key_ordinal,
-                limit,
-            },
-        }
-    }
-}
-
-#[derive(Clone)]
-pub enum RuntimeFilterConsumerTarget {
-    DirectInputOrdinal(u32),
-    SourceBoundary,
-}
-
-impl RuntimeFilterConsumerTarget {
-    fn from_attempt(value: &attempt_facts::AttemptRuntimeFilterConsumerTarget) -> Self {
-        match value {
-            attempt_facts::AttemptRuntimeFilterConsumerTarget::DirectInput { input_ordinal } => {
-                Self::DirectInputOrdinal(*input_ordinal)
-            }
-            attempt_facts::AttemptRuntimeFilterConsumerTarget::SourceBoundary => {
-                Self::SourceBoundary
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
 pub enum RuntimeFilterSortDirection {
     Ascending,
     Descending,
@@ -315,7 +260,6 @@ impl<'a> RuntimeFilterDeploymentFactsView<'a> {
             .flatten()
             .map(|placement| RuntimeFilterValidatedPlacementFacts {
                 fragment_id: placement.fragment_id,
-                instance_index: placement.instance_index,
                 fragment_instance_id: placement.finst_id,
                 backend_idx: placement.backend_idx,
             })
@@ -484,25 +428,18 @@ impl RuntimeFilterDeploymentBindingFacts<'_> {
     pub fn role(self) -> RuntimeFilterDeploymentBindingRoleFacts {
         match &self.binding.role {
             attempt_facts::AttemptRuntimeFilterBindingRoleFacts::Producer {
-                contribution_kinds,
                 completion_requirement,
-                target,
+                ..
             } => RuntimeFilterDeploymentBindingRoleFacts::Producer {
-                contribution_kinds: contribution_kinds
-                    .iter()
-                    .copied()
-                    .map(RuntimeFilterContributionKind::from_attempt)
-                    .collect(),
                 completion_requirement: RuntimeFilterCompletionRequirement::from_attempt(
                     *completion_requirement,
                 ),
-                target: RuntimeFilterProducerTarget::from_attempt(*target),
             },
             attempt_facts::AttemptRuntimeFilterBindingRoleFacts::Consumer {
                 capabilities,
                 activation,
-                target,
                 feedback_scan_type,
+                ..
             } => RuntimeFilterDeploymentBindingRoleFacts::Consumer {
                 capabilities: capabilities
                     .iter()
@@ -510,7 +447,6 @@ impl RuntimeFilterDeploymentBindingFacts<'_> {
                     .map(RuntimeFilterArtifactCapability::from_attempt)
                     .collect(),
                 activation: RuntimeFilterConsumerActivation::from_attempt(*activation),
-                target: RuntimeFilterConsumerTarget::from_attempt(target),
                 feedback_scan_type: feedback_scan_type.clone(),
             },
         }
@@ -519,14 +455,11 @@ impl RuntimeFilterDeploymentBindingFacts<'_> {
 
 pub enum RuntimeFilterDeploymentBindingRoleFacts {
     Producer {
-        contribution_kinds: Vec<RuntimeFilterContributionKind>,
         completion_requirement: RuntimeFilterCompletionRequirement,
-        target: RuntimeFilterProducerTarget,
     },
     Consumer {
         capabilities: Vec<RuntimeFilterArtifactCapability>,
         activation: RuntimeFilterConsumerActivation,
-        target: RuntimeFilterConsumerTarget,
         feedback_scan_type: Option<novarocks_physical_plan::ValueType>,
     },
 }
@@ -534,7 +467,6 @@ pub enum RuntimeFilterDeploymentBindingRoleFacts {
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterValidatedPlacementFacts {
     fragment_id: u32,
-    instance_index: usize,
     fragment_instance_id: novarocks_types::UniqueId,
     backend_idx: usize,
 }
@@ -542,10 +474,6 @@ pub struct RuntimeFilterValidatedPlacementFacts {
 impl RuntimeFilterValidatedPlacementFacts {
     pub const fn fragment_id(self) -> u32 {
         self.fragment_id
-    }
-
-    pub const fn instance_index(self) -> usize {
-        self.instance_index
     }
 
     pub const fn fragment_instance_id(self) -> novarocks_types::UniqueId {
@@ -597,13 +525,6 @@ pub enum RuntimeFilterJoinProgressFacts {
         build_frontier: Vec<RuntimeFilterFrontierEdgeFacts>,
         non_build_inputs: Vec<RuntimeFilterFrontierEdgeFacts>,
     },
-    Skipped {
-        channel_id: u32,
-        producer_binding_id: u32,
-        producer_fragment_id: u32,
-        join_node_id: i32,
-        reason: RuntimeFilterJoinProgressSkipReason,
-    },
 }
 
 impl RuntimeFilterJoinProgressFacts {
@@ -630,19 +551,6 @@ impl RuntimeFilterJoinProgressFacts {
                     .map(RuntimeFilterFrontierEdgeFacts::from_attempt)
                     .collect(),
             },
-            attempt_facts::AttemptRuntimeFilterJoinProgressFacts::Skipped {
-                channel_id,
-                producer_binding_id,
-                producer_fragment_id,
-                join_node_id,
-                reason,
-            } => Self::Skipped {
-                channel_id: *channel_id,
-                producer_binding_id: *producer_binding_id,
-                producer_fragment_id: *producer_fragment_id,
-                join_node_id: *join_node_id,
-                reason: RuntimeFilterJoinProgressSkipReason::from_attempt(*reason),
-            },
         }
     }
 }
@@ -658,27 +566,6 @@ impl RuntimeFilterFrontierEdgeFacts {
         Self {
             source_fragment_id: edge.source_fragment_id,
             target_exchange_node_id: edge.target_exchange_node_id,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub enum RuntimeFilterJoinProgressSkipReason {
-    NoRfSides,
-    MissingChild,
-    UnauditedNode { node_id: i32 },
-}
-
-impl RuntimeFilterJoinProgressSkipReason {
-    fn from_attempt(value: attempt_facts::AttemptRuntimeFilterJoinProgressSkipReason) -> Self {
-        match value {
-            attempt_facts::AttemptRuntimeFilterJoinProgressSkipReason::NoRfSides => Self::NoRfSides,
-            attempt_facts::AttemptRuntimeFilterJoinProgressSkipReason::MissingChild => {
-                Self::MissingChild
-            }
-            attempt_facts::AttemptRuntimeFilterJoinProgressSkipReason::UnauditedNode {
-                node_id,
-            } => Self::UnauditedNode { node_id },
         }
     }
 }

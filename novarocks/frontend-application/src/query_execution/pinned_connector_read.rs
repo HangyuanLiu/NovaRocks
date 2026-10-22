@@ -34,7 +34,6 @@ use crate::catalog_application::query_bindings::{
 };
 use crate::catalog_application::query_materializer::QueryLocalTableOverlay;
 use crate::query_execution::cohort_read::QueryPinnedFileSetRead;
-use novarocks_spi::connector::ConnectorControlPlanningLease;
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::query_execution::{
     FrozenConnectorScanIdentity, FrozenConnectorScanPlan, build_pinned_file_set_scan_plan,

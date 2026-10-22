@@ -92,8 +92,8 @@ pub(crate) struct TaskUpdateTransportError {
 }
 
 impl TaskUpdateTransportError {
-    /// Compatibility constructor for local callers that have no retryable
-    /// transport evidence. Such failures must fail closed.
+    /// Compatibility constructor for tests with no retryable transport evidence.
+    #[cfg(test)]
     pub(crate) fn new(detail: impl Into<String>) -> Self {
         Self::fatal(detail)
     }

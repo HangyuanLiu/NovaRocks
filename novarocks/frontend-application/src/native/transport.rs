@@ -221,7 +221,7 @@ pub(super) fn is_observed_connection_loss(error: &(dyn std::error::Error + 'stat
 
 #[derive(Clone)]
 enum FrozenClientEndpoints {
-    Backend(FrozenBackendDescriptor),
+    Backend(Box<FrozenBackendDescriptor>),
     Single {
         endpoint: NativeEndpoint,
         domain: NativeEndpointDomain,
@@ -241,7 +241,7 @@ impl Client {
         data_runtime: FrontendDataRuntime,
     ) -> Self {
         Self {
-            endpoints: FrozenClientEndpoints::Backend(descriptor),
+            endpoints: FrozenClientEndpoints::Backend(Box::new(descriptor)),
             data_runtime,
         }
     }

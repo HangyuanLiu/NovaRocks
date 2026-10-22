@@ -93,7 +93,7 @@ pub struct PreparedMutation {
 pub enum MutationStageOutcome {
     NoOp,
     AbortRequired {
-        reason: crate::dml::error::DmlExecutionError,
+        reason: Box<crate::dml::error::DmlExecutionError>,
         handle: Arc<dyn MutationAbort>,
     },
     CommitRequired(Arc<dyn MutationCommit>),
@@ -568,7 +568,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                             attempt_id: prepared.operation.attempt_id.clone(),
                             execution,
                         }),
-                        reason,
+                        reason: Box::new(reason),
                     }),
                     crate::query_execution::dml::mutation_flow::MutationStagedWrite::CommitRequired {
                         execution,
@@ -599,7 +599,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                             attempt_id: prepared.operation.attempt_id.clone(),
                             execution,
                         }),
-                        reason,
+                        reason: Box::new(reason),
                     }),
                     crate::query_execution::dml::mutation_flow::MutationStagedWrite::CommitRequired {
                         execution,

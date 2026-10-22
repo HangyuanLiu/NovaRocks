@@ -339,6 +339,7 @@ pub(crate) struct FrontendMetricsRegistry {
 }
 
 impl FrontendMetricsRegistry {
+    #[cfg(test)]
     pub(crate) fn new() -> Result<Arc<Self>, String> {
         Self::with_process_memory(None)
     }
@@ -556,6 +557,10 @@ pub(crate) fn observe_pre_ready_replan(duration: Duration) {
 /// The runtime registry remains the membership owner. This module owns only
 /// the stable metric names and label sets, so observability does not become a
 /// second membership authority.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Each value is a separately owned topology observation with independent availability; a bundle would obscure which observations were actually published."
+)]
 pub(crate) fn publish_backend_topology_metrics(
     entries: usize,
     announce_lease_valid: usize,

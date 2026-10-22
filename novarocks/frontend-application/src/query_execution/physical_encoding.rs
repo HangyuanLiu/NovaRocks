@@ -83,6 +83,7 @@ pub(crate) struct EncodedCompletedPlan {
     /// another encoding's artifacts. The generated messages it was frozen
     /// from are gone.
     pub(crate) native: NativeFragmentAttachment,
+    #[cfg(test)]
     pub(crate) topology: CompletedPlanTopology,
     /// Everything the attempt that runs this plan reads about it.
     pub(crate) plan_facts: AttemptPlanFacts,
@@ -233,7 +234,6 @@ fn encode_completed_packages(
             control,
         )?,
         topology.anchor,
-        provenance,
     )?;
     // Scan scheduling and the attempt's scan facts are read from the plan and
     // the freezes; no wire encoding is consulted.
@@ -254,6 +254,7 @@ fn encode_completed_packages(
     Ok(EncodedCompletedPlan {
         semantic_candidate,
         native,
+        #[cfg(test)]
         topology,
         plan_facts,
         access,

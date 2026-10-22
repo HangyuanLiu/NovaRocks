@@ -24,10 +24,10 @@ use novarocks_query_application::api::{
     NativeActiveConvergenceClosure, NativeActiveConvergenceRequest,
     NativeAttemptPreparationFailure, NativeAttemptTerminal, StatementNativeHealthFailure,
 };
+use novarocks_query_application::coordination::DispatchBudget;
 use novarocks_query_application::coordination::{
     AcceptedRootStatusSource, NativeAttemptDrive, ReplacementWorkerAdmissionEvidence,
 };
-use novarocks_query_application::coordination::{DispatchBudget, OperationDispatchResult};
 use novarocks_task_codec::TransportBudget;
 use novarocks_workload_control::{CancellationReason, CancellationView};
 
@@ -38,11 +38,13 @@ use super::attempt_convergence::{
     advance_task_round,
 };
 use super::clock::{ProcessMonotonicClock, TaskProtocolClock};
-use super::error::{ParticipantObservationFailure, TaskExecutionError};
+#[cfg(test)]
+use super::error::ParticipantObservationFailure;
+use super::error::TaskExecutionError;
 use super::execution::QueryTaskExecution;
 use super::graph::build_task_graph_from_manifest;
 use super::intent::TaskOperationSink;
-use super::round::{AcknowledgementObserver, TaskRound, TurnPump};
+use super::round::{AcknowledgementObserver, TaskRound};
 use super::sources::{AttemptEstablishFacts, SubmissionFragmentPlans};
 use super::split_transport::SplitDeliveryBridge;
 use super::status_intake::{NotifyWake, ObservationIntake, StatusIntake, StatusIntakeWake};
@@ -94,9 +96,6 @@ pub(crate) enum ManifestAttemptCompletion {
     /// A row result pump owns output and asks TaskRound to seal the exact root
     /// success after it has consumed Worker EOS.
     AcceptedRootSuccessSeal,
-    /// No result stream is attached. Completion requires full Task/context
-    /// convergence, which is the conservative completion-only contract.
-    AttemptDrained,
 }
 
 pub(crate) fn assemble_manifest_round(
@@ -197,7 +196,7 @@ pub(crate) fn assemble_manifest_round(
         intake,
     )?;
     if let Some(admissions) = replacement_admissions {
-        execution.adopt_replacement_admissions(admissions)?;
+        execution.adopt_replacement_admissions(&admissions)?;
     }
     let round = TaskRound::new_covered(
         execution,
@@ -259,17 +258,6 @@ impl ManifestAssembledRound {
     /// projection; this owner never constructs a second actor port.
     pub(crate) fn install_abort_effect_intake(&mut self, intake: NativeAbortEffectIntake) {
         self.round.install_abort_effect_intake(intake);
-    }
-
-    /// Installs one manifest-validated RF, credential, or split-source pump.
-    pub(crate) fn install_pump(&mut self, pump: Box<dyn TurnPump>) {
-        self.round.add_pump(pump);
-    }
-
-    /// Completes C3's runtime-resource attachment. A round cannot turn before
-    /// this explicit declaration, including when the exact pump set is empty.
-    pub(crate) fn seal_runtime_owners(&mut self) {
-        self.round.seal_pumps();
     }
 
     pub(crate) fn take_root_status_source(&mut self) -> Option<AcceptedRootStatusSource> {
@@ -459,9 +447,6 @@ impl ManifestAssembledRound {
             let completed = match completion {
                 ManifestAttemptCompletion::AcceptedRootSuccessSeal => {
                     self.round.accepted_root_success_sealed()
-                }
-                ManifestAttemptCompletion::AttemptDrained => {
-                    self.round.attempt_drained() && self.round.execution().worker_contexts_stopped()
                 }
             };
             if !waiting_for_process && completed && self.actor_gate.prepare_convergence() {
@@ -834,7 +819,7 @@ mod tests {
         assembled
             .round
             .execution_mut()
-            .apply_covered_entries(vec![ObservationIntakeEntry::Frame(
+            .apply_covered_entries(vec![ObservationIntakeEntry::Frame(Box::new(
                 ObservationFrame::Covered {
                     context,
                     generation: 1,
@@ -843,7 +828,7 @@ mod tests {
                         source_revision: None,
                     },
                 },
-            )])
+            ))])
             .unwrap();
         assert_eq!(
             assembled
@@ -931,7 +916,7 @@ mod tests {
         assembled
             .round
             .execution_mut()
-            .apply_covered_entries(vec![ObservationIntakeEntry::Frame(
+            .apply_covered_entries(vec![ObservationIntakeEntry::Frame(Box::new(
                 ObservationFrame::Covered {
                     context,
                     generation: 1,
@@ -940,7 +925,7 @@ mod tests {
                         source_revision: None,
                     },
                 },
-            )])
+            ))])
             .unwrap();
     }
 

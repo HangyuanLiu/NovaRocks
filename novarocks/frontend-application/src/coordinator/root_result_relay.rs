@@ -55,7 +55,7 @@ fn local_failure(
 }
 
 pub(super) enum RelayedRootAnswer {
-    Data(RetainedRootReply),
+    Data(Box<RetainedRootReply>),
     End(RootResultEnd),
     NotReady,
     AwaitTerminalControl,
@@ -151,6 +151,7 @@ impl RelayedRootPolls {
             .map(Arc::clone)
     }
 
+    #[cfg(test)]
     pub(super) async fn join_closed(&mut self) -> Result<(), &tokio::task::JoinError> {
         std::future::poll_fn(|cx| self.poll_closed(cx).map(|_| ())).await;
         self.closed
@@ -177,10 +178,6 @@ impl Drop for RelayedRootPolls {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Each owner of this bounded poll is explicit."
-)]
 async fn drive(
     port: Arc<dyn BoundedRootReadPort>,
     mut frontier: RootRelayFrontier,
@@ -285,7 +282,10 @@ async fn drive(
         };
         match step {
             RootRelayStep::Deliver { sequence, .. } => {
-                if send(RelayedRootAnswer::Data(reply)).await.is_err() {
+                if send(RelayedRootAnswer::Data(Box::new(reply)))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
                 match receipts.recv().await {
@@ -350,8 +350,7 @@ mod tests {
         root_result::{RootReadOutcome, RootResultData, RootResultReply},
     };
     use novarocks_query_application::{
-        api::{QueryExecutionError, QueryExecutionErrorKind},
-        coordination::AttemptFailureClass,
+        api::QueryExecutionError, coordination::AttemptFailureClass,
     };
     use novarocks_result_contract::InternalResultDomain;
     use novarocks_types::{

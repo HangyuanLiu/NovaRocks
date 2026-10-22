@@ -122,9 +122,6 @@ fn statement_result(result: MaintenanceStatementResult) -> StatementResult {
 mod tests {
     use super::super::TableMaintenanceEngine;
     use super::*;
-    use novarocks_table_maintenance::{
-        MaintenanceActionOutcome, MaintenanceActionRequest, OptimizeSubmission,
-    };
     use std::sync::Arc;
     use std::thread;
 
@@ -145,23 +142,6 @@ mod tests {
         ) -> Result<MaintenanceStatementResult, String> {
             self.called.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(MaintenanceStatementResult::Ok)
-        }
-
-        async fn execute_automatic_action(
-            &self,
-            _engine: &dyn TableMaintenanceEngine,
-            _request: MaintenanceActionRequest,
-        ) -> Result<MaintenanceActionOutcome, novarocks_table_maintenance::runtime::TerminalError>
-        {
-            Err("not used".to_string().into())
-        }
-
-        fn submit_automatic_optimize(
-            &self,
-            _engine: &dyn TableMaintenanceEngine,
-            _target: novarocks_table_maintenance::MaintenanceTarget,
-        ) -> Result<OptimizeSubmission, String> {
-            Err("not used".to_string())
         }
 
         async fn shutdown_until(&self, _deadline: std::time::Instant) -> Result<(), String> {

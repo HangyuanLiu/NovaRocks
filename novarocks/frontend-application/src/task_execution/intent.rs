@@ -25,13 +25,15 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use novarocks_execution::task_execution::FetchTaskDynamicFilters;
 use novarocks_execution::task_execution::{
     AbortQueryContext, AcquireQueryContextAdmissionTicket, CancelTask, CreateTaskReceipt,
-    EstablishQueryContext, FetchTaskDynamicFilters, GetFinalTaskInfo, OperationKind,
-    OperationOutcome, OperationShape, QueryContextAdmissionTicketReceipt, QueryContextDomainUpdate,
-    QueryContextReceipt, QuiesceQueryContext, QuiesceQueryContextReceipt, ReleaseOutcome,
-    ReleaseQueryContext, TaskDomainUpdate, TaskOperationId, UpdateQueryContext, UpdateTask,
-    UpdateTaskReceipt, status::SafeDetail,
+    EstablishQueryContext, OperationKind, OperationOutcome, OperationShape,
+    QueryContextAdmissionTicketReceipt, QueryContextDomainUpdate, QueryContextReceipt,
+    QuiesceQueryContext, QuiesceQueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
+    TaskDomainUpdate, TaskOperationId, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
+    status::SafeDetail,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_query_application::coordination::{
@@ -63,8 +65,8 @@ pub enum OperationIntent {
     QuiesceQueryContext(QuiesceQueryContext),
     AbortQueryContext(AbortQueryContext),
     ReleaseQueryContext(ReleaseQueryContext),
+    #[cfg(test)]
     FetchTaskDynamicFilters(FetchTaskDynamicFilters),
-    GetFinalTaskInfo(GetFinalTaskInfo),
 }
 
 impl OperationIntent {
@@ -79,8 +81,8 @@ impl OperationIntent {
             Self::QuiesceQueryContext(request) => request.envelope().kind(),
             Self::AbortQueryContext(request) => request.envelope().kind(),
             Self::ReleaseQueryContext(request) => request.envelope().kind(),
+            #[cfg(test)]
             Self::FetchTaskDynamicFilters(request) => request.envelope().kind(),
-            Self::GetFinalTaskInfo(request) => request.envelope().kind(),
         }
     }
 
@@ -95,8 +97,8 @@ impl OperationIntent {
             Self::QuiesceQueryContext(request) => request.envelope().operation_id(),
             Self::AbortQueryContext(request) => request.envelope().operation_id(),
             Self::ReleaseQueryContext(request) => request.envelope().operation_id(),
+            #[cfg(test)]
             Self::FetchTaskDynamicFilters(request) => request.envelope().operation_id(),
-            Self::GetFinalTaskInfo(request) => request.envelope().operation_id(),
         }
     }
 
@@ -117,8 +119,8 @@ impl OperationIntent {
             Self::QuiesceQueryContext(_) => OperationShape::QuiesceQueryContext,
             Self::AbortQueryContext(_) => OperationShape::AbortQueryContext,
             Self::ReleaseQueryContext(_) => OperationShape::ReleaseQueryContext,
+            #[cfg(test)]
             Self::FetchTaskDynamicFilters(_) => OperationShape::FetchTaskDynamicFilters,
-            Self::GetFinalTaskInfo(_) => OperationShape::GetFinalTaskInfo,
         }
     }
 
@@ -158,8 +160,8 @@ impl OperationIntent {
             Self::QuiesceQueryContext(request) => request.context().backend_process_id(),
             Self::AbortQueryContext(request) => request.context().backend_process_id(),
             Self::ReleaseQueryContext(request) => request.context().backend_process_id(),
+            #[cfg(test)]
             Self::FetchTaskDynamicFilters(request) => request.identity().backend_process_id(),
-            Self::GetFinalTaskInfo(request) => request.identity().backend_process_id(),
         }
     }
 
@@ -193,9 +195,9 @@ impl OperationIntent {
             Self::CancelTask(_)
             | Self::QuiesceQueryContext(_)
             | Self::AbortQueryContext(_)
-            | Self::ReleaseQueryContext(_)
-            | Self::FetchTaskDynamicFilters(_)
-            | Self::GetFinalTaskInfo(_) => 0,
+            | Self::ReleaseQueryContext(_) => 0,
+            #[cfg(test)]
+            Self::FetchTaskDynamicFilters(_) => 0,
         };
         payload.saturating_add(OPERATION_FIXED_BYTES)
     }
@@ -300,7 +302,7 @@ pub enum AckPayload {
     /// none or because it failed closed.
     None,
     AdmissionTicket(QueryContextAdmissionTicketReceipt),
-    Create(CreateTaskReceipt),
+    Create(Box<CreateTaskReceipt>),
     Update(UpdateTaskReceipt),
     Context(QueryContextReceipt),
     Quiesce(QuiesceQueryContextReceipt),
@@ -372,6 +374,7 @@ impl OperationAcknowledgement {
             ),
         }
     }
+    #[cfg(test)]
     pub const fn transport_unknown(operation_id: TaskOperationId, kind: OperationKind) -> Self {
         Self::from_dispatch_result(
             operation_id,
@@ -380,6 +383,7 @@ impl OperationAcknowledgement {
             AckPayload::None,
         )
     }
+
     pub const fn from_dispatch_result(
         operation_id: TaskOperationId,
         kind: OperationKind,
@@ -588,6 +592,7 @@ impl DispatchBatch {
         self.queued_at
     }
 
+    #[cfg(test)]
     pub fn into_operations(self) -> Vec<OperationIntent> {
         self.operations
     }

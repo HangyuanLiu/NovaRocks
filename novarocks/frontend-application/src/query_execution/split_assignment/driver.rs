@@ -65,10 +65,6 @@ impl ScanNodeKey {
         }
     }
 
-    pub(crate) const fn fragment_id(&self) -> FragmentId {
-        self.fragment_id
-    }
-
     /// The node id this scan carries inside its own fragment, which is what a
     /// task update names.
     pub(crate) const fn plan_node_id(&self) -> i32 {
@@ -254,7 +250,6 @@ impl From<SplitAssignmentError> for SplitAssignmentDriverError {
 pub(crate) struct SplitSourceHandle {
     scan: ScanNodeKey,
     finished: bool,
-    closed: bool,
 }
 
 impl SplitSourceHandle {
@@ -264,10 +259,6 @@ impl SplitSourceHandle {
 
     pub(crate) const fn is_finished(&self) -> bool {
         self.finished
-    }
-
-    pub(crate) const fn is_closed(&self) -> bool {
-        self.closed
     }
 }
 
@@ -350,7 +341,6 @@ impl SplitAssignmentDriver {
             .map(|scan| SplitSourceHandle {
                 scan: *scan,
                 finished: false,
-                closed: false,
             })
             .collect();
         Self {
@@ -369,14 +359,6 @@ impl SplitAssignmentDriver {
         }
     }
 
-    pub(crate) const fn execution_id(&self) -> QueryExecutionId {
-        self.execution_id
-    }
-
-    pub(crate) const fn is_closed(&self) -> bool {
-        self.closed
-    }
-
     pub(crate) const fn delivery_in_progress(&self) -> bool {
         self.delivery.is_some()
     }
@@ -384,10 +366,6 @@ impl SplitAssignmentDriver {
     pub(crate) fn next_delivery_wake_at(&self) -> Option<Instant> {
         let current = self.delivery.as_ref()?.current.as_ref()?;
         Some(current.next_attempt_at.unwrap_or(current.poll_deadline))
-    }
-
-    pub(crate) fn sources(&self) -> &[SplitSourceHandle] {
-        &self.sources
     }
 
     /// Whether this plan node has already sent its terminal marker to every
@@ -746,9 +724,6 @@ impl SplitAssignmentDriver {
     pub(crate) fn close(&mut self) {
         self.closed = true;
         self.stop.stop();
-        for source in &mut self.sources {
-            source.closed = true;
-        }
     }
 
     #[cfg(test)]

@@ -539,11 +539,13 @@ impl RelayedCowSelectionCollector {
     }
 
     /// Bytes held by the bounded collector.
+    #[cfg(test)]
     pub const fn byte_count(&self) -> u64 {
         self.collector.byte_count()
     }
 
     /// Bytes held by an unfinished record.
+    #[cfg(test)]
     pub fn assembly_bytes(&self) -> usize {
         self.assembly.retained_bytes()
     }

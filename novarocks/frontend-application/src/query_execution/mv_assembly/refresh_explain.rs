@@ -43,10 +43,6 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
 }
 
 /// EXPLAIN from an already frozen rewrite context and its planning lease.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "EXPLAIN keeps the frozen rewrite, its lease, and the request context explicit."
-)]
 pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
     ports: &IcebergMvCorePorts,
     current_catalog: Option<&str>,

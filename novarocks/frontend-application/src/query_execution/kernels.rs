@@ -57,7 +57,6 @@ pub struct QueryPreparationKernel {
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     query_execution: QueryExecutionService,
     backend_topology: BackendTopologyService,
-    exchange_port: u16,
 }
 
 /// Read-only system-table query dependencies.
@@ -101,6 +100,10 @@ impl SystemTableQueryKernel {
 }
 
 impl QueryPreparationKernel {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "This kernel constructor binds distinct query, connector, and execution owners; a second configuration aggregate would duplicate the validated kernel contract."
+    )]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -110,7 +113,7 @@ impl QueryPreparationKernel {
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         query_execution: QueryExecutionService,
         backend_topology: BackendTopologyService,
-        exchange_port: u16,
+        _exchange_port: u16,
         constant_policy: novarocks_functions::ConstantPolicy,
         static_plan_carrier: CompiledPackageCarrier,
     ) -> Self {
@@ -125,7 +128,6 @@ impl QueryPreparationKernel {
             unified_statistics,
             query_execution,
             backend_topology,
-            exchange_port,
         }
     }
 
@@ -175,10 +177,6 @@ impl QueryPreparationKernel {
     pub(crate) fn backend_topology(&self) -> &BackendTopologyService {
         &self.backend_topology
     }
-
-    pub(crate) const fn exchange_port(&self) -> u16 {
-        self.exchange_port
-    }
 }
 
 /// Foreground and historical DML execution dependencies, including CTAS.
@@ -225,10 +223,6 @@ impl DmlPlanningServices {
             static_plan_carrier,
             catalog_service,
         }
-    }
-
-    pub const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
-        self.constant_policy
     }
 }
 
@@ -349,65 +343,6 @@ impl DmlExecutionKernel {
     }
 }
 
-/// Catalog DDL dependencies.
-///
-/// This is intentionally a catalog-only kernel: it can mutate catalog facts
-/// and enforce catalog-adjacent MV/view guards, but has no query execution,
-/// statistics, DML writer or MV refresh capability.
-#[derive(Clone)]
-pub struct CatalogCommandKernel {
-    catalog_service: Arc<QueryCatalogService>,
-    catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
-    connector_control: Arc<dyn ConnectorControlRegistry>,
-    mv_readiness: Arc<MvReadinessPort>,
-    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-    view_service: Arc<dyn ViewService>,
-}
-
-impl CatalogCommandKernel {
-    pub fn new(
-        catalog_service: Arc<QueryCatalogService>,
-        catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
-        connector_control: Arc<dyn ConnectorControlRegistry>,
-        mv_readiness: Arc<MvReadinessPort>,
-        mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-        view_service: Arc<dyn ViewService>,
-    ) -> Self {
-        Self {
-            catalog_service,
-            catalog_application,
-            connector_control,
-            mv_readiness,
-            mv_storage_observation,
-            view_service,
-        }
-    }
-
-    pub(crate) fn catalog_service(&self) -> &Arc<QueryCatalogService> {
-        &self.catalog_service
-    }
-
-    pub(crate) fn catalog_application(&self) -> Option<&Arc<dyn CatalogApplicationPort>> {
-        self.catalog_application.as_ref()
-    }
-
-    pub(crate) fn connector_control(&self) -> &Arc<dyn ConnectorControlRegistry> {
-        &self.connector_control
-    }
-
-    pub(crate) fn mv_readiness(&self) -> &Arc<MvReadinessPort> {
-        &self.mv_readiness
-    }
-
-    pub(crate) fn mv_storage_observation(&self) -> &Arc<dyn MvStorageObservationPort> {
-        &self.mv_storage_observation
-    }
-
-    pub fn view_service(&self) -> &Arc<dyn ViewService> {
-        &self.view_service
-    }
-}
-
 /// View command dependencies.
 #[derive(Clone)]
 pub struct ViewExecutionKernel {
@@ -479,6 +414,10 @@ pub struct MaintenanceExecutionKernel {
 }
 
 impl MaintenanceExecutionKernel {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "This kernel constructor binds distinct query, connector, and execution owners; a second configuration aggregate would duplicate the validated kernel contract."
+    )]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -567,7 +506,6 @@ macro_rules! impl_kernel_catalog_admission {
 }
 
 impl_kernel_catalog_admission!(QueryPreparationKernel);
-impl_kernel_catalog_admission!(CatalogCommandKernel);
 impl_kernel_catalog_admission!(DmlExecutionKernel);
 impl_kernel_catalog_admission!(ViewExecutionKernel);
 impl_kernel_catalog_admission!(MaintenanceExecutionKernel);

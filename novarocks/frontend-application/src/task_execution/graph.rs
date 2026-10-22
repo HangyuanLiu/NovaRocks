@@ -154,6 +154,7 @@ pub struct TaskNode {
     identity: TaskIdentity,
     context: QueryContextRef,
     fragment_id: FragmentId,
+    #[cfg(test)]
     instance_index: usize,
     fragment_instance_id: UniqueId,
     split_plan_nodes: Vec<PlanNodeId>,
@@ -180,6 +181,7 @@ impl TaskNode {
         self.fragment_id
     }
 
+    #[cfg(test)]
     pub const fn instance_index(&self) -> usize {
         self.instance_index
     }
@@ -201,6 +203,7 @@ impl TaskNode {
 pub struct StageNode {
     stage: StageRef,
     fragment_id: FragmentId,
+    #[cfg(test)]
     tasks: Vec<TaskId>,
 }
 
@@ -217,6 +220,7 @@ impl StageNode {
         self.fragment_id
     }
 
+    #[cfg(test)]
     pub fn tasks(&self) -> &[TaskId] {
         &self.tasks
     }
@@ -266,7 +270,6 @@ impl EdgeNode {
 #[derive(Debug)]
 pub struct TaskGraph {
     execution_id: QueryExecutionId,
-    frontend_process_id: FrontendProcessId,
     root_task: TaskId,
     tasks: BTreeMap<TaskId, TaskNode>,
     stages: BTreeMap<StageId, StageNode>,
@@ -279,10 +282,6 @@ pub struct TaskGraph {
 impl TaskGraph {
     pub const fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
-    }
-
-    pub const fn frontend_process_id(&self) -> FrontendProcessId {
-        self.frontend_process_id
     }
 
     pub const fn root_task(&self) -> TaskId {
@@ -314,10 +313,6 @@ impl TaskGraph {
 
     pub fn edges(&self) -> impl ExactSizeIterator<Item = &EdgeNode> + '_ {
         self.edges.values()
-    }
-
-    pub fn edge(&self, edge_id: ExchangeEdgeId) -> Option<&EdgeNode> {
-        self.edges.get(&edge_id)
     }
 
     /// The stages that feed `stage_id`, which are exactly the stages this one
@@ -437,7 +432,7 @@ pub fn build_task_graph(
 
     let mut tasks = BTreeMap::<TaskId, TaskNode>::new();
     let mut task_of_instance = BTreeMap::<(FragmentId, usize), TaskId>::new();
-    let mut stage_tasks = BTreeMap::<StageId, Vec<TaskId>>::new();
+    let mut stage_ids = BTreeSet::<StageId>::new();
     let mut endpoints = BTreeMap::<TaskId, RuntimeEndpoint>::new();
     let mut contexts = BTreeSet::<QueryContextRef>::new();
     let mut context_task_counts = BTreeMap::<QueryContextRef, usize>::new();
@@ -506,12 +501,13 @@ pub fn build_task_graph(
                     identity,
                     context,
                     fragment_id,
+                    #[cfg(test)]
                     instance_index: placement.instance_index,
                     fragment_instance_id: placement.finst_id,
                     split_plan_nodes,
                 },
             );
-            stage_tasks.entry(stage_id).or_default().push(task_id);
+            stage_ids.insert(stage_id);
         }
     }
 
@@ -571,9 +567,9 @@ pub fn build_task_graph(
             .insert(edge.producer_stage);
     }
 
-    let stages = stage_tasks
+    let stages = stage_ids
         .into_iter()
-        .map(|(stage_id, task_ids)| {
+        .map(|stage_id| {
             let fragment_id = *stage_of_fragment
                 .iter()
                 .find(|&(_, &stage)| stage == stage_id)
@@ -584,7 +580,13 @@ pub fn build_task_graph(
                 StageNode {
                     stage: StageRef::new(inputs.execution_id, stage_id),
                     fragment_id,
-                    tasks: task_ids,
+                    #[cfg(test)]
+                    tasks: tasks
+                        .iter()
+                        .filter_map(|(&task_id, task)| {
+                            (task.stage_id() == stage_id).then_some(task_id)
+                        })
+                        .collect(),
                 },
             )
         })
@@ -592,7 +594,6 @@ pub fn build_task_graph(
 
     Ok(TaskGraph {
         execution_id: inputs.execution_id,
-        frontend_process_id: inputs.frontend_process_id,
         root_task,
         tasks,
         stages,
@@ -652,10 +653,6 @@ fn task_topology_views(
 /// assignment, so a static plan already over that bound can never become a
 /// legal creation. The combined bound is checked again once the assignment's
 /// exact size is known.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Each input is a separate frozen fact of the attempt graph."
-)]
 fn bind_creation_seed(
     topology: &Arc<AttemptTopology>,
     views: &BTreeMap<TaskId, TaskTopologyView>,
@@ -770,7 +767,6 @@ pub(crate) fn build_task_graph_from_manifest(
     let mut tasks = BTreeMap::<TaskId, TaskNode>::new();
     let mut tasks_by_identity = BTreeMap::<TaskIdentity, TaskId>::new();
     let mut stage_fragments = BTreeMap::<StageId, FragmentId>::new();
-    let mut stage_tasks = BTreeMap::<StageId, Vec<TaskId>>::new();
     let mut kernel_keys = BTreeMap::<UniqueId, TaskId>::new();
     let mut context_task_counts = BTreeMap::<QueryContextRef, usize>::new();
     for task in manifest.tasks() {
@@ -822,6 +818,7 @@ pub(crate) fn build_task_graph_from_manifest(
             identity,
             context: task.context(),
             fragment_id: task.fragment_id(),
+            #[cfg(test)]
             instance_index: task.instance_index(),
             fragment_instance_id: task.fragment_instance_id(),
             split_plan_nodes,
@@ -835,10 +832,6 @@ pub(crate) fn build_task_graph_from_manifest(
                 "attempt manifest repeats task identity {identity}"
             )));
         }
-        stage_tasks
-            .entry(identity.stage_id())
-            .or_default()
-            .push(identity.task_id());
     }
     let root_task = tasks_by_identity
         .get(&manifest.root())
@@ -964,15 +957,21 @@ pub(crate) fn build_task_graph_from_manifest(
         seeds.insert(task_id, seed);
     }
 
-    let stages = stage_tasks
-        .into_iter()
-        .map(|(stage_id, task_ids)| {
+    let stages = stage_fragments
+        .iter()
+        .map(|(&stage_id, &fragment_id)| {
             (
                 stage_id,
                 StageNode {
                     stage: StageRef::new(manifest.execution(), stage_id),
-                    fragment_id: stage_fragments[&stage_id],
-                    tasks: task_ids,
+                    fragment_id,
+                    #[cfg(test)]
+                    tasks: tasks
+                        .iter()
+                        .filter_map(|(&task_id, task)| {
+                            (task.stage_id() == stage_id).then_some(task_id)
+                        })
+                        .collect(),
                 },
             )
         })
@@ -986,7 +985,6 @@ pub(crate) fn build_task_graph_from_manifest(
     }
     Ok(TaskGraph {
         execution_id: manifest.execution(),
-        frontend_process_id,
         root_task,
         tasks,
         stages,

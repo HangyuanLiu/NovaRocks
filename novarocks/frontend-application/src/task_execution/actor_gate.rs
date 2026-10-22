@@ -265,11 +265,11 @@ impl TaskOperationSink for ActorGatedTaskOperationSink {
 }
 
 fn requires_actor_authorization(intent: &OperationIntent) -> bool {
-    match intent {
-        OperationIntent::AcquireQueryContextAdmissionTicket(_) => true,
-        OperationIntent::EstablishQueryContext(_) => true,
-        _ => false,
-    }
+    matches!(
+        intent,
+        OperationIntent::AcquireQueryContextAdmissionTicket(_)
+            | OperationIntent::EstablishQueryContext(_)
+    )
 }
 
 #[derive(Debug)]

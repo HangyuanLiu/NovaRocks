@@ -295,7 +295,7 @@ fn apply_order_by(query: &ast::Query, rows: &mut [MaterializedViewInfoRow]) -> R
         .collect::<Result<Vec<_>, _>>()?;
     rows.sort_by(|left, right| {
         for column in &columns {
-            let ord = row_sort_value(left, *column).cmp(&row_sort_value(right, *column));
+            let ord = row_sort_value(left, *column).cmp(row_sort_value(right, *column));
             if ord != std::cmp::Ordering::Equal {
                 return ord;
             }
@@ -394,10 +394,6 @@ fn string_literal(expr: &ast::Expr) -> Option<String> {
         },
         _ => None,
     }
-}
-
-fn object_name_parts(name: &ast::ObjectName) -> Vec<String> {
-    name.parts.iter().map(|part| part.value.clone()).collect()
 }
 
 fn normalize_column_name(name: &str) -> String {

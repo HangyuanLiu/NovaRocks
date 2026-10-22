@@ -117,6 +117,10 @@ pub(crate) fn install_attempt_pumps(round: &mut TaskRound, pumps: AttemptPumps) 
 /// The backend set is frozen here and shared by the operation sink and the
 /// status subscriber, so an operation and the subscription that observes its
 /// task can never be addressed to different processes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The round assembler keeps identities, budgets, ports, and observations explicit so each is validated at the task-round boundary; a wrapper would duplicate these facts."
+)]
 pub(crate) fn assemble_round(
     execution_id: QueryExecutionId,
     frontend_process_id: FrontendProcessId,

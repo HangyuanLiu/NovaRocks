@@ -18,6 +18,7 @@
 //! Role-neutral native submission assembly helpers.
 
 use std::collections::BTreeSet;
+#[cfg(test)]
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -34,7 +35,6 @@ use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::schedule::SchedulingPlan;
 #[cfg(test)]
 use novarocks_execution::exec::chunk::Chunk;
-use tracing::debug;
 
 #[cfg(test)]
 pub(crate) fn align_fetch_chunks_to_output_columns(

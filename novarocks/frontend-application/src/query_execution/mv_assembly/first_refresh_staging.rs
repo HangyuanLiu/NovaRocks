@@ -59,7 +59,6 @@ pub(crate) fn frozen_logical_context_from_rewrite(
     let _sql_pin = sql_snapshot_pin(&rewrite.mv_definition, &pin)?;
     Ok(MvFirstRefreshLogicalContext {
         mv_definition: (*rewrite.mv_definition).clone(),
-        canonical_select_query: (*rewrite.canonical_select_query).clone(),
         base_refs: rewrite
             .base_refs
             .iter()
@@ -435,10 +434,6 @@ fn bind_first_refresh_write_dataflow(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Rebuilding a frozen MV rewrite context requires each independently pinned catalog and target fact."
-)]
 pub(crate) fn rebuild_frozen_mv_rewrite_context(
     ports: &IcebergMvCorePorts,
     expected_target_snapshot_id: Option<i64>,

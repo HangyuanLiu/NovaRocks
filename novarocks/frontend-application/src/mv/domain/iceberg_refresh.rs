@@ -44,9 +44,7 @@ use crate::mv::domain::application::{
     MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement, MvRefreshRequest,
     PrepareMvCreateRequest, PreparedMvCreate,
 };
-use crate::mv::domain::lifecycle::{
-    BackendRefreshPlan, IcebergRefreshPlan, RefreshError, RefreshPlan,
-};
+use crate::mv::domain::lifecycle::{RefreshError, RefreshPlan};
 use crate::mv::domain::model::{MvStorageEngine, RefreshMode};
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::apply_key::ApplyKeyContract;
@@ -123,7 +121,7 @@ use novarocks_sql::planning::mv::{
     MV_BRANCH_ID_COLUMN_NAME as BRANCH_ID_COLUMN_NAME,
     MV_HIDDEN_APPLY_KEY_COLUMN_NAME as HIDDEN_APPLY_KEY_COLUMN_NAME,
     MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME, SqlMvAggregateCalls,
-    SqlMvAggregateLayoutScope, SqlMvApplyKeySourceFacts, SqlMvJoinAliases, extract_join_aliases,
+    SqlMvAggregateLayoutScope, SqlMvApplyKeySourceFacts, extract_join_aliases,
     mv_apply_key_source_from_column_name,
 };
 use novarocks_sql::semantic::{IcebergPartitionFieldExpr, ObjectName, TableColumnDef};
@@ -2640,10 +2638,6 @@ fn merge_affected_partition_results(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Multi-base partition planning keeps each separately observed provider fact explicit."
-)]
 fn plan_multi_base_affected_partitions(
     projection: &StoredKeyedMvProjection,
     target_partition: &mv_schema::MvPartitionContract,
@@ -2742,10 +2736,6 @@ fn plan_multi_base_affected_partitions(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Aggregate partition planning keeps each separately observed provider fact explicit."
-)]
 fn plan_aggregate_mv_affected_partitions(
     source: &dyn IcebergMvRefreshSource,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -3036,7 +3026,6 @@ fn previous_refresh_locators(
         RefreshStateBaseline::SnapshotBacked {
             previous_sources, ..
         } => previous_sources.as_slice(),
-        RefreshStateBaseline::Pinless => &[][..],
     };
     let predecessors = crate::mv::domain::refresh::planning::baseline_predecessors(
         previous_sources,
@@ -3531,11 +3520,6 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
                 snapshot_pins,
                 affected_partitions,
             },
-            backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
-                stmt: stmt.clone(),
-                current_catalog: current_catalog.map(str::to_string),
-                current_database: current_database.to_string(),
-            }),
         });
     }
     // The capability dispatch above (has_agg=false, SingleBase, non-join) routes only
@@ -3627,11 +3611,6 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
                     snapshot_pins,
                     affected_partitions,
                 },
-                backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
-                    stmt: stmt.clone(),
-                    current_catalog: current_catalog.map(str::to_string),
-                    current_database: current_database.to_string(),
-                }),
             });
         }
         ExecutableRefreshDecision::FirstRefresh
@@ -3681,11 +3660,6 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
             snapshot_pins,
             affected_partitions,
         },
-        backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
-            stmt: stmt.clone(),
-            current_catalog: current_catalog.map(str::to_string),
-            current_database: current_database.to_string(),
-        }),
     })
 }
 
@@ -3698,8 +3672,8 @@ fn plan_iceberg_union_projection_mv_refresh(
     iceberg_target: &IcebergMvTarget,
     target: MvTarget,
     stmt: &MvRefreshRequest,
-    current_catalog: Option<&str>,
-    current_database: &str,
+    _current_catalog: Option<&str>,
+    _current_database: &str,
     mv_definition: &StoredKeyedMvProjection,
     base_refs: &[TableIdentity],
     branch_count: usize,
@@ -3870,11 +3844,6 @@ fn plan_iceberg_union_projection_mv_refresh(
             snapshot_pins,
             affected_partitions,
         },
-        backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
-            stmt: stmt.clone(),
-            current_catalog: current_catalog.map(str::to_string),
-            current_database: current_database.to_string(),
-        }),
     })
 }
 
@@ -4378,16 +4347,12 @@ fn plan_iceberg_aggregate_mv_refresh(
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The final plan constructor preserves each separately validated refresh contract fact."
-)]
 fn build_iceberg_refresh_plan(
     mv_definition: &StoredKeyedMvProjection,
     target: MvTarget,
-    stmt: &MvRefreshRequest,
-    current_catalog: Option<&str>,
-    current_database: &str,
+    _stmt: &MvRefreshRequest,
+    _current_catalog: Option<&str>,
+    _current_database: &str,
     base_refs: &[RefreshBaseRelationOccurrence],
     snapshot_pins: BTreeMap<SqlMvRelationOccurrenceId, Option<i64>>,
     decision: ExecutableRefreshDecision,
@@ -4405,11 +4370,6 @@ fn build_iceberg_refresh_plan(
             snapshot_pins,
             affected_partitions,
         },
-        backend_plan: BackendRefreshPlan::Iceberg(IcebergRefreshPlan {
-            stmt: stmt.clone(),
-            current_catalog: current_catalog.map(str::to_string),
-            current_database: current_database.to_string(),
-        }),
     }
 }
 
@@ -4595,12 +4555,7 @@ fn validate_refresh_pin_table_object_ids_against_baseline(
 ) -> Result<(), String> {
     let RefreshStateBaseline::SnapshotBacked {
         previous_sources, ..
-    } = baseline
-    else {
-        return Err(
-            "iceberg refresh execution requires a snapshot-backed state baseline".to_string(),
-        );
-    };
+    } = baseline;
     for previous in previous_sources {
         if !base_refs.iter().any(|base_ref| base_ref == &previous.table) {
             return Err(format!(

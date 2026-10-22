@@ -61,7 +61,7 @@ pub(crate) enum NativeAttemptConvergenceMode {
 }
 
 pub(crate) enum NativeAttemptConvergenceStep {
-    Ready(Box<[NativeContextConvergence]>),
+    Ready,
     Pending { moved: bool },
 }
 
@@ -213,10 +213,8 @@ impl NativeAttemptConvergenceOwner {
             );
             self.begin(round, split_delivery, NativeAttemptConvergenceMode::Cleanup);
         }
-        if round.pumps_closed()
-            && let Some(contexts) = self.observed_contexts(round)
-        {
-            return Ok(NativeAttemptConvergenceStep::Ready(contexts));
+        if round.pumps_closed() && self.observed_contexts(round).is_some() {
+            return Ok(NativeAttemptConvergenceStep::Ready);
         }
         match round.turn() {
             Ok(report) => Ok(NativeAttemptConvergenceStep::Pending {
@@ -263,7 +261,7 @@ impl NativeAttemptConvergenceOwner {
                 mode,
                 request.cancellation().reason().is_some(),
             ) {
-                Ok(NativeAttemptConvergenceStep::Ready(_)) => true,
+                Ok(NativeAttemptConvergenceStep::Ready) => true,
                 Ok(NativeAttemptConvergenceStep::Pending { moved }) => moved,
                 Err(_) => false,
             };
@@ -418,7 +416,7 @@ mod tests {
     fn publish_exit(round: &mut TaskRound, context: QueryContextRef) {
         round
             .execution_mut()
-            .apply_covered_entries(vec![ObservationIntakeEntry::Frame(
+            .apply_covered_entries(vec![ObservationIntakeEntry::Frame(Box::new(
                 ObservationFrame::Covered {
                     context,
                     generation: 1,
@@ -433,7 +431,7 @@ mod tests {
                         source_revision: None,
                     },
                 },
-            )])
+            ))])
             .unwrap();
     }
 
@@ -565,7 +563,7 @@ mod tests {
                 assert!(!round.execution().worker_contexts_stopped());
                 publish_exit(&mut round, context);
             }
-            let NativeAttemptConvergenceStep::Ready(contexts) = convergence
+            let NativeAttemptConvergenceStep::Ready = convergence
                 .step(
                     &mut round,
                     &split_delivery,
@@ -576,7 +574,6 @@ mod tests {
             else {
                 panic!("both original facts must make this same owner convergent")
             };
-            assert_eq!(contexts.len(), 1);
             let contribution = round.execution().released_runtime_filter_contributions();
             assert!(contribution.is_complete());
             assert_eq!(
@@ -633,7 +630,7 @@ mod tests {
                     true,
                 )
                 .unwrap(),
-            NativeAttemptConvergenceStep::Ready(_)
+            NativeAttemptConvergenceStep::Ready
         ));
         assert!(round.execution().worker_contexts_stopped());
     }
@@ -780,7 +777,7 @@ mod tests {
                         false
                     )
                     .unwrap(),
-                NativeAttemptConvergenceStep::Ready(_)
+                NativeAttemptConvergenceStep::Ready
             ) {
                 break;
             }

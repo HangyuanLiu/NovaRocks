@@ -31,9 +31,9 @@ use novarocks_spi::connector::{
     ConnectorTableIdentity, ConnectorTableResolution,
 };
 
-use novarocks_mv_application::persistence::exact_revision::{
-    persist_exact_connector_revision, restore_exact_query_revision,
-};
+#[cfg(test)]
+use novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision;
+use novarocks_mv_application::persistence::exact_revision::restore_exact_query_revision;
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

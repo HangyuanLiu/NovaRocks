@@ -546,9 +546,7 @@ fn type_name_node(
         }
     }
     let mut spaces = exact_vec(count.saturating_sub(1))?;
-    for _ in 1..count {
-        spaces.push(true);
-    }
+    spaces.resize(count.saturating_sub(1), true);
     Ok(TypeName {
         name: name(word)?,
         arguments,

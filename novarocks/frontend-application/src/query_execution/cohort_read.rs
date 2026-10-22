@@ -18,22 +18,20 @@
 //! Provider-frozen cohort inputs retained by one rewrite statement.
 
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorFrozenRewriteGroup, ConnectorInstanceId,
-    ConnectorPinnedFileSet,
+    ConnectorControlPlanningLease, ConnectorFrozenRewriteGroup, ConnectorPinnedFileSet,
 };
 
 /// The exact file set a mutation or rewrite cohort reads and later replaces.
 #[derive(Clone)]
 pub(crate) struct QueryPinnedFileSetRead {
     pub(crate) pinned: ConnectorPinnedFileSet,
-    pub(crate) owner: ConnectorInstanceId,
     /// Provider-owned original source; FE only loans it to the admitted reader.
     /// Ordinary maintenance cohorts have no such receipt.
     pub(crate) frozen_source:
         Option<novarocks_spi::connector::read_stack::runtime::ConnectorFrozenReadSource>,
     pub(crate) planning_lease: ConnectorControlPlanningLease,
     // COW-only neutral holder: declared last so schema/source peers retire first.
-    pub(crate) original: Option<novarocks_spi::connector::ConnectorOriginalResultScope>,
+    pub(crate) _original: Option<novarocks_spi::connector::ConnectorOriginalResultScope>,
 }
 
 impl std::fmt::Debug for QueryPinnedFileSetRead {
@@ -53,7 +51,6 @@ impl std::fmt::Debug for QueryPinnedFileSetRead {
 pub(crate) struct QueryRewriteGroupRead {
     pub(crate) group: ConnectorFrozenRewriteGroup,
     pub(crate) group_digest: [u8; 32],
-    pub(crate) owner: ConnectorInstanceId,
     pub(crate) planning_lease: ConnectorControlPlanningLease,
 }
 

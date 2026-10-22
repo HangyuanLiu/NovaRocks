@@ -69,10 +69,6 @@ pub fn admitted_change_facts(
 /// Assemble the one canonical rewrite value from already frozen D/L/P/C and
 /// provider facts. Runtime handles and a second Current observation are not
 /// accepted at this boundary.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The frozen MV context retains independent source schema, complete types and original publication facts."
-)]
 pub fn build_neutral_refresh_rewrite_context(
     projection: Arc<StoredKeyedMvProjection>,
     current: Vec<MvRewriteSourceSnapshot>,
@@ -129,7 +125,6 @@ pub(crate) fn freeze_refresh_rewrite_context(
                 Some(target_table_uuid.as_str()),
                 *target_snapshot_id,
             ),
-            RefreshStateBaseline::Pinless => (&[][..], None, None),
         };
     if let Some(expected_uuid) = baseline_target_uuid {
         if inputs.target_binding.table_uuid() != expected_uuid {
@@ -260,7 +255,7 @@ pub(crate) fn observe_and_admit_change_window_for_table(
     }
     let scan = crate::connector::scan_admission::admit_connector_change_window(
         &metadata.table,
-        &metadata.schema(),
+        metadata.schema(),
         &exact_lease,
         connector_context.clone(),
         window,

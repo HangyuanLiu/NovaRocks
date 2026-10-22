@@ -179,15 +179,13 @@ fn encode_operation(
         }
         OperationIntent::AbortQueryContext(request) => Ok(encode_abort_query_context(*request)),
         OperationIntent::ReleaseQueryContext(request) => Ok(encode_release_query_context(*request)),
-        // Both reads are their own RPC with their own response shape, so they
-        // have no batch receipt to be answered by and can never be encoded as
-        // a batch item.
-        OperationIntent::FetchTaskDynamicFilters(_) | OperationIntent::GetFinalTaskInfo(_) => {
-            Err(format!(
-                "{} is a separate RPC and has no operation-batch encoding",
-                intent.kind()
-            ))
-        }
+        // This read is its own RPC with its own response shape, so it has no
+        // batch receipt to be answered by and can never be encoded as a batch item.
+        #[cfg(test)]
+        OperationIntent::FetchTaskDynamicFilters(_) => Err(format!(
+            "{} is a separate RPC and has no operation-batch encoding",
+            intent.kind()
+        )),
     }
 }
 
@@ -375,9 +373,8 @@ impl AckAddress {
             OperationIntent::UpdateQueryContext(request) => Self::Context(request.context()),
             OperationIntent::AbortQueryContext(request) => Self::Context(request.context()),
             OperationIntent::ReleaseQueryContext(request) => Self::Context(request.context()),
-            OperationIntent::FetchTaskDynamicFilters(_) | OperationIntent::GetFinalTaskInfo(_) => {
-                Self::None
-            }
+            #[cfg(test)]
+            OperationIntent::FetchTaskDynamicFilters(_) => Self::None,
         }
     }
 }
@@ -417,7 +414,7 @@ fn decode_ack(
             proto::task_operation_verdict::Ack::CreateTask(ack),
             AckAddress::Task(identity),
         ) => codec::decode_create_task_ack(ack, identity, path())
-            .map(AckPayload::Create)
+            .map(|receipt| AckPayload::Create(Box::new(receipt)))
             .map_err(|error| error.to_string()),
         (
             OperationKind::UpdateTask,
@@ -509,7 +506,7 @@ pub(crate) enum TaskOperationIntakeEvent {
         operation_id: TaskOperationId,
         context: QueryContextRef,
     },
-    Acknowledgement(OperationAcknowledgement),
+    Acknowledgement(Box<OperationAcknowledgement>),
 }
 
 /// The only handle the send path holds.
@@ -533,7 +530,7 @@ impl TaskAckIntakeHandle {
             .queue
             .lock()
             .expect("task acknowledgement queue")
-            .push(TaskOperationIntakeEvent::Acknowledgement(ack));
+            .push(TaskOperationIntakeEvent::Acknowledgement(Box::new(ack)));
         self.inner.wake.wake();
     }
 
@@ -603,7 +600,7 @@ impl TaskAckIntake {
         self.drain_events()
             .into_iter()
             .filter_map(|event| match event {
-                TaskOperationIntakeEvent::Acknowledgement(ack) => Some(ack),
+                TaskOperationIntakeEvent::Acknowledgement(ack) => Some(*ack),
                 TaskOperationIntakeEvent::EstablishSendStarted { .. } => None,
             })
             .collect()
@@ -702,7 +699,7 @@ pub(crate) enum NativeTaskTransportCreationError {
 impl novarocks_execution_contract::failure::FailureProjection for NativeTaskTransportCreationError {
     fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
         use novarocks_execution_contract::failure::{
-            FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+            FailureClass, FailureFact, FailureReason, domain,
         };
         let code = match self {
             Self::BudgetMismatch => 101,
@@ -954,7 +951,7 @@ impl TaskOperationSink for NativeTaskOperationSink {
             let encoded = encode_operation(intent, &self.attempt);
             match encoded {
                 Ok(operation) => {
-                    operations.push((is_small_control(&intent), operation));
+                    operations.push((is_small_control(intent), operation));
                     sent.push(SentOperation {
                         operation_id: intent.operation_id(),
                         kind: intent.kind(),
@@ -1976,7 +1973,7 @@ async fn observe_stream_event(
             observe_task_event(
                 context,
                 identity,
-                StatusEvent::Published(status),
+                StatusEvent::Published(Box::new(status)),
                 Some(cursor.advanced_to(version)),
                 cursors,
                 intake,
@@ -2062,7 +2059,7 @@ fn observe_event(
             observe_task_event(
                 context,
                 identity,
-                StatusEvent::Published(status.clone()),
+                StatusEvent::Published(Box::new(status.clone())),
                 Some(cursor.advanced_to(status.version())),
                 cursors,
                 intake,
@@ -3978,17 +3975,18 @@ mod tests {
             panic!("control heartbeat must complete");
         };
         assert_eq!(observed, descriptor);
-        let state = loopback.peer.state.lock().unwrap();
-        assert_eq!(state.heartbeats.len(), 1);
-        assert_eq!(
-            state.heartbeats[0]
-                .expected_process_id
-                .as_ref()
-                .unwrap()
-                .value,
-            backend.to_bytes()
-        );
-        drop(state);
+        {
+            let state = loopback.peer.state.lock().unwrap();
+            assert_eq!(state.heartbeats.len(), 1);
+            assert_eq!(
+                state.heartbeats[0]
+                    .expected_process_id
+                    .as_ref()
+                    .unwrap()
+                    .value,
+                backend.to_bytes()
+            );
+        }
         let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
         let mut data = Client::for_endpoint(
             loopback.endpoint.native_endpoint().clone(),
@@ -4094,7 +4092,7 @@ mod tests {
             .iter()
             .map(|intent| {
                 (
-                    is_small_control(&intent),
+                    is_small_control(intent),
                     encode_operation(intent, &test_attempt_facts()).expect("encodable intent"),
                 )
             })
@@ -4163,7 +4161,7 @@ mod tests {
                     .as_mut()
                     .expect("envelope")
                     .max_wait_millis = if index == 0 { 300_000 } else { 100 };
-                (is_small_control(&intent), operation)
+                (is_small_control(intent), operation)
             })
             .collect();
         let batches =
@@ -5150,11 +5148,15 @@ mod tests {
         for (entry, expected) in observed.into_iter().zip(frames) {
             assert!(matches!(
                 entry,
-                ObservationIntakeEntry::Frame(ObservationFrame::Covered {
-                    context: observed_context,
-                    generation: 7,
-                    event,
-                }) if observed_context == context && event == expected
+                ObservationIntakeEntry::Frame(frame)
+                    if matches!(
+                        frame.as_ref(),
+                        ObservationFrame::Covered {
+                            context: observed_context,
+                            generation: 7,
+                            event,
+                        } if *observed_context == context && event == &expected
+                    )
             ));
         }
         subscriber.stop(context);
@@ -6719,7 +6721,7 @@ mod tests {
         );
         assert_eq!(
             statuses,
-            vec![StatusEvent::Published(status)],
+            vec![StatusEvent::Published(Box::new(status))],
             "the receive path enqueues the snapshot and nothing else"
         );
         drop(runner);
@@ -6776,8 +6778,8 @@ mod tests {
         assert_eq!(
             statuses,
             vec![
-                StatusEvent::Published(TaskStatus::created(first)),
-                StatusEvent::Published(TaskStatus::created(second)),
+                StatusEvent::Published(Box::new(TaskStatus::created(first))),
+                StatusEvent::Published(Box::new(TaskStatus::created(second))),
             ]
         );
     }
@@ -6915,7 +6917,7 @@ mod tests {
         let mut runner = intake.try_enter().expect("the runner slot is free");
         let (observation_loss, statuses) = runner.drain_statuses(2);
         assert!(observation_loss);
-        assert_eq!(statuses, vec![StatusEvent::Published(first)]);
+        assert_eq!(statuses, vec![StatusEvent::Published(Box::new(first))]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6966,7 +6968,7 @@ mod tests {
         let mut runner = intake.try_enter().expect("the runner slot is free");
         let (observation_loss, statuses) = runner.drain_statuses(2);
         assert!(observation_loss);
-        assert_eq!(statuses, vec![StatusEvent::Published(first)]);
+        assert_eq!(statuses, vec![StatusEvent::Published(Box::new(first))]);
         drop(runner);
 
         loopback

@@ -187,7 +187,6 @@ impl FragmentArtifact {
         };
         let frozen = wire::FrozenFragment {
             package: encode_checked_package(package, limits, control)?.into(),
-            ..Default::default()
         };
         let content = FrozenBytes::freeze(frozen.encode_to_vec().into());
         #[cfg(test)]

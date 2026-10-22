@@ -245,6 +245,10 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
 /// Both supported strategies share the same sink query and admission shape; only
 /// the sink mode and the root distribution differ, and both follow from the
 /// signed strategy rather than from anything this engine decides.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Delete preparation validates separate target, mutation, and execution-owner facts at this boundary; a wrapper would only restate those independently checked inputs."
+)]
 fn prepare_delete_write(
     state: &DmlExecutionKernel,
     target: &TargetBackend,

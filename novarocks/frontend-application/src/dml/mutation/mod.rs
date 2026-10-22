@@ -66,7 +66,7 @@ impl WriteExecutor for MutationWriteExecutor<'_> {
             MutationStageOutcome::NoOp => Ok(CoordinatedWriteReport::NoOp),
             MutationStageOutcome::AbortRequired { reason, handle } => {
                 Ok(CoordinatedWriteReport::AbortRequired {
-                    reason: reason.into_dml_error(Some(&self.prepared.sql_source)),
+                    reason: Box::new((*reason).into_dml_error(Some(&self.prepared.sql_source))),
                     handle,
                 })
             }

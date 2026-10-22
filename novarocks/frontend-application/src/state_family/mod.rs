@@ -23,22 +23,23 @@
 //! each product exposes its own descriptor and the composition root validates
 //! their complete set before opening a StateStore.
 //!
-//! Two structural properties do the enforcing, so the manifest is not another
-//! convention that has to be remembered during review:
+//! The closed classification and private prefix carrier keep durable
+//! ownership out of this Frontend-local manifest:
 //!
-//! 1. **A `ProcessRuntime` family cannot have a persistent prefix.** The prefix
-//!    lives in the `Accelerator` variant only, so the illegal state is not
-//!    representable — see
-//!    [`ProcessRuntimeContract`].
-//! 2. **Frontend cannot mint a durable prefix.** [`PersistentKeyPrefix`] has
-//!    no public constructor. Product descriptors are the sole definition point
-//!    for their deployed prefix and record version.
+//! - **A `ProcessRuntime` family cannot have a persistent prefix.**
+//!   [`ProcessRuntimeContract`] has no prefix field or accessor.
+//! - **Frontend cannot mint a durable prefix.** [`PersistentKeyPrefix`] has no
+//!   public constructor, and accelerators in this manifest are in-process.
+//!   Product descriptors are the sole definition point for their deployed
+//!   prefix and record version.
 //!
 //! The manifest is a frontend application fact, not an SPI contract: the
 //! StateStore boundary knows about keys and values, and has no opinion about
 //! which frontend family owns them.
 
+#[cfg(test)]
 mod classification;
+#[cfg(test)]
 mod manifest;
 
 #[cfg(test)]

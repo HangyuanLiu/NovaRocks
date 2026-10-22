@@ -95,10 +95,7 @@ impl ReadCompletionTracker {
         self.root
     }
 
-    pub const fn stream(&self) -> RootResultStream {
-        self.stream
-    }
-
+    #[cfg(test)]
     pub const fn end_of_stream_observed(&self) -> bool {
         self.stream.end_of_stream_observed()
     }
@@ -242,10 +239,6 @@ impl WriteCompletionTracker {
             statuses: BTreeMap::new(),
             undeclared_writers: BTreeSet::new(),
         })
-    }
-
-    pub const fn root_finish_task(&self) -> TaskIdentity {
-        self.root_finish
     }
 
     pub fn writers(&self) -> impl ExactSizeIterator<Item = &TaskIdentity> + '_ {

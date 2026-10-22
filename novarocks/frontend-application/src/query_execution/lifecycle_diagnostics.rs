@@ -26,7 +26,6 @@ use novarocks_types::QueryExecutionId;
 pub(crate) enum QueryLifecycleConvergenceErrorSource {
     BackendAttestation,
     FrontendLiveness,
-    NoOutcome,
 }
 
 /// Immutable, query-scoped terminal convergence evidence. It is intentionally

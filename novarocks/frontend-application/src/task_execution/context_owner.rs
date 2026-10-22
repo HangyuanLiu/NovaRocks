@@ -301,18 +301,17 @@ impl QueryContextOwner {
         Ok(())
     }
 
-    pub const fn context(&self) -> QueryContextRef {
-        self.context
-    }
-
+    #[cfg(test)]
     pub const fn state(&self) -> QueryContextState {
         self.state
     }
 
+    #[cfg(test)]
     pub const fn lease_sequence(&self) -> LeaseSequence {
         self.lease_sequence
     }
 
+    #[cfg(test)]
     pub const fn renew_schedule(&self) -> Option<RenewSchedule> {
         self.renew_schedule
     }
@@ -640,6 +639,7 @@ impl QueryContextOwner {
         })
     }
 
+    #[cfg(test)]
     pub const fn quiesce_acknowledged(&self) -> bool {
         self.quiesce_receipt.is_some()
     }
@@ -1170,11 +1170,7 @@ impl QueryContextOwner {
         self.released = true;
     }
 
-    /// How long this owner may sleep before its next renewal is due.
-    pub fn renew_delay(&self, now: MonotonicInstant) -> Option<Duration> {
-        self.renew_schedule.map(|schedule| schedule.delay_from(now))
-    }
-
+    /// Delays another release attempt while local work remains unsettled.
     fn defer_release_retry(&mut self, now: MonotonicInstant) {
         self.release_blocked_at = Some(self.progress);
         self.release_retry_at = Some(now.saturating_add(self.release_retry_delay));

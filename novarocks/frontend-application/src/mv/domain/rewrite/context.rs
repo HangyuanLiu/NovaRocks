@@ -95,9 +95,7 @@ pub struct IcebergMvRewriteContext {
     pub previous_table_object_ids: BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
     pub target_snapshot_id: Option<i64>,
     pub target_table_uuid: String,
-    pub target_arrow_schema: SchemaRef,
     pub(crate) target_write_fields: Arc<[novarocks_spi::connector::ConnectorWriteFieldRequest]>,
-    pub target_field_ids: Arc<[Bytes]>,
     pub runtime_bindings: MvRuntimeBindings,
     analysis: MvRewriteAnalysisFacts,
     sql_schema: SqlImvSchemaContractFacts,
@@ -116,10 +114,6 @@ impl IcebergMvRewriteContext {
             .collect()
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The immutable MV handoff keeps source schema and complete write declarations independent."
-    )]
     pub fn from_parts(
         projection: Arc<StoredKeyedMvProjection>,
         current: Vec<MvRewriteSourceSnapshot>,
@@ -155,7 +149,7 @@ impl IcebergMvRewriteContext {
             return Err("MV rewrite target fields lack their exact complete declarations".into());
         }
         let runtime_bindings = reconstruct_keyed_runtime_bindings(facts, &exact_target)?;
-        let target_field_ids = validate_target_schema(&target_arrow_schema, &exact_target)?;
+        validate_target_schema(&target_arrow_schema, &exact_target)?;
         let pin = validate_source_pins(facts.definition(), current)?;
         let (previous_snapshot_ids, previous_table_object_ids) =
             validate_history(&projection, previous.clone())?;
@@ -203,35 +197,11 @@ impl IcebergMvRewriteContext {
             previous_table_object_ids,
             target_snapshot_id,
             target_table_uuid,
-            target_arrow_schema,
             target_write_fields,
-            target_field_ids: target_field_ids.into(),
             runtime_bindings,
             analysis,
             sql_schema,
         })
-    }
-
-    pub(crate) fn summary(&self) -> impl std::fmt::Debug + '_ {
-        (
-            &self.target,
-            self.mv_id,
-            self.pin
-                .iter()
-                .map(|(id, value)| (id.get(), value.snapshot_id))
-                .collect::<Vec<_>>(),
-            self.mv_definition.facts.source_revision(),
-        )
-    }
-
-    pub(crate) fn aggregate_shape_and_layout_for_execution(
-        &self,
-    ) -> Result<(SqlMvAggregateCalls, SqlMvAggregatePhysicalLayout), String> {
-        self.analysis
-            .aggregate
-            .as_ref()
-            .map(|value| (value.calls.clone(), value.layout.clone()))
-            .ok_or_else(|| "MV rewrite has no analyzed aggregate execution facts".into())
     }
 
     pub fn analysis_facts(&self) -> &MvRewriteAnalysisFacts {

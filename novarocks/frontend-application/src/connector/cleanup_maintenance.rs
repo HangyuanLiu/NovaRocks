@@ -38,10 +38,6 @@ use novarocks_spi::connector::{
 /// The durable frontend owner needs to distinguish an invalid pre-dispatch
 /// request from an execute response that may have reached the provider.
 #[derive(Clone, Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The typed frontend protocol model intentionally keeps payloads inline."
-)]
 pub enum CleanupBatchExecution {
     Receipt(BatchReceipt),
     /// The prepared batch was dispatched, but a receipt is unavailable.
@@ -53,7 +49,6 @@ pub enum CleanupBatchExecution {
 /// prepared batch twice before the durable checkpoint takes over.
 pub struct CleanupMaintenanceSession {
     lease: ConnectorCleanupMaintenanceLease,
-    table: ConnectorTableIdentity,
     plan: ConnectorCleanupPlan,
     context: ConnectorRequestContext,
     executed_ordinals: Mutex<BTreeSet<u32>>,
@@ -93,7 +88,7 @@ impl CleanupMaintenanceSession {
         let operation =
             ConnectorCleanupOperation::remove_unreferenced_objects(metadata.table, older_than_ms)?;
         let plan = lease.plan_operation(operation_id, operation, context.clone())?;
-        Self::from_plan(lease, table, plan, context)
+        Self::from_plan(lease, plan, context)
     }
 
     /// Freeze the second cleanup plan after the frontend has durably observed
@@ -133,34 +128,24 @@ impl CleanupMaintenanceSession {
             ConnectorCleanupOperation::remove_unreferenced_objects(metadata.table, older_than_ms)?;
         let plan =
             lease.plan_selected_owned_refs(operation_id, operation, selection, context.clone())?;
-        Self::from_plan(lease, table, plan, context)
+        Self::from_plan(lease, plan, context)
     }
 
     fn from_plan(
         lease: ConnectorCleanupMaintenanceLease,
-        table: ConnectorTableIdentity,
         plan: ConnectorCleanupPlan,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         Ok(Self {
             lease,
-            table,
             plan,
             context,
             executed_ordinals: Mutex::new(BTreeSet::new()),
         })
     }
 
-    pub fn table(&self) -> &ConnectorTableIdentity {
-        &self.table
-    }
-
     pub fn plan_ref(&self) -> &ConnectorCleanupPlan {
         &self.plan
-    }
-
-    pub const fn control_runtime_id(&self) -> novarocks_spi::connector::ConnectorControlRuntimeId {
-        self.lease.control_runtime_id()
     }
 
     /// Build bounded durable evidence for a frozen batch. Preparing is not a

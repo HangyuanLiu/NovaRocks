@@ -21,7 +21,7 @@
 //! Observation never controls product execution.
 
 use novarocks_failpoint::scope::{ActionClaim, ControlCancellation, GrantHandle, ProcessBinding};
-use novarocks_failpoint::target_binding::StatementInputNomination;
+use novarocks_failpoint::target_binding::{StatementInputNomination, StatementWorkNomination};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 
@@ -59,6 +59,14 @@ pub(crate) struct StatementObservationResponse {
 }
 
 const MAX_STATEMENT_OBSERVERS: usize = 64;
+
+pub(crate) type StatementInputFreezer =
+    Arc<dyn Fn(&StatementInputNomination) -> Result<(), String> + Send + Sync>;
+pub(crate) type StatementNominationFreezer = Arc<
+    dyn Fn(&StatementInputNomination, &StatementWorkNomination) -> Result<(), String> + Send + Sync,
+>;
+pub(crate) type StatementSessionResolver =
+    Arc<dyn Fn(u32) -> Result<SessionToken, String> + Send + Sync>;
 
 /// An observation capability only: neither its lifetime nor its contents
 /// control admission, execution, recovery, result visibility, or cleanup.
@@ -283,21 +291,9 @@ pub(crate) struct StatementObservationOwner {
     cancellation: ControlCancellation,
     claim: Mutex<ActionClaim>,
     observed_hit: std::sync::atomic::AtomicBool,
-    input_freezer: std::sync::OnceLock<
-        Arc<dyn Fn(&StatementInputNomination) -> Result<(), String> + Send + Sync>,
-    >,
-    nomination_freezer: std::sync::OnceLock<
-        Arc<
-            dyn Fn(
-                    &StatementInputNomination,
-                    &novarocks_failpoint::target_binding::StatementWorkNomination,
-                ) -> Result<(), String>
-                + Send
-                + Sync,
-        >,
-    >,
-    session_resolver:
-        std::sync::OnceLock<Arc<dyn Fn(u32) -> Result<SessionToken, String> + Send + Sync>>,
+    input_freezer: std::sync::OnceLock<StatementInputFreezer>,
+    nomination_freezer: std::sync::OnceLock<StatementNominationFreezer>,
+    session_resolver: std::sync::OnceLock<StatementSessionResolver>,
     state: Mutex<StatementObservers>,
 }
 impl std::fmt::Debug for StatementObservationOwner {
@@ -440,7 +436,7 @@ impl StatementObservationOwner {
     /// the request nor the declaration can supply this identity resolver.
     pub(crate) fn install_session_resolver(
         &self,
-        resolver: Arc<dyn Fn(u32) -> Result<SessionToken, String> + Send + Sync>,
+        resolver: StatementSessionResolver,
     ) -> Result<(), String> {
         self.session_resolver
             .set(resolver)
@@ -448,7 +444,7 @@ impl StatementObservationOwner {
     }
     pub(crate) fn install_input_freezer(
         &self,
-        freezer: Arc<dyn Fn(&StatementInputNomination) -> Result<(), String> + Send + Sync>,
+        freezer: StatementInputFreezer,
     ) -> Result<(), String> {
         self.input_freezer
             .set(freezer)
@@ -456,14 +452,7 @@ impl StatementObservationOwner {
     }
     pub(crate) fn install_nomination_freezer(
         &self,
-        freezer: Arc<
-            dyn Fn(
-                    &StatementInputNomination,
-                    &novarocks_failpoint::target_binding::StatementWorkNomination,
-                ) -> Result<(), String>
-                + Send
-                + Sync,
-        >,
+        freezer: StatementNominationFreezer,
     ) -> Result<(), String> {
         self.nomination_freezer
             .set(freezer)
@@ -571,13 +560,6 @@ impl StatementObservationOwner {
         }
     }
     pub(crate) fn close_observation(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.runs.clear();
-        }
-    }
-    /// The role owns this future and awaits it; no detached cleanup task exists.
-    pub(crate) async fn close_when_cancelled(&self) {
-        self.cancellation.cancelled().await;
         if let Ok(mut state) = self.state.lock() {
             state.runs.clear();
         }
@@ -749,7 +731,6 @@ mod statement_observation_tests {
     use crate::query_execution::lifecycle_diagnostics::{
         RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
     };
-    use novarocks_query_application::session_control::SessionToken;
     use novarocks_types::AttemptId;
 
     fn arm_request(token: &str, connection_id: u32, sql: &str) -> StatementObservationArmRequest {
@@ -1007,7 +988,6 @@ mod session_owner_tests {
     use novarocks_failpoint::session::{
         DECLARATION_VERSION, DomainGrant, SessionDeclaration, SessionRole,
     };
-    use novarocks_query_application::session_control::SessionToken;
     use std::os::unix::fs::DirBuilderExt;
 
     #[test]
@@ -1126,9 +1106,7 @@ mod session_owner_tests {
         fn new() -> Self {
             Self::with_input_freezer(Arc::new(|_| Ok(())))
         }
-        fn with_input_freezer(
-            freezer: Arc<dyn Fn(&StatementInputNomination) -> Result<(), String> + Send + Sync>,
-        ) -> Self {
+        fn with_input_freezer(freezer: StatementInputFreezer) -> Self {
             let root = std::path::PathBuf::from("/tmp")
                 .join(format!("g2observe-{}", uuid::Uuid::now_v7()));
             std::fs::DirBuilder::new()

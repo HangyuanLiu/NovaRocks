@@ -32,7 +32,6 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
     ConnectorTableResolution, ConnectorWriteOperationId,
 };
-use sha2::{Digest, Sha256};
 
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 
@@ -107,20 +106,6 @@ impl<S: SealedDistributedRewrite> DistributedRewriteApplicationSession<S> {
         self.session.is_noop()
     }
 
-    /// Stable durable digest for the sealed cohort membership.  It contains
-    /// no provider payload or source path; those remain provider-private in
-    /// the plan artifact.
-    pub fn cohort_set_digest(&self) -> [u8; 32] {
-        let mut hash = Sha256::new();
-        hash.update(b"novarocks.distributed-rewrite.cohort-set.v1\0");
-        hash.update((self.session.plan().cohorts().len() as u64).to_be_bytes());
-        for cohort in self.session.plan().cohorts() {
-            hash.update(cohort.cohort_id().to_bytes());
-            hash.update(cohort.group_digest());
-        }
-        hash.finalize().into()
-    }
-
     pub fn session(&self) -> &S {
         &self.session
     }
@@ -137,10 +122,6 @@ impl<S: SealedDistributedRewrite> DistributedRewriteApplicationSession<S> {
 /// Plan exactly once.  The caller captures topology before this function and
 /// retains the returned session through every staged cohort and terminal C1
 /// commit.  No current-generation lookup is available after this point.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The frozen frontend boundary keeps independently validated inputs explicit."
-)]
 pub fn plan_distributed_rewrite_session<S: DistributedRewriteSealing>(
     sealing: &S,
     resolver: &dyn ConnectorDistributedRewriteResolver,

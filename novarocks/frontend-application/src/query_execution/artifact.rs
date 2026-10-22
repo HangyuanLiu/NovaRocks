@@ -297,10 +297,6 @@ impl SnapshotBoundDormantAttemptInputs {
         self.topology.eligible_backends()
     }
 
-    pub(crate) const fn topology_revision(&self) -> u64 {
-        self.topology.revision()
-    }
-
     pub(crate) fn bind_manifest(
         self,
         schedule: &novarocks_query_application::coordination::AttemptSchedule,
@@ -372,26 +368,6 @@ impl std::fmt::Debug for ManifestBoundNativeAttemptActivation<'_> {
 }
 
 impl<'a> ManifestBoundNativeAttemptActivation<'a> {
-    /// The exact immutable inputs an assembler may project. No replacement
-    /// manifest or access owner can be supplied through this API.
-    pub(crate) fn parts(&mut self) -> (&mut PreparedDistributedQuery, &TaskManifestBinding) {
-        (
-            self.prepared
-                .as_mut()
-                .expect("an uncommitted activation retains its prepared view"),
-            &self.inputs.manifest,
-        )
-    }
-
-    /// Transfers only the derived prepared view after all fallible assembly
-    /// has succeeded. The outer active owner continues to retain the exact
-    /// manifest and access owner for the attempt lifetime.
-    pub(crate) fn commit(mut self) -> PreparedDistributedQuery {
-        self.prepared
-            .take()
-            .expect("one manifest activation can commit only once")
-    }
-
     pub(crate) fn into_prepared_and_manifest(
         mut self,
     ) -> (PreparedDistributedQuery, &'a TaskManifestBinding) {
@@ -487,10 +463,9 @@ pub(crate) struct PreparedDistributedAttemptTemplate {
 impl PreparedDistributedAttemptTemplate {
     /// The same template, for a plan that was completed rather than sealed.
     ///
-    /// The encoding that produced these facts already stamped the native
-    /// fragments with its own provenance, and the scheduling facts carry it
-    /// too; that provenance is this template's handoff identity, so nothing
-    /// here can be paired with the products of another encoding.
+    /// The encoding produces the native fragments and scheduling facts
+    /// together; the scheduling facts carry this template's handoff identity,
+    /// and the single completed-plan owner moves both products here.
     pub(crate) fn for_completed_plan(
         plan: novarocks_query_application::api::PlanSeal,
         plan_facts: crate::query_execution::attempt_plan_facts::AttemptPlanFacts,
@@ -908,10 +883,6 @@ impl<'a> RuntimeFilterScheduledView<'a> {
         self.artifact_id
     }
 
-    pub fn execution_id(self) -> QueryExecutionId {
-        self.execution_id
-    }
-
     pub fn query_id_wire(self) -> novarocks_proto_models::common::UniqueId {
         novarocks_proto_models::common::UniqueId {
             hi: self.execution_id.query_id().high(),
@@ -1057,9 +1028,9 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
             native_bundle: self.native_bundle,
             schedule: self.schedule,
             options,
-            catalog_lease,
+            _catalog_lease: catalog_lease,
             runtime_filter_contributions: self.runtime_filter_contributions,
-            attempt_access: self.attempt_access,
+            _attempt_access: self.attempt_access,
         })
     }
 }
@@ -1081,13 +1052,9 @@ pub struct TaskExecutionPreparedQuery {
     /// drops, and this value is what keeps them alive for the whole attempt.
     /// A backend still resolving a catalog through one of them must not find
     /// its planning ownership already gone.
-    #[expect(
-        dead_code,
-        reason = "the catalog planning leases are retained for the attempt's lifetime, not read"
-    )]
-    catalog_lease: QueryCatalogLease,
+    _catalog_lease: QueryCatalogLease,
     runtime_filter_contributions: BTreeMap<usize, novarocks::RuntimeFilterContribution>,
-    attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
+    _attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
 
 impl TaskExecutionPreparedQuery {
@@ -1527,15 +1494,6 @@ impl ValidatedFragmentSchedule {
             .map(|placement| placement.backend_idx)
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect()
-    }
-
-    pub fn fragment_instance_ids(&self) -> Vec<UniqueId> {
-        self.inner
-            .by_fragment
-            .values()
-            .flatten()
-            .map(|placement| placement.finst_id)
             .collect()
     }
 
@@ -2012,10 +1970,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use bytes::Bytes;
     use novarocks_spi::connector::{
         CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion, ConnectorInstanceId,
-        ConnectorProviderId, ConnectorSplit,
+        ConnectorProviderId,
     };
 
     use super::{
@@ -2109,16 +2066,6 @@ mod tests {
         );
     }
 
-    fn connector_split(split_id: &str, estimated_bytes: Option<u64>) -> ConnectorSplit {
-        ConnectorSplit::try_new(
-            ConnectorInstanceId::parse("placement-test").expect("valid instance"),
-            split_id,
-            Bytes::new(),
-            estimated_bytes,
-        )
-        .expect("valid split")
-    }
-
     #[test]
     fn catalog_set_merges_exact_typed_read_materializations_once() {
         let existing = CatalogSet::new([catalog_properties("catalog.alpha", 1, "s3://alpha")])
@@ -2154,18 +2101,6 @@ mod tests {
                 .message()
                 .contains("conflicting materialization inputs")
         );
-    }
-
-    fn placed_split_ids(placements: Vec<Vec<ConnectorSplit>>) -> Vec<Vec<String>> {
-        placements
-            .into_iter()
-            .map(|splits| {
-                splits
-                    .into_iter()
-                    .map(|split| split.split_id().to_owned())
-                    .collect()
-            })
-            .collect()
     }
 
     #[test]

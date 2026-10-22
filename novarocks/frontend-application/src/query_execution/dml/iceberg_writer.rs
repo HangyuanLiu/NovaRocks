@@ -96,6 +96,10 @@ impl IcebergWritePreparationOptions {
 
 /// Prepare an Iceberg write with an application-preallocated operation
 /// identity. This still performs no writer execution or catalog mutation.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The write preparation boundary validates the frozen target, options, and owner ports independently; a wrapper would duplicate the write contract."
+)]
 pub(crate) fn prepare_iceberg_write_with_options(
     state: &DmlExecutionKernel,
     target: &TargetBackend,
@@ -150,6 +154,10 @@ pub(crate) fn prepare_iceberg_write_with_options(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The distributed write builder receives separate frozen plan facts and connector capabilities; bundling would duplicate their owner-specific contracts."
+)]
 fn prepare_iceberg_distributed_write(
     state: &DmlExecutionKernel,
     target: &TargetBackend,
@@ -938,6 +946,7 @@ fn single_quoted_sql(value: &str) -> String {
     format!("'{escaped}'")
 }
 
+#[cfg(test)]
 fn arrow_data_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Result<SqlType, String> {
     use arrow::datatypes::{DataType, TimeUnit};
     Ok(match dt {
@@ -996,12 +1005,6 @@ fn arrow_data_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Result<SqlTyp
             ));
         }
     })
-}
-
-pub(crate) fn arrow_data_type_to_sql_type_name(
-    dt: &arrow::datatypes::DataType,
-) -> Result<String, String> {
-    sql_type_name(&arrow_data_type_to_sql_type(dt)?)
 }
 
 fn sql_type_name(sql_type: &SqlType) -> Result<String, String> {
@@ -1853,19 +1856,7 @@ mod provider_admission_before_shaping_tests {
                 .unwrap_err()
                 .contains("UUID has no SQL DDL type spelling")
         );
-        let target = TargetBackend {
-            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
-            catalog: "writer_domain_test".into(),
-            namespace: "db".into(),
-            table: "target".into(),
-        };
-        let resolved = ResolvedTable {
-            catalog: target.catalog.clone(),
-            namespace: target.namespace.clone(),
-            table: target.table.clone(),
-            columns,
-            statistics_pin: None,
-        };
+        let resolved = ResolvedTable { columns };
         let control = Arc::new(Control {
             key: ConnectorProviderBindingKey {
                 instance_id: metadata.table.owner().clone(),

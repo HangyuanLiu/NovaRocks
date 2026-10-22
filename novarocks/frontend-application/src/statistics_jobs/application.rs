@@ -41,8 +41,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use novarocks_statistics_application::StatisticsPublicationTerminal;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsTableTarget {
     pub catalog: String,
@@ -181,7 +179,7 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
             namespace: target.namespace.clone(),
             table: target.table.clone(),
             object_id: captured.object_id.as_bytes().to_vec(),
-            sql_columns: sql_visible_column_names(&captured.metadata.schema()),
+            sql_columns: sql_visible_column_names(captured.metadata.schema()),
         })
     }
 }
@@ -284,7 +282,7 @@ impl StatisticsTableReader for ConnectorStatisticsTableReader {
                 "connector metadata did not provide a statistics data-version pin",
             )
         })?;
-        let sql_columns = sql_visible_columns(&metadata.schema());
+        let sql_columns = sql_visible_columns(metadata.schema());
         let requested_column_metric_count = sql_columns.len().saturating_mul(5);
         if requested_column_metric_count > MAX_CONNECTOR_STATISTICS_METRICS {
             return Err(StatisticsApplicationError::new(format!(
@@ -527,7 +525,6 @@ pub trait StatisticsApplicationPort: Send + Sync {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsApplicationError {
     message: String,
-    publication_terminal: Option<StatisticsPublicationTerminal>,
     target_binding_failure: Option<ConnectorTableObjectBindingFailure>,
 }
 
@@ -535,18 +532,6 @@ impl StatisticsApplicationError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            publication_terminal: None,
-            target_binding_failure: None,
-        }
-    }
-
-    pub fn publication(
-        terminal: StatisticsPublicationTerminal,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            message: message.into(),
-            publication_terminal: Some(terminal),
             target_binding_failure: None,
         }
     }
@@ -555,13 +540,8 @@ impl StatisticsApplicationError {
         let target_binding_failure = error.table_object_binding_failure();
         Self {
             message: error.to_string(),
-            publication_terminal: None,
             target_binding_failure,
         }
-    }
-
-    pub const fn publication_terminal(&self) -> Option<StatisticsPublicationTerminal> {
-        self.publication_terminal
     }
 
     pub const fn target_binding_failure(&self) -> Option<ConnectorTableObjectBindingFailure> {

@@ -171,18 +171,22 @@ impl DmlPublicationAttempt {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn phase(&self) -> DmlPublicationPhase {
         self.phase
     }
 
+    #[cfg(test)]
     pub(crate) const fn header(&self) -> LakePublicationMarkerHeader {
         self.header
     }
 
+    #[cfg(test)]
     pub(crate) fn target(&self) -> &LakePublicationTarget {
         &self.target
     }
 
+    #[cfg(test)]
     pub(crate) fn statement_tag(&self) -> Option<&LakePublicationStatementTag> {
         self.statement_tag.as_ref()
     }
@@ -191,6 +195,7 @@ impl DmlPublicationAttempt {
         self.terminal.as_ref()
     }
 
+    #[cfg(test)]
     pub(crate) const fn finalization(&self) -> Option<DmlPublicationFinalization> {
         self.finalization
     }

@@ -25,12 +25,14 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use novarocks_spi::connector::ConnectorWriteOperationId;
 use novarocks_spi::connector::write_stack::{ConnectorWriteTargetPlan, WriteTargetOrdinal};
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteLease, ConnectorDistributedRewritePlan,
     ConnectorDistributedRewriteReceipt, ConnectorError, ConnectorErrorKind,
     ConnectorRequestContext, ConnectorWriteAbortOutcome, ConnectorWriteCohortId,
-    ConnectorWriteOperationId, ConnectorWriteReceipt, ExternalMutationOutcome,
+    ConnectorWriteReceipt, ExternalMutationOutcome,
 };
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
@@ -306,10 +308,6 @@ impl ConnectorDistributedRewriteSession {
     /// plan the opaque frozen source.
     pub fn lease(&self) -> &ConnectorDistributedRewriteLease {
         &self.inner.lease
-    }
-
-    pub fn operation_id(&self) -> ConnectorWriteOperationId {
-        self.inner.plan.operation_id()
     }
 
     pub fn is_noop(&self) -> bool {

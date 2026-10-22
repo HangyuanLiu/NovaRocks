@@ -68,15 +68,8 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
         .unwrap_or(novarocks_spi::connector::ConnectorReadSelector::Current);
     let target_read = QueryScanMaterialization {
         table: metadata.table.clone(),
-        catalog_handle: planning_lease
-            .binding()
-            .catalog_handle()
-            .map_err(|error| error.to_string())?
-            .clone(),
-        schema: Arc::new(metadata.schema().clone()),
         selector,
         mv_partition_selection: None,
-        statistics_pin: None,
         planning_lease: planning_lease.clone(),
     };
     let selection = affected_partitions
@@ -301,11 +294,8 @@ pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
                         frozen_snapshot_id,
                         QueryScanMaterialization {
                             table: materialization.read_table.clone(),
-                            catalog_handle: materialization.catalog_handle.clone(),
-                            schema: materialization.read_schema.clone(),
                             selector: ConnectorReadSelector::SnapshotId(frozen_snapshot_id),
                             mv_partition_selection: None,
-                            statistics_pin: materialization.statistics_pin.clone(),
                             planning_lease: materialization.planning_lease.clone(),
                         },
                     );

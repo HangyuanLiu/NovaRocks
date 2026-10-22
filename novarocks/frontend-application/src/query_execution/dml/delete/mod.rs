@@ -23,7 +23,6 @@ pub(crate) mod standard;
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::dml::error::DmlExecutionError;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
@@ -39,6 +38,7 @@ pub enum DeleteStatement<'a> {
 }
 
 /// DELETE statements recognized by the frontend command router.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeleteStatementKind {
     Predicate,
@@ -46,6 +46,7 @@ pub enum DeleteStatementKind {
 }
 
 impl DeleteStatement<'_> {
+    #[cfg(test)]
     pub const fn kind(self) -> DeleteStatementKind {
         match self {
             Self::Predicate(_) => DeleteStatementKind::Predicate,
@@ -65,12 +66,6 @@ pub struct PrepareDeleteRequest<'a> {
     pub current_database: String,
     pub query_options: Option<QueryOptions>,
     pub execution: QueryExecutionContext,
-}
-
-impl PrepareDeleteRequest<'_> {
-    pub const fn kind(&self) -> DeleteStatementKind {
-        self.statement.kind()
-    }
 }
 
 pub trait DeletePrepared: Send + Sync {

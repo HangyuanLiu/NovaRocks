@@ -978,8 +978,10 @@ async fn bootstrap_submits_63_healthy_catalogs_without_waiting_for_one_hanging_p
         CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
         SelectivelyFailingFactory::hanging_for(HANGING, Arc::clone(&entered), Arc::clone(&release)),
     );
-    let mut projection_config = CatalogProjectionConfig::default();
-    projection_config.worker_count = 1;
+    let projection_config = CatalogProjectionConfig {
+        worker_count: 1,
+        ..CatalogProjectionConfig::default()
+    };
     let catalog_controller =
         FrontendCatalogController::new(Arc::clone(&store), Arc::clone(&port), projection_config)
             .expect("one-worker catalog controller");
@@ -1028,8 +1030,10 @@ async fn bootstrap_enqueues_complete_no_io_snapshots_through_1024_catalogs() {
             CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
             SelectivelyFailingFactory::ready(),
         );
-        let mut projection_config = CatalogProjectionConfig::default();
-        projection_config.worker_count = 1;
+        let projection_config = CatalogProjectionConfig {
+            worker_count: 1,
+            ..CatalogProjectionConfig::default()
+        };
         let catalog_controller = FrontendCatalogController::new(
             Arc::clone(&store),
             Arc::clone(&port),

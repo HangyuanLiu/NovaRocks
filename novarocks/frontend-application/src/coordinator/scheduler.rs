@@ -108,10 +108,6 @@ impl FrontendBackendSnapshot {
         Ok(Self { entries })
     }
 
-    pub fn entries(&self) -> &[LiveBackendTarget] {
-        &self.entries
-    }
-
     fn target(&self, backend_idx: usize) -> Option<&LiveBackendTarget> {
         self.entries
             .iter()
@@ -150,10 +146,6 @@ impl FrontendFragmentScheduler {
             #[cfg(novarocks_dev_controls)]
             nomination: None,
         }
-    }
-
-    pub fn backend_entries(&self) -> &[LiveBackendTarget] {
-        self.backends.entries()
     }
 
     #[cfg(test)]

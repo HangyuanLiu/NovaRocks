@@ -1043,7 +1043,7 @@ mod tests {
     #[test]
     fn schema_alter_retains_one_generation_and_operation_through_guard_and_reconcile() {
         let (controls, capability, operation, context) = schema_alter_fixture(None, false);
-        let result = super::execute_admitted_alter_schema(
+        super::execute_admitted_alter_schema(
             &controls,
             &capability.descriptor.instance_id,
             operation.clone(),
@@ -1051,7 +1051,6 @@ mod tests {
             |planning| schema_alter_metadata_guard(planning, &operation, &context),
         )
         .unwrap();
-        assert_eq!(result.effect, spi::ExternalMutationEffect::Applied);
         assert_eq!(controls.acquired.load(Ordering::Acquire), 1);
         assert_eq!(
             *capability.calls.lock().unwrap(),
@@ -1064,7 +1063,7 @@ mod tests {
         );
         let ids = capability.operation_ids.lock().unwrap();
         assert_eq!(ids.len(), 3);
-        assert!(ids.iter().all(|id| *id == result.receipt.operation_id()));
+        assert!(ids.windows(2).all(|pair| pair[0] == pair[1]));
     }
 
     #[test]

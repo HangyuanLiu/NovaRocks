@@ -564,13 +564,9 @@ impl FrontendExecutionRuntimeOwner {
         }
         self.deadline_supervisor.shutdown().await;
 
-        if let Err(error) = self.query_cpu.shutdown_until(deadline).await {
-            return Err(error);
-        }
+        self.query_cpu.shutdown_until(deadline).await?;
 
-        if let Err(error) = self.query_blocking.shutdown_until(deadline).await {
-            return Err(error);
-        }
+        self.query_blocking.shutdown_until(deadline).await?;
 
         self.internal_result_cpu.shutdown_until(deadline).await?;
 

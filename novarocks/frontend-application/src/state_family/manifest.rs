@@ -68,8 +68,7 @@ impl StateFamily {
     /// The contract this family declares.
     ///
     /// One exhaustive `match`, which is what forces a new family to pick a
-    /// classification, an authority, a record version and a retain/clone policy
-    /// before it can exist.
+    /// classification, an authority, and a retain/clone policy before it exists.
     pub const fn classification(self) -> StateFamilyClassification {
         match self {
             Self::SchemaCache => StateFamilyClassification::Accelerator(AcceleratorContract::new(
@@ -364,39 +363,10 @@ mod tests {
             let retain = contract.retain_on_restart();
             let clone_policy = contract.clone_policy();
             let wipe_entry = contract.wipe_entry();
+            let rebuild_authority = contract.rebuild_authority();
             let determinism = contract.rebuild_determinism();
 
             match contract.residence() {
-                AcceleratorResidence::Durable {
-                    prefix,
-                    record_version,
-                } => {
-                    assert!(
-                        !prefix.as_str().is_empty(),
-                        "{} declares a durable prefix",
-                        family.family_id()
-                    );
-                    assert!(record_version > 0, "{}", family.family_id());
-                    assert!(
-                        retain,
-                        "{} is durable so a restart must find it",
-                        family.family_id()
-                    );
-                    assert_eq!(wipe_entry, WipeEntry::DeleteWholePrefix);
-                    assert!(
-                        matches!(
-                            clone_policy,
-                            ClonePolicy::RevalidateSourceRevisionOrWipe
-                                | ClonePolicy::WipeAndRebuild
-                        ),
-                        "{} must not carry derived records into a clone unchecked",
-                        family.family_id()
-                    );
-                    assert_eq!(
-                        family.durability_admission(),
-                        DurabilityAdmission::Permitted
-                    );
-                }
                 AcceleratorResidence::InProcess => {
                     assert!(
                         !retain,
@@ -410,6 +380,16 @@ mod tests {
                         family.durability_admission(),
                         DurabilityAdmission::Forbidden
                     );
+                    let expected_authority = match family {
+                        StateFamily::SchemaCache => {
+                            AcceleratorRebuildAuthority::ConnectorSchemaVersion
+                        }
+                        StateFamily::StatisticsArtifactCache => {
+                            AcceleratorRebuildAuthority::ConnectorStatisticsEvidenceRevision
+                        }
+                        _ => unreachable!("only accelerator families are in this match"),
+                    };
+                    assert_eq!(rebuild_authority, expected_authority);
                 }
             }
 

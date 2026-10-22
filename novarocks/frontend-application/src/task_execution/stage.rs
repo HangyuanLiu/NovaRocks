@@ -25,14 +25,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::query_execution::artifact::FragmentId;
 use novarocks_execution::task_execution::{
     CancelReason, ExchangeEdgeId, StageRef, TaskIdentity, TaskState,
 };
 use novarocks_query_application::coordination::{
     StageState, derive_stage_state, parent_released_children,
 };
-use novarocks_types::identity::{StageId, TaskId};
+#[cfg(test)]
+use novarocks_types::identity::StageId;
+use novarocks_types::identity::TaskId;
 
 use super::error::TaskExecutionError;
 use super::graph::TaskGraph;
@@ -42,8 +43,6 @@ use super::remote_task::{RemoteTask, RemoteTaskState};
 /// The frontend's owner of one stage.
 #[derive(Debug)]
 pub struct StageExecution {
-    stage: StageRef,
-    fragment_id: FragmentId,
     root_task: Option<TaskId>,
     tasks: BTreeMap<TaskId, RemoteTask>,
 }
@@ -52,7 +51,6 @@ impl StageExecution {
     /// Freezes one stage over its complete task set.
     pub fn new(
         stage: StageRef,
-        fragment_id: FragmentId,
         root_task: Option<TaskId>,
         tasks: BTreeMap<TaskId, RemoteTask>,
     ) -> Result<Self, TaskExecutionError> {
@@ -70,24 +68,7 @@ impl StageExecution {
                 stage.stage_id()
             )));
         }
-        Ok(Self {
-            stage,
-            fragment_id,
-            root_task,
-            tasks,
-        })
-    }
-
-    pub const fn stage(&self) -> StageRef {
-        self.stage
-    }
-
-    pub const fn stage_id(&self) -> StageId {
-        self.stage.stage_id()
-    }
-
-    pub const fn fragment_id(&self) -> FragmentId {
-        self.fragment_id
+        Ok(Self { root_task, tasks })
     }
 
     pub const fn root_task(&self) -> Option<TaskId> {
@@ -194,6 +175,7 @@ impl EdgeReadyDecision {
 
     /// Frozen destinations that must be closed on the producer before the
     /// edge's remaining destinations receive send permission.
+    #[cfg(test)]
     pub fn normally_closed(&self) -> &[TaskIdentity] {
         &self.normally_closed
     }

@@ -324,6 +324,11 @@ fn shape_body(
     Ok(())
 }
 
+type ShapedInsertRow = (
+    Vec<ast::Expr>,
+    Option<Vec<Option<novarocks_functions::ConstantValue>>>,
+);
+
 fn shape_row_in(
     row: &[ast::Expr],
     mapping: &[Option<usize>],
@@ -333,13 +338,7 @@ fn shape_row_in(
         novarocks_functions::ConstantPolicy,
         &dyn novarocks_type_contract::PureCompileControl,
     )>,
-) -> Result<
-    (
-        Vec<ast::Expr>,
-        Option<Vec<Option<novarocks_functions::ConstantValue>>>,
-    ),
-    String,
-> {
+) -> Result<ShapedInsertRow, String> {
     if row.len() != width {
         return Err(format!(
             "insert column count mismatch: expected {width} values for column list, got {}",
@@ -527,7 +526,13 @@ fn constrain_literal_in(
                 ("named_struct", DataType::Struct(fields))
                     if fields.len() * 2 == function.arguments.len() =>
                 {
-                    for (index, pair) in function.arguments.chunks_exact_mut(2).enumerate() {
+                    for (index, pair) in function
+                        .arguments
+                        .as_chunks_mut::<2>()
+                        .0
+                        .iter_mut()
+                        .enumerate()
+                    {
                         pair[1] =
                             constrain_literal(pair[1].clone(), &target_child(target, index)?)?;
                     }
@@ -536,7 +541,7 @@ fn constrain_literal_in(
                     if map_types(target.data_type()).is_some() {
                         let key = target_child(target, 0)?;
                         let value = target_child(target, 1)?;
-                        for pair in function.arguments.chunks_exact_mut(2) {
+                        for pair in function.arguments.as_chunks_mut::<2>().0 {
                             pair[0] = constrain_literal(pair[0].clone(), &key)?;
                             pair[1] = constrain_literal(pair[1].clone(), &value)?;
                         }

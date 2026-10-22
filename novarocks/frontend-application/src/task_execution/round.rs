@@ -45,7 +45,7 @@ use super::abort_effect::{
     NativeAbortEffectSettlement, NativeLateAbortEffect, closing_receipt, settle_late_abort_receipt,
 };
 use super::blocking_io::ConnectorBlockingIoSupervisor;
-use super::context_owner::{ContextEstablishSource, QueryContextOwner};
+use super::context_owner::ContextEstablishSource;
 use super::error::{ParticipantObservationFailure, TaskExecutionError};
 use super::execution::{ActorAbortDispatchState, QueryTaskExecution, QueuedContextAcknowledgement};
 use super::intent::{AckPayload, OperationAcknowledgement};
@@ -486,6 +486,7 @@ impl TaskRound {
     }
 
     /// Installs the single actor-to-Native Abort intake for this attempt.
+    #[cfg(test)]
     pub(crate) fn with_abort_effect_intake(mut self, intake: NativeAbortEffectIntake) -> Self {
         self.install_abort_effect_intake(intake);
         self
@@ -642,7 +643,7 @@ impl TaskRound {
                     }
                     continue;
                 }
-                TaskOperationIntakeEvent::Acknowledgement(ack) => ack,
+                TaskOperationIntakeEvent::Acknowledgement(ack) => *ack,
             };
             report.acknowledgements += 1;
             if let Err(error) = self.settle_acknowledgement(&ack) {
@@ -695,9 +696,16 @@ impl TaskRound {
             let applied_contexts = entries
                 .iter()
                 .filter_map(|entry| match entry {
-                    super::status_intake::ObservationIntakeEntry::Frame(
-                        super::status_intake::ObservationFrame::Covered { context, .. },
-                    ) => Some(*context),
+                    super::status_intake::ObservationIntakeEntry::Frame(frame) => {
+                        match frame.as_ref() {
+                            super::status_intake::ObservationFrame::Covered { context, .. } => {
+                                Some(*context)
+                            }
+                            #[cfg(test)]
+                            super::status_intake::ObservationFrame::Status(_)
+                            | super::status_intake::ObservationFrame::Gone(_) => None,
+                        }
+                    }
                     _ => None,
                 })
                 .collect::<BTreeSet<_>>();
@@ -1521,6 +1529,7 @@ impl TaskRound {
     }
 
     /// Whether every task terminated and every context was released.
+    #[cfg(test)]
     pub(crate) fn attempt_drained(&self) -> bool {
         self.execution.attempt_drained()
     }

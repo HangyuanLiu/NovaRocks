@@ -244,7 +244,7 @@ impl StagedMvCreateTarget {
     ) -> StagedPublishOutcome {
         let Self {
             management,
-            document_lease: _,
+            document_lease,
             staged_lease,
             handle,
             admission,
@@ -253,6 +253,8 @@ impl StagedMvCreateTarget {
             operation_id,
             planning_lease: _,
         } = self;
+        // The staged lease retains this exact provider generation through publication.
+        drop(document_lease);
         let Some(prepared_target) = handle.document_target() else {
             return settle_publish_known_uncommitted(
                 management,

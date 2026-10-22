@@ -69,20 +69,9 @@ fn with_original_control<T>(
     let result = author(&mut creation);
     // The author's first refusal is final, including its original provider
     // classification and retry evidence. Only success observes the tail.
-    if result.is_err() {
-        return result;
-    }
+    let value = result?;
     observe()?;
-    result
-}
-
-pub(crate) fn load_table(
-    metadata: &dyn ConnectorMetadata,
-    request: ConnectorTableRequest,
-) -> Result<ConnectorTableMetadata, ConnectorError> {
-    let control = request.context.original_operation_control();
-    with_original_control(control, |creation| metadata.load_table(request, creation))
-        .map_err(connector_schema_error)
+    Ok(value)
 }
 
 /// The FE role's explicit no-quota catalog preparation path.

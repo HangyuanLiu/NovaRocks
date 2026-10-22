@@ -43,14 +43,10 @@ struct LifecycleConvergenceDebugSnapshot {
 
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The typed frontend protocol model intentionally keeps payloads inline."
-)]
 enum RuntimeFilterTerminalRollupDebug {
     Available {
         participants: Vec<RuntimeFilterParticipantTerminalDebug>,
-        totals: RuntimeFilterTerminalTotalsDebug,
+        totals: Box<RuntimeFilterTerminalTotalsDebug>,
     },
     Unavailable {
         reason: &'static str,
@@ -147,10 +143,6 @@ struct RuntimeFilterUniqueIdDebug {
 
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The typed frontend protocol model intentionally keeps payloads inline."
-)]
 enum RuntimeFilterTerminalTotalsDebug {
     Available {
         channels: RuntimeFilterChannelTotalsDebug,
@@ -221,7 +213,6 @@ fn lifecycle_convergence_debug_snapshot(
     let error_source = snapshot.error_source.map(|source| match source {
         QueryLifecycleConvergenceErrorSource::BackendAttestation => "backend-attestation",
         QueryLifecycleConvergenceErrorSource::FrontendLiveness => "frontend-liveness",
-        QueryLifecycleConvergenceErrorSource::NoOutcome => "no-outcome",
     });
     LifecycleConvergenceDebugSnapshot {
         execution_id: format!(
@@ -292,7 +283,7 @@ fn runtime_filter_terminal_rollup_debug(
                     .into_iter()
                     .map(runtime_filter_participant_debug)
                     .collect(),
-                totals: runtime_filter_totals_debug(rollup.totals),
+                totals: Box::new(runtime_filter_totals_debug(rollup.totals)),
             }
         }
         RuntimeFilterTerminalRollupSnapshot::Unavailable(reason) => {

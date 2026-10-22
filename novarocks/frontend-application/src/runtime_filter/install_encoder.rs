@@ -55,14 +55,6 @@ impl FrontendRuntimeFilterFeedbackDeclaration {
     ) -> impl ExactSizeIterator<Item = &FrontendRuntimeFilterFeedbackChannel> {
         self.channels.values()
     }
-
-    pub(crate) fn channel(&self, channel_id: u32) -> Option<&FrontendRuntimeFilterFeedbackChannel> {
-        self.channels.get(&channel_id)
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.channels.is_empty()
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -120,7 +112,6 @@ pub(crate) struct FrontendRuntimeFilterFeedbackScanBinding {
     pub(crate) plan_node_id: i32,
     pub(crate) binding_id: u32,
     pub(crate) data_type: DataType,
-    pub(crate) nullable: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

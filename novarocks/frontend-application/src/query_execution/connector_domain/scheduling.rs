@@ -75,10 +75,6 @@ pub(crate) struct SplitSequenceAllocator {
 }
 
 impl SplitSequenceAllocator {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     /// Allocates the next sequence for one plan node, starting at one.
     ///
     /// One and not zero, for two reasons that point the same way. A split
@@ -95,14 +91,6 @@ impl SplitSequenceAllocator {
         *slot += 1;
         sequence
     }
-
-    /// The next sequence a plan node will use.
-    ///
-    /// Zero means nothing has been issued, which is a distinct answer from
-    /// any sequence a split could carry.
-    pub(crate) fn issued(&self, plan_node_id: i32) -> u64 {
-        self.next.get(&plan_node_id).copied().unwrap_or_default()
-    }
 }
 
 /// One split placed at one sequence in one plan node's queue.
@@ -116,14 +104,6 @@ pub(crate) struct ScheduledSplit {
 impl ScheduledSplit {
     pub(crate) const fn sequence_id(&self) -> u64 {
         self.sequence_id
-    }
-
-    pub(crate) const fn plan_node_id(&self) -> i32 {
-        self.plan_node_id
-    }
-
-    pub(crate) const fn split(&self) -> &Split {
-        &self.split
     }
 
     /// Encode only at TaskUpdate egress with the codec selected for this
@@ -204,10 +184,6 @@ impl PlanNodeAssignmentState {
             .get(&plan_node_id)
             .copied()
             .unwrap_or_default()
-    }
-
-    pub(crate) fn issued(&self, plan_node_id: i32) -> u64 {
-        self.sequences.issued(plan_node_id)
     }
 
     /// Build the next assignment for one plan node.
@@ -300,13 +276,7 @@ mod tests {
         // undecodable, which is every scan's first batch -- and it also makes
         // a receipt's "highest accepted sequence" ambiguous, because zero
         // would mean both nothing-accepted and accepted-zero.
-        let mut allocator = SplitSequenceAllocator::new();
-        assert_eq!(
-            allocator.issued(7),
-            0,
-            "nothing issued is its own answer, distinct from any real sequence"
-        );
-
+        let mut allocator = SplitSequenceAllocator::default();
         let first = allocator.allocate(7);
         assert!(
             SplitSequence::new(first).is_ok(),

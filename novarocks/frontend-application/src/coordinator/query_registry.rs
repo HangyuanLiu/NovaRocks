@@ -21,12 +21,17 @@ use std::sync::{Arc, Mutex};
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
+#[cfg(test)]
 use novarocks_execution_contract::task_execution::context_convergence::{
     QueryContextConvergenceReceipt, QueryContextConvergenceState,
 };
+#[cfg(test)]
 use novarocks_execution_contract::task_execution::identity::QueryContextRef;
+#[cfg(test)]
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
+#[cfg(test)]
 use novarocks_query_application::api::LiveBackendTarget;
+#[cfg(test)]
 use novarocks_query_application::coordination::{
     AttemptConvergenceFacts, AttemptDisposition, LogicalConclusion,
 };
@@ -79,7 +84,7 @@ pub(crate) struct LatchedQueryFailure {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum QueryFailureBody {
     CoordinatorDiagnostic(String),
-    Execution(novarocks_query_application::execution_error::ExecutionFailureInput),
+    Execution(Box<novarocks_query_application::execution_error::ExecutionFailureInput>),
 }
 
 impl QueryFailureBody {
@@ -106,7 +111,7 @@ impl LatchedQueryFailure {
             ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason,
         };
         let input = match self.body {
-            QueryFailureBody::Execution(input) => input,
+            QueryFailureBody::Execution(input) => *input,
             QueryFailureBody::CoordinatorDiagnostic(message) => {
                 // The coordinator's closed cause selects its own projection.
                 // Detailed diagnostics never classify a foreign domain.
@@ -143,6 +148,7 @@ struct AttemptState {
     /// ordinal that selected their backend process. The ordinal is retained
     /// only to qualify an exact process-replacement observation; it never
     /// identifies a context without the frozen process identity.
+    #[cfg(test)]
     scheduled_contexts: Option<BTreeMap<usize, QueryContextRef>>,
     /// Compatibility-only process ownership used before an exact attempt is
     /// registered. It cannot authorize context convergence facts.
@@ -155,11 +161,13 @@ struct AttemptState {
     /// convergence snapshot instead of discarding it at the first latch.
     secondary_failures: BTreeSet<(QueryFailureCause, String)>,
     next_failure_id: u64,
+    #[cfg(test)]
     convergence: AttemptConvergenceFacts,
     /// Last versioned resource observation and positive lifecycle evidence for
     /// every frozen participant. A process replacement deliberately marks the
     /// old participant unknown; it never clears its last observed usage or
     /// claims that its local execution stopped.
+    #[cfg(test)]
     backend_responsibilities: BTreeMap<BackendProcessId, AttemptBackendResponsibilitySnapshot>,
 }
 
@@ -212,23 +220,31 @@ impl AttemptState {
 }
 
 struct LogicalQuery {
+    #[cfg(test)]
     registration_generation: u64,
     /// Temporary state used only by the existing query-id-only registration
     /// API. Binding the initial attempt moves this state into the attempt map.
     unbound_attempt: AttemptState,
     legacy_registration_id: Option<u64>,
+    #[cfg(test)]
     current_attempt: Option<QueryExecutionId>,
+    #[cfg(test)]
     replacement: Option<PendingAttemptReplacement>,
     /// The attempt capability that fixed the logical conclusion.  Conclusion
     /// demotes that attempt from current immediately, but this exact owner is
     /// retained for idempotent conclusion and final registry retirement.
+    #[cfg(test)]
     terminal_attempt: Option<QueryExecutionId>,
+    #[cfg(test)]
     terminal_registration_generation: Option<u64>,
+    #[cfg(test)]
     attempts: BTreeMap<QueryExecutionId, AttemptState>,
+    #[cfg(test)]
     conclusion: Option<LogicalConclusion>,
 }
 
 impl LogicalQuery {
+    #[cfg(test)]
     fn legacy(registration_id: u64, registration_generation: u64) -> Self {
         Self {
             registration_generation,
@@ -243,6 +259,15 @@ impl LogicalQuery {
         }
     }
 
+    #[cfg(not(test))]
+    fn legacy(registration_id: u64) -> Self {
+        Self {
+            unbound_attempt: AttemptState::new(),
+            legacy_registration_id: Some(registration_id),
+        }
+    }
+
+    #[cfg(test)]
     fn with_initial_attempt(execution_id: QueryExecutionId, registration_generation: u64) -> Self {
         Self {
             registration_generation,
@@ -257,6 +282,7 @@ impl LogicalQuery {
         }
     }
 
+    #[cfg(test)]
     fn current_state(&self) -> Option<&AttemptState> {
         self.current_attempt
             .or(self.terminal_attempt)
@@ -264,6 +290,7 @@ impl LogicalQuery {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingAttemptReplacement {
     failed: QueryExecutionId,
@@ -289,6 +316,7 @@ impl RetiredQuerySequences {
             .is_some_and(|(&start, &end)| start <= sequence && sequence <= end)
     }
 
+    #[cfg(test)]
     fn insert(&mut self, sequence: u64) {
         if self.contains(sequence) {
             return;
@@ -317,10 +345,14 @@ struct RegistryState {
     /// Exact event-routing index. Attempt state remains owned by `logical` so
     /// both indexes are mutated under this one lock and never become competing
     /// authorities.
+    #[cfg(test)]
     attempt_owner: BTreeMap<QueryExecutionId, QueryKey>,
     next_legacy_registration_id: u64,
+    #[cfg(test)]
     next_logical_registration_generation: u64,
+    #[cfg(test)]
     next_replacement_phase_generation: u64,
+    #[cfg(test)]
     next_terminal_registration_generation: u64,
     retired_query_sequences: RetiredQuerySequences,
 }
@@ -328,6 +360,7 @@ struct RegistryState {
 /// Opaque proof that an exact attempt was inserted into both registry indexes.
 /// It has no `Drop` behavior: only explicit convergence retirement may remove
 /// an attempt-aware logical execution.
+#[cfg(test)]
 #[derive(Debug)]
 #[must_use = "the logical execution owner must retain the exact registered attempt"]
 pub(crate) struct RegisteredAttempt {
@@ -337,8 +370,16 @@ pub(crate) struct RegisteredAttempt {
     execution_id: QueryExecutionId,
 }
 
+#[cfg(test)]
+impl RegisteredAttempt {
+    pub(crate) const fn execution_id(&self) -> QueryExecutionId {
+        self.execution_id
+    }
+}
+
 /// Opaque owner of the interval after the old attempt was atomically demoted
 /// and before the proposed attempt is activated.
+#[cfg(test)]
 #[derive(Debug)]
 #[must_use = "replacement qualification must activate or conclude the logical execution"]
 pub(crate) struct RegisteredReplacement {
@@ -353,6 +394,7 @@ pub(crate) struct RegisteredReplacement {
 /// Opaque owner of one fixed logical conclusion. It is independent of an
 /// attempt because cancellation may win while replacement qualification owns
 /// the logical execution and no attempt is current.
+#[cfg(test)]
 #[derive(Debug)]
 #[must_use = "the terminal owner must retain the logical execution until every attempt retires"]
 pub(crate) struct RegisteredLogicalTerminal {
@@ -362,13 +404,8 @@ pub(crate) struct RegisteredLogicalTerminal {
     terminal_registration_generation: u64,
 }
 
-impl RegisteredAttempt {
-    pub(crate) const fn execution_id(&self) -> QueryExecutionId {
-        self.execution_id
-    }
-}
-
 /// Immutable result of routing an exact attempt-scoped event.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AttemptRouteSnapshot {
     query_id: QueryId,
@@ -380,6 +417,7 @@ pub(crate) struct AttemptRouteSnapshot {
     backend_responsibilities: BTreeMap<BackendProcessId, AttemptBackendResponsibilitySnapshot>,
 }
 
+#[cfg(test)]
 impl AttemptRouteSnapshot {
     pub(crate) const fn query_id(&self) -> QueryId {
         self.query_id
@@ -416,6 +454,7 @@ impl AttemptRouteSnapshot {
 /// an attempt. Versions belong to that backend's attempt-scoped observation
 /// stream, so stale samples cannot turn an unknown residual back into known
 /// usage or replace a newer byte count.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AttemptResourceObservation {
     pub(crate) version: u64,
@@ -426,17 +465,20 @@ pub(crate) struct AttemptResourceObservation {
 /// A Worker publication and an independently trusted fence remain distinct so
 /// callers cannot manufacture `actual_stopped` from transport loss or an abort
 /// acknowledgement.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AttemptStopEvidence {
     TrustedExecutionFence { version: u64 },
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AttemptProcessReplacementEvidence {
     pub(crate) topology_revision: u64,
     pub(crate) replacement: BackendProcessId,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AttemptBackendResponsibilitySnapshot {
     pub(crate) resource: Option<AttemptResourceObservation>,
@@ -449,11 +491,13 @@ pub(crate) struct AttemptBackendResponsibilitySnapshot {
 #[derive(Default)]
 struct BackendTopologyState {
     initialized: bool,
+    #[cfg(test)]
     revision: u64,
     live_process_ids: BTreeMap<usize, BackendProcessId>,
 }
 
 pub(crate) struct FrontendQueryRegistry {
+    #[cfg(test)]
     instance_id: uuid::Uuid,
     namespace: QueryProcessNamespace,
     state: Mutex<RegistryState>,
@@ -469,12 +513,16 @@ pub(crate) struct FrontendQueryRegistry {
 impl FrontendQueryRegistry {
     pub(crate) fn new(namespace: QueryProcessNamespace) -> Self {
         Self {
+            #[cfg(test)]
             instance_id: uuid::Uuid::new_v4(),
             namespace,
             state: Mutex::new(RegistryState {
                 next_legacy_registration_id: 1,
+                #[cfg(test)]
                 next_logical_registration_generation: 1,
+                #[cfg(test)]
                 next_replacement_phase_generation: 1,
+                #[cfg(test)]
                 next_terminal_registration_generation: 1,
                 ..RegistryState::default()
             }),
@@ -513,6 +561,7 @@ impl FrontendQueryRegistry {
         DistributedQueryError::new(DistributedQueryErrorKind::Rejected, message)
     }
 
+    #[cfg(test)]
     fn inactive_attempt(&self, execution_id: QueryExecutionId) -> DistributedQueryError {
         DistributedQueryError::new(
             DistributedQueryErrorKind::Rejected,
@@ -548,11 +597,14 @@ impl FrontendQueryRegistry {
             .next_legacy_registration_id
             .checked_add(1)
             .expect("frontend legacy query registration id exhausted");
-        let logical_registration_generation = next_logical_registration_generation(&mut state)?;
-        state.logical.insert(
-            key,
-            LogicalQuery::legacy(registration_id, logical_registration_generation),
+        #[cfg(test)]
+        let logical = LogicalQuery::legacy(
+            registration_id,
+            next_logical_registration_generation(&mut state)?,
         );
+        #[cfg(not(test))]
+        let logical = LogicalQuery::legacy(registration_id);
+        state.logical.insert(key, logical);
         Ok(ActiveQueryGuard {
             registry: Arc::clone(self),
             key,
@@ -565,6 +617,7 @@ impl FrontendQueryRegistry {
     /// If the compatibility API registered the query first, its accumulated
     /// state is moved into this exact attempt. The compatibility guard is then
     /// disarmed structurally and cannot delete the attempt-aware entry.
+    #[cfg(test)]
     pub(crate) fn register_initial_attempt(
         &self,
         execution_id: QueryExecutionId,
@@ -574,6 +627,7 @@ impl FrontendQueryRegistry {
 
     /// Registers the first attempt and freezes its exact Worker contexts in
     /// the same registry transaction.
+    #[cfg(test)]
     pub(crate) fn register_initial_attempt_with_contexts(
         &self,
         execution_id: QueryExecutionId,
@@ -583,6 +637,7 @@ impl FrontendQueryRegistry {
         self.register_initial_attempt_inner(execution_id, Some(frozen))
     }
 
+    #[cfg(test)]
     fn register_initial_attempt_inner(
         &self,
         execution_id: QueryExecutionId,
@@ -678,6 +733,7 @@ impl FrontendQueryRegistry {
     /// Atomically demotes the current attempt and installs the only owner of
     /// replacement qualification. No attempt is current until this exact phase
     /// capability activates the proposed identity.
+    #[cfg(test)]
     pub(crate) fn begin_attempt_replacement(
         &self,
         current: &RegisteredAttempt,
@@ -751,6 +807,7 @@ impl FrontendQueryRegistry {
 
     /// Activates the proposed attempt only after the actor has completed every
     /// replacement prerequisite represented by its own sealed reducer token.
+    #[cfg(test)]
     pub(crate) fn activate_attempt_replacement(
         &self,
         replacement: &RegisteredReplacement,
@@ -787,6 +844,7 @@ impl FrontendQueryRegistry {
     /// Resolves an exact attempt without consulting the current-attempt slot.
     /// Residual attempts therefore remain routable after replacement and after
     /// the logical result has been fixed.
+    #[cfg(test)]
     pub(crate) fn route_attempt(
         &self,
         execution_id: QueryExecutionId,
@@ -827,6 +885,7 @@ impl FrontendQueryRegistry {
             .logical
             .get_mut(&query_key(query_id))
             .ok_or_else(|| self.inactive_query(query_id))?;
+        #[cfg(test)]
         if !query.attempts.is_empty() {
             return Err(contract_violation(
                 "query-id-only backend ownership cannot mutate an attempt-aware logical execution",
@@ -835,6 +894,7 @@ impl FrontendQueryRegistry {
         set_attempt_backend_ownership(&mut query.unbound_attempt, backend_ownership)
     }
 
+    #[cfg(test)]
     pub(crate) fn set_attempt_query_contexts(
         &self,
         registered: &RegisteredAttempt,
@@ -859,6 +919,7 @@ impl FrontendQueryRegistry {
     /// Only a context frozen into this attempt can advance the retained fact.
     /// Task terminal states and Abort acknowledgements do not carry this type
     /// and therefore cannot enter this API.
+    #[cfg(test)]
     pub(crate) fn record_query_context_convergence(
         &self,
         registered: &RegisteredAttempt,
@@ -940,6 +1001,7 @@ impl FrontendQueryRegistry {
     /// Replaces the last observation for one frozen backend only when its
     /// backend-issued version advances. Equal observations are idempotent;
     /// equal-version conflicts and stale observations are rejected.
+    #[cfg(test)]
     pub(crate) fn observe_attempt_resource_usage(
         &self,
         registered: &RegisteredAttempt,
@@ -975,6 +1037,7 @@ impl FrontendQueryRegistry {
     /// discarding its last versioned byte observation. Unknown is monotonic in
     /// the registry: a later sample may update the retained byte count, while
     /// only explicit convergence releases the residual responsibility.
+    #[cfg(test)]
     pub(crate) fn mark_attempt_resource_unknown(
         &self,
         registered: &RegisteredAttempt,
@@ -990,6 +1053,7 @@ impl FrontendQueryRegistry {
     /// Retains an independently trusted execution fence for one frozen
     /// backend. Worker-owned convergence must enter through its exact typed
     /// receipt instead.
+    #[cfg(test)]
     pub(crate) fn record_attempt_stop_evidence(
         &self,
         registered: &RegisteredAttempt,
@@ -1012,6 +1076,7 @@ impl FrontendQueryRegistry {
     /// process identity. The evidence revokes routing eligibility only: it
     /// marks the old process's usage unknown and does not imply Worker stop,
     /// resource release, or external-effect convergence.
+    #[cfg(test)]
     pub(crate) fn record_attempt_process_replacement(
         &self,
         registered: &RegisteredAttempt,
@@ -1128,6 +1193,7 @@ impl FrontendQueryRegistry {
         Ok(())
     }
 
+    #[cfg(test)]
     fn validate_query_contexts(
         &self,
         execution_id: QueryExecutionId,
@@ -1200,6 +1266,7 @@ impl FrontendQueryRegistry {
         Ok(frozen)
     }
 
+    #[cfg(test)]
     fn attempt_backend_responsibility_mut<'a>(
         &self,
         state: &'a mut RegistryState,
@@ -1226,6 +1293,7 @@ impl FrontendQueryRegistry {
             })
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_live_backends(
         &self,
         revision: u64,
@@ -1299,11 +1367,6 @@ impl FrontendQueryRegistry {
         Err(self.inactive_query(query_id))
     }
 
-    pub(crate) fn first_failure(&self, query_id: QueryId) -> Option<String> {
-        self.first_failure_record(query_id)
-            .map(|failure| failure.message().to_owned())
-    }
-
     pub(crate) fn first_failure_record(&self, query_id: QueryId) -> Option<LatchedQueryFailure> {
         self.state
             .lock()
@@ -1311,11 +1374,18 @@ impl FrontendQueryRegistry {
             .logical
             .get(&query_key(query_id))
             .and_then(|query| {
-                query
-                    .current_state()
-                    .unwrap_or(&query.unbound_attempt)
-                    .first_failure
-                    .clone()
+                #[cfg(test)]
+                {
+                    query
+                        .current_state()
+                        .unwrap_or(&query.unbound_attempt)
+                        .first_failure
+                        .clone()
+                }
+                #[cfg(not(test))]
+                {
+                    query.unbound_attempt.first_failure.clone()
+                }
             })
     }
 
@@ -1330,6 +1400,7 @@ impl FrontendQueryRegistry {
             .logical
             .get_mut(&query_key(query_id))
             .ok_or_else(|| self.inactive_query(query_id))?;
+        #[cfg(test)]
         if !query.attempts.is_empty() {
             return Err(contract_violation(
                 "query-id-only failure ingress cannot mutate an attempt-aware logical execution",
@@ -1337,7 +1408,7 @@ impl FrontendQueryRegistry {
         }
         Ok(query
             .unbound_attempt
-            .record_failure_body(cause, QueryFailureBody::Execution(input)))
+            .record_failure_body(cause, QueryFailureBody::Execution(Box::new(input))))
     }
 
     /// Records why this query failed and returns the primary cause the
@@ -1357,6 +1428,7 @@ impl FrontendQueryRegistry {
             .logical
             .get_mut(&query_key(query_id))
             .ok_or_else(|| self.inactive_query(query_id))?;
+        #[cfg(test)]
         if !query.attempts.is_empty() {
             return Err(contract_violation(
                 "query-id-only failure ingress cannot mutate an attempt-aware logical execution",
@@ -1365,6 +1437,7 @@ impl FrontendQueryRegistry {
         Ok(query.unbound_attempt.record_failure(cause, message.into()))
     }
 
+    #[cfg(test)]
     pub(crate) fn latch_attempt_failure(
         &self,
         registered: &RegisteredAttempt,
@@ -1386,6 +1459,7 @@ impl FrontendQueryRegistry {
 
     /// Monotonically merges exact convergence facts for either the current or
     /// a residual attempt. Logical conclusion does not close this ingress.
+    #[cfg(test)]
     pub(crate) fn merge_attempt_convergence(
         &self,
         registered: &RegisteredAttempt,
@@ -1409,6 +1483,7 @@ impl FrontendQueryRegistry {
 
     /// Fixes the logical result once. Repeating the same conclusion is
     /// idempotent; a conflicting late conclusion is rejected.
+    #[cfg(test)]
     pub(crate) fn conclude_logical(
         &self,
         current: &RegisteredAttempt,
@@ -1477,6 +1552,7 @@ impl FrontendQueryRegistry {
     /// Fixes a non-success conclusion while replacement qualification owns the
     /// logical execution. The failed attempt capability is residual here and
     /// cannot substitute for this exact phase capability.
+    #[cfg(test)]
     pub(crate) fn conclude_attempt_replacement(
         &self,
         replacement: &RegisteredReplacement,
@@ -1514,6 +1590,7 @@ impl FrontendQueryRegistry {
     /// Removes a concluded logical execution only after every exact attempt is
     /// fully retired. Returns `false` while any current or residual attempt
     /// still owns runtime, output, or accounted resources.
+    #[cfg(test)]
     pub(crate) fn try_remove_converged(
         &self,
         terminal: &RegisteredLogicalTerminal,
@@ -1565,6 +1642,7 @@ impl FrontendQueryRegistry {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn validate_registered_attempt(
         &self,
         state: &RegistryState,
@@ -1601,6 +1679,7 @@ impl FrontendQueryRegistry {
         Ok(key)
     }
 
+    #[cfg(test)]
     fn validate_registered_replacement(
         &self,
         state: &RegistryState,
@@ -1636,9 +1715,11 @@ impl FrontendQueryRegistry {
     fn unregister_legacy(&self, key: QueryKey, registration_id: u64) {
         let mut state = self.state.lock().expect("frontend query registry lock");
         let should_remove = state.logical.get(&key).is_some_and(|logical| {
-            logical.legacy_registration_id == Some(registration_id)
-                && logical.current_attempt.is_none()
-                && logical.attempts.is_empty()
+            #[cfg(test)]
+            let unbound = logical.current_attempt.is_none() && logical.attempts.is_empty();
+            #[cfg(not(test))]
+            let unbound = true;
+            logical.legacy_registration_id == Some(registration_id) && unbound
         });
         if should_remove {
             state.logical.remove(&key);
@@ -1682,15 +1763,19 @@ fn set_attempt_backend_ownership(
             ));
         }
     }
-    attempt.backend_responsibilities = process_ids
-        .iter()
-        .copied()
-        .map(|process_id| (process_id, AttemptBackendResponsibilitySnapshot::default()))
-        .collect();
+    #[cfg(test)]
+    {
+        attempt.backend_responsibilities = process_ids
+            .iter()
+            .copied()
+            .map(|process_id| (process_id, AttemptBackendResponsibilitySnapshot::default()))
+            .collect();
+    }
     attempt.legacy_scheduled_backends = Some(scheduled_backends);
     Ok(())
 }
 
+#[cfg(test)]
 fn set_attempt_query_contexts(
     attempt: &mut AttemptState,
     scheduled_contexts: BTreeMap<usize, QueryContextRef>,
@@ -1744,6 +1829,7 @@ fn set_attempt_query_contexts(
     Ok(())
 }
 
+#[cfg(test)]
 fn next_logical_registration_generation(
     state: &mut RegistryState,
 ) -> Result<u64, DistributedQueryError> {
@@ -1860,7 +1946,7 @@ mod tests {
             }
             state.record_failure_body(
                 QueryFailureCause::BackendLocalFailure,
-                QueryFailureBody::Execution(input.clone()),
+                QueryFailureBody::Execution(Box::new(input.clone())),
             );
             let selected = state.record_failure(
                 QueryFailureCause::FrontendExecution,
@@ -1893,7 +1979,7 @@ mod tests {
         );
         let selected = state.record_failure_body(
             QueryFailureCause::BackendLocalFailure,
-            QueryFailureBody::Execution(later),
+            QueryFailureBody::Execution(Box::new(later)),
         );
         let input = selected
             .into_execution_error()

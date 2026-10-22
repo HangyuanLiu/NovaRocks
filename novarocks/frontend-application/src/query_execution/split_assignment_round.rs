@@ -28,7 +28,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
@@ -82,21 +81,6 @@ pub(crate) fn assignment_targets(
     targets
 }
 
-/// Every backend this round may deliver a task update to.
-pub(crate) fn assignment_endpoints(
-    schedule: &ValidatedFragmentSchedule,
-) -> Vec<(usize, RuntimeEndpoint)> {
-    let mut endpoints: BTreeMap<usize, RuntimeEndpoint> = BTreeMap::new();
-    for placements in schedule.fragment_placements().values() {
-        for placement in placements {
-            endpoints
-                .entry(placement.backend_idx)
-                .or_insert_with(|| placement.endpoint.clone());
-        }
-    }
-    endpoints.into_iter().collect()
-}
-
 /// Immutable, single-scan input for one attempt source-open call.
 ///
 /// It shares only this scan's process-local access entry. The actor keeps the
@@ -148,28 +132,6 @@ impl RoundSplitSourceRecipe {
             constraint: scan.constraint.clone(),
             access,
         })
-    }
-
-    /// One scan of a completed plan, from the read it was frozen with.
-    pub(crate) fn for_frozen_read(
-        fragment_id: FragmentId,
-        plan_node_id: i32,
-        assignments: Vec<novarocks_spi::connector::read_stack::runtime::ConnectorReadAssignment>,
-        dynamic_filters: Vec<(
-            u32,
-            novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
-        )>,
-        constraint: novarocks_spi::connector::read_stack::ConnectorReadConstraint,
-        access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessEntry>,
-    ) -> Self {
-        Self {
-            fragment_id,
-            plan_node_id,
-            assignments,
-            dynamic_filters,
-            constraint,
-            access,
-        }
     }
 
     pub(crate) const fn fragment_id(&self) -> FragmentId {
@@ -286,25 +248,6 @@ pub(crate) fn open_round_split_source(
     })
 }
 
-pub(crate) fn feedback_bindings(
-    table_scan: &crate::query_execution::connector_domain::TableScanNode,
-) -> Vec<(
-    u32,
-    novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
-)> {
-    table_scan
-        .dynamic_filters()
-        .iter()
-        .filter_map(|binding| {
-            table_scan
-                .assignments()
-                .iter()
-                .find(|assignment| assignment.variable() == binding.variable())
-                .map(|assignment| (binding.filter_id(), assignment.column().clone()))
-        })
-        .collect()
-}
-
 /// Everything one round needs to start assigning splits, built before the
 /// prepared artifacts are consumed by staging.
 ///
@@ -317,12 +260,6 @@ pub(crate) struct RoundSplitAssignmentPlan {
     sources: Vec<RoundSplitSource>,
     retry_policy: TaskUpdateRetryPolicy,
     initial_dynamic_filter_wait_cap: std::time::Duration,
-    /// Every backend this round may address, frozen with the schedule.
-    ///
-    /// Carried on the plan because the schedule is consumed before either path
-    /// builds its transport, and a transport built from a later snapshot could
-    /// address a process this attempt never scheduled.
-    endpoints: Vec<(usize, RuntimeEndpoint)>,
     blocking_io: ConnectorBlockingIoSupervisor,
 }
 
@@ -398,7 +335,6 @@ impl RoundSplitAssignmentPlan {
         sources: Vec<RoundSplitSource>,
         retry_policy: TaskUpdateRetryPolicy,
         initial_dynamic_filter_wait_cap: std::time::Duration,
-        endpoints: Vec<(usize, RuntimeEndpoint)>,
         blocking_io: ConnectorBlockingIoSupervisor,
     ) -> Self {
         Self {
@@ -406,19 +342,14 @@ impl RoundSplitAssignmentPlan {
             sources,
             retry_policy,
             initial_dynamic_filter_wait_cap,
-            endpoints,
             blocking_io,
         }
     }
 
     /// The scans this plan opened a source for.
+    #[cfg(test)]
     pub(crate) fn scans(&self) -> impl Iterator<Item = ScanNodeKey> + '_ {
         self.sources.iter().map(|source| source.scan)
-    }
-
-    /// Every backend this round may address.
-    pub(crate) fn endpoints(&self) -> &[(usize, RuntimeEndpoint)] {
-        &self.endpoints
     }
 }
 
@@ -728,7 +659,7 @@ impl SplitAssignmentPump {
         self.retry_at = None;
         match assignment.enumerate_once() {
             Ok(RoundSplitEnumeration::Ready(request)) => {
-                self.start_enumeration(request);
+                self.start_enumeration(*request);
                 Ok(1)
             }
             Ok(RoundSplitEnumeration::Idle(wait)) => {
@@ -1519,7 +1450,6 @@ mod tests {
             Vec::new(),
             TaskUpdateRetryPolicy::default(),
             std::time::Duration::ZERO,
-            Vec::new(),
             ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current()),
         );
         assert_eq!(plan.scans().count(), 0);
@@ -1735,7 +1665,6 @@ mod tests {
             sources,
             TaskUpdateRetryPolicy::default(),
             Duration::ZERO,
-            Vec::new(),
             supervisor.clone(),
         );
         let wake = Arc::new(CountingWake::default());
@@ -1748,8 +1677,12 @@ mod tests {
             wake.clone(),
         )
         .unwrap();
+        let wake_count_before_stop = wake.count();
         guard.request_stop();
-        let _stopped_wake = wake.count();
+        assert!(
+            wake.count() > wake_count_before_stop,
+            "requesting source close must wake the round owner"
+        );
         if terminal_cleanup {
             round.begin_terminal_cleanup();
         } else {
@@ -1770,7 +1703,7 @@ mod tests {
         let released = release.send(());
         until(|| guard.is_finished());
         if !terminal_cleanup {
-            statuses.publish(StatusEvent::Published(
+            statuses.publish(StatusEvent::Published(Box::new(
                 TaskStatus::try_new(
                     identity,
                     TaskStatusVersion::new(3).unwrap(),
@@ -1779,7 +1712,7 @@ mod tests {
                     TaskOutputFacts::new(false),
                 )
                 .unwrap(),
-            ));
+            )));
         }
         let joined_turn = round.turn();
         let local_closed = round.pumps_closed();
@@ -1942,7 +1875,6 @@ mod tests {
             vec![source],
             TaskUpdateRetryPolicy::default(),
             Duration::ZERO,
-            Vec::new(),
             supervisor.clone(),
         );
         let identity = round.root_task();
@@ -2085,7 +2017,6 @@ mod tests {
             vec![source],
             TaskUpdateRetryPolicy::default(),
             Duration::ZERO,
-            Vec::new(),
             supervisor.clone(),
         );
         let identity = round.root_task();

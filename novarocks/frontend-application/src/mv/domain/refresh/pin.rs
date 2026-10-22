@@ -36,6 +36,7 @@
 
 use std::collections::HashSet;
 
+#[cfg(test)]
 use novarocks_mv_application::persistence::keyed_documents::StoredKeyedMvProjection;
 use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorTableObjectId};
 use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
@@ -175,6 +176,7 @@ impl RefreshSnapshotPin {
     }
 }
 
+#[cfg(test)]
 /// Rejects a refresh when a persisted base-table identity no longer matches
 /// the identity frozen in this attempt's pin.
 pub fn validate_refresh_pin_table_object_ids(
@@ -190,6 +192,7 @@ pub fn validate_refresh_pin_table_object_ids(
     )
 }
 
+#[cfg(test)]
 fn validate_refresh_pin_table_object_ids_for_operation(
     mv_definition: &StoredKeyedMvProjection,
     pin: &RefreshSnapshotPin,

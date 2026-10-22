@@ -1297,11 +1297,11 @@ impl Harness {
             outcome,
             OperationOutcome::Accepted | OperationOutcome::Idempotent
         ) {
-            AckPayload::Create(CreateTaskReceipt::new(
+            AckPayload::Create(Box::new(CreateTaskReceipt::new(
                 request.identity(),
                 Vec::new(),
                 TaskStatus::created(request.identity()).with_installed(),
-            ))
+            )))
         } else {
             AckPayload::None
         };
@@ -1424,13 +1424,6 @@ impl Harness {
         self.publish_with_filters(task_id, state, termination, output_complete, None);
     }
 
-    /// Advances this task's status version counter without publishing, the way
-    /// a subscription's catch-up leaves a gap: it replays only the latest
-    /// version per cursor, so every version in between is never delivered.
-    fn skip_status_versions(&mut self, task_id: TaskId, count: u64) {
-        *self.statuses.entry(task_id).or_insert(1) += count;
-    }
-
     /// Publishes one status snapshot, optionally advertising a filter version.
     fn publish_with_filters(
         &mut self,
@@ -1462,7 +1455,7 @@ impl Harness {
             self.execution
                 .intake()
                 .handle()
-                .publish(StatusEvent::Published(status)),
+                .publish(StatusEvent::Published(Box::new(status))),
             StatusIntakeAdmission::Enqueued
         );
         self.execution
@@ -2203,14 +2196,14 @@ fn covered_frame(
     generation: u64,
     fact: CoveredStatusStreamFact,
 ) -> ObservationIntakeEntry {
-    ObservationIntakeEntry::Frame(ObservationFrame::Covered {
+    ObservationIntakeEntry::Frame(Box::new(ObservationFrame::Covered {
         context,
         generation,
         event: CoveredStatusStreamEvent {
             fact,
             source_revision: None,
         },
-    })
+    }))
 }
 
 #[test]
@@ -3573,11 +3566,11 @@ fn a_create_payload_lives_until_its_exact_acknowledgement_and_never_after() {
             operation,
             OperationKind::CreateTask,
             OperationOutcome::Accepted,
-            AckPayload::Create(CreateTaskReceipt::new(
+            AckPayload::Create(Box::new(CreateTaskReceipt::new(
                 leaf_identity,
                 Vec::new(),
                 TaskStatus::created(leaf_identity),
-            )),
+            ))),
         ));
     assert!(matches!(late, Err(TaskExecutionError::UnknownOperation)));
     assert!(
@@ -3625,11 +3618,11 @@ fn a_create_that_fails_closed_drops_its_payload_and_a_late_answer_cannot_revive_
             operation,
             OperationKind::CreateTask,
             OperationOutcome::Accepted,
-            AckPayload::Create(CreateTaskReceipt::new(
+            AckPayload::Create(Box::new(CreateTaskReceipt::new(
                 leaf_identity,
                 Vec::new(),
                 TaskStatus::created(leaf_identity),
-            )),
+            ))),
         ));
     assert!(matches!(late, Err(TaskExecutionError::UnknownOperation)));
     assert!(
@@ -4098,11 +4091,11 @@ fn production_close_reducer_explores_authorized_unknown_receiver_interleavings()
                             a.operation_id(),
                             OperationKind::CreateTask,
                             OperationOutcome::Accepted,
-                            AckPayload::Create(CreateTaskReceipt::new(
+                            AckPayload::Create(Box::new(CreateTaskReceipt::new(
                                 closed,
                                 Vec::new(),
                                 TaskStatus::created(closed),
-                            )),
+                            ))),
                         ))
                         .unwrap_or_else(|error| panic!("{trace:?}: Accepted: {error}"));
                 }
@@ -4112,7 +4105,7 @@ fn production_close_reducer_explores_authorized_unknown_receiver_interleavings()
                             .execution
                             .intake()
                             .handle()
-                            .publish(StatusEvent::Published(installed.clone()));
+                            .publish(StatusEvent::Published(Box::new(installed.clone())));
                         harness
                             .execution
                             .apply_status(64)
@@ -5400,7 +5393,9 @@ fn a_status_callback_only_enqueues_and_wakes_one_serial_runner() {
     let handle = intake.handle();
 
     assert_eq!(
-        handle.publish(StatusEvent::Published(TaskStatus::created(identity))),
+        handle.publish(StatusEvent::Published(Box::new(TaskStatus::created(
+            identity
+        )))),
         StatusIntakeAdmission::Enqueued
     );
     assert_eq!(intake.queued(), 1);
@@ -5426,9 +5421,13 @@ fn intake_overflow_is_reported_as_observation_loss_rather_than_a_silent_gap() {
         BackendProcessId::new_v7(),
     );
     let handle = intake.handle();
-    handle.publish(StatusEvent::Published(TaskStatus::created(identity)));
+    handle.publish(StatusEvent::Published(Box::new(TaskStatus::created(
+        identity,
+    ))));
     assert_eq!(
-        handle.publish(StatusEvent::Published(TaskStatus::created(identity))),
+        handle.publish(StatusEvent::Published(Box::new(TaskStatus::created(
+            identity
+        )))),
         StatusIntakeAdmission::Overflowed
     );
 
@@ -5461,7 +5460,7 @@ fn intake_is_applied_by_the_serial_runner_not_the_callback() {
         .execution
         .intake()
         .handle()
-        .publish(StatusEvent::Published(status));
+        .publish(StatusEvent::Published(Box::new(status)));
     assert_eq!(harness.wake.count(), 1);
     assert_eq!(
         harness
@@ -5819,11 +5818,11 @@ fn accepted_create_ack(intent: &OperationIntent) -> OperationAcknowledgement {
         intent.operation_id(),
         OperationKind::CreateTask,
         OperationOutcome::Accepted,
-        AckPayload::Create(CreateTaskReceipt::new(
+        AckPayload::Create(Box::new(CreateTaskReceipt::new(
             request.identity(),
             Vec::new(),
             TaskStatus::created(request.identity()),
-        )),
+        ))),
     )
 }
 
@@ -6249,12 +6248,16 @@ fn a_turn_replaces_every_established_subscription_after_local_observation_loss()
 
     for _ in 0..64 {
         assert_eq!(
-            status_handle.publish(StatusEvent::Published(TaskStatus::created(identity))),
+            status_handle.publish(StatusEvent::Published(Box::new(TaskStatus::created(
+                identity
+            )))),
             StatusIntakeAdmission::Enqueued
         );
     }
     assert_eq!(
-        status_handle.publish(StatusEvent::Published(TaskStatus::created(identity))),
+        status_handle.publish(StatusEvent::Published(Box::new(TaskStatus::created(
+            identity
+        )))),
         StatusIntakeAdmission::Overflowed
     );
 
@@ -6519,7 +6522,7 @@ fn a_status_several_versions_ahead_is_adopted_rather_than_called_an_illegal_jump
             .execution
             .intake()
             .handle()
-            .publish(StatusEvent::Published(status));
+            .publish(StatusEvent::Published(Box::new(status)));
     };
 
     // Held at PLANNED first, so there is something for the jump to be judged
@@ -6624,7 +6627,6 @@ fn feedback_declaration(
             plan_node_id: SCAN_NODE,
             binding_id: 7,
             data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
         }],
         wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
     }])
@@ -7663,7 +7665,7 @@ pub(crate) fn manifest_normal_release_ack_regression_fixture() -> (
             TaskOutputFacts::new(false),
         )
         .expect("a valid running task");
-        status.publish(StatusEvent::Published(running));
+        status.publish(StatusEvent::Published(Box::new(running)));
     }
     round.turn().expect("every task is running");
     let finished = TaskStatus::try_new(
@@ -7674,7 +7676,7 @@ pub(crate) fn manifest_normal_release_ack_regression_fixture() -> (
         TaskOutputFacts::new(true),
     )
     .expect("a valid finished root");
-    status.publish(StatusEvent::Published(finished));
+    status.publish(StatusEvent::Published(Box::new(finished)));
     round.turn().expect("the root finish is observed");
     sink.take();
     round
@@ -7710,7 +7712,7 @@ pub(crate) fn manifest_normal_release_ack_regression_fixture() -> (
             TaskOutputFacts::new(false),
         )
         .expect("a valid canceling upstream task");
-        status.publish(StatusEvent::Published(canceling));
+        status.publish(StatusEvent::Published(Box::new(canceling)));
         let canceled = TaskStatus::try_new(
             identity,
             TaskStatusVersion::new(4).expect("v4"),
@@ -7721,7 +7723,7 @@ pub(crate) fn manifest_normal_release_ack_regression_fixture() -> (
             TaskOutputFacts::new(false),
         )
         .expect("a valid canceled upstream task");
-        status.publish(StatusEvent::Published(canceled));
+        status.publish(StatusEvent::Published(Box::new(canceled)));
     }
 
     let mut releases = Vec::new();
@@ -7867,7 +7869,7 @@ fn result_pump_gate_accepts_installed_terminal_root_before_create_ack() {
     )
     .expect("a valid finished status");
     assert_eq!(
-        status.publish(StatusEvent::Published(finished)),
+        status.publish(StatusEvent::Published(Box::new(finished))),
         StatusIntakeAdmission::Enqueued
     );
     round
@@ -7920,7 +7922,7 @@ fn installed_status_proves_root_ownership_before_lost_create_ack() {
     )
     .expect("the Worker installed the root");
     assert_eq!(
-        status.publish(StatusEvent::Published(installed)),
+        status.publish(StatusEvent::Published(Box::new(installed))),
         StatusIntakeAdmission::Enqueued
     );
     round
@@ -7967,7 +7969,7 @@ fn root_pending_failure_refines_at_the_same_status_version() {
     );
     let root = round.root_task();
     assert_eq!(
-        status.publish(StatusEvent::Published(
+        status.publish(StatusEvent::Published(Box::new(
             TaskStatus::try_new_with_installed(
                 root,
                 TaskStatusVersion::new(2).expect("v2"),
@@ -7977,7 +7979,7 @@ fn root_pending_failure_refines_at_the_same_status_version() {
                 true,
             )
             .expect("an installed root status"),
-        )),
+        ))),
         StatusIntakeAdmission::Enqueued
     );
     round.turn().expect("the root installation is observed");
@@ -7992,7 +7994,7 @@ fn root_pending_failure_refines_at_the_same_status_version() {
     )
     .expect("a valid derived terminal");
     assert_eq!(
-        status.publish(StatusEvent::Published(root_derived)),
+        status.publish(StatusEvent::Published(Box::new(root_derived))),
         StatusIntakeAdmission::Enqueued
     );
     round
@@ -8032,7 +8034,7 @@ fn root_pending_failure_refines_at_the_same_status_version() {
     )
     .expect("a valid originating failure");
     assert_eq!(
-        status.publish(StatusEvent::Published(origin_failed)),
+        status.publish(StatusEvent::Published(Box::new(origin_failed))),
         StatusIntakeAdmission::Enqueued
     );
     round
@@ -8076,7 +8078,7 @@ fn finished_root_projection_is_refined_by_a_later_attempt_failure() {
         TaskOutputFacts::new(true),
     )
     .expect("a valid finished root");
-    status.publish(StatusEvent::Published(finished));
+    status.publish(StatusEvent::Published(Box::new(finished)));
     let derived = TaskStatus::try_new(
         derived_origin,
         TaskStatusVersion::new(3).expect("v3"),
@@ -8085,7 +8087,7 @@ fn finished_root_projection_is_refined_by_a_later_attempt_failure() {
         TaskOutputFacts::new(false),
     )
     .expect("a valid derived upstream terminal");
-    status.publish(StatusEvent::Published(derived));
+    status.publish(StatusEvent::Published(Box::new(derived)));
     round
         .turn()
         .expect("the Finished root is atomically published with a pending attempt failure");
@@ -8119,7 +8121,7 @@ fn finished_root_projection_is_refined_by_a_later_attempt_failure() {
         TaskOutputFacts::new(false),
     )
     .expect("a valid originating failure");
-    status.publish(StatusEvent::Published(origin_failed));
+    status.publish(StatusEvent::Published(Box::new(origin_failed)));
     round
         .turn()
         .expect("the same Finished root snapshot accepts attempt-failure refinement");
@@ -8177,16 +8179,6 @@ fn an_attempt_with_no_channel_and_no_vended_credential_installs_no_owner() {
 
     assert_eq!(round.installed_pumps(), 0);
     round.turn().expect("an attempt with no owners still turns");
-}
-
-fn now_unix_ms() -> u64 {
-    u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_millis(),
-    )
-    .expect("representable")
 }
 
 #[test]
@@ -8393,105 +8385,6 @@ fn an_advertised_version_that_is_no_longer_retained_stops_being_asked_for() {
     );
 }
 
-/// Answers one released credential advance with the epoch it carried.
-fn credential_ack(
-    execution: &mut QueryTaskExecution,
-    observer: &dyn crate::task_execution::round::AcknowledgementObserver,
-    intent: &OperationIntent,
-    outcome: OperationOutcome,
-) {
-    use novarocks_execution::task_execution::domain::DomainProgression;
-    use novarocks_execution::task_execution::operation::{
-        QueryContextDomainReceipt, QueryContextDomainUpdate, UpdateQueryContext,
-    };
-
-    let OperationIntent::UpdateQueryContext(request) = intent else {
-        unreachable!("a credential advance is a context update");
-    };
-    let UpdateQueryContext::AdvanceDomain(advance) = request.as_ref() else {
-        unreachable!("a rotation is an advance");
-    };
-    let QueryContextDomainUpdate::Credential(update) = advance.domain() else {
-        unreachable!("a rotation carries the credential domain");
-    };
-    let payload = if matches!(outcome, OperationOutcome::Accepted) {
-        AckPayload::Context(
-            QueryContextReceipt::new(advance.context(), QueryContextState::Active).with_domains(
-                vec![QueryContextDomainReceipt::Credential {
-                    lease_id: update.lease_id(),
-                    accepted_epoch: update.epoch(),
-                    progression: DomainProgression::Apply,
-                }],
-            ),
-        )
-    } else {
-        AckPayload::None
-    };
-    let ack = OperationAcknowledgement::new(
-        intent.operation_id(),
-        OperationKind::UpdateQueryContext,
-        outcome,
-        payload,
-    );
-    observer
-        .observe_acknowledgement(&ack)
-        .expect("the rotation owner settles its own advance");
-    execution
-        .acknowledge(&ack)
-        .expect("the state machine releases the permit");
-}
-
-/// Reports that transport lost the outcome of one credential advance.
-fn credential_unknown_ack(
-    execution: &mut QueryTaskExecution,
-    observer: &dyn crate::task_execution::round::AcknowledgementObserver,
-    intent: &OperationIntent,
-) {
-    let ack = OperationAcknowledgement::transport_unknown(
-        intent.operation_id(),
-        OperationKind::UpdateQueryContext,
-    );
-    observer
-        .observe_acknowledgement(&ack)
-        .expect("the rotation owner retains an unknown advance");
-    execution
-        .acknowledge(&ack)
-        .expect("the state machine releases the unknown transport slot");
-}
-
-fn credential_material(intent: &OperationIntent) -> &Arc<dyn ConfidentialContent> {
-    use novarocks_execution::task_execution::operation::{
-        QueryContextDomainUpdate, UpdateQueryContext,
-    };
-
-    let OperationIntent::UpdateQueryContext(request) = intent else {
-        panic!("a credential advance is a context update")
-    };
-    let UpdateQueryContext::AdvanceDomain(advance) = request.as_ref() else {
-        panic!("a rotation is an advance")
-    };
-    let QueryContextDomainUpdate::Credential(update) = advance.domain() else {
-        panic!("a rotation carries the credential domain")
-    };
-    update.material()
-}
-
-fn is_credential_advance(intent: &OperationIntent) -> bool {
-    use novarocks_execution::task_execution::operation::{
-        QueryContextDomainUpdate, UpdateQueryContext,
-    };
-
-    matches!(
-        intent,
-        OperationIntent::UpdateQueryContext(request)
-            if matches!(
-                request.as_ref(),
-                UpdateQueryContext::AdvanceDomain(advance)
-                    if matches!(advance.domain(), QueryContextDomainUpdate::Credential(_))
-            )
-    )
-}
-
 #[test]
 fn root_success_seal_stops_ordinary_pumps_in_its_own_turn() {
     struct RefusedPump;
@@ -8528,7 +8421,7 @@ fn root_success_seal_stops_ordinary_pumps_in_its_own_turn() {
         (3, TaskState::Flushing, false),
         (4, TaskState::Finished, true),
     ] {
-        status.publish(StatusEvent::Published(
+        status.publish(StatusEvent::Published(Box::new(
             TaskStatus::try_new(
                 root,
                 TaskStatusVersion::new(version).unwrap(),
@@ -8537,7 +8430,7 @@ fn root_success_seal_stops_ordinary_pumps_in_its_own_turn() {
                 TaskOutputFacts::new(output),
             )
             .unwrap(),
-        ));
+        )));
     }
     round.turn().unwrap();
     round.consume_root_result_packet(0, true).unwrap();
@@ -8718,7 +8611,7 @@ fn covered_exhaustion_respects_exact_root_evidence_before_and_after_eos() {
             (2, TaskState::Running, false),
             (3, TaskState::Flushing, false),
         ] {
-            status.publish(StatusEvent::Published(
+            status.publish(StatusEvent::Published(Box::new(
                 TaskStatus::try_new(
                     root,
                     TaskStatusVersion::new(version).unwrap(),
@@ -8727,7 +8620,7 @@ fn covered_exhaustion_respects_exact_root_evidence_before_and_after_eos() {
                     TaskOutputFacts::new(output),
                 )
                 .unwrap(),
-            ));
+            )));
         }
         round.turn().unwrap();
         if eos_first {
@@ -8746,7 +8639,7 @@ fn covered_exhaustion_respects_exact_root_evidence_before_and_after_eos() {
             Some(SubscriptionState::ConnectionLossExhausted),
             "EOS alone cannot replace missing root terminal evidence"
         );
-        status.publish(StatusEvent::Published(
+        status.publish(StatusEvent::Published(Box::new(
             TaskStatus::try_new(
                 root,
                 TaskStatusVersion::new(4).unwrap(),
@@ -8755,7 +8648,7 @@ fn covered_exhaustion_respects_exact_root_evidence_before_and_after_eos() {
                 TaskOutputFacts::new(true),
             )
             .unwrap(),
-        ));
+        )));
         round.turn().unwrap();
         if !eos_first {
             assert!(!round.execution().client_visible_completion());
@@ -8821,7 +8714,7 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
             (3, TaskState::Flushing, false),
             (4, TaskState::Finished, true),
         ] {
-            status.publish(StatusEvent::Published(
+            status.publish(StatusEvent::Published(Box::new(
                 TaskStatus::try_new(
                     root,
                     TaskStatusVersion::new(version).unwrap(),
@@ -8830,7 +8723,7 @@ fn covered_exhaustion_after_result_root_finished_does_not_wait_for_deep_leaf_or_
                     TaskOutputFacts::new(output),
                 )
                 .unwrap(),
-            ));
+            )));
         }
         round.turn().unwrap();
         assert!(round.execution().client_visible_completion());
@@ -8905,7 +8798,7 @@ fn covered_exhaustion_result_exception_preserves_accepted_failure_before_seal() 
     round.turn().unwrap();
     let root = round.root_task();
     round.consume_root_result_packet(0, true).unwrap();
-    status.publish(StatusEvent::Published(
+    status.publish(StatusEvent::Published(Box::new(
         TaskStatus::try_new(
             root,
             TaskStatusVersion::new(3).unwrap(),
@@ -8914,7 +8807,7 @@ fn covered_exhaustion_result_exception_preserves_accepted_failure_before_seal() 
             TaskOutputFacts::new(true),
         )
         .unwrap(),
-    ));
+    )));
     round.turn().unwrap();
     assert_eq!(
         round.classify_covered_subscription_state(leaf_context, SubscriptionState::BudgetExhausted),
@@ -8938,7 +8831,7 @@ fn covered_exhaustion_result_exception_preserves_accepted_failure_before_seal() 
         ),
         novarocks_execution::task_execution::SafeDetail::new("accepted deep-leaf failure").unwrap(),
     ));
-    status.publish(StatusEvent::Published(
+    status.publish(StatusEvent::Published(Box::new(
         TaskStatus::try_new(
             leaf_identity,
             TaskStatusVersion::new(2).unwrap(),
@@ -8947,7 +8840,7 @@ fn covered_exhaustion_result_exception_preserves_accepted_failure_before_seal() 
             TaskOutputFacts::new(false),
         )
         .unwrap(),
-    ));
+    )));
     round.turn().unwrap();
     assert_eq!(round.failure_cause(), Some(&failure));
     assert_eq!(
@@ -9001,7 +8894,7 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
             (3, TaskState::Flushing, false),
             (4, TaskState::Finished, true),
         ] {
-            status.publish(StatusEvent::Published(
+            status.publish(StatusEvent::Published(Box::new(
                 TaskStatus::try_new(
                     root,
                     TaskStatusVersion::new(version).unwrap(),
@@ -9010,7 +8903,7 @@ fn pending_success_seal_recovers_at_a_new_cut_or_rejects_at_the_original_deadlin
                     TaskOutputFacts::new(output),
                 )
                 .unwrap(),
-            ));
+            )));
         }
         round.turn().unwrap();
         round
@@ -9155,7 +9048,7 @@ pub(crate) fn manifest_terminal_regression_fixture() -> (
         (3, TaskState::Flushing, false),
         (4, TaskState::Finished, true),
     ] {
-        status.publish(StatusEvent::Published(
+        status.publish(StatusEvent::Published(Box::new(
             TaskStatus::try_new(
                 root,
                 TaskStatusVersion::new(version).unwrap(),
@@ -9164,7 +9057,7 @@ pub(crate) fn manifest_terminal_regression_fixture() -> (
                 TaskOutputFacts::new(output),
             )
             .unwrap(),
-        ));
+        )));
     }
     round.turn().unwrap();
     round.consume_root_result_packet(0, true).unwrap();
@@ -9515,11 +9408,11 @@ fn accepted_preparing_tasks_retain_deployment_window_after_rpc_settlement() {
                             intent.operation_id(),
                             OperationKind::CreateTask,
                             OperationOutcome::Accepted,
-                            AckPayload::Create(CreateTaskReceipt::new(
+                            AckPayload::Create(Box::new(CreateTaskReceipt::new(
                                 identity,
                                 Vec::new(),
                                 TaskStatus::created(identity),
-                            )),
+                            ))),
                         ))
                         .unwrap();
                     if identity.backend_process_id()
@@ -9664,11 +9557,11 @@ fn preparation_failure_in_create_ack_freezes_admission_before_any_stream_repeat(
                 intent.operation_id(),
                 OperationKind::CreateTask,
                 OperationOutcome::Accepted,
-                AckPayload::Create(CreateTaskReceipt::new(
+                AckPayload::Create(Box::new(CreateTaskReceipt::new(
                     request.identity(),
                     Vec::new(),
                     status,
-                )),
+                ))),
             ))
             .unwrap();
         assert_eq!(
@@ -9727,7 +9620,7 @@ pub(crate) fn covered_loopback_recovery_round() -> (
             (3, TaskState::Flushing, false),
             (4, TaskState::Finished, true),
         ] {
-            status.publish(StatusEvent::Published(
+            status.publish(StatusEvent::Published(Box::new(
                 TaskStatus::try_new(
                     identity,
                     TaskStatusVersion::new(version).unwrap(),
@@ -9736,7 +9629,7 @@ pub(crate) fn covered_loopback_recovery_round() -> (
                     TaskOutputFacts::new(output),
                 )
                 .unwrap(),
-            ));
+            )));
         }
     }
     round.turn().unwrap();
@@ -9781,7 +9674,7 @@ fn revoked_result_control_uses_one_deadline_even_without_eos_or_after_root_finis
                 (3, TaskState::Flushing, false),
                 (4, TaskState::Finished, true),
             ] {
-                status.publish(StatusEvent::Published(
+                status.publish(StatusEvent::Published(Box::new(
                     TaskStatus::try_new(
                         root,
                         TaskStatusVersion::new(version).unwrap(),
@@ -9790,7 +9683,7 @@ fn revoked_result_control_uses_one_deadline_even_without_eos_or_after_root_finis
                         TaskOutputFacts::new(output),
                     )
                     .unwrap(),
-                ));
+                )));
             }
             round.turn().unwrap();
         }
@@ -9873,7 +9766,7 @@ fn revoked_result_originator_fact_wins_and_success_seal_is_never_allowed() {
         (3, TaskState::Failing),
         (4, TaskState::Failed),
     ] {
-        status.publish(StatusEvent::Published(
+        status.publish(StatusEvent::Published(Box::new(
             TaskStatus::try_new(
                 child,
                 TaskStatusVersion::new(version).unwrap(),
@@ -9882,7 +9775,7 @@ fn revoked_result_originator_fact_wins_and_success_seal_is_never_allowed() {
                 TaskOutputFacts::new(false),
             )
             .unwrap(),
-        ));
+        )));
     }
     round.turn().unwrap();
     assert_eq!(round.failure_cause(), Some(&failure));
@@ -9915,7 +9808,7 @@ pub(crate) fn synchronous_root_control_round() -> (
     }
     round.turn().unwrap();
     let root = round.root_task();
-    status.publish(StatusEvent::Published(
+    status.publish(StatusEvent::Published(Box::new(
         TaskStatus::try_new(
             root,
             TaskStatusVersion::new(2).unwrap(),
@@ -9924,7 +9817,7 @@ pub(crate) fn synchronous_root_control_round() -> (
             TaskOutputFacts::new(false),
         )
         .unwrap(),
-    ));
+    )));
     round.turn().unwrap();
     assert!(round.result_pump_ready());
     assert!(!round.execution().root_end_of_stream_observed());
@@ -10092,7 +9985,7 @@ pub(crate) fn manifest_originating_failure_observation_round() -> TaskRoundForTe
     }
     round.turn().unwrap();
     let root = round.root_task();
-    status.publish(StatusEvent::Published(
+    status.publish(StatusEvent::Published(Box::new(
         TaskStatus::try_new_with_installed(
             root, TaskStatusVersion::new(2).unwrap(), TaskState::Failing,
             Some(TerminationDetail::Failed(novarocks_execution_contract::TaskFailure::new_in_phase(
@@ -10103,7 +9996,7 @@ pub(crate) fn manifest_originating_failure_observation_round() -> TaskRoundForTe
             TaskOutputFacts::new(false),
             false,
         ).unwrap(),
-    ));
+    )));
     round
 }
 

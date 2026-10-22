@@ -46,27 +46,6 @@ pub struct RefreshRequest {
 #[derive(Clone, Debug)]
 pub struct RefreshPlan {
     pub contract: RefreshPlanContract,
-    pub backend_plan: BackendRefreshPlan,
-}
-
-#[derive(Clone, Debug)]
-pub enum BackendRefreshPlan {
-    StarRocks(StarRocksTableRefreshPlan),
-    Iceberg(IcebergRefreshPlan),
-}
-
-#[derive(Clone, Debug)]
-pub struct StarRocksTableRefreshPlan {
-    pub stmt: MvRefreshRequest,
-    pub current_catalog: Option<String>,
-    pub current_database: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct IcebergRefreshPlan {
-    pub stmt: MvRefreshRequest,
-    pub current_catalog: Option<String>,
-    pub current_database: String,
 }
 
 #[derive(Clone, Debug)]
@@ -166,18 +145,12 @@ pub struct MvListRow {
 pub enum RefreshErrorKind {
     UserError,
     PreCommitFailed,
-    CommitFailedKnownUncommitted,
-    CommitFailedKnownCommitted,
-    CommitUnknown,
-    MetadataFinalizeFailed,
 }
 
+#[cfg(test)]
 impl RefreshErrorKind {
     pub fn should_rollback_after_commit(self) -> bool {
-        matches!(
-            self,
-            Self::UserError | Self::PreCommitFailed | Self::CommitFailedKnownUncommitted
-        )
+        matches!(self, Self::UserError | Self::PreCommitFailed)
     }
 }
 
@@ -224,22 +197,6 @@ impl RefreshError {
 
     pub fn pre_commit(message: impl Into<String>) -> Self {
         Self::new(RefreshErrorKind::PreCommitFailed, message)
-    }
-
-    pub fn commit_known_uncommitted(message: impl Into<String>) -> Self {
-        Self::new(RefreshErrorKind::CommitFailedKnownUncommitted, message)
-    }
-
-    pub fn commit_known_committed_finalize_failed(message: impl Into<String>) -> Self {
-        Self::new(RefreshErrorKind::CommitFailedKnownCommitted, message)
-    }
-
-    pub fn commit_unknown(message: impl Into<String>) -> Self {
-        Self::new(RefreshErrorKind::CommitUnknown, message)
-    }
-
-    pub fn metadata_finalize(message: impl Into<String>) -> Self {
-        Self::new(RefreshErrorKind::MetadataFinalizeFailed, message)
     }
 }
 
@@ -293,21 +250,11 @@ mod tests {
     use crate::mv::domain::model::MvStorageEngine;
 
     #[test]
-    fn refresh_error_kind_drives_commit_rollback_policy() {
-        assert!(RefreshErrorKind::UserError.should_rollback_after_commit());
-        assert!(RefreshErrorKind::PreCommitFailed.should_rollback_after_commit());
-        assert!(RefreshErrorKind::CommitFailedKnownUncommitted.should_rollback_after_commit());
-        assert!(!RefreshErrorKind::CommitFailedKnownCommitted.should_rollback_after_commit());
-        assert!(!RefreshErrorKind::CommitUnknown.should_rollback_after_commit());
-        assert!(!RefreshErrorKind::MetadataFinalizeFailed.should_rollback_after_commit());
-    }
-
-    #[test]
     fn refresh_error_formats_message_with_kind() {
-        let error = RefreshError::new(RefreshErrorKind::CommitUnknown, "commit state unknown");
+        let error = RefreshError::new(RefreshErrorKind::PreCommitFailed, "refresh planning failed");
 
-        assert_eq!(error.kind, RefreshErrorKind::CommitUnknown);
-        assert_eq!(error.to_string(), "commit state unknown");
+        assert_eq!(error.kind, RefreshErrorKind::PreCommitFailed);
+        assert_eq!(error.to_string(), "refresh planning failed");
     }
 
     #[test]
@@ -360,7 +307,6 @@ mod tests {
                 .starts_with("[sql.analyze.unavailable_implementation] ")
         );
         assert_eq!(failure.kind, RefreshErrorKind::UserError);
-        assert!(failure.kind.should_rollback_after_commit());
         assert_eq!(failure.compile_control_error(), None);
 
         let ordinary = SqlCompileError::Analyze(AnalyzeError::internal(
@@ -389,7 +335,6 @@ mod tests {
             assert_eq!(error.compile_control_error(), Some(control));
             assert_eq!(error.unavailable_implementation(), None);
             assert_eq!(error.kind, RefreshErrorKind::UserError);
-            assert!(error.kind.should_rollback_after_commit());
             assert_eq!(
                 RefreshError::user(error.message.clone()).compile_control_error(),
                 None

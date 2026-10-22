@@ -72,13 +72,10 @@ pub fn connector_query_binding_from_materialization(
                 snapshot_id,
                 QueryScanMaterialization {
                     table: materialization.read_table.clone(),
-                    catalog_handle: materialization.catalog_handle.clone(),
-                    schema: materialization.read_schema.clone(),
                     selector: novarocks_spi::connector::ConnectorReadSelector::SnapshotId(
                         snapshot_id,
                     ),
                     mv_partition_selection: None,
-                    statistics_pin: materialization.statistics_pin.clone(),
                     planning_lease: materialization.planning_lease.clone(),
                 },
             )
@@ -91,11 +88,8 @@ pub fn connector_query_binding_from_materialization(
         source_metadata: Some(materialization.source_metadata),
         scan_materialization: Some(QueryScanMaterialization {
             table: materialization.read_table,
-            catalog_handle: materialization.catalog_handle,
-            schema: materialization.read_schema,
             selector: materialization.read_selector,
             mv_partition_selection: None,
-            statistics_pin: materialization.statistics_pin,
             planning_lease: materialization.planning_lease,
         }),
         mv_target_read: None,
@@ -712,11 +706,8 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
             source_metadata: None,
             scan_materialization: Some(QueryScanMaterialization {
                 table: materialization.read_table,
-                catalog_handle: materialization.catalog_handle,
-                schema: materialization.read_schema,
                 selector: materialization.read_selector,
                 mv_partition_selection: None,
-                statistics_pin: materialization.statistics_pin,
                 planning_lease: materialization.planning_lease,
             }),
             mv_target_read: None,

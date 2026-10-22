@@ -174,10 +174,6 @@ impl<T> InternalResultValue<T> {
     pub(crate) fn value(&self) -> &T {
         &self.value
     }
-    pub(crate) fn window(&self) -> &ResultWindowAlias {
-        &self.window
-    }
-
     pub(crate) fn try_transform<R, E>(
         self,
         transform: impl FnOnce(T, &ResultWindowAlias) -> Result<R, E>,
@@ -313,6 +309,7 @@ impl<T> InternalResultCpuJob<T> {
             .map(Arc::clone)
     }
 
+    #[cfg(test)]
     pub(crate) async fn join_closed(&mut self) -> Result<(), &tokio::task::JoinError> {
         std::future::poll_fn(|cx| self.poll_closed(cx).map(|_| ())).await;
         self.closed

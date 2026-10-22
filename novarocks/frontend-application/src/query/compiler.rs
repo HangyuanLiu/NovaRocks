@@ -658,6 +658,10 @@ impl FrontendQueryCompiler {
     /// -- the sealed path reached the same catalogs synchronously from the
     /// same threads -- and leaves making preparation itself asynchronous as
     /// its own change.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The completion path receives distinct frozen read facts and live owner ports; bundling them would duplicate the operation contract."
+    )]
     fn complete_distributed_read(
         &self,
         purpose: FrontendQueryPurpose,

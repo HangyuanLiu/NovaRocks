@@ -24,9 +24,9 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
 enum CustodyCase {
-    QueuedCallbackDrop,
-    ReturnedOutputDrop,
-    OriginalPanicDrop,
+    QueuedCallback,
+    ReturnedOutput,
+    OriginalPanic,
 }
 
 struct HeldSuccessor {
@@ -52,7 +52,7 @@ impl Drop for ThrowsActualSuccessor {
 }
 
 fn observe_original_custody(case: CustodyCase) {
-    let queued = matches!(case, CustodyCase::QueuedCallbackDrop);
+    let queued = matches!(case, CustodyCase::QueuedCallback);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .max_blocking_threads(1)
@@ -101,7 +101,7 @@ fn observe_original_custody(case: CustodyCase) {
             invoked.fetch_add(1, Ordering::AcqRel);
             let _ = callback_started.send(());
             let _ = callback_held.recv();
-            if matches!(case, CustodyCase::OriginalPanicDrop) {
+            if matches!(case, CustodyCase::OriginalPanic) {
                 std::panic::panic_any(throws);
             }
             throws
@@ -232,15 +232,15 @@ fn observe_original_custody(case: CustodyCase) {
 
 #[test]
 fn aborted_queued_callback_drop_panic_keeps_its_actual_successor_backing() {
-    observe_original_custody(CustodyCase::QueuedCallbackDrop);
+    observe_original_custody(CustodyCase::QueuedCallback);
 }
 
 #[test]
 fn aborted_returned_output_drop_panic_keeps_its_actual_successor_backing() {
-    observe_original_custody(CustodyCase::ReturnedOutputDrop);
+    observe_original_custody(CustodyCase::ReturnedOutput);
 }
 
 #[test]
 fn aborted_original_panic_payload_drop_keeps_its_actual_successor_backing() {
-    observe_original_custody(CustodyCase::OriginalPanicDrop);
+    observe_original_custody(CustodyCase::OriginalPanic);
 }

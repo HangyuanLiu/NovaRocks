@@ -547,11 +547,8 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
                         Bytes::from_static(b"orders"),
                     )
                     .unwrap(),
-                    catalog_handle: catalog.clone(),
-                    schema: schema.clone(),
                     selector: ConnectorReadSelector::Current,
                     mv_partition_selection: None,
-                    statistics_pin: None,
                     planning_lease: lease.clone(),
                 });
                 Ok(value)
@@ -759,13 +756,8 @@ fn frozen_mv_target_routing_preserves_exact_provider_facts_and_generic_history()
             Bytes::from_static(b"orders"),
         )
         .unwrap(),
-        catalog_handle: catalog,
-        schema: Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Int64, false),
-        ])),
         selector: ConnectorReadSelector::SnapshotId(41),
         mv_partition_selection: None,
-        statistics_pin: None,
         planning_lease: host.acquire_current(&instance).unwrap(),
     };
     let session =

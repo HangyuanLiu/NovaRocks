@@ -31,6 +31,8 @@ pub type StatementNominationHook = Arc<
     dyn Fn(&StatementInputNomination, &StatementWorkNomination) -> Result<(), String> + Send + Sync,
 >;
 pub type ProviderCloseHook = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+type FrontendProviderBindHook =
+    Arc<dyn Fn(&SessionScope) -> Result<FrontendProviderTestBindings, String> + Send + Sync>;
 
 /// These callbacks are fixed Server composition, never declaration-supplied code.
 #[derive(Default)]
@@ -45,9 +47,7 @@ pub struct FrontendProviderTestBindings {
 #[derive(Clone)]
 pub struct FrontendTestSessionConfig {
     prepared: PreparedRoleSession,
-    provider_bind: Option<
-        Arc<dyn Fn(&SessionScope) -> Result<FrontendProviderTestBindings, String> + Send + Sync>,
-    >,
+    provider_bind: Option<FrontendProviderBindHook>,
 }
 impl FrontendTestSessionConfig {
     pub fn new(prepared: PreparedRoleSession) -> Self {
@@ -56,12 +56,7 @@ impl FrontendTestSessionConfig {
             provider_bind: None,
         }
     }
-    pub fn with_provider_bind(
-        mut self,
-        bind: Arc<
-            dyn Fn(&SessionScope) -> Result<FrontendProviderTestBindings, String> + Send + Sync,
-        >,
-    ) -> Self {
+    pub fn with_provider_bind(mut self, bind: FrontendProviderBindHook) -> Self {
         self.provider_bind = Some(bind);
         self
     }
@@ -122,6 +117,10 @@ impl FrontendTestSessionConfig {
         {
             return Err("root observation requires its explicit build capability".into());
         }
+        #[cfg(any(
+                feature = "mem-1-m07-closing-pressure",
+                feature = "mem-1-m07-exact-mysql-write"
+            ))]
         let mysql_fixture = novarocks_mysql_adapter::test_fixture_authorization::MysqlFixtureAuthorization::from_grants(scope.grants_for("mysql-fixture")).map_err(|error| error.to_string())?;
         let provider = match &self.provider_bind {
             Some(bind) => bind(scope)?,
@@ -147,6 +146,10 @@ impl FrontendTestSessionConfig {
             observation,
             statement,
             result_handoff,
+            #[cfg(any(
+                feature = "mem-1-m07-closing-pressure",
+                feature = "mem-1-m07-exact-mysql-write"
+            ))]
             mysql_fixture: std::sync::Mutex::new(mysql_fixture),
             provider,
             #[cfg(feature = "mem-1-m07-hms-listing-observe")]
@@ -221,6 +224,10 @@ pub(crate) struct FrontendTestSession {
         Option<Arc<novarocks_native_adapter::test_observation_controls::NativeObservationControls>>,
     pub(crate) statement: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
     pub(crate) result_handoff: Option<Arc<result_handoff::ResultHandoffControl>>,
+    #[cfg(any(
+        feature = "mem-1-m07-closing-pressure",
+        feature = "mem-1-m07-exact-mysql-write"
+    ))]
     mysql_fixture: std::sync::Mutex<
         Option<novarocks_mysql_adapter::test_fixture_authorization::MysqlFixtureAuthorization>,
     >,
@@ -232,6 +239,10 @@ pub(crate) struct FrontendTestSession {
     failures: Vec<String>,
 }
 impl FrontendTestSession {
+    #[cfg(any(
+        feature = "mem-1-m07-closing-pressure",
+        feature = "mem-1-m07-exact-mysql-write"
+    ))]
     pub(crate) fn take_mysql_fixture(
         &self,
     ) -> Result<
@@ -244,6 +255,7 @@ impl FrontendTestSession {
             .map_err(|_| "MySQL fixture ownership lock failed".into())
     }
 
+    #[cfg(any(test, feature = "mem-1-m07-root-observation"))]
     pub(crate) fn scope(&self) -> &SessionScope {
         self.role.scope()
     }

@@ -1358,10 +1358,9 @@ pub(crate) mod tests {
     use novarocks_proto_codec::connector_common::encode_connector_payload_message;
     use novarocks_spi::connector::ConnectorControlWriteBinding;
     use novarocks_spi::connector::document_storage::{
-        ConnectorDocumentFormat, ConnectorDocumentManagementAdmissionRequest,
-        ConnectorDocumentManagementOperation, ConnectorDocumentPublicationDeclaration,
-        ConnectorDocumentStorageBinding, ConnectorDocumentStorageManagement,
-        KeyedPublicationIntent,
+        ConnectorDocumentManagementAdmissionRequest, ConnectorDocumentManagementOperation,
+        ConnectorDocumentPublicationDeclaration, ConnectorDocumentStorageBinding,
+        ConnectorDocumentStorageManagement, KeyedPublicationIntent,
     };
     use novarocks_spi::connector::write_stack::{
         ConnectorCommitFragment, ConnectorWriterHandle, MAX_CONNECTOR_UNIQUE_WRITER_HANDLE_BYTES,

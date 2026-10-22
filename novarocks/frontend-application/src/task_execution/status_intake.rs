@@ -28,25 +28,27 @@
 //! counterfeit a gap in the accepted observation stream.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use novarocks_execution::task_execution::{
-    QueryContextConvergenceReceipt, QueryContextRef, QuiesceQueryContextReceipt,
-    TaskConvergenceReceipt, TaskIdentity, TaskStatus,
-};
+#[cfg(test)]
+use super::clock::ProcessMonotonicClock;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+
+use novarocks_execution::task_execution::{QueryContextRef, TaskIdentity, TaskStatus};
 use novarocks_query_application::coordination::{
     AcceptedRootControlPort, AcceptedRootControlRequest, MonotonicInstant,
 };
 
-use super::clock::{ProcessMonotonicClock, TaskProtocolClock};
+use super::clock::TaskProtocolClock;
 
 /// One immutable observation the transport published.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatusEvent {
     /// A complete status snapshot of one task.
-    Published(TaskStatus),
+    Published(Box<TaskStatus>),
     /// One task's retained record was reaped.
     Gone(TaskIdentity),
 }
@@ -134,14 +136,17 @@ impl StatusIntakeWake for NotifyWake {
 /// It exists so a test can assert that a callback woke the runner exactly
 /// once per publish without waiting on a task scheduler.
 #[derive(Debug, Default)]
+#[cfg(test)]
 pub struct CountingWake(AtomicUsize);
 
+#[cfg(test)]
 impl CountingWake {
     pub fn count(&self) -> usize {
         self.0.load(Ordering::Acquire)
     }
 }
 
+#[cfg(test)]
 impl StatusIntakeWake for CountingWake {
     fn wake(&self) {
         self.0.fetch_add(1, Ordering::AcqRel);
@@ -283,16 +288,13 @@ impl StatusIntake {
         }
     }
 
+    #[cfg(test)]
     pub fn queued(&self) -> usize {
         self.inner
             .queue
             .lock()
             .expect("status intake queue")
             .status_count
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.inner.capacity
     }
 
     /// Claims the single serial runner slot.
@@ -321,6 +323,7 @@ pub struct StatusIntakeRunner<'a> {
 impl StatusIntakeRunner<'_> {
     /// Takes at most `max` queued snapshots and reports any observation-loss
     /// marker ordered before the next success-seal request.
+    #[cfg(test)]
     pub fn drain_statuses(&mut self, max: usize) -> (bool, Vec<StatusEvent>) {
         let mut queue = self.intake.inner.queue.lock().expect("status intake queue");
         let mut statuses = Vec::new();
@@ -378,9 +381,7 @@ impl Drop for StatusIntakeRunner<'_> {
     }
 }
 
-/// One complete frame of the single Context observation stream. The
-/// generation and watermark fields are source claims; only the serial owner
-/// may validate and apply them.
+/// One frame accepted from the single Context observation stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ObservationFrame {
     Covered {
@@ -388,23 +389,10 @@ pub(crate) enum ObservationFrame {
         generation: u64,
         event: novarocks_task_codec::operation::CoveredStatusStreamEvent,
     },
+    #[cfg(test)]
     Status(TaskStatus),
-    TaskConvergence(TaskConvergenceReceipt),
-    ContextConvergence(QueryContextConvergenceReceipt),
-    Quiesce(QuiesceQueryContextReceipt),
+    #[cfg(test)]
     Gone(TaskIdentity),
-    CatchUpComplete {
-        context: QueryContextRef,
-        generation: u64,
-        source_cut: u64,
-    },
-    Bookmark {
-        context: QueryContextRef,
-        generation: u64,
-        sequence: u64,
-        covered_prefix: u64,
-        source_cut: u64,
-    },
 }
 
 /// A frame that cannot fit in one pre-read slot is a protocol/budget error,
@@ -417,10 +405,10 @@ pub(crate) struct OversizedObservationFrame {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ObservationIntakeConfigError {
-    NoQueueCapacity,
-    NoPendingOrControlCapacity,
-    NoFrameCapacity,
-    NoControlByteCapacity,
+    Queue,
+    PendingOrControl,
+    Frame,
+    ControlBytes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -428,7 +416,7 @@ pub(crate) struct ObservationSubscriptionLimit;
 
 #[derive(Debug)]
 pub(crate) enum ObservationIntakeEntry {
-    Frame(ObservationFrame),
+    Frame(Box<ObservationFrame>),
     RootControl(AcceptedRootControlRequest),
     #[cfg(test)]
     TestSeal,
@@ -506,6 +494,7 @@ impl ObservationIntake {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         queue_capacity: usize,
         total_capacity: usize,
@@ -532,17 +521,17 @@ impl ObservationIntake {
         clock: Arc<dyn TaskProtocolClock>,
     ) -> Result<Self, ObservationIntakeConfigError> {
         if queue_capacity == 0 {
-            return Err(ObservationIntakeConfigError::NoQueueCapacity);
+            return Err(ObservationIntakeConfigError::Queue);
         }
         if total_capacity < queue_capacity.saturating_add(2) {
-            return Err(ObservationIntakeConfigError::NoPendingOrControlCapacity);
+            return Err(ObservationIntakeConfigError::PendingOrControl);
         }
         if max_frame_bytes == 0 {
-            return Err(ObservationIntakeConfigError::NoFrameCapacity);
+            return Err(ObservationIntakeConfigError::Frame);
         }
         let control_bytes = std::mem::size_of::<AcceptedRootControlRequest>().max(1);
         if total_bytes < max_frame_bytes.saturating_add(control_bytes) {
-            return Err(ObservationIntakeConfigError::NoControlByteCapacity);
+            return Err(ObservationIntakeConfigError::ControlBytes);
         }
         Ok(Self {
             inner: Arc::new(ObservationIntakeInner {
@@ -766,17 +755,15 @@ impl ObservationReadPermit {
                 }
                 _ => 0,
             },
+            #[cfg(test)]
             ObservationFrame::Status(status) => match status.termination() {
                 Some(novarocks_execution::task_execution::TerminationDetail::Failed(failure)) => {
                     failure.detail().as_str().len()
                 }
                 _ => 0,
             },
-            ObservationFrame::Quiesce(receipt) => receipt
-                .accepted_tasks()
-                .len()
-                .saturating_mul(std::mem::size_of::<TaskIdentity>()),
-            _ => 0,
+            #[cfg(test)]
+            ObservationFrame::Gone(_) => 0,
         };
         let charged_bytes = std::mem::size_of::<ObservationFrame>()
             .saturating_add(encoded_bytes.max(dynamic_bytes));
@@ -804,7 +791,7 @@ impl ObservationReadPermit {
         queue.data_bytes -= self.inner.max_frame_bytes - charged_bytes;
         queue.entries.push_back(RegisteredObservation {
             registered_at: self.inner.clock.now(),
-            entry: ObservationIntakeEntry::Frame(frame),
+            entry: ObservationIntakeEntry::Frame(Box::new(frame)),
             subscription: Some(self.subscription),
             pending,
             charged_bytes,
@@ -1133,15 +1120,19 @@ mod observation_tests {
         let mut runner = intake.try_enter().expect("one serial owner");
         let entries = runner.drain_ordered(3);
         assert!(matches!(
-            entries[0],
-            ObservationIntakeEntry::Frame(ObservationFrame::Status(_))
+            &entries[0],
+            ObservationIntakeEntry::Frame(frame)
+                if matches!(frame.as_ref(), ObservationFrame::Status(_))
         ));
         assert!(matches!(
-            entries[1],
-            ObservationIntakeEntry::Frame(ObservationFrame::Status(ref status))
-                if status.state() == TaskState::Failed
+            &entries[1],
+            ObservationIntakeEntry::Frame(frame)
+                if matches!(
+                    frame.as_ref(),
+                    ObservationFrame::Status(status) if status.state() == TaskState::Failed
+                )
         ));
-        assert!(matches!(entries[2], ObservationIntakeEntry::TestSeal));
+        assert!(matches!(&entries[2], ObservationIntakeEntry::TestSeal));
     }
 
     #[tokio::test]

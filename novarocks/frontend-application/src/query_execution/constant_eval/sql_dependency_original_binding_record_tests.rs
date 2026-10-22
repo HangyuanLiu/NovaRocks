@@ -22,8 +22,8 @@ use dependency_artifact_storage::{CaptureOutputDescriptor, SqlDependencyArtifact
 use novarocks_plan_codec::{
     host_projection_v2::AdmissionRefusal,
     physical_binding_v2::{
-        ArgumentTypeIds, BindingProjectionLimits, BindingSource, EncodedFunctionBindings,
-        FunctionBindingInput, ResultTypeIds, encode_function_bindings_with_host_in,
+        ArgumentTypeIds, BindingProjectionLimits, BindingSource, FunctionBindingInput,
+        ResultTypeIds, encode_function_bindings_with_host_in,
     },
     physical_type_v2::{EncodedTypeTable, TypeProjectionLimits, encode_type_table_sources},
 };

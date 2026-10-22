@@ -211,9 +211,8 @@ pub enum CapacityBound {
     EdgeOpenVersions { limit: u32 },
 }
 
+#[cfg(test)]
 impl CapacityBound {
-    /// Every capacity bound fails closed: there is no older or cheaper path to
-    /// degrade onto.
     pub const fn as_operation_outcome(self) -> OperationOutcome {
         OperationOutcome::ResourceExhausted
     }

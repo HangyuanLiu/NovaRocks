@@ -30,15 +30,17 @@ mod transport;
 pub(crate) use supervised_source::SupervisedSplitSource;
 
 pub(crate) use driver::{
-    AssignmentTarget, ScanNodeKey, SplitAssignmentDriver, SplitAssignmentDriverError,
-    SplitAssignmentStop, SplitSourceHandle,
+    AssignmentTarget, ScanNodeKey, SplitAssignmentDriverError, SplitAssignmentStop,
 };
+#[cfg(test)]
+pub(crate) use round::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
 pub(crate) use round::{
-    DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP, DEFAULT_PUMP_BATCH_SIZE, RoundSplitAssignment,
-    RoundSplitAssignmentStop, RoundSplitEnumeration, RoundSplitEnumerationRequest,
-    RoundSplitEnumerationResult, RoundSplitSource,
+    RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitEnumeration,
+    RoundSplitEnumerationRequest, RoundSplitEnumerationResult, RoundSplitSource,
 };
+#[cfg(test)]
+pub(crate) use transport::TaskUpdateTransportErrorKind;
 pub(crate) use transport::{
     AcceptedPlanNode, TaskUpdateOutcome, TaskUpdateTicket, TaskUpdateTransport,
-    TaskUpdateTransportError, TaskUpdateTransportErrorKind,
+    TaskUpdateTransportError,
 };

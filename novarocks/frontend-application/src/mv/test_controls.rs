@@ -71,7 +71,7 @@ enum Action {
     Rewrite {
         catalog: String,
         namespace: String,
-        query: Query,
+        query: Box<Query>,
         statement_run_token: String,
         directory: PathBuf,
     },
@@ -824,7 +824,7 @@ impl MvTestControls {
             };
             if catalog != Some(expected_catalog.as_str())
                 || namespace != expected_namespace
-                || query != expected_query
+                || query != expected_query.as_ref()
                 || &statement_target.run_token != statement_run_token
             {
                 continue;
@@ -1004,7 +1004,7 @@ fn parse_action(value: &serde_json::Value) -> Result<Action, String> {
         return Ok(Action::Rewrite {
             catalog: text("catalog")?.into(),
             namespace: text("namespace")?.into(),
-            query: query.clone(),
+            query: Box::new(query.clone()),
             statement_run_token: text("statement_run_token")?.into(),
             directory: directory()?,
         });
@@ -1584,7 +1584,7 @@ pub(crate) mod tests {
             .rewrite(
                 Some("ice"),
                 "sales",
-                &query,
+                query,
                 true,
                 Some(&target),
                 &cancellation.view(),

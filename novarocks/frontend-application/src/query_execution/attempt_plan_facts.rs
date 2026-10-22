@@ -34,13 +34,16 @@ pub(crate) struct PlanOutputColumn {
     pub(crate) ty: novarocks_type_contract::FunctionValueType,
 }
 
+#[cfg(test)]
 impl PlanOutputColumn {
     pub(crate) fn data_type(&self) -> &arrow::datatypes::DataType {
         self.ty.data_type()
     }
+
     pub(crate) fn nullable(&self) -> bool {
         self.ty.nullable()
     }
+
     pub(crate) fn logical_type(&self) -> novarocks_type_contract::ValueLogicalType {
         self.ty.logical_type()
     }

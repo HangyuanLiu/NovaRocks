@@ -233,34 +233,36 @@ fn sql_dependency_request_host_abort_actual_sql_requests_match_original_full_wir
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         let scope = task.owner.scope();
-        let mut held = None;
-        let mut callbacks = 0;
-        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
-        let mut admit =
-            |facts: &CallRequestProjectionFacts| -> Result<(), AdmissionRefusal<WorkError>> {
-                callbacks += 1;
-                stock(
-                    &mut held,
-                    &resources,
-                    &scope,
-                    facts.request_bytes_upper_bound,
-                )
-                .map_err(AdmissionRefusal::Host)
-            };
-        let token = prepare_call_requests_encode_with_host_in(
-            requests,
-            types,
-            ids,
-            pools,
-            SOURCE_ENVELOPE,
-            limits(),
-            &mut admit,
-            &mut work,
-        )
-        .unwrap();
-        let same = token.emit_with_host_in(&mut admit, &mut work).unwrap();
-        work.finish().unwrap();
-        drop(admit);
+        let (same, callbacks, held) = {
+            let mut held = None;
+            let mut callbacks = 0;
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+            let mut admit =
+                |facts: &CallRequestProjectionFacts| -> Result<(), AdmissionRefusal<WorkError>> {
+                    callbacks += 1;
+                    stock(
+                        &mut held,
+                        &resources,
+                        &scope,
+                        facts.request_bytes_upper_bound,
+                    )
+                    .map_err(AdmissionRefusal::Host)
+                };
+            let token = prepare_call_requests_encode_with_host_in(
+                requests,
+                types,
+                ids,
+                pools,
+                SOURCE_ENVELOPE,
+                limits(),
+                &mut admit,
+                &mut work,
+            )
+            .unwrap();
+            let same = token.emit_with_host_in(&mut admit, &mut work).unwrap();
+            work.finish().unwrap();
+            (same, callbacks, held)
+        };
         assert_eq!(same, original);
         assert!(callbacks > 1);
         assert!(resources.snapshot().data_reserved_bytes > 0);
@@ -493,9 +495,7 @@ fn sql_dependency_request_host_abort_foreign_controller_preserves_original_text_
                 &mut other_work,
             )
             .unwrap_err();
-        let ProjectionFailure::Codec(new) = new else {
-            panic!("controller mismatch is original codec error");
-        };
+        let ProjectionFailure::Codec(new) = new;
         assert_eq!(new.to_string(), old.to_string());
         assert_eq!(called, 0);
     })
@@ -533,9 +533,7 @@ fn sql_dependency_request_host_abort_invalid_type_id_keeps_original_codec_error(
         )
         .err()
         .unwrap();
-        let ProjectionFailure::Codec(new) = new else {
-            panic!("invalid type is original codec error");
-        };
+        let ProjectionFailure::Codec(new) = new;
         assert_eq!(new.to_string(), old.to_string());
         assert_eq!(old.to_string(), "request supplied value type ID is absent");
     })

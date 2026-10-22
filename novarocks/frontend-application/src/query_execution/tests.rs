@@ -17,7 +17,7 @@
 
 use crate::query_execution::contract::{DistributedQueryErrorKind, DistributedQueryIntent};
 use crate::query_execution::outcome::QueryOutcomeFactory;
-use crate::query_execution::statistics::{StatisticsExecutionMode, StatisticsExecutionPolicy};
+use crate::query_execution::statistics::StatisticsExecutionPolicy;
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationSource};
 
 #[test]
@@ -56,33 +56,18 @@ fn outcome_factory_rejects_intent_mismatch() {
 }
 
 #[test]
-fn durable_statistics_attempt_ignores_statement_cancellation_and_is_bounded() {
-    let policy = StatisticsExecutionPolicy::try_new(
-        StatisticsExecutionMode::BackgroundCollectionAttempt,
-        std::time::Duration::from_secs(30 * 60),
-    )
-    .expect("maximum durable policy");
-    assert!(!policy.mode().statement_cancellation_terminates_execution());
+fn statistics_attempt_timeout_must_be_positive() {
+    let policy = StatisticsExecutionPolicy::try_new(std::time::Duration::from_secs(30 * 60))
+        .expect("positive attempt timeout");
     assert_eq!(
         policy.attempt_timeout(),
         std::time::Duration::from_secs(30 * 60)
     );
     assert!(
-        StatisticsExecutionPolicy::try_new(
-            StatisticsExecutionMode::BackgroundCollectionAttempt,
-            std::time::Duration::from_secs(30 * 60 + 1),
-        )
-        .is_ok(),
+        StatisticsExecutionPolicy::try_new(std::time::Duration::from_secs(30 * 60 + 1)).is_ok(),
         "the shared LakePublicationRuntimePolicy, not this transport-neutral Core policy, owns the configured maximum"
     );
-    assert!(
-        StatisticsExecutionPolicy::try_new(
-            StatisticsExecutionMode::BackgroundCollectionAttempt,
-            std::time::Duration::ZERO,
-        )
-        .is_err()
-    );
-    assert!(StatisticsExecutionMode::SynchronousWait.statement_cancellation_terminates_execution());
+    assert!(StatisticsExecutionPolicy::try_new(std::time::Duration::ZERO).is_err());
 }
 
 #[test]

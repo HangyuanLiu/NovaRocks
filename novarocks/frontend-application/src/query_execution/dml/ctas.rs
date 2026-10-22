@@ -269,11 +269,6 @@ pub trait CtasPreparedCatalogAction: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub struct PreparedCtasCatalogAction {
-    pub input_digest: [u8; 32],
-    pub handle: Arc<dyn CtasPreparedCatalogAction>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CtasFailureKind {
     InvalidRequest,
@@ -498,14 +493,12 @@ pub struct PreparedStandardCtasTarget {
 }
 
 pub struct PreparedStandardCtasCatalogAction {
-    pub input_digest: [u8; 32],
     pub handle: Arc<dyn CtasPreparedCatalogAction>,
 }
 
 pub enum StandardCtasStageOutcome {
     Prepared {
         target: PreparedStandardCtasTarget,
-        receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
     },
     AppliedButUnusable {
         receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
@@ -516,7 +509,6 @@ pub enum StandardCtasStageOutcome {
     },
     CommitUnknown {
         failure: CtasFailure,
-        evidence: ExternalMutationEvidence,
     },
 }
 
@@ -528,19 +520,16 @@ pub struct PreparedStandardCtasWrite {
 
 pub enum StandardCtasPublishOutcome {
     Applied {
-        receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
         finalization: ExternalMutationFinalization,
     },
     NoOp {
-        receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
         finalization: ExternalMutationFinalization,
     },
     KnownUncommitted {
-        failure: CtasFailure,
+        failure: Box<CtasFailure>,
         cleanup: ExternalMutationFinalization,
     },
     CommitUnknown {
-        failure: CtasFailure,
         evidence: ExternalMutationEvidence,
     },
 }
@@ -550,11 +539,10 @@ pub enum StandardCtasPublishOutcome {
 /// It cannot represent a negative result as cleanup or another publication.
 pub enum StandardCtasPublicationAdjudicationOutcome {
     Published {
-        receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
         finalization: ExternalMutationFinalization,
     },
     CommitUnknown {
-        failure: CtasFailure,
+        failure: Box<CtasFailure>,
     },
 }
 
@@ -562,10 +550,6 @@ pub enum StandardCtasPublicationAdjudicationOutcome {
 /// separate outcome type prevents the retired authority carrier from leaking
 /// back into the crash-only CTAS frontier while legacy code is being removed.
 ///
-/// `CommitUnknown` is retained but is no longer reachable from the staged
-/// write: a staged write session seals its artifacts without touching the
-/// catalog, so until the publication runs there is nothing whose external
-/// outcome could be in doubt. A write that fails now says so.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StandardCtasWriteOutcome {
     Completed {
@@ -574,10 +558,6 @@ pub enum StandardCtasWriteOutcome {
     },
     KnownUncommitted {
         failure: CtasFailure,
-    },
-    CommitUnknown {
-        failure: CtasFailure,
-        evidence: ExternalMutationEvidence,
     },
 }
 
@@ -914,13 +894,13 @@ fn prepare_planned_ctas_connector_write(
 
 enum CoreCtasCatalogActionKind {
     StandardStage {
-        preflight: CoreStandardCtasTargetPreflight,
-        request: ConnectorStagedCreatePrepareRequest,
+        preflight: Box<CoreStandardCtasTargetPreflight>,
+        request: Box<ConnectorStagedCreatePrepareRequest>,
         target_slot: Arc<Mutex<Option<Arc<CoreStandardCtasTargetSession>>>>,
     },
     StandardPublish {
         target: Arc<CoreStandardCtasTargetSession>,
-        request: ConnectorStagedCreatePublishRequest,
+        request: Box<ConnectorStagedCreatePublishRequest>,
     },
 }
 
@@ -1400,19 +1380,6 @@ fn downcast_catalog_action(
         .ok_or_else(|| internal_failure("CTAS catalog action does not belong to the core engine"))
 }
 
-fn prepared_catalog_action(
-    input_digest: [u8; 32],
-    kind: CoreCtasCatalogActionKind,
-) -> PreparedCtasCatalogAction {
-    PreparedCtasCatalogAction {
-        input_digest,
-        handle: Arc::new(CoreCtasCatalogAction {
-            kind,
-            dispatched: AtomicBool::new(false),
-        }),
-    }
-}
-
 fn downcast_standard_target(
     target: &dyn CtasPreparedTarget,
 ) -> Result<&CoreStandardCtasTargetSession, CtasFailure> {
@@ -1439,52 +1406,6 @@ fn sha256(parts: &[&[u8]]) -> [u8; 32] {
         digest.update(part);
     }
     digest.finalize().into()
-}
-
-fn standard_stage_input_digest(request: &ConnectorStagedCreatePrepareRequest) -> [u8; 32] {
-    let policy = match request.policy {
-        CreatePolicy::FailIfExists => b"fail".as_slice(),
-        CreatePolicy::NoOpIfExists => b"noop".as_slice(),
-    };
-    let columns = request
-        .columns
-        .iter()
-        .map(|column| format!("{column:?}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let partitioning = request
-        .partitioning
-        .iter()
-        .map(|transform| format!("{transform:?}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let properties = request
-        .properties
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    sha256(&[
-        b"novarocks.standard-ctas-stage.v1",
-        &request.publication_id.to_bytes(),
-        request.table.instance_id.as_str().as_bytes(),
-        request.table.namespace.as_bytes(),
-        request.table.table.as_bytes(),
-        policy,
-        columns.as_bytes(),
-        partitioning.as_bytes(),
-        properties.as_bytes(),
-    ])
-}
-
-fn standard_publish_input_digest(request: &ConnectorStagedCreatePublishRequest) -> [u8; 32] {
-    sha256(&[
-        b"novarocks.standard-ctas-publish.v1",
-        &request.operation_id.to_bytes(),
-        &request.handle.digest(),
-        &request.write.digest(),
-        &request.write.row_count().to_be_bytes(),
-    ])
 }
 
 /// Turn one completed write session into the proof its publication needs.
@@ -1874,11 +1795,10 @@ impl CtasEngine for DmlExecutionKernel {
             source.connector_context.clone(),
         );
         Ok(PreparedStandardCtasCatalogAction {
-            input_digest: standard_stage_input_digest(&request),
             handle: Arc::new(CoreCtasCatalogAction {
                 kind: CoreCtasCatalogActionKind::StandardStage {
-                    preflight: source.preflight.clone(),
-                    request,
+                    preflight: Box::new(source.preflight.clone()),
+                    request: Box::new(request),
                     target_slot: Arc::clone(&source.target_session),
                 },
                 dispatched: AtomicBool::new(false),
@@ -1904,7 +1824,7 @@ impl CtasEngine for DmlExecutionKernel {
         action.begin_dispatch()?;
         match preflight
             .lease
-            .prepare(request.clone())
+            .prepare(request.as_ref().clone())
             .map_err(connector_failure)?
         {
             ConnectorStagedCreatePrepareOutcome::Prepared {
@@ -1951,7 +1871,6 @@ impl CtasEngine for DmlExecutionKernel {
                         facts: target.facts(),
                         handle: target,
                     },
-                    receipt,
                 })
             }
             ConnectorStagedCreatePrepareOutcome::Conflict { failure }
@@ -1960,10 +1879,9 @@ impl CtasEngine for DmlExecutionKernel {
                     failure: mutation_failure(failure),
                 })
             }
-            ConnectorStagedCreatePrepareOutcome::CommitUnknown { failure, evidence } => {
+            ConnectorStagedCreatePrepareOutcome::CommitUnknown { failure, .. } => {
                 Ok(StandardCtasStageOutcome::CommitUnknown {
                     failure: mutation_failure(failure),
-                    evidence,
                 })
             }
             ConnectorStagedCreatePrepareOutcome::AppliedButUnusable {
@@ -2134,7 +2052,6 @@ impl CtasEngine for DmlExecutionKernel {
         let target = downcast_standard_target(target)?;
         let request = target.prepare_publish(publication_id, write)?;
         Ok(PreparedStandardCtasCatalogAction {
-            input_digest: standard_publish_input_digest(&request),
             handle: Arc::new(CoreCtasCatalogAction {
                 kind: CoreCtasCatalogActionKind::StandardPublish {
                     target: Arc::new(CoreStandardCtasTargetSession {
@@ -2157,7 +2074,7 @@ impl CtasEngine for DmlExecutionKernel {
                         ),
                         publish_started: AtomicBool::new(true),
                     }),
-                    request,
+                    request: Box::new(request),
                 },
                 dispatched: AtomicBool::new(false),
             }),
@@ -2177,35 +2094,24 @@ impl CtasEngine for DmlExecutionKernel {
         action.begin_dispatch()?;
         match target
             .lease
-            .publish(request.clone())
+            .publish(request.as_ref().clone())
             .map_err(connector_failure)?
         {
-            ConnectorStagedCreatePublishOutcome::Applied {
-                receipt,
-                finalization,
-            } => Ok(StandardCtasPublishOutcome::Applied {
-                receipt,
-                finalization,
-            }),
-            ConnectorStagedCreatePublishOutcome::NoOp {
-                receipt,
-                finalization,
-            } => Ok(StandardCtasPublishOutcome::NoOp {
-                receipt,
-                finalization,
-            }),
+            ConnectorStagedCreatePublishOutcome::Applied { finalization, .. } => {
+                Ok(StandardCtasPublishOutcome::Applied { finalization })
+            }
+            ConnectorStagedCreatePublishOutcome::NoOp { finalization, .. } => {
+                Ok(StandardCtasPublishOutcome::NoOp { finalization })
+            }
             ConnectorStagedCreatePublishOutcome::Conflict { failure, cleanup }
             | ConnectorStagedCreatePublishOutcome::KnownUncommitted { failure, cleanup } => {
                 Ok(StandardCtasPublishOutcome::KnownUncommitted {
-                    failure: mutation_failure(failure),
+                    failure: Box::new(mutation_failure(failure)),
                     cleanup,
                 })
             }
-            ConnectorStagedCreatePublishOutcome::CommitUnknown { failure, evidence } => {
-                Ok(StandardCtasPublishOutcome::CommitUnknown {
-                    failure: mutation_failure(failure),
-                    evidence,
-                })
+            ConnectorStagedCreatePublishOutcome::CommitUnknown { evidence, .. } => {
+                Ok(StandardCtasPublishOutcome::CommitUnknown { evidence })
             }
         }
     }
@@ -2233,16 +2139,12 @@ impl CtasEngine for DmlExecutionKernel {
             .map_err(connector_failure)?;
         match outcome {
             ConnectorStagedCreatePublicationAdjudicationOutcome::Published {
-                receipt,
-                finalization,
-            } => Ok(StandardCtasPublicationAdjudicationOutcome::Published {
-                receipt,
-                finalization,
-            }),
+                finalization, ..
+            } => Ok(StandardCtasPublicationAdjudicationOutcome::Published { finalization }),
             ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
                 failure, ..
             } => Ok(StandardCtasPublicationAdjudicationOutcome::CommitUnknown {
-                failure: mutation_failure(failure),
+                failure: Box::new(mutation_failure(failure)),
             }),
         }
     }

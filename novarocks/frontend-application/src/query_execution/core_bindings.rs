@@ -17,14 +17,11 @@
 
 //! Frontend-local implementations of Core domain contracts for query kernels.
 
-use crate::catalog_application::statement::{CatalogDropContext, CatalogMutationContext};
 use crate::connector::data_mutation::DataMutationCacheFinalizer;
 use crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer;
-use novarocks_spi::connector::{
-    ConnectorControlRegistry, ConnectorError, ConnectorErrorKind, ConnectorTableIdentity,
-};
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorTableIdentity};
 
-use super::kernels::{CatalogCommandKernel, DmlExecutionKernel, MaintenanceExecutionKernel};
+use super::kernels::{DmlExecutionKernel, MaintenanceExecutionKernel};
 
 fn invalidate_table(
     catalog_service: &crate::catalog_application::query_catalog::QueryCatalogService,
@@ -54,25 +51,5 @@ impl MetadataMaintenanceCacheFinalizer for MaintenanceExecutionKernel {
         table: &ConnectorTableIdentity,
     ) -> Result<(), ConnectorError> {
         invalidate_table(self.catalog_service().as_ref(), table)
-    }
-}
-
-impl CatalogDropContext for CatalogCommandKernel {
-    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
-        self.connector_control().as_ref()
-    }
-
-    fn mv_readiness(&self) -> &crate::mv::domain::readiness::MvReadinessPort {
-        self.mv_readiness().as_ref()
-    }
-
-    fn mv_storage_observation(&self) -> &dyn novarocks_spi::connector::MvStorageObservationPort {
-        self.mv_storage_observation().as_ref()
-    }
-}
-
-impl CatalogMutationContext for CatalogCommandKernel {
-    fn connector_control(&self) -> &dyn ConnectorControlRegistry {
-        self.connector_control().as_ref()
     }
 }

@@ -21,6 +21,7 @@
 //! `novarocks-state-store-runtime`. This module retains only Frontend's
 //! business-consumer metrics, abandonment sweep driver, and test fixtures.
 
+#[cfg(test)]
 pub mod metrics;
 pub mod sweeper;
 
@@ -31,4 +32,4 @@ pub(crate) mod testing;
 #[path = "consumer_failure_tests.rs"]
 mod consumer_failure_tests;
 
-pub use sweeper::{AbandonedAttemptSweeper, DEFAULT_SWEEP_INTERVAL};
+pub use sweeper::AbandonedAttemptSweeper;

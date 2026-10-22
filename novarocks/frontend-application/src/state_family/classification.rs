@@ -18,19 +18,15 @@
 //! The closed two-way classification every state family must declare.
 //!
 //! The classification is not a label attached to a family after the fact; it
-//! decides whether the family may own a StateStore record at all.  That is why
-//! the persistent key prefix lives inside the persistent accelerator variant's data
-//! instead of alongside the classification tag.
-
-use bytes::Bytes;
-use novarocks_state_store_api::Key;
+//! decides whether the family may own a StateStore record at all. Frontend
+//! accelerators are in-process, and durable product descriptors remain owned
+//! by their product crates.
 
 /// A StateStore key prefix owned by exactly one persistent state family.
 ///
-/// The literal is private and has no public constructor. Frontend no longer
-/// owns a durable state family; product descriptors live with their product
-/// crates. Keeping this carrier private prevents a Frontend module from
-/// recreating a local durable-owner escape hatch.
+/// The literal is private and has no public constructor. Durable product
+/// descriptors live with their product crates, so Frontend cannot mint a
+/// local durable owner.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PersistentKeyPrefix(&'static str);
 
@@ -41,33 +37,6 @@ impl PersistentKeyPrefix {
 
     pub const fn as_bytes(self) -> &'static [u8] {
         self.0.as_bytes()
-    }
-
-    /// The prefix itself, as a StateStore key.
-    ///
-    /// Range scans over a whole family start here, and families whose entire
-    /// state is one record (backend desired state) use this as their only key.
-    pub fn key(self) -> Result<Key, String> {
-        self.build(Bytes::from_static(self.0.as_bytes()))
-    }
-
-    /// The prefix followed by `suffix`, concatenated verbatim.
-    ///
-    /// The manifest deliberately inserts no separator.  Registered prefixes are
-    /// not uniform — some end in `/` and some do not, because they were frozen
-    /// by the stores that already hold them — so a separator injected here
-    /// would silently rewrite live keys.  Each owner therefore keeps its own
-    /// suffix scheme and hands over the exact bytes that follow the prefix.
-    pub fn key_with_suffix(self, suffix: &str) -> Result<Key, String> {
-        let mut bytes = Vec::with_capacity(self.0.len() + suffix.len());
-        bytes.extend_from_slice(self.0.as_bytes());
-        bytes.extend_from_slice(suffix.as_bytes());
-        self.build(Bytes::from(bytes))
-    }
-
-    fn build(self, bytes: Bytes) -> Result<Key, String> {
-        Key::try_from(bytes)
-            .map_err(|error| format!("build state family key under prefix {}: {error}", self.0))
     }
 }
 
@@ -96,10 +65,9 @@ impl StateFamilyClassification {
     /// The family's persistent key prefix, or `None` when the family owns no
     /// StateStore records.
     ///
-    /// The `ProcessRuntime` arm cannot even name a prefix: the contract holds
-    /// none and exposes no accessor for one, so this function is the compiler's
-    /// own proof that runtime state is not durable rather than a check run
-    /// after the fact.
+    /// A `ProcessRuntime` contract has no prefix field or accessor, while this
+    /// manifest's accelerator contracts are all in-process. Durable product
+    /// descriptors remain outside this local classification.
     pub const fn persistent_prefix(self) -> Option<PersistentKeyPrefix> {
         match self {
             Self::ProcessRuntime(_) => None,
@@ -163,14 +131,10 @@ pub enum DurabilityAdmission {
 /// What a `ProcessRuntime` family declares — and, more importantly, what it
 /// structurally cannot.
 ///
-/// This struct has exactly one field.  There is deliberately no prefix field,
+/// This struct has exactly one field. There is deliberately no prefix field,
 /// no `Option<PersistentKeyPrefix>`, and no prefix accessor, so "give a
 /// `ProcessRuntime` family a persistent prefix" is a type error rather than a
-/// rule someone has to remember to check.  Modelling the classification as a
-/// flat tag plus an optional prefix table would have made the illegal state
-/// representable and pushed the invariant back into review discipline; keeping
-/// the prefix inside the two persistent variants' data makes the compiler the
-/// enforcement point.
+/// rule someone has to remember to check.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessRuntimeContract {
     authority: ProcessRuntimeAuthority,
@@ -198,8 +162,6 @@ impl ProcessRuntimeContract {
 pub enum ProcessRuntimeAuthority {
     /// The statement currently executing.
     Statement,
-    /// The attempt currently executing (refresh, maintenance, or analyze).
-    Attempt,
     /// The current frontend incarnation.
     FrontendIncarnation,
 }
@@ -237,24 +199,22 @@ impl AcceleratorContract {
 
     pub const fn persistent_prefix(self) -> Option<PersistentKeyPrefix> {
         match self.residence {
-            AcceleratorResidence::Durable { prefix, .. } => Some(prefix),
             AcceleratorResidence::InProcess => None,
         }
     }
 
     pub const fn record_version(self) -> Option<u8> {
         match self.residence {
-            AcceleratorResidence::Durable { record_version, .. } => Some(record_version),
             AcceleratorResidence::InProcess => None,
         }
     }
 
-    /// The external authority this family is rebuilt from after a wipe.
+    /// The external authority this family is rebuilt from.
     pub const fn rebuild_authority(self) -> AcceleratorRebuildAuthority {
         self.rebuild_authority
     }
 
-    /// What a rebuild from that authority actually reproduces.
+    /// What rebuilding the accelerator actually reproduces from that authority.
     pub const fn rebuild_determinism(self) -> RebuildDeterminism {
         self.rebuild_determinism
     }
@@ -267,15 +227,9 @@ impl AcceleratorContract {
         self.clone_policy
     }
 
-    /// The destructive entry point that removes the whole family.
-    ///
-    /// Derived from the residence rather than declared: a durable family is
-    /// wiped by deleting its own prefix and an in-process family by dropping
-    /// its cache, so a separate field could only ever agree with the residence
-    /// or contradict it.
+    /// The destructive entry point that removes this in-process family.
     pub const fn wipe_entry(self) -> WipeEntry {
         match self.residence {
-            AcceleratorResidence::Durable { .. } => WipeEntry::DeleteWholePrefix,
             AcceleratorResidence::InProcess => WipeEntry::DropInProcessCache,
         }
     }
@@ -283,29 +237,16 @@ impl AcceleratorContract {
 
 /// Where an `Accelerator` family's records live.
 ///
-/// The two variants pair residence with record version on purpose: a durable
-/// accelerator always has exactly one record version this binary reads and
-/// writes, and an in-process accelerator has no encoded record at all.  Neither
-/// "a durable family with no record version" nor "an in-process family with
-/// one" can be written down.
+/// Frontend accelerators are in-process; durable product descriptors belong to
+/// their product crates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AcceleratorResidence {
-    Durable {
-        prefix: PersistentKeyPrefix,
-        record_version: u8,
-    },
     InProcess,
 }
 
 /// The external authority an `Accelerator` family rebuilds from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AcceleratorRebuildAuthority {
-    /// The MV lake descriptor, its publication facts, and the immutable target
-    /// identity.
-    MvLakeDescriptorAndPublicationFacts,
-    /// The current provider-proven exact ref, head and provenance tuple, read
-    /// together with the safety-age window that consumes it.
-    ProvenOwnedRefWithSafetyAgeWindow,
     /// The connector's current schema and schema version.
     ConnectorSchemaVersion,
     /// The connector's immutable statistics evidence revision.
@@ -319,40 +260,19 @@ pub enum RebuildDeterminism {
     /// identifiers may be reassigned by the rebuild; nothing user-visible
     /// depends on the discarded values.
     UserVisibleIdentical,
-    /// The rebuild is safe but not identical: it restarts a conservative window
-    /// instead of reproducing the discarded value.  A wipe therefore costs
-    /// latency, never correctness — the family exists to let a safety window
-    /// mature, and a fresh window is always the conservative side.
-    ConservativeRestart,
 }
 
 /// What happens to a family when a deployment is cloned.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClonePolicy {
-    /// Only the logical configuration crosses the clone boundary.  Every
-    /// derived identity — attachment id, CAS version, runtime generation,
-    /// resolved secret, readiness — is re-established by the clone rather than
-    /// copied, because those values name facts about the source deployment.
-    SemanticRebind,
     /// The family never crosses a clone boundary; the clone re-establishes it
     /// from its own authority.
     NotCloned,
-    /// The clone must re-validate copied records against the source revision; a
-    /// mismatch wipes and rebuilds instead of trusting the copy.
-    RevalidateSourceRevisionOrWipe,
-    /// The clone always wipes the family and lets it rebuild.  Copying the
-    /// records would import maturity the clone has not earned.
-    WipeAndRebuild,
 }
 
 /// The destructive entry point that removes a whole family.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WipeEntry {
-    /// Range-delete the family's StateStore prefix.  No per-record fence or
-    /// ordering is required: every record is rebuildable from the declared
-    /// authority, so a partially completed wipe is only a partially completed
-    /// rebuild.
-    DeleteWholePrefix,
     /// Drop the in-process cache.  There is no durable residue to wipe.
     DropInProcessCache,
 }

@@ -38,9 +38,8 @@ use std::time::Duration;
 
 use novarocks_execution::task_execution::{
     CancelReason, CancelTask, DomainConflict, DomainProgression, ExchangeEdgeId, OperationEnvelope,
-    OperationKind, OperationOutcome, QueryContextRef, TaskDomainKind, TaskDomainUpdate,
-    TaskIdentity, TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail,
-    UpdateTask,
+    OperationKind, OperationOutcome, QueryContextRef, TaskDomainUpdate, TaskIdentity,
+    TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail, UpdateTask,
 };
 use novarocks_query_application::coordination::{
     FrontendAction, GoneObservation, MonotonicInstant, ObservedTaskTransition,
@@ -215,7 +214,6 @@ pub struct RemoteTask {
     state: RemoteTaskState,
     create_in_flight: Option<TaskOperationId>,
     create_remote_unknown: bool,
-    create_acknowledged: bool,
     create_ownership_proven: bool,
     normal_stand_down: bool,
     fenced_out: bool,
@@ -231,6 +229,7 @@ pub struct RemoteTask {
     domains: TaskDomainIntentTracker,
     awaiting_terminal_status: bool,
     discarded_updates: usize,
+    #[cfg(test)]
     converged_after_terminal: usize,
 }
 
@@ -269,7 +268,18 @@ fn split_regression(
     }
 }
 
+pub(crate) type NextTaskUpdateIntent =
+    Option<(OperationIntent, Option<Box<dyn TaskOperationQueuePermit>>)>;
+
 impl RemoteTask {
+    #[cfg(test)]
+    fn record_terminal_convergence(&mut self) {
+        self.converged_after_terminal += 1;
+    }
+
+    #[cfg(not(test))]
+    fn record_terminal_convergence(&mut self) {}
+
     /// Takes ownership of one task's creation seed.
     ///
     /// The create operation id is minted here, once: every send of this
@@ -302,7 +312,6 @@ impl RemoteTask {
             state: RemoteTaskState::Creating,
             create_in_flight: None,
             create_remote_unknown: false,
-            create_acknowledged: false,
             create_ownership_proven: false,
             normal_stand_down: false,
             fenced_out: false,
@@ -318,6 +327,7 @@ impl RemoteTask {
             domains,
             awaiting_terminal_status: false,
             discarded_updates: 0,
+            #[cfg(test)]
             converged_after_terminal: 0,
         })
     }
@@ -358,17 +368,6 @@ impl RemoteTask {
 
     pub const fn state(&self) -> RemoteTaskState {
         self.state
-    }
-
-    /// Whether this frontend has historically accepted the exact CreateTask
-    /// receipt for this task.
-    ///
-    /// Lifecycle state is intentionally not used as a substitute: a task may
-    /// move directly from Creating to Terminal when status observation races
-    /// ahead of its create acknowledgement, while the later exact receipt
-    /// still proves that the task was admitted.
-    pub const fn create_acknowledged(&self) -> bool {
-        self.create_acknowledged
     }
 
     /// An exact positive Worker fact proves this Task exists even if its
@@ -489,19 +488,23 @@ impl RemoteTask {
         matches!(self.state, RemoteTaskState::Terminal)
     }
 
+    #[cfg(test)]
     pub fn pending_updates(&self) -> usize {
         self.pending.len()
     }
 
+    #[cfg(test)]
     pub const fn discarded_updates(&self) -> usize {
         self.discarded_updates
     }
 
+    #[cfg(test)]
     pub const fn converged_after_terminal(&self) -> usize {
         self.converged_after_terminal
     }
 
     /// Whether an operation for this task is currently released.
+    #[cfg(test)]
     pub const fn has_released_operation(&self) -> bool {
         self.create_in_flight.is_some()
             || self.cancel_in_flight.is_some()
@@ -836,12 +839,7 @@ impl RemoteTask {
     /// One domain change per request and at most one request in flight. That
     /// keeps a receipt attributable to exactly one domain and keeps a slow
     /// task from accumulating unacknowledged work.
-    pub fn next_update_intent(
-        &mut self,
-    ) -> Result<
-        Option<(OperationIntent, Option<Box<dyn TaskOperationQueuePermit>>)>,
-        TaskExecutionError,
-    > {
+    pub fn next_update_intent(&mut self) -> Result<NextTaskUpdateIntent, TaskExecutionError> {
         if !matches!(self.state, RemoteTaskState::Created)
             || !self.installed()
             || self.awaiting_terminal_status
@@ -930,6 +928,7 @@ impl RemoteTask {
         )))
     }
 
+    #[cfg(test)]
     pub const fn cancel_requested(&self) -> bool {
         self.cancel_requested
     }
@@ -971,7 +970,6 @@ impl RemoteTask {
             // backend from here on whatever the snapshot says, and no create
             // may follow an applied one.
             self.creation = CreationReplay::Settled;
-            self.create_acknowledged = true;
             self.create_ownership_proven = true;
             if !matches!(self.state, RemoteTaskState::Terminal) {
                 self.state = RemoteTaskState::Created;
@@ -1106,14 +1104,14 @@ impl RemoteTask {
                     // outcome is abandoned rather than replayed at a task that
                     // can no longer apply it.
                     self.released_update = None;
-                    self.converged_after_terminal += 1;
+                    self.record_terminal_convergence();
                     return Ok(UpdateSettlement::ConvergedAfterTerminal);
                 }
                 return Ok(UpdateSettlement::RetryExactRequest);
             }
             FrontendAction::StopSendingAndReconcile | FrontendAction::Settled => {
                 self.released_update = None;
-                self.converged_after_terminal += 1;
+                self.record_terminal_convergence();
                 if obsolete_input {
                     return Ok(UpdateSettlement::DiscardedAfterNormalStandDown);
                 }
@@ -1282,14 +1280,6 @@ impl RemoteTask {
             .as_ref()
             .is_some_and(|status| status.output().responsibility_complete())
     }
-
-    /// Which domains still hold unsent facts, for diagnostics.
-    pub fn pending_domains(&self) -> Vec<TaskDomainKind> {
-        self.pending
-            .iter()
-            .map(|pending| pending.update.kind())
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -1335,7 +1325,6 @@ mod destination_close_tests {
                 state: RemoteTaskState::Created,
                 create_in_flight: None,
                 create_remote_unknown: false,
-                create_acknowledged: true,
                 create_ownership_proven: true,
                 normal_stand_down: false,
                 fenced_out: false,
@@ -1351,6 +1340,7 @@ mod destination_close_tests {
                 domains,
                 awaiting_terminal_status: false,
                 discarded_updates: 0,
+                #[cfg(test)]
                 converged_after_terminal: 0,
             },
             edge,

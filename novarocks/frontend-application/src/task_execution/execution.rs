@@ -32,7 +32,7 @@ use std::time::Duration;
 use novarocks_execution::task_execution::{
     AbortCause, AdmissionEpochCapability, CancelReason, ExchangeEdgeId, OperationKind,
     QueryContextRef, TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskState, TaskStatus,
-    TaskStatusCursor, TerminationDetail, UpdateQueryContext,
+    TaskStatusCursor, TerminationDetail,
 };
 use novarocks_execution::task_execution::{
     QueryContextConvergenceCursor, QueryContextConvergenceReceipt, QuiesceQueryContextReceipt,
@@ -40,7 +40,7 @@ use novarocks_execution::task_execution::{
 };
 use novarocks_query_application::coordination::{
     AttemptDrainFacts, DispatchBudget, DispatchLane, GoneObservation, LatchOutcome,
-    MonotonicInstant, OperationDispatchResult, ReplacementWorkerAdmissionEvidence, StageState,
+    MonotonicInstant, OperationDispatchResult, ReplacementWorkerAdmissionEvidence,
     StatusObservation, TerminationLatch, parent_released_children,
 };
 use novarocks_task_codec::TransportBudget;
@@ -166,7 +166,6 @@ enum OperationTarget {
     /// dispatch permit and nothing else; the owner learns the outcome through
     /// the runner's acknowledgement-observer seam, which sees every
     /// acknowledgement before it is settled.
-    ContextDomain(QueryContextRef),
     /// An actor-owned Abort projected into this attempt's Native lifecycle
     /// lane. The dispatcher owns only carrier capacity; TaskRound settles the
     /// actor's exact effect from the same acknowledgement intake.
@@ -285,6 +284,7 @@ pub struct StatusReport {
 pub struct ReleasedRuntimeFilterContributions {
     contributions: Vec<(BackendProcessId, QueryTerminalProfileContributionTelemetry)>,
     complete: bool,
+    #[cfg(test)]
     contexts: usize,
 }
 
@@ -300,7 +300,7 @@ impl ReleasedRuntimeFilterContributions {
         self.complete
     }
 
-    /// How many query contexts this attempt placed.
+    #[cfg(test)]
     pub const fn contexts(&self) -> usize {
         self.contexts
     }
@@ -573,10 +573,7 @@ impl QueryTaskExecution {
                 TaskExecutionError::Schedule(format!("stage {stage_id} is absent"))
             })?;
             let root = tasks.contains_key(&root_task).then_some(root_task);
-            stages.insert(
-                stage_id,
-                StageExecution::new(node.stage(), node.fragment_id(), root, tasks)?,
-            );
+            stages.insert(stage_id, StageExecution::new(node.stage(), root, tasks)?);
         }
 
         let read = ReadCompletionTracker::new(graph.root_identity());
@@ -623,7 +620,7 @@ impl QueryTaskExecution {
     /// before the first Task-protocol turn.
     pub(crate) fn adopt_replacement_admissions(
         &mut self,
-        admissions: Box<[ReplacementWorkerAdmissionEvidence]>,
+        admissions: &[ReplacementWorkerAdmissionEvidence],
     ) -> Result<(), TaskExecutionError> {
         let expected = self.owners.keys().copied().collect::<BTreeSet<_>>();
         let actual = admissions
@@ -650,6 +647,7 @@ impl QueryTaskExecution {
         &self.graph
     }
 
+    #[cfg(test)]
     pub const fn dispatcher(&self) -> &OperationDispatcher {
         &self.dispatcher
     }
@@ -715,6 +713,7 @@ impl QueryTaskExecution {
                 })
                 .collect(),
             complete: self.owners.values().all(QueryContextOwner::is_released),
+            #[cfg(test)]
             contexts: self.owners.len(),
         }
     }
@@ -724,13 +723,6 @@ impl QueryTaskExecution {
             .get(&task_id)
             .and_then(|stage_id| self.stages.get(stage_id))
             .and_then(|stage| stage.task(task_id))
-    }
-
-    pub fn stage_states(&self) -> BTreeMap<StageId, StageState> {
-        self.stages
-            .iter()
-            .map(|(&stage_id, stage)| (stage_id, stage.state()))
-            .collect()
     }
 
     /// Produces every intent the owners currently have and releases bounded
@@ -998,47 +990,6 @@ impl QueryTaskExecution {
             .enqueue_update(update, queue_permit)
     }
 
-    /// Releases one shared-domain advance an attempt-local owner minted.
-    ///
-    /// This is the seam the credential rotation owner sends through. It takes
-    /// only an advance: an establish and a renewal belong to the context owner,
-    /// which mints their lease sequences, and letting a domain owner send one
-    /// would put two producers on the lease progression.
-    ///
-    /// The operation is enqueued rather than sent, so it obeys the same bounded
-    /// per-backend dispatch as everything else and cannot jump a queue that is
-    /// already full of this backend's creates.
-    pub fn enqueue_context_domain(
-        &mut self,
-        request: UpdateQueryContext,
-    ) -> Result<TaskOperationId, TaskExecutionError> {
-        if self.normal_drain_started || self.terminal_cleanup_started {
-            return Err(TaskExecutionError::Schedule(
-                "attempt drain rejects new context-domain advances".to_owned(),
-            ));
-        }
-        let UpdateQueryContext::AdvanceDomain(advance) = &request else {
-            return Err(TaskExecutionError::Schedule(
-                "only a shared-domain advance may be sent by a domain owner".to_owned(),
-            ));
-        };
-        let context = advance.context();
-        if !self.owners.contains_key(&context) {
-            return Err(TaskExecutionError::UnknownOperation);
-        }
-        let operation_id = advance.envelope().operation_id();
-        let now = self.clock.now();
-        let intent = OperationIntent::UpdateQueryContext(Arc::new(request));
-        let queue_permit = self
-            .reserve_process_queue(&intent)?
-            .ok_or_else(|| Self::process_queue_backpressure(intent.queue_request()))?;
-        self.dispatcher
-            .enqueue_reserved(intent, now, queue_permit)?;
-        self.operation_targets
-            .insert(operation_id, OperationTarget::ContextDomain(context));
-        Ok(operation_id)
-    }
-
     /// Reserves the two capacities an actor-owned Abort needs before its
     /// bounded adapter slot is released.
     ///
@@ -1186,10 +1137,7 @@ impl QueryTaskExecution {
                 let queued_kind = self.dispatcher.queued_operation_kind(operation_id);
                 (matches!(queued_kind, Some(OperationKind::CreateTask))
                     || (queued_kind == Some(OperationKind::UpdateTask)
-                        && !self.dispatcher.queued_destination_close(operation_id))
-                    || (target != OperationTarget::ActorAbort
-                        && matches!(target, OperationTarget::ContextDomain(_))
-                        && queued_kind.is_some()))
+                        && !self.dispatcher.queued_destination_close(operation_id)))
                 .then_some((operation_id, target))
             })
             .collect::<Vec<_>>();
@@ -1351,7 +1299,6 @@ impl QueryTaskExecution {
             // domain owner, which read this acknowledgement from the observer
             // seam before the runner got here, so applying it a second time
             // would be a second authority over the same progression.
-            OperationTarget::ContextDomain(_) => Ok(()),
             OperationTarget::ActorAbort => Ok(()),
         }
     }
@@ -1833,16 +1780,19 @@ impl QueryTaskExecution {
         let mut report = StatusReport::default();
         for entry in entries {
             match entry {
-                ObservationIntakeEntry::Frame(ObservationFrame::Covered {
-                    context,
-                    generation,
-                    event,
-                }) => self.apply_covered_frame(context, generation, event, &mut report)?,
-                ObservationIntakeEntry::Frame(_) => {
-                    return Err(TaskExecutionError::Schedule(
-                        "legacy observation entered the covered intake".to_owned(),
-                    ));
-                }
+                ObservationIntakeEntry::Frame(frame) => match *frame {
+                    ObservationFrame::Covered {
+                        context,
+                        generation,
+                        event,
+                    } => self.apply_covered_frame(context, generation, event, &mut report)?,
+                    #[cfg(test)]
+                    ObservationFrame::Status(_) | ObservationFrame::Gone(_) => {
+                        return Err(TaskExecutionError::Schedule(
+                            "legacy observation entered the covered intake".to_owned(),
+                        ));
+                    }
+                },
                 ObservationIntakeEntry::RootControl(request) => {
                     report.root_control = Some(request);
                     break;
@@ -2425,11 +2375,13 @@ impl QueryTaskExecution {
     }
 
     /// Whether this frontend consumed the end of the root result stream.
+    #[cfg(test)]
     pub fn root_end_of_stream_observed(&self) -> bool {
         self.read.end_of_stream_observed()
     }
 
     /// Whether the whole attempt has drained.
+    #[cfg(test)]
     pub fn attempt_drained(&self) -> bool {
         self.attempt_drain_facts().drained()
     }
@@ -2444,6 +2396,7 @@ impl QueryTaskExecution {
         self.covered_observation.get(&context)?.context_convergence
     }
 
+    #[cfg(test)]
     pub(crate) fn worker_contexts_stopped(&self) -> bool {
         self.graph
             .contexts()
@@ -2816,7 +2769,6 @@ impl QueryTaskExecution {
                     owner.rollback_unsent(operation_id);
                 }
             }
-            OperationTarget::ContextDomain(_) => {}
             OperationTarget::ActorAbort => {}
         }
     }

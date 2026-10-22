@@ -15,20 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Engine-side outer values for the typed connector read stack.
+//! Runtime split-assignment values owned by the coordinator.
 //!
-//! The engine owns the catalog-scoped wrappers, the scheduled-split identity,
-//! and the scan node; the connector owns everything inside a handle or split
-//! variant. Nothing here interprets a provider variant, so the frontend never
-//! links a provider crate.
+//! The connector owns everything inside a split variant. Nothing here
+//! interprets provider-specific data, so the frontend never links a provider
+//! crate.
 
 mod handle;
 mod scheduling;
-mod table_scan;
 
-pub(crate) use handle::{Split, TableHandle};
-pub(crate) use scheduling::{
-    PlanNodeAssignmentState, ScheduledSplit, SplitAssignment, SplitAssignmentError,
-    SplitSequenceAllocator, TaskUpdateRequest,
-};
-pub(crate) use table_scan::{DynamicFilterBinding, TableScanNode, TableScanNodeError};
+pub(crate) use handle::Split;
+pub(crate) use scheduling::{PlanNodeAssignmentState, SplitAssignmentError, TaskUpdateRequest};

@@ -604,12 +604,14 @@ pub(crate) fn execute_drop_database_statement(
     Ok(StatementResult::Ok)
 }
 
+type AdmittedForceDropChildren = (Vec<String>, Vec<String>);
+
 fn enumerate_admitted_force_drop_children(
     lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     namespace_identity: ConnectorNamespaceIdentity,
     if_exists: bool,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Option<(Vec<String>, Vec<String>)>, String> {
+) -> Result<Option<AdmittedForceDropChildren>, String> {
     // FORCE is one namespace mutation. Ask the exact owner before its
     // decomposition can encounter a weaker read or child-operation error.
     lease

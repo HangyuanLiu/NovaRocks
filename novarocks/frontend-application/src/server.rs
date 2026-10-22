@@ -193,7 +193,7 @@ struct FrontendRoleProducts {
     /// Retained because the catalog publication set observes it weakly: this
     /// is the reference that decides how long MV rediscovery reacts to newly
     /// admitted catalogs, and it ends with the role graph.
-    mv_catalog_admission: Arc<dyn crate::catalog_application::CatalogAdmissionObserver>,
+    _mv_catalog_admission: Arc<dyn crate::catalog_application::CatalogAdmissionObserver>,
     exchange_port: u16,
 }
 
@@ -573,7 +573,7 @@ async fn build_frontend_role_products(
         mv_service,
         maintenance_ports,
         mv_storage_observation,
-        mv_catalog_admission,
+        _mv_catalog_admission: mv_catalog_admission,
         exchange_port,
     })
 }

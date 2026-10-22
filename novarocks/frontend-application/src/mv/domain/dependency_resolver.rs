@@ -22,8 +22,7 @@ use crate::mv::domain::dependency::scope::{
 };
 use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_mv_application::dependency::{
-    MvDependencyObjectIdentity, MvDependencyObjectRef, MvDependencyObjectType,
-    MvDependencyStorageEngine,
+    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use novarocks_mv_application::persistence::dependency::{
     CreateMvDependencyRequest, StoredMvDependency, stored_keyed_definition_dependency_ref,
@@ -35,15 +34,6 @@ use novarocks_types::naming::TableIdentity;
 pub(crate) struct ResolvedCreateMvDependencies {
     pub(crate) base_refs: Vec<TableIdentity>,
     pub(crate) dependencies: Vec<CreateMvDependencyRequest>,
-}
-
-pub(crate) fn ensure_no_downstream_dependencies_with_readiness(
-    readiness: &MvReadinessPort,
-    upstream: &MvDependencyObjectIdentity,
-) -> Result<(), String> {
-    readiness
-        .ensure_no_ready_downstream_dependencies(upstream)
-        .map_err(|e| e.to_string())
 }
 
 pub(crate) fn resolve_create_mv_dependencies_with_readiness(
