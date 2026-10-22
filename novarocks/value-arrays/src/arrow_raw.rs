@@ -299,3 +299,271 @@ mod tests {
         assert!(buffer.into_mutable().is_ok());
     }
 }
+
+/// Identity of the visible offsets, payload and validity storage. Entries keep
+/// the source array alive; these addresses never outlive that custody.
+/// Slots: offsets(base,offset,len), values(base,offset,len), nulls(base,offset,
+/// bit-offset,bit-length), array length, frozen physical byte-layout id.
+pub(crate) fn byte_storage_identity(array: &dyn Array) -> Result<[usize; 12], ValueError> {
+    let layout = ByteLayout::from_data_type(array.data_type())
+        .ok_or(ValueError::Invariant(ValueViolation::Carrier))?;
+    macro_rules! buffers {
+        ($ty:ty) => {{
+            let a = concrete::<$ty>(array)?;
+            (a.offsets().inner().inner(), a.values())
+        }};
+    }
+    let (offsets, values) = match layout {
+        ByteLayout::Utf8 => buffers!(StringArray),
+        ByteLayout::LargeUtf8 => buffers!(LargeStringArray),
+        ByteLayout::Binary => buffers!(BinaryArray),
+        ByteLayout::LargeBinary => buffers!(LargeBinaryArray),
+        _ => return Err(ValueError::Invariant(ValueViolation::Layout)),
+    };
+    let mut key = [0; 12];
+    key[..6].copy_from_slice(&[
+        offsets.data_ptr().as_ptr() as usize,
+        offsets.ptr_offset(),
+        offsets.len(),
+        values.data_ptr().as_ptr() as usize,
+        values.ptr_offset(),
+        values.len(),
+    ]);
+    if let Some(nulls) = array.nulls() {
+        let b = nulls.inner().inner();
+        key[6..10].copy_from_slice(&[
+            b.data_ptr().as_ptr() as usize,
+            b.ptr_offset(),
+            nulls.offset(),
+            nulls.len(),
+        ]);
+    }
+    key[10] = array.len();
+    key[11] = layout as usize;
+    Ok(key)
+}
+
+pub(crate) fn make_offsets(
+    layout: ByteLayout,
+    offsets: Buffer,
+    payload: Buffer,
+    nulls: Option<NullBuffer>,
+) -> Result<ArrayRef, ValueError> {
+    use arrow_buffer::OffsetBuffer;
+    macro_rules! array {
+        ($ty:ty,$offset:ty) => {{
+            let offsets = OffsetBuffer::new(ScalarBuffer::<$offset>::from(offsets));
+            Arc::new(<$ty>::try_new(offsets, payload, nulls)?) as ArrayRef
+        }};
+    }
+    Ok(match layout {
+        ByteLayout::Utf8 => array!(StringArray, i32),
+        ByteLayout::LargeUtf8 => array!(LargeStringArray, i64),
+        ByteLayout::Binary => array!(BinaryArray, i32),
+        ByteLayout::LargeBinary => array!(LargeBinaryArray, i64),
+        _ => return Err(ValueError::Invariant(ValueViolation::Layout)),
+    })
+}
+
+pub(crate) fn make_nulls(validity: Buffer, len: usize, null_count: usize) -> Option<NullBuffer> {
+    if null_count == 0 {
+        None
+    } else {
+        // The caller tracks the packed validity bits transactionally. Using
+        // the safe constructor also verifies the exact null count in debug.
+        let nulls = NullBuffer::new(arrow_buffer::BooleanBuffer::new(validity, 0, len));
+        debug_assert_eq!(nulls.null_count(), null_count);
+        Some(nulls)
+    }
+}
+
+pub(crate) struct BorrowedNode {
+    pub data_buffers: usize,
+    pub child_count: usize,
+}
+pub(crate) fn borrowed_node(array: &dyn Array) -> Result<BorrowedNode, ValueError> {
+    use arrow_schema::{DataType, UnionMode};
+    let (data_buffers, child_count) = match array.data_type() {
+        DataType::Null => (0, 0),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => (2, 0),
+        DataType::Utf8View | DataType::BinaryView => (1 + view_parts(array)?.1.len(), 0),
+        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => (1, 1),
+        DataType::ListView(_) | DataType::LargeListView(_) => (2, 1),
+        DataType::FixedSizeList(_, _) => (0, 1),
+        DataType::Struct(fields) => (0, fields.len()),
+        DataType::Union(fields, mode) => {
+            (if *mode == UnionMode::Dense { 2 } else { 1 }, fields.len())
+        }
+        DataType::Dictionary(..) => (1, 1),
+        DataType::RunEndEncoded(..) => (0, 2),
+        _ => (1, 0),
+    };
+    Ok(BorrowedNode {
+        data_buffers,
+        child_count,
+    })
+}
+pub(crate) enum BorrowedChild<'a> {
+    Array(&'a dyn Array),
+    RunEnds {
+        data_type: &'a arrow_schema::DataType,
+        buffer: &'a Buffer,
+    },
+}
+pub(crate) fn borrowed_child(
+    array: &dyn Array,
+    index: usize,
+) -> Result<BorrowedChild<'_>, ValueError> {
+    use arrow_array::types::*;
+    use arrow_array::*;
+    use arrow_schema::DataType;
+    let bounds = || ValueError::Invariant(ValueViolation::Bounds);
+    macro_rules! one {
+        ($ty:ty,$method:ident) => {{
+            if index != 0 {
+                return Err(bounds());
+            }
+            concrete::<$ty>(array)?.$method().as_ref()
+        }};
+    }
+    macro_rules! dict {
+        ($ty:ty) => {
+            one!(DictionaryArray<$ty>, values)
+        };
+    }
+    macro_rules! run {
+        ($ty:ty,$ends:expr) => {{
+            let a = concrete::<RunArray<$ty>>(array)?;
+            match index {
+                0 => {
+                    return Ok(BorrowedChild::RunEnds {
+                        data_type: $ends.data_type(),
+                        buffer: a.run_ends().inner().inner(),
+                    });
+                }
+                1 => a.values().as_ref(),
+                _ => return Err(bounds()),
+            }
+        }};
+    }
+    Ok(BorrowedChild::Array(match array.data_type() {
+        DataType::List(_) => one!(ListArray, values),
+        DataType::LargeList(_) => one!(LargeListArray, values),
+        DataType::ListView(_) => one!(ListViewArray, values),
+        DataType::LargeListView(_) => one!(LargeListViewArray, values),
+        DataType::FixedSizeList(_, _) => one!(FixedSizeListArray, values),
+        DataType::Map(_, _) => {
+            if index != 0 {
+                return Err(bounds());
+            }
+            concrete::<MapArray>(array)?.entries()
+        }
+        DataType::Struct(_) => concrete::<StructArray>(array)?
+            .columns()
+            .get(index)
+            .ok_or_else(bounds)?
+            .as_ref(),
+        DataType::Union(fields, _) => {
+            let (id, _) = fields.iter().nth(index).ok_or_else(bounds)?;
+            concrete::<UnionArray>(array)?.child(id).as_ref()
+        }
+        DataType::Dictionary(key, _) => match key.as_ref() {
+            DataType::Int8 => dict!(Int8Type),
+            DataType::Int16 => dict!(Int16Type),
+            DataType::Int32 => dict!(Int32Type),
+            DataType::Int64 => dict!(Int64Type),
+            DataType::UInt8 => dict!(UInt8Type),
+            DataType::UInt16 => dict!(UInt16Type),
+            DataType::UInt32 => dict!(UInt32Type),
+            DataType::UInt64 => dict!(UInt64Type),
+            _ => return Err(bounds()),
+        },
+        DataType::RunEndEncoded(ends, _) => match ends.data_type() {
+            DataType::Int16 => run!(Int16Type, ends),
+            DataType::Int32 => run!(Int32Type, ends),
+            DataType::Int64 => run!(Int64Type, ends),
+            _ => return Err(bounds()),
+        },
+        _ => return Err(bounds()),
+    }))
+}
+
+/// Adopt one visible source region without copying payload. Offset rebasing
+/// exposes only a slice already owned by the source; no hidden bytes are read.
+pub(crate) fn append_span_view(
+    layout: ByteLayout,
+    span: ByteSpan<'_>,
+    regions: &mut Vec<Buffer>,
+) -> Result<u128, ValueError> {
+    let bytes = span.bytes();
+    if bytes.len() <= 12 {
+        return inline_view(bytes);
+    }
+    let ByteSpan::Region {
+        buffer,
+        offset,
+        len,
+    } = span
+    else {
+        return Err(ValueError::Invariant(ValueViolation::Carrier));
+    };
+    let (region, offset) = if offset > i32::MAX as usize {
+        (buffer.slice_with_length(offset, len), 0)
+    } else {
+        (buffer.clone(), offset)
+    };
+    let identity = |b: &Buffer| (b.data_ptr(), b.ptr_offset(), b.len());
+    let index = if let Some(index) = regions
+        .iter()
+        .position(|b| identity(b) == identity(&region))
+    {
+        index
+    } else {
+        regions
+            .try_reserve(1)
+            .map_err(|source| ValueError::Allocation {
+                requested: std::mem::size_of::<Buffer>(),
+                source,
+            })?;
+        let index = regions.len();
+        regions.push(region);
+        index
+    };
+    external_view(layout, bytes, index, offset)
+}
+
+#[cfg(test)]
+mod structural_tests {
+    use super::*;
+    use arrow_array::{Int16Array, RunArray, types::Int16Type};
+    #[test]
+    fn run_ends_are_borrowed_as_the_actual_implicit_primitive_child() {
+        let ends = Int16Array::from(vec![2, 4]);
+        let values = StringArray::from(vec!["a", "b"]);
+        let run = RunArray::<Int16Type>::try_new(&ends, &values).unwrap();
+        let node = borrowed_node(&run).unwrap();
+        assert_eq!((node.data_buffers, node.child_count), (0, 2));
+        let BorrowedChild::RunEnds { data_type, buffer } = borrowed_child(&run, 0).unwrap() else {
+            panic!("run ends")
+        };
+        assert_eq!(data_type, &arrow_schema::DataType::Int16);
+        assert_eq!(buffer.as_ptr(), run.run_ends().inner().inner().as_ptr());
+        let BorrowedChild::Array(child) = borrowed_child(&run, 1).unwrap() else {
+            panic!("values")
+        };
+        assert_eq!(child.len(), 2);
+    }
+    #[test]
+    fn offset_and_validity_slice_geometry_are_part_of_cache_identity() {
+        let source = StringArray::from(vec![Some("a"), None, Some("c"), None, Some("e")]);
+        let a = source.slice(0, 3);
+        let b = source.slice(1, 3);
+        let ka = byte_storage_identity(&a).unwrap();
+        let kb = byte_storage_identity(&b).unwrap();
+        assert_ne!(ka, kb);
+        assert_eq!(ka[0], kb[0]);
+        assert_eq!(ka[3], kb[3]);
+        assert_ne!(ka[1], kb[1]);
+        assert_ne!(ka[8], kb[8]);
+    }
+}

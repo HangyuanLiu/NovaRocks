@@ -40,7 +40,8 @@ pub enum ValueViolation {
 
 /// Stable field-specific representation identifiers: 1..=6 belong to
 /// ByteLayout, 7 counts view regions, 8 measures a view's start offset in bytes,
-/// 9 measures Arrow offset extent, and 10 counts dictionary entries.
+/// 9 measures Arrow offset extent, 10 counts dictionary entries, and 11 measures
+/// owned allocation bytes (bounded by the Rust allocation Layout).
 pub fn field_representation(
     code: u16,
     boundary: RepresentationBoundary,
@@ -68,6 +69,10 @@ pub enum ValueError {
         requested: usize,
         source: std::collections::TryReserveError,
     },
+    Allocator {
+        requested: usize,
+        source: allocator_api2::collections::TryReserveError,
+    },
     Arrow(arrow_schema::ArrowError),
 }
 impl ValueError {
@@ -90,7 +95,7 @@ impl fmt::Display for ValueError {
                 "value representation cannot satisfy {:?} layout {}:{}",
                 facts.boundary, facts.layout.domain, facts.layout.code
             ),
-            Self::Allocation { requested, .. } => {
+            Self::Allocation { requested, .. } | Self::Allocator { requested, .. } => {
                 write!(f, "value array allocation refused: {requested} bytes")
             }
             Self::Arrow(source) => write!(f, "value array construction failed: {source}"),
@@ -101,6 +106,7 @@ impl Error for ValueError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Allocation { source, .. } => Some(source),
+            Self::Allocator { source, .. } => Some(source),
             Self::Arrow(source) => Some(source),
             _ => None,
         }
@@ -111,7 +117,7 @@ impl FailureProjection for ValueError {
         let (class, code) = match self {
             Self::Invariant(violation) => (FailureClass::Invariant, *violation as u16),
             Self::Representation(_) => (FailureClass::Representation, 1),
-            Self::Allocation { .. } => (FailureClass::Resource, 2),
+            Self::Allocation { .. } | Self::Allocator { .. } => (FailureClass::Resource, 2),
             Self::Arrow(arrow_schema::ArrowError::MemoryError(_)) => (FailureClass::Resource, 4),
             Self::Arrow(arrow_schema::ArrowError::OffsetOverflowError(_)) => {
                 (FailureClass::Representation, 5)
@@ -131,7 +137,7 @@ impl FailureProjection for ValueError {
         if let Self::Representation(details) = self {
             fact = fact.with_representation(*details);
         }
-        if let Self::Allocation { requested, .. } = self {
+        if let Self::Allocation { requested, .. } | Self::Allocator { requested, .. } = self {
             use novarocks_failure_contract::{ResourceDimension, ResourceFacts};
             fact = fact.with_resource(ResourceFacts {
                 request_scope: None,
