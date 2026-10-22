@@ -246,7 +246,6 @@ fn build_cow_append_query_core(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn build_cow_rewrite_query_closed(
     selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
     rows: &[novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal],
@@ -657,7 +656,6 @@ fn add_bytes(a: u64, b: u64) -> closed::Result<u64> {
 // Caller first validates the sealed target/proof/base/single-file facts and
 // produces actual new target metadata layout. This scalar is NOT a public
 // authority: the private all-target caller must derive it before any clone.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn preflight_target(
     selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
     rows: &[novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal],
@@ -979,7 +977,6 @@ fn preflight_target_core(
     recipe.finish_target(target).map_err(map_footprint)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn preflight_signed_cell(
     selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
     row: novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal,

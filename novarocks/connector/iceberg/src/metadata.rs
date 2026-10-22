@@ -1854,7 +1854,6 @@ fn split_name_mapping(table: &IcebergTablePayload) -> Result<Option<String>, Con
         .transpose()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_data_split(
     provider: &IcebergMetadata,
     scan: &IcebergScanPayload,

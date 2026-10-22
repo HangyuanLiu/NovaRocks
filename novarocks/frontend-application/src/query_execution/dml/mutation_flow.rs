@@ -360,7 +360,6 @@ fn change_stream_routed_targets(
     Ok(routed)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn compile_dml_change_stream_write(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
@@ -1710,7 +1709,6 @@ fn mutation_source_relation_to_sql(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_update_mor_change_stream_write_plan(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
@@ -2702,7 +2700,6 @@ fn build_cow_append_query(
 /// relation of the rows the statement matched inside it. A deleted row is
 /// dropped by the trailing predicate; every other row is re-emitted so the
 /// replacement file is complete.
-#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 fn build_cow_rewrite_query(
     selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
@@ -4700,7 +4697,6 @@ fn build_exact_cow_merge_selection_query(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_merge_mor_change_stream_write_plan(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,

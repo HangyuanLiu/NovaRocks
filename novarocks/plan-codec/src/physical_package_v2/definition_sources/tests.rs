@@ -1378,7 +1378,6 @@ fn same(
 
 // Every stored ID resolves through the original encoded type table to the
 // exact original occurrence; bindings resolve to the original owner rows.
-#[allow(clippy::too_many_arguments)]
 fn verify_roots(
     package: &p::FragmentPackage,
     bindings: &BindingSources<'_>,

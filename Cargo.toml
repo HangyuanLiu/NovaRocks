@@ -41,6 +41,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"
+# Aligned with Databend and RisingWave: typed failure facts are intentionally
+# rich, and stack size is not a maintained goal in the current phase.
+result_large_err = "allow"
 
 [workspace.dependencies]
 allocator-api2 = "0.2"

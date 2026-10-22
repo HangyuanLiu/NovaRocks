@@ -137,7 +137,6 @@ pub enum ResolvedDataMutation {
 
 /// Execute a data mutation and project its typed truth state to the existing
 /// user-facing engine error vocabulary.
-#[allow(clippy::too_many_arguments)]
 pub fn execute_data_mutation(
     resolver: &dyn ConnectorDataMutationResolver,
     cache_finalizer: &dyn DataMutationCacheFinalizer,
@@ -185,7 +184,6 @@ pub fn execute_data_mutation(
 /// planning error is therefore known uncommitted. Once execute is called, an
 /// outer SPI error is conservatively possibly dispatched. A provider unknown
 /// is reconciled once through the retained lease and is never re-executed.
-#[allow(clippy::too_many_arguments)]
 pub fn resolve_data_mutation(
     resolver: &dyn ConnectorDataMutationResolver,
     cache_finalizer: &dyn DataMutationCacheFinalizer,
@@ -231,7 +229,6 @@ enum DataMutationSessionPhase {
 }
 
 impl DataMutationSession {
-    #[allow(clippy::result_large_err)]
     pub fn plan(
         resolver: &dyn ConnectorDataMutationResolver,
         instance_id: &ConnectorInstanceId,

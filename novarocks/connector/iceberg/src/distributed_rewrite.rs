@@ -692,7 +692,6 @@ fn bounded_groups(
     Ok(groups)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cohort_plans_from_artifact(
     owner: &ConnectorProviderBindingKey,
     request: &ConnectorDistributedRewritePlanningRequest,
@@ -851,7 +850,6 @@ pub(crate) fn delete_artifact_execution_schema(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn rewrite_preparation(
     owner: &ConnectorProviderBindingKey,
     request: &ConnectorDistributedRewritePlanningRequest,

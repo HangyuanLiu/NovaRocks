@@ -878,7 +878,6 @@ pub(crate) async fn reclaim(
     );
     report
 }
-#[allow(clippy::too_many_arguments)]
 async fn reclaim_round(
     owner: &IcebergMetadataContext,
     target: CatalogTableName,
@@ -904,7 +903,6 @@ async fn reclaim_round(
     )
     .await
 }
-#[allow(clippy::too_many_arguments)]
 async fn reclaim_round_using(
     catalog: &dyn crate::catalog::NovaRocksCatalog,
     planning_binding: &IcebergReadBinding,

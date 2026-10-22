@@ -396,7 +396,6 @@ impl Default for ScanPreparationConfig {
 }
 
 impl TypedScanRuntime {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         execution_id: QueryExecutionId,
         catalog_read_execution: CatalogReadExecutionResolver,

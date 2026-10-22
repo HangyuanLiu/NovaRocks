@@ -148,7 +148,6 @@ pub enum ResolvedMetadataMaintenance {
 }
 
 /// Compatibility projection for a synchronous statement caller.
-#[allow(clippy::too_many_arguments)]
 pub fn execute_metadata_maintenance(
     resolver: &dyn ConnectorMetadataMaintenanceResolver,
     cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
@@ -221,7 +220,6 @@ pub fn execute_planned_metadata_maintenance(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn plan_metadata_maintenance_session(
     resolver: &dyn ConnectorMetadataMaintenanceResolver,
     instance_id: &ConnectorInstanceId,
@@ -290,7 +288,6 @@ pub fn read_max_compactable_data_files(
 }
 
 /// Plan and execute one operation using a newly acquired current lease.
-#[allow(clippy::too_many_arguments)]
 pub fn resolve_metadata_maintenance(
     resolver: &dyn ConnectorMetadataMaintenanceResolver,
     cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
@@ -324,7 +321,6 @@ pub struct MetadataMaintenanceSession {
 impl MetadataMaintenanceSession {
     /// Acquire the current exact lease, strictly load the base table, and make
     /// one immutable provider plan. This is the only entry point that plans.
-    #[allow(clippy::result_large_err)]
     pub(crate) fn plan(
         resolver: &dyn ConnectorMetadataMaintenanceResolver,
         instance_id: &ConnectorInstanceId,

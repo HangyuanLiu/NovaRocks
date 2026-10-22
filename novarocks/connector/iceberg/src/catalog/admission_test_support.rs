@@ -575,7 +575,6 @@ pub(crate) async fn publish_ref_change(
 
 /// Publish a fully frozen fixture through the real owner. Tests supply the
 /// original provider identity; the journal owns the only dispatch verdict.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn publish_frozen(
     owner: Arc<dyn NovaRocksCatalog>,
     descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,

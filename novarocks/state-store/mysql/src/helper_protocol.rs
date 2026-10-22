@@ -417,7 +417,6 @@ impl HelperState {
         Ok(response)
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn range(
         &mut self,
         id: u64,

@@ -242,7 +242,6 @@ pub type RuntimeFilterParticipantCloseHook = Arc<
 >;
 
 impl RuntimeFilterParticipant {
-    #[allow(clippy::too_many_arguments)]
     fn from_installed(
         execution_id: QueryExecutionId,
         install: BackendParticipantInstall,
@@ -1047,7 +1046,6 @@ mod tests {
     use novarocks_worker::runtime_filter::fixture::BackendRuntimeFilterFixture;
 
     impl RuntimeFilterParticipant {
-        #[allow(clippy::too_many_arguments)]
         fn from_test_parts(
             execution_id: QueryExecutionId,
             install: BackendParticipantInstall,

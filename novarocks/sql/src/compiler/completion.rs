@@ -528,7 +528,6 @@ pub struct ProviderReadNeed {
 }
 
 impl ProviderReadNeed {
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn try_new(
         id: CompileNeedId,
         occurrence: ProviderReadOccurrenceId,
@@ -3483,7 +3482,6 @@ pub mod fixtures {
         MaterializedViewNeed::try_new(CompileNeedId::new(id), referenced_relations)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn provider_read_need(
         id: u32,
         occurrence: novarocks_physical_plan::ProviderReadOccurrenceId,

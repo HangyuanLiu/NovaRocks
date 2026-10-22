@@ -626,7 +626,6 @@ impl SemanticTraceIndexes {
             .collect()
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn map_union_values(
         &mut self,
         fragment: FragmentId,

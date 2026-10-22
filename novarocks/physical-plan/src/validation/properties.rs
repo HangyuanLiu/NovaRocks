@@ -919,7 +919,6 @@ pub(crate) fn validate_node_output_properties(
 /// installed implementations. Projection limits cover the occurrence index
 /// only: structural/Kahn/cut scratch, candidate maps and property clones need
 /// caller admission; this API neither models all allocations nor grants MEM.
-#[allow(clippy::too_many_arguments)]
 pub fn derive_fragment_output_properties_observed(
     fragment: &Fragment,
     cuts: &FragmentCuts,
@@ -1182,7 +1181,6 @@ fn derive_fragment_output_properties_core(
 /// Projection ceilings cover only the occurrence index. The caller must admit
 /// delegated structural scratch and output property clones before entry;
 /// neither these ceilings nor the returned facts grant host memory.
-#[allow(clippy::too_many_arguments)]
 pub fn derive_replica_sensitive_output_properties_observed(
     fragment: &Fragment,
     uses: &crate::PhysicalRootUses,
@@ -1384,7 +1382,6 @@ pub(crate) fn validate_node_output_properties_from(
     .map(|_| ())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn derive_node_output_properties_from(
     fragment: &Fragment,
     node: &PhysicalNode,
@@ -2112,7 +2109,6 @@ fn validate_assertion_properties_from(
     Some(expected)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_table_function_properties_from(
     fragment: &Fragment,
     node: &PhysicalNode,

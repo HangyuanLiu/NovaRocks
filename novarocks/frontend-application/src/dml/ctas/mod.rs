@@ -60,10 +60,6 @@ impl DmlService {
     /// frontend record cannot safely replay, abort, clean up, or adjudicate a
     /// provider-owned staged-create publication after the originating process
     /// has gone away.
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
     pub(crate) fn prepare_ctas(
         &self,
         engine: &dyn CtasEngine,
@@ -132,10 +128,6 @@ impl DmlService {
         })
     }
 
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
     pub(crate) fn execute_prepared_ctas(
         &self,
         engine: &dyn CtasEngine,
@@ -154,10 +146,6 @@ impl DmlService {
     }
 }
 
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
 #[expect(
     clippy::too_many_arguments,
     reason = "The statement boundary keeps its source and session inputs explicit."
@@ -239,10 +227,6 @@ fn execute_standard_ctas_operation(
     finish_standard_publication(engine, &mut attempt, target, publish)
 }
 
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
 fn finish_standard_publication(
     engine: &dyn CtasEngine,
     attempt: &mut DmlPublicationAttempt,

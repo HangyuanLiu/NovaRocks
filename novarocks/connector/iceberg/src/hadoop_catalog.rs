@@ -1219,7 +1219,6 @@ impl HadoopFileSystemCatalog {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn reconcile_create_using_io(
         &self,
         namespace: &str,

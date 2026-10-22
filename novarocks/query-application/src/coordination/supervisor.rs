@@ -1210,7 +1210,6 @@ fn supervise_residual_rows_attempt(
     });
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn converge_rows_attempts(
     active: &mut SupervisedActiveNativeOwner,
     active_contexts: &[novarocks_execution_contract::QueryContextRef],
@@ -1264,7 +1263,6 @@ async fn converge_residual_rows_attempts(
     result
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn drive_rows_attempt_until_pump_decision(
     active: &mut dyn ActiveNativeAttemptOwner,
     drive: &NativeAttemptDrive,
@@ -1314,7 +1312,6 @@ async fn drive_rows_attempt_until_pump_decision(
     (pump_result,)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn supervise_rows(
     actor: &super::LogicalExecutionActor,
     session: &mut LogicalNativeSession,

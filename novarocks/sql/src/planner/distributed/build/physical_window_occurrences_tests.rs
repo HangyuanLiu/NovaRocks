@@ -204,7 +204,6 @@ fn count_binding(catalog: &EngineFunctionCatalog, types: &[FunctionValueType]) -
     }
 }
 // The fixture spells every authored WindowCall field at its call sites.
-#[allow(clippy::too_many_arguments)]
 fn window(
     builder: &mut FragmentBuilder,
     input: NodeId,
@@ -230,7 +229,6 @@ fn window(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn window_with_passthrough(
     builder: &mut FragmentBuilder,
     input: NodeId,

@@ -515,7 +515,6 @@ pub struct ConnectorDistributedRewritePlan {
 }
 
 impl ConnectorDistributedRewritePlan {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         request: &ConnectorDistributedRewritePlanningRequest,
         state_digest: [u8; 32],
@@ -772,7 +771,6 @@ struct RewriteLeaseRelease {
 }
 
 impl ConnectorDistributedRewriteLease {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         control_runtime_id: ConnectorControlRuntimeId,

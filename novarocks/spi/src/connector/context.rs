@@ -319,7 +319,6 @@ pub struct ResolvedVendedS3Access {
 }
 
 impl ResolvedVendedS3Access {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage_access_domain_id: StorageAccessDomainId,
         lease_id: CredentialLeaseId,

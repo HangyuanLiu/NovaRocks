@@ -570,7 +570,6 @@ impl FrontendQueryCompiler {
     /// for execution -- the same driver, the same facts, the same version --
     /// and then printed rather than run. Nothing is executed, and the
     /// capabilities the completion takes are released with it.
-    #[allow(clippy::too_many_arguments)]
     fn complete_distributed_explain(
         &self,
         query: &Query,
@@ -660,7 +659,6 @@ impl FrontendQueryCompiler {
     /// -- the sealed path reached the same catalogs synchronously from the
     /// same threads -- and leaves making preparation itself asynchronous as
     /// its own change.
-    #[allow(clippy::too_many_arguments)]
     fn complete_distributed_read(
         &self,
         purpose: FrontendQueryPurpose,
@@ -829,7 +827,6 @@ impl FrontendQueryCompiler {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn complete_distributed_profile(
         &self,
         query: &Query,
@@ -992,7 +989,6 @@ impl FrontendQueryCompiler {
         Ok(PreparedQueryOperation::Distributed(operation))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn analyze_request<'a>(
         &'a self,
         query: &Query,

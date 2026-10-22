@@ -611,10 +611,6 @@ fn final_plan_construction_error(
 /// plan addresses that scan by is the one occurrence the finalized read set
 /// accounts for. Taking it from anywhere else would let the plan name a read
 /// nothing was frozen for.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Frozen write facts and the request's read-only control remain separate inputs."
-)]
 pub fn build_final_frozen_connector_write_plan(
     source: crate::planning::query_execution::FrozenConnectorScanPlan,
     sink: DmlWritePlanInput,
@@ -829,7 +825,6 @@ pub fn compile_final_connector_write_plan(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn complete_connector_write_plan(
     mut physical: crate::planner::physical::PhysicalPlanNode,
     query_statistics: &crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -1271,7 +1266,6 @@ impl DmlChangeStreamCompletion {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     producer: crate::optimizer::OptimizedOperatorNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -1531,7 +1525,6 @@ pub(crate) fn seal_final_change_stream_producer(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     producer: crate::optimizer::OptimizedOperatorNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -1845,7 +1838,6 @@ fn build_update_change_event_expand(
     .map_err(crate::compiler::SqlCompileError::Compilation)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_merge_change_event_expand(
     optimized_tree: crate::optimizer::OptimizedOperatorNode,
     target_columns: &[novarocks_types::schema::ColumnDef],

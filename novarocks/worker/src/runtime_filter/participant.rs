@@ -156,7 +156,6 @@ impl WorkerRuntimeFilterParticipant {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         install: BackendParticipantInstall,
         observation: Arc<RuntimeFilterObservationEmitter>,

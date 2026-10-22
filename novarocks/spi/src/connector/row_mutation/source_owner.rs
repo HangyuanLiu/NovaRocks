@@ -323,7 +323,6 @@ impl ConnectorRowMutationSourceBuilder {
     /// `node` is the schema's preorder type-node ordinal. The factory selects
     /// the type itself, so equal but independently allocated caller DataTypes
     /// cannot smuggle uncharged Field or metadata backing into the result.
-    #[allow(clippy::too_many_arguments)]
     pub fn array(
         &mut self,
         node: usize,

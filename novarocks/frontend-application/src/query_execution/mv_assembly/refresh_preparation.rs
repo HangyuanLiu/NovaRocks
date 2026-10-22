@@ -796,7 +796,6 @@ fn definition_has_join(query: &novarocks_parser::ast::Query) -> bool {
 /// Join first refresh remains behind its typed logical binder and therefore
 /// fails closed here rather than using the old frontend row-materialization
 /// implementation.
-#[allow(clippy::too_many_arguments)]
 fn prepare_frontend_first_refresh_write(
     source: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
@@ -1387,7 +1386,6 @@ fn prepare_metadata_only_publication(
     Ok((write, admitted))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn mv_refresh_publication_intent(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -1511,7 +1509,6 @@ fn baseline_previous_sources(baseline: &RefreshStateBaseline) -> &[RefreshStateB
 /// writer contract.  Join branches and policy-driven full rebuilds retain
 /// their explicit preparation boundary until their distinct physical artifacts
 /// are extracted; treating either as an append would be incorrect.
-#[allow(clippy::too_many_arguments)]
 enum PreparedIncrementalRefreshWork {
     MetadataOnly,
     ChangeStream(PreparedMvIncrementalWrite, AdmittedMvDataPublication),

@@ -1174,7 +1174,6 @@ pub(crate) fn iceberg_write_shuffle_by_output_index(
 /// The session is both the reason the plan is a dataflow and the source of the
 /// recipes it carries, so it is taken here rather than attached later: a plan
 /// and the session that sealed it must not be separable.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_query_as_iceberg_write_with_write_session(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
@@ -1206,7 +1205,6 @@ pub(crate) fn prepare_query_as_iceberg_write_with_write_session(
 
 /// The original constant source author retains complete types separately from
 /// the owned syntax query; ordinary cells use the same compiler body.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_query_as_iceberg_write_with_write_session_and_constants(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
@@ -1252,7 +1250,6 @@ pub(crate) fn prepare_query_as_iceberg_write_with_write_session_and_constants(
 /// replaces: the frozen single-file source is not a durable catalog table, and
 /// the overlay is consumed by the application materializer without ever being
 /// registered in the shared local catalog.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_query_as_iceberg_write_at_write_target(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
@@ -1399,7 +1396,6 @@ enum DmlMaterializedWriteSource {
     Expressions(novarocks_sql::compiler::SqlExpressionConstants),
 }
 
-#[allow(clippy::too_many_arguments)]
 fn prepare_query_as_iceberg_write_with_connector_binding(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,

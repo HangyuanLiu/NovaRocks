@@ -932,7 +932,6 @@ impl LogicalExecutionActorConfig {
     ///     );
     /// }
     /// ```
-    #[allow(clippy::too_many_arguments)]
     pub fn single_attempt_read_rows(
         initial_execution: QueryExecutionId,
         mailbox_capacity: NonZeroUsize,
@@ -1016,7 +1015,6 @@ impl LogicalExecutionActorConfig {
 
     /// Constructs an effect-free read whose whole attempt may restart only
     /// before any result packet becomes visible.
-    #[allow(clippy::too_many_arguments)]
     pub fn read_only_pre_visibility_recovery_rows(
         initial_execution: QueryExecutionId,
         mailbox_capacity: NonZeroUsize,

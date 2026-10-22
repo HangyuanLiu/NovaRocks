@@ -298,7 +298,6 @@ impl ConnectorControlBinding {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_write(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -341,7 +340,6 @@ impl ConnectorControlBinding {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_data_mutation(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -364,7 +362,6 @@ impl ConnectorControlBinding {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_capabilities(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -388,7 +385,6 @@ impl ConnectorControlBinding {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_capabilities(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -466,7 +462,6 @@ impl ConnectorControlBinding {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_capabilities_and_metadata_maintenance(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -494,7 +489,6 @@ impl ConnectorControlBinding {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_capabilities_and_staged_create(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -539,7 +533,6 @@ impl ConnectorControlBinding {
         Ok(binding)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_maintenance_capabilities(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -569,7 +562,6 @@ impl ConnectorControlBinding {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_maintenance_capabilities_and_staged_create(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -603,7 +595,6 @@ impl ConnectorControlBinding {
 
     /// Constructs a control binding with all FE-only maintenance facets.
     /// Cleanup deliberately remains absent from BE execution bindings.
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,

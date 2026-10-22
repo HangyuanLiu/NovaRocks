@@ -119,7 +119,6 @@ pub struct MvRefreshPublicationIntent {
 }
 
 impl MvRefreshPublicationIntent {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         publication_id: LakePublicationId,
         target_object_id: ConnectorTableObjectId,

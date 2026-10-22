@@ -126,7 +126,6 @@ impl fmt::Display for BackendParticipantInstallError {
 impl std::error::Error for BackendParticipantInstallError {}
 
 impl BackendMaterializationPolicy {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bloom_bits_per_key: u32,
         bloom_hash_count: u32,
@@ -360,7 +359,6 @@ pub struct BackendChannelInstall {
 }
 
 impl BackendChannelInstall {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         channel_id: RuntimeFilterChannelId,
         execution_contract: RuntimeFilterExecutionContract,

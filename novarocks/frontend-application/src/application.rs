@@ -1223,7 +1223,6 @@ impl FrontendApplicationHost {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn open_with_role_factories_and_state_store_registry(
         state_store: Option<StateStoreHostInput>,
         state_store_registry: &StateStoreProviderRegistry,
@@ -1257,7 +1256,6 @@ impl FrontendApplicationHost {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn open_with_connector_control_host_and_state_store_registry(
         state_store: Option<StateStoreHostInput>,
         state_store_registry: &StateStoreProviderRegistry,

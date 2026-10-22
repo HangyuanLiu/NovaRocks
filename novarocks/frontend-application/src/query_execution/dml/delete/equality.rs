@@ -280,7 +280,6 @@ fn begin_equality_delete_write_session(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn prepare_equality_delete_distributed_write(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,

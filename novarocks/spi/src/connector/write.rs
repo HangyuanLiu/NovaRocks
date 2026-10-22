@@ -1087,7 +1087,6 @@ pub struct ConnectorCommittedPartitionField {
 }
 
 impl ConnectorCommittedPartitionField {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         partition_field_id: i32,
         partition_field_name: impl Into<Arc<str>>,

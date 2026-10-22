@@ -417,7 +417,6 @@ pub(crate) struct MvObservedMaintenancePolicy {
 }
 
 impl MvMaintenanceMetadataObservation {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         current_snapshot_id: Option<i64>,
         snapshots: Vec<MvObservedSnapshot>,

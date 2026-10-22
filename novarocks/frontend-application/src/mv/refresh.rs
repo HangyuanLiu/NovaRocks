@@ -220,7 +220,6 @@ fn record_data_publication_terminal(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn execute_data(
     dependencies: &FrontendMvRefreshDependencies,
     planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
@@ -442,7 +441,6 @@ fn bind_and_execute_data_write(
 /// fast-forwarded -- three commits, an intermediate branch a crash could
 /// strand, and no P document at all, so the canonical projection had nothing
 /// to read and the refresh failed after its external effects had landed.
-#[allow(clippy::too_many_arguments)]
 fn execute_metadata_only(
     dependencies: &FrontendMvRefreshDependencies,
     planning: &novarocks_spi::connector::ConnectorControlPlanningLease,

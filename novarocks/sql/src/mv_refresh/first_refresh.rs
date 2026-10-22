@@ -929,7 +929,6 @@ pub fn begin_final_mv_incremental_refresh_change_stream(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn canonical_incremental_change_stream_request<'a>(
     query: ast::Query,
     imv_rewrite: &'a crate::compiler::SqlImvPlanningInput,
@@ -2296,7 +2295,6 @@ pub struct SqlMvFirstRefreshArtifactBuilder {
 }
 
 impl SqlMvFirstRefreshArtifactBuilder {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         select_query: ast::Query,
         pin: SqlMvSnapshotPin,

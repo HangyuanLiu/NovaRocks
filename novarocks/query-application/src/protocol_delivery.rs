@@ -119,7 +119,6 @@ impl GovernedProtocolOwner {
 
     /// A Local caller destroys its renderer/source and transfers only the
     /// bounded writer tail. Any still-live ordinary backing keeps its alias.
-    #[allow(clippy::result_large_err)]
     pub fn into_closing_delivery<W>(
         self,
         writer: W,
@@ -357,7 +356,6 @@ impl GovernedImmediateStatementResult {
     /// Transfer a freshly produced, closed Local graph while the admitted
     /// statement still retains the exact producer window. The application
     /// source audit, not the graph's runtime shape, establishes exclusivity.
-    #[allow(clippy::result_large_err)]
     pub fn try_new(
         result: QueryResult,
         statement: GovernedQueryStatementOwner,
@@ -527,7 +525,6 @@ impl StreamingStatementResult {
 
     /// Transfer only after the independent capacity proves the complete tail.
     /// A rejected handoff returns every original owner intact.
-    #[allow(clippy::result_large_err)]
     pub fn into_closing_delivery<W>(
         mut self,
         writer: W,

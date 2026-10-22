@@ -89,7 +89,6 @@ impl SlotCore {
     ) {
         unsafe { self.add_inner(store, reference, tagged, r1_small, count, buffered, true) };
     }
-    #[allow(clippy::too_many_arguments)]
     unsafe fn add_inner(
         &mut self,
         store: &RecordStore,

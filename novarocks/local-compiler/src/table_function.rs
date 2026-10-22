@@ -319,7 +319,6 @@ pub(crate) struct LoweredTableFunction {
 /// Lower one planned table function into its argument Project and the local
 /// TableFunction. `pass_through_definitions` are the Project's synthesized
 /// slot-read definitions, in planned pass-through order.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_table_function_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
@@ -346,7 +345,6 @@ pub(crate) fn lower_table_function_with_creation<H>(
     crate::creation::finish_attempt(result, work)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn lower_core_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,

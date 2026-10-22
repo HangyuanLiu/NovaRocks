@@ -196,7 +196,6 @@ impl IcebergMvCorePorts {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_management_entrance(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,

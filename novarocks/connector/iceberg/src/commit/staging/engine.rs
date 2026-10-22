@@ -296,7 +296,6 @@ impl<'a> StagingEngine<'a> {
 
 /// Freeze an existing-table metadata/ref change through canonical staging.
 /// This capability owns no FileIO and cannot allocate or adopt any artifact.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn freeze_existing_change(
     target: TableIdent,
     target_ref: &str,

@@ -963,7 +963,6 @@ impl RootSessionState {
     }
     /// One cursor for one original input, chosen by the frozen root purpose.
     /// Every cursor's storage is prepaid by `capacity` before it is created.
-    #[allow(clippy::too_many_arguments)]
     fn begin_encoder(
         &self,
         input: &Input,

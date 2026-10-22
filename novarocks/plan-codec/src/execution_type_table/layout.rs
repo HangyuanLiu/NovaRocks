@@ -414,7 +414,6 @@ pub(super) fn validate_schema_root<H>(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_field<H>(
     field: &wire::ArrowPhysicalField,
     id: u32,
@@ -450,7 +449,6 @@ fn validate_field<H>(
         context,
     )
 }
-#[allow(clippy::too_many_arguments)]
 pub(super) fn validate<H>(
     value: &wire::ArrowPhysicalType,
     id: u32,

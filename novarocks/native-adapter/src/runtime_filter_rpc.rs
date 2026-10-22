@@ -392,7 +392,6 @@ pub struct BackendNativeRuntimeFilterEnvelope {
     reason = "Retained for target-specific native integration and regression coverage."
 )]
 impl BackendNativeRuntimeFilterEnvelope {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         kind: novarocks_worker::runtime_filter::domain::BackendEnvelopeKind,
         participant: BackendParticipantIdentity,

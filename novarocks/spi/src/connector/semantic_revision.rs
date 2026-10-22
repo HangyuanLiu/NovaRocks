@@ -153,7 +153,6 @@ impl ConnectorExactSemanticRevision {
     /// This does not interpret either value. It reapplies the SPI bounds and
     /// requires one provider identity for both halves so a persisted bare byte
     /// string can never be promoted into an exact revision by itself.
-    #[allow(clippy::too_many_arguments)]
     pub fn try_from_persisted_facts(
         provider: ConnectorProviderId,
         object_format: impl Into<Arc<str>>,

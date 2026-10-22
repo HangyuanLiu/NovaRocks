@@ -623,7 +623,6 @@ pub(super) fn finish<T>(
 /// inline/namespace floors do not prove nested strings, metadata bucket backing
 /// or a formal host grant. Full graph, node, occurrence and kernel validity
 /// remains the sole checked FragmentPackage/compiler chain's responsibility.
-#[allow(clippy::too_many_arguments)]
 pub fn prepare_expression_definitions<'loan, 'source, 'control>(
     arena: &'loan ExprArena,
     inputs: &'loan [ExpressionTypeIds<'source>],
@@ -653,7 +652,6 @@ pub fn prepare_expression_definitions<'loan, 'source, 'control>(
     );
     finish(work, result)
 }
-#[allow(clippy::too_many_arguments)]
 pub fn prepare_expression_definitions_in<'loan, 'source, 'control>(
     arena: &'loan ExprArena,
     inputs: &'loan [ExpressionTypeIds<'source>],
@@ -682,7 +680,6 @@ pub fn prepare_expression_definitions_in<'loan, 'source, 'control>(
         work,
     )
 }
-#[allow(clippy::too_many_arguments)]
 fn prepare_core<'loan, 'source, 'control>(
     arena: &'loan ExprArena,
     inputs: &'loan [ExpressionTypeIds<'source>],
@@ -1179,7 +1176,6 @@ fn prepare_core<'loan, 'source, 'control>(
     })()
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn encode_expression_definitions<'loan, 'source, 'control>(
     arena: &'loan ExprArena,
     inputs: &'loan [ExpressionTypeIds<'source>],

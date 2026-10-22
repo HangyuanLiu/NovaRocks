@@ -364,7 +364,6 @@ trait IcebergDataMutationBackend: Send + Sync {
         ConnectorError,
     >;
 
-    #[allow(clippy::result_large_err)]
     fn execute(
         &self,
         planned: &PlannedIcebergMutation,

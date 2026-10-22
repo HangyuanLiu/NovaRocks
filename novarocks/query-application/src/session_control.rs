@@ -576,7 +576,6 @@ impl QueryControlService {
 
     /// Acquire the complete result position together with nonqueued business
     /// admission, before registering or starting the statement's producer.
-    #[allow(clippy::too_many_arguments)]
     pub fn begin_governed_statement_with_result(
         &self,
         session: SessionToken,
@@ -598,7 +597,6 @@ impl QueryControlService {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn begin_nonqueued(
         &self,
         session: SessionToken,

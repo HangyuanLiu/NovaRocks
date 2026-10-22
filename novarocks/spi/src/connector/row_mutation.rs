@@ -313,7 +313,6 @@ impl<'a> ConnectorMutationSelectionFieldRef<'a> {
 }
 
 impl ConnectorMutationMatchContract {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         owner: ConnectorProviderBindingKey,
         table: ConnectorTableHandle,
@@ -347,7 +346,6 @@ impl ConnectorMutationMatchContract {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::ptr_arg)]
     fn validate_match_layout(
         owner: &ConnectorProviderBindingKey,
@@ -630,7 +628,6 @@ pub struct ConnectorRowMutationRoute {
 }
 
 impl ConnectorRowMutationRoute {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         route_id: ConnectorWriteRouteId,
         cohort_id: ConnectorWriteCohortId,
@@ -753,7 +750,6 @@ pub struct ConnectorRowMutationPreparation {
 }
 
 impl ConnectorRowMutationPreparation {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         owner: ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
@@ -1450,7 +1446,6 @@ impl ConnectorRowMutationCohortRecipe {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn try_rewrite(
         cohort_id: ConnectorWriteCohortId,
         route_id: ConnectorWriteRouteId,
@@ -2068,7 +2063,6 @@ fn validate_recipe_body_shape(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_copy_on_write_plan(
     preparation: &ConnectorRowMutationPreparation,
     selection: &ConnectorRowMutationSelection,
@@ -2430,7 +2424,6 @@ fn digest_owner(hasher: &mut Sha256, owner: &ConnectorProviderBindingKey) {
 // Every argument is a distinct field of the digest this function seals. Folding
 // them into a struct would add a type whose only purpose is to be destructured
 // again here, and would let a caller build a partially-populated digest input.
-#[allow(clippy::too_many_arguments)]
 fn match_digest(
     owner: &ConnectorProviderBindingKey,
     table: &ConnectorTableHandle,
@@ -2624,7 +2617,6 @@ fn execution_plan_digest(
 }
 // Same reasoning as `match_digest`: these are the sealed digest's fields, not a
 // parameter list that wants grouping.
-#[allow(clippy::too_many_arguments)]
 fn preparation_digest(
     owner: &ConnectorProviderBindingKey,
     operation: ConnectorWriteOperationId,

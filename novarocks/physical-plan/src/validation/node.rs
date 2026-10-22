@@ -3308,7 +3308,6 @@ fn validate_aggregate_contract(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_grouped_topn(
     fragment: &Fragment,
     node: &PhysicalNode,

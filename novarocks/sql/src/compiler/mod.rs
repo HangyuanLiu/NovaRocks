@@ -993,7 +993,6 @@ pub struct SqlAnalyzeRequest<'a> {
 }
 
 impl<'a> SqlAnalyzeRequest<'a> {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         statement: SqlStatementInput,
         intent: SqlCompileIntent,
@@ -1030,7 +1029,6 @@ impl<'a> SqlAnalyzeRequest<'a> {
     /// Constant evaluation stays available: it materializes no binding and
     /// touches no catalog, and withholding it would make a re-entered plan
     /// fold differently from the same plan compiled directly.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_logical(
         plan: crate::planner::logical::LogicalPlanNode,
         factory: crate::column_id::ColumnRefFactory,
@@ -1362,7 +1360,6 @@ pub fn compile_imv_refresh_explain_lines(
     output.into_explain_lines(level, true, &explain_control)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn imv_refresh_explain_request<'a>(
     query: novarocks_parser::ast::Query,
     imv_rewrite: &'a SqlImvPlanningInput,

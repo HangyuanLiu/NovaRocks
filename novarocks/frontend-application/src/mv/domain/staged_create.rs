@@ -637,7 +637,6 @@ pub(crate) struct PublishedOutput {
     pub(crate) snapshot_id: i64,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn install_current_projection(
     entrance: &ManagementEntrance,
     readiness: &crate::mv::domain::readiness::MvReadinessPort,

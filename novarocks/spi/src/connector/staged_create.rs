@@ -1160,7 +1160,6 @@ impl ConnectorStagedCreateLease {
 
     /// Constructs the provider-private prepare carrier from facts already
     /// frozen by the FE-owned control-runtime lease.
-    #[allow(clippy::too_many_arguments)]
     pub fn prepare_request(
         &self,
         publication_id: LakePublicationId,
@@ -1186,7 +1185,6 @@ impl ConnectorStagedCreateLease {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn prepare_document_managed_request(
         &self,
         publication_id: LakePublicationId,

@@ -174,7 +174,6 @@ pub struct IcebergOldDeleteArtifactRef {
 }
 
 impl IcebergOldDeleteArtifactRef {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         path: String,
         content: IcebergFileContent,

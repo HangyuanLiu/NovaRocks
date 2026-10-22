@@ -96,7 +96,6 @@ impl IcebergWritePreparationOptions {
 
 /// Prepare an Iceberg write with an application-preallocated operation
 /// identity. This still performs no writer execution or catalog mutation.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_iceberg_write_with_options(
     state: &DmlExecutionKernel,
     target: &TargetBackend,
@@ -151,7 +150,6 @@ pub(crate) fn prepare_iceberg_write_with_options(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn prepare_iceberg_distributed_write(
     state: &DmlExecutionKernel,
     target: &TargetBackend,
@@ -271,7 +269,6 @@ fn prepare_iceberg_distributed_write(
 /// The table is named the way the provider parses it -- namespace-qualified,
 /// last dot separating the table -- so a multi-level namespace round-trips
 /// instead of losing its trailing level.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn connector_write_begin_request(
     target: &TargetBackend,
     target_ref: &str,
@@ -291,7 +288,6 @@ pub(crate) fn connector_write_begin_request(
 /// An application-document publication must name the base its declaration was
 /// built against, so the provider can refuse a session that would publish onto
 /// a different one.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn connector_write_begin_request_on_base(
     target: &TargetBackend,
     target_ref: &str,
@@ -472,7 +468,6 @@ struct FrozenIcebergWriteSemanticBinding {
 
 /// Admit the complete provider-declared input before shaping INSERT source
 /// expressions. This opens no write session and performs no external effect.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_iceberg_write_plan(
     write_lease: &novarocks_spi::connector::ConnectorWriteLease,
     target_ref: &str,

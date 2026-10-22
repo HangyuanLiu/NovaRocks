@@ -452,7 +452,6 @@ pub struct PaimonSplit {
 }
 
 impl PaimonSplit {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         snapshot_id: i64,
         schema_id: i64,

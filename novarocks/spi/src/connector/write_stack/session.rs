@@ -316,7 +316,6 @@ struct ConnectorWriteRewriteSourceFacts {
     _storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 impl ConnectorWriteRewriteSource {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new_typed(
         source: ConnectorTableHandle,
         pinned_source: ConnectorPinnedFileSet,

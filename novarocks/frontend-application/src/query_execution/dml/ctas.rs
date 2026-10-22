@@ -686,7 +686,6 @@ pub(crate) struct PlannedCtasSourceQuery {
     optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn plan_query_for_ctas_source(
     state: &DmlExecutionKernel,
     current_catalog: Option<&str>,

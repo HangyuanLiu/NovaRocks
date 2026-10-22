@@ -1188,7 +1188,6 @@ impl FrontendQueryService {
         self
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         session_catalog_resolver: SessionCatalogService,
         query_compiler: FrontendQueryCompiler,
@@ -5366,7 +5365,6 @@ mod tests {
     /// Test-only router fixture. Production routing is the typed branch in
     /// `execute_typed_statement`; this helper keeps focused unit tests independent of
     /// a running frontend session.
-    #[allow(clippy::too_many_arguments)]
     fn execute_frontend_command<C>(
         dml: &DmlService,
         insert_engine: &dyn InsertEngine,

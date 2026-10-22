@@ -2446,10 +2446,6 @@ impl<'a> AnalyzerContext<'a> {
     /// inner WHERE would no longer resolve. Instead, we mirror the EXISTS
     /// path: take the subquery's FROM as the join's right side, and place
     /// the subquery's full WHERE plus the eq_cond into the join condition.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "The rewrite accepts the frozen correlated-subquery facts without rebuilding a synthetic carrier."
-    )]
     fn rewrite_correlated_in_subquery(
         &self,
         select: &mut ResolvedSelect,

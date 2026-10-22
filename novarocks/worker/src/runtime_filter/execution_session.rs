@@ -99,7 +99,6 @@ pub struct WorkerRuntimeFilterExecutionSession {
 }
 
 impl WorkerRuntimeFilterExecutionSession {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         fragment_instance_id: UniqueId,
         participant: BackendParticipantIdentity,

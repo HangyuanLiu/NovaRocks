@@ -81,7 +81,6 @@ pub(crate) struct QueryCompilerPorts {
 }
 
 impl QueryCompilerPorts {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -189,7 +188,6 @@ pub struct DmlEnginePorts {
 }
 
 impl DmlEnginePorts {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -384,7 +382,6 @@ pub struct MaintenanceCommandPorts {
 }
 
 impl MaintenanceCommandPorts {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -665,7 +662,6 @@ pub(crate) struct MvRefreshProviderActivationPorts {
 }
 
 impl MvRefreshProviderActivationPorts {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,

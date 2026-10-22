@@ -596,7 +596,6 @@ mod tests {
     use crate::{BePorts, CrossProcessRuntime};
     use std::path::PathBuf;
 
-    #[allow(clippy::too_many_arguments)]
     fn config(
         role: &str,
         http: u16,
@@ -650,7 +649,6 @@ mod tests {
         evidence_with_options(root, ports, secret, extra, profile, "disabled", None, None)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn evidence_with_options(
         root: &Path,
         ports: (u16, u16, u16, u16, u16, u16),

@@ -569,7 +569,6 @@ fn prepare_table_creation(
     Ok((namespace, creation))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn execute_create_table(
     provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
@@ -2408,7 +2407,6 @@ fn guarded_property_commit_conflict(kind: crate::iceberg::ErrorKind) -> bool {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn execute_guarded_publication(
     provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,

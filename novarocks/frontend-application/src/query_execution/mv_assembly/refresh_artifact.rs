@@ -131,7 +131,6 @@ pub(crate) struct MvFirstRefreshWriteRequest {
 }
 
 impl MvFirstRefreshWriteRequest {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         target_catalog: String,
         target_namespace: String,
@@ -420,7 +419,6 @@ impl MvIncrementalWriteRequest {
         &self.target_table
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         target_catalog: String,
         target_namespace: String,

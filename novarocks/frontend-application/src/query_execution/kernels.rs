@@ -101,7 +101,6 @@ impl SystemTableQueryKernel {
 }
 
 impl QueryPreparationKernel {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
@@ -366,7 +365,6 @@ pub struct CatalogCommandKernel {
 }
 
 impl CatalogCommandKernel {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -481,7 +479,6 @@ pub struct MaintenanceExecutionKernel {
 }
 
 impl MaintenanceExecutionKernel {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,

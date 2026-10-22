@@ -102,7 +102,6 @@ pub struct MvAggregateStateColumn {
 }
 
 impl MvAggregateStateColumn {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         value_type: FunctionValueType,

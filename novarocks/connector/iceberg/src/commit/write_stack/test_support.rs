@@ -99,7 +99,6 @@ fn document_publication_id() -> novarocks_spi::connector::LakePublicationId {
 
 /// Ask the actual document provider for admission, under the same explicitly
 /// admitted catalog fixture used by document_publication_for_refusal.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn admitted_document_publication_declaration(
     runtime: &std::sync::Arc<crate::metadata_context::IcebergMetadataContext>,
     incarnation: ProviderBindingEpoch,

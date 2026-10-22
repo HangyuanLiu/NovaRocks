@@ -212,7 +212,6 @@ pub struct FragmentInstanceSpec {
 }
 
 impl FragmentInstanceSpec {
-    #[allow(clippy::too_many_arguments)]
     pub fn new_native(
         contract_version: FragmentContractVersion,
         query_id: QueryId,

@@ -1113,7 +1113,6 @@ impl ProviderReadPageSourceProvider<PaimonReadRuntime> for PaimonExecutionPageSo
     /// validates and registers frozen facts; its first poll loads the exact
     /// schema and opens the SDK stream, awaited through the split's own
     /// operations, without parking a thread.
-    #[allow(clippy::too_many_arguments)]
     fn create_page_stream(
         &self,
         _session: &ConnectorSession,

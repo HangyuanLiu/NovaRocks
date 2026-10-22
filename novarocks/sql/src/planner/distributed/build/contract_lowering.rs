@@ -725,7 +725,6 @@ fn runtime_filter_scan_lineage(
     target: (FragmentId, NodeId, ValueId),
     dead_end: &mut Option<LineageDeadEnd>,
 ) -> Option<Box<[RuntimeFilterLineageStep]>> {
-    #[allow(clippy::too_many_arguments)]
     fn walk(
         fragments: &BTreeMap<FragmentId, Fragment>,
         edges: &BTreeMap<EdgeId, Edge>,

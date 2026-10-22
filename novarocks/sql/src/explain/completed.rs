@@ -265,7 +265,6 @@ impl SqlExplainOperatorMetrics {
         self
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub const fn with_dictionary_counts(
         mut self,
         input_rows: i64,

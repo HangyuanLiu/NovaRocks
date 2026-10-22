@@ -64,7 +64,6 @@ pub trait WriteExecutor {
     type CommitHandle;
     type AbortHandle;
 
-    #[allow(clippy::result_large_err)]
     fn run_coordinated_write(
         &self,
         spec: &WriteTransactionSpec,
@@ -109,7 +108,6 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
         Self { executor, family }
     }
 
-    #[allow(clippy::result_large_err)]
     pub(crate) fn run(
         &self,
         spec: WriteTransactionSpec,
@@ -207,7 +205,6 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
         }
     }
 
-    #[allow(clippy::result_large_err)]
     fn complete_commit(
         &self,
         spec: &WriteTransactionSpec,
@@ -306,7 +303,6 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
         }
     }
 
-    #[allow(clippy::result_large_err)]
     fn finish_committed(
         &self,
         spec: &WriteTransactionSpec,

@@ -1319,7 +1319,6 @@ pub struct SqlImvSchemaContractFacts {
 }
 
 impl SqlImvSchemaContractFacts {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         bases: Vec<SqlImvBaseContractFacts>,
         output_columns: Vec<SqlImvOutputColumnFacts>,
@@ -1418,7 +1417,6 @@ pub struct SqlImvAggregateExecutionStateColumnFacts {
 }
 
 impl SqlImvAggregateExecutionStateColumnFacts {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         name: String,
         value_type: novarocks_type_contract::FunctionValueType,
@@ -1458,7 +1456,6 @@ pub struct SqlImvAggregateExecutionFacts {
 }
 
 impl SqlImvAggregateExecutionFacts {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         group_key_count: usize,
         visible_outputs: Vec<crate::mv_refresh::VisibleAggregateOutput>,
@@ -1543,7 +1540,6 @@ pub(crate) struct SqlImvRewriteSnapshot {
 }
 
 impl SqlImvRewriteSnapshot {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_frozen_parts(
         target: novarocks_types::naming::TableIdentity,
         target_binding: SqlTableBindingId,
@@ -2510,7 +2506,6 @@ pub struct SqlMvRewriteDefinitionFacts {
 }
 
 impl SqlMvRewriteDefinitionFacts {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         mv_id: i64,
         definition_revision: [u8; 32],

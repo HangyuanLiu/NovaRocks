@@ -548,7 +548,6 @@ impl IcebergMetadataMaintenanceAdapter {
         Ok(outcome)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn execute_expire(
         &self,
         plan: &ConnectorMetadataMaintenancePlan,

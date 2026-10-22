@@ -90,7 +90,6 @@ pub struct VendedS3CredentialLeaseEntry {
 }
 
 impl VendedS3CredentialLeaseEntry {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         prefix: StorageCredentialScopePrefix,
         not_after_unix_ms: u64,
@@ -767,7 +766,6 @@ impl CredentialLoadTableDelegation {
 }
 
 impl CredentialLeaseDescriptor {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         lease_id: CredentialLeaseId,
         epoch: u64,

@@ -1056,7 +1056,6 @@ pub trait ConnectorReadPageSourceProvider: Send + Sync {
     /// Opens one split as a page stream the host polls with `budget`, the
     /// CPU budget it refills every turn. Opening must not wait for I/O: the
     /// stream opens its input when it is first polled.
-    #[allow(clippy::too_many_arguments)]
     fn create_page_stream(
         &self,
         session: &ConnectorSession,

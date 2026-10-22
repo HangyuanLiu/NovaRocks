@@ -574,7 +574,6 @@ pub struct IcebergWriteTableFacts {
 }
 
 impl IcebergWriteTableFacts {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         table_uuid: String,
         namespace: String,
