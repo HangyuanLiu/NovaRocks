@@ -95,6 +95,64 @@ class RendererTests(RendererCase):
         self.assertEqual(before, (self.entry / 'env.sh').read_bytes())
         self.assertEqual(self.backend.events, ['ensure'])
 
+    def test_attach_full_validation_can_exceed_short_lock_wait_budget(self):
+        now = [100.0]
+        def pending(base):
+            now[0] += 0.9
+            return []
+        original_volume = self.backend.validate_minio_volume
+        def volume(snapshot):
+            now[0] += 0.9
+            original_volume(snapshot)
+        def healthy(snapshot):
+            self.assertEqual(self.backend.operation_deadline, 190.0)
+            now[0] += 1.2
+            return True
+        with mock.patch.object(entry.time, 'monotonic', side_effect=lambda: now[0]), \
+                mock.patch.object(self.backend, 'unsettled_operations', side_effect=pending), \
+                mock.patch.object(self.backend, 'validate_minio_volume', side_effect=volume), \
+                mock.patch.object(self.backend, 'healthy', side_effect=healthy):
+            result = self.bind()
+        self.assertTrue(result['ready'])
+        self.assertGreater(now[0], 102.0)
+        self.assertIsNone(self.backend.operation_deadline)
+        self.assertTrue(publication.read(self.entry)['ready'])
+
+    def test_attach_machine_lock_wait_remains_two_seconds(self):
+        now = [100.0]
+        other = machine.MachineOwner(self.owner.root, backend=self.backend)
+        def sleep(seconds):
+            now[0] += seconds
+        with other.maintenance_lock(), \
+                mock.patch.object(entry.time, 'monotonic', side_effect=lambda: now[0]), \
+                mock.patch.object(machine.time, 'sleep', side_effect=sleep), \
+                mock.patch.object(self.backend, 'healthy') as healthy:
+            with self.assertRaisesRegex(runtime.RuntimeFailure, 'MachineMaintaining'):
+                self.bind()
+        self.assertAlmostEqual(now[0], 102.0)
+        healthy.assert_not_called()
+        self.assertFalse(publication.read(self.entry)['ready'])
+        self.assertIsNone(self.backend.operation_deadline)
+
+    def test_attach_validation_expiry_invalidates_entry_without_extending_outer_budget(self):
+        for outer, health_end in ((None, 190.0), (104.0, 104.0)):
+            with self.subTest(outer=outer):
+                now = [100.0]
+                self.bind()
+                self.assertTrue(publication.read(self.entry)['ready'])
+                self.backend.operation_deadline = outer
+                def healthy(snapshot):
+                    self.assertEqual(self.backend.operation_deadline, 190.0 if outer is None else outer)
+                    now[0] = health_end
+                    return True
+                with mock.patch.object(entry.time, 'monotonic', side_effect=lambda: now[0]), \
+                        mock.patch.object(self.backend, 'healthy', side_effect=healthy):
+                    with self.assertRaisesRegex(runtime.RuntimeFailure, 'RunBudgetExpired'):
+                        self.bind()
+                self.assertFalse(publication.read(self.entry)['ready'])
+                self.assertEqual(self.backend.operation_deadline, outer)
+                self.backend.operation_deadline = None
+
     def test_server_warehouse_and_storage_owner_are_actual_machine_facts(self):
         first = self.bind()
         directory = Path(first['published_dir'])
@@ -259,6 +317,96 @@ class RendererTests(RendererCase):
             original(context, staging)
         with mock.patch.object(entry, 'render_entry', side_effect=renderer):
             self.bind()
+
+
+class InheritedAttachBudgetTests(RendererCase):
+    wall = 1792650000.0
+
+    def context(self, remaining_work):
+        from scratch import ScratchIdentity
+        identity = ScratchIdentity.create('s3://novarocks/inherited-owner',
+            now_ms=int(self.wall * 1000) - 10000, token='b' * 32)
+        grace = self.snapshot['policy']['cleanup_grace_seconds']
+        return {'schema': 1, 'identity': identity.as_dict(), 'started_unix_ms': int(self.wall * 1000) - 10000,
+                'deadline_unix_ms': int((self.wall + grace + remaining_work) * 1000),
+                'cleanup_grace_seconds': grace}
+
+    def invoke(self, raw_context, *, health_seconds=0, expected_deadline=None):
+        now = [100.0]
+        fresh_owner = machine.MachineOwner(self.owner.root, backend=self.backend)
+        environment = {**os.environ, 'NOVAROCKS_WORKSPACE_ROOT': str(self.workspace),
+            'NOVA_ENV_CONFIG_FILE': str(HERE / 'shared.env'), 'NOVA_ENV_UPDATE_CURRENT': 'false',
+            'NOVA_FIXTURE_RUN_CONTEXT': raw_context}
+        def verified(config):
+            config['fixture_inputs'].update(lock_sha256=bom()['lock_sha256'], verified=True)
+            return bom()
+        def healthy(snapshot):
+            if expected_deadline is not None:
+                self.assertEqual(self.backend.operation_deadline, expected_deadline)
+            now[0] += health_seconds
+            return True
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(entry.time, 'time', return_value=self.wall), \
+                mock.patch.object(entry.time, 'monotonic', side_effect=lambda: now[0]), \
+                mock.patch.object(machine, 'MachineOwner', return_value=fresh_owner), \
+                mock.patch.object(entry, 'verify_inputs', side_effect=verified), \
+                mock.patch.object(self.backend, 'image_id', wraps=self.backend.image_id) as image_id, \
+                mock.patch.object(self.backend, 'healthy', side_effect=healthy) as health, \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = entry.worktree_main(['up'])
+            self.assertEqual(os.environ['NOVA_FIXTURE_RUN_CONTEXT'], raw_context)
+        actual_entry = self.workspace / 'docker/iceberg-rest/runtime' / entry.environment_identity(self.workspace)
+        self.assertIsNone(getattr(self.backend, 'operation_deadline', None))
+        return code, publication.read(actual_entry), stdout.getvalue(), stderr.getvalue(), health.call_count, image_id.call_count
+
+    def test_real_cli_env_context_bounds_full_validation_without_rewriting_parent(self):
+        original = self.context(4)
+        raw = json.dumps(original, indent=2)
+        code, published, stdout, stderr, health_calls, _ = self.invoke(raw, health_seconds=3, expected_deadline=104.0)
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(published['ready'])
+        self.assertEqual(health_calls, 1)
+        directory = Path(json.loads(stdout)['published_dir'])
+        for path in directory.iterdir():
+            if path.is_file():
+                self.assertNotIn(original['identity']['run_id'], path.read_text(), path.name)
+        self.assertNotIn('run_context', published['config'])
+
+    def test_real_cli_rejects_expired_context_before_definition_or_health(self):
+        code, published, _, stderr, health_calls, image_calls = self.invoke(json.dumps(self.context(-1)))
+        self.assertEqual(code, 1)
+        self.assertIn('RunBudgetExpired', stderr)
+        self.assertFalse(published['ready'])
+        self.assertEqual((health_calls, image_calls), (0, 0))
+
+    def test_real_cli_context_work_expiry_and_owner_cap_do_not_publish_ready(self):
+        for remaining, expected, health_seconds in ((4, 104.0, 4), (200, 190.0, 90)):
+            with self.subTest(remaining=remaining):
+                code, published, _, stderr, health_calls, _ = self.invoke(
+                    json.dumps(self.context(remaining)), health_seconds=health_seconds, expected_deadline=expected)
+                self.assertEqual(code, 1)
+                self.assertIn('RunBudgetExpired', stderr)
+                self.assertEqual(health_calls, 1)
+                self.assertFalse(published['ready'])
+
+    def test_real_cli_invalid_context_fails_fast_and_null_remains_ordinary_up(self):
+        wrong_grace = self.context(4)
+        wrong_grace['cleanup_grace_seconds'] = 1
+        excessive = self.context(4)
+        excessive['deadline_unix_ms'] = excessive['started_unix_ms'] + 86401000
+        invalid = ('{', '[]', '{"schema":1}', 'x' * 16385, json.dumps(wrong_grace), json.dumps(excessive))
+        for raw in invalid:
+            with self.subTest(raw=raw[:30]):
+                code, published, _, stderr, health_calls, image_calls = self.invoke(raw)
+                self.assertEqual(code, 75)
+                self.assertIn('RunBudgetRejected', stderr)
+                self.assertFalse(published['ready'])
+                self.assertEqual((health_calls, image_calls), (0, 0))
+        code, published, _, stderr, health_calls, _ = self.invoke('null', health_seconds=3, expected_deadline=190.0)
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(published['ready'])
+        self.assertEqual(health_calls, 1)
 
 
 class SharedEnvironmentTests(RendererCase):

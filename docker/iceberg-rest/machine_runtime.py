@@ -789,9 +789,14 @@ class MachineOwner:
                                       **copy.deepcopy(verified_bom["derived_images"]["iceberg-spark"])})
 
     @contextmanager
-    def ready_snapshot(self, definition, deadline=None, *, expected_generation=None):
+    def ready_snapshot(self, definition, deadline=None, *, expected_generation=None, lock_deadline=None):
+        if lock_deadline is not None and (type(lock_deadline) not in (int, float) or not math.isfinite(lock_deadline)):
+            raise runtime.RuntimeFailure("InvalidConfiguration", "machine lock deadline must be finite")
         previous = getattr(self.backend, "operation_deadline", None)
         effective = deadline if previous is None else previous if deadline is None else min(previous, deadline)
+        lock_limit = effective
+        if lock_deadline is not None:
+            lock_limit = lock_deadline if effective is None else min(effective, lock_deadline)
         self.backend.operation_deadline = effective
         def check_deadline():
             if effective is not None and time.monotonic() >= effective:
@@ -799,7 +804,7 @@ class MachineOwner:
         try:
             check_deadline()
             self.assert_live_daemon()
-            with self.maintenance_lock(effective):
+            with self.maintenance_lock(lock_limit):
                 state = self.read_saved_state()
                 if not state or state["phase"] != "ready":
                     raise runtime.RuntimeFailure("MachineUnavailable", "start or finish machine maintenance explicitly")

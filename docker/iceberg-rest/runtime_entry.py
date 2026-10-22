@@ -716,12 +716,44 @@ def attach_entry(owner, env_id, entry, config, bom):
     entry = Path(entry).resolve()
     with runtime.file_lock(entry / '.entry.lock'):
         try:
-            definition = owner.required_definition(owner.load_config(), bom)
-            with owner.ready_snapshot(definition, deadline=time.monotonic() + 2) as snapshot:
-                if config['benchmark']['shared_root'].rstrip('/') != snapshot['config']['benchmark_root']:
-                    raise runtime.RuntimeFailure('MachineVersionMismatch', 'worktree benchmark root differs from machine configuration')
-                return publication.publish(entry, {'worktree': env_id, 'ready': True,
-                    'machine': snapshot, 'config': config, 'producer_receipt': snapshot['producer_receipt']}, render_entry)
+            started = time.monotonic()
+            deadline = started + owner.timeout
+            inherited = None
+            raw_context = os.environ.get('NOVA_FIXTURE_RUN_CONTEXT')
+            if raw_context is not None:
+                if len(raw_context) > 16384:
+                    raise runtime.RuntimeFailure('RunBudgetRejected', 'inherited context exceeds its input bound')
+                try:
+                    inherited = json.loads(raw_context)
+                except ValueError as error:
+                    raise runtime.RuntimeFailure('RunBudgetRejected', 'invalid inherited run context JSON') from error
+            if inherited is not None:
+                from scratch import RunBudget, ScratchIdentity
+                if not isinstance(inherited, dict) or 'identity' not in inherited:
+                    raise runtime.RuntimeFailure('RunBudgetRejected', 'attach requires the original run context')
+                saved = owner.read_saved_state()
+                if not saved or saved['phase'] != 'ready':
+                    raise runtime.RuntimeFailure('MachineUnavailable', 'shared fixture has no ready saved authority')
+                identity = ScratchIdentity.from_dict(inherited['identity'])
+                budget = RunBudget.admit(saved, identity, inherited=inherited,
+                                         wall_clock=time.time, monotonic=time.monotonic)
+                deadline = min(deadline, budget.deadline - budget.cleanup_grace_seconds)
+            previous = getattr(owner.backend, 'operation_deadline', None)
+            owner.backend.operation_deadline = min(previous, deadline) if previous is not None else deadline
+            try:
+                definition = owner.required_definition(owner.load_config(), bom)
+                # Lock contention stays short; full validation retains the original work deadline.
+                with owner.ready_snapshot(definition, deadline=deadline,
+                                          lock_deadline=time.monotonic() + 2) as snapshot:
+                    if inherited is not None:
+                        RunBudget.admit(snapshot, identity, inherited=inherited,
+                                        wall_clock=time.time, monotonic=time.monotonic).check(work=True)
+                    if config['benchmark']['shared_root'].rstrip('/') != snapshot['config']['benchmark_root']:
+                        raise runtime.RuntimeFailure('MachineVersionMismatch', 'worktree benchmark root differs from machine configuration')
+                    return publication.publish(entry, {'worktree': env_id, 'ready': True,
+                        'machine': snapshot, 'config': config, 'producer_receipt': snapshot['producer_receipt']}, render_entry)
+            finally:
+                owner.backend.operation_deadline = previous
         except runtime.RuntimeFailure:
             # Failed identity/health observation also invalidates discovery.
             # Pinned immutable publications stay readable for existing owners.
