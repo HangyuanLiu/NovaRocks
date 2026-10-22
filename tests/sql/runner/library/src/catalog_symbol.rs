@@ -526,6 +526,13 @@ impl Visit for CatalogEdits<'_> {
                     }
                 }
             }
+            Statement::Maintenance(MaintenanceStatement::ShowOptimize(show)) => {
+                if let Some(from) = &show.from
+                    && from.parts.len() == 2
+                {
+                    self.ident(&from.parts[0]);
+                }
+            }
             Statement::Maintenance(MaintenanceStatement::Call(call)) => {
                 if call.procedure.parts.last().is_some_and(|n| {
                     n.value
@@ -896,6 +903,45 @@ mod tests {
         assert!(out.contains(&format!("DROP CATALOG {name}")));
         assert_eq!(out, s.rewrite_source(&out).unwrap());
     }
+    #[test]
+    fn optimize_show_binds_the_same_catalog_as_submission() {
+        let symbols = symbols();
+        let catalog = symbols.lookup("owned").unwrap();
+        let source = "ALTER TABLE owned.ns.orders OPTIMIZE; \
+                      SHOW ALTER TABLE OPTIMIZE FROM `owned`.`ns` \
+                      WHERE TableName = 'owned'; \
+                      SHOW ALTER TABLE OPTIMIZE FROM owned;";
+        let rewritten = symbols.rewrite_source(source).unwrap();
+        assert!(rewritten.contains(&format!("ALTER TABLE {catalog}.ns.orders OPTIMIZE")));
+        assert!(
+            rewritten.contains(&format!("SHOW ALTER TABLE OPTIMIZE FROM `{catalog}`.`ns`")),
+            "{rewritten}"
+        );
+        assert!(rewritten.contains("WHERE TableName = 'owned'"));
+        assert!(rewritten.contains("SHOW ALTER TABLE OPTIMIZE FROM owned;"));
+        assert_eq!(symbols.rewrite_source(&rewritten).unwrap(), rewritten);
+    }
+
+    #[test]
+    fn optimize_show_only_rewrites_the_explicit_catalog_slot() {
+        let symbols = symbols();
+        let catalog = symbols.lookup("owned").unwrap();
+        assert_eq!(
+            symbols
+                .rewrite_source("SHOW ALTER TABLE OPTIMIZE IN owned.owned;")
+                .unwrap(),
+            format!("SHOW ALTER TABLE OPTIMIZE IN {catalog}.owned;")
+        );
+        for source in [
+            "SHOW ALTER TABLE OPTIMIZE;",
+            "SHOW ALTER TABLE OPTIMIZE FROM owned;",
+            "SHOW ALTER TABLE OPTIMIZE FROM external.owned;",
+            "SELECT * FROM owned.orders;",
+        ] {
+            assert_eq!(symbols.rewrite_source(source).unwrap(), source);
+        }
+    }
+
     #[test]
     fn typed_controls_status_argument_and_metadata_cells_bind_without_data_rewrites() {
         let s = symbols();
