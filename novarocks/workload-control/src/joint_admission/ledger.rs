@@ -53,12 +53,28 @@ pub struct JointAdmissionHandle {
     pub(super) inner: Arc<Inner>,
 }
 
-#[derive(Clone)]
-pub(super) struct ClaimRecord {
-    pub(super) owner: WorkId,
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) struct ProfileKey {
+    class: usize,
+    lane: usize,
+    dependencies: Vec<u64>,
+}
+pub(super) struct ProfileFacts {
+    pub(super) key: Arc<ProfileKey>,
     pub(super) class: WorkClass,
     pub(super) lane: JointLane,
     pub(super) dependencies: Arc<[Arc<DependencyRecord>]>,
+}
+#[derive(Clone)]
+pub(super) struct ProfileRecord {
+    pub(super) facts: Arc<ProfileFacts>,
+    pub(super) amounts: JointResources,
+    pub(super) claims: usize,
+}
+#[derive(Clone)]
+pub(super) struct ClaimRecord {
+    pub(super) owner: WorkId,
+    pub(super) facts: Arc<ProfileFacts>,
     pub(super) amounts: JointResources,
 }
 
@@ -81,6 +97,7 @@ pub(crate) struct JointLedger {
     pub(super) config: Arc<ValidatedJointCapacityConfig>,
     dependencies: BTreeMap<SharedDependency, Weak<DependencyRecord>>,
     pub(super) claims: BTreeMap<u64, ClaimRecord>,
+    pub(super) profiles: BTreeMap<Arc<ProfileKey>, ProfileRecord>,
     pub(super) requests: BTreeMap<u64, RequestRecord>,
     /// A checked, nonwrapping release epoch; never a proof of actual exit.
     pub(super) release_epoch: u64,
@@ -90,7 +107,10 @@ pub(crate) struct JointLedger {
 
 impl JointLedger {
     pub(crate) fn is_drained(&self) -> bool {
-        self.claims.is_empty() && self.requests.is_empty() && self.active.is_none()
+        self.claims.is_empty()
+            && self.profiles.is_empty()
+            && self.requests.is_empty()
+            && self.active.is_none()
     }
     pub(super) fn released(&mut self) {
         match self.release_epoch.checked_add(1) {
@@ -117,6 +137,7 @@ impl WorkloadControl {
                 config: Arc::clone(&config),
                 dependencies: BTreeMap::new(),
                 claims: BTreeMap::new(),
+                profiles: BTreeMap::new(),
                 requests: BTreeMap::new(),
                 release_epoch: 0,
                 active: None,
@@ -225,9 +246,19 @@ impl JointAdmissionHandle {
                             None,
                             ClaimRecord {
                                 owner: scope.id,
-                                class: node.class,
-                                lane: *lane,
-                                dependencies: selected.into(),
+                                facts: Arc::new(ProfileFacts {
+                                    key: Arc::new(ProfileKey {
+                                        class: class_index(node.class),
+                                        lane: *lane as usize,
+                                        dependencies: selected
+                                            .iter()
+                                            .map(|domain| domain.ordinal)
+                                            .collect(),
+                                    }),
+                                    class: node.class,
+                                    lane: *lane,
+                                    dependencies: selected.into(),
+                                }),
                                 amounts: *amounts,
                             },
                         )
@@ -271,7 +302,7 @@ impl JointAdmissionHandle {
             // Settlement remains possible after cancellation/admission closure.
             if records
                 .iter()
-                .any(|record| record.claim.lane != JointLane::Settlement)
+                .any(|record| record.claim.facts.lane != JointLane::Settlement)
             {
                 node.check()?;
             }
@@ -282,7 +313,7 @@ impl JointAdmissionHandle {
             if state.closed
                 && records
                     .iter()
-                    .any(|record| record.claim.lane != JointLane::Settlement)
+                    .any(|record| record.claim.facts.lane != JointLane::Settlement)
             {
                 return Err(WorkError::Closed);
             }
@@ -382,7 +413,14 @@ impl JointClaim {
         self.inner.update(|state| {
             let ledger = state.joint.as_mut().ok_or(WorkError::NotReady)?;
             let record = ledger.claims.get_mut(&id).ok_or(WorkError::Released)?;
-            record.amounts = record.amounts.checked_sub(released)?;
+            let remainder = record.amounts.checked_sub(released)?;
+            let profile = ledger
+                .profiles
+                .get_mut(&record.facts.key)
+                .expect("original claim profile");
+            let total = profile.amounts.checked_sub(released)?;
+            record.amounts = remainder;
+            profile.amounts = total;
             ledger.released();
             Ok(())
         })
@@ -401,7 +439,20 @@ pub(super) fn release_claim(state: &mut State, id: u64) {
         .as_mut()
         .and_then(|ledger| ledger.claims.remove(&id))
     {
-        state.joint.as_mut().unwrap().released();
+        let ledger = state.joint.as_mut().unwrap();
+        let profile = ledger
+            .profiles
+            .get_mut(&record.facts.key)
+            .expect("original claim profile");
+        profile.amounts = profile
+            .amounts
+            .checked_sub(record.amounts)
+            .expect("profile contains original charge");
+        profile.claims -= 1;
+        if profile.claims == 0 {
+            ledger.profiles.remove(&record.facts.key);
+        }
+        ledger.released();
         state.nodes.get_mut(&record.owner).unwrap().resource_holders -= 1;
         state.collect(record.owner);
     }

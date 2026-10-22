@@ -19,7 +19,7 @@
 //! schedules turns and yields between them; this module spawns no task.
 
 use super::{
-    ledger::{ChangeRecord, ClaimRecord, release_claim},
+    ledger::{ChangeRecord, ProfileFacts, ProfileKey, ProfileRecord, release_claim},
     protection::{
         CheckError, CoordinateLimit, ExactProfile, Feasibility, ProofInput, ProtectionProof,
     },
@@ -67,8 +67,8 @@ struct Turn {
     owner: WorkId,
     changes: Arc<[ChangeRecord]>,
     release_epoch: u64,
-    cursor: Option<u64>,
-    records: Vec<ClaimRecord>,
+    cursor: Option<Arc<ProfileKey>>,
+    records: Vec<ProfileRecord>,
     snapshot_capacity: usize,
     pending_domain_limits: Vec<u128>,
     domains: BTreeMap<u64, usize>,
@@ -120,7 +120,7 @@ impl JointProgressDriver {
                     let cancelled = request
                         .changes
                         .iter()
-                        .any(|change| change.claim.lane != JointLane::Settlement)
+                        .any(|change| change.claim.facts.lane != JointLane::Settlement)
                         && state
                             .nodes
                             .get(&request.owner)
@@ -139,7 +139,7 @@ impl JointProgressDriver {
                         release_epoch: ledger.release_epoch,
                         cursor: None,
                         records: Vec::new(),
-                        snapshot_capacity: ledger.claims.len(),
+                        snapshot_capacity: ledger.profiles.len(),
                         pending_domain_limits: Vec::new(),
                         domains: BTreeMap::new(),
                         input: None,
@@ -173,7 +173,7 @@ impl JointProgressDriver {
                 if turn
                     .changes
                     .iter()
-                    .any(|change| change.claim.lane != JointLane::Settlement)
+                    .any(|change| change.claim.facts.lane != JointLane::Settlement)
                 {
                     state
                         .nodes
@@ -212,14 +212,35 @@ impl JointProgressDriver {
                 let state = self.inner.state.lock().unwrap();
                 let ledger = state.joint.as_ref().unwrap();
                 ledger
-                    .claims
-                    .range((turn.cursor.map_or(Unbounded, Excluded), Unbounded))
+                    .profiles
+                    .range::<Arc<ProfileKey>, _>((
+                        turn.cursor.as_ref().map_or(Unbounded, Excluded),
+                        Unbounded,
+                    ))
                     .next()
-                    .map(|(&id, record)| (id, record.clone()))
+                    .map(|(key, record)| (Arc::clone(key), record.clone()))
             };
-            if let Some((id, record)) = next {
-                turn.cursor = Some(id);
-                if !turn.changes.iter().any(|change| change.old == Some(id)) {
+            if let Some((key, mut record)) = next {
+                turn.cursor = Some(Arc::clone(&key));
+                // Authenticate and subtract every old charge from its exact
+                // aggregate once. Other owners' concurrent releases remain a
+                // conservative overestimate, never a copied grant to restore.
+                for change in turn.changes.iter() {
+                    if change.old.is_some() && change.claim.facts.key == key {
+                        record.amounts = match record
+                            .amounts
+                            .checked_sub(change.original_amounts.expect("original charge"))
+                        {
+                            Ok(amounts) => amounts,
+                            Err(error) => {
+                                self.finish(turn, Err(error), false);
+                                return JointProgress::More;
+                            }
+                        };
+                        record.claims -= 1;
+                    }
+                }
+                if record.claims != 0 {
                     if let Err(error) = turn.push_record(record, &self.config.config) {
                         self.finish(turn, Err(error), false);
                         return JointProgress::More;
@@ -283,7 +304,7 @@ impl JointProgressDriver {
                 return JointProgress::More;
             }
             let claim = &turn.changes[turn.next_change].claim;
-            let profile = turn.profile(claim);
+            let profile = turn.profile(&claim.facts, claim.amounts);
             let input = turn.input.as_mut().unwrap();
             input.affected_dependencies = profile.dependencies.clone();
             input.checked_coordinates = profile
@@ -319,7 +340,7 @@ impl JointProgressDriver {
             let stopped = if turn
                 .changes
                 .iter()
-                .any(|change| change.claim.lane != JointLane::Settlement)
+                .any(|change| change.claim.facts.lane != JointLane::Settlement)
             {
                 state
                     .nodes
@@ -343,7 +364,7 @@ impl JointProgressDriver {
                 if turn
                     .changes
                     .iter()
-                    .any(|change| change.claim.lane != JointLane::Settlement)
+                    .any(|change| change.claim.facts.lane != JointLane::Settlement)
                 {
                     node.check()?;
                 }
@@ -384,9 +405,38 @@ impl JointProgressDriver {
                     .next_id
                     .checked_add(turn.changes.len() as u64)
                     .ok_or(WorkError::ArithmeticOverflow)?;
-                Ok(())
+                let ledger = state.joint.as_ref().unwrap();
+                let mut profiles = BTreeMap::new();
+                for change in turn.changes.iter() {
+                    let key = &change.claim.facts.key;
+                    let profile = profiles.entry(Arc::clone(key)).or_insert_with(|| {
+                        ledger.profiles.get(key).cloned().unwrap_or(ProfileRecord {
+                            facts: Arc::clone(&change.claim.facts),
+                            amounts: JointResources::ZERO,
+                            claims: 0,
+                        })
+                    });
+                    if change.old.is_some() {
+                        profile.amounts = profile
+                            .amounts
+                            .checked_sub(change.original_amounts.expect("original charge"))?;
+                        profile.claims =
+                            profile.claims.checked_sub(1).ok_or(WorkError::Conflict)?;
+                    }
+                }
+                // Subtract all originals before adding replacements, matching
+                // the hypothetical batch even at the arithmetic boundary.
+                for change in turn.changes.iter() {
+                    let profile = profiles.get_mut(&change.claim.facts.key).unwrap();
+                    profile.amounts = profile.amounts.checked_add(change.claim.amounts)?;
+                    profile.claims = profile
+                        .claims
+                        .checked_add(1)
+                        .ok_or(WorkError::ArithmeticOverflow)?;
+                }
+                Ok(profiles)
             });
-            let result = verdict.map(|()| {
+            let result = verdict.map(|profiles| {
                 // All checks precede the single affected-entry transaction. Do
                 // not install the shadow: that would resurrect concurrent frees.
                 for change in turn.changes.iter() {
@@ -406,6 +456,7 @@ impl JointProgressDriver {
                     state.nodes.get_mut(&turn.owner).unwrap().resource_holders += 1;
                     ids.push(id);
                 }
+                state.joint.as_mut().unwrap().profiles.extend(profiles);
                 ids
             });
             let request = state
@@ -427,7 +478,7 @@ impl JointProgressDriver {
 impl Turn {
     fn push_record(
         &mut self,
-        record: ClaimRecord,
+        record: ProfileRecord,
         config: &JointCapacityConfig,
     ) -> Result<(), WorkError> {
         if self.records.len() >= config.max_claims {
@@ -442,7 +493,7 @@ impl Turn {
             .ok_or(WorkError::ArithmeticOverflow)?;
         let bytes = count
             .checked_mul(
-                std::mem::size_of::<ClaimRecord>()
+                std::mem::size_of::<ProfileRecord>()
                     + COORDINATE_COUNT * 16
                     + config.max_dependencies_per_claim * std::mem::size_of::<usize>(),
             )
@@ -459,7 +510,7 @@ impl Turn {
     fn prepare_one(&mut self, config: &JointCapacityConfig) -> Result<(), WorkError> {
         match self.preparation {
             Preparation::Allocate => {
-                let per_record = std::mem::size_of::<ClaimRecord>();
+                let per_record = std::mem::size_of::<ProfileRecord>();
                 if self.snapshot_capacity > config.max_claims
                     || self
                         .snapshot_capacity
@@ -475,11 +526,11 @@ impl Turn {
             }
             Preparation::Domains(index, dependency) => {
                 let record = if index < self.records.len() {
-                    Some(&self.records[index])
+                    Some(&self.records[index].facts)
                 } else {
                     self.changes
                         .get(index - self.records.len())
-                        .map(|change| &change.claim)
+                        .map(|change| &change.claim.facts)
                 };
                 if let Some(record) = record {
                     if let Some(domain) = record.dependencies.get(dependency) {
@@ -516,7 +567,7 @@ impl Turn {
                     // domain arcs/maps, coordinate limits and temporary buffers.
                     let per_profile = COORDINATE_COUNT
                         .checked_mul(16)
-                        .and_then(|n| n.checked_add(std::mem::size_of::<ClaimRecord>() * 2))
+                        .and_then(|n| n.checked_add(std::mem::size_of::<ProfileRecord>() * 2))
                         .and_then(|n| {
                             n.checked_add(config.max_dependencies_per_claim.checked_mul(32)?)
                         })
@@ -589,7 +640,7 @@ impl Turn {
             }
             Preparation::Profiles(index) => {
                 if let Some(record) = self.records.get(index) {
-                    let profile = self.profile(record);
+                    let profile = self.profile(&record.facts, record.amounts);
                     self.input.as_mut().unwrap().profiles.push(profile);
                     self.preparation = Preparation::Profiles(index + 1);
                 } else {
@@ -600,23 +651,23 @@ impl Turn {
         }
         Ok(())
     }
-    fn profile(&self, record: &ClaimRecord) -> ExactProfile {
+    fn profile(&self, facts: &ProfileFacts, values: JointResources) -> ExactProfile {
         let mut amounts = vec![0; COORDINATE_COUNT];
         for projection in [
             0,
-            1 + class_index(record.class),
-            1 + CLASS_COUNT + record.lane as usize,
+            1 + class_index(facts.class),
+            1 + CLASS_COUNT + facts.lane as usize,
             1 + CLASS_COUNT
                 + LANE_COUNT
-                + class_index(record.class) * LANE_COUNT
-                + record.lane as usize,
+                + class_index(facts.class) * LANE_COUNT
+                + facts.lane as usize,
         ] {
             for index in 0..RESOURCE_COUNT {
-                amounts[projection * RESOURCE_COUNT + index] = u128::from(record.amounts.0[index]);
+                amounts[projection * RESOURCE_COUNT + index] = u128::from(values.0[index]);
             }
         }
         ExactProfile {
-            dependencies: record
+            dependencies: facts
                 .dependencies
                 .iter()
                 .map(|domain| self.domains[&domain.ordinal])

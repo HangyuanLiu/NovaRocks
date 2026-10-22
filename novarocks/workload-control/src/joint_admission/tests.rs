@@ -499,3 +499,201 @@ fn snapshot_builder_shares_the_finite_total_work_ceiling() {
     }
     assert_eq!(held(&control), (0, 0));
 }
+
+#[test]
+fn exact_profiles_aggregate_once_and_keep_distinct_dependencies_and_live_zero_claims() {
+    let (control, handle, mut driver) = control();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let b = dependency(&handle, "b");
+    let mut first = handle
+        .request(
+            &scope,
+            vec![
+                JointClaimChange::New {
+                    dependencies: vec![a.clone()],
+                    lane: JointLane::Foreground,
+                    amounts: bytes(1),
+                },
+                JointClaimChange::New {
+                    dependencies: vec![a],
+                    lane: JointLane::Foreground,
+                    amounts: bytes(1),
+                },
+            ],
+        )
+        .unwrap();
+    drive(&mut driver);
+    let mut originals = granted(&mut first);
+    let profiles = || {
+        let state = control.inner.state.lock().unwrap();
+        let ledger = state.joint.as_ref().unwrap();
+        let mut values = ledger
+            .profiles
+            .values()
+            .map(|profile| {
+                (
+                    profile.claims,
+                    profile.amounts.get(JointResource::PayloadBytes),
+                )
+            })
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        values
+    };
+    assert_eq!(profiles(), vec![(2, 2)]);
+    let mut second = request(&handle, &scope, &[&b], JointLane::Foreground, 1);
+    drive(&mut driver);
+    let mut second = granted(&mut second);
+    assert_eq!(profiles(), vec![(1, 1), (2, 2)]);
+    drop(originals.pop());
+    assert_eq!(profiles(), vec![(1, 1), (1, 1)]);
+    second[0].release_part(bytes(1)).unwrap();
+    assert_eq!(profiles(), vec![(1, 0), (1, 1)]);
+    let mut replacement = handle
+        .request(
+            &scope,
+            vec![JointClaimChange::Replace {
+                original: originals.pop().unwrap(),
+                amounts: bytes(2),
+            }],
+        )
+        .unwrap();
+    drive(&mut driver);
+    let replacement = granted(&mut replacement);
+    assert_eq!(profiles(), vec![(1, 0), (1, 2)]);
+    drop(second);
+    assert_eq!(profiles(), vec![(1, 2)]);
+    drop(replacement);
+    assert!(profiles().is_empty());
+}
+
+#[test]
+fn atomic_replacement_subtracts_all_originals_before_any_addition_at_u64_boundary() {
+    let control = WorkloadControl::try_new_counted(WorkloadConfig::default())
+        .unwrap()
+        .owner;
+    let (mut config, mut required) = profile();
+    config.global = limits(u64::MAX, u64::MAX, 0);
+    config.classes = [JointResourceLimits::default(); CLASS_COUNT];
+    config.classes[4] = config.global;
+    config.lanes = [JointResourceLimits::default(); LANE_COUNT];
+    config.lanes[1] = config.global;
+    config.class_lanes = [[JointResourceLimits::default(); LANE_COUNT]; CLASS_COUNT];
+    config.class_lanes[4][1] = config.global;
+    required.global = JointResources::ZERO;
+    let (handle, mut driver) = control
+        .configure_joint_capacity(config.validate(&required).unwrap())
+        .unwrap();
+    control.mark_ready().unwrap();
+    let root = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let scope = root.owner.scope();
+    let a = dependency(&handle, "a");
+    let mut initial = handle
+        .request(
+            &scope,
+            vec![
+                JointClaimChange::New {
+                    dependencies: vec![a.clone()],
+                    lane: JointLane::Foreground,
+                    amounts: bytes(0),
+                },
+                JointClaimChange::New {
+                    dependencies: vec![a],
+                    lane: JointLane::Foreground,
+                    amounts: bytes(u64::MAX),
+                },
+            ],
+        )
+        .unwrap();
+    drive(&mut driver);
+    let mut original = granted(&mut initial).into_iter();
+    let zero = original.next().unwrap();
+    let full = original.next().unwrap();
+    let mut replacement = handle
+        .request(
+            &scope,
+            vec![
+                JointClaimChange::Replace {
+                    original: zero,
+                    amounts: bytes(u64::MAX),
+                },
+                JointClaimChange::Replace {
+                    original: full,
+                    amounts: bytes(0),
+                },
+            ],
+        )
+        .unwrap();
+    drive(&mut driver);
+    let claims = granted(&mut replacement);
+    assert_eq!(claims[0].amounts().unwrap(), bytes(u64::MAX));
+    assert_eq!(claims[1].amounts().unwrap(), bytes(0));
+    assert_eq!(held(&control), (2, u64::MAX));
+    drop(claims);
+    assert_eq!(held(&control), (0, 0));
+}
+
+#[test]
+fn same_profile_other_owner_release_is_not_restored_by_affected_profile_commit() {
+    let (control, handle, mut driver) = control();
+    let first = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let second = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let a = dependency(&handle, "a");
+    let mut initial = request(
+        &handle,
+        &first.owner.scope(),
+        &[&a],
+        JointLane::Foreground,
+        1,
+    );
+    drive(&mut driver);
+    let initial = granted(&mut initial);
+    let mut next = request(
+        &handle,
+        &second.owner.scope(),
+        &[&a],
+        JointLane::Foreground,
+        1,
+    );
+    driver.step();
+    driver.step();
+    driver.step(); // Same-key old amount copied.
+    drop(initial);
+    first.owner.complete();
+    first.business.release();
+    drive(&mut driver);
+    let next = granted(&mut next);
+    assert_eq!(held(&control), (1, 1));
+    // A stale aggregate would still contain 2 and falsely block this request.
+    let third = control
+        .try_begin_root(WorkRequest::new(WorkClass::Management))
+        .unwrap();
+    let mut last = request(
+        &handle,
+        &third.owner.scope(),
+        &[&a],
+        JointLane::Foreground,
+        1,
+    );
+    drive(&mut driver);
+    let last = granted(&mut last);
+    assert_eq!(held(&control), (2, 2));
+    {
+        let state = control.inner.state.lock().unwrap();
+        let ledger = state.joint.as_ref().unwrap();
+        assert_eq!(ledger.profiles.len(), 1);
+        assert_eq!(ledger.profiles.values().next().unwrap().amounts, bytes(2));
+    }
+    drop((next, last));
+    assert_eq!(held(&control), (0, 0));
+}
