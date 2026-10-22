@@ -62,7 +62,9 @@ FROM ${case_db}.t_write_set_entry_budget$snapshots;
 -- 32 * 32 * 16 distinct partition values, plus one more: 16385 commit
 -- fragments against a 16384-entry budget. The root aggregation refuses the
 -- set rather than committing a prefix of it.
--- @expect_error=ResourceExhausted: connector prepared write set exceeds the frozen entry budget
+-- Match the public resource identity and the connector's exact entry refusal,
+-- rather than the private source error's former Display text.
+-- @expect_error=[query.execution.resource_exhausted] Resource failure (reason 4:44)
 INSERT INTO ${case_db}.t_write_set_entry_budget
 SELECT (a.n * 32 + b.n) * 16 + c.n AS p, 2 AS v
 FROM ${case_db}.seed_write_set_entry_budget a
