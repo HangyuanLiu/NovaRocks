@@ -47,6 +47,7 @@ class Backend:
         self.events, self.version, self.online = [], None, False
         self.occupied, self.failure, self.counter = False, None, 0
         self.volumes = {}
+        self.catalog_present = False
 
     labels = staticmethod(machine.MachineDocker.labels)
     minio_volume_identity = machine.MachineDocker.minio_volume_identity
@@ -92,6 +93,7 @@ class Backend:
         if self.failure == "ensure":
             raise runtime.RuntimeFailure("PortUnavailable", "occupied port")
         self.occupied = self.online = True
+        self.catalog_present = True
         self.version = record["version"]
         self.counter += 1
         record["containers"] = {s: f"container-{s}-{self.counter}" for s in record["required_services"]}
@@ -111,6 +113,18 @@ class Backend:
 
     def remove_rest_state(self, record):
         self.events.append("remove-rest-state")
+        if self.failure == "remove-rest-state":
+            raise runtime.RuntimeFailure("DockerOperationTimeout", "catalog removal outcome is unknown")
+        self.catalog_present = False
+        return self.rest_state_barrier(record)
+
+    def rest_state_barrier(self, record):
+        self.events.append("verify-catalog-absence")
+        if self.catalog_present or self.failure == "catalog-absence":
+            raise runtime.RuntimeFailure("CatalogRemovalUnconfirmed", "catalog absence is unconfirmed")
+        return dict(schema=1, daemon_id=record["daemon_id"], generation=record["generation"],
+                    volumes=[machine.PROJECT + "_" + s + "-catalog" for s in ("rest", "rest-mv")],
+                    complete=True)
 
     def validate_resources(self, record):
         self.events.append("validate")
@@ -515,12 +529,16 @@ class SnapshotDeadlineTests(unittest.TestCase):
 class Sweeper:
     def __init__(self, record, backend):
         self.backend = backend
+        self.record = record
 
     def revoke_users(self):
         self.backend.events.append("revoke-users")
 
     def sweep(self, *, expired_only, deadline):
         assert self.backend.online, "purge requires an online MinIO"
+        if not expired_only:
+            assert self.record["offline_catalog_barrier"]["complete"]
+            assert not self.backend.catalog_present
         self.backend.events.append(("sweep", expired_only))
         return {"complete": self.backend.failure != "purge", "removed": []}
 
@@ -748,7 +766,8 @@ class MachineTests(unittest.TestCase):
         self.backend.events.clear()
         final = self.owner.activate(self.changed(), upgrade=True)
         self.assertEqual(self.backend.events, ["stop-writers", "rotate-root", "verify-fence",
-            "revoke-users", ("sweep", False), "remove-rest-state", "ensure"])
+            "remove-rest-state", "verify-catalog-absence", "verify-catalog-absence",
+            "revoke-users", ("sweep", False), "ensure"])
         self.assertNotEqual(first["credentials"], final["credentials"])
         self.assertEqual(first["volumes"][0], final["volumes"][0])
         self.assertNotEqual(first["generation"], final["generation"])
@@ -766,6 +785,70 @@ class MachineTests(unittest.TestCase):
         self.assertEqual(final["generation"], failed["generation"])
         self.assertEqual(final["credentials"], failed["credentials"])
         self.assertEqual(self.backend.events.count("rotate-root"), 1)
+
+    def test_unknown_catalog_removal_never_revokes_or_purges_and_is_retried(self):
+        self.start()
+        self.backend.events.clear()
+        self.backend.failure = "remove-rest-state"
+        self.assert_code("DockerOperationTimeout", lambda: self.owner.activate(self.changed(), upgrade=True))
+        failed = self.owner.read_saved_state()
+        self.assertEqual(failed["phase"], "maintenance")
+        self.assertFalse(failed["steps"].get("rest_removed", False))
+        self.assertNotIn("revoke-users", self.backend.events)
+        self.assertNotIn(("sweep", False), self.backend.events)
+        self.backend.failure = None
+        final = self.owner.activate(self.changed(), upgrade=True)
+        self.assertEqual(final["generation"], failed["generation"])
+        self.assertEqual(self.backend.events.count("remove-rest-state"), 2)
+        self.assertEqual(self.backend.events.count("rotate-root"), 1)
+
+    def test_catalog_absence_must_be_observed_before_persisting_barrier(self):
+        self.start()
+        self.backend.failure = "catalog-absence"
+        self.assert_code("CatalogRemovalUnconfirmed", lambda: self.owner.activate(self.changed(), upgrade=True))
+        failed = self.owner.read_saved_state()
+        self.assertFalse(failed["steps"].get("rest_removed", False))
+        self.assertNotIn("offline_catalog_barrier", failed["fenced_store"])
+        self.assertNotIn(("sweep", False), self.backend.events)
+
+    def test_resume_rechecks_native_absence_instead_of_trusting_saved_barrier(self):
+        self.start()
+        self.backend.failure = "purge"
+        self.assert_code("ScratchCleanupIncomplete", lambda: self.owner.activate(self.changed(), upgrade=True))
+        failed = self.owner.read_saved_state()
+        self.assertTrue(failed["steps"]["rest_removed"])
+        self.assertTrue(failed["fenced_store"]["offline_catalog_barrier"]["complete"])
+        self.backend.events.clear()
+        self.backend.failure = None
+        self.backend.catalog_present = True
+        self.assert_code("CatalogRemovalUnconfirmed", lambda: self.owner.activate(self.changed(), upgrade=True))
+        self.assertEqual(self.backend.events, ["verify-catalog-absence"])
+        self.assertEqual(self.owner.read_saved_state()["phase"], "maintenance")
+
+    def test_cancelled_catalog_removal_keeps_files_and_maintenance(self):
+        self.start()
+        self.backend.events.clear()
+        with mock.patch.object(self.backend, "remove_rest_state", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.owner.activate(self.changed(), upgrade=True)
+        failed = self.owner.read_saved_state()
+        self.assertEqual(failed["phase"], "maintenance")
+        self.assertFalse(failed["steps"].get("rest_removed", False))
+        self.assertNotIn("revoke-users", self.backend.events)
+        self.assertNotIn(("sweep", False), self.backend.events)
+
+    def test_offline_barrier_is_durable_before_constructing_purge_owner(self):
+        first = self.start()
+        def factory(record, backend):
+            saved = self.owner.read_saved_state()
+            self.assertTrue(saved["steps"]["rest_removed"])
+            self.assertEqual(saved["fenced_store"]["offline_catalog_barrier"], dict(
+                schema=1, daemon_id="local-daemon", generation=first["generation"],
+                volumes=["nr-fixture-machine_rest-catalog", "nr-fixture-machine_rest-mv-catalog"],
+                complete=True))
+            return Sweeper(record, backend)
+        self.owner.sweeper_factory = factory
+        self.owner.activate(self.changed(), upgrade=True)
 
     def test_unconfirmed_fence_never_purges_and_retries_without_another_rotation(self):
         self.start()
@@ -903,6 +986,27 @@ class DockerActivationTests(unittest.TestCase):
         self.install(self.source, "rest", identity="unapproved-replacement")
         with self.assertRaisesRegex(runtime.RuntimeFailure, "replaced outside maintenance"):
             self.docker.container(self.source, "rest")
+
+    def test_catalog_barrier_requires_both_exact_containers_and_volumes_absent(self):
+        for service in ("rest", "rest-mv"):
+            with self.subTest(service=service, kind="container"):
+                self.infos = {}
+                self.install(self.source, service)
+                with self.assertRaisesRegex(runtime.RuntimeFailure, "CatalogRemovalUnconfirmed"):
+                    self.docker.rest_state_barrier(self.source)
+            with self.subTest(service=service, kind="volume"):
+                self.infos = {}
+                original = self.docker.inspect
+                name = machine.PROJECT + "_" + service + "-catalog"
+                def inspect(kind, identity, **kwargs):
+                    return {"Name": name} if kind == "volume" and identity == name else original(kind, identity, **kwargs)
+                with mock.patch.object(self.docker, "inspect", side_effect=inspect):
+                    with self.assertRaisesRegex(runtime.RuntimeFailure, "CatalogRemovalUnconfirmed"):
+                        self.docker.rest_state_barrier(self.source)
+        self.infos = {}
+        barrier = self.docker.rest_state_barrier(self.source)
+        self.assertTrue(barrier["complete"])
+        self.assertEqual(barrier["generation"], self.source["generation"])
 
 
 if __name__ == "__main__":

@@ -679,6 +679,16 @@ class MachineDocker(runtime.Docker):
                 self.command(["volume", "rm", name])
         for service in ("rest", "rest-mv"):
             record.get("containers", {}).pop(service, None)
+        return self.rest_state_barrier(record)
+
+    def rest_state_barrier(self, record):
+        """Observe exact old catalog absence before granting offline purge."""
+        volumes = [PROJECT + "_" + service + "-catalog" for service in ("rest", "rest-mv")]
+        for service, name in zip(("rest", "rest-mv"), volumes):
+            if self.container(record, service) or self.inspect("volume", name, absent_ok=True):
+                raise runtime.RuntimeFailure("CatalogRemovalUnconfirmed", "old REST catalog state is still present")
+        return dict(schema=1, daemon_id=record["daemon_id"], generation=record["generation"],
+                    volumes=volumes, complete=True)
 
 
 class MachineOwner:
@@ -935,6 +945,15 @@ class MachineOwner:
                     self.backend.assert_old_root_revoked(previous)
                     steps["root_fenced"] = True
                     self._save(record)
+                if not steps.get("rest_removed"):
+                    barrier = self.backend.remove_rest_state(fence)
+                    fence["offline_catalog_barrier"] = barrier
+                    steps["rest_removed"] = True
+                    self._save(record)
+                # A durable observation does not replace a fresh native absence
+                # check when resuming an interrupted purge under the same intent.
+                fence["offline_catalog_barrier"] = self.backend.rest_state_barrier(fence)
+                self._save(record)
                 if not steps.get("purged"):
                     sweeper = self._sweeper(fence)
                     sweeper.revoke_users()
@@ -943,10 +962,6 @@ class MachineOwner:
                     if not report.get("complete"):
                         raise runtime.RuntimeFailure("ScratchCleanupIncomplete", "machine remains in maintenance")
                     steps["purged"] = True
-                    self._save(record)
-                if not steps.get("rest_removed"):
-                    self.backend.remove_rest_state(fence)
-                    steps["rest_removed"] = True
                     self._save(record)
                 previous = fence
             record["steps"]["activation_started"] = True
