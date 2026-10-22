@@ -4528,8 +4528,7 @@ pub(crate) mod tests {
         ));
         let completion = FragmentCompletion::new(1, runtime_state.error_state());
         let cancellation = ExecutionFailure::from(novarocks_functions::KernelFailure::Cancelled);
-        let submitted_failure: crate::runtime::fragment::ExecutionFailure =
-            (cancellation.clone()).into();
+        let submitted_failure: crate::runtime::fragment::ExecutionFailure = cancellation.clone();
         completion.fail(submitted_failure.clone());
         assert!(
             completion

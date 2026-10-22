@@ -1408,8 +1408,7 @@ mod tests {
         );
 
         let failure = ExecutionFailure::from(novarocks_functions::KernelFailure::DeadlineExceeded);
-        let submitted_failure: crate::runtime::fragment::ExecutionFailure =
-            (failure.clone()).into();
+        let submitted_failure: crate::runtime::fragment::ExecutionFailure = failure.clone();
         completion.fail(submitted_failure.clone());
         assert!(
             completion
@@ -1449,8 +1448,7 @@ mod tests {
         });
         let original: ExecutionFailure =
             novarocks_functions::KernelFailure::DeadlineExceeded.into();
-        let submitted_failure: crate::runtime::fragment::ExecutionFailure =
-            (original.clone()).into();
+        let submitted_failure: crate::runtime::fragment::ExecutionFailure = original.clone();
         completion.fail(submitted_failure.clone());
         assert!(
             completion
@@ -1886,8 +1884,7 @@ mod tests {
         // The fragment fails elsewhere: the parked driver gets one turn to
         // deliver cancellation, then waits for its owner again.
         let failure = ExecutionFailure::from(novarocks_functions::KernelFailure::DeadlineExceeded);
-        let submitted_failure: crate::runtime::fragment::ExecutionFailure =
-            (failure.clone()).into();
+        let submitted_failure: crate::runtime::fragment::ExecutionFailure = failure.clone();
         harness.completion.fail(submitted_failure.clone());
         assert!(
             harness
@@ -2543,7 +2540,7 @@ mod tests {
             Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         );
         let first: ExecutionFailure = novarocks_functions::KernelFailure::ResourceExhausted.into();
-        let submitted_failure: crate::runtime::fragment::ExecutionFailure = (first.clone()).into();
+        let submitted_failure: crate::runtime::fragment::ExecutionFailure = first.clone();
         completion.fail(submitted_failure.clone());
         assert!(
             completion

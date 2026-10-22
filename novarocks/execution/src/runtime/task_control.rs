@@ -516,7 +516,7 @@ pub(crate) mod test_support {
     }
     #[cfg(test)]
     enum DeferredInput {
-        Proposal(PreparedConclusion),
+        Proposal(Box<PreparedConclusion>),
         Settle(SettledContinuation<ExecutionFailure>),
     }
     #[cfg(test)]
@@ -550,7 +550,9 @@ pub(crate) mod test_support {
             // lock covers adjudication, notification, destruction or callbacks.
             let input = self.queue.lock().unwrap().inputs.pop_front();
             match input {
-                Some(DeferredInput::Proposal(prepared)) => self.owner.adjudicate_prepared(prepared),
+                Some(DeferredInput::Proposal(prepared)) => {
+                    self.owner.adjudicate_prepared(*prepared)
+                }
                 Some(DeferredInput::Settle(continuation)) => continuation(self.accepted()),
                 None => return false,
             }
@@ -600,7 +602,7 @@ pub(crate) mod test_support {
             self.owner.accepted()
         }
         fn submit(&self, proposal: TaskConclusionProposal<ExecutionFailure>) {
-            let prepared = Owner::prepare(proposal);
+            let prepared = Box::new(Owner::prepare(proposal));
             let rejected = {
                 let mut queue = self.queue.lock().unwrap();
                 if queue.failed {
