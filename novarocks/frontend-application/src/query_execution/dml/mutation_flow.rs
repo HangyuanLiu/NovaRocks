@@ -5078,6 +5078,10 @@ mod tests {
         use super::*;
         include!("cow_real_compiler_tests.rs");
     }
+    mod merge_router_completion {
+        use super::*;
+        include!("merge_router_completion_tests.rs");
+    }
 
     use arrow::datatypes::DataType;
     use novarocks_types::schema::ColumnDef;

@@ -17,6 +17,8 @@
 
 逻辑等义与物理完全相等是不同问题。以 `TypedValueBinding::same_semantics` 或其借用 `value_type` 判断逻辑语义；执行绑定的 equality 同时包含 layout。不能因为 Utf8/LargeUtf8 的值语义相同就换掉准确 offset 布局。独立构造的等义 schema 可以绑定；共享指针只作为已验证不可变对象的快速路径。
 
+compiled package 的 writer 专有配额、来源核算与兼容边界见 [Compiled package 容量准入](compiled-package-admission.md)。
+
 ## 构造与持有分开
 
 纯 FE 入口保持已有结构限额、取消与 deadline 控制，不提供 memory creator。调用方选择纯入口时传 `None`，不能创建无限配额、成功 no-op scope 或 FE query lease 来满足类型签名。

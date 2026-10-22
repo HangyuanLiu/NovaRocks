@@ -164,10 +164,22 @@ pub mod test_support {
     pub fn installed_read_execution_with_factory_version(
         version: [u8; 32],
     ) -> ConnectorExecutionReadBinding {
+        installed_read_execution_with_provider(version, None)
+    }
+
+    pub fn installed_read_execution_with_provider(
+        version: [u8; 32],
+        provider: Option<
+            std::sync::Arc<
+                dyn novarocks_spi::connector::read_stack::ConnectorReadPageSourceProvider,
+            >,
+        >,
+    ) -> ConnectorExecutionReadBinding {
         let codec = fixture_codec();
         let binding = codec.adapter.binding();
         ConnectorExecutionReadBinding::new(
             std::sync::Arc::new(FixtureFactory {
+                provider,
                 binding: novarocks_spi::connector::read_stack::ConnectorReadBinding::new(
                     binding.descriptor().clone(),
                     novarocks_spi::connector::CatalogHandle::new(
@@ -210,17 +222,14 @@ pub mod test_support {
         }
         fn decode_relation_payload(
             &self,
-            _relation: &novarocks_spi::connector::ConnectorReadRelationPayload,
+            relation: &novarocks_spi::connector::ConnectorReadRelationPayload,
         ) -> Result<
             novarocks_spi::connector::read_stack::ConnectorReadRelation,
             novarocks_spi::connector::ConnectorCodecError,
         > {
             let table = self.adapter.wrap_table(FixtureTable);
             self.adapter
-                .relation(
-                    novarocks_spi::connector::read_stack::ConnectorReadRelationKind::Table,
-                    table,
-                )
+                .relation(relation.kind(), table)
                 .map_err(|error| {
                     novarocks_spi::connector::ConnectorCodecError::new(
                         novarocks_spi::connector::ConnectorFieldPath::root("table"),
@@ -282,30 +291,13 @@ pub mod test_support {
             ))
         }
     }
-    struct InertSystemProvider;
-    impl novarocks_spi::connector::read_stack::ConnectorReadSystemTableProvider
-        for InertSystemProvider
-    {
-        fn create_system_page_stream(
-            &self,
-            _: &novarocks_spi::connector::read_stack::ConnectorSession,
-            _: &novarocks_spi::connector::read_stack::ConnectorReadTableHandle,
-            _: &[novarocks_spi::connector::read_stack::Assignment<
-                novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
-            >],
-            _: &novarocks_spi::connector::read_stack::ConnectorPollBudget,
-        ) -> Result<
-            novarocks_spi::connector::read_stack::OwnedConnectorPageStream,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            Err(novarocks_spi::connector::ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::Internal,
-                "fixture system provider is never read",
-            ))
-        }
-    }
     struct FixtureFactory {
         binding: novarocks_spi::connector::read_stack::ConnectorReadBinding,
+        provider: Option<
+            std::sync::Arc<
+                dyn novarocks_spi::connector::read_stack::ConnectorReadPageSourceProvider,
+            >,
+        >,
     }
     impl novarocks_spi::connector::read_stack::ConnectorAdmittedReadProviderFactory for FixtureFactory {
         fn binding(&self) -> &novarocks_spi::connector::read_stack::ConnectorReadBinding {
@@ -323,20 +315,88 @@ pub mod test_support {
             >,
             novarocks_spi::connector::ConnectorError,
         > {
-            Ok(std::sync::Arc::new(InertPageProvider))
+            Ok(self
+                .provider
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::new(InertPageProvider)))
         }
-        fn create_system_table_provider(
-            &self,
-            _: &novarocks_spi::connector::ConnectorRequestContext,
-            _: novarocks_spi::connector::ConnectorExecutionResources,
-        ) -> Result<
-            std::sync::Arc<
-                dyn novarocks_spi::connector::read_stack::ConnectorReadSystemTableProvider,
+    }
+
+    /// A real opened stream which parks until its owning Task closes it.
+    #[derive(Default)]
+    pub struct PendingReadProbe {
+        pub opens: std::sync::atomic::AtomicUsize,
+        pub closes: std::sync::atomic::AtomicUsize,
+    }
+    struct PendingFixtureProvider(std::sync::Arc<PendingReadProbe>);
+    struct PendingFixtureStream(std::sync::Arc<PendingReadProbe>, Option<std::task::Waker>);
+    impl tokio_stream::Stream for PendingFixtureStream {
+        type Item = Result<
+            novarocks_spi::connector::read_stack::SourcePage,
+            novarocks_spi::connector::ConnectorError,
+        >;
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.get_mut().1 = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        }
+    }
+    impl novarocks_spi::connector::read_stack::ConnectorPageStream for PendingFixtureStream {
+        fn metrics(&self) -> novarocks_spi::connector::read_stack::PageSourceMetrics {
+            Default::default()
+        }
+        fn memory_usage_bytes(&self) -> u64 {
+            0
+        }
+        fn close(
+            self: std::pin::Pin<Box<Self>>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<(), novarocks_spi::connector::ConnectorError>,
+                    > + Send
+                    + 'static,
             >,
+        > {
+            self.0
+                .closes
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Box::pin(async { Ok(()) })
+        }
+    }
+    impl novarocks_spi::connector::read_stack::ConnectorReadPageSourceProvider
+        for PendingFixtureProvider
+    {
+        fn create_page_stream(
+            &self,
+            _: &novarocks_spi::connector::read_stack::ConnectorSession,
+            _: &novarocks_spi::connector::read_stack::ConnectorReadTableHandle,
+            _: &novarocks_spi::connector::read_stack::ConnectorReadSplit,
+            _: u64,
+            _: &[novarocks_spi::connector::read_stack::Assignment<
+                novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+            >],
+            _: &std::sync::Arc<novarocks_spi::connector::read_stack::ConnectorReadDynamicFilter>,
+            _: &novarocks_spi::connector::read_stack::ConnectorPollBudget,
+        ) -> Result<
+            novarocks_spi::connector::read_stack::OwnedConnectorPageStream,
             novarocks_spi::connector::ConnectorError,
         > {
-            Ok(std::sync::Arc::new(InertSystemProvider))
+            self.0
+                .opens
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(Box::pin(PendingFixtureStream(self.0.clone(), None)))
         }
+    }
+    pub fn installed_pending_read_execution(
+        probe: std::sync::Arc<PendingReadProbe>,
+    ) -> ConnectorExecutionReadBinding {
+        installed_read_execution_with_provider(
+            [1; 32],
+            Some(std::sync::Arc::new(PendingFixtureProvider(probe))),
+        )
     }
 
     pub fn decoded_scan() -> novarocks_proto_codec::connector_read::DecodedConnectorReadScan {
@@ -459,7 +519,6 @@ pub mod test_support {
             dynamic_filters: Vec::new(),
             max_batch_rows: 1024,
             max_batch_bytes: 1 << 20,
-            work_source: dto::ScanWorkSource::RuntimeSplits as i32,
         }
     }
 
@@ -506,14 +565,14 @@ mod tests {
     use arrow::array::{ArrayRef, Int64Array};
     use novarocks_execution::connector::{SplitQueueConfig, SplitQueueRegistry, TaskAttemptKey};
     use novarocks_proto_codec::FieldPath;
+    use novarocks_proto_codec::connector_read::ConnectorReadDecoder;
     use novarocks_proto_codec::connector_read::ConnectorTableScanSource;
     use novarocks_proto_models::connector_read as dto;
     use novarocks_spi::connector::read_stack::{
         ConnectorPageStream, ConnectorPollBudget, ConnectorPreparationControl,
         ConnectorPreparationProgress, ConnectorPreparationStart, ConnectorPreparedPageSource,
-        ConnectorReadDynamicFilter, ConnectorReadPageSourceProvider,
-        ConnectorReadSystemTableProvider, ConnectorSourceOperations, OwnedConnectorPageStream,
-        PageSourceMetrics, SourcePage,
+        ConnectorReadDynamicFilter, ConnectorReadPageSourceProvider, ConnectorSourceOperations,
+        OwnedConnectorPageStream, PageSourceMetrics, SourcePage,
     };
     use novarocks_spi::connector::{
         ConnectorError, ConnectorErrorKind, ConnectorStopOwner, ConnectorStopView,
@@ -523,9 +582,7 @@ mod tests {
     use novarocks_worker::RuntimeFilterSessionResolver;
     use novarocks_worker::TypedConnectorReadDescriptor;
     use novarocks_worker::read_attempt::ReceivedReadSplit;
-    use novarocks_worker::typed_connector_runtime::{
-        TypedConnectorScanSource, TypedConnectorSystemTableScanSource,
-    };
+    use novarocks_worker::typed_connector_runtime::TypedConnectorScanSource;
     use novarocks_worker::typed_scan_filter::TypedScanLiveDynamicFilterFactory;
 
     use super::*;
@@ -1192,6 +1249,73 @@ mod tests {
     }
 
     #[test]
+    fn one_work_unit_and_an_empty_sibling_use_the_same_split_read_execution() {
+        let execution = test_support::installed_read_execution();
+        let read_unit = || {
+            let raw = novarocks_proto_codec::connector_read::ScheduledSplit::parse(
+                test_support::split_proto(NODE, 1),
+                novarocks_proto_codec::FieldPath::root("unit"),
+            )
+            .unwrap();
+            let (evidence, split) = execution
+                .decoder()
+                .decode_scheduled_split(&raw)
+                .unwrap()
+                .into_parts();
+            ReceivedReadSplit::new(evidence.sequence_id(), evidence.plan_node_id(), split)
+        };
+        let provider = ScriptedStreamProvider::new(vec![vec![Some(int_page(vec![2, 3]))]]);
+        let mut combined = Vec::new();
+        for with_unit in [true, false] {
+            let queues = attempt_queues();
+            queues
+                .queue(NODE)
+                .offer_splits(
+                    NODE,
+                    if with_unit { vec![read_unit()] } else { vec![] },
+                    true,
+                )
+                .unwrap();
+            let source = stream_source_with(
+                provider.clone(),
+                queues,
+                request(ConnectorStopOwner::new().view()),
+            );
+            let op = bind(&source);
+            let budget = ConnectorPollBudget::new();
+            let mut stream = claim(&op, &budget);
+            let values = drain_values(&mut stream, &budget);
+            if with_unit {
+                assert_eq!(values, vec![2, 3]);
+            } else {
+                assert!(values.is_empty(), "zero units end without opening a stream");
+            }
+            combined.extend(values);
+            close_now(stream);
+        }
+        assert_eq!(provider.opens.load(Ordering::Acquire), 1);
+        assert_eq!(provider.closes.load(Ordering::Acquire), 1);
+        let single = ScriptedStreamProvider::new(vec![vec![Some(int_page(vec![2, 3]))]]);
+        let queues = attempt_queues();
+        queues
+            .queue(NODE)
+            .offer_splits(NODE, vec![read_unit()], true)
+            .unwrap();
+        let source = stream_source_with(
+            single.clone(),
+            queues,
+            request(ConnectorStopOwner::new().view()),
+        );
+        let op = bind(&source);
+        let budget = ConnectorPollBudget::new();
+        let mut stream = claim(&op, &budget);
+        assert_eq!(combined, drain_values(&mut stream, &budget));
+        close_now(stream);
+        assert_eq!(single.opens.load(Ordering::Acquire), 1);
+        assert_eq!(single.closes.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
     fn the_scan_stream_parks_on_an_empty_queue_and_a_split_wakes_it() {
         let queues = attempt_queues();
         let provider = ScriptedStreamProvider::new(vec![vec![Some(int_page(vec![1, 2, 3]))]]);
@@ -1625,156 +1749,5 @@ mod tests {
             "a second claim is refused, never a second reader"
         );
         close_now(stream);
-    }
-
-    struct ScriptedSystemStreams {
-        pages: Mutex<Vec<Option<SourcePage>>>,
-        closes: Arc<AtomicUsize>,
-        close_error: Option<ConnectorError>,
-    }
-
-    impl ConnectorReadSystemTableProvider for ScriptedSystemStreams {
-        fn create_system_page_stream(
-            &self,
-            _session: &ConnectorSession,
-            _table: &novarocks_spi::connector::read_stack::ConnectorReadTableHandle,
-            _columns: &[novarocks_spi::connector::read_stack::Assignment<
-                novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
-            >],
-            _budget: &ConnectorPollBudget,
-        ) -> Result<OwnedConnectorPageStream, ConnectorError> {
-            let pages = std::mem::take(&mut *self.pages.lock().expect("pages"));
-            Ok(Box::pin(ScriptedPageStream {
-                pages: pages.into(),
-                closes: Arc::clone(&self.closes),
-                close_error: self.close_error.clone(),
-            }))
-        }
-    }
-
-    #[test]
-    fn a_system_relation_stream_reads_its_relation_without_a_split() {
-        let closes = Arc::new(AtomicUsize::new(0));
-        let operations = ConnectorSourceOperations::new();
-        let source = TypedConnectorSystemTableScanSource::new(
-            descriptor(),
-            Arc::new(ScriptedSystemStreams {
-                pages: Mutex::new(vec![Some(int_page(vec![7])), None, Some(int_page(vec![8]))]),
-                closes: Arc::clone(&closes),
-                close_error: None,
-            }),
-            session(),
-            request_with_source(&operations),
-            NODE,
-            vec![SlotId::new(1)],
-            Arc::new({
-                // This source is explicitly Plain INT64; its Arrow field is
-                // presentation only and cannot author its value domain.
-                let value = novarocks_type_contract::FunctionValueType::new(
-                    arrow::datatypes::DataType::Int64,
-                    true,
-                );
-                let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
-                let slot = novarocks_execution::exec::chunk::ChunkSlotSchema::try_new_typed(
-                    SlotId::new(1),
-                    Arc::new(arrow::datatypes::Field::new(
-                        "value",
-                        arrow::datatypes::DataType::Int64,
-                        true,
-                    )),
-                    value.typed_binding().clone(),
-                    None,
-                    storage.clone(),
-                )
-                .expect("complete test output slot");
-                novarocks_execution::exec::chunk::ChunkSchema::try_new_typed(vec![slot], storage)
-                    .expect("complete test output schema")
-            }),
-            #[cfg(novarocks_dev_controls)]
-            None,
-            crate::backend_test_support::test_scan_stream_runtime(),
-        );
-        let op = source
-            .bind(BoundScanRanges::None)
-            .expect("a system relation binds with no range");
-        let budget = ConnectorPollBudget::new();
-        let mut stream = claim(&op, &budget);
-        assert_eq!(drain_values(&mut stream, &budget), vec![7, 8]);
-        assert_eq!(closes.load(Ordering::Acquire), 1);
-        close_now(stream);
-        assert!(operations.is_sealed());
-    }
-
-    #[test]
-    fn a_system_relation_close_error_is_cleanup_after_real_data_eos() {
-        use novarocks_execution::runtime::fragment::{
-            ExecutionFailureCause, connector_failure::ConnectorOperation,
-        };
-        let cleanup = ConnectorError::new(
-            ConnectorErrorKind::CorruptData,
-            "the actual system reader cleanup failed",
-        );
-        let closes = Arc::new(AtomicUsize::new(0));
-        let operations = ConnectorSourceOperations::new();
-        let source = TypedConnectorSystemTableScanSource::new(
-            descriptor(),
-            Arc::new(ScriptedSystemStreams {
-                pages: Mutex::new(vec![Some(int_page(vec![7])), None, Some(int_page(vec![8]))]),
-                closes: Arc::clone(&closes),
-                close_error: Some(cleanup.clone()),
-            }),
-            session(),
-            request_with_source(&operations),
-            NODE,
-            vec![SlotId::new(1)],
-            Arc::new({
-                // This source is explicitly Plain INT64; its Arrow field is
-                // presentation only and cannot author its value domain.
-                let value = novarocks_type_contract::FunctionValueType::new(
-                    arrow::datatypes::DataType::Int64,
-                    true,
-                );
-                let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
-                let slot = novarocks_execution::exec::chunk::ChunkSlotSchema::try_new_typed(
-                    SlotId::new(1),
-                    Arc::new(arrow::datatypes::Field::new(
-                        "value",
-                        arrow::datatypes::DataType::Int64,
-                        true,
-                    )),
-                    value.typed_binding().clone(),
-                    None,
-                    storage.clone(),
-                )
-                .expect("complete test output slot");
-                novarocks_execution::exec::chunk::ChunkSchema::try_new_typed(vec![slot], storage)
-                    .expect("complete test output schema")
-            }),
-            #[cfg(novarocks_dev_controls)]
-            None,
-            crate::backend_test_support::test_scan_stream_runtime(),
-        );
-        let op = source
-            .bind(BoundScanRanges::None)
-            .expect("a system relation binds with no range");
-        let budget = ConnectorPollBudget::new();
-        let mut stream = claim(&op, &budget);
-        let reports = stream.failures.clone();
-        assert_eq!(drain_values(&mut stream, &budget), vec![7, 8]);
-        assert!(reports.runtime.error().is_none());
-        assert!(reports.runtime.local_exit_fault().is_none());
-        let recorded = reports.cleanup.lock().unwrap().clone();
-        assert_eq!(recorded.len(), 1);
-        let ExecutionFailureCause::Connector(actual) = recorded[0].cause() else {
-            panic!("the original system close author remains typed");
-        };
-        assert_eq!(actual.operation(), ConnectorOperation::CloseReader);
-        assert_eq!(actual.cause(), &cleanup);
-        assert_eq!(closes.load(Ordering::Acquire), 1);
-        close_now(stream);
-        assert!(operations.is_sealed());
-        assert!(operations.is_exited());
-        assert_eq!(reports.cleanup.lock().unwrap().len(), 1);
-        assert!(reports.runtime.error().is_none());
     }
 }

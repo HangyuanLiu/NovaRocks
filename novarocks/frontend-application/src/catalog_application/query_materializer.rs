@@ -411,6 +411,11 @@ impl<'a> CatalogServiceMaterializer<'a> {
         table: &str,
         metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
     ) -> CatalogResolutionResult<ResolvedAnalyzerTable> {
+        if metadata_table_type == novarocks_sql::planning::catalog::MetadataTableKind::Partitions {
+            return Err(CatalogResolutionError::failed(
+                "invariant: $partitions is a SQL view over $files",
+            ));
+        }
         match self.effective_catalog(catalog) {
             Some("default_catalog") | None => {
                 let local = self
@@ -674,7 +679,7 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
     ) -> CatalogResolutionResult<QueryTableBinding> {
         let alias = format!(
             "{table}${}",
-            metadata_table_alias_suffix(metadata_table_type)
+            metadata_table_alias_suffix(metadata_table_type)?
         );
         let materialization = load_connector_table_alias_materialization_with_lease_typed(
             self.controls,
@@ -691,7 +696,7 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
         // renders a raw epoch integer, and ordering by it fails at the
         // exchange with a schema mismatch.
         let columns =
-            frozen_metadata_columns(metadata_table_type).unwrap_or(materialization.columns);
+            frozen_metadata_columns(metadata_table_type)?.unwrap_or(materialization.columns);
         Ok(QueryTableBinding {
             resolved: novarocks_sql::planning::catalog::resolved_metadata_table(
                 catalog,
@@ -726,22 +731,25 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
 /// The frozen column contract for one metadata relation, when it is fully
 /// determined by the relation kind alone.
 ///
-/// `$files`, `$entries` and `$partitions` are not: their `partition`,
+/// `$files` and `$entries` are not: their `partition`,
 /// `lower_bounds` and `upper_bounds` columns are derived from the table's own
 /// partition spec and schema, and the contract entry point omits them rather
 /// than guess. Those facts live in the connector and no typed column binding
-/// carries a type today, so those three keep resolving through the connector's
+/// carries a type today, so those two keep resolving through the connector's
 /// alias materialization until the derived types can cross the control plane.
 /// Returning `None` for them is that staged state, stated rather than hidden.
 fn frozen_metadata_columns(
     kind: novarocks_sql::planning::catalog::MetadataTableKind,
-) -> Option<Vec<novarocks_types::schema::ColumnDef>> {
+) -> CatalogResolutionResult<Option<Vec<novarocks_types::schema::ColumnDef>>> {
     use novarocks_sql::planning::catalog::MetadataTableKind;
 
-    match kind {
-        MetadataTableKind::Files | MetadataTableKind::Entries | MetadataTableKind::Partitions => {
-            None
+    Ok(match kind {
+        MetadataTableKind::Partitions => {
+            return Err(CatalogResolutionError::failed(
+                "invariant: $partitions is a SQL view over $files",
+            ));
         }
+        MetadataTableKind::Files | MetadataTableKind::Entries => None,
         MetadataTableKind::Snapshots
         | MetadataTableKind::History
         | MetadataTableKind::Refs
@@ -757,7 +765,7 @@ fn frozen_metadata_columns(
                 })
                 .collect(),
         ),
-    }
+    })
 }
 
 /// Connector read-alias suffix for one metadata relation.
@@ -768,20 +776,24 @@ fn frozen_metadata_columns(
 /// rather than resolve to some other relation's schema.
 pub(crate) fn metadata_table_alias_suffix(
     kind: novarocks_sql::planning::catalog::MetadataTableKind,
-) -> &'static str {
+) -> CatalogResolutionResult<&'static str> {
     use novarocks_sql::planning::catalog::MetadataTableKind;
 
-    match kind {
+    Ok(match kind {
         MetadataTableKind::Snapshots => "SNAPSHOTS",
         MetadataTableKind::History => "HISTORY",
         MetadataTableKind::Refs => "REFS",
         MetadataTableKind::Files => "FILES",
         MetadataTableKind::Manifests => "MANIFESTS",
-        MetadataTableKind::Partitions => "PARTITIONS",
+        MetadataTableKind::Partitions => {
+            return Err(CatalogResolutionError::failed(
+                "invariant: $partitions is a SQL view over $files",
+            ));
+        }
         // Was `LOGICAL_ICEBERG_METADATA`. The alias is retired; `$entries` is
         // the only spelling, and it maps to the wire's ENTRIES worker type.
         MetadataTableKind::Entries => "ENTRIES",
-    }
+    })
 }
 
 #[cfg(test)]
@@ -803,6 +815,217 @@ mod tests {
             allocator.allocate().expect("non-zero test binding ordinal");
         }
         allocator.allocate().expect("non-zero test binding ordinal")
+    }
+
+    #[test]
+    fn partitions_completion_loads_only_one_files_binding_and_preserves_its_token() {
+        use novarocks_sql::compiler::{
+            CatalogLookupTarget, CatalogRelationFact, DEFAULT_COMPLETION_LIMITS,
+            SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent, SqlCompileProgress,
+            SqlCompiler, SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch,
+            SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput, StatisticsFact,
+            builtin_sql_function_catalog, noop_constant_evaluator,
+        };
+        use novarocks_sql::planning::catalog::MetadataTableKind;
+        struct FilesLoader {
+            calls: Arc<AtomicUsize>,
+            tokens: Arc<Mutex<Vec<SqlTableBindingId>>>,
+            partitioned: bool,
+        }
+        impl QueryTableBindingLoader for FilesLoader {
+            fn load_strict_base_table(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: SqlTableBindingId,
+            ) -> CatalogResolutionResult<QueryTableBinding> {
+                panic!("a metadata read must not resolve the ordinary table or CTE")
+            }
+            fn load_metadata_table(
+                &self,
+                catalog: &str,
+                db: &str,
+                table: &str,
+                kind: MetadataTableKind,
+                token: SqlTableBindingId,
+            ) -> CatalogResolutionResult<QueryTableBinding> {
+                assert_eq!(kind, MetadataTableKind::Files);
+                assert_eq!((catalog, db, table), ("ice", "db", "orders"));
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.tokens.lock().unwrap().push(token);
+                let mut columns = novarocks_sql::planning::catalog::metadata_table_schema(kind)
+                    .into_iter()
+                    .map(|column| novarocks_types::schema::ColumnDef {
+                        name: column.name,
+                        data_type: column.data_type,
+                        nullable: column.nullable,
+                        write_default: None,
+                        logical_type: column.logical_type,
+                    })
+                    .collect::<Vec<_>>();
+                if self.partitioned {
+                    columns.push(novarocks_types::schema::ColumnDef {
+                        name: "partition".into(),
+                        data_type: arrow::datatypes::DataType::Struct(
+                            vec![arrow::datatypes::Field::new(
+                                "p",
+                                arrow::datatypes::DataType::Int32,
+                                true,
+                            )]
+                            .into(),
+                        ),
+                        nullable: true,
+                        write_default: None,
+                        logical_type: None,
+                    });
+                }
+                let resolved = novarocks_sql::planning::catalog::resolved_metadata_table(
+                    catalog,
+                    db,
+                    table,
+                    kind,
+                    columns,
+                    Vec::new(),
+                    token,
+                );
+                // Local supplies only the fixture's capability-free binding
+                // container. Keep the exact Metadata source and token, as the
+                // production metadata loader does; no runtime is opened here.
+                let mut binding = QueryTableBinding::local(resolved.clone(), token);
+                binding.resolved = resolved;
+                Ok(binding)
+            }
+        }
+        for partitioned in [true, false] {
+            for sql in [
+                "SELECT * FROM orders$partitions",
+                "SELECT p.* FROM DB.ORDERS$partitions p",
+                "SELECT * FROM ICE.DB.ORDERS$partitions",
+                "WITH orders AS (SELECT 7 AS content) SELECT p.* FROM orders$partitions p",
+            ] {
+                let service =
+                    crate::catalog_application::query_catalog::new_query_catalog_service();
+                let bindings = Arc::new(QueryTableBindingStore::try_new().unwrap());
+                let calls = Arc::new(AtomicUsize::new(0));
+                let tokens = Arc::new(Mutex::new(Vec::new()));
+                let catalog = CatalogServiceMaterializer::new(
+                    Some("ice"),
+                    &service,
+                    bindings.clone(),
+                    Box::new(FilesLoader {
+                        calls: calls.clone(),
+                        tokens: tokens.clone(),
+                        partitioned,
+                    }),
+                );
+                let control = SqlCompileControl::unbounded();
+                let request = SqlFinalPlanCompileRequest::new(
+                    novarocks_physical_plan::PlanVersionId::try_new([71; 16]).unwrap(),
+                    SqlStatementInput::sql(sql),
+                    SqlCompileIntent::Query,
+                    SqlSessionContext {
+                        sql_semantics: Default::default(),
+                        current_catalog: Some("ice".into()),
+                        current_database: "db".into(),
+                        optimizer_settings: SessionOptimizerSettings {
+                            enable_materialized_view_rewrite: Some(false),
+                            ..SessionOptimizerSettings::default()
+                        },
+                    },
+                    SqlPlanningEnvironment::Distributed,
+                    builtin_sql_function_catalog().snapshot(),
+                    noop_constant_evaluator(),
+                    crate::application::test_constant_policy(),
+                    control.clone(),
+                    novarocks_physical_plan::PipelineDopDomain {
+                        min: 1,
+                        max: 8,
+                        requires_power_of_two: true,
+                    },
+                    novarocks_physical_plan::ScanReadBudget {
+                        max_batch_rows: 1024,
+                        max_batch_bytes: 1 << 20,
+                    },
+                    DEFAULT_COMPLETION_LIMITS,
+                );
+                let mut progress =
+                    SqlCompiler::start(request.try_into_completion().unwrap(), &control).unwrap();
+                loop {
+                    let SqlCompileProgress::Incomplete(compilation) = progress else {
+                        panic!("expected actual provider read need")
+                    };
+                    let facts = match compilation.needs() {
+                        SqlNeedBatch::CatalogRelations(needs) => SqlFactBatch::CatalogRelations(needs.iter().map(|need| {
+                            let CatalogLookupTarget::IcebergMetadata { kind } = need.target() else { panic!("only Files facts") };
+                            assert_eq!(kind, MetadataTableKind::Files);
+                            let relation = need.relation();
+                            let resolved = catalog.resolve_metadata_table_typed(Some(&relation.catalog), &relation.namespace, &relation.table, kind).unwrap();
+                            CatalogRelationFact::resolved(need, resolved).unwrap()
+                        }).collect::<Vec<_>>().into_boxed_slice()),
+                        SqlNeedBatch::Statistics(needs) => SqlFactBatch::Statistics(needs.iter().map(|need| StatisticsFact::try_new(need, need.metrics().to_vec(), novarocks_sql::planning::dml::DmlStatisticsEvidence::Missing {
+                            binding: need.binding(), label: "ice.db.orders$files".into(), reason: "no statistics in metadata binding test".into(),
+                        }).unwrap()).collect::<Vec<_>>().into_boxed_slice()),
+                        SqlNeedBatch::ProviderReads(needs) => {
+                            assert_eq!(needs.len(), 1, "{sql}");
+                            assert_eq!(calls.load(Ordering::SeqCst), 1, "{sql}");
+                            assert_eq!(bindings.captured_bindings().len(), 1, "{sql}");
+                            let token = {
+                                let tokens = tokens.lock().unwrap();
+                                assert_eq!(tokens.len(), 1);
+                                tokens[0]
+                            };
+                            assert_eq!(needs[0].binding(), token);
+                            assert!(matches!(needs[0].relation(), novarocks_sql::compiler::ProviderReadRelationNeed::Metadata { kind: MetadataTableKind::Files, .. }));
+                            let first = catalog.get_iceberg_metadata_table(None, "db", "orders", MetadataTableKind::Files).unwrap();
+                            let second = catalog.get_iceberg_metadata_table(Some("ice"), "db", "orders", MetadataTableKind::Files).unwrap();
+                            assert_eq!(novarocks_sql::planning::catalog::table_binding_id(&first), token);
+                            assert_eq!(novarocks_sql::planning::catalog::table_binding_id(&second), token);
+                            assert_eq!(calls.load(Ordering::SeqCst), 1);
+                            break;
+                        }
+                        other => panic!("unexpected metadata completion round {other:?}"),
+                    };
+                    progress = SqlCompiler::finish(compilation, facts, &control).unwrap();
+                }
+                let error = catalog
+                    .resolve_metadata_table_typed(
+                        None,
+                        "db",
+                        "orders",
+                        MetadataTableKind::Partitions,
+                    )
+                    .unwrap_err();
+                assert!(matches!(error, CatalogResolutionError::Failed { .. }));
+                assert!(
+                    error
+                        .message()
+                        .contains("invariant: $partitions is a SQL view over $files")
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn partitions_cannot_be_materialized_as_a_provider_alias() {
+        use novarocks_sql::planning::catalog::MetadataTableKind;
+        assert!(
+            metadata_table_alias_suffix(MetadataTableKind::Partitions)
+                .unwrap_err()
+                .message()
+                .contains("invariant:")
+        );
+        assert!(
+            frozen_metadata_columns(MetadataTableKind::Partitions)
+                .unwrap_err()
+                .message()
+                .contains("invariant:")
+        );
+        assert_eq!(
+            metadata_table_alias_suffix(MetadataTableKind::Files).unwrap(),
+            "FILES"
+        );
     }
 
     fn local_binding(binding: SqlTableBindingId) -> QueryTableBinding {

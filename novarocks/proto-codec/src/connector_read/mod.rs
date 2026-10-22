@@ -36,7 +36,7 @@ pub use runtime_codec::{
     ConnectorReadCodecError, ConnectorReadDecoder, ConnectorReadEncoder, DecodedConnectorReadScan,
     DecodedScheduledReadSplit, ReceivedScheduledSplit,
 };
-pub use scan::{ConnectorTableScanSource, DynamicFilterBinding, ScanAssignment, ScanWorkSource};
+pub use scan::{ConnectorTableScanSource, DynamicFilterBinding, ScanAssignment};
 pub use split::{SplitCategory, ValidatedConnectorSplit};
 pub use task_update::{ScheduledSplit, SplitAssignment, parse_task_update_assignments};
 pub use value::{decode_value, decode_value_type, encode_value, encode_value_type};

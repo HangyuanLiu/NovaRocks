@@ -278,7 +278,7 @@ fn preflight_encode(
     };
     if admission.observed() {
         if let Some(input) = input {
-            add(known_namespace, physical_floor(input, ids)?)?;
+            physical_floor(input, ids)?;
             model.items = add(input.output.columns.len(), input.fields.len())?;
             model.refs = model.items;
             model.request::<u32>(input.output.columns.len(), 1)?;
@@ -305,10 +305,19 @@ fn preflight_encode(
         count_prefix(0, 0, source, known_namespace, limits, w)?;
         return admission.facts(&model, w);
     };
-    let mut known = add(known_namespace, physical_floor(input, ids)?)?;
+    // The value namespace retains the original whole-source invoice, which
+    // already covers this ResultPort. These necessary floors may overlap.
+    let mut known = physical_floor(input, ids)?;
     model.items = add(input.output.columns.len(), input.fields.len())?;
     model.refs = model.items;
-    count_prefix(0, model.items, source, known, limits, w)?;
+    count_prefix(
+        0,
+        model.items,
+        source,
+        known.max(known_namespace),
+        limits,
+        w,
+    )?;
     admission.facts(&model, w)?;
     let same_width = ids.len() == input.fields.len();
     w.step()?;
@@ -346,7 +355,7 @@ fn preflight_encode(
             }
             admission.admit(&model)?;
         }
-        floor(source, known, w)?;
+        floor(source, known.max(known_namespace), w)?;
         if !admission.observed() {
             text_request(&mut model, &field.name, 1, &mut admission, w)?;
             if let Some(alias) = &field.alias {
@@ -428,7 +437,7 @@ fn preflight_encode(
                 physical_type_v2::preflight_value_type_clone(&field.ty, w).map_err(type_error)?;
             known = add(known, clone.allocation_request_bytes_upper_bound())?;
         }
-        floor(source, known, w)?;
+        floor(source, known.max(known_namespace), w)?;
         admission.facts(&model, w)?;
     }
     admission.facts(&model, w)
@@ -461,7 +470,7 @@ fn preflight_decode(
                 .as_ref()
                 .map_or(0, |output| output.value_ids.len());
             if let Some(output) = &input.output {
-                add(known_namespace, wire_floor(input, output)?)?;
+                wire_floor(input, output)?;
             }
             model.items = add(columns, input.fields.len())?;
             model.refs = model.items;
@@ -486,10 +495,19 @@ fn preflight_decode(
     required(input.fragment_id, "result fragment ID is absent", w)?;
     let output = required(input.output.as_ref(), "result output port is absent", w)?;
     required(output.node_id, "result output node ID is absent", w)?;
-    let mut known = add(known_namespace, wire_floor(input, output)?)?;
+    // The admitted wire source already contains the result DTO. Preserve
+    // both necessary floors without charging their shared backing twice.
+    let mut known = wire_floor(input, output)?;
     model.items = add(output.value_ids.len(), input.fields.len())?;
     model.refs = model.items;
-    count_prefix(0, model.items, source, known, limits, w)?;
+    count_prefix(
+        0,
+        model.items,
+        source,
+        known.max(known_namespace),
+        limits,
+        w,
+    )?;
     if !admission.observed() {
         model.request::<p::ValueId>(output.value_ids.len(), 2)?;
         model.request::<p::ResultField>(input.fields.len(), 2)?;
@@ -519,7 +537,7 @@ fn preflight_decode(
             }
             admission.admit(&model)?;
         }
-        floor(source, known, w)?;
+        floor(source, known.max(known_namespace), w)?;
         if !admission.observed() {
             text_request(&mut model, &field.name, 2, &mut admission, w)?;
             if let Some(alias) = &field.alias {

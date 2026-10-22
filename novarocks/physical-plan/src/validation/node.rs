@@ -21,8 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use arrow_schema::DataType;
 use novarocks_connector_contract::{
-    ConnectorCodecCategory, ConnectorEncodedPayload, ConnectorReadRelationKind,
-    ConnectorReadWorkSource, MAX_CONNECTOR_WRITE_TARGETS,
+    ConnectorCodecCategory, ConnectorEncodedPayload, MAX_CONNECTOR_WRITE_TARGETS,
 };
 
 use crate::{
@@ -2915,26 +2914,6 @@ pub(crate) fn validate_relation(
     errors: &mut ValidationContext,
 ) {
     validate_read_reference(relation.read(), path, errors);
-    if relation.work_source() == ConnectorReadWorkSource::WholeRelation
-        && relation.read().relation.kind() != ConnectorReadRelationKind::SystemTable
-    {
-        errors.push(ValidationError::new(
-            path,
-            "whole-relation work is valid only for a system-table relation",
-        ));
-    }
-    if relation.work_source() == ConnectorReadWorkSource::WholeRelation
-        && (!matches!(
-            relation.provided_properties().distribution,
-            Distribution::Singleton
-        ) || fragment.dop_domain().min != 1
-            || fragment.dop_domain().max != 1)
-    {
-        errors.push(ValidationError::new(
-            path,
-            "whole-relation work requires singleton distribution and exactly one driver",
-        ));
-    }
     if relation.selection_digest() == [0; 32] {
         errors.push(ValidationError::new(
             path,

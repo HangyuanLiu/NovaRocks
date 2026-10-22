@@ -282,7 +282,11 @@ message ChangeWindowSplitCategory {
   novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
-message SystemFilesSplitCategory {
+message SystemRelationSplitCategory {
+  novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
+}
+
+message SystemManifestSplitCategory {
   novarocks.connector_common.ConnectorEncodedPayload provider_payload = 1;
 }
 
@@ -306,8 +310,9 @@ message ConnectorSplit {
     DataSplit data = 10;
     TableChangesSplitCategory table_changes = 11;
     ChangeWindowSplitCategory change_window = 12;
-    SystemFilesSplitCategory system_files = 13;
+    SystemManifestSplitCategory system_manifest = 13;
     RewritePositionDeleteFilesSplitCategory rewrite_position_delete_files = 14;
+    SystemRelationSplitCategory system_relation = 15;
   }
 }
 
@@ -350,23 +355,6 @@ message DynamicFilterBinding {
   string variable = 2;  // must name one of this scan's assignments.
 }
 
-// How one scan's work reaches the backend that runs it.
-//
-// It is an engine decision about execution, not a fact of the provider's
-// relation handle, so it travels on the scan node. A neutral backend reads it
-// to choose a lane and never matches a provider variant to re-derive it.
-enum ScanWorkSource {
-  SCAN_WORK_SOURCE_UNSPECIFIED = 0;
-  // Splits arrive at runtime on the task-update queue. Every ordinary read
-  // uses this, including the distributed system relations.
-  SCAN_WORK_SOURCE_RUNTIME_SPLITS = 1;
-  // No split at all: one backend reads the relation itself from an immutable
-  // metadata file. Only a system relation the coordinator resolved to a single
-  // task may use this, and reading it on more than one task duplicates every
-  // row, so the coordinator alone keeps it to one.
-  SCAN_WORK_SOURCE_WHOLE_RELATION = 2;
-}
-
 // The typed replacement for the opaque connector read source. It carries no
 // split list, no private payload, and no Arrow IPC schema.
 message ConnectorTableScanSource {
@@ -378,7 +366,8 @@ message ConnectorTableScanSource {
   repeated DynamicFilterBinding dynamic_filters = 6;
   uint64 max_batch_rows = 7;                    // required nonzero.
   uint64 max_batch_bytes = 8;                   // required nonzero.
-  ScanWorkSource work_source = 9;               // required, never unspecified.
+  reserved 9;
+  reserved "work_source";
 }
 
 // ---------------------------------------------------------------------------

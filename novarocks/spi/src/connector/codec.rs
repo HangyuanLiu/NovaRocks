@@ -492,7 +492,8 @@ pub enum ConnectorReadSplitCategory {
     Data,
     TableChanges,
     ChangeWindow,
-    SystemFiles,
+    SystemManifest,
+    SystemRelation,
     RewritePositionDeleteFiles,
 }
 

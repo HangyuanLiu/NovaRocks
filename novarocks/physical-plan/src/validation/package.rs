@@ -357,7 +357,6 @@ fn validate_package_scans(input: &FragmentPackageInput, errors: &mut ValidationC
         }
         if scan.max_batch_rows().get() != read_budget.max_batch_rows
             || scan.max_batch_bytes().get() != read_budget.max_batch_bytes
-            || scan.work_source() != relation.work_source()
         {
             errors.push(ValidationError::new(
                 &path,
@@ -511,23 +510,22 @@ fn validate_public_read_properties(
 ) {
     use novarocks_connector_contract::{
         ConnectorReadDistribution, ConnectorReadNullOrdering, ConnectorReadSortDirection,
-        ConnectorReadWorkSource,
     };
     let public = frozen.public_facts().source().properties();
     let physical = relation.provided_properties();
-    let distribution_matches =
-        if frozen.scan().work_source() == ConnectorReadWorkSource::WholeRelation {
-            physical.distribution == crate::Distribution::Singleton
-        } else {
-            match (public.distribution(), &physical.distribution) {
-                (ConnectorReadDistribution::Unconstrained, crate::Distribution::Unconstrained)
-                | (ConnectorReadDistribution::Singleton, crate::Distribution::Singleton)
-                | (ConnectorReadDistribution::RoundRobin, crate::Distribution::RoundRobin) => true,
-                // The current provider contract has no exact plan partition-count
-                // identity for these facts; FE negotiation rejects them as well.
-                _ => false,
-            }
-        };
+    let distribution_matches = matches!(
+        (public.distribution(), &physical.distribution),
+        (
+            ConnectorReadDistribution::Unconstrained,
+            crate::Distribution::Unconstrained
+        ) | (
+            ConnectorReadDistribution::Singleton,
+            crate::Distribution::Singleton
+        ) | (
+            ConnectorReadDistribution::RoundRobin,
+            crate::Distribution::RoundRobin
+        )
+    );
     let ordering_matches = public.ordering().len() == physical.ordering.len()
         && public
             .ordering()

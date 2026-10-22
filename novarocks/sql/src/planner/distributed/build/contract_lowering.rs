@@ -2044,11 +2044,7 @@ impl<'a> ContractLoweringVisitor<'a> {
                         fragment: fragment_id,
                     },
                 )?;
-                // A fragment that can only run one driver says so. The plan's
-                // domain is what a fragment may widen to, and a fragment whose
-                // root delivers one stream -- a metadata read the provider hands
-                // to one reader, a gather, a finish -- never does.
-                let dop_domain = fragment_dop_domain(&builder, root, self.dop_domain);
+                let dop_domain = self.dop_domain;
                 let fragment = builder.finish_definition(root, sink, dop_domain)?;
                 finished_fragments.insert(fragment_id, fragment);
             }
@@ -3233,7 +3229,6 @@ impl<'a> ContractLoweringVisitor<'a> {
                 Relation::Metadata(MetadataRelation {
                     kind,
                     read: contract.read,
-                    work_source: contract.work_source,
                     selection_digest: contract.selection_digest,
                     schema: relation_schema.into_boxed_slice(),
                     predicate_guarantees: guarantees.into_boxed_slice(),
@@ -3243,7 +3238,6 @@ impl<'a> ContractLoweringVisitor<'a> {
             }
             _ => Relation::Data(DataRelation {
                 read: contract.read,
-                work_source: contract.work_source,
                 selection_digest: contract.selection_digest,
                 schema: relation_schema.into_boxed_slice(),
                 predicate_guarantees: guarantees.into_boxed_slice(),
@@ -11684,27 +11678,6 @@ fn column_value_type(
     Ok(full_source_type(&declared))
 }
 
-/// The widest this fragment may run.
-///
-/// A fragment that reads a relation the provider hands to one reader whole has
-/// no split to spread, so it runs exactly one driver however wide the plan may
-/// otherwise go. Everything else takes the plan's own domain.
-fn fragment_dop_domain(
-    builder: &FragmentBuilder,
-    _root: NodeId,
-    plan: PipelineDopDomain,
-) -> PipelineDopDomain {
-    if builder.reads_a_whole_relation() {
-        PipelineDopDomain {
-            min: 1,
-            max: 1,
-            requires_power_of_two: plan.requires_power_of_two,
-        }
-    } else {
-        plan
-    }
-}
-
 fn value_type(column: &OutputColumn) -> ValueType {
     full_source_type(&column.value_type)
 }
@@ -13003,8 +12976,7 @@ mod tests {
         ValueOrigin,
     };
     use novarocks_spi::connector::read_stack::{
-        ConnectorReadBinding, ConnectorReadRelationKind, ConnectorReadWorkSource,
-        ConnectorValueType,
+        ConnectorReadBinding, ConnectorReadRelationKind, ConnectorValueType,
     };
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
@@ -14907,7 +14879,6 @@ mod tests {
             request: ProviderReadRequestBinding::from_need(&need),
             read,
             metadata_kind: None,
-            work_source: ConnectorReadWorkSource::RuntimeSplits,
             selection_digest: [8; 32],
             schema: vec![
                 ProviderReadColumnFact::new(

@@ -38,19 +38,19 @@ use prost::Message;
 
 use crate::provider_types::IcebergReadView;
 use crate::typed_read::{
-    ColumnIdentity, ColumnIdentityCategory, FilesTableSplit, FilesTableSplitParams,
-    HiveTransactionHandle, IcebergAddedRows, IcebergChangeSplit, IcebergChangeWindowHandle,
-    IcebergChangeWindowHandleParams, IcebergColumnHandle, IcebergColumnHandleParams,
-    IcebergDeleteFile, IcebergDeleteFileContent, IcebergDeleteFileParams,
-    IcebergDeletedDataFileRows, IcebergFileFormat, IcebergInsertTableHandle,
-    IcebergInsertTableHandleParams, IcebergMergeTableHandle, IcebergOptimizeHandle,
-    IcebergProcedureId, IcebergReadSplit, IcebergRewriteArtifactContentId,
+    ColumnIdentity, ColumnIdentityCategory, HiveTransactionHandle, IcebergAddedRows,
+    IcebergChangeSplit, IcebergChangeWindowHandle, IcebergChangeWindowHandleParams,
+    IcebergColumnHandle, IcebergColumnHandleParams, IcebergDeleteFile, IcebergDeleteFileContent,
+    IcebergDeleteFileParams, IcebergDeletedDataFileRows, IcebergFileFormat,
+    IcebergInsertTableHandle, IcebergInsertTableHandleParams, IcebergMergeTableHandle,
+    IcebergOptimizeHandle, IcebergProcedureId, IcebergReadSplit, IcebergRewriteArtifactContentId,
     IcebergRewritePositionDeleteFilesHandle, IcebergRewritePositionDeleteFilesSplit,
     IcebergRewritePositionDeleteFilesSplitParams, IcebergRuntimeRelation, IcebergSplit,
     IcebergSplitParams, IcebergSystemTableReference, IcebergSystemTableReferenceParams,
     IcebergSystemTableType, IcebergTableExecuteHandle, IcebergTableExecuteHandleParams,
     IcebergTableExecuteProcedureHandle, IcebergTableHandle, IcebergTableHandleParams,
-    IcebergVisibilityDifferenceRows, ParquetFileDecryptionData, TableChangesChangeType,
+    IcebergVisibilityDifferenceRows, ParquetFileDecryptionData, SystemManifestSplit,
+    SystemManifestSplitParams, SystemRelationSplit, TableChangesChangeType,
     TableChangesFunctionHandle, TableChangesFunctionHandleParams, TableChangesSplit,
     TableChangesSplitParams, TrinoManifestContent, TrinoManifestFile, TrinoManifestFileParams,
 };
@@ -284,7 +284,8 @@ enum Schema {
     DeletedDataFileRows,
     ChangeSplit,
     Manifest,
-    FilesSplit,
+    ManifestSplit,
+    RelationSplit,
     RewriteSplit,
     ReadSplit,
 }
@@ -552,10 +553,17 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             2..=14 => singular(Varint),
             _ => return None,
         },
-        FilesSplit => match field {
+        ManifestSplit => match field {
             1 => singular(Message(Manifest)),
             2 | 3 | 5..=7 => singular(Scalar),
             4 => repeated(MapI32String),
+            8 => singular(Varint),
+            9 => singular(Message(SystemTable)),
+            10 => repeated(PackedVarint),
+            _ => return None,
+        },
+        RelationSplit => match field {
+            1 => singular(Message(SystemTable)),
             _ => return None,
         },
         RewriteSplit => match field {
@@ -568,7 +576,8 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             10 => oneof(Message(DataSplit)),
             11 => oneof(Message(TableChangesSplit)),
             12 => oneof(Message(ChangeSplit)),
-            13 => oneof(Message(FilesSplit)),
+            13 => oneof(Message(ManifestSplit)),
+            15 => oneof(Message(RelationSplit)),
             14 => oneof(Message(RewriteSplit)),
             _ => return None,
         },
@@ -1960,7 +1969,6 @@ fn encode_system_table(value: &IcebergSystemTableReference) -> dto::IcebergSyste
             IcebergSystemTableType::History => dto::IcebergSystemTableType::History,
             IcebergSystemTableType::Refs => dto::IcebergSystemTableType::Refs,
             IcebergSystemTableType::Manifests => dto::IcebergSystemTableType::Manifests,
-            IcebergSystemTableType::Partitions => dto::IcebergSystemTableType::Partitions,
         } as i32,
         metadata_file_location: value.metadata_file_location().to_string(),
         table_uuid: value.table_uuid().to_string(),
@@ -1982,7 +1990,6 @@ fn decode_system_table(
             Ok(dto::IcebergSystemTableType::History) => IcebergSystemTableType::History,
             Ok(dto::IcebergSystemTableType::Refs) => IcebergSystemTableType::Refs,
             Ok(dto::IcebergSystemTableType::Manifests) => IcebergSystemTableType::Manifests,
-            Ok(dto::IcebergSystemTableType::Partitions) => IcebergSystemTableType::Partitions,
             Ok(dto::IcebergSystemTableType::Unspecified) | Err(_) => {
                 return Err(codec_error(
                     "system_table.system_table_type",
@@ -2846,8 +2853,9 @@ fn decode_manifest(
     finish_decode(result, context)
 }
 
-fn encode_files_split(value: &FilesTableSplit) -> dto::FilesTableSplit {
-    dto::FilesTableSplit {
+fn encode_files_split(value: &SystemManifestSplit) -> dto::SystemManifestSplit {
+    dto::SystemManifestSplit {
+        reference: Some(encode_system_table(value.reference())),
         table_has_variant_history: value.table_has_variant_history(),
         manifest: Some(encode_manifest(value.manifest())),
         table_schema_json: value.table_schema_json().to_string(),
@@ -2860,18 +2868,29 @@ fn encode_files_split(value: &FilesTableSplit) -> dto::FilesTableSplit {
         partition_column_type_json: value.partition_column_type_json().map(str::to_string),
         bounds_column_type_json: value.bounds_column_type_json().map(str::to_string),
         encryption_key_id: value.encryption_key_id().map(str::to_string),
+        partition_slot_field_ids: value.partition_slot_field_ids().to_vec(),
     }
 }
 
 fn decode_files_split(
-    raw: &dto::FilesTableSplit,
+    raw: &dto::SystemManifestSplit,
     context: &mut ConnectorDecodeContext<'_>,
-) -> Result<FilesTableSplit, ConnectorCodecError> {
+) -> Result<SystemManifestSplit, ConnectorCodecError> {
     // Existing serde/domain/library operations remain opaque inside this boundary.
     context.flush_compile_control()?;
     let result = (|| {
         {
-            let opaque_arguments = (FilesTableSplitParams {
+            let opaque_arguments = (SystemManifestSplitParams {
+                reference: decode_system_table(
+                    raw.reference.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "manifest_split.reference",
+                            ConnectorCodecErrorKind::MissingField,
+                            "Iceberg manifest split requires a frozen reference",
+                        )
+                    })?,
+                    context,
+                )?,
                 table_has_variant_history: raw.table_has_variant_history,
                 manifest: decode_manifest(
                     raw.manifest.as_ref().ok_or_else(|| {
@@ -2886,6 +2905,7 @@ fn decode_files_split(
                 table_schema_json: copy_string(&raw.table_schema_json, context)?,
                 metadata_table_schema_json: copy_string(&raw.metadata_table_schema_json, context)?,
                 partition_spec_jsons: copy_i32_string_map(&raw.partition_spec_jsons, context)?,
+                partition_slot_field_ids: copy_slice(&raw.partition_slot_field_ids, context)?,
                 partition_column_type_json: raw
                     .partition_column_type_json
                     .as_deref()
@@ -2902,7 +2922,7 @@ fn decode_files_split(
                     .map(|value| copy_string(value, context))
                     .transpose()?,
             },);
-            observe_opaque(context, || FilesTableSplit::try_new(opaque_arguments.0))?
+            observe_opaque(context, || SystemManifestSplit::try_new(opaque_arguments.0))?
         }
         .map_err(|error| domain_error("files_split", error))
     })();
@@ -2967,7 +2987,12 @@ fn encode_split(
             Split::TableChanges(encode_table_changes_split(value))
         }
         IcebergReadSplit::ChangeWindow(value) => Split::ChangeWindow(encode_change_split(value)?),
-        IcebergReadSplit::SystemFiles(value) => Split::SystemFiles(encode_files_split(value)),
+        IcebergReadSplit::SystemManifest(value) => Split::SystemManifest(encode_files_split(value)),
+        IcebergReadSplit::SystemRelation(value) => {
+            Split::SystemRelation(dto::SystemRelationSplit {
+                reference: Some(encode_system_table(value.reference())),
+            })
+        }
         IcebergReadSplit::RewritePositionDeleteFiles(value) => {
             Split::RewritePositionDeleteFiles(encode_rewrite_split(value))
         }
@@ -3017,7 +3042,7 @@ fn decode_split(
                     .transpose()?,
                 context,
             )?)),
-            Split::SystemFiles(value) => {
+            Split::SystemManifest(value) => {
                 require_no_affinity(facts, "files_split")?;
                 if facts.split_weight() != SplitWeight::STANDARD {
                     return Err(codec_error(
@@ -3026,9 +3051,33 @@ fn decode_split(
                         "Iceberg files split requires standard split weight",
                     ));
                 }
-                Ok(IcebergReadSplit::SystemFiles(decode_files_split(
+                Ok(IcebergReadSplit::SystemManifest(decode_files_split(
                     value, context,
                 )?))
+            }
+            Split::SystemRelation(value) => {
+                require_no_affinity(facts, "system_relation_split")?;
+                if facts.split_weight() != SplitWeight::STANDARD {
+                    return Err(codec_error(
+                        "system_relation_split.split_weight",
+                        ConnectorCodecErrorKind::InconsistentFields,
+                        "Iceberg relation split requires standard split weight",
+                    ));
+                }
+                let reference = decode_system_table(
+                    value.reference.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "system_relation_split.reference",
+                            ConnectorCodecErrorKind::MissingField,
+                            "Iceberg relation split requires a frozen reference",
+                        )
+                    })?,
+                    context,
+                )?;
+                Ok(IcebergReadSplit::SystemRelation(
+                    SystemRelationSplit::try_new(reference)
+                        .map_err(|error| domain_error("system_relation_split", error))?,
+                ))
             }
             Split::RewritePositionDeleteFiles(value) => {
                 Ok(IcebergReadSplit::RewritePositionDeleteFiles(
@@ -3352,6 +3401,121 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.kind(), &ConnectorCodecErrorKind::InconsistentFields);
+    }
+
+    #[test]
+    fn metadata_work_unit_round_trip_preserves_exact_reference_and_manifest() {
+        use crate::iceberg::spec::{PrimitiveType, Type};
+        let reference = |kind| {
+            IcebergSystemTableReference::try_new(IcebergSystemTableReferenceParams {
+                schema_table_name: SchemaTableName::try_new("db", "t").unwrap(),
+                system_table_type: kind,
+                metadata_file_location: "s3://warehouse/db/t/metadata/v1.json".into(),
+                table_uuid: "9d1f4c1e-6a1f-4a0b-9c3a-0f2b6d5e7a11".into(),
+                snapshot_id: Some(11),
+            })
+            .unwrap()
+        };
+        let table_schema = crate::iceberg::spec::Schema::builder()
+            .with_fields([Arc::new(crate::iceberg::spec::NestedField::optional(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap();
+        let spec: crate::iceberg::spec::PartitionSpec = serde_json::from_value(serde_json::json!({
+            "spec-id":0,"fields":[{"field-id":1000,"source-id":1,"name":"p","transform":"identity"}]
+        }))
+        .unwrap();
+        let partition =
+            crate::partition_row::UnifiedPartitionRow::of(&table_schema, &[spec.clone()]).unwrap();
+        let manifest = TrinoManifestFile::try_new(TrinoManifestFileParams {
+            path: "s3://warehouse/db/t/metadata/m0.avro".into(),
+            length: 1024,
+            partition_spec_id: spec.spec_id(),
+            content: TrinoManifestContent::Data,
+            sequence_number: 1,
+            min_sequence_number: 1,
+            added_snapshot_id: 11,
+            added_files_count: Some(1),
+            existing_files_count: Some(0),
+            deleted_files_count: Some(0),
+            added_rows_count: Some(3),
+            existing_rows_count: Some(0),
+            deleted_rows_count: Some(0),
+            first_row_id: None,
+            key_metadata: Vec::new(),
+        })
+        .unwrap();
+        let mut splits = vec![IcebergReadSplit::SystemRelation(
+            SystemRelationSplit::try_new(reference(IcebergSystemTableType::Snapshots)).unwrap(),
+        )];
+        for kind in [
+            IcebergSystemTableType::Files,
+            IcebergSystemTableType::Entries,
+        ] {
+            splits.push(IcebergReadSplit::SystemManifest(
+                SystemManifestSplit::try_new(SystemManifestSplitParams {
+                    reference: reference(kind),
+                    table_has_variant_history: true,
+                    manifest: manifest.clone(),
+                    table_schema_json: serde_json::to_string(&table_schema).unwrap(),
+                    metadata_table_schema_json: "{}".into(),
+                    partition_spec_jsons: [(spec.spec_id(), serde_json::to_string(&spec).unwrap())]
+                        .into(),
+                    partition_column_type_json: Some(
+                        crate::typed_read::derived_row_type_json(&partition.arrow_type().unwrap())
+                            .unwrap(),
+                    ),
+                    partition_slot_field_ids: partition.field_ids(),
+                    bounds_column_type_json: None,
+                    encryption_key_id: None,
+                })
+                .unwrap(),
+            ));
+        }
+        for split in splits {
+            let payload = IcebergReadWireCodec.encode_private(&split).unwrap();
+            let facts = ConnectorReadSplitFacts::new(
+                true,
+                vec![],
+                None::<&str>,
+                SplitWeight::STANDARD,
+                split.retained_size_in_bytes(),
+            );
+            let header = header(ConnectorCodecCategory::ReadSplit);
+            let mut ledger = ConnectorDecodeLedger::new(limits());
+            let decoded = IcebergReadWireCodec
+                .decode_split_private(
+                    &payload,
+                    &facts,
+                    &mut ConnectorDecodeContext::new(&header, &mut ledger),
+                )
+                .unwrap();
+            match (split, decoded) {
+                (
+                    IcebergReadSplit::SystemRelation(before),
+                    IcebergReadSplit::SystemRelation(after),
+                ) => {
+                    assert_eq!(before.reference(), after.reference());
+                }
+                (
+                    IcebergReadSplit::SystemManifest(before),
+                    IcebergReadSplit::SystemManifest(after),
+                ) => {
+                    assert_eq!(before.reference(), after.reference());
+                    assert_eq!(before.manifest(), after.manifest());
+                    assert!(after.table_has_variant_history());
+                    assert_eq!(before.partition_slot_field_ids(), &[1000]);
+                    assert_eq!(
+                        before.partition_slot_field_ids(),
+                        after.partition_slot_field_ids()
+                    );
+                }
+                _ => panic!("metadata work unit kind changed"),
+            }
+        }
     }
 
     #[test]

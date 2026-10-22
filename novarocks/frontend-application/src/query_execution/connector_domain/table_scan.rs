@@ -25,8 +25,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use novarocks_spi::connector::read_stack::{
-    Assignment, ConnectorExpression, ConnectorReadColumnHandle, ConnectorReadWorkSource,
-    TupleDomain,
+    Assignment, ConnectorExpression, ConnectorReadColumnHandle, TupleDomain,
 };
 
 use super::handle::TableHandle;
@@ -67,7 +66,6 @@ pub(crate) struct TableScanNode {
     dynamic_filters: Vec<DynamicFilterBinding>,
     max_batch_rows: u64,
     max_batch_bytes: u64,
-    work_source: ConnectorReadWorkSource,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,9 +117,6 @@ impl<'a> TableScanSourceView<'a> {
     pub(crate) const fn max_batch_bytes(&self) -> u64 {
         self.node.max_batch_bytes()
     }
-    pub(crate) const fn work_source(&self) -> ConnectorReadWorkSource {
-        self.node.work_source()
-    }
 }
 
 impl TableScanNode {
@@ -135,7 +130,6 @@ impl TableScanNode {
         dynamic_filters: Vec<DynamicFilterBinding>,
         max_batch_rows: u64,
         max_batch_bytes: u64,
-        work_source: ConnectorReadWorkSource,
     ) -> Result<Self, TableScanNodeError> {
         // The protocol layer already proved every dynamic filter names an
         // assigned variable and that ids are unique; re-check here only what
@@ -167,7 +161,6 @@ impl TableScanNode {
             dynamic_filters,
             max_batch_rows,
             max_batch_bytes,
-            work_source,
         })
     }
 
@@ -203,9 +196,6 @@ impl TableScanNode {
     }
     pub(crate) const fn max_batch_bytes(&self) -> u64 {
         self.max_batch_bytes
-    }
-    pub(crate) const fn work_source(&self) -> ConnectorReadWorkSource {
-        self.work_source
     }
 
     /// The columns a dynamic filter may constrain on this scan.

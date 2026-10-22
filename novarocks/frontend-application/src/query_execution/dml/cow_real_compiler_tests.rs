@@ -367,7 +367,7 @@ fn compile_signed_cow(
             ExactInputVersion, PredicateGuaranteeKind, ProviderColumnReference,
             ProviderReadReference,
         };
-        use novarocks_spi::connector::read_stack::{ConnectorReadBinding, ConnectorReadWorkSource};
+        use novarocks_spi::connector::read_stack::ConnectorReadBinding;
         use novarocks_spi::connector::{
             ConnectorCodecCategory, ConnectorInstanceDescriptor, ConnectorInstanceId,
             ConnectorProviderId, ConnectorReadRelationPayload,
@@ -401,7 +401,6 @@ fn compile_signed_cow(
                     )
                     .expect("fixture metadata kind")
                 }),
-            work_source: ConnectorReadWorkSource::RuntimeSplits,
             selection_digest: [8; 32],
             schema: need
                 .columns()

@@ -214,7 +214,13 @@ pub fn observe_stream_writer_schema_construction<'a, H>(
             union_id_requests: counts.union_requests,
         },
         SchemaResourceSource {
-            is_flat: counts.types == counts.fields,
+            // Preserve this Arrow library owner's existing conservative model.
+            // Codec-owned source walkers supply their captured node count instead.
+            walker_node_bound: if counts.types == counts.fields {
+                1
+            } else {
+                MAX_VALUE_TYPE_NODES
+            },
             // Actual copied name/parameter byte operations are known here.
             // This is a work bound; it is never an original source invoice.
             source_retained_bytes: counts.string_bytes,

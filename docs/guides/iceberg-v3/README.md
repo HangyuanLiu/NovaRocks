@@ -92,7 +92,7 @@ NovaRocks 努力对齐 Iceberg v3 spec，但有几处**语法和 Spark 不一致
 | 主题 | NovaRocks | Spark | 说明 |
 | --- | --- | --- | --- |
 | 写指定 branch | `INSERT INTO t.branch_<x> ...` | `INSERT INTO t@<branch> ...` | NovaRocks 用 `<table>.branch_<name>` 后缀而非 `@` 限定符 |
-| Metadata table 路由 | ✅ `<tbl>$snapshots` / `$history` / `$refs` / `$partitions`（PR #85） | `SELECT * FROM t.snapshots` 或 `t$snapshots` | NovaRocks 只接受 `$` 形式（点号会与 schema/database 限定名歧义）；其余 metadata table 仍未实现 |
+| Metadata table 路由 | ✅ `<tbl>$snapshots` / `$history` / `$refs` / `$manifests` / `$files` / `$entries` / `$partitions` | `SELECT * FROM t.snapshots` 或 `t$snapshots` | NovaRocks 只接受 `$` 形式（点号会与 schema/database 限定名歧义）；`$partitions` 是 `$files` 的数据文件聚合视图；完整支持表见 [Metadata Tables](metadata-tables.md) |
 | Hadoop catalog metadata 文件名 | `vN.metadata.json`（Hadoop 约定） | `vN.metadata.json` | 与 StarRocks FE 期望的 `{version}-{uuid}.metadata.json` 不一致，混用时需要转换 |
 
 ---

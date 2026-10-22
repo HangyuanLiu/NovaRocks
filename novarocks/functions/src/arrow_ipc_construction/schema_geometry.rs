@@ -46,7 +46,8 @@ pub struct SchemaGeometry {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct SchemaResourceSource {
-    pub is_flat: bool,
+    /// Bound on the original source walker's pending entries.
+    pub walker_node_bound: usize,
     pub source_retained_bytes: usize,
     pub scratch_work: usize,
 }
@@ -152,16 +153,10 @@ pub fn schema_writer_allocation_metrics<E: From<IpcGeometryError>>(
 ) -> Result<SchemaAllocationMetrics, E> {
     let mut requests = SchemaRequestAccumulator::default();
     requests.exact::<u8, E>(schema.backing, 2, observe)?;
-    if source.is_flat {
-        requests.exact::<(&DataType, usize), E>(1, 4, observe)?;
-    } else {
-        requests.geometric::<(&DataType, usize), E>(
-            novarocks_type_contract::MAX_VALUE_TYPE_NODES,
-            1,
-            4,
-            observe,
-        )?;
+    if source.walker_node_bound == 0 {
+        return Err(IpcGeometryError::SourceModel.into());
     }
+    requests.geometric::<(&DataType, usize), E>(source.walker_node_bound, 1, 4, observe)?;
     requests.exact::<(&str, &str), E>(schema.metadata_entries, 1, observe)?;
     // WIPOffset is the standard four-byte relative wire offset. Its original
     // caller verifies the locked concrete offset/location layouts separately.

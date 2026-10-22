@@ -190,7 +190,6 @@ fn prepared(
             serialized_metadata: Some(
                 serde_json::to_string(metadata).expect("small metadata JSON"),
             ),
-            serialized_metadata_rows: None,
         }),
         metadata_columns: ["_file", "_pos", "_row_id", "_last_updated_sequence_number"]
             .into_iter()

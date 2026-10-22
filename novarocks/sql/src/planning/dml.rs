@@ -3136,8 +3136,8 @@ mod tests {
             ExactInputVersion, PipelineDopDomain, PlanVersionId, ProviderColumnReference,
             ProviderReadReference, ScanReadBudget, ValueType,
         };
+        use novarocks_spi::connector::read_stack::ConnectorReadBinding;
         use novarocks_spi::connector::read_stack::value::ConnectorValueType;
-        use novarocks_spi::connector::read_stack::{ConnectorReadBinding, ConnectorReadWorkSource};
         use novarocks_spi::connector::{
             CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
             ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
@@ -3200,7 +3200,6 @@ mod tests {
                 )
                 .expect("fixture metadata kind")
             }),
-            work_source: ConnectorReadWorkSource::RuntimeSplits,
             selection_digest: [8; 32],
             schema: Box::from([crate::compiler::ProviderReadColumnFact::new(
                 0,

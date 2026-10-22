@@ -375,9 +375,12 @@ const fn frozen_encode_limits() -> PackageEncodeLimits {
             max_work: WORK,
         },
         writers: WriterRecipeProjectionLimits {
-            max_recipes: 100_000,
-            max_input_fields: 100_000,
-            max_token_bytes: 32_000,
+            // These three fields only compare actual facts with a threshold.
+            // Production adds no writer-specific count or token quota; source
+            // invoices, checked layouts and shared resource controls still apply.
+            max_recipes: usize::MAX,
+            max_input_fields: usize::MAX,
+            max_token_bytes: usize::MAX,
             max_allocation_requests: 1_000_000,
             max_allocation_request_bytes: REQUEST,
             max_coexisting_source_and_request_bytes: COEXIST,
@@ -522,6 +525,20 @@ mod tests {
             encode.constant_records.recursive.flat,
         ] {
             assert_eq!(record.max_cumulative_library_work, usize::MAX / 4);
+        }
+    }
+
+    #[test]
+    fn frozen_writer_policy_has_no_additional_count_or_token_quota() {
+        let encode = PackageEncodeLimits::FROZEN.writers;
+        let decode = PackageDecodeLimits::FROZEN.writers;
+        for limits in [encode, decode] {
+            assert_eq!(limits.max_recipes, usize::MAX);
+            assert_eq!(limits.max_input_fields, usize::MAX);
+            assert_eq!(limits.max_token_bytes, usize::MAX);
+            assert_eq!(limits.max_allocation_request_bytes, REQUEST);
+            assert_eq!(limits.max_coexisting_source_and_request_bytes, COEXIST);
+            assert_eq!(limits.max_work, WORK);
         }
     }
 

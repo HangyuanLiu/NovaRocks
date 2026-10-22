@@ -861,3 +861,193 @@ fn zero_width_project_carries_its_row_count_into_count_star() {
     let chunks = run_single(&plan, &catalog);
     assert_eq!(int64_rows(&chunks), [vec![Some(3)]]);
 }
+
+/// A singleton provider work unit may be assigned to only one of several
+/// instances. Empty siblings still send their initial aggregate states and EOS.
+#[test]
+fn compiled_scan_partials_merge_one_unit_and_empty_instances_at_dop_one_and_two() {
+    use super::aggregate_fixture::{
+        aggregate_catalog, compile_with_providers, packages_with_reads, try_run_with_scans,
+    };
+    use crate::exec::pipeline::binding::ScanBindings;
+    use crate::runtime::fragment::scan::compiled_fixture::{
+        FixtureScanOp, add_typed_scan, providers, scan_chunk,
+    };
+    use novarocks_connector_contract::FrozenConnectorRead;
+    use novarocks_physical_plan::ProviderReadOccurrenceId;
+    use std::sync::Arc;
+    let catalog = aggregate_catalog(&[
+        (
+            "count",
+            novarocks_functions::PureKernelAbi::AggregateWindowV1,
+        ),
+        ("sum", novarocks_functions::PureKernelAbi::AggregateWindowV1),
+    ]);
+    let calls = Calls(vec![
+        (bind(&catalog, "count", &[]), false),
+        (bind(&catalog, "sum", &[int64(false)]), true),
+    ]);
+    for dop in [1, 2] {
+        for has_unit in [true, false] {
+            let mut partial = FragmentBuilder::new(PARTIAL);
+            let scan = partial.reserve_node_id().unwrap();
+            let (columns, read): (_, FrozenConnectorRead) =
+                add_typed_scan(&mut partial, scan, &[int64(false), int64(false)], vec![]);
+            let (aggregate, states) = add_aggregate(
+                &mut partial,
+                scan,
+                &[],
+                &calls.update(columns[1], true),
+                AggregateGrouping::Partial,
+            );
+            let partial = finish(
+                partial,
+                aggregate,
+                FragmentSink::Stream { edge: TO_FINAL },
+                dop,
+            );
+            let mut last = FragmentBuilder::new(FINAL);
+            let receiver = last.reserve_node_id().unwrap();
+            let sent = states
+                .iter()
+                .zip(calls.all())
+                .map(|(state, call)| (*state, call.intermediate_type()))
+                .collect::<Vec<_>>();
+            let inputs = receive(&mut last, receiver, TO_FINAL, &sent, |_| {
+                Distribution::Singleton
+            });
+            let (aggregate, _) = add_aggregate(
+                &mut last,
+                receiver,
+                &[],
+                &calls.merge(&inputs),
+                AggregateGrouping::Complete,
+            );
+            let last = finish(last, aggregate, FragmentSink::Result, dop);
+            let output = last.nodes()[&aggregate].output.clone();
+            let mut plan = PlanBuilder::new(version());
+            plan.add_fragment(partial).unwrap();
+            plan.add_fragment(last).unwrap();
+            plan.add_edge(edge(
+                TO_FINAL,
+                (PARTIAL, &states),
+                (FINAL, receiver, &inputs),
+                Distribution::Singleton,
+                Distribution::Singleton,
+            ))
+            .unwrap();
+            plan.set_result_port(result_port(
+                FINAL,
+                output,
+                &calls.all().map(Bound::result_type).collect::<Vec<_>>(),
+            ))
+            .unwrap();
+            let plan = plan
+                .finish_observed(&FixtureControl)
+                .expect("scan aggregate plan");
+            let mut packages = packages_with_reads(
+                &plan,
+                &catalog,
+                &BTreeMap::from([(ProviderReadOccurrenceId::new(0), read)]),
+            );
+            let partial = compile_with_providers(
+                packages.remove(&PARTIAL).unwrap(),
+                &catalog,
+                dop as usize,
+                false,
+                &providers(),
+            );
+            let last = compile(
+                packages.remove(&FINAL).unwrap(),
+                &catalog,
+                dop as usize,
+                true,
+            );
+            let port = in_process_test_exchange_receiver_port();
+            let transmitter = LoopbackTransmitter::new(Arc::clone(&port));
+            let final_instance = FINAL_FINSTS[0];
+            let bindings = register(&last, final_instance, PARTIAL_FINSTS.len(), &port);
+            let keys = bindings
+                .node_ids()
+                .map(
+                    |node| crate::runtime::fragment::io::exchange_receiver::ExchangeReceiverKey {
+                        fragment_instance_id: final_instance,
+                        node_id: node,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let mut scans = Vec::new();
+            for (ordinal, instance) in PARTIAL_FINSTS.into_iter().enumerate() {
+                let chunks = if has_unit && ordinal == 0 {
+                    vec![scan_chunk(&partial, &[2, 3], &[2, 3])]
+                } else {
+                    vec![]
+                };
+                let op = FixtureScanOp::new(chunks, false);
+                let mut scan_bindings = ScanBindings::default();
+                scan_bindings.insert(
+                    i32::try_from(partial.scan_inputs().values().next().unwrap().scan_node)
+                        .unwrap(),
+                    op.clone(),
+                );
+                let sink = stream_sink(
+                    &partial,
+                    instance,
+                    vec![destination(
+                        final_instance,
+                        instance,
+                        ordinal as u32,
+                        PARTIAL_FINSTS.len() as u32,
+                    )],
+                    &transmitter,
+                );
+                try_run_with_scans(
+                    &partial,
+                    sink,
+                    ExchangeBindings::default(),
+                    scan_bindings,
+                    instance,
+                )
+                .expect("each partial instance joins after its scan closes");
+                assert_eq!(op.claims(), 1, "each instance claims its own source once");
+                assert_eq!(op.closes(), 1, "each source closes before successful join");
+                assert_eq!(
+                    op.terminations(),
+                    0,
+                    "normal EOS closes the stream without canceling its source"
+                );
+                scans.push(op);
+            }
+            for key in &keys {
+                assert_eq!(
+                    port.snapshot(*key).unwrap().finished_senders,
+                    PARTIAL_FINSTS.len(),
+                    "the empty sibling's EOS participates too"
+                );
+            }
+            let output = ResultSinkHandle::new();
+            try_run(
+                &last,
+                result_sink(&last, final_instance, &output),
+                bindings,
+                final_instance,
+            )
+            .expect("final instance joins after all senders end");
+            let rows = int64_rows(&output.take_chunks());
+            assert_eq!(
+                rows,
+                if has_unit {
+                    vec![vec![Some(2), Some(5)]]
+                } else {
+                    vec![vec![Some(0), None]]
+                },
+                "dop={dop}, has_unit={has_unit}"
+            );
+            assert_eq!(scans.len(), 2, "both independent partial instances ran");
+            for key in keys {
+                port.remove(key);
+                assert!(port.snapshot(key).is_none());
+            }
+        }
+    }
+}

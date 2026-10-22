@@ -682,8 +682,7 @@ impl PreparedDistributedQuery {
                         ))
                     })?;
                 let assigned = match work.assignment() {
-                    BoundManifestScanAssignment::RuntimeSplits
-                    | BoundManifestScanAssignment::WholeRelation => Vec::new(),
+                    BoundManifestScanAssignment::RuntimeSplits => Vec::new(),
                     BoundManifestScanAssignment::FrozenUnits(units) => {
                         let mut selected = Vec::with_capacity(units.len().get());
                         for offset in 0..units.len().get() {

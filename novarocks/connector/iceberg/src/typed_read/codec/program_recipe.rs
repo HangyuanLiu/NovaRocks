@@ -19,8 +19,7 @@
 
 use novarocks_connector_contract::{
     ConnectorReadArtifactCoverage, ConnectorReadDistribution, ConnectorReadProgramCompiler,
-    ConnectorReadRelationRecipeDraft, ConnectorReadWorkSource, FrozenConnectorRead,
-    PureProviderCompileError,
+    ConnectorReadRelationRecipeDraft, FrozenConnectorRead, PureProviderCompileError,
 };
 use novarocks_spi::connector::{
     ConnectorCodecCategory, ConnectorCodecError, ConnectorCodecErrorKind, ConnectorCodecRevision,
@@ -165,28 +164,20 @@ fn compile(
                 )?,
                 None => false,
             };
-            let expected_work = if reference.system_table_type().produces_splits() {
-                ConnectorReadWorkSource::RuntimeSplits
-            } else {
-                ConnectorReadWorkSource::WholeRelation
-            };
-            let matching_work = scan.work_source() == expected_work;
             work.step()?;
-            if !matching_metadata || !matching_work {
+            if !matching_metadata {
                 return Err(invalid(
                     "metadata",
-                    "Iceberg metadata kind or work source differs from its frozen reference",
+                    "Iceberg metadata kind differs from its frozen reference",
                 ));
             }
         }
         _ => {
-            let matching_work = scan.work_source() == ConnectorReadWorkSource::RuntimeSplits
-                && public.metadata_kind().is_none();
             work.step()?;
-            if !matching_work {
+            if public.metadata_kind().is_some() {
                 return Err(invalid(
                     "relation",
-                    "Iceberg ordinary relation has metadata facts or a different work source",
+                    "Iceberg ordinary relation has metadata facts",
                 ));
             }
         }

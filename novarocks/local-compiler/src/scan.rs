@@ -21,9 +21,7 @@
 //! runtime split address. Splits themselves are task facts, never program facts.
 
 use crate::lowering::FragmentCompileError;
-use novarocks_connector_contract::{
-    ConnectorReadProgramRecipe, ConnectorReadRelationKind, ConnectorReadWorkSource,
-};
+use novarocks_connector_contract::{ConnectorReadProgramRecipe, ConnectorReadRelationKind};
 use novarocks_local_program::{
     BindingRequirement, CompiledScanInput, ProgramExprId, ProgramNodeId, ProgramNodeKind,
     ProgramScanSource, ScanSourceKind, StaticLayout,
@@ -40,7 +38,7 @@ pub(crate) struct LoweredScan {
     pub input: CompiledScanInput,
 }
 
-/// The admitted scan shape: a source-tree leaf over one runtime-split table
+/// The admitted scan shape: a source-tree leaf over one provider work-unit
 /// read whose output is exactly its provider outputs in order, with its original
 /// ordered residuals and guarantees admitted by the checked package. Exact
 /// guarantees remain in the provider recipe; pruning-only guarantees retain
@@ -67,21 +65,27 @@ pub(crate) fn admit_scan(
         feature,
     };
     work.step()?;
-    // Whole-relation work is opened directly by one executor (today only for
-    // system tables); the compiled scan addresses runtime splits only.
-    if relation.work_source() != ConnectorReadWorkSource::RuntimeSplits {
-        return Err(unsupported("whole-relation provider read"));
-    }
-    let Relation::Data(data) = relation.as_ref() else {
-        return Err(unsupported("provider metadata or system-table relation"));
-    };
-    if data.read.relation.kind() != ConnectorReadRelationKind::Table {
-        return Err(unsupported("provider relation other than a table"));
+    match relation.as_ref() {
+        Relation::Data(data) => {
+            if !matches!(
+                data.read.relation.kind(),
+                ConnectorReadRelationKind::Table | ConnectorReadRelationKind::TableExecute
+            ) {
+                return Err(unsupported("provider relation other than a table"));
+            }
+        }
+        Relation::Metadata(metadata) => {
+            if metadata.read.relation.kind() != ConnectorReadRelationKind::SystemTable {
+                return Err(FragmentCompileError::Invalid(
+                    "metadata relation is not a system table",
+                ));
+            }
+        }
     }
     if !derived_values.is_empty() {
         return Err(unsupported("derived or VARIANT scan value"));
     }
-    for guarantee in data.predicate_guarantees.iter() {
+    for guarantee in relation.predicate_guarantees().iter() {
         let evaluated = residuals.contains(&guarantee.predicate);
         work.step()?;
         match guarantee.kind {
@@ -115,18 +119,11 @@ pub(crate) fn admit_scan(
             ));
         }
     }
-    let recipe = recipe.ok_or(FragmentCompileError::Invalid(
+    let _recipe = recipe.ok_or(FragmentCompileError::Invalid(
         "scan has no provider read recipe",
     ))?;
-    // Frozen dynamic filters are the scan's runtime-filter consumers; the
-    // runtime-filter plan already proved they are exactly its admitted ones.
-    let scan = recipe.frozen().scan();
+    // The checked package and provider validation retain the exact recipe.
     work.step()?;
-    if scan.work_source() != data.work_source {
-        return Err(FragmentCompileError::Invalid(
-            "provider read work source differs from its scan",
-        ));
-    }
     Ok(())
 }
 

@@ -32,8 +32,8 @@ use novarocks_types::identity::{
 };
 
 use crate::api::{
-    ExecutionSchedulingFacts, NativeScanWork, PlanScanIdentity, ScanSchedulingFacts,
-    SchedulingStreamKind,
+    ExecutionSchedulingFacts, NativeScanWork, PlanScanIdentity, RuntimeSplitPlacement,
+    ScanSchedulingFacts, SchedulingStreamKind,
 };
 
 use super::{
@@ -107,7 +107,6 @@ impl ScheduledScanWork {
 #[derive(Debug, Eq, PartialEq)]
 pub enum ScheduledScanAssignment {
     RuntimeSplits,
-    WholeRelation,
     FrozenUnits { units: ScheduledFrozenUnits },
 }
 
@@ -115,7 +114,7 @@ impl ScheduledScanAssignment {
     pub const fn frozen_units(&self) -> Option<&ScheduledFrozenUnits> {
         match self {
             Self::FrozenUnits { units } => Some(units),
-            Self::RuntimeSplits | Self::WholeRelation => None,
+            Self::RuntimeSplits => None,
         }
     }
 }
@@ -443,8 +442,13 @@ fn scan_fragment_parallelism(scans: &[ScanSchedulingFacts], backend_count: usize
     for scan in scans {
         match scan.work {
             NativeScanWork::Empty => {}
-            NativeScanWork::WholeRelation => return 1,
-            NativeScanWork::RuntimeSplits => parallelism = backend_count,
+            NativeScanWork::RuntimeSplits { placement } => {
+                let contribution = match placement {
+                    RuntimeSplitPlacement::SingleUnit => 1,
+                    RuntimeSplitPlacement::Spread => backend_count,
+                };
+                parallelism = parallelism.max(contribution);
+            }
             NativeScanWork::FrozenUnits { count } => parallelism = parallelism.max(count.get()),
         }
     }
@@ -459,7 +463,7 @@ fn assign_scan_work(
     for &ScanSchedulingFacts { scan, work } in scans {
         match work {
             NativeScanWork::Empty => {}
-            NativeScanWork::RuntimeSplits => {
+            NativeScanWork::RuntimeSplits { .. } => {
                 for task in &mut assigned {
                     task.push(ScheduledScanWork {
                         scan,
@@ -467,10 +471,6 @@ fn assign_scan_work(
                     });
                 }
             }
-            NativeScanWork::WholeRelation => assigned[0].push(ScheduledScanWork {
-                scan,
-                assignment: ScheduledScanAssignment::WholeRelation,
-            }),
             NativeScanWork::FrozenUnits { count } => {
                 let total = count.get();
                 let task_count = assigned.len();
@@ -736,7 +736,9 @@ mod tests {
             execution,
             frontend,
             &backends,
-            NativeScanWork::RuntimeSplits,
+            NativeScanWork::RuntimeSplits {
+                placement: RuntimeSplitPlacement::Spread,
+            },
         );
 
         let scan_fragment = schedule
@@ -783,26 +785,95 @@ mod tests {
     }
 
     #[test]
-    fn whole_relation_and_frozen_units_have_exact_task_assignments() {
+    fn single_unit_runtime_scan_uses_one_task_with_runtime_assignment() {
+        let schedule = build_scan_edge(
+            execution(1),
+            FrontendProcessId::new_v7(),
+            &backends(3),
+            NativeScanWork::RuntimeSplits {
+                placement: RuntimeSplitPlacement::SingleUnit,
+            },
+        );
+        let scan = &schedule.fragments()[0];
+        assert_eq!(scan.tasks().len(), 1);
+        assert!(matches!(
+            scan.tasks()[0].scan_work()[0].assignment(),
+            ScheduledScanAssignment::RuntimeSplits
+        ));
+        assert_eq!(schedule.edges()[0].sender_count().get(), 1);
+    }
+
+    #[test]
+    fn single_unit_scan_does_not_constrain_a_spread_scan_in_the_same_fragment() {
+        let mut inputs = scan_edge_inputs(NativeScanWork::RuntimeSplits {
+            placement: RuntimeSplitPlacement::SingleUnit,
+        });
+        let single = inputs.fragments[0].scans[0].scan;
+        let spread = PlanScanIdentity::new(single.plan(), single.fragment_id(), 1);
+        inputs.fragments[0].scans.push(ScanSchedulingFacts {
+            scan: spread,
+            work: NativeScanWork::RuntimeSplits {
+                placement: RuntimeSplitPlacement::Spread,
+            },
+        });
+        let schedule = build_attempt_schedule(
+            execution(1),
+            FrontendProcessId::new_v7(),
+            &backends(3),
+            &inputs,
+            #[cfg(novarocks_dev_controls)]
+            Ok(None),
+        )
+        .unwrap();
+        let tasks = schedule.fragments()[0].tasks();
+        assert_eq!(tasks.len(), 3);
+        for task in tasks {
+            assert_eq!(task.scan_work().len(), 2);
+            assert_eq!(task.scan_work()[0].scan(), single);
+            assert_eq!(task.scan_work()[1].scan(), spread);
+            assert!(
+                task.scan_work().iter().all(|work| matches!(
+                    work.assignment(),
+                    ScheduledScanAssignment::RuntimeSplits
+                ))
+            );
+        }
+        assert_eq!(schedule.edges()[0].sender_count().get(), 3);
+    }
+
+    #[test]
+    fn ignoring_single_unit_hint_still_assigns_runtime_splits_to_every_task() {
+        // The provider still enumerates one unit. Choosing wider placement
+        // changes only the number of receivers, not the assignment protocol.
+        let mut inputs = scan_edge_inputs(NativeScanWork::RuntimeSplits {
+            placement: RuntimeSplitPlacement::SingleUnit,
+        });
+        inputs.fragments[0].scans[0].work = NativeScanWork::RuntimeSplits {
+            placement: RuntimeSplitPlacement::Spread,
+        };
+        let schedule = build_attempt_schedule(
+            execution(1),
+            FrontendProcessId::new_v7(),
+            &backends(3),
+            &inputs,
+            #[cfg(novarocks_dev_controls)]
+            Ok(None),
+        )
+        .unwrap();
+        assert_eq!(schedule.fragments()[0].tasks().len(), 3);
+        assert!(schedule.fragments()[0].tasks().iter().all(|task| {
+            task.scan_work().len() == 1
+                && matches!(
+                    task.scan_work()[0].assignment(),
+                    ScheduledScanAssignment::RuntimeSplits
+                )
+        }));
+    }
+
+    #[test]
+    fn frozen_units_have_exact_task_assignments() {
         let frontend = FrontendProcessId::new_v7();
         let backends = backends(3);
-        let whole = build_scan_edge(
-            execution(1),
-            frontend,
-            &backends,
-            NativeScanWork::WholeRelation,
-        );
-        let whole_scan = whole
-            .fragments()
-            .iter()
-            .find(|fragment| !fragment.tasks()[0].scan_work().is_empty())
-            .unwrap();
-        assert_eq!(whole_scan.tasks().len(), 1);
-        assert!(matches!(
-            whole_scan.tasks()[0].scan_work()[0].assignment(),
-            ScheduledScanAssignment::WholeRelation
-        ));
-
         let frozen = build_scan_edge(
             execution(2),
             frontend,
@@ -958,13 +1029,17 @@ mod tests {
             execution(1),
             frontend,
             &backends,
-            NativeScanWork::RuntimeSplits,
+            NativeScanWork::RuntimeSplits {
+                placement: RuntimeSplitPlacement::Spread,
+            },
         );
         let second = build_scan_edge(
             execution(2),
             frontend,
             &backends,
-            NativeScanWork::RuntimeSplits,
+            NativeScanWork::RuntimeSplits {
+                placement: RuntimeSplitPlacement::Spread,
+            },
         );
         assert_ne!(first.root(), second.root());
         assert_eq!(
@@ -1004,8 +1079,22 @@ mod tests {
         let mut reverse = forward.clone();
         reverse.reverse();
 
-        let first = build_scan_edge(execution, frontend, &forward, NativeScanWork::RuntimeSplits);
-        let second = build_scan_edge(execution, frontend, &reverse, NativeScanWork::RuntimeSplits);
+        let first = build_scan_edge(
+            execution,
+            frontend,
+            &forward,
+            NativeScanWork::RuntimeSplits {
+                placement: RuntimeSplitPlacement::Spread,
+            },
+        );
+        let second = build_scan_edge(
+            execution,
+            frontend,
+            &reverse,
+            NativeScanWork::RuntimeSplits {
+                placement: RuntimeSplitPlacement::Spread,
+            },
+        );
         let identities = |schedule: &AttemptSchedule| {
             schedule
                 .fragments()
@@ -1063,7 +1152,9 @@ mod tests {
             BackendProcessId::new_v7(),
             BackendProcessId::new_v7(),
         ];
-        let plan = scan_edge_inputs(NativeScanWork::WholeRelation);
+        let plan = scan_edge_inputs(NativeScanWork::RuntimeSplits {
+            placement: RuntimeSplitPlacement::SingleUnit,
+        });
         let schedule =
             build_attempt_schedule(execution, frontend, &backends, &plan, Ok(Some(backends[2])))
                 .unwrap();

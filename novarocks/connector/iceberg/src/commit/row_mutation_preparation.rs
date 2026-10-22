@@ -621,7 +621,6 @@ mod tests {
                 location: "file:///tmp/row-mutation".to_string(),
                 schema: iceberg_schema_def(&iceberg_schema()),
                 serialized_metadata: self.serialized_metadata,
-                serialized_metadata_rows: None,
             });
             let payload = IcebergTablePayload {
                 namespace: "db".to_string(),

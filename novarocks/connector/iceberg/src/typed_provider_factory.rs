@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::read_stack::adapter::{
     ProviderAdmittedReadFactory, ProviderReadFactoryAdapter, ProviderReadPageSourceProvider,
-    ProviderReadRuntime, ProviderReadSystemTableProvider, ReadRuntimeAdapter,
+    ProviderReadRuntime, ReadRuntimeAdapter,
 };
 use novarocks_spi::connector::read_stack::{
     ConnectorAdmittedReadProviderFactory, ConnectorDataCacheOptions,
@@ -43,7 +43,6 @@ use crate::provider_types::IcebergReadCodecs;
 use crate::typed_read::page_source_provider::{
     IcebergPageSourceProvider, IcebergPageSourceProviderOptions,
 };
-use crate::typed_read::system_page_source::IcebergSystemTableProvider;
 use crate::typed_read::{
     HiveTransactionHandle, IcebergColumnHandle, IcebergConnectorReadWireAdapter,
     IcebergExecutionReadRuntime, IcebergReadSplit, IcebergRuntimeRelation,
@@ -156,30 +155,6 @@ impl IcebergTypedProviderFactory {
             binding, context, options,
         )))
     }
-
-    fn create_system_table_provider_unadmitted<P>(
-        &self,
-        request: &ConnectorRequestContext,
-    ) -> Result<Arc<dyn ProviderReadSystemTableProvider<P>>, ConnectorError>
-    where
-        P: ProviderReadRuntime<
-                Table = IcebergRuntimeRelation,
-                Column = IcebergColumnHandle,
-                Transaction = HiveTransactionHandle,
-                Split = IcebergReadSplit,
-            >,
-    {
-        let binding = self.binding_for_request(request);
-        let context = binding.file_read_context(
-            novarocks_fs::FileCancellation::from_connector_request(request),
-            request.deadline(),
-        )?;
-        Ok(Arc::new(IcebergSystemTableProvider::new(
-            binding,
-            context,
-            self.options.budget.max_rows,
-        )))
-    }
 }
 
 impl<P> ProviderAdmittedReadFactory<P> for IcebergTypedProviderFactory
@@ -199,15 +174,6 @@ where
     ) -> Result<Arc<dyn ProviderReadPageSourceProvider<P>>, ConnectorError> {
         resources.checkpoint()?;
         self.create_page_source_provider_unadmitted(request, options)
-    }
-
-    fn create_system_table_provider(
-        &self,
-        request: &ConnectorRequestContext,
-        resources: ConnectorExecutionResources,
-    ) -> Result<Arc<dyn ProviderReadSystemTableProvider<P>>, ConnectorError> {
-        resources.checkpoint()?;
-        self.create_system_table_provider_unadmitted(request)
     }
 }
 

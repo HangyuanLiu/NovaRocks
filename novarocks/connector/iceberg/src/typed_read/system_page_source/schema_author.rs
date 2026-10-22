@@ -235,142 +235,27 @@ fn map(
         creation,
     )
 }
-fn find_source<'a>(
-    ty: &'a Type,
-    id: i32,
-    depth: usize,
-    creation: &mut ConnectorReadSchemaCreation<'_>,
-) -> Result<Option<&'a NestedField>, Failure> {
-    creation.work(1)?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(extent());
-    }
-    let mut find = |field: &'a NestedField| -> Result<Option<&'a NestedField>, Failure> {
-        creation.work(1)?;
-        if field.id == id {
-            Ok(Some(field))
-        } else {
-            find_source(&field.field_type, id, depth + 1, creation)
-        }
-    };
-    match ty {
-        Type::Primitive(_) | Type::Variant(_) => Ok(None),
-        Type::Struct(fields) => {
-            for field in fields.fields() {
-                if let Some(field) = find(field)? {
-                    return Ok(Some(field));
-                }
-            }
-            Ok(None)
-        }
-        Type::List(list) => find(&list.element_field),
-        Type::Map(map) => {
-            if let Some(field) = find(&map.key_field)? {
-                Ok(Some(field))
-            } else {
-                find(&map.value_field)
-            }
-        }
-    }
-}
 fn partition(
     schema: &Schema,
-    metadata: Option<&TableMetadata>,
+    _metadata: Option<&TableMetadata>,
     specs: &[&PartitionSpec],
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<Option<FunctionValueType>, Failure> {
-    let count = specs.iter().try_fold(0usize, |count, spec| {
-        creation.work(1)?;
-        count.checked_add(spec.fields().len()).ok_or_else(extent)
-    })?;
-    if count > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
-        return Err(extent());
+    let canonical =
+        crate::partition_row::UnifiedPartitionRow::of_checked(schema, specs, || creation.work(1))
+            .map_err(|cause| match cause {
+            crate::partition_row::PartitionRowError::Semantic(cause) => Failure::from(cause),
+            crate::partition_row::PartitionRowError::Original(cause) => cause,
+        })?;
+    if canonical.fields.is_empty() {
+        return Ok(None);
     }
-    let mut ordered = creation.reserve(specs.len())?;
-    for spec in specs {
-        creation.work(1)?;
-        ordered.push(spec);
+    let mut columns: Columns = creation.reserve(canonical.fields.len())?;
+    for field in canonical.fields {
+        let value = scalar(field.data_type, true, creation)?;
+        add(&mut columns, &field.name, value, creation)?;
     }
-    // Sorting is an opaque bounded library operation; its bound is observed
-    // before entry and its completion before any further construction.
-    creation.work(
-        ordered
-            .len()
-            .checked_mul(ordered.len().max(1).ilog2() as usize + 1)
-            .ok_or_else(extent)?,
-    )?;
-    ordered.sort_unstable_by_key(|spec| spec.spec_id());
-    creation.work(1)?;
-    let mut columns: Columns = creation.reserve(count)?;
-    for spec in ordered {
-        for part in spec.fields() {
-            let source_type = if let Some(metadata) = metadata {
-                let (resolved, _) = crate::read_snapshot::partition_source_types_checked(
-                    metadata,
-                    schema,
-                    part.source_id,
-                    || creation.work(1),
-                )
-                .map_err(|cause| match cause {
-                    crate::read_snapshot::PartitionSourceTypeFailure::Semantic(message) => {
-                        Failure::from(corrupt(message))
-                    }
-                    crate::read_snapshot::PartitionSourceTypeFailure::Original(cause) => cause,
-                })?;
-                std::borrow::Cow::Owned(Type::Primitive(resolved))
-            } else {
-                let mut found = None;
-                for root in schema.as_struct().fields() {
-                    creation.work(1)?;
-                    if root.id == part.source_id {
-                        found = Some(root.as_ref());
-                        break;
-                    }
-                    if let Some(field) = find_source(&root.field_type, part.source_id, 1, creation)?
-                    {
-                        found = Some(field);
-                        break;
-                    }
-                }
-                let source = found
-                    .ok_or_else(|| bad("partition source ID is absent from frozen metadata"))?;
-                std::borrow::Cow::Borrowed(source.field_type.as_ref())
-            };
-            creation.work(1)?;
-            let transformed = part
-                .transform
-                .result_type(source_type.as_ref())
-                .map_err(|_| bad("partition transform has no exact declared result"))?;
-            creation.work(1)?;
-            let Type::Primitive(ty) = transformed else {
-                return Err(bad("partition result is not a primitive"));
-            };
-            let layout =
-                crate::metadata_batch_reader::iceberg_type_to_arrow_type(&Type::Primitive(ty))
-                    .map_err(|message| corrupt(message))?;
-            let value = scalar(layout, true, creation)?;
-            let mut previous = None;
-            for (name, existing) in &columns {
-                creation.work(part.name.len() + 1)?;
-                if name.eq_ignore_ascii_case(&part.name) {
-                    previous = Some(existing);
-                    break;
-                }
-            }
-            if let Some(previous) = previous {
-                if !previous.exactly_equals_checked_observed(&value, || creation.work(1))? {
-                    return Err(bad("partition declaration differs across specs"));
-                }
-            } else {
-                add(&mut columns, &part.name, value, creation)?;
-            }
-        }
-    }
-    if columns.is_empty() {
-        Ok(None)
-    } else {
-        row(compact(columns, creation)?, true, creation).map(Some)
-    }
+    row(compact(columns, creation)?, true, creation).map(Some)
 }
 fn count_primitives(
     field: &NestedField,
@@ -556,8 +441,8 @@ fn files(
     _bounds: Option<FunctionValueType>,
     creation: &mut ConnectorReadSchemaCreation<'_>,
 ) -> Result<Columns, Failure> {
-    // The public metadata-table author freezes eighteen columns, including an
-    // empty partition ROW on unpartitioned tables and field-ID binary maps.
+    // The partition column exists only when canonical partition fields remain;
+    // metric bounds retain field-ID binary maps.
     let mut columns = creation.reserve(18)?;
     for (name, ty) in [
         ("content", DataType::Int32),
@@ -615,11 +500,9 @@ fn files(
         true,
         creation,
     )?;
-    let partition = match partition {
-        Some(value) => value,
-        None => row(Vec::new(), true, creation)?,
-    };
-    add(&mut columns, "partition", partition, creation)?;
+    if let Some(partition) = partition {
+        add(&mut columns, "partition", partition, creation)?;
+    }
     Ok(columns)
 }
 fn entries(
@@ -777,20 +660,6 @@ fn manifests(creation: &mut ConnectorReadSchemaCreation<'_>) -> Result<Columns, 
     add(&mut columns, "partition_summaries", summary, creation)?;
     Ok(columns)
 }
-fn partitions(
-    _partition: Option<FunctionValueType>,
-    _metrics: Option<FunctionValueType>,
-    creation: &mut ConnectorReadSchemaCreation<'_>,
-) -> Result<Columns, Failure> {
-    let mut columns = creation.reserve(4)?;
-    for name in ["record_count", "file_count"] {
-        s(&mut columns, name, DataType::Int64, false, creation)?;
-    }
-    for name in ["position_delete_file_count", "equality_delete_file_count"] {
-        s(&mut columns, name, DataType::Int64, true, creation)?;
-    }
-    Ok(columns)
-}
 fn columns(
     kind: IcebergSystemTableType,
     schema: &Schema,
@@ -812,7 +681,6 @@ fn columns(
         IcebergSystemTableType::History => history(creation),
         IcebergSystemTableType::Refs => refs(creation),
         IcebergSystemTableType::Manifests => manifests(creation),
-        IcebergSystemTableType::Partitions => partitions(None, None, creation),
     }
 }
 
@@ -1177,7 +1045,6 @@ mod tests {
             IcebergSystemTableType::History,
             IcebergSystemTableType::Refs,
             IcebergSystemTableType::Manifests,
-            IcebergSystemTableType::Partitions,
         ] {
             let original = system_relation_schema(kind, &schema, &[]).unwrap();
             let Type::Struct(row) = metadata_relation_row(&original).unwrap() else {
@@ -1266,7 +1133,6 @@ mod tests {
                 (M::History, IcebergSystemTableType::History),
                 (M::Refs, IcebergSystemTableType::Refs),
                 (M::Manifests, IcebergSystemTableType::Manifests),
-                (M::Partitions, IcebergSystemTableType::Partitions),
             ] {
                 let mut requests = 0;
                 let mut units = 0;

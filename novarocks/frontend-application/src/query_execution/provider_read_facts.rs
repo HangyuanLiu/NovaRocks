@@ -34,6 +34,8 @@
 //! attempt alone: it is deposited the moment it is taken and never appears in a
 //! fact, a plan, or anything encoded.
 
+use novarocks_query_application::api::RuntimeSplitPlacement;
+
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
@@ -55,8 +57,8 @@ use novarocks_spi::connector::{
         ConnectorReadMetadataKind, ConnectorReadMetadataRequest, ConnectorReadMetadataVersion,
         ConnectorReadNullOrdering, ConnectorReadProperties, ConnectorReadPublicSchema,
         ConnectorReadRelationVersion, ConnectorReadRequestControl, ConnectorReadSortDirection,
-        ConnectorReadStaticFacts, ConnectorReadTableHandle, ConnectorReadWorkSource,
-        ConnectorSession, Constraint, SchemaTableName, TupleDomain,
+        ConnectorReadStaticFacts, ConnectorReadTableHandle, ConnectorSession, Constraint,
+        SchemaTableName, TupleDomain,
         negotiation::{
             ReadFreezeRequest, ReadNegotiation, ReadPushdownDisposition, ReadPushdownOp,
             ReadPushdownOutcome,
@@ -134,15 +136,12 @@ pub(crate) struct FrozenReadEncoding {
     /// What the reader must still apply itself.
     pub(crate) unenforced_predicate: TupleDomain<ConnectorReadColumnHandle>,
     pub(crate) remaining_expression: Option<ConnectorExpression>,
-    pub(crate) work_source: ConnectorReadWorkSource,
+    pub(crate) placement: RuntimeSplitPlacement,
     pub(crate) encoder: Arc<dyn ConnectorReadWireEncoder>,
     /// The provider's own static facts, exactly as it froze them.
     ///
-    /// The plan's contract keeps a projection of these with the distribution
-    /// this freeze decided for a relation one reader takes whole, and drops
-    /// the artifact coverage entirely. A compiled program states the
-    /// provider's own answer instead, because the provider's pure compiler
-    /// checks it against the private relation it froze.
+    /// The physical contract and compiled program retain the provider's own
+    /// distribution. Work-unit hints remain separate frontend scheduling facts.
     pub(crate) static_facts: ConnectorReadStaticFacts<ConnectorReadColumnHandle>,
     /// The public fields of the assignment columns, one per assignment in
     /// assignment order, as the provider that owns them published them; or
@@ -150,8 +149,8 @@ pub(crate) struct FrozenReadEncoding {
     ///
     /// Only a compiled program carries these fields, and a provider may
     /// decline to publish them for a relation family it does not program.
-    /// The refusal is kept rather than raised here: a plan tree never reads
-    /// the fields, and the owner that does reports the provider's own reason.
+    /// The refusal is kept rather than raised here so the compiled-package
+    /// owner reports the provider's own reason.
     pub(crate) public_schema: Result<ConnectorReadPublicSchema, ConnectorError>,
 }
 
@@ -383,7 +382,7 @@ pub(crate) fn freeze_one_read(
     // 1. Freeze the relation family this read names. Admission already
     //    resolved the name, so a provider that now reports nothing means the
     //    pin is gone rather than that the query named an unknown relation.
-    let (handle, metadata_work_source, frozen_metadata_kind) = open_relation(
+    let (handle, metadata_placement, frozen_metadata_kind) = open_relation(
         metadata.as_ref(),
         session,
         &table,
@@ -391,7 +390,7 @@ pub(crate) fn freeze_one_read(
         &admitted,
         &name,
     )?;
-    let work_source = work_source_of(relation, metadata_work_source);
+    let placement = placement_of(relation, metadata_placement);
 
     // 2. Bind the requested projection to the provider's own columns. The
     //    request's ordinals are the output authority; the provider is asked for
@@ -497,7 +496,7 @@ pub(crate) fn freeze_one_read(
                         enforced_predicate,
                         unenforced_predicate,
                         remaining_expression,
-                        work_source,
+                        placement,
                         encoder: Arc::clone(&encoder),
                         static_facts: frozen.clone(),
                         public_schema,
@@ -522,17 +521,11 @@ pub(crate) fn freeze_one_read(
             relation: relation_payload,
         },
         metadata_kind: frozen_metadata_kind,
-        work_source,
         selection_digest: frozen.selection_digest(),
         schema,
         predicates: predicate_facts(need, &offer, &negotiated.outcomes),
         limit: limit_fact(need, &offer, &negotiated.outcomes),
-        provided_properties: read_properties(
-            frozen.properties(),
-            &columns_by_ordinal,
-            work_source,
-            &name,
-        )?,
+        provided_properties: read_properties(frozen.properties(), &columns_by_ordinal, &name)?,
         coverage_evidence: frozen.coverage_evidence().into(),
     };
     ProviderReadFact::negotiated(need, contract).map_err(|error| {
@@ -604,23 +597,14 @@ fn relation_identity(relation: &ProviderReadRelationNeed) -> &TableIdentity {
     }
 }
 
-/// How this read's work reaches a backend.
-///
-/// Only the provider knows for a metadata relation, and it says so through the
-/// plan it returns; an ordinary relation is always enumerated into splits.
-/// How execution obtains this read's work.
-///
-/// Only the provider knows: one of its metadata relations may be an immutable
-/// file one reader opens directly, and another may be real distributable I/O
-/// that enumerates. Deciding by relation family instead would hand a split
-/// relation to a single reader, or spread one that has no split at all.
-const fn work_source_of(
+/// Provider work-unit hints affect placement only. Every read uses splits.
+const fn placement_of(
     relation: &ProviderReadRelationNeed,
-    metadata: Option<ConnectorReadWorkSource>,
-) -> ConnectorReadWorkSource {
+    metadata: Option<RuntimeSplitPlacement>,
+) -> RuntimeSplitPlacement {
     match (relation, metadata) {
-        (ProviderReadRelationNeed::Metadata { .. }, Some(work_source)) => work_source,
-        _ => ConnectorReadWorkSource::RuntimeSplits,
+        (ProviderReadRelationNeed::Metadata { .. }, Some(placement)) => placement,
+        _ => RuntimeSplitPlacement::Spread,
     }
 }
 
@@ -635,7 +619,7 @@ fn open_relation(
 ) -> Result<
     (
         ConnectorReadTableHandle,
-        Option<ConnectorReadWorkSource>,
+        Option<RuntimeSplitPlacement>,
         Option<ConnectorReadMetadataKind>,
     ),
     String,
@@ -720,18 +704,17 @@ fn open_relation(
                 .ok_or_else(|| {
                     format!("provider read of {name} is not a metadata relation of this provider")
                 })?;
-            // `SingleCoordinator` means one backend opens one immutable
-            // metadata file with no split; spreading it would duplicate every
-            // row. `AllNodes` is real distributable I/O and enumerates.
-            let work_source = match plan.distribution() {
-                novarocks_spi::connector::read_stack::SystemTableDistribution::AllNodes => ConnectorReadWorkSource::RuntimeSplits,
-                novarocks_spi::connector::read_stack::SystemTableDistribution::SingleCoordinator => {
-                    ConnectorReadWorkSource::WholeRelation
+            let placement = match plan.unit_hint() {
+                novarocks_spi::connector::read_stack::SystemTableUnitHint::ManyUnits => {
+                    RuntimeSplitPlacement::Spread
+                }
+                novarocks_spi::connector::read_stack::SystemTableUnitHint::SingleUnit => {
+                    RuntimeSplitPlacement::SingleUnit
                 }
             };
             Ok((
                 plan.into_handle(),
-                Some(work_source),
+                Some(placement),
                 Some(request.kind().clone()),
             ))
         }
@@ -856,7 +839,9 @@ fn metadata_kind(kind: MetadataTableKind) -> Result<ConnectorReadMetadataKind, S
         MetadataTableKind::Refs => "$refs",
         MetadataTableKind::Files => "$files",
         MetadataTableKind::Manifests => "$manifests",
-        MetadataTableKind::Partitions => "$partitions",
+        MetadataTableKind::Partitions => {
+            return Err("invariant: $partitions is a SQL view over $files".into());
+        }
         MetadataTableKind::Entries => "$entries",
     };
     ConnectorReadMetadataKind::try_new(suffix)
@@ -1055,10 +1040,8 @@ fn offered_constraint(offer: &OfferedOps) -> ConnectorReadConstraint {
 ///   evaluating a predicate twice costs time, and skipping the pruning costs
 ///   the entire point of a pruning answer.
 /// - `Unsupported`, or no filter offered: the reader is told nothing. An
-///   unenforced domain is the reader's own work by contract, and a relation the
-///   provider declined may have no reader that applies one - a metadata
-///   relation read whole by a single backend opens its page source with no
-///   constraint at all, so a predicate parked there would be applied by nobody.
+///   unenforced domain is the reader's own work by contract. A provider that
+///   declines the filter may not apply it, so it must remain in the engine.
 fn filter_responsibility(
     offer: &OfferedOps,
     outcomes: &[ReadPushdownOutcome],
@@ -1151,37 +1134,23 @@ fn column_facts(
 fn read_properties(
     properties: &ConnectorReadProperties<ConnectorReadColumnHandle>,
     ordinals: &BTreeMap<ConnectorReadColumnHandle, u32>,
-    work_source: ConnectorReadWorkSource,
     name: &str,
 ) -> Result<ProviderReadProperties, String> {
-    // A relation one reader takes whole arrives as one stream. That is this
-    // freeze's own decision, not the provider's: a provider describing an
-    // unconstrained read is describing one that could be split, and this one
-    // will not be. Stating the weaker of the two would let the plan spread a
-    // read that has nothing to spread.
-    let distribution = if work_source == ConnectorReadWorkSource::WholeRelation {
-        // A relation one reader takes whole arrives as one stream. The
-        // provider says how it may be split, and this one is not being split;
-        // stating the weaker of its two answers would let the plan spread a
-        // read that has nothing to spread.
-        ProviderReadDistribution::Singleton
-    } else {
-        match properties.distribution() {
-            ConnectorReadDistribution::Unconstrained => ProviderReadDistribution::Unconstrained,
-            ConnectorReadDistribution::Singleton => ProviderReadDistribution::Singleton,
-            ConnectorReadDistribution::RoundRobin => ProviderReadDistribution::RoundRobin,
-            // A partitioned read is only usable as a plan property with a
-            // proof the provider contract does not carry: a hash read needs
-            // its exact partition-count token, a bucket read its
-            // ordinal-domain evidence. Claiming the property without them
-            // would let the plan skip an exchange on a guarantee nobody made.
-            ConnectorReadDistribution::Hash { .. }
-            | ConnectorReadDistribution::BucketShuffle { .. } => {
-                return Err(format!(
-                    "provider read of {name} declares a partitioned distribution without the \
+    let distribution = match properties.distribution() {
+        ConnectorReadDistribution::Unconstrained => ProviderReadDistribution::Unconstrained,
+        ConnectorReadDistribution::Singleton => ProviderReadDistribution::Singleton,
+        ConnectorReadDistribution::RoundRobin => ProviderReadDistribution::RoundRobin,
+        // A partitioned read is only usable as a plan property with a
+        // proof the provider contract does not carry: a hash read needs
+        // its exact partition-count token, a bucket read its
+        // ordinal-domain evidence. Claiming the property without them
+        // would let the plan skip an exchange on a guarantee nobody made.
+        ConnectorReadDistribution::Hash { .. }
+        | ConnectorReadDistribution::BucketShuffle { .. } => {
+            return Err(format!(
+                "provider read of {name} declares a partitioned distribution without the \
                      partition proof a plan property requires"
-                ));
-            }
+            ));
         }
     };
     let ordering = properties
@@ -1248,6 +1217,50 @@ mod tests {
             .expect("allocator")
             .allocate()
             .expect("binding")
+    }
+
+    #[test]
+    fn partitions_cannot_be_frozen_as_a_provider_metadata_relation() {
+        assert!(
+            metadata_kind(MetadataTableKind::Partitions)
+                .unwrap_err()
+                .contains("invariant: $partitions is a SQL view over $files")
+        );
+        assert_eq!(
+            metadata_kind(MetadataTableKind::Files).unwrap().as_str(),
+            "$files"
+        );
+    }
+
+    #[test]
+    fn single_metadata_unit_preserves_unconstrained_static_distribution() {
+        let relation = ProviderReadRelationNeed::Metadata {
+            relation: identity(),
+            kind: MetadataTableKind::Snapshots,
+            version: ProviderReadVersionNeed::Current,
+        };
+        let properties =
+            ConnectorReadProperties::try_new(ConnectorReadDistribution::Unconstrained, Vec::new())
+                .unwrap();
+        assert_eq!(
+            placement_of(&relation, Some(RuntimeSplitPlacement::SingleUnit)),
+            RuntimeSplitPlacement::SingleUnit
+        );
+        let frozen = read_properties(&properties, &BTreeMap::new(), "orders$snapshots").unwrap();
+        assert!(matches!(
+            frozen.distribution,
+            ProviderReadDistribution::Unconstrained
+        ));
+        assert!(frozen.ordering.is_empty());
+        assert_eq!(
+            placement_of(&relation, Some(RuntimeSplitPlacement::Spread)),
+            RuntimeSplitPlacement::Spread
+        );
+        let spread = read_properties(&properties, &BTreeMap::new(), "orders$snapshots").unwrap();
+        assert!(matches!(
+            spread.distribution,
+            ProviderReadDistribution::Unconstrained
+        ));
     }
 
     /// One read of one column, with one predicate and a limit, so both
@@ -1405,8 +1418,7 @@ mod tests {
     }
 
     /// A filter the provider declined leaves the reader nothing to apply. The
-    /// engine evaluates the whole predicate, and a relation read whole by one
-    /// backend has no reader that would apply a parked domain anyway.
+    /// engine evaluates the whole predicate regardless of unit placement.
     #[test]
     fn a_declined_filter_leaves_the_reader_nothing() {
         let need = a_need(None);

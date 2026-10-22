@@ -196,10 +196,6 @@ pub struct IcebergTableInfo {
     /// resolved via paths that do not have access to the Iceberg
     /// `TableMetadata` (for example, synthetic test fixtures).
     pub serialized_metadata: Option<String>,
-    /// JSON-serialized per-row payload for the `$files` / `$manifests` /
-    /// `$entries` metadata tables, produced by the resolution-time manifest
-    /// walk. `None` for all other tables.
-    pub serialized_metadata_rows: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]

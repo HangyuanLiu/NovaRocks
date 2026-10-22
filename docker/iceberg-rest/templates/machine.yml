@@ -72,6 +72,7 @@ services:
       CATALOG_S3_ENDPOINT: http://minio:9000
       CATALOG_S3_PATH__STYLE__ACCESS: 'true'
       CATALOG_URI: jdbc:sqlite:/tmp/iceberg-rest-catalog.db
+      CATALOG_CLIENTS: '1'
     ports: ['${NOVA_ENV_REST_PORT}:8181']
     volumes: [rest-catalog:/tmp]
     networks: [iceberg_net]
@@ -86,6 +87,7 @@ services:
       CATALOG_S3_ENDPOINT: http://minio:9000
       CATALOG_S3_PATH__STYLE__ACCESS: 'true'
       CATALOG_URI: jdbc:sqlite:/tmp/iceberg-rest-catalog.db
+      CATALOG_CLIENTS: '1'
     ports: ['${NOVA_ENV_REST_MV_PORT}:8181']
     volumes: [rest-mv-catalog:/tmp]
     networks: [iceberg_net]

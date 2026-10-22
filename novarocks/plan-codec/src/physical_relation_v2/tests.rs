@@ -249,7 +249,7 @@ fn fixture() -> (Vec<p::Relation>, Vec<(u32, FunctionValueType)>) {
     };
     let data = p::Relation::Data(p::DataRelation {
         read: read(),
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
+
         selection_digest: [0; 32],
         schema: fields(),
         predicate_guarantees: guarantees(),
@@ -258,7 +258,7 @@ fn fixture() -> (Vec<p::Relation>, Vec<(u32, FunctionValueType)>) {
     let meta = p::Relation::Metadata(p::MetadataRelation {
         kind: p::MetadataRelationKind::try_new("files / ✓").unwrap(),
         read: read(),
-        work_source: ConnectorReadWorkSource::WholeRelation,
+
         selection_digest: [255; 32],
         schema: fields(),
         predicate_guarantees: guarantees(),
@@ -315,7 +315,7 @@ fn expected(i: usize) -> wire::RelationDefinition {
         kind: Some(if i == 0 {
             wire::relation_definition::Kind::Data(wire::DataRelation {
                 read_reference_id: Some(0),
-                work_source: 1,
+
                 selection_digest: vec![0; 32],
                 schema,
                 predicate_guarantees: guarantees,
@@ -325,7 +325,7 @@ fn expected(i: usize) -> wire::RelationDefinition {
             wire::relation_definition::Kind::Metadata(wire::MetadataRelation {
                 kind: "files / ✓".into(),
                 read_reference_id: Some(1),
-                work_source: 2,
+
                 selection_digest: vec![255; 32],
                 schema,
                 predicate_guarantees: guarantees,
@@ -526,7 +526,7 @@ fn relation_namespace_source_association_full_fvt_and_presence_never_guess_or_re
         let rs =
             decode_provider_reads(reads.as_wire(), &bs, &ps, 256 * 1024, read_limits()).unwrap();
         let ts = decode_type_table(types.as_wire(), type_limits(), &c).unwrap();
-        for which in 0..11 {
+        for which in 0..10 {
             let mut def = expected(0);
             if which == 0 {
                 def.kind = None;
@@ -541,7 +541,7 @@ fn relation_namespace_source_association_full_fvt_and_presence_never_guess_or_re
                     7 => v.predicate_guarantees[0].predicate_expr_id = None,
                     8 => v.provided_properties = None,
                     9 => v.selection_digest.pop().map(|_| ()).unwrap(),
-                    _ => v.work_source = 0,
+                    _ => unreachable!(),
                 }
             }
             assert!(
@@ -761,7 +761,7 @@ fn check_original_owned_backing_floor(dictionary: bool) {
     let relation = p::Relation::Metadata(p::MetadataRelation {
         kind: p::MetadataRelationKind::try_new("original.metadata").unwrap(),
         read: read(),
-        work_source: ConnectorReadWorkSource::WholeRelation,
+
         selection_digest: [7; 32],
         schema: (0..16)
             .map(|_| p::RelationField {

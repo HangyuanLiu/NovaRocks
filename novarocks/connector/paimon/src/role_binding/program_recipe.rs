@@ -25,8 +25,7 @@ use bytes::Bytes;
 use novarocks_connector_contract::{
     ConnectorReadArtifactCoverage, ConnectorReadBinding, ConnectorReadDistribution,
     ConnectorReadProgramCompiler, ConnectorReadRelationKind, ConnectorReadRelationRecipeDraft,
-    ConnectorReadWorkSource, FrozenConnectorRead, MAX_CONNECTOR_RECIPE_PAYLOAD_BYTES,
-    PureProviderCompileError,
+    FrozenConnectorRead, MAX_CONNECTOR_RECIPE_PAYLOAD_BYTES, PureProviderCompileError,
 };
 use novarocks_spi::connector::read_stack::ConnectorReadPublicSchema;
 use novarocks_spi::connector::{
@@ -98,7 +97,6 @@ fn compile(
     work.step()?;
     if draft.binding().descriptor().provider_id.as_str() != PROVIDER_ID
         || draft.relation().kind() != ConnectorReadRelationKind::Table
-        || scan.work_source() != ConnectorReadWorkSource::RuntimeSplits
         || public.metadata_kind().is_some()
     {
         return Err(invalid(
@@ -716,7 +714,6 @@ mod tests {
                 self.filters.clone(),
                 NonZeroU64::new(1024).unwrap(),
                 NonZeroU64::new(1 << 20).unwrap(),
-                ConnectorReadWorkSource::RuntimeSplits,
             )
             .unwrap();
             let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();

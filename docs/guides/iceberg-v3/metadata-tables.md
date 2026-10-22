@@ -19,28 +19,31 @@ under the License.
 
 # Metadata Tables
 
-> Spec 定义的虚拟表，用来查表内部状态（snapshot 历史、refs、文件统计、partition 统计 ...）。PR #81 落地了 BE 端的 `snapshots / history / refs / partitions` 四张，PR #85 接通了 standalone parser 的 `<tbl>$<metatype>` 路由 —— **首批四张端到端 SQL 现在可用**。其余 metadata table（`$manifests` / `$files` / `$delete_files` / `$entries` / `$metadata_log_entries` / `$position_deletes` / `$all_files` 等）仍在路线图上。
+> Metadata table 用 `<tbl>$<metatype>` 查询同一份冻结 Iceberg metadata 中的 snapshot、ref、manifest、文件和分区统计。`$partitions` 是 SQL 对 `$files` 的聚合视图；其余已支持的关系由 provider 枚举工作单元，经运行期 split 交给 BE 读取。
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| `<tbl>$snapshots` | ✅ | BE PR #81 + SQL 路由 PR #85 |
-| `<tbl>$history` | ✅ | 同上 |
-| `<tbl>$refs`（branches + tags） | ✅ | 同上 |
-| `<tbl>$partitions` | ✅ | 同上 |
-| `<tbl>$manifests` | ❌ | |
-| `<tbl>$files` / `<tbl>$all_data_files` | ❌ | |
-| `<tbl>$delete_files` / `<tbl>$all_delete_files` | ❌ | |
-| `<tbl>$entries`（manifest entries） | ❌ | |
+| `<tbl>$snapshots` | ✅ | snapshot 元信息 |
+| `<tbl>$history` | ✅ | snapshot 历史 |
+| `<tbl>$refs`（branches + tags） | ✅ | 引用及保留策略 |
+| `<tbl>$manifests` | ✅ | 所选 snapshot 的 manifest 列表 |
+| `<tbl>$files` | ✅ | 所选 snapshot 的有效 data/delete 文件；用 `content` 区分 |
+| `<tbl>$entries`（manifest entries） | ✅ | 所选 snapshot 的 manifest entries，包含 entry 状态 |
+| `<tbl>$partitions` | ✅ | 同一 `$files` 冻结绑定上的数据文件聚合视图 |
+| `<tbl>$all_data_files` | ❌ | 跨 snapshot 文件视图 |
+| `<tbl>$delete_files` / `<tbl>$all_delete_files` | ❌ | 可通过 `$files.content` 筛选当前 delete 文件 |
 | `<tbl>$metadata_log_entries` | ❌ | |
 | `<tbl>$position_deletes` | ❌ | |
 | `<tbl>$all_files`（V3 统一视图） | ❌ | |
 
 实现入口：
 
-- 读路径 op：`novarocks/connector/iceberg/src/typed_read/system_page_source.rs`（native Rust，基于 vendored iceberg-rust 0.11 的 `iceberg::spec::TableMetadata`，不再走 JNI/Java SDK）
-- Parser 路由：`src/sql/parser/dialect/mod.rs`（`<tbl>$<metatype>` 重写为 `<tbl>.__nr_meta_<metatype>__`）
-- Analyzer：`src/sql/analyzer/iceberg_metadata.rs`（`split_metadata_suffix`）+ `Relation::IcebergMetadataScan` variant
-- 当前覆盖：snapshots / history / refs。Files / Manifests / Partitions / LogicalIcebergMetadata 在 op 构造时 fail-fast 报 `not yet implemented in the native-Rust scan path`，留给后续 PR 用 iceberg-rust 的 manifest/scan API 补
+- SQL metadata 名称解析与分区视图：`novarocks/sql/src/analyzer/iceberg_metadata.rs`、`resolve_from.rs`、`iceberg_partitions.rs`。
+- Provider 工作单元与冻结身份：`novarocks/connector/iceberg/src/typed_read/system_table.rs`、`typed_boundary.rs`。
+- BE metadata 页读取：`novarocks/connector/iceberg/src/typed_read/system_page_source.rs`，使用 native Rust 与 vendored iceberg-rust 0.11。
+- 统一 partition ROW：`novarocks/connector/iceberg/src/partition_row.rs`，分析期 schema、冻结事实与 BE 输出共用按 partition field ID 构造的布局。
+
+读取模型见 [ADR-0192](../../adr/ADR-0192-provider-work-units-share-one-runtime-split-path.md)。这些关系不经 FE 预读整表并序列化结果行；BE 验证冻结 metadata 文件位置、表 UUID 与所选 snapshot，身份不一致时报错，不重新解析最新表状态。
 
 依赖基线与补丁政策见 [ADR-0174](../../adr/ADR-0174-vendored-iceberg-baseline-and-patch-policy.md)。0.11 的 metadata 解析拒绝 v1/v2 中的 v3 专有类型；Decimal 显示与 JSON 使用 `decimal(p, s)`，Binary/Fixed 默认值的奇数长度 hex 明确报错。V2 snapshot 缺 `sequence-number` 时取 0；v3 构建时解析加密属性，不意味着 NovaRocks 已支持加密读取。
 
@@ -97,23 +100,39 @@ SELECT * FROM orders$refs;
 | `max_snapshot_age_ms` | BIGINT |
 | `max_ref_age_ms` | BIGINT |
 
+## ✅ `<tbl>$files`、`<tbl>$entries` 与 `<tbl>$manifests`
+
+`$files` 列出所选 snapshot 的有效文件，`content=0` 是数据文件，`content=1` 是 position-delete 文件，`content=2` 是 equality-delete 文件。需要删除文件统计时，按 `$files.content` 筛选并聚合。`$entries` 保留 manifest entry 的状态，可能包含已删除 entry；它与 `$files` 的有效文件集合不同。`$manifests` 列出该 snapshot 引用的 manifest。
+
+```sql
+SELECT content, COUNT(*) FROM orders$files GROUP BY content;
+```
+
+`$files.partition` 与 `$entries.partition` 使用同一个统一 ROW 布局：
+
+- 字段按 **partition field ID 升序**排列。同一 ID 在不同 spec 中改名时仍是一个槽位，展示名取包含它的最新 spec；不同 ID 即使同名也保留独立槽位。名字只用于展示和 SQL 访问，不用于推断身份。
+- 仅保留源列仍在当前 schema 中的字段。各文件按自身 spec 将值写入对应 ID 的槽位，缺少的字段为 NULL；ROW 的每个槽位均可空。若没有剩余分区字段（包括所有源列均已删除），不输出 `partition` 列。
+- 展示名按 SQL 忽略大小写的比较规则保持唯一。先保留全部自然名字；同名组中 field ID 最大者保留自然名。其余字段按 ID 升序尝试 `<name>_<field_id>`，与任一自然名或已分配名冲突时，继续尝试 `<name>_<field_id>_1`、`_2`，直到唯一。例如 ID 1000、1001 均叫 `p`，而 ID 1002 自然名为 `p_1000` 时，1000 的展示名是 `p_1000_1`；若这个名字也被占用则继续消歧。
+- 同一 ID/source 的 void 与非 void 定义兼容，取非 void 的有效 transform 和类型；两个非 void transform 或 source ID 冲突则报错。类型按当前 schema 的源列推导，保留合法类型提升。
+
+没有所选 snapshot 时，`$files`、`$entries` 和 `$partitions` 均为空。
+
 ## ✅ `<tbl>$partitions`
 
-列出表当前的 partition 一览，含每个分区的文件 / 行数。
+对同一次冻结解析所得的 `$files` 过滤 `content=0`，汇总数据文件；不统计 delete 文件，也不按已应用删除扣减文件声明的行数。
 
 ```sql
 SELECT * FROM orders$partitions;
 ```
 
-| 列 | 类型 | 说明 |
-| --- | --- | --- |
-| 分区列（按表当前 partition spec） | varies | `country='CN'` / `bucket(8, id)` 等都按 transform 后的值出现 |
-| `record_count` | BIGINT | live data record 数 |
-| `file_count` | BIGINT | live data file 数 |
-| `position_delete_file_count` | BIGINT | V2 position-delete 文件数 |
-| `equality_delete_file_count` | BIGINT | equality-delete 文件数 |
+| 列 | 类型 | 可空 | 说明 |
+| --- | --- | --- | --- |
+| `partition` | ROW | 字段槽位可空 | 仅有统一分区字段时出现；布局与 `$files.partition` 相同 |
+| `record_count` | BIGINT | 是 | `SUM(record_count)`，数据文件声明的记录数之和 |
+| `file_count` | BIGINT | 否 | `COUNT(*)`，数据文件数 |
+| `total_size` | BIGINT | 是 | `SUM(file_size_in_bytes)`，数据文件字节数之和 |
 
-> **注意**：当前不暴露 `dv_count`（V3 deletion vector），未来扩展。`$partitions` 只反映 current snapshot 的 partition 一览；要查历史 partition spec 的文件用 time travel + `$partitions`。
+有分区字段时按整个 `partition` ROW 分组，只有包含数据文件的分区才有结果行。无分区字段时只输出后三列：有数据文件输出一行，没有数据文件输出零行；这由聚合后的 `HAVING COUNT(*) > 0` 保证。空表、没有 snapshot 的表，以及只有删除文件而没有数据文件的输入都输出零行，不生成全零统计行。`SUM` 的结果声明沿用 SQL 可空性，不改成必填或用 0 代替 NULL；`COUNT(*)` 为必填。
 
 ---
 
@@ -130,19 +149,13 @@ NovaRocks 的语法用 `<tbl>$<metatype>`（`$` 分隔），与 Spark 一致：
 
 ## ❌ 其他 metadata table
 
-下列 spec 要求的 metadata table 在 BE 和 SQL 两端都未实现：
+以下 metadata table 尚未实现：
 
-- `$manifests`：列出 current snapshot 的所有 manifest 文件（path / length / partition spec / added/existing/deleted file counts ...）
-- `$files`：current snapshot 的 live data file 列表（path / file_format / record_count / file_size_in_bytes / column stats / partition）
-- `$all_data_files`：所有 snapshot 的并集
-- `$delete_files`：current snapshot 的 delete file 列表（V2 position-delete + equality-delete + V3 DV）
-- `$all_delete_files`：所有 snapshot 的并集
-- `$entries`：manifest entries（包含 added / existing / deleted 状态、sequence number ...）
-- `$metadata_log_entries`：每次 metadata.json 切换的日志
-- `$position_deletes`：所有 V2 position-delete 行展开
-- `$all_files`（V3）：data file + delete file 的统一视图
-
-**TODO**：路线图按需推进，BE bridge 可以参考 PR #81 的 4 张实现。
+- `$all_data_files`：所有 snapshot 的数据文件并集。
+- `$delete_files` / `$all_delete_files`：独立删除文件视图；当前 snapshot 的删除文件可查询 `$files.content`。
+- `$metadata_log_entries`：metadata.json 切换日志。
+- `$position_deletes`：V2 position-delete 行展开。
+- `$all_files`（V3）：跨 snapshot 的 data/delete 文件统一视图。
 
 ---
 

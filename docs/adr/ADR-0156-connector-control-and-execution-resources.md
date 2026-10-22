@@ -12,7 +12,7 @@ code-anchors:
   - "novarocks/spi/src/connector/context.rs (ConnectorRequestContext)"
   - "novarocks/spi/src/connector/binding/role.rs (ConnectorExecutionReadBinding)"
   - "novarocks/worker/src/typed_scan_runtime.rs (admitted_connector_resources_for_bound_task)"
-  - "novarocks/native-adapter/src/fragment_typed_connector_scan.rs (new_deferred)"
+  - "novarocks/native-adapter/src/compiled_scan_binding.rs (bind_compiled_scan)"
   - "novarocks/frontend-application/src/task_execution/blocking_io.rs"
   - "novarocks/connector/paimon/src/resources.rs"
   - "novarocks/fs/src/runtime.rs (FileCancellation::from_connector_request)"
