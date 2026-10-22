@@ -1282,6 +1282,309 @@ mod tests {
         }
     }
 
+    // The native statistics seed projects these exact 1024 additions before
+    // its writer. Exercise the common SQL-to-package path with the production
+    // policy and ceilings; small test-carrier limits are not its admission.
+    // This source-only test does not claim to execute the INSERT or its writer.
+    #[test]
+    fn wide_statistics_source_freezes_with_production_limits() {
+        use novarocks_plan_codec::physical_package_v2::{
+            FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits,
+            PackageEncodeLimits, decode_fragment_package,
+        };
+        use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
+
+        let projection = (0..1024)
+            .map(|index| format!("generate_series + {}", index * 1_000_000))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {projection} FROM TABLE(generate_series(1, 4))");
+        let control = SqlCompileControl::unbounded();
+        let request = SqlFinalPlanCompileRequest::new(
+            PlanVersionId::try_new([19; 16]).expect("plan version"),
+            SqlStatementInput::sql(&sql),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+                current_catalog: Some("native_statistics".into()),
+                current_database: "native_statistics_db".into(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            builtin_sql_function_catalog().snapshot(),
+            crate::query_execution::constant_eval::constant_evaluator(),
+            FROZEN_CONSTANT_POLICY,
+            control.clone(),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            ScanReadBudget {
+                max_batch_rows: MAX_SCAN_BATCH_ROWS,
+                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (_root, scope) = query_scope();
+        let completed = runtime
+            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request, &scope))
+            .unwrap_or_else(|error| panic!("wide statistics source completion: {error:#?}"));
+        let plan = completed.candidate().plan();
+        assert_eq!(
+            plan.result_port().expect("source result").fields.len(),
+            1024
+        );
+        let fragment_ids = plan.fragments().keys().copied().collect::<Vec<_>>();
+        let packages = crate::query_execution::package_freeze::freeze_fragment_packages(
+            completed.candidate(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            FROZEN_CONSTANT_POLICY,
+            &FROZEN_PACKAGE_ADMISSION,
+            &PackageEncodeLimits::FROZEN,
+            &control,
+        )
+        .unwrap_or_else(|error| panic!("wide statistics source package freeze: {error:#?}"));
+        assert_eq!(packages.keys().copied().collect::<Vec<_>>(), fragment_ids);
+        let model = FragmentDecodeResourceModel::try_new(&control).expect("decode model");
+        for (id, bytes) in &packages {
+            let decoded =
+                decode_fragment_package(bytes, &model, &PackageDecodeLimits::FROZEN, &control)
+                    .unwrap_or_else(|error| {
+                        panic!("wide statistics source fragment {id:?} decode: {error:#?}")
+                    });
+            assert_eq!(decoded.fragment().id(), *id);
+        }
+    }
+
+    // Compile the original 1024-column statistics seed through the public
+    // DML writer planner and production package ceilings. The marker handle
+    // is a test-owned write declaration, not an Iceberg execution capability.
+    #[test]
+    fn wide_statistics_insert_plan_freezes_with_production_limits() {
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_connector_contract::{ConnectorWriteBinding, ConnectorWriteRecipeDraft};
+        use novarocks_plan_codec::physical_package_v2::{
+            FROZEN_CONSTANT_POLICY, FROZEN_PACKAGE_ADMISSION, PackageDecodeLimits,
+            PackageEncodeLimits, decode_fragment_package,
+        };
+        use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
+        use novarocks_query_application::preparation::CompletedPhysicalPlanCandidate;
+        use novarocks_spi::connector::{
+            CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
+            ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
+            ConnectorInstanceId, ConnectorProviderId, ConnectorWriteFieldBinding,
+            ConnectorWriteFieldToken, ConnectorWriteInputShape,
+        };
+        use novarocks_sql::binding::SqlTableBindingAllocator;
+        use novarocks_sql::compiler::{
+            RootDistributionRequirement, SqlAnalyzeRequest, SqlCompiler, SqlOptimizeRequest,
+            SqlPlannerTableSnapshot,
+        };
+        use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
+        use novarocks_sql::planning::dml::{
+            ConnectorWriteInputBinding, DmlFinalPlanContext, DmlFinalWritePlanContext,
+            DmlFinalizedProviderReadSet, DmlFinalizedWriteTarget, DmlFinalizedWriteTargetSet,
+            DmlStatisticsSnapshot, DmlWritePlanInput, DmlWriteSinkMode, DmlWriteTarget,
+            DmlWriteTargetField, compile_final_connector_write_plan,
+        };
+        use novarocks_type_contract::FunctionValueType;
+        use novarocks_types::schema::ColumnDef;
+
+        let projection = (0..1024)
+            .map(|index| format!("generate_series + {}", index * 1_000_000))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {projection} FROM TABLE(generate_series(1, 4))");
+        let control = SqlCompileControl::unbounded();
+        let settings = SessionOptimizerSettings::default();
+        let catalog = PlannerMemoryCatalog::default();
+        let snapshot = SqlPlannerTableSnapshot::new(&catalog);
+        let functions = novarocks_sql::compiler::build_builtin_engine_function_catalog()
+            .expect("real builtin SQL catalogue");
+        let semantics = novarocks_sql::sql_mode::SqlSemanticSettings::default();
+        let decimal = semantics.sql_mode().decimal_overflow_policy();
+        let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+            SqlStatementInput::sql(&sql),
+            SqlCompileIntent::IcebergWrite {
+                root_distribution: RootDistributionRequirement::Any,
+            },
+            SqlSessionContext {
+                sql_semantics: semantics,
+                current_catalog: Some("native_statistics".into()),
+                current_database: "native_statistics_db".into(),
+                optimizer_settings: settings.clone(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            &snapshot,
+            &functions,
+            crate::query_execution::constant_eval::constant_evaluator(),
+            None,
+            FROZEN_CONSTANT_POLICY,
+            control.clone(),
+        ))
+        .unwrap_or_else(|error| panic!("wide INSERT source analysis: {error:#?}"))
+        .into_pending()
+        .expect("pending DML source");
+        let columns = (0..1024)
+            .map(|index| ColumnDef {
+                name: format!("v{index}"),
+                data_type: DataType::Int64,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            })
+            .collect::<Vec<_>>();
+        let token = |index: usize| {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&u32::try_from(index + 1).unwrap().to_be_bytes());
+            ConnectorWriteFieldToken::from_bytes(bytes)
+        };
+        let mut allocator = SqlTableBindingAllocator::new_unique().expect("binding allocator");
+        let sink = DmlWritePlanInput::try_new(
+            DmlWriteSinkMode::Data,
+            DmlWriteTarget {
+                binding: allocator.allocate().expect("admitted test target"),
+                catalog: "native_statistics".into(),
+                namespace: "native_statistics_db".into(),
+                table: "native_statistics_wide_source".into(),
+                fields: columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| DmlWriteTargetField {
+                        token: token(index),
+                        column: column.clone(),
+                        is_hidden: false,
+                    })
+                    .collect(),
+            },
+            columns.clone(),
+            ConnectorWriteInputBinding::RootOutputByOrdinal,
+        )
+        .expect("exact 1024-field write contract");
+        let provider = ConnectorProviderId::parse("statistics_test").unwrap();
+        let instance = ConnectorInstanceId::parse("native_statistics").unwrap();
+        let catalog = CatalogHandle::new(instance.clone(), CatalogVersion::from_bytes([21; 32]));
+        let binding = ConnectorWriteBinding::new(
+            ConnectorInstanceDescriptor {
+                provider_id: provider.clone(),
+                instance_id: instance,
+            },
+            catalog.clone(),
+        );
+        let handle = ConnectorEncodedPayload::new(
+            ConnectorEnvelopeHeader::new(
+                provider,
+                catalog,
+                ConnectorCodecCategory::WriteHandle,
+                ConnectorCodecRevision::try_new(1).unwrap(),
+            ),
+            bytes::Bytes::from_static(b"wide-statistics-owned-test-handle"),
+        );
+        let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
+        let statistics = DmlStatisticsSnapshot::empty();
+        // The original failing seed disables collect-on-write, so there are
+        // no auxiliary statistics requirements, exactly as in this fixture.
+        let owner = compile_final_connector_write_plan(
+            SqlOptimizeRequest::new(analyzed, &statistics, control.clone()),
+            sink,
+            ordinal,
+            &[],
+            &settings,
+            DmlFinalWritePlanContext::new(
+                DmlFinalPlanContext::new(
+                    PlanVersionId::try_new([21; 16]).unwrap(),
+                    PipelineDopDomain {
+                        min: 1,
+                        max: 8,
+                        requires_power_of_two: true,
+                    },
+                    DmlFinalizedProviderReadSet::empty(),
+                ),
+                DmlFinalizedWriteTargetSet::try_new([DmlFinalizedWriteTarget {
+                    ordinal,
+                    handle: handle.clone(),
+                }])
+                .unwrap(),
+            ),
+            decimal,
+        )
+        .unwrap_or_else(|error| panic!("wide INSERT writer planning: {error:#?}"));
+        let widths = owner
+            .plan()
+            .fragments()
+            .values()
+            .flat_map(|fragment| fragment.nodes().values())
+            .filter_map(|node| match &node.kind {
+                NodeKind::TableWriter { target } => Some(target.target_fields.len()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            widths,
+            vec![1024],
+            "the real planner retains one wide writer"
+        );
+        let recipe = ConnectorWriteRecipeDraft::try_new(
+            binding,
+            handle,
+            ConnectorWriteInputShape::Data {
+                fields: columns
+                    .iter()
+                    .enumerate()
+                    .map(|(index, column)| {
+                        ConnectorWriteFieldBinding::try_new_typed(
+                            token(index),
+                            Field::new(&column.name, DataType::Int64, true),
+                            FunctionValueType::new(DataType::Int64, true),
+                        )
+                        .expect("owned provider field declaration")
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("wide INSERT test writer recipe: {error:#?}"));
+        let candidate = CompletedPhysicalPlanCandidate::for_sql_program(owner, &control)
+            .and_then(|candidate| {
+                candidate.freeze_root_output(
+                    novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                        novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                    ),
+                )
+            })
+            .unwrap_or_else(|error| panic!("wide INSERT completed candidate: {error:#?}"));
+        let packages = crate::query_execution::package_freeze::extract_checked_packages(
+            &candidate,
+            &BTreeMap::new(),
+            &BTreeMap::from([(ordinal, recipe)]),
+            FROZEN_CONSTANT_POLICY,
+            &FROZEN_PACKAGE_ADMISSION,
+            &control,
+        )
+        .unwrap_or_else(|error| panic!("wide INSERT checked package extraction: {error:#?}"));
+        assert_eq!(packages.len(), candidate.plan().fragments().len());
+        let model = FragmentDecodeResourceModel::try_new(&control).expect("decode model");
+        for (id, package) in &packages {
+            let bytes = crate::query_execution::package_freeze::encode_checked_package(
+                package,
+                &PackageEncodeLimits::FROZEN,
+                &control,
+            )
+            .unwrap_or_else(|error| panic!("wide INSERT fragment {id:?} encode: {error:#?}"));
+            let decoded =
+                decode_fragment_package(&bytes, &model, &PackageDecodeLimits::FROZEN, &control)
+                    .unwrap_or_else(|error| {
+                        panic!("wide INSERT fragment {id:?} decode: {error:#?}")
+                    });
+            assert_eq!(decoded.fragment().id(), *id);
+        }
+    }
+
     // A VALUES cell keeps its analyzed type until final lowering assigns its
     // column's, so a NULL cell is a NULL of its column's type. Lowered in its
     // own type first and then replaced, it left a definition no operator

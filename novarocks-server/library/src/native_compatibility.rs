@@ -139,6 +139,33 @@ mod tests {
     }
 
     #[test]
+    fn peer_with_writer_count_and_token_quotas_has_a_distinct_plan_contract() {
+        let manifest = server_manifest();
+        let current =
+            resolve_native_compatibility_material(manifest.contracts(), [0x31; 32], COMPILED)
+                .unwrap();
+        let prior = novarocks_version::derive_repository_native_compatibility_material(
+            native_carrier_declarations(manifest.contracts()).unwrap(),
+            [0x31; 32],
+            14,
+            COMPILED,
+        )
+        .unwrap();
+        assert_eq!(
+            current.plan_contract_revision(),
+            novarocks_physical_plan::PLAN_CONTRACT_REVISION
+        );
+        assert_ne!(
+            current.plan_contract_revision(),
+            prior.plan_contract_revision()
+        );
+        assert_ne!(current.plan_contract_digest(), prior.plan_contract_digest());
+        assert_ne!(current.id(), prior.id());
+        assert_eq!(current.descriptor_digest(), prior.descriptor_digest());
+        assert_eq!(current.carriers(), prior.carriers());
+    }
+
+    #[test]
     fn static_manifest_contains_exact_private_provider_descriptors() {
         let manifest = server_manifest();
         let declarations =

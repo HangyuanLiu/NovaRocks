@@ -1242,6 +1242,31 @@ mod resource_tests {
         assert_eq!(calls, 1);
     }
     #[test]
+    fn unlimited_thresholds_do_not_allow_unrepresentable_field_facts_or_layouts() {
+        let mut multiplication = Model::new::<wire::FrozenWriterRecipe>(0, 0).unwrap();
+        assert!(matches!(
+            multiplication.fields(usize::MAX / 32 + 1),
+            Err(E::Control(CompileControlError::ResourceExhausted))
+        ));
+        let mut count = Model::new::<wire::FrozenWriterRecipe>(0, 0).unwrap();
+        count.facts.input_field_count = usize::MAX;
+        assert!(matches!(
+            count.fields(1),
+            Err(E::Control(CompileControlError::ResourceExhausted))
+        ));
+        let mut tokens = Model::new::<wire::FrozenWriterRecipe>(0, 0).unwrap();
+        tokens.facts.token_bytes = usize::MAX - 31;
+        assert!(matches!(
+            tokens.fields(1),
+            Err(E::Control(CompileControlError::ResourceExhausted))
+        ));
+        assert!(matches!(
+            array::<ConnectorWriteFieldRef<'_>>(usize::MAX),
+            Err(E::Control(CompileControlError::ResourceExhausted))
+        ));
+    }
+
+    #[test]
     fn known_field_and_token_gate_precedes_real_pending255_late_control_without_scope_footer() {
         for cause in [
             CompileControlError::Cancelled,
