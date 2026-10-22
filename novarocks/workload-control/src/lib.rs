@@ -68,6 +68,7 @@
 
 mod admission;
 mod cancellation;
+pub mod joint_admission;
 mod observation;
 mod queue;
 mod resource;

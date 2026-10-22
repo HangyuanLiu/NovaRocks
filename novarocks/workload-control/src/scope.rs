@@ -262,6 +262,7 @@ impl Node {
 
 #[derive(Default)]
 pub(crate) struct State {
+    pub(crate) joint: Option<crate::joint_admission::ledger::JointLedger>,
     pub closed: bool,
     pub ready: bool,
     pub next_id: u64,
@@ -300,6 +301,10 @@ pub(crate) struct State {
 }
 
 impl State {
+    pub(crate) fn progress_marker(&self) -> WorkloadProgressRevision {
+        WorkloadProgressRevision(self.progress_revision)
+    }
+
     pub(crate) fn waiting_records(&self) -> usize {
         self.requests.len() + self.resource_waiters.len()
     }
@@ -314,6 +319,7 @@ impl State {
 
     pub(crate) fn is_drained(&self) -> bool {
         self.closed
+            && self.joint.as_ref().is_none_or(|ledger| ledger.is_drained())
             && self.nodes.is_empty()
             && self.roots == 0
             && self.businesses == 0

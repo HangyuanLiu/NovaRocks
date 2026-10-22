@@ -4321,6 +4321,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-resource-contract"
+version = "0.1.0"
+dependencies = [
+ "url",
+]
+
+[[package]]
 name = "novarocks-result-contract"
 version = "0.1.0"
 dependencies = [
@@ -4793,6 +4800,7 @@ name = "novarocks-workload-control"
 version = "0.1.0"
 dependencies = [
  "novarocks-failure-contract",
+ "novarocks-resource-contract",
  "tokio",
 ]
 

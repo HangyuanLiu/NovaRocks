@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 novarocks-failure-contract.workspace = true
+novarocks-resource-contract.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "macros"] }
 
 [dev-dependencies]
