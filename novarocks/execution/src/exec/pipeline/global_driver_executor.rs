@@ -1001,6 +1001,9 @@ fn worker_loop(shared: Arc<ExecutorShared>) {
         };
         task.observe_worker_start();
 
+        // Stop is a hint, not a verdict about a just-handed-off proposal.
+        // A delayed stop takes the ordinary failure retirement below, handing
+        // off the same occurrence again before its own physical exit.
         if shared.admission_closed.load(Ordering::Acquire) || task.completion.should_abort() {
             if let Some(task) =
                 task.finish_abort_for_control(shared.admission_closed.load(Ordering::Acquire))

@@ -807,6 +807,15 @@ impl EventScheduler {
             .fetch_add(1, Ordering::AcqRel)
             .wrapping_add(1);
         self.register_finish_observer(task, Arc::clone(&wait.observable))?;
+        let terminal = if task.operator_terminal_signal_delivered() {
+            None
+        } else {
+            task.blocked_terminal_snapshot()
+                .filter(|(terminal, _)| !Arc::ptr_eq(terminal, &wait.observable))
+        };
+        if let Some((terminal, _)) = terminal.as_ref() {
+            self.register_terminal_observer(task, Arc::clone(terminal));
+        }
         let wake_now = {
             let mut blocked = self.blocked.lock().expect("event scheduler blocked lock");
             if self.shutdown.load(Ordering::Acquire) || blocked.contains_key(&key) {
@@ -820,7 +829,9 @@ impl EventScheduler {
                 BlockedTask {
                     task,
                     observable: Some((Arc::downgrade(&wait.observable), wait.generation)),
-                    terminal: None,
+                    terminal: terminal
+                        .as_ref()
+                        .map(|(terminal, generation)| (Arc::downgrade(terminal), *generation)),
                     block_epoch,
                 },
             );
@@ -859,6 +870,11 @@ impl EventScheduler {
                 &Arc::downgrade(&wait.observable),
                 wait.observable.generation(),
             );
+            // Both watches can fire before the task enters the blocked map.
+            // Rechecking their generations closes both registration races.
+            if let Some((terminal, _)) = terminal.as_ref() {
+                self.enqueue_observable(key, &Arc::downgrade(terminal), terminal.generation());
+            }
         }
         Ok(true)
     }
@@ -1363,6 +1379,267 @@ mod tests {
         assert!(state.deadlines.is_empty());
         assert!(state.deadline_index.is_empty());
         assert!(state.earliest_deadline().is_none());
+    }
+
+    // Native scheduling remains manually driven; neither a dispatcher thread nor
+    // the FragmentContext's explicit fanout participates in the wake oracle.
+    #[derive(Clone, Copy, Debug)]
+    enum OwnerStopPark {
+        Input,
+        Dependency,
+        PendingFinish,
+    }
+
+    struct OwnerStopSource {
+        event: Arc<Observable>,
+        reason: WaitReason,
+    }
+    impl OperatorLifecycle for OwnerStopSource {
+        fn name(&self) -> &str {
+            "OWNER_STOP_SOURCE"
+        }
+    }
+    impl SourceKernel for OwnerStopSource {
+        fn poll_output(&mut self, _: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
+            Ok(StepResult::new(
+                None,
+                NextStep::Wait(WaitFact {
+                    reason: self.reason,
+                    observable: self.event.clone(),
+                    observed_generation: self.event.generation(),
+                    deadline: None,
+                }),
+                0,
+            ))
+        }
+    }
+    struct OwnerStopSink {
+        pending: Arc<AtomicBool>,
+        event: Arc<Observable>,
+        terminal_calls: Arc<AtomicUsize>,
+    }
+    impl OperatorLifecycle for OwnerStopSink {
+        fn name(&self) -> &str {
+            "OWNER_STOP_SINK"
+        }
+        fn cancel(&mut self) {
+            self.terminal_calls.fetch_add(1, Ordering::AcqRel);
+        }
+        fn observe_exit(&mut self) -> crate::exec::pipeline::operator::ExitObservation {
+            if self.pending.load(Ordering::Acquire) {
+                crate::exec::pipeline::operator::ExitObservation::pending(FinishWatch::Notify(
+                    self.event.clone(),
+                ))
+            } else {
+                crate::exec::pipeline::operator::ExitObservation::exited()
+            }
+        }
+    }
+    impl InputEncodingPolicy for OwnerStopSink {}
+    impl SinkKernel for OwnerStopSink {
+        fn consume(
+            &mut self,
+            _: &mut StepContext<'_>,
+            _: PreparedInput,
+        ) -> ExecutionResult<SinkStep> {
+            panic!("a stop-only wake fixture must not receive data")
+        }
+    }
+
+    fn assert_owner_stop_only_wakes_parked_driver(
+        owner: Arc<dyn crate::runtime::task_control::TaskExecutionPort>,
+        advance: impl FnOnce(),
+        deferred: bool,
+        park: OwnerStopPark,
+        stop_before_parking: bool,
+    ) {
+        use novarocks_execution_contract::{AbortCause, TaskConclusionProposal, TaskFailurePhase};
+        let state = Arc::new(RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::for_task(
+                Arc::new(
+                    crate::runtime::task_control::TaskExecutionControl::new(
+                        owner.identity(),
+                        owner.clone(),
+                        TaskFailurePhase::Execution,
+                    )
+                    .unwrap(),
+                ),
+            )),
+        ));
+        let data_event = Arc::new(Observable::new());
+        let finish_event = Arc::new(Observable::new());
+        let pending = Arc::new(AtomicBool::new(matches!(
+            park,
+            OwnerStopPark::PendingFinish
+        )));
+        let terminal_calls = Arc::new(AtomicUsize::new(0));
+        let source: Box<dyn Operator> = if matches!(park, OwnerStopPark::PendingFinish) {
+            Box::new(Source::new(DrainedSource))
+        } else {
+            Box::new(Source::new(OwnerStopSource {
+                event: data_event.clone(),
+                reason: if matches!(park, OwnerStopPark::Dependency) {
+                    WaitReason::Dependency
+                } else {
+                    WaitReason::Input
+                },
+            }))
+        };
+        let driver = PipelineDriver::new(
+            82,
+            vec![
+                source,
+                Box::new(Transform::hydrating(OwnerStopSink {
+                    pending: pending.clone(),
+                    event: finish_event.clone(),
+                    terminal_calls: terminal_calls.clone(),
+                })),
+            ],
+            None,
+            Vec::new(),
+            state.clone(),
+            Some((91_082, 91_083)),
+        );
+        let completion = FragmentCompletion::new(1, state.error_state());
+        let context = Arc::new(FragmentContext::new(
+            None,
+            state,
+            Some((91_082, 91_083)),
+            None,
+            None,
+            None,
+        ));
+        let mut task = DriverTask::new(
+            driver,
+            completion.clone(),
+            context,
+            Duration::from_millis(10),
+        );
+        let blocked = match task.process_for_test(Duration::from_secs(1)) {
+            DriverState::PendingFinish if matches!(park, OwnerStopPark::PendingFinish) => None,
+            DriverState::Blocked(reason) if !matches!(park, OwnerStopPark::PendingFinish) => {
+                Some(reason)
+            }
+            state => panic!("the driver must park before the owner stops: {state:?}"),
+        };
+        assert!(!task.operator_terminal_signal_delivered());
+        let scheduler = Arc::new(EventScheduler::new());
+        let executor = Arc::new(ExecutorShared::new());
+        assert!(scheduler.shared.set(executor.clone()).is_ok());
+        let wakes = || scheduler.reschedule_queue.lock().unwrap().queue.len();
+        let park_task = |task: DriverTask| {
+            if let Some(reason) = blocked {
+                assert!(scheduler.add_blocked(task, reason).is_ok());
+            } else {
+                let mut slot = Some(task);
+                assert!(scheduler.add_pending_finish(&mut slot).unwrap());
+                assert!(slot.is_none());
+            }
+        };
+        // Before-parking checks the generation/initial-state race; after-parking
+        // proves an already parked task receives a later stop publication.
+        if stop_before_parking {
+            owner.submit(TaskConclusionProposal::Aborted(AbortCause::QueryFailed));
+            if deferred {
+                assert!(!owner.is_stopped());
+            }
+            advance();
+            park_task(task);
+        } else {
+            park_task(task);
+            assert_eq!(wakes(), 0);
+            owner.submit(TaskConclusionProposal::Aborted(AbortCause::QueryFailed));
+            if deferred {
+                assert!(!owner.is_stopped());
+                assert_eq!(wakes(), 0, "handoff itself has no wake authority");
+            }
+            advance();
+        }
+        assert!(owner.is_stopped());
+        assert_eq!(data_event.generation(), 0);
+        assert_eq!(
+            finish_event.generation(),
+            0,
+            "the actual async owner did not end"
+        );
+        assert_eq!(
+            wakes(),
+            1,
+            "only the accepted stop made the driver runnable"
+        );
+        let key = scheduler
+            .reschedule_queue
+            .lock()
+            .unwrap()
+            .queue
+            .pop_front()
+            .unwrap();
+        scheduler.try_schedule_key(key);
+        let mut task = executor.queue.lock().unwrap().pop_front().unwrap();
+        let state = task.process_for_test(Duration::from_secs(1));
+        assert!(task.operator_terminal_signal_delivered());
+        assert_eq!(terminal_calls.load(Ordering::Acquire), 1);
+        if matches!(park, OwnerStopPark::PendingFinish) {
+            assert!(matches!(state, DriverState::PendingFinish));
+            assert!(completion.stopped_fact().is_none());
+            let mut slot = Some(task);
+            assert!(scheduler.add_pending_finish(&mut slot).unwrap());
+            assert!(slot.is_none());
+            assert_eq!(wakes(), 0, "stop is not a proof of the async owner's exit");
+            pending.store(false, Ordering::Release);
+            finish_event.notify_observers();
+            assert_eq!(wakes(), 1);
+            let key = scheduler
+                .reschedule_queue
+                .lock()
+                .unwrap()
+                .queue
+                .pop_front()
+                .unwrap();
+            scheduler.try_schedule_key(key);
+            task = executor.queue.lock().unwrap().pop_front().unwrap();
+        } else {
+            assert!(matches!(state, DriverState::Failed(_)));
+        }
+        assert!(
+            task.finish_due_to_abort().is_none(),
+            "actual exit converges the original driver"
+        );
+        assert!(completion.stopped_fact().is_some());
+        assert!(scheduler.blocked.lock().unwrap().is_empty());
+        assert!(executor.queue.lock().unwrap().is_empty());
+        assert_eq!(terminal_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_pending_finish_driver_wakes_for_a_later_stop() {
+        let owner = crate::runtime::task_control::test_support::Owner::new();
+        assert_owner_stop_only_wakes_parked_driver(
+            owner,
+            || {},
+            false,
+            OwnerStopPark::PendingFinish,
+            false,
+        );
+    }
+
+    #[test]
+    fn a_pending_finish_driver_does_not_lose_a_stop_before_parking() {
+        let owner = crate::runtime::task_control::test_support::Owner::new();
+        assert_owner_stop_only_wakes_parked_driver(
+            owner,
+            || {},
+            false,
+            OwnerStopPark::PendingFinish,
+            true,
+        );
     }
 
     struct FinishTransitionSink {

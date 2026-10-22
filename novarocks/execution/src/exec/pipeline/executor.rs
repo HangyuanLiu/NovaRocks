@@ -140,12 +140,15 @@ impl PreparedPipelineExecution {
             // Keep the actual source before the accepting call. A clone is
             // offered through the same control; no catch invents another cause.
             let proposal = tasks.install_initial_failure(error);
-            tasks.metadata(1, &control, || fragment_ctx.set_final_status(proposal));
-            if control.is_stopped() {
+            let handed_off = tasks
+                .metadata(1, &control, || fragment_ctx.set_final_status(proposal))
+                .is_some();
+            if handed_off {
                 start_work_exited = tasks.dispose_initial_failure(&control);
             } else {
-                // The accepting call did not establish a conclusion. Its
-                // original source and start-work obligation remain owned.
+                // Unwind cannot distinguish a pre-handoff panic from a
+                // post-handoff notification panic. Retain the original source
+                // and start-work obligation rather than infer acceptance.
                 start_work_exited = false;
             }
         }
