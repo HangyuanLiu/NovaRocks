@@ -795,18 +795,18 @@ impl IcebergReadBinding {
         let resolver = context.storage_resolver().ok_or_else(|| {
             invalid("Iceberg vended object-store operation has no query storage resolver")
         })?;
-        let mut resolved = locations
+        let resolved = locations
             .iter()
             .map(|location| {
                 StorageAccessRequest::try_new(owner.clone(), location)
                     .and_then(|request| resolver.resolve_vended_s3(&request))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mut resolved = resolved.into_iter();
         let selected = resolved
-            .drain(..)
             .next()
             .ok_or_else(|| invalid("Iceberg filesystem locations are empty"))?;
-        if resolved.iter().any(|other| {
+        if resolved.any(|other| {
             other.storage_access_domain_id() != selected.storage_access_domain_id()
                 || other.lease_id() != selected.lease_id()
                 || other.epoch() != selected.epoch()
@@ -1311,6 +1311,167 @@ mod tests {
                 "test vended resolver denial",
             ))
         }
+    }
+
+    const MULTI_VENDED_LOCATIONS: [&str; 2] = [
+        "s3://warehouse/table/a/data.parquet",
+        "s3://warehouse/table/b/data.parquet",
+    ];
+
+    #[derive(Clone, Copy, Debug)]
+    enum SelectionDifference {
+        Lease,
+        Epoch,
+        Domain,
+        Prefix,
+        RenewalPath,
+        MissingRenewalPath,
+    }
+
+    /// Both values come through the real request resolver. Only the second
+    /// location varies one actual selection dimension; no comparison is mocked.
+    struct TwoLocationVendedResolver {
+        difference: Option<SelectionDifference>,
+        calls: AtomicUsize,
+    }
+    impl ConnectorStorageResolver for TwoLocationVendedResolver {
+        fn resolve_vended_s3(
+            &self,
+            request: &StorageAccessRequest,
+        ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+            assert_eq!(request.owner(), vended_catalog_properties().handle());
+            assert!(MULTI_VENDED_LOCATIONS.contains(&request.location()));
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let difference = (request.location() == MULTI_VENDED_LOCATIONS[1])
+                .then_some(self.difference)
+                .flatten();
+            let mut lease = [0x21; 16];
+            let mut epoch = 1;
+            let mut domain = [0x31; 32];
+            let mut prefix = "s3://warehouse/table";
+            let mut path = Some(endpoint_path());
+            match difference {
+                Some(SelectionDifference::Lease) => lease = [0x22; 16],
+                Some(SelectionDifference::Epoch) => epoch = 2,
+                Some(SelectionDifference::Domain) => domain = [0x32; 32],
+                Some(SelectionDifference::Prefix) => prefix = "s3://warehouse/table/b",
+                Some(SelectionDifference::RenewalPath) => {
+                    path = Some(CredentialRenewalPath::CredentialsEndpoint(routing(
+                        "https://rest/v2/credentials",
+                    )))
+                }
+                Some(SelectionDifference::MissingRenewalPath) => path = None,
+                None => {}
+            }
+            Ok(ResolvedVendedS3Access::new(
+                StorageAccessDomainId::from_bytes(domain),
+                novarocks_spi::connector::CredentialLeaseId::try_from_bytes(lease).unwrap(),
+                epoch,
+                novarocks_spi::connector::StorageCredentialScopePrefix::try_from_normalized(prefix)
+                    .unwrap(),
+                path,
+                None,
+            ))
+        }
+    }
+
+    #[test]
+    fn vended_multi_location_refuses_each_different_original_selection() {
+        let runtime = tokio::runtime::Runtime::new().expect("binding runtime");
+        for difference in [
+            SelectionDifference::Lease,
+            SelectionDifference::Epoch,
+            SelectionDifference::Domain,
+            SelectionDifference::Prefix,
+            SelectionDifference::RenewalPath,
+            SelectionDifference::MissingRenewalPath,
+        ] {
+            let resolver = Arc::new(TwoLocationVendedResolver {
+                difference: Some(difference),
+                calls: AtomicUsize::new(0),
+            });
+            // Reuse the real catalog binding whose role has no independent
+            // vending identity. A selection refusal must precede authority or
+            // operator admission, rather than fail later for missing material.
+            let binding = vending_binding(&runtime, None, false).for_request(
+                ConnectorRequestContext::try_new(
+                    Instant::now() + Duration::from_secs(1),
+                    novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                    1024,
+                    2048,
+                )
+                .unwrap()
+                .with_storage_resolver(resolver.clone()),
+            );
+            let registry = Arc::clone(binding.resources.storage_authority_registry());
+            let error = binding
+                .resolve_access_for_locations(MULTI_VENDED_LOCATIONS)
+                .expect_err("different selections cannot share the first location's operator");
+            assert_eq!(
+                error.kind(),
+                ConnectorErrorKind::InvalidRequest,
+                "{difference:?}"
+            );
+            assert_eq!(
+                error.message(),
+                "Iceberg vended filesystem locations require different credential selections",
+                "{difference:?}: refusal must be the actual multi-location selection gate"
+            );
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), 2, "{difference:?}");
+            assert_eq!(registry.metrics().resident, 0, "{difference:?}");
+            assert_eq!(registry.metrics().misses, 0, "{difference:?}");
+        }
+    }
+
+    #[test]
+    fn vended_multi_location_same_selection_resolves_both_paths_without_io() {
+        let runtime = tokio::runtime::Runtime::new().expect("binding runtime");
+        let resolver = Arc::new(TwoLocationVendedResolver {
+            difference: None,
+            calls: AtomicUsize::new(0),
+        });
+        let binding = vending_binding(&runtime, None, false).for_request(
+            ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(1),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                1024,
+                2048,
+            )
+            .unwrap()
+            .with_storage_resolver(resolver.clone()),
+        );
+        // Resolution builds the ordinary operator. No read, stat, signing, or
+        // acquisition is requested; no secret or network fixture is needed.
+        let access = binding
+            .resolve_access_for_locations(MULTI_VENDED_LOCATIONS)
+            .expect("the original same-selection path remains accepted");
+        assert_eq!(
+            access.access_domain(),
+            StorageAccessDomainId::from_bytes([0x31; 32])
+        );
+        assert_eq!(access.scheme(), FsScheme::ObjectStore);
+        assert_eq!(access.authority(), Some("warehouse"));
+        assert_eq!(access.paths().len(), 2);
+        for (actual, expected) in access.paths().iter().zip(MULTI_VENDED_LOCATIONS) {
+            assert_eq!(actual.location().original(), expected);
+        }
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            binding
+                .resources
+                .storage_authority_registry()
+                .metrics()
+                .resident,
+            1
+        );
+        assert_eq!(
+            binding
+                .resources
+                .storage_authority_registry()
+                .metrics()
+                .misses,
+            1
+        );
     }
 
     fn vended_catalog_properties() -> CatalogProperties {
