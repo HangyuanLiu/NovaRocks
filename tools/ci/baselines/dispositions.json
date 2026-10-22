@@ -5,9 +5,9 @@
       "unit": "sql-case:decimal/test_decimal256_cast_operations",
       "failure": {
         "class": "error_code",
-        "code": "UnsupportedCompiledShape"
+        "code": "sql.analyze.unsupported_expression"
       },
-      "reason": "Observed on clean f1227548a4a8ca0cfbd000698f9d0e69e54f0395, step 2, substatement 1/1, sha256=cb9ae403592dc1bba4fa393879335bb64e165acbe08e891320960640927b5a36: Boolean -> Decimal128(38,15) CAST. No failed independent expectation. P00 same-statement detail plus current exact owner predicate identifies the capability; current sanitized message alone is not a recipe trace. Exit: B8 implements Boolean -> Decimal128(38,15) CAST; the original entire decimal/test_decimal256_cast_operations native case passes with all required oracles, then remove this disposition. Unreached suffixes remain unverified until that run. Re-observed same exact statement and actual code on clean fffbffe8; no executed independent oracle failed and no secondary cleanup failure observed.",
+      "reason": "Observed in the unchanged full native case after the closeout SQL refusal repair (retained 23b160748 plus tested patch), step 7, statement sha256=aca98e26f7e493ba8b69301a5e9b3ae6e773d17811de796f4f3ef557e08086eb: Physical Decimal128(38,15) -> nullable nominal LARGEINT / FixedSizeBinary(16). The exact Functions conversion family is absent; the SQL value-conversion author now returns its existing UnsupportedExpression only for this missing shape. The old step 2 Boolean prefix passes. Five of 25 required oracles passed; the remaining 20 were not executed, no independent expected result failed, and suite/server/fixture cleanup was OK. Exit: B8 implements this conversion and the entire unchanged native case passes all 25 required oracles, then remove this disposition. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p11-decimal-postfix-run-r1/.",
       "owner": "B8 scalar remainder and statement-environment capability",
       "expires": "2026-12-15"
     },
