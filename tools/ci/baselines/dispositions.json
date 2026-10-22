@@ -2454,23 +2454,13 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg-dml/equality_delete_schema_evolution",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing compiled whole-relation provider read for the Iceberg $snapshots SystemTable (SingleCoordinator -> WholeRelation), explicitly refused by LocalCompiler scan admission; owner B6. Remove after B6 restores the exact metadata scan and this unchanged full native case passes; unreached DML/budget assertions are not waived or claimed repaired.",
-      "owner": "B6",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:iceberg-dml/merge_into_cow",
       "failure": {
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Missing compiled whole-relation provider read for the Iceberg $snapshots SystemTable (SingleCoordinator -> WholeRelation), explicitly refused by LocalCompiler scan admission; owner B6. Remove after B6 restores the exact metadata scan and this unchanged full native case passes; unreached DML/budget assertions are not waived or claimed repaired.",
-      "owner": "B6",
+      "reason": "Statement 4 MERGE reaches the signed MOR change-stream route; Frontend physical_encoding.rs refuses the unrepresented Router sink with PLAN_CODEC 17:40, projected as UnsupportedCompiledShape. B6a restored the earlier $snapshots work-unit read. Current clean 2b51 native statement/code match the retained separate typed diagnostic and unchanged production FE Delete/Replace/Insert -> Provider MOR -> Router author chain; case names do not choose COW. Later assertions remain unverified. Exit: B1b restores this exact Router sink/edge and B2 revalidates the unchanged entire native case and cleanup. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
+      "owner": "UEA-5E B1b",
       "expires": "2026-12-15"
     },
     {
@@ -2479,8 +2469,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Missing compiled whole-relation provider read for the Iceberg $snapshots SystemTable (SingleCoordinator -> WholeRelation), explicitly refused by LocalCompiler scan admission; owner B6. Remove after B6 restores the exact metadata scan and this unchanged full native case passes; unreached DML/budget assertions are not waived or claimed repaired.",
-      "owner": "B6",
+      "reason": "Statement 4 MERGE reaches the signed MOR change-stream route; Frontend physical_encoding.rs refuses the unrepresented Router sink with PLAN_CODEC 17:40, projected as UnsupportedCompiledShape. B6a restored the earlier $snapshots work-unit read. Current clean 2b51 native statement/code match the retained separate typed diagnostic and unchanged production FE Delete/Replace/Insert -> Provider MOR -> Router author chain; case names do not choose COW. Later assertions remain unverified. Exit: B1b restores this exact Router sink/edge and B2 revalidates the unchanged entire native case and cleanup. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
+      "owner": "UEA-5E B1b",
       "expires": "2026-12-15"
     },
     {
@@ -2489,8 +2479,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Missing compiled whole-relation provider read for the Iceberg $snapshots SystemTable (SingleCoordinator -> WholeRelation), explicitly refused by LocalCompiler scan admission; owner B6. Remove after B6 restores the exact metadata scan and this unchanged full native case passes; unreached DML/budget assertions are not waived or claimed repaired.",
-      "owner": "B6",
+      "reason": "Statement 4 MERGE reaches the signed MOR change-stream route; Frontend physical_encoding.rs refuses the unrepresented Router sink with PLAN_CODEC 17:40, projected as UnsupportedCompiledShape. B6a restored the earlier $snapshots work-unit read. Current clean 2b51 native statement/code match the retained separate typed diagnostic and unchanged production FE Delete/Replace/Insert -> Provider MOR -> Router author chain; case names do not choose COW. Later assertions remain unverified. Exit: B1b restores this exact Router sink/edge and B2 revalidates the unchanged entire native case and cleanup. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
+      "owner": "UEA-5E B1b",
       "expires": "2026-12-15"
     },
     {
@@ -2499,8 +2489,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Missing compiled whole-relation provider read for the Iceberg $snapshots SystemTable (SingleCoordinator -> WholeRelation), explicitly refused by LocalCompiler scan admission; owner B6. Remove after B6 restores the exact metadata scan and this unchanged full native case passes; unreached DML/budget assertions are not waived or claimed repaired.",
-      "owner": "B6",
+      "reason": "Statement 4 MERGE reaches the signed MOR change-stream route; Frontend physical_encoding.rs refuses the unrepresented Router sink with PLAN_CODEC 17:40, projected as UnsupportedCompiledShape. B6a restored the earlier $snapshots work-unit read. Current clean 2b51 native statement/code match the retained separate typed diagnostic and unchanged production FE Delete/Replace/Insert -> Provider MOR -> Router author chain; case names do not choose COW. Later assertions remain unverified. Exit: B1b restores this exact Router sink/edge and B2 revalidates the unchanged entire native case and cleanup. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
+      "owner": "UEA-5E B1b",
       "expires": "2026-12-15"
     },
     {
@@ -2509,28 +2499,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "Missing compiled whole-relation provider read for the Iceberg $snapshots SystemTable (SingleCoordinator -> WholeRelation), explicitly refused by LocalCompiler scan admission; owner B6. Remove after B6 restores the exact metadata scan and this unchanged full native case passes; unreached DML/budget assertions are not waived or claimed repaired.",
-      "owner": "B6",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/prepared_write_set_entry_budget",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing compiled whole-relation provider read for the Iceberg $snapshots SystemTable (SingleCoordinator -> WholeRelation), explicitly refused by LocalCompiler scan admission; owner B6. Remove after B6 restores the exact metadata scan and this unchanged full native case passes; unreached DML/budget assertions are not waived or claimed repaired.",
-      "owner": "B6",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-dml/update_cow_multi_file",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Missing compiled whole-relation provider read for the Iceberg $snapshots SystemTable (SingleCoordinator -> WholeRelation), explicitly refused by LocalCompiler scan admission; owner B6. Remove after B6 restores the exact metadata scan and this unchanged full native case passes; unreached DML/budget assertions are not waived or claimed repaired.",
-      "owner": "B6",
+      "reason": "Statement 3 MERGE reaches the signed MOR change-stream route; Frontend physical_encoding.rs refuses the unrepresented Router sink with PLAN_CODEC 17:40, projected as UnsupportedCompiledShape. B6a restored the earlier $snapshots work-unit read. Current clean 2b51 native statement/code match the retained separate typed diagnostic and unchanged production FE Delete/Replace/Insert -> Provider MOR -> Router author chain; case names do not choose COW. Later assertions remain unverified. Exit: B1b restores this exact Router sink/edge and B2 revalidates the unchanged entire native case and cleanup. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
+      "owner": "UEA-5E B1b",
       "expires": "2026-12-15"
     },
     {
@@ -2804,83 +2774,13 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:iceberg/iceberg_metadata_entries",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged case first reaches $entries at statement 5; its frozen provider metadata Scan is refused by the compiled scan capability gate. No independent failed oracle or cleanup violation accompanies it. Restore this exact metadata-read capability and pass the original full case before removal.",
-      "owner": "UEA-5E B6",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:iceberg/iceberg_metadata_files",
       "failure": {
         "class": "error_code",
-        "code": "UnsupportedCompiledShape"
+        "code": "sql.analyze.unavailable_implementation"
       },
-      "reason": "The unchanged case first reaches $files at statement 5; its frozen provider metadata Scan is refused by the compiled scan capability gate. No independent failed oracle or cleanup violation accompanies it. Restore this exact metadata-read capability and pass the original full case before removal.",
-      "owner": "UEA-5E B6",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg/iceberg_metadata_history",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged case first reaches $history at statement 5; its frozen provider metadata Scan is refused by the compiled scan capability gate. No independent failed oracle or cleanup violation accompanies it. Restore this exact metadata-read capability and pass the original full case before removal.",
-      "owner": "UEA-5E B6",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg/iceberg_metadata_manifests",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged case first reaches $manifests at statement 5; its frozen provider metadata Scan is refused by the compiled scan capability gate. No independent failed oracle or cleanup violation accompanies it. Restore this exact metadata-read capability and pass the original full case before removal.",
-      "owner": "UEA-5E B6",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg/iceberg_metadata_partitions",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged case first reaches $partitions at statement 4; its frozen provider metadata Scan is refused by the compiled scan capability gate. No independent failed oracle or cleanup violation accompanies it. Restore this exact metadata-read capability and pass the original full case before removal.",
-      "owner": "UEA-5E B6",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg/iceberg_metadata_refs",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged case first reaches $refs at statement 6; its frozen provider metadata Scan is refused by the compiled scan capability gate. No independent failed oracle or cleanup violation accompanies it. Restore this exact metadata-read capability and pass the original full case before removal.",
-      "owner": "UEA-5E B6",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg/iceberg_metadata_snapshots",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged case first reaches $snapshots at statement 6; its frozen provider metadata Scan is refused by the compiled scan capability gate. No independent failed oracle or cleanup violation accompanies it. Restore this exact metadata-read capability and pass the original full case before removal.",
-      "owner": "UEA-5E B6",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg/iceberg_snapshot_summary_totals",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged case first reaches $snapshots at statement 5; its frozen provider metadata Scan is refused by the compiled scan capability gate. No independent failed oracle or cleanup violation accompanies it. Restore this exact metadata-read capability and pass the original full case before removal.",
-      "owner": "UEA-5E B6",
+      "reason": "Statement 7 partition-field projection requires the absent pure implementation builtin.scalar/__struct_subfield/dynamic-v1; SQL analysis returns sql.analyze.unavailable_implementation. B6a restored the preceding $files work-unit read. Current clean 2b51 statement/code match retained exact pure diagnosis and the unchanged catalog; later assertions remain unverified. Exit: B7a implements this exact struct-field capability and the unchanged entire native case and cleanup pass. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
+      "owner": "UEA-5E B7a",
       "expires": "2026-12-15"
     },
     {
@@ -2889,38 +2789,8 @@
         "class": "error_code",
         "code": "UnsupportedCompiledShape"
       },
-      "reason": "The unchanged case first reaches $files at statement 5; its frozen provider metadata Scan is refused by the compiled scan capability gate. No independent failed oracle or cleanup violation accompanies it. Restore this exact metadata-read capability and pass the original full case before removal.",
-      "owner": "UEA-5E B6",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-compatibility/spark_rest_minio_composite_scan_units",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged case first reaches $files at statement 2; its frozen provider metadata Scan is refused by the compiled scan capability gate. No independent failed oracle or cleanup violation accompanies it. Restore this exact metadata-read capability and pass the original full case before removal.",
-      "owner": "UEA-5E B6",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-compatibility/spark_rest_minio_row_group_scan_units",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged case first reaches $files at statement 2; its frozen provider metadata Scan is refused by the compiled scan capability gate. No independent failed oracle or cleanup violation accompanies it. Restore this exact metadata-read capability and pass the original full case before removal.",
-      "owner": "UEA-5E B6",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg-compatibility/spark_rest_minio_v3_metadata_tables",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged case first reaches $snapshots at statement 2; its frozen provider metadata Scan is refused by the compiled scan capability gate. No independent failed oracle or cleanup violation accompanies it. Restore this exact metadata-read capability and pass the original full case before removal.",
-      "owner": "UEA-5E B6",
+      "reason": "Statement 10 EXCEPT reaches LocalCompiler's unsupported SetOp path (INTERSECT or EXCEPT set operation), projected as UnsupportedCompiledShape; the earlier OPTIMIZE and reached row checks passed. Current clean 2b51 statement/code match the retained separate typed BE diagnostic and unchanged lowering author. B6a restored metadata work-unit reads; the unexecuted suffix remains unverified. Exit: B4 restores this exact EXCEPT capability and the unchanged entire native case and cleanup pass. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
+      "owner": "UEA-5E B4",
       "expires": "2026-12-15"
     },
     {
@@ -2971,16 +2841,6 @@
       },
       "reason": "The unchanged projection/filter MV case fails at statement 4, substatement 3 REFRESH, after its initial refresh/result and the INSERT/DELETE prefix complete. Frozen incremental PF construction preserves only primitive columns and predicates, completes a real change-stream Router sink, and encoding refuses that sink before writer/package recipe extraction. Earlier structural/read errors cannot produce the observed typed Source Unsupported; missing implementation admission would emit a distinct Analyze code. This exact Router capability is owned by B1. No independent failed oracle or cleanup violation accompanies the refusal. Restore the incremental change-stream Router capability and pass the unchanged entire native case, including repartition/publication, later refresh and all positive/negative oracles, before removal.",
       "owner": "UEA-5E B1",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:iceberg/iceberg_v3_rewrite_position_delete_files",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "The unchanged positive CALL first fails at statement 3 with actual UnsupportedCompiledShape after maintenance now preserves its original selected native failure. The frozen delete-artifact cohort is a TableExecute relation with RuntimeSplits; the LocalCompiler scan gate explicitly refuses provider relation other than a table. This named B6 provider/table-maintenance read capability remains absent. No independent failed oracle or cleanup violation accompanies the refusal. Earlier position-delete read step 2 passed; writer/open, post-rewrite rows and count suffixes remain unverified. Restore this exact TableExecute compiled read, then pass the entire original native case and all original log/result/cleanup assertions before removal.",
-      "owner": "UEA-5E B6",
       "expires": "2026-12-15"
     },
     {
@@ -3143,45 +3003,10 @@
       "review_by": "2026-12-15"
     },
     {
-      "unit": "sql-case:distributed-resilience/task-kill-query",
-      "reason": "The original metadata-reader cancellation query at statement7 fails LocalCompiler Metadata relation capability admission before reader-open and before the cancellation fault can execute. The actual target failure is separately retained as UnsupportedCompiledShape/LOCAL_COMPILER19:1 in native stderr; the raw case remains a runner barrier error with no SQL code and a failed expected-cancel oracle. This is the B6 metadata relation gap, not an excused timeout or successful cancellation.",
-      "owner": "UEA-5E B6",
-      "exit_condition": "UEA-5E B6 restores metadata files relation; rerun this original complete native1FE+3BE case with all original result, expected-error, fault, lifecycle and cleanup assertions passing, then remove this quarantine.",
-      "review_by": "2026-12-15"
-    },
-    {
-      "unit": "system-scenario:statistics/native-aggregate-and-collect-on-write",
-      "reason": "The original scenario exits 1 at SELECT count(*) FROM native_statistics.native_statistics_db.native_statistics_source$snapshots, before its main assertion path. The shared snapshot_count helper requires this metadata read; Snapshots is a provider-authored WholeRelation system read, refused by compiled Scan admission (LOCAL_COMPILER UnsupportedFragment, public UnsupportedCompiledShape/reason19:1). This is the existing UEA-5E B6 whole-relation metadata-read gap; subsequent writer/statistics/fault semantics are unobserved, not proven failed. The original native scenario has stable declared inputs and successful producer teardown; raw FAIL is retained.",
-      "owner": "UEA-5E B6",
-      "exit_condition": "UEA-5E B6 restores the original $snapshots whole-relation metadata read. Rerun the entire original native1FE+3BE statistics/native-aggregate-and-collect-on-write scenario with its unchanged 900-second deadline and all original result, publication, placement, fault/control, statistics and cleanup oracles passing; then remove this quarantine. Reassess any newly reached first failure instead of waiving the suffix.",
-      "review_by": "2026-12-15"
-    },
-    {
-      "unit": "system-scenario:connector/distributed-writer-overwrite",
-      "reason": "The original scenario exits 1 at SELECT count(*) FROM distributed_overwrite.distributed_overwrite_db.distributed_overwrite_data$snapshots, before its main assertion path. The shared snapshot_count helper requires this metadata read; Snapshots is a provider-authored WholeRelation system read, refused by compiled Scan admission (LOCAL_COMPILER UnsupportedFragment, public UnsupportedCompiledShape/reason19:1). This is the existing UEA-5E B6 whole-relation metadata-read gap; subsequent writer/statistics/fault semantics are unobserved, not proven failed. The original native scenario has stable declared inputs and successful producer teardown; raw FAIL is retained.",
-      "owner": "UEA-5E B6",
-      "exit_condition": "UEA-5E B6 restores the original $snapshots whole-relation metadata read. Rerun the entire original native1FE+3BE connector/distributed-writer-overwrite scenario with its unchanged 900-second deadline and all original result, publication, placement, fault/control, statistics and cleanup oracles passing; then remove this quarantine. Reassess any newly reached first failure instead of waiving the suffix.",
-      "review_by": "2026-12-15"
-    },
-    {
       "unit": "system-scenario:connector/distributed-writer-row-level",
-      "reason": "The original scenario exits 1 at SELECT count(*) FROM row_level_writer.row_level_writer_db.row_level_dv$snapshots, before its main assertion path. The shared snapshot_count helper requires this metadata read; Snapshots is a provider-authored WholeRelation system read, refused by compiled Scan admission (LOCAL_COMPILER UnsupportedFragment, public UnsupportedCompiledShape/reason19:1). This is the existing UEA-5E B6 whole-relation metadata-read gap; subsequent writer/statistics/fault semantics are unobserved, not proven failed. The original native scenario has stable declared inputs and successful producer teardown; raw FAIL is retained.",
-      "owner": "UEA-5E B6",
-      "exit_condition": "UEA-5E B6 restores the original $snapshots whole-relation metadata read. Rerun the entire original native1FE+3BE connector/distributed-writer-row-level scenario with its unchanged 900-second deadline and all original result, publication, placement, fault/control, statistics and cleanup oracles passing; then remove this quarantine. Reassess any newly reached first failure instead of waiving the suffix.",
-      "review_by": "2026-12-15"
-    },
-    {
-      "unit": "system-scenario:connector/distributed-writer-faults",
-      "reason": "The original scenario exits 1 at SELECT count(*) FROM distributed_writer_faults.distributed_writer_fault_db.distributed_writer_fault_data$snapshots, before its main assertion path. The shared snapshot_count helper requires this metadata read; Snapshots is a provider-authored WholeRelation system read, refused by compiled Scan admission (LOCAL_COMPILER UnsupportedFragment, public UnsupportedCompiledShape/reason19:1). This is the existing UEA-5E B6 whole-relation metadata-read gap; subsequent writer/statistics/fault semantics are unobserved, not proven failed. The original native scenario has stable declared inputs and successful producer teardown; raw FAIL is retained.",
-      "owner": "UEA-5E B6",
-      "exit_condition": "UEA-5E B6 restores the original $snapshots whole-relation metadata read. Rerun the entire original native1FE+3BE connector/distributed-writer-faults scenario with its unchanged 900-second deadline and all original result, publication, placement, fault/control, statistics and cleanup oracles passing; then remove this quarantine. Reassess any newly reached first failure instead of waiving the suffix.",
-      "review_by": "2026-12-15"
-    },
-    {
-      "unit": "system-scenario:connector/distributed-writer-dataflow",
-      "reason": "D0-5(a): clean 1f15 native 1FE+3BE case actually exits1 before the measured INSERT. Its exact first SQL SELECT count(*) FROM distributed_writer.distributed_writer_db.distributed_writer_data$snapshots is refused with UnsupportedCompiledShape (rendered LOCAL_COMPILER19:1). The snapshot metadata producer is SingleCoordinator, FE freezes WholeRelation, and the existing LocalCompiler scan guard refuses whole-relation provider reads. This is the registered umbrella B6 metadata/provider gap, not an inferred distributed-writer capability. Original later assertions remain UNKNOWN; native record_complete/terminated/identity and producer teardown cleanup are actual ok.",
-      "owner": "B6",
-      "exit_condition": "B6 delivers this exact compiled metadata/whole-relation provider read, then rerun the entire unchanged scenario on one clean source and canonical native 1FE+3BE artifacts. Remove quarantine only when snapshot counts, measured distributed writer/DOP/root aggregation, single-commit/data/resource and cleanup assertions all pass; independently review any newly exposed first cause.",
+      "reason": "The original 1FE+3BE/900-second scenario passes DV deletion, repeated DV deletion, position deletion and COW update, then refuses the matched/unmatched MERGE Router sink at Frontend physical_encoding.rs (PLAN_CODEC 17:40 -> UnsupportedCompiledShape). Current clean 2b51 action sequence matches the retained separate single-scenario typed diagnostic and unchanged signed MOR author chain; all roles/fixture exit normally. Later data/snapshot assertions remain unverified. Evidence: workflow/handoffs/2026-10-21-uea-5e-b6a/closeout-20261022/p09-reconciliation.md.",
+      "owner": "UEA-5E B1b",
+      "exit_condition": "B1b restores this exact compiled change-stream Router sink/edge, and B2 revalidates the unchanged entire connector/distributed-writer-row-level scenario under native 1FE+3BE with its original 900-second limit, including matched/unmatched MERGE data/snapshot assertions, resource convergence and complete role/fixture cleanup. Then remove this exact quarantine.",
       "review_by": "2026-12-15"
     },
     {
