@@ -856,6 +856,75 @@ mod tests {
         original
     }
     #[test]
+    fn initial_failure_start_does_not_read_its_own_submission() {
+        use novarocks_execution_contract::{TaskConclusionPort, TaskFailurePhase};
+        let owner = crate::runtime::task_control::test_support::DeferredOwner::new();
+        let control = Arc::new(owner.view(TaskFailurePhase::Execution));
+        let runtime_state = Arc::new(RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(test_execution_runtime()),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::for_task(
+                control.clone(),
+            )),
+        ));
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let driver = PipelineDriver::new(
+            1,
+            vec![Box::new(crate::exec::pipeline::shape::Source::new(
+                ParkedSourceOperator {
+                    observable: Arc::new(Observable::new()),
+                    ready: Arc::new(AtomicBool::new(false)),
+                    cancel_calls: cancels.clone(),
+                },
+            ))],
+            None,
+            Vec::new(),
+            runtime_state.clone(),
+            None,
+        );
+        let original: ExecutionFailure =
+            novarocks_functions::KernelFailure::ResourceExhausted.into();
+        let running = manually_prepared_execution(driver, runtime_state.clone(), None)
+            .start_failed(original.clone());
+        assert!(
+            owner.accepted().is_none(),
+            "handoff returns before any adjudication"
+        );
+        assert!(!control.is_stopped());
+        owner.advance_all();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while running.stopped_fact().is_none() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            running.stopped_fact().is_some(),
+            "a normally returned handoff releases start work and permits actual driver exit"
+        );
+        assert!(running.join().unwrap_err().same_occurrence(&original));
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+        owner.advance_all();
+        assert!(
+            owner
+                .accepted()
+                .unwrap()
+                .originating_failure()
+                .unwrap()
+                .same_occurrence(&original)
+        );
+        assert!(
+            runtime_state
+                .error_state()
+                .exit_health_reporter()
+                .failure()
+                .is_none()
+        );
+    }
+    #[test]
     fn typed_failure_all_kernel_causes_survive_activation_pull_completion_and_runtime_latches() {
         use novarocks_functions::{KernelDiagnostic, KernelFailure};
         let diagnostic = || KernelDiagnostic::new("ResourceExhausted: identical diagnostic text");

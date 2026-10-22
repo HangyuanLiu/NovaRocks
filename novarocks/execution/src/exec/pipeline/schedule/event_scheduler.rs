@@ -1642,6 +1642,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn deferred_parked_drivers_wake_on_stop_notification_alone() {
+        for park in [
+            OwnerStopPark::Input,
+            OwnerStopPark::Dependency,
+            OwnerStopPark::PendingFinish,
+        ] {
+            let owner = crate::runtime::task_control::test_support::DeferredOwner::new();
+            let pump = owner.clone();
+            assert_owner_stop_only_wakes_parked_driver(
+                owner,
+                move || pump.advance_all(),
+                true,
+                park,
+                false,
+            );
+        }
+    }
     struct FinishTransitionSink {
         finished: Arc<AtomicBool>,
         observable: Arc<Observable>,

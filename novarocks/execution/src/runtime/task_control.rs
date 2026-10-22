@@ -311,6 +311,12 @@ pub(crate) mod test_support {
             )
         }
     }
+    // Project a source on its reporting thread before either queue or owner lock.
+    struct PreparedConclusion {
+        reported_evidence: Option<novarocks_failure_contract::FailureEvidence>,
+        conclusion: TaskConclusion,
+        origin: Option<ExecutionFailure>,
+    }
     pub(crate) struct Owner {
         health: Arc<crate::runtime::execution_health::ExecutionHealth>,
         cleanup: Mutex<[Option<FailureFact>; 4]>,
@@ -347,14 +353,8 @@ pub(crate) mod test_support {
             TaskExecutionControl::new(self.identity, self.clone(), phase).unwrap()
         }
     }
-    impl TaskConclusionPort<ExecutionFailure> for Owner {
-        fn identity(&self) -> TaskIdentity {
-            self.identity
-        }
-        fn accepted(&self) -> Option<Snapshot> {
-            self.accepted.lock().unwrap().clone()
-        }
-        fn submit(&self, proposed: TaskConclusionProposal<ExecutionFailure>) {
+    impl Owner {
+        fn prepare(proposed: TaskConclusionProposal<ExecutionFailure>) -> PreparedConclusion {
             // This fixture owns one Task domain. The real Worker owner, its
             // status publication and terminal seal are integrated separately.
             let mut reported_evidence = None;
@@ -393,6 +393,22 @@ pub(crate) mod test_support {
                     )
                 }
             };
+
+            PreparedConclusion {
+                reported_evidence,
+                conclusion,
+                origin,
+            }
+        }
+        fn adjudicate(&self, proposed: TaskConclusionProposal<ExecutionFailure>) {
+            self.adjudicate_prepared(Self::prepare(proposed));
+        }
+        fn adjudicate_prepared(&self, prepared: PreparedConclusion) {
+            let PreparedConclusion {
+                reported_evidence,
+                conclusion,
+                origin,
+            } = prepared;
             let mut current = self.accepted.lock().unwrap();
             let held = current
                 .as_ref()
@@ -431,6 +447,17 @@ pub(crate) mod test_support {
                 self.cv.notify_all();
                 self.observable.notify_observers();
             }
+        }
+    }
+    impl TaskConclusionPort<ExecutionFailure> for Owner {
+        fn identity(&self) -> TaskIdentity {
+            self.identity
+        }
+        fn accepted(&self) -> Option<Snapshot> {
+            self.accepted.lock().unwrap().clone()
+        }
+        fn submit(&self, proposed: TaskConclusionProposal<ExecutionFailure>) {
+            self.adjudicate(proposed);
         }
         fn on_settled(&self, continuation: SettledContinuation<ExecutionFailure>) {
             let snapshot = self.accepted();
@@ -471,6 +498,373 @@ pub(crate) mod test_support {
                 .unwrap();
             self.stopped.load(Ordering::Acquire)
         }
+    }
+    /// A manually driven owner for proposal-order and settlement contracts.
+    /// Only one test pump advances it; submissions may come from any thread.
+    #[cfg(test)]
+    pub(crate) struct DeferredOwner {
+        owner: Arc<Owner>,
+        queue: Mutex<DeferredQueue>,
+    }
+    #[cfg(test)]
+    #[derive(Default)]
+    struct DeferredQueue {
+        inputs: std::collections::VecDeque<DeferredInput>,
+        failed: bool,
+        failure_published: bool,
+        dropped: usize,
+    }
+    #[cfg(test)]
+    enum DeferredInput {
+        Proposal(PreparedConclusion),
+        Settle(SettledContinuation<ExecutionFailure>),
+    }
+    #[cfg(test)]
+    impl DeferredOwner {
+        pub(crate) fn new() -> Arc<Self> {
+            Arc::new(Self {
+                owner: Owner::new(),
+                queue: Mutex::new(DeferredQueue::default()),
+            })
+        }
+        pub(crate) fn view(self: &Arc<Self>, phase: TaskFailurePhase) -> TaskExecutionControl {
+            TaskExecutionControl::new(self.identity(), self.clone(), phase).unwrap()
+        }
+        pub(crate) fn pending_len(&self) -> usize {
+            self.queue.lock().unwrap().inputs.len()
+        }
+        pub(crate) fn pending_settlements(&self) -> usize {
+            self.queue
+                .lock()
+                .unwrap()
+                .inputs
+                .iter()
+                .filter(|input| matches!(input, DeferredInput::Settle(_)))
+                .count()
+        }
+        pub(crate) fn dropped_proposals(&self) -> usize {
+            self.queue.lock().unwrap().dropped
+        }
+        pub(crate) fn advance_one(&self) -> bool {
+            // Callbacks may submit or register another continuation. No queue
+            // lock covers adjudication, notification, destruction or callbacks.
+            let input = self.queue.lock().unwrap().inputs.pop_front();
+            match input {
+                Some(DeferredInput::Proposal(prepared)) => self.owner.adjudicate_prepared(prepared),
+                Some(DeferredInput::Settle(continuation)) => continuation(self.accepted()),
+                None => return false,
+            }
+            true
+        }
+        pub(crate) fn advance_all(&self) {
+            while self.advance_one() {}
+        }
+        pub(crate) fn fail_owner(&self) {
+            {
+                let mut queue = self.queue.lock().unwrap();
+                if queue.failed {
+                    return;
+                }
+                queue.failed = true;
+            }
+            if self.accepted().is_none() {
+                self.owner.adjudicate(TaskConclusionProposal::Failed {
+                    cause: ExecutionFailure::from_domain(DeferredOwnerFailure),
+                    phase: TaskFailurePhase::Execution,
+                });
+            }
+            let inputs = {
+                let mut queue = self.queue.lock().unwrap();
+                queue.failure_published = true;
+                let inputs = std::mem::take(&mut queue.inputs);
+                queue.dropped += inputs
+                    .iter()
+                    .filter(|input| matches!(input, DeferredInput::Proposal(_)))
+                    .count();
+                inputs
+            };
+            for input in inputs {
+                match input {
+                    DeferredInput::Proposal(proposal) => drop(proposal),
+                    DeferredInput::Settle(continuation) => continuation(self.accepted()),
+                }
+            }
+        }
+    }
+    #[cfg(test)]
+    impl TaskConclusionPort<ExecutionFailure> for DeferredOwner {
+        fn identity(&self) -> TaskIdentity {
+            self.owner.identity()
+        }
+        fn accepted(&self) -> Option<Snapshot> {
+            self.owner.accepted()
+        }
+        fn submit(&self, proposal: TaskConclusionProposal<ExecutionFailure>) {
+            let prepared = Owner::prepare(proposal);
+            let rejected = {
+                let mut queue = self.queue.lock().unwrap();
+                if queue.failed {
+                    queue.dropped += 1;
+                    Some(prepared)
+                } else {
+                    queue.inputs.push_back(DeferredInput::Proposal(prepared));
+                    None
+                }
+            };
+            drop(rejected);
+        }
+        fn on_settled(&self, continuation: SettledContinuation<ExecutionFailure>) {
+            let immediate = {
+                let mut queue = self.queue.lock().unwrap();
+                if queue.failure_published {
+                    Some(continuation)
+                } else {
+                    queue.inputs.push_back(DeferredInput::Settle(continuation));
+                    None
+                }
+            };
+            if let Some(continuation) = immediate {
+                continuation(self.accepted());
+            }
+        }
+    }
+    #[cfg(test)]
+    impl TaskExecutionPort for DeferredOwner {
+        fn execution_health(&self) -> Arc<crate::runtime::execution_health::ExecutionHealth> {
+            self.owner.execution_health()
+        }
+        fn report_cleanup(&self, cause: &ExecutionFailure, phase: TaskFailurePhase) {
+            self.owner.report_cleanup(cause, phase);
+        }
+        fn report_unresolved_exit(&self, fact: FailureFact, phase: TaskFailurePhase) {
+            self.owner.report_unresolved_exit(fact, phase);
+        }
+        fn is_stopped(&self) -> bool {
+            self.owner.is_stopped()
+        }
+        fn stop_observable(&self) -> Arc<Observable> {
+            self.owner.stop_observable()
+        }
+        fn wait_until_stopped(&self, duration: Duration) -> bool {
+            self.owner.wait_until_stopped(duration)
+        }
+    }
+    #[cfg(test)]
+    #[derive(Debug)]
+    struct DeferredOwnerFailure;
+    #[cfg(test)]
+    impl fmt::Display for DeferredOwnerFailure {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("Task conclusion owner failed")
+        }
+    }
+    #[cfg(test)]
+    impl Error for DeferredOwnerFailure {}
+    #[cfg(test)]
+    impl FailureProjection for DeferredOwnerFailure {
+        fn failure_fact(&self) -> FailureFact {
+            FailureFact::new(
+                FailureClass::Invariant,
+                novarocks_failure_contract::FailureReason::new(
+                    novarocks_failure_contract::domain::EXECUTION,
+                    NonZeroU16::new(65004).unwrap(),
+                ),
+            )
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn deferred_owner_for(identity: TaskIdentity) -> Arc<DeferredOwner> {
+        Arc::new(DeferredOwner {
+            owner: owner_for(identity),
+            queue: Mutex::new(DeferredQueue::default()),
+        })
+    }
+    // The oracle is the proposal contract: handoff order, monotonic published
+    // stop and a barrier after all earlier inputs. No production async owner
+    // is required to exercise execution-side callers at this lowest layer.
+    #[test]
+    fn deferred_owner_adjudicates_in_handoff_order_before_settlement() {
+        let owner = DeferredOwner::new();
+        let control = owner.view(TaskFailurePhase::Execution);
+        let original = cause();
+        owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        control.report_failure(original.clone());
+        let observed = Arc::new(Mutex::new(None));
+        let seen = observed.clone();
+        control.on_settled(Box::new(move |snapshot| *seen.lock().unwrap() = snapshot));
+        assert_eq!(owner.pending_len(), 3);
+        assert!(owner.accepted().is_none());
+        assert!(owner.advance_one());
+        let peer = owner.accepted().unwrap();
+        assert_eq!(
+            peer.neutral().conclusion(),
+            &TaskConclusion::Terminated(TerminationDetail::Aborted(AbortCause::PeerTaskFailed))
+        );
+        assert_eq!(peer.neutral().generation().get(), 1);
+        assert!(owner.advance_one());
+        assert!(
+            observed.lock().unwrap().is_none(),
+            "settlement is ordered after both proposals"
+        );
+        assert!(owner.advance_one());
+        let snapshot = observed.lock().unwrap().take().unwrap();
+        assert_eq!(snapshot.neutral().generation().get(), 2);
+        assert!(
+            snapshot
+                .originating_failure()
+                .unwrap()
+                .same_occurrence(&original)
+        );
+        assert!(!owner.advance_one());
+    }
+    #[test]
+    fn deferred_stop_follows_the_published_snapshot_and_never_resets() {
+        let owner = DeferredOwner::new();
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let seen = notifications.clone();
+        let weak = Arc::downgrade(&owner);
+        owner.stop_observable().add_observer(Arc::new(move || {
+            let owner = weak.upgrade().unwrap();
+            assert!(owner.is_stopped());
+            assert!(
+                owner.accepted().is_some(),
+                "snapshot precedes stop and notification"
+            );
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        let control = owner.view(TaskFailurePhase::Execution);
+        control.report_failure(cause());
+        assert!(!control.is_stopped());
+        assert!(!control.wait_until_stopped(Duration::ZERO));
+        assert!(control.accepted().is_none());
+        owner.advance_all();
+        let accepted = owner.accepted().unwrap();
+        assert!(control.wait_until_stopped(Duration::ZERO));
+        owner.submit(TaskConclusionProposal::Canceled(
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        owner.advance_all();
+        assert!(control.is_stopped());
+        assert!(Arc::ptr_eq(&accepted, &owner.accepted().unwrap()));
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn settlement_runs_exactly_once_including_after_terminal() {
+        let owner = DeferredOwner::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        owner.on_settled(Box::new(move |snapshot| {
+            assert!(
+                snapshot.is_none(),
+                "no proposal is a legitimate success-side barrier"
+            );
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        owner.advance_all();
+        owner.advance_all();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        owner.submit(TaskConclusionProposal::Succeeded);
+        owner.advance_all();
+        let seen = calls.clone();
+        owner.on_settled(Box::new(move |snapshot| {
+            assert_eq!(
+                snapshot.unwrap().neutral().conclusion(),
+                &TaskConclusion::Succeeded
+            );
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        owner.advance_all();
+        owner.advance_all();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+    #[test]
+    fn owner_failure_publishes_before_stop_and_settles_once() {
+        for keep_existing in [false, true] {
+            let owner = DeferredOwner::new();
+            if keep_existing {
+                owner.submit(TaskConclusionProposal::Canceled(
+                    CancelReason::UpstreamNoLongerNeeded,
+                ));
+                owner.advance_all();
+            }
+            let existing = owner.accepted();
+            let weak = Arc::downgrade(&owner);
+            owner.stop_observable().add_observer(Arc::new(move || {
+                let owner = weak.upgrade().unwrap();
+                assert!(owner.is_stopped());
+                assert!(owner.accepted().is_some());
+            }));
+            owner
+                .view(TaskFailurePhase::Execution)
+                .report_failure(cause());
+            let snapshots = Arc::new(Mutex::new(Vec::new()));
+            let seen = snapshots.clone();
+            owner.on_settled(Box::new(move |snapshot| {
+                seen.lock().unwrap().push(snapshot.unwrap())
+            }));
+            owner
+                .view(TaskFailurePhase::Execution)
+                .report_failure(cause());
+            owner.fail_owner();
+            owner.fail_owner();
+            owner.advance_all();
+            assert_eq!(owner.dropped_proposals(), 2);
+            assert_eq!(owner.pending_len(), 0);
+            let accepted = owner.accepted().unwrap();
+            if let Some(existing) = existing {
+                assert!(Arc::ptr_eq(&existing, &accepted));
+            } else {
+                let source = accepted.originating_failure().unwrap();
+                assert_eq!(source.failure_fact().class(), FailureClass::Invariant);
+                assert_eq!(source.to_string(), "Task conclusion owner failed");
+            }
+            assert!(owner.is_stopped());
+            assert_eq!(snapshots.lock().unwrap().len(), 1);
+            assert!(Arc::ptr_eq(&snapshots.lock().unwrap()[0], &accepted));
+            owner
+                .view(TaskFailurePhase::Execution)
+                .report_failure(cause());
+            assert_eq!(owner.dropped_proposals(), 3);
+            let seen = snapshots.clone();
+            owner.on_settled(Box::new(move |snapshot| {
+                seen.lock().unwrap().push(snapshot.unwrap())
+            }));
+            assert_eq!(snapshots.lock().unwrap().len(), 2);
+            assert!(Arc::ptr_eq(&snapshots.lock().unwrap()[1], &accepted));
+            owner.advance_all();
+            assert_eq!(snapshots.lock().unwrap().len(), 2);
+        }
+    }
+    #[test]
+    fn owner_failure_queues_concurrent_settlement_until_publication_finishes() {
+        let owner = DeferredOwner::new();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        *owner.owner.before_notify.lock().unwrap() = Some((entered.clone(), release.clone()));
+        let pump = owner.clone();
+        let failed = std::thread::spawn(move || pump.fail_owner());
+        entered.wait();
+        let settled = Arc::new(Mutex::new(None));
+        let seen = settled.clone();
+        owner.on_settled(Box::new(move |snapshot| {
+            *seen.lock().unwrap() = Some(snapshot)
+        }));
+        let called_before_publication_finished = settled.lock().unwrap().is_some();
+        release.wait();
+        failed.join().unwrap();
+        assert!(!called_before_publication_finished);
+        let snapshot = settled.lock().unwrap().take().unwrap().unwrap();
+        assert_eq!(
+            snapshot
+                .originating_failure()
+                .unwrap()
+                .failure_fact()
+                .class(),
+            FailureClass::Invariant
+        );
+        assert!(Arc::ptr_eq(&snapshot, &owner.accepted().unwrap()));
+        assert!(!owner.advance_one());
     }
     #[test]
     fn cleanup_and_unknown_exit_leave_the_exact_accepted_task_receipt_unchanged() {
