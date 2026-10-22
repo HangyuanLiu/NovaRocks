@@ -12,8 +12,8 @@ PLAN FRAGMENT 1
     PARTITION: UNPARTITIONED
 1:PROJECT [l.k, flag] stats={rows=8000}
   2:HASH JOIN (BROADCAST, LEFT OUTER, eq: [l.k = r.k]) bcast_verdict=feasible stats={rows=8000}
-    3:SCAN db_sqlt_daa0fb3549863650.oq12_stats_join_l (alias=l) stats={rows=1000}
-         TABLE: db_sqlt_daa0fb3549863650.oq12_stats_join_l
+    3:SCAN ${case_db}.oq12_stats_join_l (alias=l) stats={rows=1000}
+         TABLE: ${case_db}.oq12_stats_join_l
          columns: k
          min-max stats
     4:BROADCAST EXCHANGE stats={rows=800}
@@ -23,8 +23,8 @@ PLAN FRAGMENT 2
   STREAM DATA SINK
     EXCHANGE ID: 4
     PARTITION: BROADCAST
-5:SCAN db_sqlt_daa0fb3549863650.oq12_stats_join_r (alias=r) stats={rows=800}
-     TABLE: db_sqlt_daa0fb3549863650.oq12_stats_join_r
+5:SCAN ${case_db}.oq12_stats_join_r (alias=r) stats={rows=800}
+     TABLE: ${case_db}.oq12_stats_join_r
      columns: k, flag
      min-max stats
 
@@ -46,8 +46,8 @@ PLAN FRAGMENT 1
     PARTITION: UNPARTITIONED
 1:PROJECT [l.k] stats={rows=1000}
   2:HASH JOIN (BROADCAST, LEFT SEMI, eq: [l.k = r.k]) bcast_verdict=feasible stats={rows=1000}
-    3:SCAN db_sqlt_daa0fb3549863650.oq12_stats_join_l (alias=l) stats={rows=1000}
-         TABLE: db_sqlt_daa0fb3549863650.oq12_stats_join_l
+    3:SCAN ${case_db}.oq12_stats_join_l (alias=l) stats={rows=1000}
+         TABLE: ${case_db}.oq12_stats_join_l
          columns: k
          min-max stats
     4:BROADCAST EXCHANGE stats={rows=720}
@@ -57,8 +57,8 @@ PLAN FRAGMENT 2
   STREAM DATA SINK
     EXCHANGE ID: 4
     PARTITION: BROADCAST
-5:SCAN db_sqlt_daa0fb3549863650.oq12_stats_join_r (alias=r) stats={rows=720}
-     TABLE: db_sqlt_daa0fb3549863650.oq12_stats_join_r
+5:SCAN ${case_db}.oq12_stats_join_r (alias=r) stats={rows=720}
+     TABLE: ${case_db}.oq12_stats_join_r
      columns: k
      min-max stats
      predicates: r.k IS NOT NULL
@@ -77,8 +77,8 @@ PLAN FRAGMENT 1
     PARTITION: UNPARTITIONED
 1:PROJECT [l.k] stats={rows=400}
   2:HASH JOIN (BROADCAST, LEFT ANTI, eq: [l.k = r.k]) bcast_verdict=feasible stats={rows=400}
-    3:SCAN db_sqlt_daa0fb3549863650.oq12_stats_join_l (alias=l) stats={rows=1000}
-         TABLE: db_sqlt_daa0fb3549863650.oq12_stats_join_l
+    3:SCAN ${case_db}.oq12_stats_join_l (alias=l) stats={rows=1000}
+         TABLE: ${case_db}.oq12_stats_join_l
          columns: k
          min-max stats
     4:BROADCAST EXCHANGE stats={rows=800}
@@ -88,7 +88,7 @@ PLAN FRAGMENT 2
   STREAM DATA SINK
     EXCHANGE ID: 4
     PARTITION: BROADCAST
-5:SCAN db_sqlt_daa0fb3549863650.oq12_stats_join_r (alias=r) stats={rows=800}
-     TABLE: db_sqlt_daa0fb3549863650.oq12_stats_join_r
+5:SCAN ${case_db}.oq12_stats_join_r (alias=r) stats={rows=800}
+     TABLE: ${case_db}.oq12_stats_join_r
      columns: k
      min-max stats

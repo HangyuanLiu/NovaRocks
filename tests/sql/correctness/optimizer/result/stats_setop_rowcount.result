@@ -12,13 +12,13 @@ PLAN FRAGMENT 1
     PARTITION: UNPARTITIONED
 1:UNION ALL stats={rows=1600}
   2:PROJECT [k] stats={rows=1000}
-    3:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
-         TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
+    3:SCAN ${case_db}.oq12_stats_set_l stats={rows=1000}
+         TABLE: ${case_db}.oq12_stats_set_l
          columns: k
          min-max stats
   4:PROJECT [k] stats={rows=600}
-    5:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
-         TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
+    5:SCAN ${case_db}.oq12_stats_set_r stats={rows=600}
+         TABLE: ${case_db}.oq12_stats_set_r
          columns: k
          min-max stats
 
@@ -45,13 +45,13 @@ PLAN FRAGMENT 2
 3:HASH AGGREGATE (LOCAL, group by: [k]) stats={rows=160}
   4:UNION ALL stats={rows=1600}
     5:PROJECT [k] stats={rows=1000}
-      6:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
-           TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
+      6:SCAN ${case_db}.oq12_stats_set_l stats={rows=1000}
+           TABLE: ${case_db}.oq12_stats_set_l
            columns: k
            min-max stats
     7:PROJECT [k] stats={rows=600}
-      8:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
-           TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
+      8:SCAN ${case_db}.oq12_stats_set_r stats={rows=600}
+           TABLE: ${case_db}.oq12_stats_set_r
            columns: k
            min-max stats
 
@@ -77,8 +77,8 @@ PLAN FRAGMENT 2
     EXCHANGE ID: 2
     PARTITION: HASH_PARTITIONED (k)
 4:PROJECT [k] stats={rows=1000}
-  5:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
-       TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
+  5:SCAN ${case_db}.oq12_stats_set_l stats={rows=1000}
+       TABLE: ${case_db}.oq12_stats_set_l
        columns: k
        min-max stats
 PLAN FRAGMENT 3
@@ -88,8 +88,8 @@ PLAN FRAGMENT 3
     EXCHANGE ID: 3
     PARTITION: HASH_PARTITIONED (k)
 6:PROJECT [k] stats={rows=600}
-  7:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
-       TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
+  7:SCAN ${case_db}.oq12_stats_set_r stats={rows=600}
+       TABLE: ${case_db}.oq12_stats_set_r
        columns: k
        min-max stats
 
@@ -115,8 +115,8 @@ PLAN FRAGMENT 2
     EXCHANGE ID: 2
     PARTITION: HASH_PARTITIONED (k)
 4:PROJECT [k] stats={rows=1000}
-  5:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
-       TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
+  5:SCAN ${case_db}.oq12_stats_set_l stats={rows=1000}
+       TABLE: ${case_db}.oq12_stats_set_l
        columns: k
        min-max stats
 PLAN FRAGMENT 3
@@ -126,7 +126,7 @@ PLAN FRAGMENT 3
     EXCHANGE ID: 3
     PARTITION: HASH_PARTITIONED (k)
 6:PROJECT [k] stats={rows=600}
-  7:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
-       TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
+  7:SCAN ${case_db}.oq12_stats_set_r stats={rows=600}
+       TABLE: ${case_db}.oq12_stats_set_r
        columns: k
        min-max stats

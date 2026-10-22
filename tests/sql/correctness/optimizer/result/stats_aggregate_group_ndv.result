@@ -21,7 +21,7 @@ PLAN FRAGMENT 2
     PARTITION: HASH_PARTITIONED (a, b)
 4:HASH AGGREGATE (LOCAL, group by: [a, b]) stats={rows=63}
   aggregations: sum(v)
-  5:SCAN db_sqlt_61285ef79214c2ad.oq12_stats_group stats={rows=1000}
-       TABLE: db_sqlt_61285ef79214c2ad.oq12_stats_group
+  5:SCAN ${case_db}.oq12_stats_group stats={rows=1000}
+       TABLE: ${case_db}.oq12_stats_group
        columns: a, b, v
        min-max stats

@@ -1,6 +1,6 @@
 -- query 6
 Explain String
-TABLE STATS ref=0 table=iceberg_opt.db_sqlt_9277b14d3609c4e0.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
+TABLE STATS ref=0 table=iceberg_opt.${case_db}.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -12,14 +12,14 @@ PLAN FRAGMENT 1
     EXCHANGE ID: 0
     PARTITION: UNPARTITIONED
 1:PROJECT [k, v] stats={rows=990}
-  2:SCAN db_sqlt_9277b14d3609c4e0.cost_model_explain_t stats={rows=990}
-       TABLE: db_sqlt_9277b14d3609c4e0.cost_model_explain_t
+  2:SCAN ${case_db}.cost_model_explain_t stats={rows=990}
+       TABLE: ${case_db}.cost_model_explain_t
        columns: k, v
        predicates: CAST(v AS Int64) > 10
 
 -- query 7
 Explain String
-TABLE STATS ref=0 table=iceberg_opt.db_sqlt_9277b14d3609c4e0.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
+TABLE STATS ref=0 table=iceberg_opt.${case_db}.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -32,8 +32,8 @@ PLAN FRAGMENT 1
     PARTITION: UNPARTITIONED
 1:PROJECT [k, v, generate_series] stats={rows=100}
   2:HASH JOIN (BROADCAST, INNER, eq: [CAST(k AS Int64) = generate_series]) bcast_verdict=feasible bcast[verdict=feasible, forced=false, build_bytes=800, hash_table_bytes=2666.666666666667, backends=3, fanout_bytes=2400, per_node_budget_bytes=1073741824, risk_multiplier=1] stats={rows=100}
-    3:SCAN db_sqlt_9277b14d3609c4e0.cost_model_explain_t stats={rows=900}
-         TABLE: db_sqlt_9277b14d3609c4e0.cost_model_explain_t
+    3:SCAN ${case_db}.cost_model_explain_t stats={rows=900}
+         TABLE: ${case_db}.cost_model_explain_t
          columns: k, v
          predicates: k IS NOT NULL
     4:BROADCAST EXCHANGE stats={rows=100}
@@ -47,7 +47,7 @@ PLAN FRAGMENT 2
 
 -- query 8
 Explain String
-TABLE STATS ref=0 table=iceberg_opt.db_sqlt_9277b14d3609c4e0.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
+TABLE STATS ref=0 table=iceberg_opt.${case_db}.cost_model_explain_t rows=1000 confidence=Exact source=IcebergManifest
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -61,6 +61,6 @@ PLAN FRAGMENT 1
     PARTITION: UNPARTITIONED
 2:LOCAL TOP-N (limit=10, offset=0) [v DESC NULLS LAST] stats={rows=10}
   3:PROJECT [k, v] stats={rows=1000}
-    4:SCAN db_sqlt_9277b14d3609c4e0.cost_model_explain_t stats={rows=1000}
-         TABLE: db_sqlt_9277b14d3609c4e0.cost_model_explain_t
+    4:SCAN ${case_db}.cost_model_explain_t stats={rows=1000}
+         TABLE: ${case_db}.cost_model_explain_t
          columns: k, v
