@@ -115,6 +115,7 @@ pub fn reject_if_iceberg_mv_table_with_planning_lease_and_context(
             "MV mutation guard planning lease does not match the target connector".to_string(),
         );
     }
+    let context = crate::connector::context_for_planning_lease(exact_lease, context)?;
     let identity = ConnectorTableIdentity {
         instance_id,
         namespace: Arc::from(target.namespace.as_str()),
@@ -394,3 +395,7 @@ fn normalized_object_name_parts(name: &novarocks_parser::ast::ObjectName) -> Opt
         .collect::<Result<Vec<_>, _>>()
         .ok()
 }
+
+#[cfg(test)]
+#[path = "iceberg_guard_context_tests.rs"]
+mod context_tests;
