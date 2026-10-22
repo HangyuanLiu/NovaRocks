@@ -18,6 +18,7 @@ import socket
 import sys
 import tempfile
 import unittest
+import weakref
 from unittest.mock import patch
 from urllib.parse import unquote
 
@@ -782,6 +783,32 @@ class SweepTests(unittest.TestCase):
         for parent in parents:
             self.assertEqual(self.backend.calls.count(parent), 1)
 
+    def test_complete_continued_parent_rows_are_released_before_reading_next_parent(self):
+        values = [identity(604801, token="a" * 32, worktree="s3://novarocks/worktree-a"),
+                  identity(604801, token="b" * 32, worktree="s3://novarocks/worktree-b")]
+        self.backend.objects = {value.scope_root + "/file" for value in values}
+        parent_calls = {("ls", "store/novarocks/worktree-a/scratch/"),
+                        ("ls", "store/novarocks/worktree-b/scratch/")}
+        references = []
+        native = self.sweeper._mc
+        class Rows(list):
+            pass
+        def observed(args, deadline, *, absent_ok=False):
+            if tuple(args) in parent_calls:
+                self.assertTrue(all(reference() is None for reference in references))
+                rows = Rows(native(args, deadline, absent_ok=absent_ok))
+                references.append(weakref.ref(rows))
+                return rows
+            return native(args, deadline, absent_ok=absent_ok)
+        with tempfile.TemporaryDirectory() as directory:
+            self.continuation(directory, [value.scope_root for value in values])
+            with patch.object(self.sweeper, "_mc", side_effect=observed):
+                result = self.sweep()
+        self.assertTrue(result["complete"], result)
+        self.assertEqual(len(references), 2)
+        self.assertTrue(all(reference() is None for reference in references))
+        self.assertFalse(self.backend.objects)
+
     def test_continued_parent_observations_are_fresh_on_next_same_sweeper_call(self):
         original_file = self.old.scope_root + "/file"
         self.backend.objects = {original_file}
@@ -823,7 +850,7 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(self.backend.objects, files)
         self.assertFalse(any(call[0] == "rm" for call in self.backend.calls))
 
-    def test_each_continued_root_is_validated_even_after_its_parent_was_listed(self):
+    def test_all_continued_roots_are_validated_before_reading_any_parent(self):
         other = identity(604801, token="b" * 32)
         files = {self.old.scope_root + "/file", other.scope_root + "/file"}
         self.backend.objects = set(files)
@@ -834,6 +861,52 @@ class SweepTests(unittest.TestCase):
             result = self.sweep()
         self.assertFalse(result["complete"])
         self.assertEqual(result["errors"][-1]["code"], "RuntimeStateUnreadable")
+        self.assertEqual(self.backend.calls.count(("ls", "store/novarocks/worktree-a/scratch/")), 0)
+        self.assertEqual(self.backend.objects, files)
+        self.assertFalse(any(call[0] == "rm" for call in self.backend.calls))
+
+    def test_continued_root_validation_observes_original_deadline(self):
+        values = [identity(604801, token=f"{index:032x}") for index in range(2000)]
+        roots = {value.scope_root for value in values}
+        files = {root + "/file" for root in roots}
+        self.backend.objects = set(files)
+        native = self.sweeper._protected
+        checked = []
+        def protected(uri, *, deletion=False):
+            if uri in roots:
+                checked.append(uri)
+                self.clock.advance(0.01)
+            return native(uri, deletion=deletion)
+        with tempfile.TemporaryDirectory() as directory:
+            self.continuation(directory, [value.scope_root for value in values])
+            with patch.object(self.sweeper, "_protected", side_effect=protected):
+                result = self.sweeper.sweep(expired_only=True, deadline=self.clock.mono() + 0.05)
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["errors"][-1]["code"], "ScratchSweepTimeout")
+        self.assertGreater(len(checked), 0)
+        self.assertLess(len(checked), len(values))
+        self.assertEqual(self.backend.calls.count(("ls", "store/novarocks/worktree-a/scratch/")), 0)
+        self.assertEqual(self.backend.objects, files)
+        self.assertFalse(any(call[0] == "rm" for call in self.backend.calls))
+
+    def test_continued_native_presence_matching_observes_original_deadline(self):
+        values = [identity(604801, token=f"{index:032x}") for index in range(2000)]
+        files = {value.scope_root + "/file" for value in values}
+        self.backend.objects = set(files)
+        native = self.sweeper._folder_component
+        checked = []
+        def component(row):
+            checked.append(row["key"])
+            self.clock.advance(0.01)
+            return native(row)
+        with tempfile.TemporaryDirectory() as directory:
+            self.continuation(directory, [value.scope_root for value in values])
+            with patch.object(self.sweeper, "_folder_component", side_effect=component):
+                result = self.sweeper.sweep(expired_only=True, deadline=self.clock.mono() + 0.05)
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["errors"][-1]["code"], "ScratchSweepTimeout")
+        self.assertGreater(len(checked), 0)
+        self.assertLess(len(checked), len(values))
         self.assertEqual(self.backend.calls.count(("ls", "store/novarocks/worktree-a/scratch/")), 1)
         self.assertEqual(self.backend.objects, files)
         self.assertFalse(any(call[0] == "rm" for call in self.backend.calls))
