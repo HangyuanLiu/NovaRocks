@@ -564,6 +564,12 @@ impl ManagedProcess {
         result
     }
 
+    /// True only after the monitor was actually waited and its clean Final
+    /// was validated. Work failure and the original exit status are separate.
+    pub fn cleanup_settled(&self) -> bool {
+        self.settled
+    }
+
     pub fn stop(&mut self) -> Result<()> {
         if self.settled {
             return Ok(());

@@ -1130,6 +1130,63 @@ fn admitted_lifetime_stops_writes_while_the_owner_remains_alive() {
     );
 }
 
+fn cleanup_after_admitted_lifetime(kill_first: bool) {
+    let directory = Directory::new();
+    let now = Instant::now();
+    let mut request = command(SERVICE);
+    request.terminate_at(now + Duration::from_secs(2), now + Duration::from_secs(4));
+    let mut process = ManagedProcess::spawn(
+        "expired service cleanup".into(),
+        request,
+        ReadyMarker::StdoutContains("READY".into()),
+        Duration::from_secs(2),
+        directory.0.join("locator"),
+    )
+    .unwrap();
+    let root = process.diagnostic_root().to_owned();
+    // Observe the original monitor's Final before invoking either cleanup
+    // method. Neither cleanup request is what causes this admitted expiry.
+    let record = final_record(&root);
+    assert_eq!(record["lifetime_expired"], true, "{record}");
+    assert_eq!(record["owner_lost"], false, "{record}");
+    assert_eq!(record["group_exit_observed"], true, "{record}");
+    let text = fs::read_to_string(root.join("record.jsonl")).unwrap();
+    let pending: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert!(
+        record["group_exit_observed_ns"].as_u64().unwrap()
+            < pending["lifetime_ns"][1].as_u64().unwrap(),
+        "actual group exit must remain within the admitted complete clock"
+    );
+    assert!(!process.cleanup_settled());
+    let error = if kill_first {
+        process.kill_now().unwrap_err()
+    } else {
+        process.stop().unwrap_err()
+    };
+    assert!(
+        error.is::<novarocks_test_support::PayloadLifetimeExpired>(),
+        "{error:#}"
+    );
+    assert!(process.cleanup_settled());
+    process.stop().unwrap();
+    process.kill_now().unwrap();
+    assert!(process.cleanup_settled());
+    // The cleanup calls above must actually wait the monitor; PID absence is
+    // an additional observation rather than permission to claim settlement.
+    assert_pid_reaped(process.pid());
+    assert_eq!(final_record(&root), record);
+}
+
+#[test]
+fn stop_after_admitted_lifetime_settles_and_is_idempotent() {
+    cleanup_after_admitted_lifetime(false);
+}
+
+#[test]
+fn kill_after_admitted_lifetime_settles_and_is_idempotent() {
+    cleanup_after_admitted_lifetime(true);
+}
+
 #[test]
 fn admitted_lifetime_escalates_term_ignoring_group_and_observes_descendants_exit() {
     let directory = Directory::new();

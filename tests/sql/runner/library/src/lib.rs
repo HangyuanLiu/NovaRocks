@@ -5454,8 +5454,9 @@ pub fn run_correctness(build: build_information::BuildInformation) -> Result<()>
 fn shutdown_server_handle(
     server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
     retain_runtime_artifacts: bool,
-) -> Result<()> {
+) -> (Result<()>, bool) {
     let mut errors = Vec::new();
+    let mut writer_exit_observed = false;
     match server_handle.lock() {
         Ok(mut handle) => {
             if retain_runtime_artifacts {
@@ -5464,8 +5465,10 @@ fn shutdown_server_handle(
             if let Err(error) = handle.shutdown() {
                 errors.push(format!("shutdown failed: {error:#}"));
             }
+            writer_exit_observed = handle.writer_exit_observed();
             let residual = handle.residual_process_ids();
             if !residual.is_empty() {
+                writer_exit_observed = false;
                 errors.push(format!(
                     "residual server process IDs after shutdown: {residual:?}"
                 ));
@@ -5473,11 +5476,12 @@ fn shutdown_server_handle(
         }
         Err(_) => errors.push("server handle lock poisoned during shutdown".to_string()),
     }
-    if errors.is_empty() {
+    let result = if errors.is_empty() {
         Ok(())
     } else {
-        bail!(errors.join("; "))
-    }
+        Err(anyhow::anyhow!(errors.join("; ")))
+    };
+    (result, writer_exit_observed)
 }
 
 #[cfg(test)]
@@ -5525,12 +5529,14 @@ fn finish_run_with_server_cleanup_recorded(
     // failed; bounded failure snapshots do not replace those original files.
     let retain_runtime_artifacts =
         primary_failed || preserve_result.is_err() || shutdown_failure_candidate.is_err();
-    let cleanup_result = shutdown_server_handle(&server_handle, retain_runtime_artifacts);
+    let (cleanup_result, writer_exit_observed) =
+        shutdown_server_handle(&server_handle, retain_runtime_artifacts);
+    let writer_exit_observed = writer_exit_observed && !external;
     if let Some(observed) = writer_exit {
-        observed.store(cleanup_result.is_ok() && !external, Ordering::Release);
+        observed.store(writer_exit_observed, Ordering::Release);
     }
     if let Some(results) = results {
-        results.observe(serde_json::json!({"kind":"server","cleanup":{"status":if cleanup_result.is_err(){"failed"}else if external{"external"}else{"ok"},"error":cleanup_result.as_ref().err().map(|e|format!("{e:#}")),"residual_pids":[]}}));
+        results.observe(serde_json::json!({"kind":"server","cleanup":{"status":if cleanup_result.is_err(){"failed"}else if external{"external"}else{"ok"},"error":cleanup_result.as_ref().err().map(|e|format!("{e:#}")),"residual_pids":[],"writer_exit_observed":writer_exit_observed}}));
     }
     if let Err(error) = &cleanup_result {
         failure_artifacts.record_provenance(
@@ -8092,6 +8098,145 @@ mod tests {
             cli.failure_artifact_dir.as_deref(),
             Some("logs/custom-sql-failures")
         );
+    }
+
+    #[test]
+    fn default_empty_process_diagnostics_do_not_prove_writer_exit() {
+        // This owner uses the trait defaults for shutdown, residual IDs and
+        // writer settlement; successful control alone grants no cleanup proof.
+        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+            Arc::new(Mutex::new(Box::new(ArtifactCapableServer)));
+        let root = tempfile::TempDir::new().unwrap();
+        let artifacts = crate::failure_artifacts::FailureArtifactRecorder::new(
+            crate::failure_artifacts::FailureArtifactContext {
+                root: root.path().join("artifacts"),
+                lane: "correctness".into(),
+                suites: vec!["analytic".into()],
+            },
+        );
+        let path = root.path().join("results.jsonl");
+        let results =
+            crate::results_record::ResultsWriter::create(root.path(), path.to_str()).unwrap();
+        let writer = AtomicBool::new(true);
+        assert_eq!(
+            super::finish_run_with_server_cleanup_recorded(
+                server,
+                Ok(0),
+                &artifacts,
+                Some(&results),
+                false,
+                Some(&writer),
+            )
+            .unwrap(),
+            0
+        );
+        assert!(!writer.load(Ordering::Acquire));
+        let record: serde_json::Value =
+            serde_json::from_str(fs::read_to_string(path).unwrap().lines().next().unwrap())
+                .unwrap();
+        assert_eq!(record["cleanup"]["status"], "ok");
+        assert_eq!(record["cleanup"]["residual_pids"], serde_json::json!([]));
+        assert_eq!(record["cleanup"]["writer_exit_observed"], false);
+    }
+
+    struct WriterExitServer {
+        observed: bool,
+        shutdown_fails: bool,
+        residual: bool,
+        shutdown_started: bool,
+    }
+
+    impl crate::cluster::ServerHandle for WriterExitServer {
+        fn target_host(&self) -> Option<&str> {
+            None
+        }
+        fn target_port(&self) -> Option<u16> {
+            None
+        }
+        fn be_count(&self) -> usize {
+            3
+        }
+        fn writer_exit_observed(&self) -> bool {
+            self.shutdown_started && self.observed
+        }
+        fn residual_process_ids(&self) -> Vec<u32> {
+            if self.residual { vec![4242] } else { vec![] }
+        }
+        fn shutdown(&mut self) -> anyhow::Result<()> {
+            self.shutdown_started = true;
+            if self.shutdown_fails {
+                anyhow::bail!("original lifecycle control failure");
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn writer_exit_fact_is_separate_from_original_run_and_shutdown_failures() {
+        for observed in [false, true] {
+            for shutdown_fails in [false, true] {
+                for external in [false, true] {
+                    for residual in [false, true] {
+                        let server: Arc<Mutex<Box<dyn crate::cluster::ServerHandle>>> =
+                            Arc::new(Mutex::new(Box::new(WriterExitServer {
+                                observed,
+                                shutdown_fails,
+                                residual,
+                                shutdown_started: false,
+                            })));
+                        let root = tempfile::TempDir::new().unwrap();
+                        let artifacts = crate::failure_artifacts::FailureArtifactRecorder::new(
+                            crate::failure_artifacts::FailureArtifactContext {
+                                root: root.path().join("artifacts"),
+                                lane: "correctness".into(),
+                                suites: vec!["analytic".into()],
+                            },
+                        );
+                        let path = root.path().join("results.jsonl");
+                        let results = crate::results_record::ResultsWriter::create(
+                            root.path(),
+                            path.to_str(),
+                        )
+                        .unwrap();
+                        let writer = AtomicBool::new(!observed);
+                        let error = super::finish_run_with_server_cleanup_recorded(
+                            server,
+                            Err(anyhow::anyhow!("original SQL failure")),
+                            &artifacts,
+                            Some(&results),
+                            external,
+                            Some(&writer),
+                        )
+                        .unwrap_err();
+                        let message = format!("{error:#}");
+                        assert!(message.contains("original SQL failure"), "{message}");
+                        if shutdown_fails {
+                            assert!(
+                                message.contains("original lifecycle control failure"),
+                                "{message}"
+                            );
+                        }
+                        let expected = observed && !external && !residual;
+                        assert_eq!(writer.load(Ordering::Acquire), expected);
+                        let records: Vec<serde_json::Value> = fs::read_to_string(path)
+                            .unwrap()
+                            .lines()
+                            .map(|line| serde_json::from_str(line).unwrap())
+                            .collect();
+                        assert_eq!(records.len(), 1);
+                        assert_eq!(records[0]["cleanup"]["writer_exit_observed"], expected);
+                        let expected_status = if shutdown_fails || residual {
+                            "failed"
+                        } else if external {
+                            "external"
+                        } else {
+                            "ok"
+                        };
+                        assert_eq!(records[0]["cleanup"]["status"], expected_status);
+                    }
+                }
+            }
+        }
     }
 
     struct CleanupFailureServer {

@@ -131,7 +131,8 @@ impl NativeFaultProxyControl {
 pub struct NativeFaultProxy {
     address: SocketAddr,
     state: Arc<ProxyState>,
-    accept_thread: Option<JoinHandle<()>>,
+    accept_thread: Option<JoinHandle<bool>>,
+    shutdown_joined: bool,
 }
 
 impl NativeFaultProxy {
@@ -190,6 +191,7 @@ impl NativeFaultProxy {
             address,
             state,
             accept_thread: Some(accept_thread),
+            shutdown_joined: false,
         })
     }
 
@@ -216,8 +218,12 @@ impl NativeFaultProxy {
     pub fn stop(&mut self) {
         self.state.stopped.store(true, Ordering::Release);
         if let Some(handle) = self.accept_thread.take() {
-            let _ = handle.join();
+            self.shutdown_joined = matches!(handle.join(), Ok(true));
         }
+    }
+
+    pub(crate) fn writer_exit_observed(&self) -> bool {
+        self.shutdown_joined
     }
 }
 
@@ -227,14 +233,15 @@ impl Drop for NativeFaultProxy {
     }
 }
 
-fn accept_loop(listener: TcpListener, upstream: SocketAddr, state: Arc<ProxyState>) {
+fn accept_loop(listener: TcpListener, upstream: SocketAddr, state: Arc<ProxyState>) -> bool {
     const MAX_CONNECTIONS: usize = 256;
     let mut workers = Vec::<JoinHandle<()>>::new();
+    let mut joined = true;
     while !state.stopped.load(Ordering::Acquire) {
         let mut index = 0;
         while index < workers.len() {
             if workers[index].is_finished() {
-                let _ = workers.swap_remove(index).join();
+                joined &= workers.swap_remove(index).join().is_ok();
             } else {
                 index += 1;
             }
@@ -271,8 +278,10 @@ fn accept_loop(listener: TcpListener, upstream: SocketAddr, state: Arc<ProxyStat
     // The only blocking operation is a bounded two-second upstream connect.
     state.stopped.store(true, Ordering::Release);
     for worker in workers {
-        let _ = worker.join();
+        // Do not short-circuit: every owned worker must actually be joined.
+        joined &= worker.join().is_ok();
     }
+    joined
 }
 
 struct ActiveConnection(Arc<ProxyState>);
@@ -463,6 +472,29 @@ mod tests {
     }
 
     #[test]
+    fn worker_join_failure_stays_unconfirmed_after_repeated_stop() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut proxy = NativeFaultProxy::start(upstream.local_addr().unwrap(), 1024).unwrap();
+        assert!(!proxy.writer_exit_observed());
+        let _client = TcpStream::connect(proxy.address()).unwrap();
+        wait_until(|| proxy.state.active_connections.load(Ordering::Acquire) > 0);
+        let state = Arc::clone(&proxy.state);
+        assert!(
+            thread::spawn(move || {
+                let _mode = state.modes.lock().unwrap();
+                panic!("injected forwarding worker failure");
+            })
+            .join()
+            .is_err()
+        );
+        wait_until(|| proxy.state.active_connections.load(Ordering::Acquire) == 0);
+        proxy.stop();
+        assert!(!proxy.writer_exit_observed());
+        proxy.stop();
+        assert!(!proxy.writer_exit_observed());
+    }
+
+    #[test]
     fn paired_listeners_share_the_original_budget_and_keep_independent_fault_modes() {
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let control_upstream = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -497,8 +529,11 @@ mod tests {
             1
         );
         data.stop();
+        assert!(data.writer_exit_observed());
+        assert!(!control.writer_exit_observed());
         assert!(!combined.is_stopped());
         control.stop();
+        assert!(control.writer_exit_observed());
         assert!(combined.is_stopped());
         assert_eq!(combined.retained_bytes(), 0);
     }
