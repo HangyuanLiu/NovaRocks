@@ -20,10 +20,10 @@
 -- Validate Spark can read a NovaRocks-written v2 position-delete file.
 
 -- query 1
-CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0};
+CREATE DATABASE IF NOT EXISTS iceberg_compat_${suite_uuid0}.${case_db};
 
 -- query 2
-CREATE TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.nr_v2_pos_delete_${uuid0} (
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.nr_v2_pos_delete_${uuid0} (
   id BIGINT,
   region STRING,
   score INT
@@ -32,7 +32,7 @@ PARTITION BY (region)
 TBLPROPERTIES ("format-version" = "2");
 
 -- query 3
-INSERT INTO iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.nr_v2_pos_delete_${uuid0}
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.nr_v2_pos_delete_${uuid0}
 VALUES
   (1, 'east', 10),
   (2, 'east', 20),
@@ -40,12 +40,12 @@ VALUES
   (4, 'west', 40);
 
 -- query 4
-DELETE FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.nr_v2_pos_delete_${uuid0}
+DELETE FROM iceberg_compat_${suite_uuid0}.${case_db}.nr_v2_pos_delete_${uuid0}
 WHERE id IN (2, 4);
 
 -- query 5
 SELECT id, region, score
-FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.nr_v2_pos_delete_${uuid0}
+FROM iceberg_compat_${suite_uuid0}.${case_db}.nr_v2_pos_delete_${uuid0}
 ORDER BY id;
 
 -- query 6
@@ -61,7 +61,7 @@ SELECT CASE
   THEN 'SPARK_POSITION_DELETE_OK'
   ELSE 'SPARK_POSITION_DELETE_BAD'
 END AS status
-FROM ice_rest.nr_compat_${suite_uuid0}.nr_v2_pos_delete_${uuid0}
+FROM ice_rest.${case_db}.nr_v2_pos_delete_${uuid0}
 ;
 SPARK_SQL
 if ! spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql" 2>&1)"; then
@@ -73,4 +73,4 @@ printf '%s\n' "$spark_out" | grep -F "SPARK_POSITION_DELETE_OK" >/dev/null
 printf 'SPARK_POSITION_DELETE_OK\n'
 
 -- query 7
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.nr_v2_pos_delete_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.nr_v2_pos_delete_${uuid0} FORCE;

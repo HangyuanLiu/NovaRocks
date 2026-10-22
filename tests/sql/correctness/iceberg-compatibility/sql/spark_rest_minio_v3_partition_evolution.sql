@@ -25,11 +25,11 @@ shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-v3-part-evo-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_compat_${suite_uuid0};
+CREATE NAMESPACE IF NOT EXISTS ice_rest.${case_db};
 
-DROP TABLE IF EXISTS ice_rest.nr_compat_${suite_uuid0}.spark_v3_part_evo_${uuid0};
+DROP TABLE IF EXISTS ice_rest.${case_db}.spark_v3_part_evo_${uuid0};
 
-CREATE TABLE ice_rest.nr_compat_${suite_uuid0}.spark_v3_part_evo_${uuid0} (
+CREATE TABLE ice_rest.${case_db}.spark_v3_part_evo_${uuid0} (
   id BIGINT,
   region STRING,
   metric INT
@@ -40,18 +40,18 @@ TBLPROPERTIES (
   'write.format.default' = 'parquet'
 );
 
-INSERT INTO ice_rest.nr_compat_${suite_uuid0}.spark_v3_part_evo_${uuid0} VALUES
+INSERT INTO ice_rest.${case_db}.spark_v3_part_evo_${uuid0} VALUES
   (1, 'us', 10),
   (2, 'eu', 20),
   (3, 'us', 30);
 
-ALTER TABLE ice_rest.nr_compat_${suite_uuid0}.spark_v3_part_evo_${uuid0}
+ALTER TABLE ice_rest.${case_db}.spark_v3_part_evo_${uuid0}
   DROP PARTITION FIELD region;
 
-ALTER TABLE ice_rest.nr_compat_${suite_uuid0}.spark_v3_part_evo_${uuid0}
+ALTER TABLE ice_rest.${case_db}.spark_v3_part_evo_${uuid0}
   ADD PARTITION FIELD bucket(4, id);
 
-INSERT INTO ice_rest.nr_compat_${suite_uuid0}.spark_v3_part_evo_${uuid0} VALUES
+INSERT INTO ice_rest.${case_db}.spark_v3_part_evo_${uuid0} VALUES
   (4, 'eu', 40),
   (5, 'apac', 50);
 SPARK_SQL
@@ -60,9 +60,9 @@ printf 'SPARK_SQL_OK\n'
 
 -- query 2
 SELECT region, COUNT(*) AS cnt, SUM(metric) AS total_metric
-FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_part_evo_${uuid0}
+FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_part_evo_${uuid0}
 GROUP BY region
 ORDER BY region;
 
 -- query 3
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_part_evo_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_part_evo_${uuid0} FORCE;

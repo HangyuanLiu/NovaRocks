@@ -45,7 +45,7 @@ shell: set -eu
 # Create namespace; ignore 409 Conflict (already exists).
 http_code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "${iceberg_rest_uri}/v1/namespaces" \
     -H 'Content-Type: application/json' \
-    -d "{\"namespace\": [\"nr_compat_${suite_uuid0}\"]}")"
+    -d "{\"namespace\": [\"${case_db}\"]}")"
 if [ "$http_code" != "200" ] && [ "$http_code" != "409" ]; then
     printf 'FAIL: namespace create returned HTTP %s\n' "$http_code" >&2
     exit 1
@@ -55,7 +55,7 @@ printf 'NAMESPACE_OK ns=nr_compat_%s\n' "${suite_uuid0}"
 -- query 2
 -- NovaRocks creates the TIMESTAMP_NS table in the shared REST catalog.
 -- @skip_result_check=true
-CREATE TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.tsns_${uuid0} (
+CREATE TABLE iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0} (
     id     BIGINT,
     ts     TIMESTAMP_NS
 )
@@ -67,7 +67,7 @@ TBLPROPERTIES ("format-version" = "3");
 -- Row 2: ts = .000000001 (1 sub-microsecond ns -- the minimum non-zero ns)
 -- Row 3: ts = epoch (all-zero nanoseconds)
 -- @skip_result_check=true
-INSERT INTO iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.tsns_${uuid0}
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0}
 VALUES
     (1, '2024-01-02 03:04:05.123456789'),
     (2, '2024-01-02 03:04:05.000000001'),
@@ -81,7 +81,7 @@ VALUES
 -- the REST API endpoint is the same one Spark uses when reading Iceberg tables.
 -- @result_contains=CATALOG_OK
 shell: set -eu
-resp="$(curl -sf "${iceberg_rest_uri}/v1/namespaces/nr_compat_${suite_uuid0}/tables/tsns_${uuid0}")"
+resp="$(curl -sf "${iceberg_rest_uri}/v1/namespaces/${case_db}/tables/tsns_${uuid0}")"
 # Verify the Iceberg schema carries timestamp_ns type (not timestamp_micro).
 ts_type="$(printf '%s' "$resp" | python3 -c "
 import json, sys
@@ -122,7 +122,7 @@ printf 'CATALOG_OK schema=timestamp_ns records=%s\n' "$rec_count"
 -- CAST(ts AS STRING) renders the full nanosecond value, bypassing the MySQL
 -- wire protocol's microsecond truncation.
 SELECT id, CAST(ts AS STRING) AS s
-  FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.tsns_${uuid0}
+  FROM iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0}
   ORDER BY id;
 
 -- query 6
@@ -131,9 +131,9 @@ SELECT id, CAST(ts AS STRING) AS s
 -- If the predicate were rounded to microseconds (.000000), rows 1 and 2 would
 -- both pass (COUNT=2), proving the nanosecond path is exercised end-to-end.
 SELECT COUNT(*) AS cnt
-  FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.tsns_${uuid0}
+  FROM iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0}
   WHERE ts > '2024-01-02 03:04:05.000000001';
 
 -- query 7
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.tsns_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.tsns_${uuid0} FORCE;

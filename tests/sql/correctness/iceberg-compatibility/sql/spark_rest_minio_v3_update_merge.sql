@@ -25,11 +25,11 @@ shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-v3-update-merge-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_compat_${suite_uuid0};
+CREATE NAMESPACE IF NOT EXISTS ice_rest.${case_db};
 
-DROP TABLE IF EXISTS ice_rest.nr_compat_${suite_uuid0}.spark_v3_update_merge_${uuid0};
+DROP TABLE IF EXISTS ice_rest.${case_db}.spark_v3_update_merge_${uuid0};
 
-CREATE TABLE ice_rest.nr_compat_${suite_uuid0}.spark_v3_update_merge_${uuid0} (
+CREATE TABLE ice_rest.${case_db}.spark_v3_update_merge_${uuid0} (
   id BIGINT,
   label STRING,
   metric INT
@@ -41,16 +41,16 @@ TBLPROPERTIES (
   'write.merge.mode' = 'merge-on-read'
 );
 
-INSERT INTO ice_rest.nr_compat_${suite_uuid0}.spark_v3_update_merge_${uuid0} VALUES
+INSERT INTO ice_rest.${case_db}.spark_v3_update_merge_${uuid0} VALUES
   (1, 'base-a', 10),
   (2, 'base-b', 20),
   (3, 'base-c', 30);
 
-UPDATE ice_rest.nr_compat_${suite_uuid0}.spark_v3_update_merge_${uuid0}
+UPDATE ice_rest.${case_db}.spark_v3_update_merge_${uuid0}
 SET label = 'updated-b', metric = metric + 100
 WHERE id = 2;
 
-MERGE INTO ice_rest.nr_compat_${suite_uuid0}.spark_v3_update_merge_${uuid0} AS target
+MERGE INTO ice_rest.${case_db}.spark_v3_update_merge_${uuid0} AS target
 USING (
   SELECT 3 AS id, 'merged-c' AS label, 330 AS metric
   UNION ALL
@@ -65,8 +65,8 @@ printf 'SPARK_SQL_OK\n'
 
 -- query 2
 SELECT id, label, metric
-FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_update_merge_${uuid0}
+FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_update_merge_${uuid0}
 ORDER BY id;
 
 -- query 3
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_update_merge_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_update_merge_${uuid0} FORCE;

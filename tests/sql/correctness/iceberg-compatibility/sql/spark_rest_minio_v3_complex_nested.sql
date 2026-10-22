@@ -25,11 +25,11 @@ shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-v3-complex-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_compat_${suite_uuid0};
+CREATE NAMESPACE IF NOT EXISTS ice_rest.${case_db};
 
-DROP TABLE IF EXISTS ice_rest.nr_compat_${suite_uuid0}.spark_v3_complex_${uuid0};
+DROP TABLE IF EXISTS ice_rest.${case_db}.spark_v3_complex_${uuid0};
 
-CREATE TABLE ice_rest.nr_compat_${suite_uuid0}.spark_v3_complex_${uuid0} (
+CREATE TABLE ice_rest.${case_db}.spark_v3_complex_${uuid0} (
   id BIGINT,
   profile STRUCT<name: STRING, city: STRING>,
   tags ARRAY<STRING>,
@@ -41,7 +41,7 @@ TBLPROPERTIES (
   'write.format.default' = 'parquet'
 );
 
-INSERT INTO ice_rest.nr_compat_${suite_uuid0}.spark_v3_complex_${uuid0} VALUES
+INSERT INTO ice_rest.${case_db}.spark_v3_complex_${uuid0} VALUES
   (
     1,
     named_struct('name', 'ann', 'city', 'sf'),
@@ -67,8 +67,8 @@ SELECT id,
        tags[1] AS first_tag,
        attrs['score'] AS score,
        events[1].weight AS first_event_weight
-FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_complex_${uuid0}
+FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_complex_${uuid0}
 ORDER BY id;
 
 -- query 3
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_complex_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_complex_${uuid0} FORCE;
