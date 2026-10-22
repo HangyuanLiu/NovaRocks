@@ -1098,6 +1098,42 @@ pub fn check_binary(
             }
         }
     };
+    publish_build_info_capture(
+        binary,
+        controlled,
+        required,
+        evidence,
+        BuildInfoCapture {
+            stdout,
+            stderr,
+            status_result,
+            primary,
+        },
+    )
+}
+
+struct BuildInfoCapture {
+    stdout: tempfile::NamedTempFile,
+    stderr: tempfile::NamedTempFile,
+    status_result: std::io::Result<std::process::ExitStatus>,
+    primary: Option<String>,
+}
+
+// The caller retains the process owner and its original deadline. Publishing
+// captured streams and the observed wait outcome precedes semantic admission.
+fn publish_build_info_capture(
+    binary: &Path,
+    controlled: bool,
+    required: &[(String, String)],
+    evidence: &Path,
+    capture: BuildInfoCapture,
+) -> Result<Value> {
+    let BuildInfoCapture {
+        stdout,
+        stderr,
+        status_result,
+        primary,
+    } = capture;
     // Keep the actual stdout/stderr on timeout, nonzero exit and capability rejection.
     // persist_noclobber preserves old attempts, including a failed binary's output.
     stdout
@@ -1605,23 +1641,32 @@ mod tests {
     fn capability_rejection_keeps_the_original_native_output_and_cannot_overwrite_it() {
         let directory = tempfile::tempdir().unwrap();
         let native = info("normal-build", vec![]).to_string();
-        let binary = executable(directory.path(), &format!("printf '%s' '{}'", native));
+        // This unit starts at the capture-publication boundary: these are
+        // build-info format bytes and an ExitStatus fixture, not an observed
+        // Server process. The public probe/launch integration and original
+        // deadline/kill/wait test retain subprocess coverage.
+        use std::os::unix::process::ExitStatusExt;
+        let binary = directory.path().join("capture-fixture-not-executed");
         let evidence = directory.path().join("attempt.json");
+        let capture = || {
+            let mut stdout = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+            std::io::Write::write_all(stdout.as_file_mut(), native.as_bytes()).unwrap();
+            BuildInfoCapture {
+                stdout,
+                stderr: tempfile::NamedTempFile::new_in(directory.path()).unwrap(),
+                status_result: Ok(std::process::ExitStatus::from_raw(0)),
+                primary: None,
+            }
+        };
         let diagnostics = |result: &Result<Value>| {
             format!(
-                "check_binary={result:?}; raw_stdout={:?}; raw_stderr={:?}; exit_receipt={:?}",
+                "publish_build_info_capture={result:?}; raw_stdout={:?}; raw_stderr={:?}; exit_receipt={:?}",
                 fs::read_to_string(&evidence),
                 fs::read_to_string(evidence.with_extension("stderr.log")),
                 fs::read_to_string(evidence.with_extension("exit.json")),
             )
         };
-        let rejected = check_binary(
-            &binary,
-            true,
-            &[],
-            Instant::now() + Duration::from_secs(1),
-            &evidence,
-        );
+        let rejected = publish_build_info_capture(&binary, true, &[], &evidence, capture());
         let first_diagnostics = diagnostics(&rejected);
         let error = rejected.expect_err(&first_diagnostics);
         assert_eq!(
@@ -1634,13 +1679,7 @@ mod tests {
             native,
             "{first_diagnostics}"
         );
-        let overwrite = check_binary(
-            &binary,
-            false,
-            &[],
-            Instant::now() + Duration::from_secs(1),
-            &evidence,
-        );
+        let overwrite = publish_build_info_capture(&binary, false, &[], &evidence, capture());
         let overwrite_diagnostics = diagnostics(&overwrite);
         let error = overwrite.expect_err(&overwrite_diagnostics);
         assert_eq!(
