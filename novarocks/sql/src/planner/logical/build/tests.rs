@@ -2801,7 +2801,7 @@ fn apply_output_columns_extend_left_with_output_column() {
         is_internal: true,
     };
     let plan = LogicalPlanNode::new(
-        LogicalPlanKind::Apply(LogicalApplyNode {
+        LogicalPlanKind::apply(LogicalApplyNode {
             kind: ApplyKind::Scalar,
             subquery_expr: TypedExpr {
                 kind: ExprKind::ColumnRef {

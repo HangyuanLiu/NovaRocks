@@ -63,7 +63,7 @@ pub(super) fn wrap_scalar_applies(
         let col_name = spec.output_column.name.clone();
         let col_type = spec.output_column.value_type.data_type().clone();
         current = LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 inner_output_column_id,
                 subquery_expr: TypedExpr {
@@ -147,7 +147,7 @@ pub(super) fn wrap_predicate_applies(
         };
 
         current = LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind,
                 subquery_expr,
                 output_column: spec.output_column,

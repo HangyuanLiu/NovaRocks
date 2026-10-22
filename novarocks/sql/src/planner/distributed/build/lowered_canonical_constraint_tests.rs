@@ -269,7 +269,7 @@ fn canonical_constraint_actual_typed_empty_array_retains_full_json_item_target()
     let DataType::List(selected_item) = &selected.data_type() else {
         unreachable!();
     };
-    assert!(Arc::ptr_eq(&item, &selected_item));
+    assert!(Arc::ptr_eq(item, selected_item));
     assert_public_result_fields(&owner);
     let result = owner.plan().result_port().unwrap();
     assert_eq!(result.fields.len(), 1);

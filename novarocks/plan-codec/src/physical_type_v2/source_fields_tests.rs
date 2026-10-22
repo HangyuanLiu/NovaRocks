@@ -236,9 +236,11 @@ fn package_creator_source_fields_hold_the_real_construction_until_last_loan() {
     }
     let dropped = Arc::new(AtomicUsize::new(0));
     let storage = ValueTypeStorageLifetime::held(Arc::new(Hold(dropped.clone())));
-    let mut package = novarocks_proto_models::physical_package_v2::FragmentPackage::default();
-    package.types = Some(wire::TypeTable::default());
-    package.source_fields = Some(table());
+    let package = novarocks_proto_models::physical_package_v2::FragmentPackage {
+        types: Some(wire::TypeTable::default()),
+        source_fields: Some(table()),
+        ..Default::default()
+    };
     // This fixture owns a fresh package shell and the exact public Vec/String
     // backing counted above. It has no other package-owned heap allocations.
     let bytes =
@@ -275,9 +277,11 @@ fn package_creator_source_fields_hold_the_real_construction_until_last_loan() {
 
 #[test]
 fn package_creator_returns_the_first_host_payload_before_graph_work() {
-    let mut package = novarocks_proto_models::physical_package_v2::FragmentPackage::default();
-    package.types = Some(wire::TypeTable::default());
-    package.source_fields = Some(table());
+    let package = novarocks_proto_models::physical_package_v2::FragmentPackage {
+        types: Some(wire::TypeTable::default()),
+        source_fields: Some(table()),
+        ..Default::default()
+    };
     let bytes =
         std::mem::size_of_val(&package) + source_bytes(package.source_fields.as_ref().unwrap());
     let mut exact = |_: Layout| panic!("no exact request after original refusal");
@@ -632,7 +636,7 @@ fn each_actual_source_constructor_refusal_preserves_first_payload_and_has_no_tai
     ) {
         use std::cell::Cell;
         let calls = Cell::new(0usize);
-        let mut tick = || {
+        let tick = || {
             let n = calls.get();
             assert!(refuse.is_none_or(|at| n <= at), "callback after refusal");
             calls.set(n + 1);

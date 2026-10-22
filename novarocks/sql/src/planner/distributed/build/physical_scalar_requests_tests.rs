@@ -769,7 +769,7 @@ fn scalar_requests_lambda_preserves_full_static_signature_and_observes_actual_pa
         let DataType::List(actual) = &parameter_types[1].data_type() else {
             unreachable!()
         };
-        assert!(Arc::ptr_eq(&actual, &original_layout));
+        assert!(Arc::ptr_eq(actual, &original_layout));
         assert!(actual.metadata().is_empty());
         assert_eq!(
             parameter_types[1].child_at(0).unwrap().logical_type(),

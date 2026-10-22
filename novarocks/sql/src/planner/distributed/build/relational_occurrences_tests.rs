@@ -579,7 +579,7 @@ fn relational_unnest_keeps_real_argument_root_separate_from_table_context_and_or
     else {
         unreachable!()
     };
-    assert!(Arc::ptr_eq(&original, &original_layout));
+    assert!(Arc::ptr_eq(original, &original_layout));
     assert_eq!(original.name(), "item");
     assert!(original.metadata().is_empty());
     assert_eq!(field.metadata()["unknown-source"], "preserved");

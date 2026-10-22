@@ -797,8 +797,7 @@ fn is_version_scan_source(source: &ScanSource) -> bool {
         Some(
             SqlScanKind::FrozenInputSet { .. }
                 | SqlScanKind::Data {
-                    version: crate::planner::table::SqlTableVersionSelector::Snapshot(_)
-                        | crate::planner::table::SqlTableVersionSelector::TimestampMillis(_),
+                    version: crate::planner::table::SqlTableVersionSelector::Snapshot(_),
                 }
         )
     )
@@ -914,7 +913,7 @@ mod tests {
     }
 
     fn scan_plan(scan: PlanScanNode) -> LogicalPlanNode {
-        LogicalPlanNode::new(LogicalPlanKind::Scan(scan), vec![], None)
+        LogicalPlanNode::new(LogicalPlanKind::scan(scan), vec![], None)
     }
 
     #[test]

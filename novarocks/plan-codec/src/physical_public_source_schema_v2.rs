@@ -634,7 +634,6 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
             .map(|port| &mut **port as &mut dyn ValueSchemaCreationScope<H>)
     };
     let mut entries = request_vec::<Entry, H>(defs.len(), &mut container_port, work)?;
-    drop(container_port);
     for def in defs {
         let id = def
             .id
@@ -687,14 +686,14 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
         } else {
             storage.clone()
         };
-        let mut shape_port = if let Some(scope) = shape_scope.as_mut() {
+        let shape_port = if let Some(scope) = shape_scope.as_mut() {
             Some(scope as &mut dyn ValueSchemaCreationScope<H>)
         } else {
             creation
                 .as_mut()
                 .map(|port| &mut **port as &mut dyn ValueSchemaCreationScope<H>)
         };
-        if let Some(port) = shape_port.as_deref_mut() {
+        if let Some(port) = shape_port {
             work.flush()?;
             port.request_layout(arc_layout(Layout::new::<arrow::datatypes::Schema>())?)
                 .map_err(ProjectionFailure::Host)?;
@@ -706,7 +705,6 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
             ConnectorSourceSchemaShape::try_new_observed(shape_schema, shape_storage, |units| {
                 work_units(work, units).map_err(ProjectionFailure::<Error, H>::from)
             })?;
-        drop(shape_port);
         let mut facts_scope = begin(
             factory,
             &mut model,
@@ -733,7 +731,6 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
             &mut facts_port,
             work,
         )?;
-        drop(facts_port);
         for fact in &def.field_facts {
             let mut field_scope = begin(
                 factory,
@@ -760,7 +757,7 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
                 work.step()?;
             }
             if !path.is_empty()
-                && let Some(creation) = field_port.as_deref_mut()
+                && let Some(creation) = field_port
             {
                 creation
                     .observe_opaque_upper_bound(layout::<u32>(path.len())?.size())
@@ -769,7 +766,6 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
             work.flush()?;
             let path = path.into_boxed_slice();
             work.flush()?;
-            drop(field_port);
             let default = if let Some(default) = &fact.initial_default {
                 let json = default
                     .json
@@ -787,7 +783,7 @@ fn decode_core<H, F: ValueSchemaCreationFactory<H>>(
                     .as_ref()
                     .map(ValueSchemaCreationScope::<H>::storage_lifetime)
                     .unwrap_or_else(|| storage.clone());
-                let mut default_port = if let Some(scope) = default_scope.as_mut() {
+                let default_port = if let Some(scope) = default_scope.as_mut() {
                     Some(scope as &mut dyn ValueSchemaCreationScope<H>)
                 } else {
                     creation

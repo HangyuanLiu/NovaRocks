@@ -657,7 +657,6 @@ fn binding_error(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::num::NonZeroU32;
 
     use super::super::contract::{
         ArtifactCapability, BindingId, ChannelId, CompletionFenceKind, CompletionRequirement,
@@ -667,9 +666,7 @@ mod tests {
     };
     use super::super::coverage::{Coverage, CoverageShapeError};
     use super::super::graph::tests::*;
-    use super::super::graph::{
-        ProducerBindingTarget, RuntimeFilterBindingRole, RuntimeFilterGraph,
-    };
+    use super::super::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
     use super::super::policy::{MAX_ARTIFACT_BYTES, MAX_DEADLINE_MS, MAX_RETRIES};
     use super::*;
 
@@ -706,10 +703,6 @@ mod tests {
                     ContributionKind::ProducerClosed,
                 ]),
                 CompletionRequirement::ProducerClosed,
-                ProducerBindingTarget::AggregateTopNKey {
-                    group_key_ordinal: 0,
-                    limit: NonZeroU32::new(10).unwrap(),
-                },
             ))
             .unwrap();
         graph
@@ -764,7 +757,6 @@ mod tests {
                 CompletionRequirement::FencedFinalDomain(
                     CompletionFenceKind::CommittedDomainFrozen,
                 ),
-                ProducerBindingTarget::JoinBuildKey { ordinal: 0 },
             ))
             .unwrap();
         graph
@@ -989,10 +981,6 @@ mod tests {
                     ContributionKind::ProducerClosed,
                 ]),
                 CompletionRequirement::ProducerClosed,
-                ProducerBindingTarget::AggregateTopNKey {
-                    group_key_ordinal: 0,
-                    limit: NonZeroU32::new(3).unwrap(),
-                },
             ))
             .unwrap();
 

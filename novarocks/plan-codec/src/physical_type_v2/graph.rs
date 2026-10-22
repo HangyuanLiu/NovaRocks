@@ -210,6 +210,7 @@ impl<'source> Index<'source> {
     /// This does not run Field/Value/Writer attribute laws or prove topology.
     /// The caller owns entry/footer and composes this contribution with the
     /// whole original source and all subsequent graph/materialization facts.
+    #[cfg(test)]
     pub(super) fn prepare_observed(
         table: &'source wire::TypeTable,
         limits: TypeProjectionLimits,

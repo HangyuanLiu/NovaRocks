@@ -1080,7 +1080,6 @@ mod tests {
                         cluster_id: "catalog-attachment-budget-test".to_string(),
                         limits: StateStoreLimitOverrides {
                             max_value_bytes: Some(256),
-                            ..StateStoreLimitOverrides::default()
                         },
                         provider: StateStoreProviderConfig::Sqlite {
                             path: directory.path().join("state-store.sqlite"),

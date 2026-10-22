@@ -30,7 +30,6 @@ use novarocks_types::schema::ColumnDef;
 pub enum SqlTableVersionSelector {
     Current,
     Snapshot(i64),
-    TimestampMillis(i64),
 }
 
 /// SQL-level metadata table identity.  Provider-specific metadata APIs are
@@ -142,6 +141,7 @@ pub struct SqlTableIdentity {
 impl SqlTableIdentity {
     /// Construct immutable table identity facts for a request-local SQL
     /// binding. This contains no catalog or connector handle.
+    #[cfg(test)]
     pub fn try_new(catalog: String, namespace: String, table: String) -> Result<Self, String> {
         if catalog.is_empty() || namespace.is_empty() || table.is_empty() {
             return Err("SQL table identity is incomplete".to_string());
@@ -403,14 +403,13 @@ impl SqlMvTargetStateScan {
         "token-bound MV target"
     }
 
+    #[cfg(test)]
     pub(crate) fn constraint_summary(&self) -> String {
         let row_filter = match &self.row_filter {
             SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name,
                 branch_scope: None,
-            } => {
-                format!("row_filter=delta_input_row_ids({row_id_column_name})")
-            }
+            } => format!("row_filter=delta_input_row_ids({row_id_column_name})"),
             SqlMvTargetStateRowFilter::DeltaInputRowIds {
                 row_id_column_name,
                 branch_scope: Some(scope),

@@ -323,6 +323,10 @@ impl<T: StatementNativeAttemptOwner + ?Sized> StatementNativeForegroundLease<T> 
             }
         }
     }
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "Changing this public foreground-owner accessor to BorrowMut requires cross-crate API review."
+    )]
     pub fn borrow_mut(&mut self) -> &mut T {
         self.owner.as_deref_mut().expect("live original owner")
     }

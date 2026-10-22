@@ -377,31 +377,20 @@ pub enum ProviderReadRelationNeed {
 
 /// Which admission-frozen input one provider read names.
 ///
-/// A timestamp is deliberately not one of these. A timestamp names an instant,
-/// not an input, and only admission holds the snapshot log that turns one into
-/// the other. By the time a read is requested that resolution has already
-/// happened, so a timestamp arriving here would be a resolution that never ran
-/// rather than a version any provider could honour - and no provider may
-/// resolve one itself.
+/// Timestamp-based selectors are resolved by admission before a read is
+/// requested, so the compiler receives only a current or exact snapshot input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderReadVersionNeed {
     Current,
     Snapshot(i64),
 }
 
-fn provider_version_need(
-    id: CompileNeedId,
-    value: SqlTableVersionSelector,
-) -> Result<ProviderReadVersionNeed, CompletionProtocolError> {
+fn provider_version_need(value: SqlTableVersionSelector) -> ProviderReadVersionNeed {
     match value {
-        SqlTableVersionSelector::Current => Ok(ProviderReadVersionNeed::Current),
+        SqlTableVersionSelector::Current => ProviderReadVersionNeed::Current,
         SqlTableVersionSelector::Snapshot(snapshot_id) => {
-            Ok(ProviderReadVersionNeed::Snapshot(snapshot_id))
+            ProviderReadVersionNeed::Snapshot(snapshot_id)
         }
-        SqlTableVersionSelector::TimestampMillis(_) => Err(CompletionProtocolError::InvalidNeed {
-            id,
-            reason: "provider read version was not resolved from a timestamp to a snapshot",
-        }),
     }
 }
 
@@ -786,16 +775,16 @@ pub(super) fn provider_relation_need_from_sql_scan(
     let need = match scan_kind {
         SqlScanKind::Data { version } => ProviderReadRelationNeed::Data {
             relation,
-            version: provider_version_need(id, *version)?,
+            version: provider_version_need(*version),
         },
         SqlScanKind::FrozenInputSet { version } => ProviderReadRelationNeed::FrozenInputSet {
             relation,
-            version: provider_version_need(id, *version)?,
+            version: provider_version_need(*version),
         },
         SqlScanKind::Metadata { kind, version } => ProviderReadRelationNeed::Metadata {
             relation,
             kind: *kind,
-            version: provider_version_need(id, *version)?,
+            version: provider_version_need(*version),
         },
         SqlScanKind::Delta {
             from_snapshot_id,
@@ -1586,14 +1575,14 @@ pub(crate) enum CompilerStep {
     },
     Ready {
         version: PlanVersionId,
-        draft: LoweredSqlPhysicalDraft,
+        draft: Box<LoweredSqlPhysicalDraft>,
         display_intent: SqlDisplayIntent,
         display_annotations: Box<[SqlDisplayAnnotation]>,
     },
     #[cfg(test)]
     TestReady {
         version: PlanVersionId,
-        builder: PlanBuilder,
+        builder: Box<PlanBuilder>,
         display_intent: SqlDisplayIntent,
         display_annotations: Box<[SqlDisplayAnnotation]>,
     },
@@ -1615,7 +1604,7 @@ impl CompilerStep {
     ) -> Self {
         Self::Ready {
             version,
-            draft,
+            draft: Box::new(draft),
             display_intent,
             display_annotations: display_annotations.into(),
         }
@@ -1640,7 +1629,7 @@ impl SqlCompileRequest {
         Self {
             first_step: CompilerStep::TestReady {
                 version,
-                builder,
+                builder: Box::new(builder),
                 display_intent,
                 display_annotations: display_annotations.into(),
             },
@@ -1702,7 +1691,7 @@ impl SqlCompileProgress {
 enum CompletedPlanSource {
     Authored(SqlAuthoredPhysicalPlan),
     #[cfg(test)]
-    StructurallyUntrusted(novarocks_physical_plan::PhysicalPlan),
+    StructurallyUntrusted(Box<novarocks_physical_plan::PhysicalPlan>),
 }
 
 impl CompletedPlanSource {
@@ -2280,7 +2269,13 @@ fn advance_step(
             draft,
             display_intent,
             display_annotations,
-        } => complete(version, draft, display_intent, display_annotations, control),
+        } => complete(
+            version,
+            *draft,
+            display_intent,
+            display_annotations,
+            control,
+        ),
         #[cfg(test)]
         CompilerStep::TestReady {
             version,
@@ -2293,7 +2288,7 @@ fn advance_step(
                 .map_err(completion_plan_construction_error)?;
             complete_source(
                 version,
-                CompletedPlanSource::StructurallyUntrusted(plan),
+                CompletedPlanSource::StructurallyUntrusted(Box::new(plan)),
                 display_intent,
                 display_annotations,
             )
@@ -2750,7 +2745,7 @@ fn validate_provider_properties(
                     .expect("validated provider ordinal always fits usize");
                 !scheme
                     .algorithm
-                    .supports_partition_key(&need.columns[ordinal].engine_type.data_type())
+                    .supports_partition_key(need.columns[ordinal].engine_type.data_type())
             }) {
                 return Err(CompletionProtocolError::ProviderPartitionSchemeInvalid {
                     id: need.id,
@@ -2781,7 +2776,7 @@ fn validate_provider_properties(
                     .expect("validated provider ordinal always fits usize");
                 !scheme
                     .hash
-                    .supports_partition_key(&need.columns[ordinal].engine_type.data_type())
+                    .supports_partition_key(need.columns[ordinal].engine_type.data_type())
             }) {
                 return Err(CompletionProtocolError::ProviderPartitionSchemeInvalid {
                     id: need.id,
@@ -2849,7 +2844,7 @@ fn provider_request_dynamic_bytes(
         checked_sum(columns.iter().map(|column| {
             checked_sum([
                 checked_size(column.name.len()),
-                data_type_dynamic_bytes(&column.engine_type.data_type()),
+                data_type_dynamic_bytes(column.engine_type.data_type()),
             ])
         })),
     ])?;
@@ -3131,7 +3126,7 @@ fn provider_fact_bytes(fact: &ProviderReadFact) -> Result<u64, CompletionProtoco
             checked_sum(contract.schema.iter().map(|field| {
                 checked_sum([
                     provider_column_bytes(&field.column),
-                    data_type_dynamic_bytes(&field.engine_type.data_type()),
+                    data_type_dynamic_bytes(field.engine_type.data_type()),
                 ])
             })),
         ])?;
@@ -4520,22 +4515,6 @@ mod tests {
                 to_snapshot_id: 5,
                 ..
             }
-        ));
-        // A timestamp names an instant, not an admitted input, and nothing
-        // downstream of here holds the snapshot log that would turn one into
-        // the other. Asking is refused where the resolution was skipped.
-        assert!(matches!(
-            provider_relation_need_from_sql_scan(
-                CompileNeedId::new(1),
-                identity.clone(),
-                &SqlScanKind::Data {
-                    version: SqlTableVersionSelector::TimestampMillis(1_700_000_000_000),
-                },
-            ),
-            Err(CompletionProtocolError::InvalidNeed {
-                reason: "provider read version was not resolved from a timestamp to a snapshot",
-                ..
-            })
         ));
         let missing_reference = provider_relation_need_from_sql_scan(
             CompileNeedId::new(1),

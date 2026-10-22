@@ -647,7 +647,7 @@ mod tests {
 
     fn scan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: "t".to_string(),

@@ -104,10 +104,6 @@ impl Winner {
     }
 
     #[cfg(test)]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
-    )]
     pub(crate) fn from_legacy_total(
         group_id: GroupId,
         expr_index: usize,

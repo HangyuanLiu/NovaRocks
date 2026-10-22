@@ -56,6 +56,7 @@ pub(crate) struct SchemaWriterRequestFacts {
     pub request_count: usize,
     pub work_upper_bound: usize,
 }
+#[cfg(test)]
 pub(crate) type SchemaAdmit<'a> =
     dyn FnMut(&SchemaWriterRequestFacts) -> Result<(), CompileControlError> + 'a;
 

@@ -332,7 +332,7 @@ mod tests {
 
     fn scan(table: &str, column_id: ColumnId, source: ScanSource) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: table.to_string(),

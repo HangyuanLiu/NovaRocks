@@ -92,7 +92,7 @@ pub(super) fn plan_relation_scoped(
                 });
             }
             Ok(LogicalPlanNode::new(
-                LogicalPlanKind::Scan(PlanScanNode {
+                LogicalPlanKind::scan(PlanScanNode {
                     database: scan.database,
                     table: scan.table,
                     alias: scan.alias,
@@ -275,7 +275,7 @@ fn plan_iceberg_metadata_scan(
         source: ScanSource::Sql(source),
     };
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Scan(PlanScanNode {
+        LogicalPlanKind::scan(PlanScanNode {
             database: rel.database,
             table: synthetic_table,
             alias: rel.alias,
@@ -391,7 +391,7 @@ fn plan_iceberg_delta_scan(
         source: ScanSource::Sql(delta_source),
     };
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Scan(PlanScanNode {
+        LogicalPlanKind::scan(PlanScanNode {
             database: rel.namespace,
             table: synthetic_table,
             alias: rel.alias,

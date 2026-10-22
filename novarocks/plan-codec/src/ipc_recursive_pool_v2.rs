@@ -79,6 +79,7 @@ impl PreparedRecursivePoolWriter<'_, '_> {
             .expect("receiving recursive writer owns source facts")
     }
 
+    #[cfg(test)]
     pub(crate) fn emit_in(
         self,
         admit: &mut dyn FnMut(&RecursivePoolWriteFacts) -> Result<(), CompileControlError>,
@@ -633,6 +634,7 @@ fn publish<H>(
     }
     Ok(())
 }
+#[cfg(test)]
 pub(crate) fn prepare_recursive_pool_write_in<'pool, 'control>(
     pool: &'pool ConstantPool,
     source: usize,

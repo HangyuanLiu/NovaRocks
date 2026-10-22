@@ -3314,8 +3314,9 @@ mod tests {
         // a forced physical winner. Verify the actual filter and endpoints,
         // since a successful compilation with no filter misses the regression.
         let observed_c9 = [("c9", 2, 10.140857276181588, 30_002.0)];
-        let lanes: [(&str, &[(&str, u64, f64, f64)]); 2] =
-            [("Missing", &[]), ("HistoricalC9", &observed_c9)];
+        type LaneObservation = (&'static str, u64, f64, f64);
+        type StatisticsLane<'a> = (&'static str, &'a [LaneObservation]);
+        let lanes: [StatisticsLane<'_>; 2] = [("Missing", &[]), ("HistoricalC9", &observed_c9)];
         for (statistics, metrics) in lanes {
             {
                 for (label, sql) in [

@@ -476,8 +476,8 @@ impl<'a> AnalyzerContext<'a> {
                 let lhs = self.analyze_expr(in_expr, scope)?;
                 let inner_col = &resolved_sub.output_columns[0];
                 if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
-                    &lhs.value_type.data_type(),
-                    &inner_col.value_type.data_type(),
+                    lhs.value_type.data_type(),
+                    inner_col.value_type.data_type(),
                 ) {
                     let op_sym = match &sq_info.kind {
                         SubqueryKind::InSubquery { negated: true } => "NOT IN",
@@ -1808,8 +1808,8 @@ impl<'a> AnalyzerContext<'a> {
         {
             self.check_control()?;
             if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
-                &lhs_i.value_type.data_type(),
-                &sub_col.value_type.data_type(),
+                lhs_i.value_type.data_type(),
+                sub_col.value_type.data_type(),
             ) {
                 let op_sym = if negated { "NOT IN" } else { "IN" };
                 return Err(AnalyzeError::type_mismatch(
@@ -2290,8 +2290,8 @@ impl<'a> AnalyzerContext<'a> {
             value_type: param.value_type.clone(),
         };
         let (probe, item) = match novarocks_types::comparison_common_type(
-            &probe.value_type.data_type(),
-            &item.value_type.data_type(),
+            probe.value_type.data_type(),
+            item.value_type.data_type(),
         )
         .map_err(|message| AnalyzeError::type_mismatch_source(message, span))?
         {
@@ -4984,14 +4984,14 @@ fn recompute_case_result_type(
             result_type = then_expr.value_type.data_type().clone();
         } else {
             result_type =
-                novarocks_types::wider_type(&result_type, &then_expr.value_type.data_type());
+                novarocks_types::wider_type(&result_type, then_expr.value_type.data_type());
         }
     }
     if let Some(expr) = else_expr {
         if result_type == DataType::Null {
             result_type = expr.value_type.data_type().clone();
         } else {
-            result_type = novarocks_types::wider_type(&result_type, &expr.value_type.data_type());
+            result_type = novarocks_types::wider_type(&result_type, expr.value_type.data_type());
         }
     }
     if result_type == DataType::Null {

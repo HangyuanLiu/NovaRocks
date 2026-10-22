@@ -53,7 +53,7 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
         .collect();
 
     let kind = match &expr.op {
-        Operator::LogicalScan(op) => LogicalPlanKind::Scan(PlanScanNode {
+        Operator::LogicalScan(op) => LogicalPlanKind::scan(PlanScanNode {
             database: op.database.clone(),
             table: op.table.clone(),
             alias: op.alias.clone(),
@@ -136,7 +136,7 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
             PlanAssertOneRowNode::global_at_most_one(op.subquery_text.clone()),
         ),
 
-        Operator::LogicalApply(op) => LogicalPlanKind::Apply(LogicalApplyNode {
+        Operator::LogicalApply(op) => LogicalPlanKind::apply(LogicalApplyNode {
             kind: op.kind,
             subquery_expr: materialize(arena, op.subquery_expr),
             output_column: op.output_column.clone(),

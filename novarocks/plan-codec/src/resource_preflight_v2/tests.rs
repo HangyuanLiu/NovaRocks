@@ -19,6 +19,10 @@ use super::*;
 use prost::encoding::{WireType, encode_key, encode_varint};
 use std::sync::Mutex;
 
+const _: () = assert!(novarocks_type_contract::owned_resources::profile::LOCKED_TOOLCHAIN);
+const _: () = assert!(novarocks_proto_models::resource_layout::RESOURCE_LAYOUT_REVISION == 1);
+const _: () = assert!(std::mem::size_of::<prost::encoding::DecodeContext>() != 0);
+
 #[derive(Default)]
 struct Control {
     events: Mutex<Vec<(CompilePhase, u32)>>,
@@ -85,12 +89,6 @@ fn library_profile_is_the_actual_locked_workspace_decoder_and_container_version(
     let models = block("novarocks-proto-models");
     assert!(models.contains("\"prost 0.13.5\""));
     assert!(block("bytes").contains("version = \"1.11.0\""));
-    assert!(novarocks_type_contract::owned_resources::profile::LOCKED_TOOLCHAIN);
-    assert_eq!(
-        novarocks_proto_models::resource_layout::RESOURCE_LAYOUT_REVISION,
-        1
-    );
-    assert_ne!(std::mem::size_of::<prost::encoding::DecodeContext>(), 0);
 }
 
 #[test]

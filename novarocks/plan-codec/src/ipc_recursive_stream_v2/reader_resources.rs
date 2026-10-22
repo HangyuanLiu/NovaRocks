@@ -249,25 +249,6 @@ pub(crate) fn preflight(
         work,
     )
 }
-pub(crate) fn preflight_in<E: ReaderResourceFailure>(
-    input: &ReaderInput<'_, '_>,
-    value_type: &FunctionValueType,
-    source_retained_bytes: usize,
-    policy: ConstantPolicy,
-    limits: RecursiveReaderProjectionLimits,
-    admission: &mut Admission<'_, '_, E>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<RecursiveReaderResourceFacts, E> {
-    preflight_core(
-        input,
-        value_type,
-        source_retained_bytes,
-        policy,
-        limits,
-        Some(admission),
-        work,
-    )
-}
 fn preflight_core<E: ReaderResourceFailure>(
     input: &ReaderInput<'_, '_>,
     value_type: &FunctionValueType,

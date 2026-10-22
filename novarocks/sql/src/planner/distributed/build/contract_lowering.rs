@@ -141,10 +141,6 @@ pub(crate) fn lower_final_physical_plan(
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Pure lowering must receive the caller's explicit constant policy and original compile control."
-)]
 pub(crate) fn lower_final_physical_plan_with_provider_reads(
     plan: &PhysicalPlanNode,
     version: PlanVersionId,
@@ -179,10 +175,6 @@ pub(crate) struct FinalWriteLowering<'a> {
     pub(crate) targets: FinalizedWriteTargetSet,
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Pure lowering must receive the caller's explicit constant policy and original compile control."
-)]
 pub(crate) fn lower_final_physical_write_plan(
     plan: &PhysicalPlanNode,
     version: PlanVersionId,
@@ -234,10 +226,6 @@ pub(crate) struct FinalChangeStreamWriteLowering<'a> {
     pub(crate) targets: FinalizedWriteTargetSet,
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Pure lowering must receive the caller's explicit constant policy and original compile control."
-)]
 pub(crate) fn lower_final_change_stream_write_plan(
     plan: &PhysicalPlanNode,
     version: PlanVersionId,
@@ -281,10 +269,6 @@ pub(crate) fn lower_final_change_stream_write_plan(
     visitor.lower_writer_finish(writers, ordinals, auxiliary, &sequences)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Pure lowering must receive the caller's explicit constant policy and original compile control."
-)]
 fn lower_final_physical_plan_inner(
     plan: &PhysicalPlanNode,
     version: PlanVersionId,
@@ -381,7 +365,7 @@ fn lower_final_physical_plan_inner_with_domains(
             return Err(invalid_write("root semantic field count differs".into()));
         }
         for (field, domain) in result_fields.iter_mut().zip(domains) {
-            if !domain.matches_storage(&field.ty.data_type()) {
+            if !domain.matches_storage(field.ty.data_type()) {
                 return Err(invalid_write("root semantic field storage differs".into()));
             }
             field.domain = *domain;
@@ -660,7 +644,7 @@ fn join_output_pass_through(
         .into_iter()
         .filter(move |side| kind.side_only_loses_rows(*side))
         .filter_map(move |side| {
-            let ordinal = u32::try_from(side.input_ordinal()).ok()?;
+            let ordinal = side.input_ordinal();
             let input = *node.inputs.get(usize::try_from(ordinal).ok()?)?;
             fragment
                 .nodes()
@@ -8629,7 +8613,7 @@ impl<'a> ContractLoweringVisitor<'a> {
     ) -> Result<ExprId, ContractLoweringError> {
         let source = expression_type(expression);
         if source.nullable() && !target.nullable()
-            || novarocks_types::wider_type(&source.data_type(), &target.data_type())
+            || novarocks_types::wider_type(source.data_type(), target.data_type())
                 != *target.data_type()
         {
             return Err(ContractLoweringError::ExpressionTypeMismatch {
@@ -12118,7 +12102,7 @@ fn lower_literal(
         )),
         LiteralValue::LargeInt(value)
             if target.logical_type() == novarocks_type_contract::ValueLogicalType::LargeInt
-                && novarocks_type_contract::is_largeint_data_type(&target.data_type()) =>
+                && novarocks_type_contract::is_largeint_data_type(target.data_type()) =>
         {
             Ok((
                 ContractLiteralValue::LargeInt(*value),

@@ -372,7 +372,7 @@ fn validate_arrays_overlap_typed_arguments(args: &[TypedExpr]) -> Result<(), Str
     ) {
         return Err(format!(
             "2-th input of arrays_overlap should be an array, rather than {}",
-            arrays_overlap_type_name(&second.value_type.data_type())
+            arrays_overlap_type_name(second.value_type.data_type())
         ));
     }
     let Some(first) = args.first() else {
@@ -384,7 +384,7 @@ fn validate_arrays_overlap_typed_arguments(args: &[TypedExpr]) -> Result<(), Str
     ) {
         return Err(format!(
             "1-th input of arrays_overlap should be an array, rather than {}",
-            arrays_overlap_type_name(&first.value_type.data_type())
+            arrays_overlap_type_name(first.value_type.data_type())
         ));
     }
     if let (DataType::List(left), DataType::List(right)) = (

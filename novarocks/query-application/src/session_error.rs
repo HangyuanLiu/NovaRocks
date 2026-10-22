@@ -58,7 +58,7 @@ enum QueryServiceErrorBody {
         message: String,
     },
     Execution {
-        input: crate::execution_error::ExecutionFailureInput,
+        input: Box<crate::execution_error::ExecutionFailureInput>,
         user_error: UserError,
         message: String,
     },
@@ -113,7 +113,7 @@ impl QueryServiceError {
         let message = user_error.to_string();
         Self {
             body: QueryServiceErrorBody::Execution {
-                input,
+                input: Box::new(input),
                 user_error,
                 message,
             },
@@ -125,7 +125,7 @@ impl QueryServiceError {
 
     pub fn execution_failure(&self) -> Option<&crate::execution_error::ExecutionFailureInput> {
         match &self.body {
-            QueryServiceErrorBody::Execution { input, .. } => Some(input),
+            QueryServiceErrorBody::Execution { input, .. } => Some(input.as_ref()),
             QueryServiceErrorBody::Message { .. } | QueryServiceErrorBody::User { .. } => None,
         }
     }

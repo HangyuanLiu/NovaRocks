@@ -252,10 +252,6 @@ pub(crate) fn build_aggregate_state_merge(
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Target-state scan facts are independently validated planner inputs; grouping them would hide their distinct contracts."
-)]
 fn target_state_old_scan(
     target: &novarocks_types::naming::TableIdentity,
     target_columns: Vec<ColumnDef>,
@@ -290,7 +286,7 @@ fn target_state_old_scan(
         .map(|column| column.column_id)
         .collect::<Vec<_>>();
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Scan(PlanScanNode {
+        LogicalPlanKind::scan(PlanScanNode {
             database: target.namespace.clone(),
             table: TableDef {
                 name: target.table.clone(),
@@ -1092,7 +1088,7 @@ fn branch_case_arm_expr(
     expr: TypedExpr,
     target: &novarocks_type_contract::FunctionValueType,
 ) -> TypedExpr {
-    if !branch_case_requires_runtime_cast(&target.data_type())
+    if !branch_case_requires_runtime_cast(target.data_type())
         && expr
             .value_type
             .same_physical_binding_ignoring_root_nullability_observed(target, || {
@@ -2926,7 +2922,7 @@ mod tests {
             },
         ];
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "b".to_string(),
@@ -3619,7 +3615,7 @@ mod tests {
             ]
         );
         for item in &project.items {
-            if branch_case_requires_runtime_cast(&item.expr.value_type.data_type()) {
+            if branch_case_requires_runtime_cast(item.expr.value_type.data_type()) {
                 assert_branch_case_arms_cast_to_output_type(item);
             }
         }
@@ -3882,7 +3878,7 @@ mod tests {
         for (_, then_expr) in when_then {
             assert_cast_target(
                 then_expr,
-                &item.expr.value_type.data_type(),
+                item.expr.value_type.data_type(),
                 &item.output_name,
             );
         }
@@ -3891,7 +3887,7 @@ mod tests {
             .unwrap_or_else(|| panic!("expected CASE ELSE for {}", item.output_name));
         assert_cast_target(
             else_expr,
-            &item.expr.value_type.data_type(),
+            item.expr.value_type.data_type(),
             &item.output_name,
         );
     }

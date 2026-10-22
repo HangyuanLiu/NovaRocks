@@ -23,78 +23,27 @@
 
 use std::sync::Arc;
 
-#[cfg(test)]
-use arrow::datatypes::Field;
 use arrow::datatypes::{Schema, SchemaRef};
 use novarocks_types::schema::ColumnDef;
 
-use crate::analysis::TypedExpr;
-use crate::planner::distributed::write::contract::{ConnectorWriteInputBinding, SqlWritePlanInput};
+use crate::planner::distributed::write::contract::SqlWritePlanInput;
 
-/// Provider-neutral input for a distributed connector writer. It contains
-/// only the Arrow contract between the terminal fragment and the BE-local
-/// writer; concrete providers keep target metadata in their opaque handle.
-#[derive(Clone, Debug)]
-pub(crate) struct ConnectorWritePlanInput {
-    pub(crate) target_schema: SchemaRef,
-    pub(crate) input: ConnectorWriteInputBinding,
-    /// A root-only projection supplied by SQL when the physical stream needs
-    /// to materialize hidden or state columns immediately before the sink.
-    /// The expression contract is generic planner data, never provider data.
-    pub(crate) root_output_exprs: Option<Vec<TypedExpr>>,
-}
-
-impl ConnectorWritePlanInput {
-    /// The writer input schema, one field per input column.
-    ///
-    /// Fields contain only the declared normalized value layout and NULL law.
-    /// Statistics borrow the same original input columns' complete declarations;
-    /// this representation never carries logical identity in annotations.
-    pub(crate) fn target_schema_from_sql_write_plan_input(
-        sink: &SqlWritePlanInput,
-        control: &dyn novarocks_type_contract::PureCompileControl,
-    ) -> Result<SchemaRef, crate::compiler::SqlCompileError> {
-        let fields = sink
-            .contract
-            .input_columns
-            .iter()
-            .map(|column| writer_input_field(column, control))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Arc::new(Schema::new(fields)))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_target_columns(
-        target_columns: &[ColumnDef],
-        input: ConnectorWriteInputBinding,
-        root_output_exprs: Option<Vec<TypedExpr>>,
-    ) -> Self {
-        let fields = target_columns
-            .iter()
-            .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
-            .collect::<Vec<_>>();
-        Self {
-            target_schema: Arc::new(Schema::new(fields)),
-            input,
-            root_output_exprs,
-        }
-    }
-
-    /// Project the sealed SQL write contract into the generic Arrow sink
-    /// boundary. This consumes no provider metadata: the binding token stays
-    /// in the SQL contract for application-side writer registration.
-    pub(crate) fn from_sql_write_plan_input(sink: SqlWritePlanInput) -> Result<Self, String> {
-        let target_schema = Self::target_schema_from_sql_write_plan_input(
-            &sink,
-            &crate::compiler::SqlCompileControl::unbounded(),
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(Self {
-            target_schema,
-            input: sink.input,
-            root_output_exprs: sink.root_output_exprs,
-        })
-    }
+/// The writer input schema, one field per input column.
+///
+/// Fields contain only the declared normalized value layout and NULL law.
+/// Statistics borrow the same original input columns' complete declarations;
+/// this representation never carries logical identity in annotations.
+pub(crate) fn target_schema_from_sql_write_plan_input(
+    sink: &SqlWritePlanInput,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<SchemaRef, crate::compiler::SqlCompileError> {
+    let fields = sink
+        .contract
+        .input_columns
+        .iter()
+        .map(|column| writer_input_field(column, control))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::new(Schema::new(fields)))
 }
 
 /// Materialize one writer input column as the Arrow field its declared value
@@ -144,7 +93,7 @@ mod tests {
     use novarocks_type_contract::{DecimalOverflowPolicy, FunctionValueType, ValueLogicalType};
     use novarocks_types::schema::{ColumnDef, SqlType};
 
-    use super::ConnectorWritePlanInput;
+    use super::target_schema_from_sql_write_plan_input;
     use crate::compiler::SqlFunctionCatalog;
     use crate::planner::distributed::write::auxiliary::{
         WriterStatisticsTargetInput, plan_writer_statistics,
@@ -247,15 +196,12 @@ mod tests {
             ),
             column("v", DataType::LargeBinary, true, Some(SqlType::Variant)),
         ]);
-        let schema = ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(
+        let schema = target_schema_from_sql_write_plan_input(
             &sink,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("writer input schema");
-        assert_eq!(
-            schema.field(0).as_ref(),
-            &Field::new("id", DataType::Int64, false)
-        );
+        assert_eq!(schema.field(0), &Field::new("id", DataType::Int64, false));
         for (ordinal, expected) in [
             (1, ValueLogicalType::LargeInt),
             (2, ValueLogicalType::Hll),
@@ -291,7 +237,7 @@ mod tests {
                 Some(SqlType::LargeInt),
             ),
         ]);
-        let schema = ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(
+        let schema = target_schema_from_sql_write_plan_input(
             &sink,
             &crate::compiler::SqlCompileControl::unbounded(),
         )
@@ -329,7 +275,7 @@ mod tests {
             false,
             Some(SqlType::LargeInt),
         )]);
-        let error = ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(
+        let error = target_schema_from_sql_write_plan_input(
             &sink,
             &crate::compiler::SqlCompileControl::unbounded(),
         )

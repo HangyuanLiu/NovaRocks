@@ -544,7 +544,7 @@ fn canonical_table_struct_relation_retains_nested_field_identity() {
     let DataType::List(selected_item) = &cv.value_type().data_type() else {
         unreachable!()
     };
-    assert!(Arc::ptr_eq(&selected_item, &authored_item));
+    assert!(Arc::ptr_eq(selected_item, authored_item));
     assert_result(&owner);
 }
 

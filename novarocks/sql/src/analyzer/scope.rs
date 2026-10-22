@@ -778,7 +778,6 @@ fn reserved_name_error(name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use arrow::datatypes::DataType;
-    use novarocks_type_contract::{FunctionValueType, PureCompileControl};
     use novarocks_types::schema::ColumnDef;
 
     fn test_factory() -> Rc<RefCell<ColumnRefFactory>> {

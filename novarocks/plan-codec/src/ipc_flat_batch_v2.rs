@@ -284,23 +284,6 @@ pub(crate) fn preflight_verified_flat_record_batch(
 ) -> Result<FlatBatchGeometry, TypeCodecError> {
     preflight_verified_flat_record_batch_core(message, body, expected, limits, None, work)
 }
-pub(crate) fn preflight_verified_flat_record_batch_in<E: ReaderGeometryFailure>(
-    message: arrow::ipc::Message<'_>,
-    body: &[u8],
-    expected: &Field,
-    limits: FlatBatchProjectionLimits,
-    admission: &mut Admission<'_, '_, E>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<FlatBatchGeometry, E> {
-    preflight_verified_flat_record_batch_core(
-        message,
-        body,
-        expected,
-        limits,
-        Some(admission),
-        work,
-    )
-}
 fn preflight_verified_flat_record_batch_core<E: ReaderGeometryFailure>(
     message: arrow::ipc::Message<'_>,
     body: &[u8],
@@ -591,7 +574,7 @@ pub(crate) fn inspect_leaf_at_core<E: ReaderGeometryFailure>(
                 admission.as_deref_mut(),
                 work,
             )?;
-            for record in views[..extent].chunks_exact(16) {
+            for record in views[..extent].as_chunks::<16>().0 {
                 let read = |start| {
                     u32::from_le_bytes([
                         record[start],

@@ -487,8 +487,8 @@ fn prepare_core<'pool, 'table, 'control>(
             check(&facts, limits, work)?;
             work.flush()?;
             let types_match = arrow_data_types_exact_borrowed_observed(
-                &pool.value_type().data_type(),
-                &ty.data_type(),
+                pool.value_type().data_type(),
+                ty.data_type(),
                 || work.step().map_err(Error::from),
             )?;
             work.step()?;

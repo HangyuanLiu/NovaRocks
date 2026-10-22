@@ -100,6 +100,8 @@ pub(crate) fn encode_state_interpretation(
         order_keys: keys,
     })
 }
+#[cfg(test)]
+#[cfg(test)]
 pub(crate) fn decode_state_interpretation(
     raw: &wire::AggregateStateInterpretation,
     work: &mut CompileCheckpoints<'_>,

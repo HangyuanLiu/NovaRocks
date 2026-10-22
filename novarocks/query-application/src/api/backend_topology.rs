@@ -205,6 +205,10 @@ impl LiveBackendSnapshot {
 }
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "heartbeat returns the exact descriptor inline; boxing changes the role-adapter topology contract"
+)]
 pub enum HeartbeatOutcome {
     Ok {
         /// The descriptor returned by the backend after it verified the

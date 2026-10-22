@@ -115,10 +115,6 @@ fn norm_agg(
 /// Decide whether (and how) the query aggregate can be answered from the MV.
 /// Returns None when not rewritable. No candidate is published before the
 /// original scope observes its completed tail.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
-)]
 pub(crate) fn plan_rollup(
     query_group_by: &[ScalarId],
     query_aggregates: &[ScalarAggregateSpec],
@@ -256,10 +252,6 @@ mod tests {
 
     use super::super::descriptor::{SpjgAggregate, SpjgOutput, SpjgOutputExpr};
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The fixture mirrors the checked rollup port."
-    )]
     fn plan_rollup(
         query_group_by: &[ScalarId],
         query_aggregates: &[ScalarAggregateSpec],

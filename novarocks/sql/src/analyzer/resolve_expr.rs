@@ -109,7 +109,7 @@ fn validate_nested_decimal_cast_policy(expr: &TypedExpr) -> Result<(), &'static 
             decimal_overflow_policy,
         } => {
             if !novarocks_type_contract::decimal_error_policy_cast_supported(
-                &child.value_type.data_type(),
+                child.value_type.data_type(),
                 target,
                 *decimal_overflow_policy,
             ) {
@@ -519,15 +519,15 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
                 for item in &list_typed {
                     if incompatible_complex_compare(
-                        &expr_typed.value_type.data_type(),
-                        &item.value_type.data_type(),
+                        expr_typed.value_type.data_type(),
+                        item.value_type.data_type(),
                     )
                     .is_some()
                     {
                         return Err(AnalyzeError::type_mismatch(
                             in_predicate_type_error(
-                                &expr_typed.value_type.data_type(),
-                                &item.value_type.data_type(),
+                                expr_typed.value_type.data_type(),
+                                item.value_type.data_type(),
                             ),
                             in_list.span,
                         ));
@@ -1667,8 +1667,8 @@ impl<'a> super::AnalyzerContext<'a> {
                         DataType::Struct(_) => Some("STRUCT"),
                         _ => None,
                     };
-                    if let Some(kind) = unsupported_complex_kind(&left_typed.value_type.data_type())
-                        .or_else(|| unsupported_complex_kind(&right_typed.value_type.data_type()))
+                    if let Some(kind) = unsupported_complex_kind(left_typed.value_type.data_type())
+                        .or_else(|| unsupported_complex_kind(right_typed.value_type.data_type()))
                     {
                         return Err(AnalyzeError::invalid_argument(
                             format!(
@@ -1684,8 +1684,8 @@ impl<'a> super::AnalyzerContext<'a> {
                 // fall through to a runtime CAST that produces a confusing
                 // error; surface a clear analyzer-level message instead.
                 if let Some(reason) = incompatible_complex_compare(
-                    &left_typed.value_type.data_type(),
-                    &right_typed.value_type.data_type(),
+                    left_typed.value_type.data_type(),
+                    right_typed.value_type.data_type(),
                 ) {
                     return Err(AnalyzeError::type_mismatch(
                         format!(
@@ -1760,8 +1760,8 @@ impl<'a> super::AnalyzerContext<'a> {
         let (left_typed, right_typed) = if *op == ast::BinaryOperator::Multiply
             && self.sql_semantics.decimal_overflow_to_double()
             && novarocks_type_contract::decimal_multiplication_requires_float64(
-                &left_typed.value_type.data_type(),
-                &right_typed.value_type.data_type(),
+                left_typed.value_type.data_type(),
+                right_typed.value_type.data_type(),
             ) {
             (
                 cast_null_preserving_target_type(
@@ -1914,8 +1914,8 @@ impl<'a> super::AnalyzerContext<'a> {
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 left_typed.value_type.nullable()
                     || right_typed.value_type.nullable()
-                    || compares_element_wise_with_nulls(&left_typed.value_type.data_type())
-                    || compares_element_wise_with_nulls(&right_typed.value_type.data_type())
+                    || compares_element_wise_with_nulls(left_typed.value_type.data_type())
+                    || compares_element_wise_with_nulls(right_typed.value_type.data_type())
             }
             _ => left_typed.value_type.nullable() || right_typed.value_type.nullable(),
         };
@@ -2216,7 +2216,7 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             let typed_arg = self.analyze_expr(arg_exprs[0], scope)?;
             let narrowed = narrow_int_literals_in_typed_expr(typed_arg);
-            let type_name = arrow_type_to_starrocks_name(&narrowed.value_type.data_type());
+            let type_name = arrow_type_to_starrocks_name(narrowed.value_type.data_type());
             return Ok(TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::String(type_name)),
                 value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
@@ -2427,7 +2427,7 @@ impl<'a> super::AnalyzerContext<'a> {
         if name == "concat"
             && args_typed
                 .iter()
-                .any(|arg| is_array_carrier(&arg.value_type.data_type()))
+                .any(|arg| is_array_carrier(arg.value_type.data_type()))
         {
             // CONCAT chooses the array family before implicit string casts.
             // A scalar contributes one element, including a NULL element;
@@ -2435,7 +2435,7 @@ impl<'a> super::AnalyzerContext<'a> {
             args_typed = args_typed
                 .into_iter()
                 .map(|arg| {
-                    if is_array_carrier(&arg.value_type.data_type()) {
+                    if is_array_carrier(arg.value_type.data_type()) {
                         Ok(arg)
                     } else {
                         resolved_scalar_call_at(
@@ -3231,7 +3231,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     match &args_typed[2].kind {
                         ExprKind::Literal(LiteralValue::String(t)) => {
                             return_type =
-                                novarocks_types::value::variant::variant_get_target_type(&t)
+                                novarocks_types::value::variant::variant_get_target_type(t)
                                     .map_err(|message| {
                                         AnalyzeError::invalid_literal_source(message, func.span)
                                     })?;
@@ -5010,7 +5010,7 @@ fn date_day_arithmetic_expr(
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<TypedExpr>, AnalyzeError> {
     match op {
-        ast::BinaryOperator::Add if is_temporal_day_base(&left.value_type.data_type()) => {
+        ast::BinaryOperator::Add if is_temporal_day_base(left.value_type.data_type()) => {
             date_day_shift_expr(
                 function_catalog,
                 "days_add",
@@ -5022,7 +5022,7 @@ fn date_day_arithmetic_expr(
                 control,
             )
         }
-        ast::BinaryOperator::Add if is_temporal_day_base(&right.value_type.data_type()) => {
+        ast::BinaryOperator::Add if is_temporal_day_base(right.value_type.data_type()) => {
             date_day_shift_expr(
                 function_catalog,
                 "days_add",
@@ -5034,7 +5034,7 @@ fn date_day_arithmetic_expr(
                 control,
             )
         }
-        ast::BinaryOperator::Subtract if is_temporal_day_base(&left.value_type.data_type()) => {
+        ast::BinaryOperator::Subtract if is_temporal_day_base(left.value_type.data_type()) => {
             date_day_shift_expr(
                 function_catalog,
                 "days_sub",
@@ -5060,7 +5060,7 @@ fn date_day_shift_expr(
     constant_policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Option<TypedExpr>, AnalyzeError> {
-    if !is_integer_day_offset(&offset_expr.value_type.data_type()) {
+    if !is_integer_day_offset(offset_expr.value_type.data_type()) {
         return Ok(None);
     }
     if !matches!(
@@ -5153,13 +5153,18 @@ fn apply_implicit_string_function_casts(name: &str, args: &mut [TypedExpr]) -> b
         "concat"
             if args
                 .iter()
-                .any(|arg| is_array_carrier(&arg.value_type.data_type())) =>
+                .any(|arg| is_array_carrier(arg.value_type.data_type())) =>
         {
             false
         }
-        "concat" | "concat_ws" | "group_concat" | "string_agg" => args
-            .iter_mut()
-            .fold(false, |changed, arg| cast_to_utf8_if_needed(arg) || changed),
+        "concat" | "concat_ws" | "group_concat" | "string_agg" => {
+            let mut changed = false;
+            for arg in args.iter_mut() {
+                let arg_changed = cast_to_utf8_if_needed(arg);
+                changed = changed || arg_changed;
+            }
+            changed
+        }
         "append_trailing_char_if_absent"
         | "find_in_set"
         | "instr"
@@ -5195,7 +5200,7 @@ impl BoundScalarCall {
 
     pub(super) fn return_type(&self) -> &DataType {
         match &self.binding.selected.result_type {
-            novarocks_functions::FunctionResultType::Scalar(result) => &result.data_type(),
+            novarocks_functions::FunctionResultType::Scalar(result) => result.data_type(),
             novarocks_functions::FunctionResultType::Relation(_) => {
                 unreachable!("scalar function binding cannot have a relation result")
             }
@@ -5417,7 +5422,7 @@ fn coerce_function_argument(
                 decimal_overflow_policy,
                 false,
             ))
-        || timestamp_unit_cast_can_return_null(&expr.value_type.data_type(), target);
+        || timestamp_unit_cast_can_return_null(expr.value_type.data_type(), target);
     Ok(TypedExpr {
         kind: ExprKind::Cast {
             expr: Box::new(expr),
@@ -5439,7 +5444,7 @@ fn coerce_selected_function_argument(
 ) -> Result<TypedExpr, AnalyzeError> {
     if expr.value_type.same_value_domain(target) {
         let mut coerced =
-            coerce_function_argument(expr, &target.data_type(), decimal_overflow_policy)
+            coerce_function_argument(expr, target.data_type(), decimal_overflow_policy)
                 .map_err(AnalyzeError::internal)?;
         coerced.value_type =
             super::helpers::with_nullability(target.clone(), coerced.value_type.nullable());
@@ -5454,7 +5459,7 @@ fn coerce_selected_function_argument(
                 decimal_overflow_policy,
                 false,
             ))
-        || timestamp_unit_cast_can_return_null(&expr.value_type.data_type(), &target.data_type())
+        || timestamp_unit_cast_can_return_null(expr.value_type.data_type(), target.data_type())
         || (expr.value_type.logical_type() == novarocks_type_contract::ValueLogicalType::LargeInt
             && target.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
             && matches!(
@@ -5488,7 +5493,7 @@ fn coerce_selected_function_argument(
     // Ordinary carrier coercion retains its checked integer-literal
     // normalization and runtime narrowing policy. The selected owner still
     // supplies the complete target domain, including nested field facts.
-    let mut coerced = coerce_function_argument(expr, &target.data_type(), decimal_overflow_policy)
+    let mut coerced = coerce_function_argument(expr, target.data_type(), decimal_overflow_policy)
         .map_err(AnalyzeError::internal)?;
     coerced.value_type =
         super::helpers::with_nullability(target.clone(), coerced.value_type.nullable());
@@ -5560,8 +5565,8 @@ fn normalize_field_arguments(
     };
     let string = |ty: &DataType| matches!(ty, DataType::Utf8 | DataType::LargeUtf8);
     for arg in &args {
-        if !numeric(&arg.value_type.data_type())
-            && !string(&arg.value_type.data_type())
+        if !numeric(arg.value_type.data_type())
+            && !string(arg.value_type.data_type())
             && !matches!(
                 arg.value_type.data_type(),
                 DataType::Null | DataType::Boolean | DataType::Date32 | DataType::Timestamp(_, _)
@@ -5632,7 +5637,7 @@ fn normalize_field_arguments(
     args.into_iter()
         .map(|arg| {
             let can_introduce_null = *arg.value_type.data_type() != common
-                && string(&arg.value_type.data_type())
+                && string(arg.value_type.data_type())
                 && !string(&common);
             let mut cast = coerce_function_argument(arg, &common, decimal_overflow_policy)
                 .map_err(AnalyzeError::internal)?;
@@ -6030,7 +6035,7 @@ fn aggregate_arg_cast_type(name: &str, input_type: &DataType) -> Option<DataType
 fn apply_implicit_aggregate_casts(name: &str, args: &mut [TypedExpr]) -> bool {
     let mut changed = false;
     for arg in args {
-        let Some(target) = aggregate_arg_cast_type(name, &arg.value_type.data_type()) else {
+        let Some(target) = aggregate_arg_cast_type(name, arg.value_type.data_type()) else {
             continue;
         };
         let inner = std::mem::replace(
@@ -6131,7 +6136,7 @@ fn group_concat_signature_type(expr: &TypedExpr, separator: bool) -> String {
                     DataType::List(item) => {
                         group_concat_data_type_signature(item.data_type(), false)
                     }
-                    _ => group_concat_data_type_signature(&expr.value_type.data_type(), false),
+                    _ => group_concat_data_type_signature(expr.value_type.data_type(), false),
                 }
             });
             format!("array<{item}>")
@@ -6145,18 +6150,18 @@ fn group_concat_signature_type(expr: &TypedExpr, separator: bool) -> String {
                 })
                 .unzip();
             let key_type = infer_literal_signature_type(&keys).unwrap_or_else(|| {
-                map_entry_data_type(&expr.value_type.data_type(), 0)
+                map_entry_data_type(expr.value_type.data_type(), 0)
                     .map(|data_type| group_concat_data_type_signature(data_type, false))
                     .unwrap_or_else(|| "unknown".to_string())
             });
             let value_type = infer_literal_signature_type(&values).unwrap_or_else(|| {
-                map_entry_data_type(&expr.value_type.data_type(), 1)
+                map_entry_data_type(expr.value_type.data_type(), 1)
                     .map(|data_type| group_concat_data_type_signature(data_type, true))
                     .unwrap_or_else(|| "unknown".to_string())
             });
             format!("map<{key_type},{value_type}>")
         }
-        _ => group_concat_data_type_signature(&expr.value_type.data_type(), false),
+        _ => group_concat_data_type_signature(expr.value_type.data_type(), false),
     }
 }
 
@@ -6308,13 +6313,13 @@ fn validate_percentile_numeric_arg(
     role: &str,
     expr: &TypedExpr,
 ) -> Result<(), String> {
-    if is_numeric_type(&expr.value_type.data_type()) {
+    if is_numeric_type(expr.value_type.data_type()) {
         return Ok(());
     }
     Err(format!(
         "{name} requires the {} parameter ({role}) to be numeric type, but got: {}.",
         ordinal_name(index),
-        percentile_argument_type_name(&expr.value_type.data_type())
+        percentile_argument_type_name(expr.value_type.data_type())
     ))
 }
 
@@ -6365,10 +6370,10 @@ fn is_lead_lag_default_arg_acceptable(default_arg: &TypedExpr, value_type: &Data
         return true;
     }
     if matches!(stripped.kind, ExprKind::ColumnRef { .. }) {
-        return lead_lag_family_compatible(value_type, &default_arg.value_type.data_type());
+        return lead_lag_family_compatible(value_type, default_arg.value_type.data_type());
     }
     if is_constant_default_expression(stripped) {
-        return lead_lag_narrow_numeric_compatible(value_type, &stripped.value_type.data_type());
+        return lead_lag_narrow_numeric_compatible(value_type, stripped.value_type.data_type());
     }
     false
 }

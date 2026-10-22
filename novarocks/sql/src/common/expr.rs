@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::DataType;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinKind {
     Inner,

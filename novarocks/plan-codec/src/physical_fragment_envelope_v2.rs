@@ -26,9 +26,9 @@ use novarocks_connector_contract::{
 };
 use novarocks_physical_plan as p;
 use novarocks_proto_models::{physical_control_v2::Empty, physical_package_v2 as wire};
-use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
-};
+#[cfg(test)]
+use novarocks_type_contract::CompilePhase;
+use novarocks_type_contract::{CompileCheckpoints, CompileControlError, PureCompileControl};
 use std::mem::size_of;
 
 pub(crate) use crate::physical_node_v2::{
@@ -640,9 +640,11 @@ pub(crate) struct PreparedFragmentEnvelopeEncode<'a> {
     facts: FragmentEnvelopeProjectionFacts,
 }
 impl PreparedFragmentEnvelopeEncode<'_> {
+    #[cfg(test)]
     pub(crate) fn facts(&self) -> &FragmentEnvelopeProjectionFacts {
         &self.facts
     }
+    #[cfg(test)]
     pub(crate) fn emit(
         self,
     ) -> Result<(EncodedFragmentEnvelope, FragmentEnvelopeProjectionFacts), Error> {
@@ -667,6 +669,7 @@ impl PreparedFragmentEnvelopeEncode<'_> {
         emit_encode(self.input, work).map(|output| (output, self.facts))
     }
 }
+#[cfg(test)]
 pub(crate) fn prepare_fragment_envelope_encode<'a>(
     input: &'a p::Fragment,
     source_retained_bytes: usize,
@@ -694,9 +697,11 @@ pub(crate) struct PreparedFragmentEnvelopeDecode<'a> {
     facts: FragmentEnvelopeProjectionFacts,
 }
 impl PreparedFragmentEnvelopeDecode<'_> {
+    #[cfg(test)]
     pub(crate) fn facts(&self) -> &FragmentEnvelopeProjectionFacts {
         &self.facts
     }
+    #[cfg(test)]
     pub(crate) fn emit(
         self,
     ) -> Result<(DecodedFragmentEnvelope, FragmentEnvelopeProjectionFacts), Error> {
@@ -721,6 +726,7 @@ impl PreparedFragmentEnvelopeDecode<'_> {
         emit_decode(self.input, work).map(|output| (output, self.facts))
     }
 }
+#[cfg(test)]
 pub(crate) fn prepare_fragment_envelope_decode<'a>(
     input: &'a wire::Fragment,
     source_retained_bytes: usize,

@@ -338,6 +338,10 @@ pub fn prepare_constant_record_from_sources_input_derived_with_factory_in<
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The record profile keeps creator scope and caller-owned resource facts explicit."
+)]
 pub(super) fn prepare_profile<'raw, 'source, 'control, H, F: ValueSchemaCreationFactory<H>>(
     record: &'raw wire::IpcConstantPool,
     value_type: &'source FunctionValueType,

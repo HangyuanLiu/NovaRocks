@@ -30,8 +30,6 @@ use std::fmt;
 
 mod encode;
 mod read;
-#[cfg(test)]
-pub(crate) use encode::encode_call_requests_in;
 pub use encode::{PreparedCallRequestsEncode, encode_call_requests, prepare_call_requests_encode};
 pub use encode::{prepare_call_requests_encode_in, prepare_call_requests_encode_with_host_in};
 pub use read::{

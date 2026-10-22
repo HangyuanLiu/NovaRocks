@@ -201,7 +201,7 @@ mod tests {
 
     fn scan(table: &str, id: ColumnId) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "default".to_string(),
                 table: table_def(table),
                 alias: None,
@@ -321,7 +321,7 @@ mod tests {
 
     fn exists_apply(negated: bool, right: LogicalPlanNode, correlated: bool) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::Exists { negated },
                 subquery_expr: bool_expr(),
                 output_column: exists_output(),

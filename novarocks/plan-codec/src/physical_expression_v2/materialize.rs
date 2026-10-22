@@ -114,6 +114,7 @@ pub struct MaterializedExpressions<'loan, 'headers, 'wire, 'control> {
 }
 impl<'loan, 'headers, 'wire, 'control> MaterializedExpressions<'loan, 'headers, 'wire, 'control> {
     pub fn arena(&self) -> &p::ExprArena {
+        let _namespace_loans = (&self.functions, &self.aggregates);
         &self.arena
     }
     pub fn facts(&self) -> &Facts {
@@ -122,12 +123,15 @@ impl<'loan, 'headers, 'wire, 'control> MaterializedExpressions<'loan, 'headers, 
     pub fn into_arena(self) -> p::ExprArena {
         self.arena
     }
+    #[cfg(test)]
     pub(crate) fn expressions(&self) -> &'loan DecodedExpressions<'headers, 'wire, 'control> {
         self.expressions
     }
+    #[cfg(test)]
     pub(crate) fn functions(&self) -> &'loan MaterializedFunctionBindings<'headers, 'wire> {
         self.functions
     }
+    #[cfg(test)]
     pub(crate) fn aggregates(
         &self,
     ) -> &'loan MaterializedAggregateBindings<'loan, 'headers, 'wire> {

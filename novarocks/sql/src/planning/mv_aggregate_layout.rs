@@ -166,7 +166,7 @@ pub fn build_sql_mv_aggregate_physical_layout(
         })?;
         validate_aggregate_state_visible_type(
             call.function(),
-            &visible.value_type.data_type(),
+            visible.value_type.data_type(),
             aggregate_input_types
                 .get(aggregate_index)
                 .and_then(Option::as_ref),

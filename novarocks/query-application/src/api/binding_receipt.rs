@@ -17,12 +17,9 @@
 
 use std::{
     collections::HashMap,
-    error::Error,
-    fmt,
     sync::{Arc, Mutex},
 };
 
-use novarocks_spi::connector::read_stack::ConnectorReadBinding;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorErrorKind, ConnectorReadSelector,
     ConnectorSemanticFact, ConnectorTableHandle,
@@ -31,7 +28,6 @@ use novarocks_sql::binding::{SqlTableBindingAllocator, SqlTableBindingId, SqlTab
 
 const MAX_FACT_BYTES: usize = 64 * 1024;
 const MAX_IDENTITY_BYTES: usize = 256;
-const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 4096;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ObjectPath(Arc<[Arc<str>]>);
@@ -47,12 +43,6 @@ impl ObjectPath {
 
     pub fn parts(&self) -> &[Arc<str>] {
         &self.0
-    }
-
-    fn encoded_len(&self) -> Option<usize> {
-        self.0
-            .iter()
-            .try_fold(0_usize, |total, part| total.checked_add(part.len()))
     }
 }
 
@@ -102,13 +92,6 @@ impl ProviderFactFormat {
     pub const fn version(&self) -> u16 {
         self.version
     }
-
-    fn encoded_len(&self) -> Option<usize> {
-        self.provider
-            .len()
-            .checked_add(self.format.len())?
-            .checked_add(std::mem::size_of::<u16>())
-    }
 }
 
 macro_rules! encoded_binding_fact {
@@ -154,11 +137,6 @@ macro_rules! encoded_binding_fact {
                 )
             }
 
-            fn encoded_len(&self) -> Option<usize> {
-                self.format
-                    .encoded_len()
-                    .and_then(|size| size.checked_add(self.value.len()))
-            }
         }
     };
 }
@@ -173,43 +151,9 @@ pub struct ExactObjectBinding {
     catalog_generation: CatalogGeneration,
     object_identity: Option<ObjectIdentity>,
     data_version: Option<DataVersion>,
-    read_binding: Option<ConnectorReadBinding>,
 }
 
 impl ExactObjectBinding {
-    #[cfg(test)]
-    pub(crate) fn new_for_test(
-        object: ObjectPath,
-        catalog_generation: CatalogGeneration,
-        object_identity: ObjectIdentity,
-        data_version: DataVersion,
-    ) -> Self {
-        Self {
-            object,
-            catalog_generation,
-            object_identity: Some(object_identity),
-            data_version: Some(data_version),
-            read_binding: None,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_for_publication_test(
-        object: ObjectPath,
-        catalog_generation: CatalogGeneration,
-        relation: &novarocks_sql::compiler::SqlMvRewritePublicationRelation,
-    ) -> Self {
-        Self {
-            object,
-            catalog_generation,
-            object_identity: ObjectIdentity::from_provider_fact(
-                relation.revision().object_identity(),
-            ),
-            data_version: DataVersion::from_provider_fact(relation.revision().data_version()),
-            read_binding: None,
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn new_without_semantic_revision_for_test(
         object: ObjectPath,
@@ -220,7 +164,6 @@ impl ExactObjectBinding {
             catalog_generation,
             object_identity: None,
             data_version: None,
-            read_binding: None,
         }
     }
 
@@ -243,53 +186,6 @@ impl ExactObjectBinding {
     pub fn has_stable_semantic_revision(&self) -> bool {
         self.object_identity.is_some() && self.data_version.is_some()
     }
-
-    pub(crate) fn matches_publication_relation(
-        &self,
-        relation: &novarocks_sql::compiler::SqlMvRewritePublicationRelation,
-    ) -> Result<bool, String> {
-        let expected_parts = relation.table_fqn().split('.').collect::<Vec<_>>();
-        let actual_parts = self.object.parts();
-        if expected_parts.len() != actual_parts.len()
-            || expected_parts
-                .iter()
-                .zip(actual_parts)
-                .any(|(expected, actual)| *expected != actual.as_ref())
-        {
-            return Ok(false);
-        }
-        let expected_object =
-            ObjectIdentity::from_provider_fact(relation.revision().object_identity())
-                .ok_or_else(|| "MV publication object identity is invalid".to_string())?;
-        let expected_version = DataVersion::from_provider_fact(relation.revision().data_version())
-            .ok_or_else(|| "MV publication data version is invalid".to_string())?;
-        Ok(self.object_identity.as_ref() == Some(&expected_object)
-            && self.data_version.as_ref() == Some(&expected_version))
-    }
-
-    pub(crate) fn read_binding(&self) -> Result<&ConnectorReadBinding, String> {
-        self.read_binding.as_ref().ok_or_else(|| {
-            "exact binding receipt has no production Connector read binding".to_string()
-        })
-    }
-
-    fn retained_encoded_len(&self) -> Option<usize> {
-        self.object
-            .encoded_len()?
-            .checked_add(self.catalog_generation.encoded_len()?)?
-            .checked_add(
-                self.object_identity
-                    .as_ref()
-                    .and_then(ObjectIdentity::encoded_len)
-                    .unwrap_or_default(),
-            )?
-            .checked_add(
-                self.data_version
-                    .as_ref()
-                    .and_then(DataVersion::encoded_len)
-                    .unwrap_or_default(),
-            )
-    }
 }
 
 /// Query-owned receipt authority paired with one request-local binding store.
@@ -309,11 +205,12 @@ struct ExactBindingReceiptState {
     sealed: Option<Arc<HashMap<SqlTableBindingId, ExactObjectBinding>>>,
 }
 
-/// Immutable read authority produced when the query binding owner closes its
-/// semantic admission phase.
+/// Opaque marker that the query binding owner has closed semantic admission.
 #[derive(Clone)]
 pub struct SealedExactBindingReceipts {
+    #[cfg(test)]
     scope: SqlTableBindingScopeId,
+    #[cfg(test)]
     receipts: Arc<HashMap<SqlTableBindingId, ExactObjectBinding>>,
 }
 
@@ -387,16 +284,11 @@ impl ExactBindingReceiptStore {
             catalog_generation,
             object_identity,
             data_version,
-            read_binding: Some(ConnectorReadBinding::new(
-                descriptor.clone(),
-                planning_lease
-                    .binding()
-                    .catalog_properties()
-                    .map_err(|error| error.to_string())?
-                    .handle()
-                    .clone(),
-            )),
         };
+        planning_lease
+            .binding()
+            .catalog_properties()
+            .map_err(|error| error.to_string())?;
         self.register_receipt(binding, receipt)
     }
 
@@ -431,16 +323,11 @@ impl ExactBindingReceiptStore {
             catalog_generation,
             object_identity: None,
             data_version: None,
-            read_binding: Some(ConnectorReadBinding::new(
-                descriptor.clone(),
-                planning_lease
-                    .binding()
-                    .catalog_properties()
-                    .map_err(|error| error.to_string())?
-                    .handle()
-                    .clone(),
-            )),
         };
+        planning_lease
+            .binding()
+            .catalog_properties()
+            .map_err(|error| error.to_string())?;
         self.register_receipt(binding, receipt)
     }
 
@@ -465,11 +352,11 @@ impl ExactBindingReceiptStore {
         }
     }
 
-    /// Close registration and publish one immutable snapshot. Repeated calls
-    /// return the same snapshot and never reopen admission.
+    /// Close registration and retain one immutable snapshot. Repeated calls
+    /// never reopen admission.
     pub fn seal(&self) -> SealedExactBindingReceipts {
         let mut state = self.state.lock().expect("exact binding receipt lock");
-        let receipts = match &state.sealed {
+        let _receipts = match &state.sealed {
             Some(receipts) => Arc::clone(receipts),
             None => {
                 let receipts = Arc::new(std::mem::take(&mut state.receipts));
@@ -478,8 +365,10 @@ impl ExactBindingReceiptStore {
             }
         };
         SealedExactBindingReceipts {
+            #[cfg(test)]
             scope: self.scope,
-            receipts,
+            #[cfg(test)]
+            receipts: _receipts,
         }
     }
 
@@ -488,25 +377,17 @@ impl ExactBindingReceiptStore {
         state
             .sealed
             .as_ref()
-            .map(|receipts| SealedExactBindingReceipts {
+            .map(|_receipts| SealedExactBindingReceipts {
+                #[cfg(test)]
                 scope: self.scope,
-                receipts: Arc::clone(receipts),
+                #[cfg(test)]
+                receipts: Arc::clone(_receipts),
             })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn register_for_test(
-        &self,
-        binding: SqlTableBindingId,
-        receipt: ExactObjectBinding,
-    ) {
-        assert!(binding.belongs_to(self.scope));
-        self.register_receipt(binding, receipt)
-            .expect("test receipt registration must precede semantic seal");
     }
 }
 
 impl SealedExactBindingReceipts {
+    #[cfg(test)]
     pub(crate) fn resolve(&self, binding: SqlTableBindingId) -> Result<ExactObjectBinding, String> {
         if !binding.belongs_to(self.scope) {
             return Err("exact binding receipt token belongs to another query".to_string());

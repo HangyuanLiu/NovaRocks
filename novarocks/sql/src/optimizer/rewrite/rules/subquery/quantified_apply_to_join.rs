@@ -251,7 +251,7 @@ mod tests {
 
     fn scan(table: &str, columns: Vec<OutputColumn>) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "default".to_string(),
                 table: table_def(table),
                 alias: None,
@@ -364,7 +364,7 @@ mod tests {
         correlated: bool,
     ) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::In { negated },
                 subquery_expr: col_ref(OUTER_A, "a", outer_a_nullable),
                 output_column: bool_output(),

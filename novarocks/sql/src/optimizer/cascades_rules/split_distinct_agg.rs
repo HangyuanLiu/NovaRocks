@@ -319,10 +319,6 @@ fn scalar_key_matches(arena: &ScalarArena, left: ScalarId, right: ScalarId) -> b
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The original request control accompanies existing distinct aggregate stage inputs."
-)]
 fn apply_three_phase(
     expr: &MExpr,
     memo: &mut Memo,

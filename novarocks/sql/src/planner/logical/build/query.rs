@@ -723,7 +723,7 @@ fn plan_body_scoped(
 mod constant_identity_tests {
     use super::*;
     use arrow::array::{Array, ArrayRef, Float64Array, Int64Array};
-    use arrow::datatypes::{DataType, Field};
+    use arrow::datatypes::Field;
     use novarocks_type_contract::{CompileControlError, CompilePhase, FunctionValueType};
     use std::sync::{Arc, Mutex};
 

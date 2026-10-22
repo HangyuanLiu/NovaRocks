@@ -924,6 +924,13 @@ impl<H> ControlPartsProjection for CreatedControlProjection<'_, '_, H> {
 /// Projected grammar facts, not a validated expression graph or root attachment.
 /// Native must map these exact definitions and run its full ProgramControlFlow
 /// and RootAttachment checks before publishing a LocalProgram.
+pub type ExpressionControlParts = (
+    Vec<ExpressionEvaluationDomain>,
+    Vec<ExpressionInvocation<ExprId>>,
+    Vec<(ExpressionRootSite, ExpressionUseId)>,
+    novarocks_type_contract::ValueTypeStorageLifetime,
+);
+
 pub struct CreatedExpressionControlParts {
     domains: Vec<ExpressionEvaluationDomain>,
     uses: Vec<ExpressionInvocation<ExprId>>,
@@ -940,14 +947,7 @@ impl CreatedExpressionControlParts {
     pub fn roots(&self) -> &[(ExpressionRootSite, ExpressionUseId)] {
         &self.roots
     }
-    pub fn into_parts(
-        self,
-    ) -> (
-        Vec<ExpressionEvaluationDomain>,
-        Vec<ExpressionInvocation<ExprId>>,
-        Vec<(ExpressionRootSite, ExpressionUseId)>,
-        novarocks_type_contract::ValueTypeStorageLifetime,
-    ) {
+    pub fn into_parts(self) -> ExpressionControlParts {
         (self.domains, self.uses, self.roots, self.storage)
     }
 }

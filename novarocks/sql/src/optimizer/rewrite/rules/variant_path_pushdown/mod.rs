@@ -120,7 +120,7 @@ mod tests {
         let source_column = add_column(factory, "v", source_type.clone(), true, false);
         (
             LogicalPlanNode::new(
-                LogicalPlanKind::Scan(PlanScanNode {
+                LogicalPlanKind::scan(PlanScanNode {
                     database: "db".to_string(),
                     table: table_def(source, source_type),
                     alias: None,

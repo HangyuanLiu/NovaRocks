@@ -117,9 +117,7 @@ impl std::error::Error for PackageSemanticsError {
 }
 impl novarocks_failure_contract::FailureProjection for PackageSemanticsError {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::{
-            FailureClass, FailureFact, FailureProjection, FailureReason, domain,
-        };
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
         let (class, code) = match self {
             Self::Control(cause) => return cause.failure_fact(),
             Self::ConstantSource(cause) => return cause.failure_fact(),

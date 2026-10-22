@@ -20,7 +20,7 @@
 //! coexistence limits before the full helper begins its two type walks.
 //! These numbers neither admit memory nor cover batch metadata/body/output.
 
-use super::owner_admission::{Admission, HostSchemaAdmit, SchemaAdmit, SchemaWriterRequestFacts};
+use super::owner_admission::{Admission, HostSchemaAdmit, SchemaWriterRequestFacts};
 use crate::host_projection_v2::ProjectionFailure;
 type HostError<H> = ProjectionFailure<TypeCodecError, H>;
 use super::{IpcSchemaProjectionLimits, SchemaPreflight, checked_add as add, checked_mul as mul};
@@ -92,19 +92,6 @@ fn environment(work: &mut CompileCheckpoints<'_>) -> Result<(), TypeCodecError> 
     }
 }
 impl Requests {
-    fn layout(
-        &mut self,
-        layout: Layout,
-        copies: usize,
-        mut work: Option<&mut CompileCheckpoints<'_>>,
-    ) -> Result<(), TypeCodecError> {
-        self.0.layout::<TypeCodecError>(layout, copies, &mut || {
-            if let Some(work) = work.as_deref_mut() {
-                work.step()?;
-            }
-            Ok(())
-        })
-    }
     fn exact<T>(
         &mut self,
         capacity: usize,
@@ -545,25 +532,6 @@ pub(super) fn reader_facts(
         request_count: requests.count,
         work_upper_bound: work,
     })
-}
-
-pub(crate) fn schema_writer_prefix_resources_in(
-    field: &Field,
-    source: usize,
-    limits: IpcSchemaProjectionLimits,
-    max_work: usize,
-    admit: &mut SchemaAdmit<'_>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<SchemaWriterPrefixFacts, TypeCodecError> {
-    schema_writer_prefix_resources_with_host_in(
-        field,
-        source,
-        limits,
-        max_work,
-        &mut |facts| admit(facts).map_err(HostError::<std::convert::Infallible>::from),
-        work,
-    )
-    .map_err(ProjectionFailure::without_host)
 }
 
 pub(crate) fn schema_writer_prefix_resources_with_host_in<H>(

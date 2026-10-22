@@ -191,7 +191,7 @@ pub struct LogicalExecutionSupervisor {
 
 enum SupervisorRunOutcome {
     Completed,
-    Failed(QueryExecutionError),
+    Failed(Box<QueryExecutionError>),
     Panicked,
 }
 
@@ -291,7 +291,7 @@ impl LogicalExecutionSupervisor {
                     self.registry.record_native_supervision_join_failure(error);
                     Some(SupervisorRunOutcome::Panicked)
                 }
-                Ok(Ok(Err(error))) => Some(SupervisorRunOutcome::Failed(error)),
+                Ok(Ok(Err(error))) => Some(SupervisorRunOutcome::Failed(Box::new(error))),
                 Ok(Ok(Ok(()))) => Some(SupervisorRunOutcome::Completed),
             };
             self.join.take();
@@ -315,7 +315,7 @@ impl LogicalExecutionSupervisor {
         if let Some(error) = self.registry.statement_native_health()
             && matches!(self.run_outcome, Some(SupervisorRunOutcome::Completed))
         {
-            self.run_outcome = Some(SupervisorRunOutcome::Failed(error));
+            self.run_outcome = Some(SupervisorRunOutcome::Failed(Box::new(error)));
         }
         self.shutdown_complete = true;
         match self
@@ -325,7 +325,7 @@ impl LogicalExecutionSupervisor {
         {
             SupervisorRunOutcome::Completed => Ok(()),
             SupervisorRunOutcome::Failed(error) => Err(
-                LogicalExecutionSupervisorShutdownError::SupervisorFailed(error),
+                LogicalExecutionSupervisorShutdownError::SupervisorFailed(*error),
             ),
             SupervisorRunOutcome::Panicked => {
                 Err(LogicalExecutionSupervisorShutdownError::SupervisorPanicked)
@@ -1185,7 +1185,7 @@ enum ActiveAttemptConvergence {
         exact_contexts: Box<[novarocks_execution_contract::QueryContextRef]>,
     },
     Unresolved(StatementNativeHealthFailure),
-    Recorded(Result<(), QueryExecutionError>),
+    Recorded(Box<Result<(), QueryExecutionError>>),
 }
 
 fn supervise_residual_rows_attempt(
@@ -1312,6 +1312,10 @@ async fn drive_rows_attempt_until_pump_decision(
     (pump_result,)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the attempt supervisor takes exact per-query capabilities and active-attempt facts from the single coordinator assembly boundary"
+)]
 async fn supervise_rows(
     actor: &super::LogicalExecutionActor,
     session: &mut LogicalNativeSession,
@@ -1897,7 +1901,7 @@ async fn record_reported_active_convergence(
     convergence: ActiveAttemptConvergence,
 ) -> Result<(), QueryExecutionError> {
     let convergence = match convergence {
-        ActiveAttemptConvergence::Recorded(result) => return result,
+        ActiveAttemptConvergence::Recorded(result) => return *result,
         ActiveAttemptConvergence::Unresolved(failure) => {
             return Err(QueryExecutionError::new(
                 QueryExecutionErrorKind::Failed,
@@ -2023,9 +2027,9 @@ async fn converge_supervised_active(
                 .await
         }
         ActiveAttemptConvergence::Unresolved(failure) => Err(owner.retain_unresolved(failure)),
-        ActiveAttemptConvergence::Recorded(result) => result,
+        ActiveAttemptConvergence::Recorded(result) => *result,
     };
-    ActiveAttemptConvergence::Recorded(result)
+    ActiveAttemptConvergence::Recorded(Box::new(result))
 }
 
 #[cfg(test)]
@@ -3114,13 +3118,15 @@ mod tests {
         }
     }
 
-    fn failing_native() -> (
+    type FailingNativeFixture = (
         Arc<dyn LogicalExecutionNativePort>,
         FailingActivationPreparationPort,
         Arc<AtomicU64>,
         Arc<AtomicBool>,
         Arc<AtomicBool>,
-    ) {
+    );
+
+    fn failing_native() -> FailingNativeFixture {
         let opened = Arc::new(AtomicU64::new(0));
         let activated = Arc::new(AtomicBool::new(false));
         let residual = Arc::new(AtomicBool::new(false));
@@ -4445,7 +4451,6 @@ mod tests {
                         super::super::AcceptedAttemptFailure::None,
                     )
                     .unwrap();
-                let _fetches = Arc::new(AtomicU64::new(0));
                 let binding = test_root_binding(
                     root,
                     window.0,
@@ -5261,7 +5266,6 @@ mod tests {
                         super::super::AcceptedAttemptFailure::None,
                     )
                     .unwrap();
-                let _fetches = Arc::new(AtomicU64::new(0));
                 let binding = test_root_binding(
                     root,
                     window.0,

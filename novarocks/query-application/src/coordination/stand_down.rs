@@ -424,7 +424,7 @@ enum AbortIssueEventKind {
     TransportOwned,
     DefinitelyUnsent,
     TransportUnknown,
-    WorkerSettled(AbortQueryContextWorkerSettlement),
+    WorkerSettled(Box<AbortQueryContextWorkerSettlement>),
     FailedClosed,
 }
 
@@ -697,6 +697,7 @@ impl ContextStandDownLedger {
             })
     }
 
+    #[cfg(test)]
     pub(crate) fn has_unsettled_establish_issue(&self) -> bool {
         self.records
             .values()
@@ -772,6 +773,7 @@ impl ContextStandDownLedger {
         self.drain_events_at(super::MonotonicInstant::ORIGIN)
     }
 
+    #[cfg(test)]
     pub(crate) async fn apply_next_event(
         &mut self,
         now: impl FnOnce() -> super::MonotonicInstant,
@@ -814,7 +816,9 @@ impl ContextStandDownLedger {
         if event.authorization_generation < record.authorization_generation {
             return match event.kind {
                 AbortIssueEventKind::WorkerSettled(_) if record.registry_fenced => Ok(()),
-                AbortIssueEventKind::WorkerSettled(settlement) => settle_worker(record, settlement),
+                AbortIssueEventKind::WorkerSettled(settlement) => {
+                    settle_worker(record, *settlement)
+                }
                 AbortIssueEventKind::FailedClosed => fail_closed(record),
                 _ => Ok(()),
             };
@@ -826,7 +830,7 @@ impl ContextStandDownLedger {
             return Ok(());
         }
         match event.kind {
-            AbortIssueEventKind::WorkerSettled(settlement) => settle_worker(record, settlement),
+            AbortIssueEventKind::WorkerSettled(settlement) => settle_worker(record, *settlement),
             AbortIssueEventKind::TransportOwned => match record.issue_state {
                 Some(AbortQueryContextIssueState::IssueAuthorized) => {
                     record.issue_state = Some(AbortQueryContextIssueState::TransportOwned);
@@ -1145,7 +1149,7 @@ impl AbortQueryContextEffectSubmission {
         receipt: QueryContextReceipt,
     ) -> Result<(), ContextStandDownError> {
         let settlement = AbortQueryContextWorkerSettlement::try_new(self.identity, receipt)?;
-        let result = self.publish(AbortIssueEventKind::WorkerSettled(settlement));
+        let result = self.publish(AbortIssueEventKind::WorkerSettled(Box::new(settlement)));
         self.request.take();
         result
     }
@@ -1206,7 +1210,7 @@ impl LateAbortQueryContextWorkerSettlement {
             AbortIssueEvent {
                 identity: self.identity,
                 authorization_generation: self.authorization_generation,
-                kind: AbortIssueEventKind::WorkerSettled(settlement),
+                kind: AbortIssueEventKind::WorkerSettled(Box::new(settlement)),
             },
         )
     }

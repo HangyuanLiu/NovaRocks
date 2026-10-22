@@ -150,10 +150,6 @@ impl FrozenConnectorScanPlan {
         );
         Ok(self.0)
     }
-
-    pub(crate) fn into_physical(self) -> crate::planner::physical::PhysicalPlanNode {
-        self.0
-    }
 }
 
 /// Build the query-local analyzer table for an admitted frozen connector

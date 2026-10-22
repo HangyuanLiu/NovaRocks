@@ -227,11 +227,6 @@ impl FreshCreateIntentObservation {
     pub(crate) fn into_parts(self) -> (CreateIntent, ManagedMvTarget) {
         (self.intent, self.target)
     }
-
-    #[cfg(test)]
-    pub(super) const fn for_test(intent: CreateIntent, target: ManagedMvTarget) -> Self {
-        Self { intent, target }
-    }
 }
 
 impl PendingManagementObservation {

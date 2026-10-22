@@ -27,7 +27,7 @@ pub fn runtime_filter_comparator_digest(
         return Ok(None);
     };
     let (comparator_digest, _) =
-        runtime_filter_order_digests(&key.ty.data_type(), key.direction, key.null_ordering)?;
+        runtime_filter_order_digests(key.ty.data_type(), key.direction, key.null_ordering)?;
     Ok(Some(comparator_digest))
 }
 

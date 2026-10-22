@@ -314,21 +314,6 @@ pub(super) fn inspect(
         .map_err(ProjectionFailure::without_host)
 }
 
-pub(super) fn inspect_in(
-    data: &ArrayData,
-    limits: RecursivePoolWriteLimits,
-    capture: &mut dyn FnMut(&Geometry) -> Result<(), TypeCodecError>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Geometry, TypeCodecError> {
-    inspect_with_host_in(
-        data,
-        limits,
-        &mut |geometry| capture(geometry).map_err(HostError::<std::convert::Infallible>::from),
-        work,
-    )
-    .map_err(ProjectionFailure::without_host)
-}
-
 pub(super) fn inspect_with_host_in<H>(
     data: &ArrayData,
     limits: RecursivePoolWriteLimits,

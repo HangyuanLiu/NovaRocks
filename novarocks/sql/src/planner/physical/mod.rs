@@ -27,8 +27,7 @@ pub(crate) mod vocab;
 pub(crate) use node::*;
 pub(crate) use runtime_filter::JoinExecutionMode;
 pub(crate) use stats::{
-    DEFAULT_CPU_COST_WEIGHT, DEFAULT_MEMORY_COST_WEIGHT, DEFAULT_NETWORK_COST_WEIGHT,
-    MAX_ROW_COUNT, PhysicalPlanStats, PlannerBroadcastDecision, PlannerColumnStatistic,
-    PlannerConfidence, PlannerCostEstimate,
+    PhysicalPlanStats, PlannerBroadcastDecision, PlannerColumnStatistic, PlannerConfidence,
+    PlannerCostEstimate,
 };
 pub(crate) use vocab::{AggMode, AggregateOutputLayout, HashSource, JoinDistribution, TopNPhase};

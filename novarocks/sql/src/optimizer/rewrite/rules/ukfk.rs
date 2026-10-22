@@ -1126,9 +1126,7 @@ mod tests {
             let Operator::LogicalScan(scan) = &mut input.op else {
                 unreachable!()
             };
-            let ScanSource::Sql(source) = scan.table.source.clone() else {
-                unreachable!()
-            };
+            let ScanSource::Sql(source) = scan.table.source.clone();
             scan.table.source = ScanSource::Sql(source.with_ukfk_facts(
                 SqlUkFkTableFacts::from_connector_planning_facts(&schema, &facts),
             ));

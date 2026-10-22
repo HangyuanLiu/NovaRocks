@@ -127,10 +127,6 @@ pub struct MvDesiredSemantics {
 }
 
 impl MvDesiredSemantics {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The constructor makes every lake-authoritative MV semantic field explicit."
-    )]
     pub fn new(
         package_id: String,
         query_definition: PersistedQueryDefinition,

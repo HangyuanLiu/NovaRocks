@@ -399,7 +399,7 @@ impl ContractLoweringVisitor<'_> {
                         let mut revised = old.ty.clone();
                         revised = revised.with_nullable(revised.nullable() || (input.nullable()
                             || novarocks_functions::carrier_cast_can_produce_null_with_policy(
-                                &input.data_type(),
+                                input.data_type(),
                                 target,
                                 *decimal_overflow_policy,
                                 self.root_allow_throw_exception,

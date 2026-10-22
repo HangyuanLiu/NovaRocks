@@ -625,7 +625,6 @@ async fn foreground_panic_returns_original_box_to_cleanup_and_keeps_its_health_f
 
 #[tokio::test]
 async fn foreground_convergence_panic_retains_same_owner_obligation_and_payload_without_repoll() {
-    use std::future::Future;
     let registry = StatementNativeResidualRegistry::new(314);
     let (control, root) = governance();
     let scope = root.owner.scope();

@@ -429,6 +429,7 @@ impl Model {
         }
         Ok(facts)
     }
+    #[cfg(test)]
     pub(super) fn gate(
         &self,
         limits: PackageTypeProjectionLimits,

@@ -1998,10 +1998,6 @@ fn base_field_name(
         })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
-)]
 fn build_join_descriptor(
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
     left: &novarocks_types::naming::TableIdentity,

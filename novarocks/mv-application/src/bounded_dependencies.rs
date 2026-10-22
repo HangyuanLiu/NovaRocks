@@ -114,15 +114,6 @@ impl DependencyCollector {
         Ok(())
     }
 
-    pub(crate) fn push_clone(
-        &mut self,
-        dependency: &StoredMvDependency,
-    ) -> Result<(), MvRepositoryError> {
-        self.admit(dependency)?;
-        self.entries.push(dependency.clone());
-        Ok(())
-    }
-
     pub(crate) fn finish(mut self) -> Vec<StoredMvDependency> {
         self.entries.sort_by(|left, right| {
             display_bytes(&left.upstream)

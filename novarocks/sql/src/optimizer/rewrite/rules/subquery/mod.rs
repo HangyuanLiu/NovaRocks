@@ -123,7 +123,7 @@ mod tests {
 
     fn apply_over_values() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: TypedExpr {
                     kind: ExprKind::ColumnRef {
@@ -161,7 +161,7 @@ mod tests {
 
     fn exists_apply_over_values() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::Exists { negated: false },
                 subquery_expr: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
@@ -219,7 +219,7 @@ mod tests {
         let inner_col = int_output_column(ColumnId(9), "inner_v");
 
         LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::In { negated: false },
                 subquery_expr: int_column_ref(outer_col.column_id, &outer_col.name),
                 output_column: OutputColumn {

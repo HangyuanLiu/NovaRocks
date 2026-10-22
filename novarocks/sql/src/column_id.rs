@@ -28,9 +28,9 @@
 //!
 //! Design reference: StarRocks `ColumnRefOperator` / `ColumnRefFactory`.
 
-use std::fmt;
-
+#[cfg(test)]
 use arrow::datatypes::DataType;
+use std::fmt;
 
 // ---------------------------------------------------------------------------
 // ColumnId

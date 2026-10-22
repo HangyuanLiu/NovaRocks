@@ -369,7 +369,7 @@ mod tests {
                 output_qualifier: None,
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanKind::Scan(scan),
+                LogicalPlanKind::scan(scan),
                 vec![],
                 None,
             )],
@@ -457,7 +457,7 @@ mod tests {
                 },
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanKind::Scan(delta_scan_with_row_id(ColumnId(101))),
+                LogicalPlanKind::scan(delta_scan_with_row_id(ColumnId(101))),
                 vec![],
                 None,
             )],

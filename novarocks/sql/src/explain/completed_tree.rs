@@ -751,7 +751,7 @@ fn scan_admits_min_max_stats(
         fragment
             .values()
             .get(value)
-            .is_some_and(|definition| type_states_bounds(&definition.ty.data_type()))
+            .is_some_and(|definition| type_states_bounds(definition.ty.data_type()))
     })
 }
 

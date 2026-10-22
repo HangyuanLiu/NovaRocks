@@ -18,15 +18,15 @@
 
 mod contract_lowering;
 mod lowered_draft;
+#[cfg(test)]
+pub(crate) use lowered_draft::CheckedAggregateLogicalSourceEntry;
 pub use lowered_draft::{
     AggregateRuntimeDemand, CheckedSqlResultDeclaration, ResultDeclarationError,
     SqlAuthoredPhysicalPlan, SqlCallDependencyLoan, SqlCallDependencyProvenance,
     SqlCallDependencySite, SqlCanonicalDependencyLoan, SqlExpressionCallKind,
     SqlSourceJournalError,
 };
-pub(crate) use lowered_draft::{
-    CheckedAggregateLogicalSourceEntry, LoweredSqlPhysicalDraft, SqlPublicationError,
-};
+pub(crate) use lowered_draft::{LoweredSqlPhysicalDraft, SqlPublicationError};
 mod expression_occurrences;
 mod source_support;
 pub use source_support::check_pure_call_definitions_observed;
@@ -50,11 +50,12 @@ pub use package_semantics::{
     FragmentPackageSemantics, PackageSemanticsError, author_fragment_package_semantics,
 };
 
+#[cfg(test)]
+pub(crate) use contract_lowering::lower_final_physical_plan;
 pub(crate) use contract_lowering::{
     ContractLoweringError, FinalChangeStreamWriteLowering, FinalWriteLowering,
-    lower_final_change_stream_write_plan, lower_final_physical_plan,
-    lower_final_physical_plan_with_provider_reads, lower_final_physical_plan_with_root_semantics,
-    lower_final_physical_write_plan,
+    lower_final_change_stream_write_plan, lower_final_physical_plan_with_provider_reads,
+    lower_final_physical_plan_with_root_semantics, lower_final_physical_write_plan,
 };
 
 #[cfg(test)]

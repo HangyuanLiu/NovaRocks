@@ -742,7 +742,7 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, L
                 )));
             }
             let mut entries = Vec::with_capacity(args.len() / 2);
-            for pair in args.chunks_exact(2) {
+            for pair in args.as_chunks::<2>().0 {
                 entries.push((expr_to_literal(pair[0])?, expr_to_literal(pair[1])?));
             }
             Ok(Literal::Map(entries))

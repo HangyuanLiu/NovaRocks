@@ -652,6 +652,10 @@ pub fn prepare_expression_definitions<'loan, 'source, 'control>(
     );
     finish(work, result)
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The namespace boundary keeps original inputs, frozen limits, admission, and caller checkpoints explicit."
+)]
 pub fn prepare_expression_definitions_in<'loan, 'source, 'control>(
     arena: &'loan ExprArena,
     inputs: &'loan [ExpressionTypeIds<'source>],
@@ -680,6 +684,10 @@ pub fn prepare_expression_definitions_in<'loan, 'source, 'control>(
         work,
     )
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The internal composer keeps expression sources and independent namespace authorities distinct."
+)]
 fn prepare_core<'loan, 'source, 'control>(
     arena: &'loan ExprArena,
     inputs: &'loan [ExpressionTypeIds<'source>],
@@ -1052,7 +1060,7 @@ fn prepare_core<'loan, 'source, 'control>(
                 admission.charge(&mut facts, verified.work_upper_bound(), work)?;
                 work.flush()?;
                 let matched =
-                    arrow_data_types_exact_borrowed_observed(&node.ty.data_type(), target, || {
+                    arrow_data_types_exact_borrowed_observed(node.ty.data_type(), target, || {
                         work.step()
                             .map_err(crate::physical_type_v2::TypeCodecError::from)
                     });

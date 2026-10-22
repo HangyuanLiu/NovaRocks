@@ -151,6 +151,10 @@ pub struct MvCreateCommand {
 
 /// Product commands after SQL lowering and before provider work.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the public product command carries the frozen CREATE request inline; boxing changes the cross-crate command contract"
+)]
 pub enum MvCommand {
     Create(MvCreateCommand),
     Drop { target: MvTarget, if_exists: bool },

@@ -43,6 +43,7 @@ pub(crate) fn ordering_spec_from_sort_items(items: &[SortItem]) -> OrderingSpec 
     OrderingSpec::from_sort_keys(keys)
 }
 
+#[cfg(test)]
 pub(crate) fn window_sort_items(
     partition_by: &[TypedExpr],
     order_by: &[SortItem],
@@ -59,6 +60,7 @@ pub(crate) fn window_sort_items(
     items
 }
 
+#[cfg(test)]
 pub(crate) fn window_ordering_spec(
     partition_by: &[TypedExpr],
     order_by: &[SortItem],

@@ -188,7 +188,7 @@ mod tests {
             ),
         };
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "default".to_string(),
                 table,
                 alias: None,

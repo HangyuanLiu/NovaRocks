@@ -25,8 +25,7 @@ use std::{future::Future, num::NonZeroU64, pin::Pin, sync::Arc};
 
 use novarocks_execution_contract::root_result::RootResultRead;
 use novarocks_execution_contract::{
-    AbortCause, QueryContextRef, ResultPacketSequence, TaskIdentity, TaskState, TaskStatus,
-    TerminationDetail,
+    QueryContextRef, ResultPacketSequence, TaskIdentity, TaskState, TaskStatus,
 };
 use novarocks_types::QueryExecutionId;
 use novarocks_workload_control::{CancellationReason, CancellationView, WorkError, WorkScope};
@@ -209,8 +208,8 @@ impl AcceptedRootControlRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AcceptedRootProjection {
-    Observation(AcceptedRootObservation),
-    SuccessSealed(TaskStatus),
+    Observation(Box<AcceptedRootObservation>),
+    SuccessSealed(Box<TaskStatus>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -221,6 +220,10 @@ struct AcceptedRootObservation {
 
 #[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the public projection keeps the selected attempt termination inline with its accepted root status"
+)]
 pub enum AcceptedAttemptFailure {
     None,
     DerivedPending,
@@ -339,7 +342,7 @@ impl AcceptedRootStatusSender {
                 );
             if status.version() < held.status.version()
                 || (status.version() == held.status.version()
-                    && observation != *held
+                    && observation != **held
                     && !cause_refinement)
                 || (held.status.is_terminal() && observation.status != held.status)
             {
@@ -347,7 +350,7 @@ impl AcceptedRootStatusSender {
                     "accepted root status regressed or overwrote a published version",
                 ));
             }
-            if observation == *held {
+            if observation == **held {
                 return Ok(());
             }
         } else if self.sender.borrow().is_some() {
@@ -356,7 +359,9 @@ impl AcceptedRootStatusSender {
             ));
         }
         self.sender
-            .send_replace(Some(AcceptedRootProjection::Observation(observation)));
+            .send_replace(Some(AcceptedRootProjection::Observation(Box::new(
+                observation,
+            ))));
         Ok(())
     }
 
@@ -379,7 +384,9 @@ impl AcceptedRootStatusSender {
             }
         };
         self.sender
-            .send_replace(Some(AcceptedRootProjection::SuccessSealed(status)));
+            .send_replace(Some(AcceptedRootProjection::SuccessSealed(Box::new(
+                status,
+            ))));
         Ok(())
     }
 }
@@ -611,7 +618,7 @@ impl PumpRuntime {
     ) -> Result<(), PumpInterruption> {
         match projection {
             AcceptedRootProjection::Observation(observation) => {
-                self.observe_status(observation).await
+                self.observe_status(*observation).await
             }
             AcceptedRootProjection::SuccessSealed(status) => {
                 if self.pending_root_failure.is_some() || status.state() != TaskState::Finished {
@@ -620,7 +627,7 @@ impl PumpRuntime {
                     )));
                 }
                 self.observe_status(AcceptedRootObservation {
-                    status,
+                    status: *status,
                     attempt_failure: AcceptedAttemptFailure::None,
                 })
                 .await?;
@@ -685,7 +692,7 @@ impl PumpRuntime {
                 .observer
                 .observe_status_with_failure(
                     status,
-                    RootTerminalFailure::Authoritative(failure.error.clone()),
+                    RootTerminalFailure::Authoritative(Box::new(failure.error.clone())),
                 )
                 .await
             {
@@ -716,7 +723,9 @@ impl PumpRuntime {
         };
         let terminal_actor_fact = match (&attempt_failure, terminal_failure.as_ref()) {
             (AcceptedAttemptFailure::DerivedPending, _) => RootTerminalFailure::Pending,
-            (_, Some(failure)) => RootTerminalFailure::Authoritative(failure.error.clone()),
+            (_, Some(failure)) => {
+                RootTerminalFailure::Authoritative(Box::new(failure.error.clone()))
+            }
             _ => RootTerminalFailure::Unspecified,
         };
         match self
@@ -1587,18 +1596,19 @@ mod tests {
         collections::VecDeque,
         num::NonZeroUsize,
         sync::{Arc, Mutex},
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     use arrow::datatypes::DataType;
     use novarocks_execution_contract::{
-        SafeDetail, TaskFailure, TaskOutputFacts, TaskState, TaskStatusVersion,
+        AbortCause, SafeDetail, TaskFailure, TaskOutputFacts, TaskState, TaskStatusVersion,
+        TerminationDetail,
     };
     use novarocks_types::{
         AttemptId, BackendProcessId, QueryId, StageId, TaskId, identity::QueryExecutionId,
     };
     use novarocks_workload_control::{
-        ResourceConfig, Stage, WorkClass, WorkOwner, WorkRequest, WorkloadConfig, WorkloadControl,
+        ResourceConfig, Stage, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
     };
     use tokio::{runtime::Handle, sync::Notify};
 
@@ -1841,7 +1851,7 @@ mod tests {
         for foreign_scope in [false, true] {
             let (
                 Harness {
-                    control: _,
+                    control: _control,
                     scope,
                     actor,
                     owner,

@@ -21,8 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 use novarocks_type_contract::{
-    CompileControlError, CompilePhase, FunctionValueType, NR_LOGICAL_TYPE_KEY, PureCompileControl,
-    ValueLogicalType,
+    CompileControlError, CompilePhase, FunctionValueType, PureCompileControl, ValueLogicalType,
 };
 use novarocks_types::schema::{ColumnDef, SqlType};
 

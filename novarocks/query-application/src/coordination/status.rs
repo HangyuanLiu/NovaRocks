@@ -27,6 +27,10 @@ use novarocks_execution_contract::{
 /// change a Worker task. The coordinator resubscribes from its retained
 /// cursors when it receives `ObservationLost`.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "status events carry the exact TaskStatus inline across the role adapter boundary"
+)]
 pub enum StatusObservationPortEvent {
     Published(TaskStatus),
     Gone(TaskIdentity),

@@ -1324,7 +1324,7 @@ fn one_under(limits: DefinitionSourceLimits, axis: usize) -> DefinitionSourceLim
 enum Failure {
     Control(CompileControlError),
     Source(TypeViewError),
-    Ordinary(String),
+    Ordinary,
 }
 impl From<CompileControlError> for Failure {
     fn from(e: CompileControlError) -> Self {
@@ -1339,7 +1339,7 @@ impl From<TypeViewError> for Failure {
         }
     }
 }
-macro_rules! ordinary_from {($($t:ident),+)=>{$(impl From<$t> for Failure {fn from(e:$t)->Self {match e {$t::Control(c)=>Self::Control(c),other=>Self::Ordinary(format!("{other:?}"))}}})+};}
+macro_rules! ordinary_from {($($t:ident),+)=>{$(impl From<$t> for Failure {fn from(e:$t)->Self {match e {$t::Control(c)=>Self::Control(c),_=>Self::Ordinary}}})+};}
 ordinary_from!(TypeCodecError, CallRequestCodecError, NodeCodecError);
 fn finish<T>(result: Result<T, Failure>, work: CompileCheckpoints<'_>) -> Result<T, Failure> {
     if matches!(result, Err(Failure::Control(_))) {

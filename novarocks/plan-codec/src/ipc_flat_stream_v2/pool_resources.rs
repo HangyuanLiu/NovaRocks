@@ -169,15 +169,6 @@ impl FlatConstantStream<'_, '_> {
     ) -> Result<FlatPoolResourceProjection, FlatPoolResourceError> {
         self.pool_resources_core(value_type, policy, None, work)
     }
-    pub(super) fn pool_resources_in<E: ReaderResourceFailure>(
-        &self,
-        value_type: &FunctionValueType,
-        policy: ConstantPolicy,
-        admission: &mut Admission<'_, '_, E>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<FlatPoolResourceProjection, E> {
-        self.pool_resources_core(value_type, policy, Some(admission), work)
-    }
     fn pool_resources_core<E: ReaderResourceFailure>(
         &self,
         value_type: &FunctionValueType,

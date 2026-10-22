@@ -595,6 +595,11 @@ impl<'control> ExplainRenderOutput<'control> {
         Ok(self.lines)
     }
 
+    #[cfg(test)]
+    pub(super) fn finish(self) -> Vec<String> {
+        self.lines
+    }
+
     pub(super) fn push(&mut self, arguments: fmt::Arguments<'_>) -> Result<(), SqlCompileError> {
         if self.lines.len() >= self.budget.max_lines {
             return Err(explain_budget_exceeded(self.budget));
@@ -650,10 +655,6 @@ impl<'control> ExplainRenderOutput<'control> {
             .ok_or_else(|| explain_budget_exceeded(self.budget))?;
         self.lines.push(line);
         Ok(())
-    }
-
-    pub(super) fn finish(self) -> Vec<String> {
-        self.lines
     }
 
     pub(super) fn ensure_prefix_fits(&self, bytes: usize) -> Result<(), SqlCompileError> {

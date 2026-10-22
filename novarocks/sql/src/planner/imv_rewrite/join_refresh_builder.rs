@@ -723,10 +723,6 @@ fn pending_count_expr(net_column: &OutputColumn, op: BinOp) -> TypedExpr {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The join shell preserves independently typed locator and output identity facts for validation."
-)]
 fn build_locator_join_shell(
     left: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
@@ -776,10 +772,6 @@ fn build_locator_join_shell(
     ))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Locator scan construction keeps each bound target-column identity explicit for planner validation."
-)]
 fn build_target_locator_scan(
     desc: &JoinRefreshDescriptor,
     locator: &JoinRefreshTargetLocatorBinding,
@@ -857,7 +849,7 @@ fn build_target_locator_scan(
         ),
     ];
     Ok(LogicalPlanNode::new(
-        LogicalPlanKind::Scan(PlanScanNode {
+        LogicalPlanKind::scan(PlanScanNode {
             database: desc.mv_identity.database.clone(),
             table: TableDef {
                 name: desc.mv_identity.name.clone(),
@@ -935,10 +927,6 @@ fn build_locator_assert_filter(
     ))
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Final projection construction retains independently checked payload and locator identities."
-)]
 fn build_final_coalesce_project(
     input: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,

@@ -48,6 +48,11 @@ pub(super) struct TypeGraphDomainFacts {
     pub(super) cumulative_work_upper_bound: usize,
 }
 
+type DomainAdmission<'a, H> = dyn FnMut(
+        &TypeGraphDomainFacts,
+    ) -> Result<(), crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>>
+    + 'a;
+
 pub(super) struct RootDomains<'source> {
     table: &'source wire::TypeTable,
     flags: BTreeMap<Node, u8>,
@@ -176,12 +181,7 @@ struct Classification<'index, 'source, 'admit, H> {
     lookup: usize,
     insertion: InsertionOnlyFacts,
     root_work: usize,
-    admit: &'admit mut dyn FnMut(
-        &TypeGraphDomainFacts,
-    ) -> Result<
-        (),
-        crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
-    >,
+    admit: &'admit mut DomainAdmission<'admit, H>,
 }
 impl<H> Classification<'_, '_, '_, H> {
     fn gate(
@@ -287,12 +287,7 @@ pub(super) fn prepare_domains_with_host<'source, H>(
     roots: &PackageTypeRootSources<'source>,
     package: &'source package_wire::FragmentPackage,
     source_bytes: usize,
-    admit: &mut impl FnMut(
-        &TypeGraphDomainFacts,
-    ) -> Result<
-        (),
-        crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
-    >,
+    admit: &mut DomainAdmission<'_, H>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<RootDomains<'source>, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>> {
     let definitions = index.vertex_count()?;
@@ -441,6 +436,7 @@ pub(super) fn prepare_domains_with_host<'source, H>(
     })
 }
 
+#[cfg(test)]
 pub(super) fn prepare_domains<'source>(
     index: &Index<'source>,
     roots: &PackageTypeRootSources<'source>,

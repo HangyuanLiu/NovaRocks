@@ -455,13 +455,11 @@ fn receiver_value_schema_ipc_and_unused_strict_roots_reject_same_writer_wide_des
                 id: 0,
                 carrier_type_id: Some(0),
                 logical_type_id: Some(0),
-                ..Default::default()
             },
             wire::ValueTypeDefinition {
                 id: u32::MAX,
                 carrier_type_id: Some(u32::MAX),
                 logical_type_id: Some(u32::MAX),
-                ..Default::default()
             },
         ];
         for field in &mut execution.fields {

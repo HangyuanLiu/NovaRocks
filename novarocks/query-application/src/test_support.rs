@@ -72,7 +72,7 @@ impl TestResultDeliveryReceipt {
         {
             ResultDeliveryDisposition::Completed => TestResultDeliveryDisposition::Completed,
             ResultDeliveryDisposition::Failed(error) => {
-                TestResultDeliveryDisposition::Failed(error)
+                TestResultDeliveryDisposition::Failed(*error)
             }
             ResultDeliveryDisposition::Dropped => TestResultDeliveryDisposition::Dropped,
         }
@@ -85,7 +85,7 @@ pub struct ResultStreamTestProducer {
     execution_id: QueryExecutionId,
     transport: QueryResultTransport,
     failure: watch::Sender<Option<QueryExecutionError>>,
-    workload: WorkloadControl,
+    _workload: WorkloadControl,
     root: Option<RootWork>,
     window: Option<novarocks_workload_control::ResultWindowGrant>,
     capacity: Option<novarocks_workload_control::ResultCapacityHandle>,
@@ -181,7 +181,7 @@ impl ResultStreamTestProducer {
                 execution_id,
                 transport,
                 failure,
-                workload,
+                _workload: workload,
                 root: Some(root),
                 window,
                 capacity,
@@ -610,7 +610,7 @@ impl LogicalExecutionTestHarness {
         drop(self.running.take());
         drop(self.initial.take());
         drop(self.actor.take());
-        drop(self.registration.take());
+        let _ = self.registration.take();
         self.registry_owner
             .as_mut()
             .expect("the test registry owner may be shut down only once")

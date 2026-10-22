@@ -996,7 +996,7 @@ mod column_id_helper_tests {
             ),
         };
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "default".to_string(),
                 table,
                 alias: None,
@@ -1216,7 +1216,7 @@ mod column_id_helper_tests {
             })
             .collect();
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: table.to_string(),

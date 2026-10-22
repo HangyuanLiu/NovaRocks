@@ -30,9 +30,7 @@ fn compile_with_id_type(sql: &str, id_type: DataType) -> SqlOptimizedOutput {
     let source = crate::planner::table::test_sql_scan_source(
         crate::planner::table::SqlScanKind::ConnectorRead,
     );
-    let crate::planner::table::ScanSource::Sql(scan) = &source else {
-        unreachable!()
-    };
+    let crate::planner::table::ScanSource::Sql(scan) = &source;
     let statistics = crate::planning::dml::DmlStatisticsSnapshot::from_evidence([
         crate::planning::dml::DmlStatisticsEvidence::Missing {
             binding: scan.binding,

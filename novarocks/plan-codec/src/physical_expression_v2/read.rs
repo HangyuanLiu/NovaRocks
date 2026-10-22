@@ -860,7 +860,7 @@ impl<'loan, 'wire, 'control> DecodedExpressions<'loan, 'wire, 'control> {
                 };
                 work.flush()?;
                 let same =
-                    arrow_data_types_exact_borrowed_observed(&header.data_type(), carrier, || {
+                    arrow_data_types_exact_borrowed_observed(header.data_type(), carrier, || {
                         work.step().map_err(TypeCodecError::from)
                     })
                     .map_err(Error::from)?;

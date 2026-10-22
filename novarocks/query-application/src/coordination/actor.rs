@@ -115,6 +115,7 @@ impl LogicalExecutionClock for ProcessLogicalExecutionClock {
 }
 
 impl AttemptActivationIdentity {
+    #[cfg(test)]
     pub(crate) const fn from_parts(
         actor_instance_id: u64,
         execution: QueryExecutionId,
@@ -155,10 +156,12 @@ pub(crate) struct RootResultObserver {
 }
 
 impl RootResultObserver {
+    #[cfg(test)]
     pub(crate) const fn activation(&self) -> AttemptActivationIdentity {
         self.activation
     }
 
+    #[cfg(test)]
     pub(crate) async fn observe_status(
         &self,
         status: TaskStatus,
@@ -1015,6 +1018,10 @@ impl LogicalExecutionActorConfig {
 
     /// Constructs an effect-free read whose whole attempt may restart only
     /// before any result packet becomes visible.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "this public constructor freezes each independent admission, replacement, work-owner, and row-carrier fact"
+    )]
     pub fn read_only_pre_visibility_recovery_rows(
         initial_execution: QueryExecutionId,
         mailbox_capacity: NonZeroUsize,
@@ -1420,7 +1427,7 @@ struct RootTerminalObservation {
 pub(crate) enum RootTerminalFailure {
     Unspecified,
     Pending,
-    Authoritative(QueryExecutionError),
+    Authoritative(Box<QueryExecutionError>),
 }
 
 enum PendingResult {
@@ -2296,6 +2303,10 @@ pub(crate) fn spawn_logical_execution_actor(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the actor loop receives independently owned mailboxes, permits, effect ports, and ledger state from one spawn boundary"
+)]
 async fn run_actor(
     state: &mut LogicalExecutionState,
     mut receiver: mpsc::Receiver<ActorCommand>,
@@ -3372,7 +3383,7 @@ fn result_receipt_failure(
 ) -> Option<QueryExecutionError> {
     match disposition {
         Ok(ResultDeliveryDisposition::Completed) => None,
-        Ok(ResultDeliveryDisposition::Failed(error)) => Some(error),
+        Ok(ResultDeliveryDisposition::Failed(error)) => Some(*error),
         Ok(ResultDeliveryDisposition::Dropped) | Err(()) => Some(logical_owner_failure(
             crate::execution_error::QueryFailureReason::LogicalOwnerStopped,
             "result delivery receipt ended without a consumer completion",
@@ -3890,7 +3901,7 @@ fn fail_result_runtime(state: &mut LogicalExecutionState, runtime: Option<&mut R
 fn conclude_for_work_cancellation(
     state: &mut LogicalExecutionState,
     replacement: Option<&ReplacementRuntime>,
-    mut runtime: Option<&mut ResultRuntime>,
+    runtime: Option<&mut ResultRuntime>,
     reason: &CancellationReason,
 ) {
     let was_unconcluded = state.conclusion().is_none();
@@ -3958,6 +3969,10 @@ fn conclude_with(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each mutable reference is a distinct actor ledger and must stay separately borrowed while one command is applied"
+)]
 fn handle_command(
     state: &mut LogicalExecutionState,
     attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
@@ -5071,7 +5086,10 @@ fn apply_root_status_observation(
             return;
         }
         if let RootTerminalFailure::Authoritative(error) = terminal_failure {
-            runtime.attempt_error = Some(AttemptResultFailure { activation, error });
+            runtime.attempt_error = Some(AttemptResultFailure {
+                activation,
+                error: *error,
+            });
         }
         if state.output_visible() {
             fail_result_observation(state, runtime);
@@ -5127,7 +5145,10 @@ fn apply_root_status_observation(
     if terminal_state {
         let cause_pending = matches!(&terminal_failure, RootTerminalFailure::Pending);
         if let RootTerminalFailure::Authoritative(error) = terminal_failure {
-            runtime.attempt_error = Some(AttemptResultFailure { activation, error });
+            runtime.attempt_error = Some(AttemptResultFailure {
+                activation,
+                error: *error,
+            });
         }
         if cause_pending {
             runtime.attempt_decision_pending = Some(activation);

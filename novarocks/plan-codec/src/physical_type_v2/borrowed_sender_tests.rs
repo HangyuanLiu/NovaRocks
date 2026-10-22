@@ -325,7 +325,6 @@ fn borrowed_writer_recipe_retains_permissive_original_fields_across_ordinals() {
     let writers = [WriterTypeSource::new(&recipe, &ids)];
     let encoded = borrowed(&[], &[], &writers, SOURCE, &Control::default()).unwrap();
     let expected_first = field_definition(0, 0, "writer\0", false);
-    let _original = recipe.input().fields_iter().next().unwrap().field();
     let source_wire = original_source_wire(&recipe, 0);
     assert_eq!(
         source_wire.field_facts[0].metadata,

@@ -2413,7 +2413,7 @@ mod tests {
             column_def(&format!("{name}_v")),
         ];
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: name.to_string(),

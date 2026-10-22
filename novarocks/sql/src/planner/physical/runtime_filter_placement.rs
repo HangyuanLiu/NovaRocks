@@ -721,7 +721,7 @@ fn push_probe_down(
     place_probe(node, filter_id, &bindable)
 }
 
-/// Entry point for the planner-side RF placement pass once the bridge wires it.
+#[cfg(test)]
 pub(crate) fn place_runtime_filters(
     root: &mut PhysicalPlanNode,
     settings: &SessionOptimizerSettings,

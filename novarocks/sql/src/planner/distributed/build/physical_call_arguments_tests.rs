@@ -435,7 +435,7 @@ fn physical_call_request_lambda_keeps_nested_field_names_metadata_logical_tags_a
     let DataType::List(actual) = &parameter_types[0].data_type() else {
         panic!("list")
     };
-    assert!(Arc::ptr_eq(&actual, &original_layout));
+    assert!(Arc::ptr_eq(actual, &original_layout));
     assert_eq!(actual.name(), "item");
     assert!(actual.metadata().is_empty());
     assert_eq!(

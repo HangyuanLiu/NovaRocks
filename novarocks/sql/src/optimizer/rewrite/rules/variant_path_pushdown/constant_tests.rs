@@ -24,7 +24,6 @@ use crate::planner::table::{
     SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector, TableDef,
 };
 use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray, StringViewArray};
-use arrow::datatypes::Field;
 use novarocks_functions::{ConstantPolicy, ConstantPool, ConstantValue};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, DecimalOverflowPolicy, FunctionValueType,

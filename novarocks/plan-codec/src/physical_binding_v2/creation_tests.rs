@@ -68,9 +68,7 @@ fn identity_exact_requests_preserve_first_host_and_have_no_control_tail() {
             panic!("original host error was replaced")
         };
         assert!(Arc::ptr_eq(&original, &error));
-        drop(construction);
         drop(creator);
-        drop(request);
         assert_eq!(trace.len(), refusal + 1);
         assert_eq!(trace[0], Layout::array::<u8>(8).unwrap());
         if refusal == 1 {
@@ -101,13 +99,11 @@ fn materialized_identity_clone_keeps_only_its_original_storage_until_last_refere
     };
     let identity = construction.function("identity", &mut work).unwrap();
     let independent = identity.clone_observed(|| work.step()).unwrap();
-    drop(construction);
     drop(creator);
     drop(identity);
     assert_eq!(released.load(Ordering::SeqCst), 0);
     drop(independent);
     assert_eq!(released.load(Ordering::SeqCst), 1);
-    drop(request);
     assert_eq!(
         layouts,
         [
@@ -163,20 +159,17 @@ fn argument_collection_private_holder_preserves_original_host_and_independent_li
                 failed_at.load(Ordering::SeqCst),
                 "no callback after holder refusal"
             );
-            drop(construction);
             drop(creator);
             assert_eq!(released.load(Ordering::SeqCst), 1);
         } else {
             let arguments = result.unwrap();
             let independent = arguments.clone_observed(|| work.step()).unwrap();
-            drop(construction);
             drop(creator);
             drop(arguments);
             assert_eq!(released.load(Ordering::SeqCst), 0);
             drop(independent);
             assert_eq!(released.load(Ordering::SeqCst), 1);
         }
-        drop(request);
         assert_eq!(
             trace,
             [

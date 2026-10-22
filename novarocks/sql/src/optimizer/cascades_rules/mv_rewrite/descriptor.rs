@@ -1226,7 +1226,7 @@ mod tests {
     }
 
     fn scan_plan(cols: &[OutputColumn]) -> LogicalPlanNode {
-        LogicalPlanNode::new(LogicalPlanKind::Scan(scan(cols)), vec![], None)
+        LogicalPlanNode::new(LogicalPlanKind::scan(scan(cols)), vec![], None)
     }
 
     /// A scan over a named table (the shared `scan()` helper hardcodes "t").
@@ -1238,7 +1238,7 @@ mod tests {
 
     fn scan_plan_named(table_name: &str, cols: &[OutputColumn]) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(scan_named(table_name, cols)),
+            LogicalPlanKind::scan(scan_named(table_name, cols)),
             vec![],
             None,
         )
@@ -1920,7 +1920,7 @@ mod tests {
         let v = col(2, "v");
         let sum_out = col(3, "s");
         let scan_op = scan(&[a.clone(), v.clone()]);
-        let plan = LogicalPlanNode::new(LogicalPlanKind::Scan(scan_op), vec![], None);
+        let plan = LogicalPlanNode::new(LogicalPlanKind::scan(scan_op), vec![], None);
         let mut memo = crate::optimizer::memo::Memo::new();
         let opt_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             &plan,

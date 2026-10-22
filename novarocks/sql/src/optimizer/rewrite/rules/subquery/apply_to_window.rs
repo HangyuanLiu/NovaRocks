@@ -488,15 +488,10 @@ fn check_preconditions_opt(
         return None;
     }
     for oc in &outer_conjuncts {
-        match sub_residual
+        let pos = sub_residual
             .iter()
-            .position(|sc| expr_phys_eq(arena, *oc, *sc, &full_map))
-        {
-            Some(pos) => {
-                sub_residual.remove(pos);
-            }
-            None => return None,
-        }
+            .position(|sc| expr_phys_eq(arena, *oc, *sc, &full_map))?;
+        sub_residual.remove(pos);
     }
 
     Some(WinMagicMatch {
@@ -605,7 +600,7 @@ mod tests {
         apply_right: &LogicalPlanNode,
     ) -> Option<()> {
         let apply_plan = LogicalPlanNode::new(
-            LogicalPlanKind::Apply(apply.clone()),
+            LogicalPlanKind::apply(apply.clone()),
             vec![apply_left.clone(), apply_right.clone()],
             None,
         );
@@ -738,7 +733,7 @@ mod tests {
     /// Build `Scan(lineitem, table_id=1)` for the outer left side (first instance).
     fn make_outer_lineitem_scan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: "lineitem".to_string(),
@@ -797,7 +792,7 @@ mod tests {
     /// Build `Scan(part, table_id=2)`.
     fn make_part_scan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: "part".to_string(),
@@ -846,7 +841,7 @@ mod tests {
     /// Build inner `Scan(lineitem, table_id=1)` — second instance with INNER_ ColumnIds.
     fn make_inner_lineitem_scan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: "lineitem".to_string(),
@@ -975,7 +970,7 @@ mod tests {
         );
 
         let apply = LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
                 output_column: OutputColumn {
@@ -1061,7 +1056,7 @@ mod tests {
             None,
         );
         let apply = LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: col_ref_nullable(APPLY_OUT, "val_subq", DataType::Float64),
                 output_column: OutputColumn {
@@ -1161,7 +1156,7 @@ mod tests {
         let rule = ApplyToWindow;
         // Apply without Filter wrapper → should not match
         let apply = LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Float64),
                 output_column: OutputColumn {
@@ -1532,7 +1527,7 @@ mod tests {
         left: LogicalPlanNode,
         right: LogicalPlanNode,
     ) -> LogicalPlanNode {
-        LogicalPlanNode::new(LogicalPlanKind::Apply(apply), vec![left, right], None)
+        LogicalPlanNode::new(LogicalPlanKind::apply(apply), vec![left, right], None)
     }
 
     fn make_filter_apply(
@@ -1696,7 +1691,7 @@ mod tests {
         let a = a_orig.clone();
         // Replace inner scan with one from table_id=99
         let foreign_scan = LogicalPlanNode::new(
-            LogicalPlanKind::Scan(PlanScanNode {
+            LogicalPlanKind::scan(PlanScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: "other".to_string(),
@@ -2023,7 +2018,7 @@ mod tests {
             col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64),
         );
         let apply = LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
                 output_column: OutputColumn {
@@ -2162,7 +2157,7 @@ mod tests {
         );
 
         let apply = LogicalPlanNode::new(
-            LogicalPlanKind::Apply(LogicalApplyNode {
+            LogicalPlanKind::apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
                 output_column: OutputColumn {

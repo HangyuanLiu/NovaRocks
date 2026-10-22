@@ -1318,9 +1318,11 @@ impl CatalogApplicationPort for CatalogApplicationService {
     }
 }
 
+type CatalogCredentialBindingExtraction = (Vec<CatalogCredentialBinding>, Vec<(String, String)>);
+
 fn extract_catalog_credential_bindings(
     properties: Vec<(String, String)>,
-) -> Result<(Vec<CatalogCredentialBinding>, Vec<(String, String)>), CatalogApplicationError> {
+) -> Result<CatalogCredentialBindingExtraction, CatalogApplicationError> {
     let mut credential_fields = BTreeMap::new();
     let mut provider_properties = Vec::with_capacity(properties.len());
     for (key, value) in properties {

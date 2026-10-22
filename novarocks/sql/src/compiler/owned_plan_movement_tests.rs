@@ -137,7 +137,7 @@ fn completed_query_parts_move_original_plan_and_logical_journal_together() {
                 else {
                     panic!("MIN logical source is its original scan value")
                 };
-                assert_eq!(value_type, &FunctionValueType::new(DataType::Int64, false));
+                assert_eq!(*value_type, FunctionValueType::new(DataType::Int64, false));
                 assert!(constant.is_none());
                 assert_eq!(
                     request.expected_result_type,

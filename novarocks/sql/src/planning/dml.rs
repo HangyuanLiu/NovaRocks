@@ -611,6 +611,10 @@ fn final_plan_construction_error(
 /// plan addresses that scan by is the one occurrence the finalized read set
 /// accounts for. Taking it from anywhere else would let the plan name a read
 /// nothing was frozen for.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This public FE-to-SQL boundary receives separately frozen write facts and policies; changing its signature requires a coordinated caller migration outside the P06 ownership boundary."
+)]
 pub fn build_final_frozen_connector_write_plan(
     source: crate::planning::query_execution::FrozenConnectorScanPlan,
     sink: DmlWritePlanInput,
@@ -634,7 +638,9 @@ pub fn build_final_frozen_connector_write_plan(
         .finalize_provider_read_occurrence(scan_occurrence)
         .map_err(|error| format!("finalize frozen connector scan occurrence: {error}"))?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0,control)?;
+        crate::planner::distributed::write::sink::target_schema_from_sql_write_plan_input(
+            &sink.0, control,
+        )?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
@@ -701,7 +707,9 @@ pub fn begin_final_connector_write_plan(
         .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0,&control)?;
+        crate::planner::distributed::write::sink::target_schema_from_sql_write_plan_input(
+            &sink.0, &control,
+        )?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
@@ -795,7 +803,9 @@ pub fn compile_final_connector_write_plan(
         .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0,&control)?;
+        crate::planner::distributed::write::sink::target_schema_from_sql_write_plan_input(
+            &sink.0, &control,
+        )?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
@@ -825,6 +835,10 @@ pub fn compile_final_connector_write_plan(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The lowering consumes independently owned plan, statistics, connector, and policy facts; keeping them explicit avoids a second aggregate with misleading ownership."
+)]
 fn complete_connector_write_plan(
     mut physical: crate::planner::physical::PhysicalPlanNode,
     query_statistics: &crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -1055,7 +1069,9 @@ pub fn begin_final_ctas_connector_write_plan(
 > {
     let mut physical = crate::planner::optimizer_bridge::to_physical_plan(&source.optimized)?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0,control)?;
+        crate::planner::distributed::write::sink::target_schema_from_sql_write_plan_input(
+            &sink.0, control,
+        )?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
@@ -1266,6 +1282,10 @@ impl DmlChangeStreamCompletion {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This transition consumes separately frozen producer, route, statistics, and policy facts; a wrapper would hide their distinct owners."
+)]
 pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     producer: crate::optimizer::OptimizedOperatorNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -1474,10 +1494,6 @@ pub fn compile_final_dml_change_stream(
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The producer, signed routes, statistics, authored policy and request control are distinct compiler inputs."
-)]
 pub(crate) fn seal_final_change_stream_producer(
     producer: crate::optimizer::OptimizedOperatorNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -1525,6 +1541,10 @@ pub(crate) fn seal_final_change_stream_producer(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This transition consumes separately frozen producer, route, statistics, and policy facts; a wrapper would hide their distinct owners."
+)]
 pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     producer: crate::optimizer::OptimizedOperatorNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -1701,7 +1721,7 @@ fn plan_change_stream_writer_statistics(
     let target_schemas = routes
         .iter()
         .map(|route| {
-            crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(
+            crate::planner::distributed::write::sink::target_schema_from_sql_write_plan_input(
                 &route.sink.0,
                 control,
             )
