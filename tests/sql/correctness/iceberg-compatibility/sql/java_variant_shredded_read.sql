@@ -25,15 +25,15 @@ shell: set -eu
 receipt_parent="${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/experiments/iceberg-variant"
 mkdir -p "$receipt_parent"
 receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
-"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode shredded --namespace nr_compat_${suite_uuid0} --table java_variant_shredded_${uuid0} --output "$receipt_dir"
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode shredded --namespace ${case_db} --table java_variant_shredded_${uuid0} --output "$receipt_dir"
 
 -- query 2
 SELECT id,variant_typeof(v) AS kind,try_variant_get(v,'$','int') AS number
-FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_shredded_${uuid0} ORDER BY id;
+FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_shredded_${uuid0} ORDER BY id;
 
 -- query 3
-SELECT id FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_shredded_${uuid0} WHERE try_variant_get(v,'$','int')=42 ORDER BY id;
+SELECT id FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_shredded_${uuid0} WHERE try_variant_get(v,'$','int')=42 ORDER BY id;
 
 -- query 4
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_shredded_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_shredded_${uuid0} FORCE;

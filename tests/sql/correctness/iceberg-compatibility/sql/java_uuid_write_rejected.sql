@@ -25,22 +25,22 @@ shell: set -eu
 receipt_parent="${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/experiments/iceberg-variant"
 mkdir -p "$receipt_parent"
 receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
-"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode uuid --namespace nr_compat_${suite_uuid0} --table java_uuid_rejected_${uuid0} --output "$receipt_dir"
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode uuid --namespace ${case_db} --table java_uuid_rejected_${uuid0} --output "$receipt_dir"
 
 -- query 2
-SELECT id,k IS NULL AS key_is_null FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_uuid_rejected_${uuid0} ORDER BY id;
+SELECT id,k IS NULL AS key_is_null FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} ORDER BY id;
 
 -- query 3
 -- @expect_error=Iceberg uuid writes are not supported
-INSERT INTO iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_uuid_rejected_${uuid0} VALUES (3,NULL);
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} VALUES (3,NULL);
 
 -- query 4
 -- @expect_error=Iceberg uuid writes are not supported
-UPDATE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_uuid_rejected_${uuid0} SET id=99 WHERE id=1;
+UPDATE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} SET id=99 WHERE id=1;
 
 -- query 5
 -- @expect_error=uuid
-ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_uuid_rejected_${uuid0} ADD EQUALITY DELETE (k) VALUES (NULL);
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} ADD EQUALITY DELETE (k) VALUES (NULL);
 
 -- query 6
 -- @result_contains=IRU9_UNCHANGED_OK
@@ -48,16 +48,16 @@ shell: set -eu
 receipt_parent="${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/experiments/iceberg-variant"
 mkdir -p "$receipt_parent"
 receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
-"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode unchanged --namespace nr_compat_${suite_uuid0} --table java_uuid_rejected_${uuid0} --output "$receipt_dir"
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode unchanged --namespace ${case_db} --table java_uuid_rejected_${uuid0} --output "$receipt_dir"
 
 -- query 7
 -- @skip_result_check=true
-DELETE FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_uuid_rejected_${uuid0} WHERE id=1;
-ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_uuid_rejected_${uuid0} ADD EQUALITY DELETE (id) VALUES (2);
+DELETE FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} WHERE id=1;
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} ADD EQUALITY DELETE (id) VALUES (2);
 
 -- query 8
-SELECT COUNT(*) AS remaining_rows FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_uuid_rejected_${uuid0};
+SELECT COUNT(*) AS remaining_rows FROM iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0};
 
 -- query 9
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_uuid_rejected_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_uuid_rejected_${uuid0} FORCE;

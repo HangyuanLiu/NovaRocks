@@ -25,18 +25,18 @@ shell: set -eu
 receipt_parent="${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/experiments/iceberg-variant"
 mkdir -p "$receipt_parent"
 receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
-"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode nested --namespace nr_compat_${suite_uuid0} --table java_variant_nested_${uuid0} --output "$receipt_dir"
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode nested --namespace ${case_db} --table java_variant_nested_${uuid0} --output "$receipt_dir"
 
 -- query 2
-SELECT id FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_nested_${uuid0} ORDER BY id;
+SELECT id FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_nested_${uuid0} ORDER BY id;
 
 -- query 3
 -- @expect_error=reading Iceberg Variant nested inside STRUCT, LIST or MAP is not supported
-SELECT st FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_nested_${uuid0};
+SELECT st FROM iceberg_compat_${suite_uuid0}.${case_db}.java_variant_nested_${uuid0};
 
 -- query 4
 -- @expect_error=Iceberg Variant writes are not supported
-INSERT INTO iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_nested_${uuid0} VALUES (2,NULL);
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_variant_nested_${uuid0} VALUES (2,NULL);
 
 -- query 5
 -- @result_contains=IRU9_UNCHANGED_OK
@@ -44,8 +44,8 @@ shell: set -eu
 receipt_parent="${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/experiments/iceberg-variant"
 mkdir -p "$receipt_parent"
 receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
-"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode unchanged --namespace nr_compat_${suite_uuid0} --table java_variant_nested_${uuid0} --output "$receipt_dir"
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode unchanged --namespace ${case_db} --table java_variant_nested_${uuid0} --output "$receipt_dir"
 
 -- query 6
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_variant_nested_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_variant_nested_${uuid0} FORCE;

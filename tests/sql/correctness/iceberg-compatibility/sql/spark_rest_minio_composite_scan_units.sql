@@ -26,21 +26,21 @@ shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-composite-units-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_compat_${suite_uuid0};
-DROP TABLE IF EXISTS ice_rest.nr_compat_${suite_uuid0}.composite_units_${uuid0};
-CREATE TABLE ice_rest.nr_compat_${suite_uuid0}.composite_units_${uuid0} (id BIGINT, payload STRING)
+CREATE NAMESPACE IF NOT EXISTS ice_rest.${case_db};
+DROP TABLE IF EXISTS ice_rest.${case_db}.composite_units_${uuid0};
+CREATE TABLE ice_rest.${case_db}.composite_units_${uuid0} (id BIGINT, payload STRING)
 USING iceberg
 TBLPROPERTIES ('format-version' = '3', 'write.format.default' = 'parquet');
 SPARK_SQL
 for id in $(seq 1 12); do
-  printf "INSERT INTO ice_rest.nr_compat_${suite_uuid0}.composite_units_${uuid0} VALUES (%s, 'small-%s');\n" "$id" "$id" >> "$tmp_sql"
+  printf "INSERT INTO ice_rest.${case_db}.composite_units_${uuid0} VALUES (%s, 'small-%s');\n" "$id" "$id" >> "$tmp_sql"
 done
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 printf 'SPARK_SQL_OK\n'
 
 -- query 2
 SELECT count(*) AS n_data_files
-FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.composite_units_${uuid0}$files
+FROM iceberg_compat_${suite_uuid0}.${case_db}.composite_units_${uuid0}$files
 WHERE content = 0;
 
 -- query 3
@@ -48,8 +48,8 @@ WHERE content = 0;
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE,12
 -- @be_log_count_at_least=NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN,12
 SELECT count(*) AS rows
-FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.composite_units_${uuid0};
+FROM iceberg_compat_${suite_uuid0}.${case_db}.composite_units_${uuid0};
 
 -- query 4
 -- @skip_result_check=true
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.composite_units_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.composite_units_${uuid0} FORCE;

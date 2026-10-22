@@ -25,11 +25,11 @@ shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-v3-mv-refresh-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_compat_${suite_uuid0};
+CREATE NAMESPACE IF NOT EXISTS ice_rest.${case_db};
 
-DROP TABLE IF EXISTS ice_rest.nr_compat_${suite_uuid0}.spark_v3_mv_base_${uuid0};
+DROP TABLE IF EXISTS ice_rest.${case_db}.spark_v3_mv_base_${uuid0};
 
-CREATE TABLE ice_rest.nr_compat_${suite_uuid0}.spark_v3_mv_base_${uuid0} (
+CREATE TABLE ice_rest.${case_db}.spark_v3_mv_base_${uuid0} (
   id BIGINT,
   metric INT
 ) USING iceberg
@@ -39,7 +39,7 @@ TBLPROPERTIES (
   'write.format.default' = 'parquet'
 );
 
-INSERT INTO ice_rest.nr_compat_${suite_uuid0}.spark_v3_mv_base_${uuid0} VALUES
+INSERT INTO ice_rest.${case_db}.spark_v3_mv_base_${uuid0} VALUES
   (1, 10),
   (2, 20),
   (3, 30);
@@ -50,7 +50,7 @@ printf 'SPARK_SQL_OK\n'
 -- query 2
 -- @skip_result_check=true
 SET CATALOG iceberg_compat_${suite_uuid0};
-USE nr_compat_${suite_uuid0};
+USE ${case_db};
 CREATE MATERIALIZED VIEW mv_spark_refresh_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES('storage_engine' = 'iceberg')
@@ -73,7 +73,7 @@ shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-v3-mv-refresh-append-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-INSERT INTO ice_rest.nr_compat_${suite_uuid0}.spark_v3_mv_base_${uuid0} VALUES
+INSERT INTO ice_rest.${case_db}.spark_v3_mv_base_${uuid0} VALUES
   (4, 40),
   (5, 5),
   (6, 60);
@@ -94,5 +94,5 @@ ORDER BY id;
 -- @cleanup=true
 -- @skip_result_check=true
 SET CATALOG iceberg_compat_${suite_uuid0};
-DROP MATERIALIZED VIEW IF EXISTS nr_compat_${suite_uuid0}.mv_spark_refresh_${uuid0};
-DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_mv_base_${uuid0} FORCE;
+DROP MATERIALIZED VIEW IF EXISTS ${case_db}.mv_spark_refresh_${uuid0};
+DROP TABLE IF EXISTS iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_mv_base_${uuid0} FORCE;

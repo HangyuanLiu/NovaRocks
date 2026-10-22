@@ -26,11 +26,11 @@ shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-v3-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_compat_${suite_uuid0};
+CREATE NAMESPACE IF NOT EXISTS ice_rest.${case_db};
 
-DROP TABLE IF EXISTS ice_rest.nr_compat_${suite_uuid0}.spark_v3_read_${uuid0};
+DROP TABLE IF EXISTS ice_rest.${case_db}.spark_v3_read_${uuid0};
 
-CREATE TABLE ice_rest.nr_compat_${suite_uuid0}.spark_v3_read_${uuid0} (
+CREATE TABLE ice_rest.${case_db}.spark_v3_read_${uuid0} (
   id BIGINT,
   data STRING,
   metric INT
@@ -40,7 +40,7 @@ TBLPROPERTIES (
   'write.format.default' = 'parquet'
 );
 
-INSERT INTO ice_rest.nr_compat_${suite_uuid0}.spark_v3_read_${uuid0} VALUES
+INSERT INTO ice_rest.${case_db}.spark_v3_read_${uuid0} VALUES
   (1, 'spark-rest-minio-a', 10),
   (2, 'spark-rest-minio-b', 20),
   (3, 'spark-rest-minio-c', 30);
@@ -50,8 +50,8 @@ printf 'SPARK_SQL_OK\n'
 
 -- query 2
 SELECT id, data, metric
-FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_read_${uuid0}
+FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_read_${uuid0}
 ORDER BY id;
 
 -- query 3
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_read_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_read_${uuid0} FORCE;

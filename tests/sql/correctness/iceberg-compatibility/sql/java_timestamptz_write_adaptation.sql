@@ -25,18 +25,18 @@ shell: set -eu
 receipt_parent="${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/experiments/iceberg-variant"
 mkdir -p "$receipt_parent"
 receipt_dir="$(mktemp -d "$receipt_parent/$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")"
-"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode write-target --namespace nr_compat_${suite_uuid0} --table java_timestamptz_target_${uuid0} --output "$receipt_dir"
+"${NOVAROCKS_WORKSPACE_ROOT:-.}/tests/sql/fixtures/iceberg-variant/run.sh" --mode write-target --namespace ${case_db} --table java_timestamptz_target_${uuid0} --output "$receipt_dir"
 
 -- query 2
 -- @skip_result_check=true
 SET time_zone='+08:00';
-INSERT INTO iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_timestamptz_target_${uuid0} VALUES
+INSERT INTO iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} VALUES
  (1,'2024-01-02 03:04:05.123456',12.34,'東京',X'FF00'),
  (2,NULL,NULL,NULL,NULL);
 
 -- query 3
 SELECT id,CAST(ts AS VARCHAR) AS instant,d,s,hex(raw) AS raw_hex
-FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_timestamptz_target_${uuid0} ORDER BY id;
+FROM iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} ORDER BY id;
 
 -- ADD EQUALITY DELETE currently accepts scalar literals only; hexadecimal
 -- binary literals are rejected by the existing statement lowering. Keep the
@@ -44,13 +44,13 @@ FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_timestamptz_tar
 -- adaptation with expressible timestamptz, decimal and string keys.
 -- query 4
 -- @skip_result_check=true
-ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_timestamptz_target_${uuid0} ADD EQUALITY DELETE (ts,d,s)
+ALTER TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} ADD EQUALITY DELETE (ts,d,s)
 VALUES ('2024-01-02 03:04:05.123456',12.34,'東京');
 
 -- query 5
-SELECT id FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_timestamptz_target_${uuid0} ORDER BY id;
+SELECT id FROM iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} ORDER BY id;
 
 -- query 6
 -- @skip_result_check=true
 SET time_zone='UTC';
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.java_timestamptz_target_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.java_timestamptz_target_${uuid0} FORCE;

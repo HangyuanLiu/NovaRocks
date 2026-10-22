@@ -25,11 +25,11 @@ shell: set -eu
 tmp_sql="$(mktemp "${TMPDIR:-/tmp}/novarocks-spark-v3-types-XXXXXX.sql")"
 trap 'rm -f "$tmp_sql"' EXIT
 cat > "$tmp_sql" <<'SPARK_SQL'
-CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_compat_${suite_uuid0};
+CREATE NAMESPACE IF NOT EXISTS ice_rest.${case_db};
 
-DROP TABLE IF EXISTS ice_rest.nr_compat_${suite_uuid0}.spark_v3_types_${uuid0};
+DROP TABLE IF EXISTS ice_rest.${case_db}.spark_v3_types_${uuid0};
 
-CREATE TABLE ice_rest.nr_compat_${suite_uuid0}.spark_v3_types_${uuid0} (
+CREATE TABLE ice_rest.${case_db}.spark_v3_types_${uuid0} (
   id BIGINT,
   c_bool BOOLEAN,
   c_int INT,
@@ -45,7 +45,7 @@ TBLPROPERTIES (
   'write.format.default' = 'parquet'
 );
 
-INSERT INTO ice_rest.nr_compat_${suite_uuid0}.spark_v3_types_${uuid0} VALUES
+INSERT INTO ice_rest.${case_db}.spark_v3_types_${uuid0} VALUES
   (1, TRUE, 7, CAST(7000000000 AS BIGINT), 2.50, CAST(12.34 AS DECIMAL(10, 2)), DATE '2024-01-02', TIMESTAMP '2024-01-02 03:04:05', 'alpha'),
   (2, FALSE, -8, CAST(-9000000000 AS BIGINT), -2.25, CAST(-56.78 AS DECIMAL(10, 2)), DATE '1970-01-01', TIMESTAMP '2025-12-31 23:59:58', 'beta'),
   (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
@@ -63,7 +63,7 @@ SELECT COUNT(*) AS rows_total,
        MIN(c_date) AS min_date,
        MAX(c_ts) AS max_ts,
        COUNT(c_string) AS string_nonnull
-FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_types_${uuid0};
+FROM iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_types_${uuid0};
 
 -- query 3
-DROP TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.spark_v3_types_${uuid0} FORCE;
+DROP TABLE iceberg_compat_${suite_uuid0}.${case_db}.spark_v3_types_${uuid0} FORCE;
