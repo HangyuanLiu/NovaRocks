@@ -734,6 +734,110 @@ class SweepTests(unittest.TestCase):
             self.assertEqual(cursor["pending"], [])
             self.assertNotIn("lease", cursor)
 
+    def continuation(self, directory, roots):
+        self.record.update(compose_file=str(Path(directory) / "compose.yml"), version="v1", generation="g1")
+        path = Path(directory) / "scratch-cursor.json"
+        path.write_text(json.dumps(dict(schema=1, version="v1", generation="g1", expired_only=True,
+            pending=["s3://novarocks/unvisited"], observed_run_roots=roots)))
+        return path
+
+    def test_continued_runs_share_one_native_parent_list_without_authorizing_missing_root(self):
+        present = [identity(604801, token=token * 32) for token in ("a", "b", "c")]
+        missing = identity(604801, token="d" * 32)
+        files = {value.scope_root + "/file" for value in (*present, missing)}
+        self.backend.objects = set(files)
+        parent_call = ("ls", "store/novarocks/worktree-a/scratch/")
+        native = self.backend.run_mc
+        def listing(record, script, *, deadline):
+            result = native(record, script, deadline=deadline)
+            if self.backend.calls[-1] == parent_call:
+                # Independent native listing omits one cursor hint. Its file
+                # stays in the fake store to detect any cursor-only deletion.
+                return "\n".join(json.dumps(dict(status="success", type="folder", key=value.run_id + "/"))
+                                 for value in present) + "\nNOVA_SCRATCH_MC_EXIT=0"
+            return result
+        with tempfile.TemporaryDirectory() as directory:
+            self.continuation(directory, [value.scope_root for value in (*present, missing)])
+            with patch.object(self.backend, "run_mc", side_effect=listing):
+                result = self.sweep()
+        self.assertTrue(result["complete"], result)
+        self.assertEqual(self.backend.calls.count(parent_call), 1)
+        self.assertEqual(self.backend.objects, {missing.scope_root + "/file"})
+        self.assertEqual({call[-1] for call in self.backend.calls if call[0] == "rm"},
+                         {value.scope_root.replace("s3://", "store/") + "/" for value in present})
+
+    def test_continued_parent_lists_keep_exact_bucket_and_parent_boundaries(self):
+        values = [identity(604801, token="a" * 32, worktree="s3://novarocks/worktree-a"),
+                  identity(604801, token="b" * 32, worktree="s3://novarocks/worktree-b"),
+                  identity(604801, token="c" * 32, worktree="s3://other/worktree-a")]
+        self.backend.objects = {value.scope_root + "/file" for value in values}
+        parents = [("ls", "store/novarocks/worktree-a/scratch/"),
+                   ("ls", "store/novarocks/worktree-b/scratch/"),
+                   ("ls", "store/other/worktree-a/scratch/")]
+        with tempfile.TemporaryDirectory() as directory:
+            self.continuation(directory, [value.scope_root for value in values])
+            result = self.sweep()
+        self.assertTrue(result["complete"], result)
+        self.assertFalse(self.backend.objects)
+        for parent in parents:
+            self.assertEqual(self.backend.calls.count(parent), 1)
+
+    def test_continued_parent_observations_are_fresh_on_next_same_sweeper_call(self):
+        original_file = self.old.scope_root + "/file"
+        self.backend.objects = {original_file}
+        parent_call = ("ls", "store/novarocks/worktree-a/scratch/")
+        native = self.backend.run_mc
+        def listing(record, script, *, deadline):
+            result = native(record, script, deadline=deadline)
+            if self.backend.calls[-1] == parent_call and self.backend.calls.count(parent_call) == 2:
+                return "\nNOVA_SCRATCH_MC_EXIT=0"
+            return result
+        with tempfile.TemporaryDirectory() as directory:
+            self.continuation(directory, [self.old.scope_root])
+            with patch.object(self.backend, "run_mc", side_effect=listing):
+                first = self.sweep()
+                self.assertTrue(first["complete"], first)
+                self.assertFalse(self.backend.objects)
+                self.backend.objects = {original_file}
+                # A later continuation on the SAME instance must establish
+                # native presence again, not reuse the earlier invocation.
+                self.continuation(directory, [self.old.scope_root])
+                second = self.sweep()
+        self.assertTrue(second["complete"], second)
+        self.assertEqual(self.backend.calls.count(parent_call), 2)
+        self.assertEqual(self.backend.objects, {original_file})
+
+    def test_continued_parent_read_failure_preserves_all_files(self):
+        values = [identity(604801, token=token * 32) for token in ("a", "b")]
+        files = {value.scope_root + "/file" for value in values}
+        self.backend.objects = set(files)
+        parent_call = ("ls", "store/novarocks/worktree-a/scratch/")
+        self.backend.fail[parent_call] = "AccessDenied"
+        with tempfile.TemporaryDirectory() as directory:
+            self.continuation(directory, [value.scope_root for value in values])
+            result = self.sweep()
+        self.assertFalse(result["complete"])
+        self.assertFalse(result["enumeration_complete"])
+        self.assertEqual(result["errors"][-1]["code"], "ScratchAccessDenied")
+        self.assertEqual(self.backend.calls.count(parent_call), 1)
+        self.assertEqual(self.backend.objects, files)
+        self.assertFalse(any(call[0] == "rm" for call in self.backend.calls))
+
+    def test_each_continued_root_is_validated_even_after_its_parent_was_listed(self):
+        other = identity(604801, token="b" * 32)
+        files = {self.old.scope_root + "/file", other.scope_root + "/file"}
+        self.backend.objects = set(files)
+        self.record["protected_benchmark_roots"].append(other.scope_root)
+        self.sweeper = Sweeper(self.record, self.backend, self.clock)
+        with tempfile.TemporaryDirectory() as directory:
+            self.continuation(directory, [self.old.scope_root, other.scope_root])
+            result = self.sweep()
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["errors"][-1]["code"], "RuntimeStateUnreadable")
+        self.assertEqual(self.backend.calls.count(("ls", "store/novarocks/worktree-a/scratch/")), 1)
+        self.assertEqual(self.backend.objects, files)
+        self.assertFalse(any(call[0] == "rm" for call in self.backend.calls))
+
     def test_upgrade_does_not_reuse_partial_expired_only_scan(self):
         with tempfile.TemporaryDirectory() as directory:
             self.record.update(compose_file=str(Path(directory) / "compose.yml"), version="v1", generation="g1")

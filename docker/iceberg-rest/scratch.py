@@ -944,6 +944,7 @@ class ScratchSweeper:
                     cached_roots = saved.get("observed_run_roots", [])
                     if not isinstance(cached_roots, list) or len(cached_roots) > MAX_PENDING_PREFIXES:
                         raise runtime.RuntimeFailure("RuntimeStateUnreadable", "invalid scratch root continuation")
+                    parent_rows = {}
                     for root in cached_roots:
                         bucket, key = s3_parts(root)
                         parent, _, run = key.rpartition("/")
@@ -952,7 +953,11 @@ class ScratchSweeper:
                             raise runtime.RuntimeFailure("RuntimeStateUnreadable", "unsafe continued scratch root")
                         # A cursor is only a hint. A fresh native parent listing
                         # must re-establish every retained root before cleanup.
-                        rows = self._mc(["ls", "store/" + bucket + "/" + parent + "/"], deadline, absent_ok=True)
+                        parent_key = (bucket, parent)
+                        if parent_key not in parent_rows:
+                            parent_rows[parent_key] = self._mc(
+                                ["ls", "store/" + bucket + "/" + parent + "/"], deadline, absent_ok=True)
+                        rows = parent_rows[parent_key]
                         if any(self._folder_component(row) == run for row in rows):
                             self._identity_fact(ScratchIdentity(run, root))
         if not pending:
