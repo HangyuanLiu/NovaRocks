@@ -319,6 +319,96 @@ class RendererTests(RendererCase):
             self.bind()
 
 
+class InheritedAttachBudgetTests(RendererCase):
+    wall = 1792650000.0
+
+    def context(self, remaining_work):
+        from scratch import ScratchIdentity
+        identity = ScratchIdentity.create('s3://novarocks/inherited-owner',
+            now_ms=int(self.wall * 1000) - 10000, token='b' * 32)
+        grace = self.snapshot['policy']['cleanup_grace_seconds']
+        return {'schema': 1, 'identity': identity.as_dict(), 'started_unix_ms': int(self.wall * 1000) - 10000,
+                'deadline_unix_ms': int((self.wall + grace + remaining_work) * 1000),
+                'cleanup_grace_seconds': grace}
+
+    def invoke(self, raw_context, *, health_seconds=0, expected_deadline=None):
+        now = [100.0]
+        fresh_owner = machine.MachineOwner(self.owner.root, backend=self.backend)
+        environment = {**os.environ, 'NOVAROCKS_WORKSPACE_ROOT': str(self.workspace),
+            'NOVA_ENV_CONFIG_FILE': str(HERE / 'shared.env'), 'NOVA_ENV_UPDATE_CURRENT': 'false',
+            'NOVA_FIXTURE_RUN_CONTEXT': raw_context}
+        def verified(config):
+            config['fixture_inputs'].update(lock_sha256=bom()['lock_sha256'], verified=True)
+            return bom()
+        def healthy(snapshot):
+            if expected_deadline is not None:
+                self.assertEqual(self.backend.operation_deadline, expected_deadline)
+            now[0] += health_seconds
+            return True
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, environment, clear=True), \
+                mock.patch.object(entry.time, 'time', return_value=self.wall), \
+                mock.patch.object(entry.time, 'monotonic', side_effect=lambda: now[0]), \
+                mock.patch.object(machine, 'MachineOwner', return_value=fresh_owner), \
+                mock.patch.object(entry, 'verify_inputs', side_effect=verified), \
+                mock.patch.object(self.backend, 'image_id', wraps=self.backend.image_id) as image_id, \
+                mock.patch.object(self.backend, 'healthy', side_effect=healthy) as health, \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = entry.worktree_main(['up'])
+            self.assertEqual(os.environ['NOVA_FIXTURE_RUN_CONTEXT'], raw_context)
+        actual_entry = self.workspace / 'docker/iceberg-rest/runtime' / entry.environment_identity(self.workspace)
+        self.assertIsNone(getattr(self.backend, 'operation_deadline', None))
+        return code, publication.read(actual_entry), stdout.getvalue(), stderr.getvalue(), health.call_count, image_id.call_count
+
+    def test_real_cli_env_context_bounds_full_validation_without_rewriting_parent(self):
+        original = self.context(4)
+        raw = json.dumps(original, indent=2)
+        code, published, stdout, stderr, health_calls, _ = self.invoke(raw, health_seconds=3, expected_deadline=104.0)
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(published['ready'])
+        self.assertEqual(health_calls, 1)
+        directory = Path(json.loads(stdout)['published_dir'])
+        for path in directory.iterdir():
+            if path.is_file():
+                self.assertNotIn(original['identity']['run_id'], path.read_text(), path.name)
+        self.assertNotIn('run_context', published['config'])
+
+    def test_real_cli_rejects_expired_context_before_definition_or_health(self):
+        code, published, _, stderr, health_calls, image_calls = self.invoke(json.dumps(self.context(-1)))
+        self.assertEqual(code, 1)
+        self.assertIn('RunBudgetExpired', stderr)
+        self.assertFalse(published['ready'])
+        self.assertEqual((health_calls, image_calls), (0, 0))
+
+    def test_real_cli_context_work_expiry_and_owner_cap_do_not_publish_ready(self):
+        for remaining, expected, health_seconds in ((4, 104.0, 4), (200, 190.0, 90)):
+            with self.subTest(remaining=remaining):
+                code, published, _, stderr, health_calls, _ = self.invoke(
+                    json.dumps(self.context(remaining)), health_seconds=health_seconds, expected_deadline=expected)
+                self.assertEqual(code, 1)
+                self.assertIn('RunBudgetExpired', stderr)
+                self.assertEqual(health_calls, 1)
+                self.assertFalse(published['ready'])
+
+    def test_real_cli_invalid_context_fails_fast_and_null_remains_ordinary_up(self):
+        wrong_grace = self.context(4)
+        wrong_grace['cleanup_grace_seconds'] = 1
+        excessive = self.context(4)
+        excessive['deadline_unix_ms'] = excessive['started_unix_ms'] + 86401000
+        invalid = ('{', '[]', '{"schema":1}', 'x' * 16385, json.dumps(wrong_grace), json.dumps(excessive))
+        for raw in invalid:
+            with self.subTest(raw=raw[:30]):
+                code, published, _, stderr, health_calls, image_calls = self.invoke(raw)
+                self.assertEqual(code, 75)
+                self.assertIn('RunBudgetRejected', stderr)
+                self.assertFalse(published['ready'])
+                self.assertEqual((health_calls, image_calls), (0, 0))
+        code, published, _, stderr, health_calls, _ = self.invoke('null', health_seconds=3, expected_deadline=190.0)
+        self.assertEqual(code, 0, stderr)
+        self.assertTrue(published['ready'])
+        self.assertEqual(health_calls, 1)
+
+
 class SharedEnvironmentTests(RendererCase):
     def test_independent_domains_reject_actual_overlap_and_keep_sibling_boundaries(self):
         domains = entry.storage_domains(self.config, self.snapshot, shared=True)
