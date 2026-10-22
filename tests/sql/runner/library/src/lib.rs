@@ -611,6 +611,8 @@ fn execute_target_session_sql_with<S>(
 /// Shared, read-only context for running cases within a suite.
 struct SuiteRunContext {
     fixture_budget: novarocks_cluster_harness::fixture_run::RunBudget,
+    fixture_storage: Option<novarocks_cluster_harness::fixture_run::RunStorageScope>,
+    fixture_writers_settled: Arc<AtomicBool>,
     namespace_catalogs: namespace_guard::CatalogFacts,
     suite_name: String,
     controls: Option<Arc<control_plan::SqlControlExecution>>,
@@ -659,6 +661,7 @@ impl SuiteRunContext {
     ) -> namespace_guard::NamespaceGuard {
         namespace_guard::NamespaceGuard::new(
             self.fixture_budget.identity(),
+            self.fixture_storage.as_ref(),
             self.namespace_catalogs.clone(),
             conn,
             if cleanup {
@@ -679,14 +682,22 @@ impl SuiteRunContext {
         } else {
             self.work_deadline()
         };
-        match self.fixture_budget.to_json() {
-            Ok(context) => shell::execute_shell_step_in_context(
+        match (
+            self.fixture_budget.to_json(),
+            self.fixture_storage
+                .as_ref()
+                .map(|scope| scope.to_json())
+                .transpose(),
+        ) {
+            (Ok(context), Ok(storage)) => shell::execute_shell_step_observed(
                 sql,
                 Some(deadline.map_or(limit, |d| d.min(limit))),
                 Some(&context),
+                storage.as_deref(),
                 cleanup,
+                Some(&self.fixture_writers_settled),
             ),
-            Err(error) => (
+            (Err(error), _) | (_, Err(error)) => (
                 false,
                 None,
                 format!("SQL run context serialization failed: {error:#}"),
@@ -1760,6 +1771,7 @@ struct InflightPublicationFrontendKill<'a> {
 struct InflightPublicationConcurrentShell<'a> {
     namespace_guard: namespace_guard::NamespaceGuard,
     run_context: String,
+    writer_exit: Arc<AtomicBool>,
     meta: &'a QueryMeta,
     server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
     session_config: ConnectionConfig,
@@ -1776,6 +1788,7 @@ struct InflightPublicationConcurrentShell<'a> {
 struct InflightPublicationServiceShell<'a> {
     namespace_guard: namespace_guard::NamespaceGuard,
     run_context: String,
+    writer_exit: Arc<AtomicBool>,
     meta: &'a QueryMeta,
     server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
     session_config: ConnectionConfig,
@@ -1794,6 +1807,7 @@ fn execute_target_query_with_inflight_publication_service_shell(
     let InflightPublicationServiceShell {
         namespace_guard,
         run_context,
+        writer_exit,
         meta,
         server_handle,
         session_config,
@@ -1847,11 +1861,14 @@ fn execute_target_query_with_inflight_publication_service_shell(
         log,
         "    @publication_service_hold post-requirements boundary reached"
     );
-    let (companion_ok, _, companion_error) = shell::execute_shell_step_in_context(
+    let storage = std::env::var(novarocks_cluster_harness::fixture_run::RUN_STORAGE_ENV).ok();
+    let (companion_ok, _, companion_error) = shell::execute_shell_step_observed(
         &format!("shell: {shell}"),
         Some(deadline),
         Some(&run_context),
+        storage.as_deref(),
         false,
+        Some(&writer_exit),
     );
     if !companion_ok {
         let _ = hold.release();
@@ -1909,6 +1926,7 @@ fn execute_target_query_while_publication_service_holds_shell(
     let InflightPublicationServiceShell {
         namespace_guard,
         run_context,
+        writer_exit,
         meta,
         server_handle,
         session_config,
@@ -1925,7 +1943,15 @@ fn execute_target_query_while_publication_service_holds_shell(
         original_deadline.map_or(action_deadline, |original| original.min(action_deadline));
     let shell = format!("shell: {shell}");
     let shell_thread = std::thread::spawn(move || {
-        shell::execute_shell_step_in_context(&shell, Some(deadline), Some(&run_context), false)
+        let storage = std::env::var(novarocks_cluster_harness::fixture_run::RUN_STORAGE_ENV).ok();
+        shell::execute_shell_step_observed(
+            &shell,
+            Some(deadline),
+            Some(&run_context),
+            storage.as_deref(),
+            false,
+            Some(&writer_exit),
+        )
     });
     if let Err(error) = hold.wait_until_held(deadline) {
         let _ = hold.release();
@@ -2012,6 +2038,7 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
     let InflightPublicationConcurrentShell {
         namespace_guard,
         run_context,
+        writer_exit,
         meta,
         server_handle,
         session_config,
@@ -2073,11 +2100,14 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
         "    @publication_catalog_fault before-dispatch hold reached"
     );
 
-    let (companion_ok, _, companion_error) = shell::execute_shell_step_in_context(
+    let storage = std::env::var(novarocks_cluster_harness::fixture_run::RUN_STORAGE_ENV).ok();
+    let (companion_ok, _, companion_error) = shell::execute_shell_step_observed(
         &format!("shell: {shell}"),
         Some(deadline),
         Some(&run_context),
+        storage.as_deref(),
         false,
+        Some(&writer_exit),
     );
     if !companion_ok {
         let _ = fault_guard.release();
@@ -3117,6 +3147,7 @@ fn run_case_observed(
                             unreachable!("validated service hold requires a companion shell");
                         };
                         let request = InflightPublicationServiceShell {
+                            writer_exit: Arc::clone(&ctx.fixture_writers_settled),
                             namespace_guard: ctx
                                 .namespace_guard(&case_target_conn, step.meta.cleanup),
                             run_context: ctx
@@ -3159,6 +3190,7 @@ fn run_case_observed(
                         };
                         execute_target_query_with_inflight_publication_concurrent_shell(
                             InflightPublicationConcurrentShell {
+                                writer_exit: Arc::clone(&ctx.fixture_writers_settled),
                                 namespace_guard: ctx
                                     .namespace_guard(&case_target_conn, step.meta.cleanup),
                                 run_context: ctx
@@ -5460,6 +5492,7 @@ fn finish_run_with_server_cleanup(
         failure_artifacts,
         None,
         false,
+        None,
     )
 }
 
@@ -5469,6 +5502,7 @@ fn finish_run_with_server_cleanup_recorded(
     failure_artifacts: &FailureArtifactRecorder,
     results: Option<&Arc<results_record::ResultsWriter>>,
     external: bool,
+    writer_exit: Option<&AtomicBool>,
 ) -> Result<i32> {
     let primary_failed = !matches!(&primary_result, Ok(0));
     // A real cross-process shutdown removes its runtime directory even when
@@ -5492,6 +5526,9 @@ fn finish_run_with_server_cleanup_recorded(
     let retain_runtime_artifacts =
         primary_failed || preserve_result.is_err() || shutdown_failure_candidate.is_err();
     let cleanup_result = shutdown_server_handle(&server_handle, retain_runtime_artifacts);
+    if let Some(observed) = writer_exit {
+        observed.store(cleanup_result.is_ok() && !external, Ordering::Release);
+    }
     if let Some(results) = results {
         results.observe(serde_json::json!({"kind":"server","cleanup":{"status":if cleanup_result.is_err(){"failed"}else if external{"external"}else{"ok"},"error":cleanup_result.as_ref().err().map(|e|format!("{e:#}")),"residual_pids":[]}}));
     }
@@ -5688,8 +5725,17 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         println!("❌ ERROR: {error}");
         return Ok(1);
     }
+    let owns_fixture_run =
+        std::env::var_os(novarocks_cluster_harness::fixture_run::RUN_CONTEXT_ENV).is_none();
+    let original_fixture_env = runner_config
+        .values
+        .get("fixture_env_file")
+        .map(PathBuf::from);
+    let server_writers_exited = AtomicBool::new(false);
+    let fixture_writers_settled = Arc::new(AtomicBool::new(true));
     let fixture_budget =
         fixture_context::admit(&runner_config, &base_dir, cli.fixture_budget_secs)?;
+    let fixture_storage = fixture_context::storage_scope(&runner_config, &fixture_budget)?;
     let naming_sources =
         fixture_context::selected_sources(&cli, &base_dir, &suite_names, &suite_configs)?;
     let mut fixture_names = fixture_context::RunNames::prepare(&fixture_budget, &naming_sources)?;
@@ -5753,7 +5799,26 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         } else {
             FixtureEndpoints::from_runner_config(&runner_config)?
         };
-        let subprocess_environment = fixture_endpoints.project(&mut runner_config);
+        let mut subprocess_environment = fixture_endpoints.project(&mut runner_config);
+        if let Some(storage) = &fixture_storage {
+            subprocess_environment.insert(
+                novarocks_cluster_harness::fixture_run::RUN_STORAGE_ENV.into(),
+                storage.to_json()?,
+            );
+            if isolated_rest_catalog.is_none() {
+                runner_config.values.insert(
+                    "__shared_rest_run_root".into(),
+                    fixture_budget.identity().scope_root.clone(),
+                );
+            }
+        }
+        // SAFETY: no runner-owned server, proxy or case worker exists yet.
+        // Publish the physical fixture projection once before starting those threads.
+        unsafe {
+            for (key, value) in &subprocess_environment {
+                std::env::set_var(key, value);
+            }
+        }
         let mut dataset_bindings = BTreeMap::new();
         for suite_name in &suite_names {
             if let Some(requirement) = &suite_configs[suite_name].manifest.prepared_dataset {
@@ -5768,13 +5833,6 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                     serde_json::to_value(&binding)?,
                 );
                 dataset_bindings.insert(suite_name.clone(), binding);
-            }
-        }
-        // SAFETY: no runner-owned server, proxy or case worker exists yet.
-        // Publish the physical fixture projection once before starting those threads.
-        unsafe {
-            for (key, value) in &subprocess_environment {
-                std::env::set_var(key, value);
             }
         }
         let publication_service_control = if let Some(control_uri) = publication_control_uri {
@@ -6520,6 +6578,8 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
 
                 let ctx = SuiteRunContext {
                     fixture_budget: fixture_budget.clone(),
+                    fixture_storage: fixture_storage.clone(),
+                    fixture_writers_settled: Arc::clone(&fixture_writers_settled),
                     namespace_catalogs: namespace_catalogs.clone(),
                     controls: controls.clone(),
                     suite_name: suite.name.clone(),
@@ -6730,6 +6790,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             failure_artifacts.as_ref(),
             Some(&results_writer),
             selected_cluster_mode == ClusterMode::AllInOne,
+            Some(&server_writers_exited),
         );
         server_recorded.store(true, Ordering::Relaxed);
         result
@@ -6755,6 +6816,26 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                 }
             }
             Err(error) => fixture_failures.push(format!("stop isolated fixture: {error:#}")),
+        }
+    }
+    if let (Some(storage), Some(env_file)) = (&fixture_storage, &original_fixture_env) {
+        if owns_fixture_run && !cli.dry_run && selected_cluster_mode != ClusterMode::AllInOne {
+            if server_writers_exited.load(Ordering::Acquire)
+                && fixture_writers_settled.load(Ordering::Acquire)
+                && fixture_failures.is_empty()
+            {
+                match fixture_context::cleanup_run(&base_dir, env_file, &fixture_budget, storage) {
+                    Ok(report) => failure_artifacts
+                        .record_provenance("fixture-scratch-cleanup".into(), report),
+                    Err(error) => fixture_failures.push(format!("run scratch cleanup: {error:#}")),
+                }
+            } else if server_recorded.load(Ordering::Acquire) {
+                fixture_failures.push("run scratch files retained: writer exit or private/proxy cleanup was not confirmed".into());
+            }
+        } else {
+            failure_artifacts.record_provenance("fixture-scratch-cleanup".into(), serde_json::json!({
+                "status":"deferred", "owner":if cli.dry_run {"dry-run"} else if !owns_fixture_run {"original-outer-run"} else {"external-server"}, "objects_reclaimed":false
+            }));
         }
     }
     if selection_written.load(Ordering::Relaxed) && !server_recorded.load(Ordering::Relaxed) {
@@ -6957,6 +7038,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -8110,14 +8192,17 @@ mod tests {
         let results =
             crate::results_record::ResultsWriter::create(temp.path(), results_path.to_str())
                 .unwrap();
+        let observed_exit = AtomicBool::new(true);
         let error = super::finish_run_with_server_cleanup_recorded(
             server,
             Ok(0),
             &failure_artifacts,
             Some(&results),
             false,
+            Some(&observed_exit),
         )
         .expect_err("cleanup failure must fail a successful run");
+        assert!(!observed_exit.load(Ordering::Acquire));
         let records = fs::read_to_string(results_path)
             .unwrap()
             .lines()
@@ -8319,6 +8404,8 @@ mod tests {
             },
         ));
         let ctx = super::SuiteRunContext {
+            fixture_storage: None,
+            fixture_writers_settled: Arc::new(AtomicBool::new(true)),
             namespace_catalogs: crate::namespace_guard::CatalogFacts::default(),
             fixture_budget: novarocks_cluster_harness::fixture_run::RunBudget::from_environment(
                 3600,

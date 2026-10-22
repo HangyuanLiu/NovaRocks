@@ -101,7 +101,7 @@ fn canonical_interop_s3(uri: &str) -> Option<String> {
         || !bucket
             .bytes()
             .all(|value| edge(value) || matches!(value, b'.' | b'-'))
-        || uri.contains(['%', '?', '#'])
+        || uri.contains(['%', '*', '?', '#'])
         || uri.chars().any(|value| value.is_control() || value <= ' ')
         || path.starts_with('/')
         || path.contains("//")
@@ -123,6 +123,72 @@ fn interop_descendant(root: &str, location: &str) -> bool {
     match (canonical_interop_s3(root), canonical_interop_s3(location)) {
         (Some(root), Some(location)) => location.starts_with(&format!("{root}/")),
         _ => false,
+    }
+}
+
+fn interop_storage_belongs(storage: &Value, context: &Value, location: &str) -> bool {
+    if storage["schema"] != 1
+        || storage["identity"] != context["identity"]
+        || storage["machine"]["daemon_id"] != storage["storage_owner"]["daemon_id"]
+        || storage["storage_owner"]["minio_volume"]
+            .as_str()
+            .is_none_or(str::is_empty)
+    {
+        return false;
+    }
+    let normalized = location
+        .strip_prefix("s3a://")
+        .map(|body| format!("s3://{body}"));
+    let Some(location) = canonical_interop_s3(normalized.as_deref().unwrap_or(location)) else {
+        return false;
+    };
+    let Some(root) = context["identity"]["scope_root"].as_str() else {
+        return false;
+    };
+    if storage["ranges"]["run_root"].as_str() != Some(format!("{root}/").as_str()) {
+        return false;
+    }
+    if location == root || interop_descendant(root, &location) {
+        return true;
+    }
+    let Some(run) = context["identity"]["run_id"].as_str() else {
+        return false;
+    };
+    for range in ["rest", "rest_mv"] {
+        let Some(warehouse) = storage["ranges"][range]["warehouse"].as_str() else {
+            return false;
+        };
+        if storage["ranges"][range]["namespace_prefix"].as_str() != Some(format!("{run}_").as_str())
+            || canonical_interop_s3(warehouse).is_none_or(|v| format!("{v}/") != warehouse)
+        {
+            return false;
+        }
+        if let Some(relative) = location.strip_prefix(warehouse) {
+            let namespace = relative.split('/').next().unwrap_or_default();
+            if let Some(purpose) = namespace.strip_prefix(&format!("{run}_")) {
+                if namespace.len() <= 63
+                    && !purpose.is_empty()
+                    && purpose.as_bytes()[0].is_ascii_lowercase()
+                    && purpose
+                        .bytes()
+                        .all(|v| v.is_ascii_lowercase() || v.is_ascii_digit())
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn assert_original_storage(location: &str) {
+    if let Some(context) = original_scratch() {
+        let storage: Value = serde_json::from_str(&required("NOVA_FIXTURE_RUN_STORAGE"))
+            .expect("original fixture storage projection must be JSON");
+        assert!(
+            interop_storage_belongs(&storage, &context, location),
+            "actual Java location must belong to the original run storage ranges"
+        );
     }
 }
 
@@ -194,10 +260,8 @@ fn scratch_location(namespace: &NamespaceIdent, name: Option<&str>) -> Option<St
     })
 }
 
-fn scratch_namespace_properties(namespace: &NamespaceIdent) -> HashMap<String, String> {
-    scratch_location(namespace, None)
-        .map(|location| HashMap::from([("location".into(), location)]))
-        .unwrap_or_default()
+fn scratch_namespace_properties(_namespace: &NamespaceIdent) -> HashMap<String, String> {
+    HashMap::new()
 }
 
 #[test]
@@ -246,6 +310,27 @@ fn shared_interop_case_ordinals_preserve_complete_scratch_identity() {
     assert!(
         std::panic::catch_unwind(|| scratch_namespace(&malformed, "NR_IRU5", "shapes")).is_err()
     );
+}
+
+#[test]
+fn shared_interop_storage_membership_matches_fixture_scope_vectors() {
+    let vectors: Value = serde_json::from_str(include_str!(
+        "../../../../../../docker/iceberg-rest/tests/run_storage_scope_vectors.json"
+    ))
+    .unwrap();
+    let context = json!({"identity":vectors["identity"]});
+    for case in vectors["membership"].as_array().unwrap() {
+        assert_eq!(
+            interop_storage_belongs(
+                &vectors["projection"],
+                &context,
+                case["uri"].as_str().unwrap()
+            ),
+            case["belongs"].as_bool().unwrap_or(false),
+            "{}",
+            case["uri"]
+        );
+    }
 }
 
 fn error(message: impl Into<String>) -> Error {
@@ -437,7 +522,7 @@ impl Java {
             .post(self.endpoint(&["namespaces", &self.namespace.to_url_string(), "tables"]))
             .json(&CreateTableRequest {
                 name: name.to_owned(),
-                location: scratch_location(&self.namespace, Some(name)),
+                location: None,
                 schema: schema(),
                 partition_spec: Some(PartitionSpec::unpartition_spec().into_unbound()),
                 write_order: Some(SortOrder::unsorted_order()),
@@ -452,6 +537,10 @@ impl Java {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let loaded: LoadTableResult = response.json().await.unwrap();
+        assert_original_storage(loaded.metadata.location());
+        if let Some(location) = loaded.metadata_location.as_deref() {
+            assert_original_storage(location);
+        }
         assert_eq!(loaded.metadata.format_version(), FormatVersion::V3);
         assert!(
             loaded.metadata.location().starts_with("s3://"),
@@ -476,11 +565,9 @@ impl Java {
             .json()
             .await
             .map_err(|e| error(format!("Java load decode failed: {e}")))?;
-        if let Some(expected) = scratch_location(&self.namespace, None) {
-            assert!(
-                interop_descendant(&expected, loaded.metadata.location()),
-                "actual Java table location must retain original scratch scope"
-            );
+        assert_original_storage(loaded.metadata.location());
+        if let Some(location) = loaded.metadata_location.as_deref() {
+            assert_original_storage(location);
         }
         Ok(loaded)
     }
@@ -2552,12 +2639,7 @@ async fn iru13a_java_rest_view_create_replace_drop() {
     assert!(endpoints.view_exists(&view).await.unwrap());
     let current = endpoints.load_view(&view).await.unwrap();
     assert_eq!(current.uuid(), view_uuid);
-    if let Some(expected) = scratch_location(rest.namespace(), None) {
-        assert!(
-            interop_descendant(&expected, current.location()),
-            "actual Java view location must retain original scratch scope"
-        );
-    }
+    assert_original_storage(current.location());
     assert_eq!(current_sql(&current), "select 1 as id");
 
     let again = endpoints.create_view(rest.namespace(), creation()).await;
@@ -3164,12 +3246,7 @@ impl NovaRocksRest {
             .load_view(&self.java.ident(name))
             .await
             .unwrap();
-        if let Some(expected) = scratch_location(self.namespace(), None) {
-            assert!(
-                interop_descendant(&expected, loaded.location()),
-                "actual Java view location must retain original scratch scope"
-            );
-        }
+        assert_original_storage(loaded.location());
         loaded
     }
 
@@ -3464,12 +3541,7 @@ async fn iru13b_java_rest_view_replacement_keeps_dialects_unless_allowed() {
         .await;
     assert_eq!(status, StatusCode::OK);
     let current = rest.endpoints.load_view(&java.ident("v")).await.unwrap();
-    if let Some(expected) = scratch_location(rest.namespace(), None) {
-        assert!(
-            interop_descendant(&expected, current.location()),
-            "actual Java view location must retain original scratch scope"
-        );
-    }
+    assert_original_storage(current.location());
 
     // Without permission the replacement is refused before dispatch.
     let error = rest

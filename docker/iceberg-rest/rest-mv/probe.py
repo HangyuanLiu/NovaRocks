@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import fixture_run
 import fixture_runtime
 from machine_runtime import MachineOwner
-from scratch import MAX_REST_BYTES, _DeadlineConnection, canonical_s3, contains
+from scratch import MAX_REST_BYTES, _DeadlineConnection, canonical_s3, contains, RunStorageScope, ScratchSweeper
 
 
 class ContractFailure(RuntimeError):
@@ -100,6 +100,7 @@ class Catalog:
         self.warehouse = endpoint["warehouse"].rstrip("/")
         self.budget, self.machine = budget, machine
         self.shared = budget is not None
+        self.storage = RunStorageScope.from_record(budget.identity, machine) if self.shared else None
         self.cleanup_mode, self.unsafe_scope = False, False
         self.namespace_root = None
         if self.shared:
@@ -172,30 +173,26 @@ class Catalog:
             self.validate_metadata(result)
         return result
 
-    def scoped_location(self, value, root, *, exact=False):
+    def scoped_location(self, value):
         try:
-            require(isinstance(value, str), f"{self.label}: actual location is absent")
-            canonical = canonical_s3(value)
-            require((canonical == canonical_s3(root) if exact else canonical != canonical_s3(root) and contains(root, canonical)),
-                    f"{self.label}: actual location escaped the original scratch root")
-            return canonical
+            require(isinstance(value, str) and self.storage.belongs(value),
+                    f"{self.label}: actual location escaped the original run storage ranges")
+            return value
         except (ContractFailure, fixture_runtime.RuntimeFailure):
             self.unsafe_scope = True
-            raise ContractFailure(f"{self.label}: actual location is not the original canonical scratch scope")
+            raise ContractFailure(f"{self.label}: actual location is outside the original run storage ranges")
 
     def validate_metadata(self, result):
         metadata = result.get("metadata")
-        require(isinstance(metadata, dict) and self.namespace_root is not None,
+        require(isinstance(metadata, dict) and self.namespace_name is not None,
                 f"{self.label}: shared metadata has no admitted namespace")
-        location = self.scoped_location(metadata.get("location"), self.namespace_root)
-        require(isinstance(result.get("metadata-location"), str), f"{self.label}: shared metadata omitted its actual file location")
-        self.scoped_location(result["metadata-location"], location)
+        self.scoped_location(metadata.get("location"))
+        self.scoped_location(result.get("metadata-location"))
 
     def validate_namespace(self, result):
         require(isinstance(result, dict) and result.get("namespace") == [self.namespace_name]
-                and isinstance(result.get("properties"), dict),
-                f"{self.label}: namespace omitted its actual location properties")
-        self.scoped_location(result["properties"].get("location"), self.namespace_root, exact=True)
+                and self.storage.owns_namespace(self.namespace_name),
+                f"{self.label}: namespace differs from the original run")
 
     def owner(self, *, cleanup=False):
         record = self.machine
@@ -216,8 +213,7 @@ class Catalog:
         self.namespace_path = base + "/" + urllib.parse.quote(namespace, safe="")
         properties = {}
         if self.shared:
-            self.namespace_root = self.budget.identity.scope_root + "/" + self.label + "/" + namespace
-            properties["location"] = self.namespace_root
+            require(self.storage.owns_namespace(namespace), f"{self.label}: namespace is outside the original run")
         created = self.request("POST", base, {"namespace": [namespace], "properties": properties}, expected=(200, 201))
         if self.shared:
             self.validate_namespace(created)
@@ -227,7 +223,7 @@ class Catalog:
         path = self.namespace_path + "/views/" + name
         self.resources.append(path)
         result = self.request("POST", self.namespace_path + "/views", {
-            "name": name, "location": (self.namespace_root if self.shared else self.warehouse + "/" + view_version["default-namespace"][0]) + "/" + name,
+            "name": name, **({} if self.shared else {"location": self.warehouse + "/" + view_version["default-namespace"][0] + "/" + name}),
             "schema": schema(), "view-version": view_version, "properties": {},
         }, expected=(200, 201))
         require("metadata" in result, f"{self.label}: create view {name} omitted metadata")
@@ -259,7 +255,7 @@ class Catalog:
         self.resources.append(table_path)
         table = self.request("POST", self.namespace_path + "/tables", {
             "name": "ordinary_table", "schema": schema(), "properties": {"format-version": "2"},
-            "location": (self.namespace_root if self.shared else self.warehouse + "/" + namespace) + "/ordinary_table",
+            **({} if self.shared else {"location": self.warehouse + "/" + namespace + "/ordinary_table"}),
         }, expected=(200, 201))["metadata"]
         require(self.request("GET", table_path).get("metadata") == table,
                 f"{self.label}: create/load table disagree")
@@ -344,11 +340,8 @@ class Catalog:
                 self.validate_metadata(loaded)
         for path in [*reversed(self.resources), self.namespace_path]:
             self.request("DELETE", path, expected=(200,204,404))
-        target = "store/" + canonical_s3(self.namespace_root).removeprefix("s3://") + "/"
-        script = ('set -e\nmc alias set store http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null\n'
-                  'mc rm --recursive --force ' + shlex.quote(target) + ' >/dev/null\n'
-                  'mc ls --recursive --json ' + shlex.quote(target))
-        require(not self.mc(script, cleanup=True).strip(), f"{self.label}: shared cleanup left objects in the exact prefix")
+        # Catalog deletion is local to this probe. Its original run owner (or
+        # TTL) retains files until the complete run-wide catalog barrier passes.
 
 
 def isolated_compose(manifest: dict) -> list[str]:
@@ -447,6 +440,7 @@ def run_probe(manifest: dict, mode: str, *, expect_dropped: bool = False, env_fi
         uri = urllib.parse.urlparse(endpoint["uri"])
         if uri.scheme not in ("http", "https") or not uri.netloc or uri.username or uri.password:
             raise EnvironmentFailure(f"fixture manifest has an invalid {key} URI")
+    owns_run = os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") in (None, "null")
     budget, machine = None, manifest.get("runtime", {}).get("machine")
     if machine is not None:
         if env_file is None:
@@ -492,6 +486,20 @@ def run_probe(manifest: dict, mode: str, *, expect_dropped: bool = False, env_fi
                 client.cleanup()
             except (ContractFailure, EnvironmentFailure, fixture_runtime.RuntimeFailure) as error:
                 failures.append(error)
+        if budget is not None and owns_run and not failures:
+            try:
+                owner = MachineOwner(machine["control_root"], daemon=machine["daemon_id"],
+                                     timeout=max(0.001, budget.remaining_seconds()))
+                with owner.ready_snapshot({"version": machine["version"]}, deadline=budget.deadline,
+                                          expected_generation=machine["generation"]) as current:
+                    scope = RunStorageScope.from_record(budget.identity, current)
+                    report = ScratchSweeper(current, owner.backend).cleanup_run(scope, [], budget.deadline)
+                    print(json.dumps(report, sort_keys=True), file=sys.stderr)
+                    require(report.get("complete") is True, "run-wide catalog barrier or object cleanup failed: " + ",".join(str(error.get("code")) for error in report.get("errors", [])))
+            except (ContractFailure, EnvironmentFailure, fixture_runtime.RuntimeFailure) as error:
+                failures.append(error)
+        if budget is not None and not owns_run and not failures:
+            print(json.dumps({"complete":False,"objects_reclaimed":False,"cleanup_owner":"original-run-or-ttl","run_id":budget.identity.run_id}), file=sys.stderr)
         if failures:
             detail = "; ".join(str(error) for error in failures)
             raise EnvironmentFailure("shared probe cleanup failed: " + detail) from primary

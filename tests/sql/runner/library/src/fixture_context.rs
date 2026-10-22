@@ -19,7 +19,7 @@
 use crate::types::{RunnerConfig, SuiteConfig};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::fixture_run::{
-    FixturePolicy, FixtureRunContext, RunBudget, ScratchIdentity, rejected,
+    FixturePolicy, FixtureRunContext, RunBudget, RunStorageScope, ScratchIdentity, rejected,
 };
 use regex::Regex;
 use sha2::{Digest, Sha256};
@@ -382,6 +382,28 @@ pub(crate) fn admit(config: &RunnerConfig, root: &Path, seconds: u64) -> Result<
     .map_err(rejected)
 }
 
+/// Capture the original shared publication before private endpoints can replace
+/// runner configuration. This is a storage projection, never another run clock.
+pub(crate) fn storage_scope(
+    config: &RunnerConfig,
+    budget: &RunBudget,
+) -> Result<Option<novarocks_cluster_harness::fixture_run::RunStorageScope>> {
+    let Some(env_file) = config.values.get("fixture_env_file") else {
+        return Ok(None);
+    };
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        Path::new(env_file).with_file_name("manifest.json"),
+    )?)?;
+    if manifest["shared_docker"] != true {
+        return Ok(None);
+    }
+    novarocks_cluster_harness::fixture_run::RunStorageScope::from_publication(
+        Path::new(env_file),
+        budget,
+    )
+    .map(Some)
+}
+
 /// Explicit writer-start maintenance, after the complete naming preflight.
 /// Read-only prepared-dataset admission never calls this helper.
 pub(crate) fn startup_sweep(config: &RunnerConfig, repo: &Path, budget: &RunBudget) -> Result<()> {
@@ -397,6 +419,88 @@ pub(crate) fn startup_sweep(config: &RunnerConfig, repo: &Path, budget: &RunBudg
     budget.check_work()?;
     novarocks_cluster_harness::fixture_run::startup_sweep(repo, Path::new(env_file), budget)?;
     budget.check_work()
+}
+
+/// The invocation owner calls this only after every writer has actually exited.
+pub(crate) fn cleanup_run(
+    repo: &Path,
+    env_file: &Path,
+    budget: &RunBudget,
+    storage: &RunStorageScope,
+) -> Result<serde_json::Value> {
+    ensure!(
+        std::time::Instant::now() < budget.deadline(),
+        "original fixture cleanup deadline expired"
+    );
+    ensure!(
+        storage.identity() == budget.identity(),
+        "cleanup storage differs from original run"
+    );
+    let mut command = novarocks_test_support::ManagedCommand::new("python3");
+    command
+        .env_clear()
+        .envs(std::env::vars_os().filter(|(key, _)| {
+            matches!(
+                key.to_str(),
+                Some(
+                    "PATH"
+                        | "HOME"
+                        | "TMPDIR"
+                        | "LANG"
+                        | "LC_ALL"
+                        | "SSL_CERT_FILE"
+                        | "DOCKER_CONTEXT"
+                        | "DOCKER_HOST"
+                        | "DOCKER_CONFIG"
+                        | "DOCKER_TLS_VERIFY"
+                        | "DOCKER_CERT_PATH"
+                        | "NOVA_FIXTURE_STORE"
+                        | "XDG_STATE_HOME"
+                        | "XDG_CONFIG_HOME"
+                )
+            )
+        }))
+        .current_dir(repo)
+        .arg(repo.join("docker/iceberg-rest/fixture_run.py"))
+        .arg("cleanup-run")
+        .arg("--env-file")
+        .arg(env_file)
+        .env(
+            novarocks_cluster_harness::fixture_run::RUN_CONTEXT_ENV,
+            budget.to_json()?,
+        )
+        .env(
+            novarocks_cluster_harness::fixture_run::RUN_STORAGE_ENV,
+            storage.to_json()?,
+        );
+    let outcome = novarocks_test_support::capture_command_until(
+        command,
+        tempfile::tempfile()?,
+        tempfile::tempfile()?,
+        budget.deadline(),
+    )?;
+    ensure!(
+        !outcome.timed_out && outcome.failures.is_empty() && outcome.output.status.success(),
+        "fixture run cleanup failed with {}; stdout={}; stderr={}; diagnostics retained at {}",
+        outcome.output.status,
+        String::from_utf8_lossy(&outcome.output.stdout),
+        String::from_utf8_lossy(&outcome.output.stderr),
+        outcome.diagnostic_root().display()
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&outcome.output.stdout).with_context(|| {
+            format!(
+                "invalid fixture cleanup report; diagnostics retained at {}",
+                outcome.diagnostic_root().display()
+            )
+        })?;
+    ensure!(
+        report["complete"] == true,
+        "fixture cleanup incomplete; report={report}; diagnostics retained at {}",
+        outcome.diagnostic_root().display()
+    );
+    outcome.release_diagnostics()?;
+    Ok(report)
 }
 
 pub(crate) fn selected_sources(
@@ -1046,17 +1150,20 @@ mod tests {
         std::fs::create_dir_all(&scripts).unwrap();
         std::fs::write(scripts.join("fixture_run.py"),r#"import json,os,pathlib,sys
 assert sys.argv[1]=='sweep-start' and sys.argv[2]=='--env-file'
+assert json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE'])['identity']==json.loads(os.environ['NOVA_FIXTURE_RUN_CONTEXT'])['identity']
 env=pathlib.Path(sys.argv[3])
 with (env.parent/'started').open('a') as output: output.write(os.environ['NOVA_FIXTURE_RUN_CONTEXT']+'\n')
 print(json.dumps({'complete':True,'pending':False,'errors':[],'removed':[]}))
 "#).unwrap();
         let env_file = root.path().join("env.sh");
         std::fs::write(&env_file, "# pinned publication\n").unwrap();
-        std::fs::write(
-            root.path().join("manifest.json"),
-            r#"{"ready":true,"runtime":{"machine":{}}}"#,
-        )
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docker/iceberg-rest/tests/run_storage_scope_vectors.json"
+        ))
         .unwrap();
+        let mut record = vectors["record"].clone();
+        record["phase"] = serde_json::json!("ready");
+        std::fs::write(root.path().join("manifest.json"), serde_json::to_vec(&serde_json::json!({"ready":true,"shared_docker":true,"runtime":{"machine":record}})).unwrap()).unwrap();
         let budget = RunBudget::admit(
             FixturePolicy::default(),
             ScratchIdentity::create("s3://novarocks/sql-startup").unwrap(),
@@ -1079,6 +1186,56 @@ print(json.dumps({'complete':True,'pending':False,'errors':[],'removed':[]}))
                 .collect::<Vec<_>>(),
             vec![budget.to_json().unwrap()]
         );
+    }
+
+    #[test]
+    fn cleanup_preserves_original_scope_deadline_and_raw_incomplete_report() {
+        let root = tempfile::tempdir().unwrap();
+        let scripts = root.path().join("docker/iceberg-rest");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let script = scripts.join("fixture_run.py");
+        std::fs::write(&script, r#"import json,os,pathlib,sys
+assert sys.argv[1:3]==['cleanup-run','--env-file']
+context=json.loads(os.environ['NOVA_FIXTURE_RUN_CONTEXT'])
+storage=json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE'])
+assert context['identity']==storage['identity']
+pathlib.Path('cleanup-request.json').write_text(json.dumps({'context':context,'storage':storage,'env':sys.argv[3]}))
+print(json.dumps({'complete':True,'catalog_barrier':{context['identity']['run_id']:{'complete':True}}}))
+"#).unwrap();
+        let env_file = root.path().join("env.sh");
+        std::fs::write(&env_file, "# pinned publication\n").unwrap();
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docker/iceberg-rest/tests/run_storage_scope_vectors.json"
+        ))
+        .unwrap();
+        let budget = RunBudget::admit(
+            FixturePolicy::default(),
+            ScratchIdentity::create("s3://novarocks/sql-cleanup").unwrap(),
+            600,
+            None,
+        )
+        .unwrap();
+        let storage = RunStorageScope::from_record(budget.identity(), &vectors["record"]).unwrap();
+        let result = cleanup_run(root.path(), &env_file, &budget, &storage).unwrap();
+        assert_eq!(result["complete"], true);
+        let request: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("cleanup-request.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            request["context"],
+            serde_json::to_value(budget.context()).unwrap()
+        );
+        assert_eq!(
+            request["storage"],
+            serde_json::from_str::<serde_json::Value>(&storage.to_json().unwrap()).unwrap()
+        );
+        std::fs::write(script,"print('{\"complete\":false,\"errors\":[{\"code\":\"CatalogRemovalUnconfirmed\"}]}')\nraise SystemExit(1)\n").unwrap();
+        let error = cleanup_run(root.path(), &env_file, &budget, &storage)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("CatalogRemovalUnconfirmed"), "{error}");
+        assert!(error.contains("diagnostics retained"));
     }
 
     #[test]

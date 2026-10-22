@@ -689,6 +689,8 @@ PYBIND
   source_env
   NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" context --env-file "$ENV_FILE")"
   export NOVA_FIXTURE_RUN_CONTEXT
+  NOVA_FIXTURE_RUN_STORAGE="$(python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" storage --env-file "$ENV_FILE")"
+  export NOVA_FIXTURE_RUN_STORAGE
   python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" sweep-start --env-file "$ENV_FILE" >&2 || return
   compose_args=(python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" compose --env-file "$ENV_FILE" --
     --env-file "$NOVA_ENV_COMPOSE_ENV" -p "$NOVA_ENV_COMPOSE_PROJECT" -f "$NOVA_ENV_COMPOSE_FILE")
@@ -826,6 +828,8 @@ main() {
     source_env
     NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" context --env-file "$ENV_FILE")"
     export NOVA_FIXTURE_RUN_CONTEXT
+    NOVA_FIXTURE_RUN_STORAGE="$(python3 "$SOURCE_ROOT/docker/iceberg-rest/fixture_run.py" storage --env-file "$ENV_FILE")"
+    export NOVA_FIXTURE_RUN_STORAGE
     if [[ "${NOVA_ENV_READY:-false}" != true ]]; then
       emit_error ready_invalid "fixture publication is unbound"
       exit 1

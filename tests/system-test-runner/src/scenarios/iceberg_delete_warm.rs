@@ -28,7 +28,7 @@ use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::CrossProcessChildEnvironment;
-use novarocks_cluster_harness::fixture_run::{RunBudget, canonical_s3};
+use novarocks_cluster_harness::fixture_run::{RunBudget, RunStorageScope};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -90,6 +90,8 @@ struct MachineBinding {
     daemon: String,
     version: String,
     generation: String,
+    storage: RunStorageScope,
+    owns_run: bool,
 }
 
 impl MachineBinding {
@@ -100,15 +102,18 @@ impl MachineBinding {
             ensure!(!value.is_empty(), "warm scratch binding omitted {name}");
             Ok(value)
         };
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(read("NOVA_ENV_MANIFEST")?)?)?;
+        let machine = &manifest["runtime"]["machine"];
         let binding = Self {
             root: read("NOVA_FIXTURE_MACHINE_ROOT")?,
             daemon: read("NOVA_FIXTURE_MACHINE_DAEMON")?,
             version: read("NOVA_FIXTURE_MACHINE_VERSION")?,
             generation: read("NOVA_FIXTURE_MACHINE_GENERATION")?,
+            storage: RunStorageScope::from_environment(budget.identity(), machine)?,
+            owns_run: env::var(novarocks_cluster_harness::fixture_run::RUN_CONTEXT_ENV)
+                .map_or(true, |value| value == "null"),
         };
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&fs::read(read("NOVA_ENV_MANIFEST")?)?)?;
-        let machine = &manifest["runtime"]["machine"];
         budget.validate_machine(machine)?;
         ensure!(
             machine["control_root"] == binding.root
@@ -292,26 +297,23 @@ impl Scenario for IcebergDeleteWarmConcurrent {
             .context("warm delete omitted original machine binding")?;
         budget.check_work()?;
         let namespace = budget.identity().resource_name("warm")?;
-        let scope = format!("{}/warm", budget.identity().scope_root);
+        let storage_projection = machine.storage.to_json()?;
         let table = format!("{CATALOG}.{namespace}.visible_rows");
         let mut registration = novarocks_cluster_harness::resource_registration::register(
             context.scenario_root(),
-            "warm-delete-scratch",
+            "warm-delete-catalog",
             &namespace,
-            &scope,
+            &storage_projection,
         )?;
         control.query_drop(format!("CREATE DATABASE {CATALOG}.{namespace}"))?;
         let mut location_verified = false;
         let private_operation = (|| -> Result<()> {
-            // SQL has no namespace LOCATION clause. Keep its DDL oracle and
-            // set the owned REST namespace location before the first table.
-            bind_scratch_namespace(&fixture.rest_uri, &namespace, &scope, budget)?;
             control.query_drop(format!("CREATE TABLE {table} (id INT, p INT, value STRING) TBLPROPERTIES ('format-version'='3', 'write.row-lineage'='true')"))?;
             verify_scratch_table(
                 &fixture.rest_uri,
                 &namespace,
                 "visible_rows",
-                &scope,
+                &machine.storage,
                 budget,
             )?;
             location_verified = true;
@@ -345,30 +347,31 @@ impl Scenario for IcebergDeleteWarmConcurrent {
             context.action("pinned and warmed old snapshot before DELETE; concurrent old/latest actors independently checked their snapshot-specific row bags");
             Ok(())
         })();
-        let cleanup = (|| -> Result<()> {
-            ensure!(
-                location_verified,
-                "warm delete cleanup retains an unverified table location"
-            );
-            // Only the attempt's private namespace is mutable or cleaned up.
-            control.query_drop(format!("DROP TABLE IF EXISTS {table} FORCE"))?;
-            control.query_drop(format!("DROP DATABASE {CATALOG}.{namespace}"))?;
-            cleanup_scratch_prefix(budget, machine, &scope, context.scenario_root())?;
-            Ok(())
-        })();
-        let cleanup_registration = registration.settle(&cleanup);
         drop(control);
         let exit = await_resource_convergence(
             context,
             &baseline,
             "warm delete and snapshot visibility readers",
         );
+        let cleanup = (|| -> Result<()> {
+            ensure_cleanup_ready(&private_operation, location_verified, &exit)?;
+            // The run-wide owner removes both catalogs before any recursive
+            // object deletion, including native JDBC warehouse directories.
+            if machine.owns_run {
+                cleanup_scratch_run(budget, machine, context.scenario_root())
+            } else {
+                cleanup_warm_namespace(&fixture.rest_uri, &namespace, budget)
+            }
+        })();
+        let cleanup_registration = registration.settle(&cleanup);
         fs::write(
             context.scenario_root().join("delete-warm-concurrent.json"),
             serde_json::to_vec_pretty(&json!({
                 "corpus_receipt":fixture.receipt_path,"corpus_sha256":fixture.receipt_sha256,
                 "observations":observations,"private_operation":private_operation.as_ref().err().map(ToString::to_string),
                 "private_cleanup":cleanup.as_ref().err().map(ToString::to_string),
+                "objects_reclaimed":machine.owns_run && cleanup.is_ok(),
+                "cleanup_owner":if machine.owns_run {"scenario-run"} else {"original-outer-run"},
                 "resource_exit":exit.as_ref().err().map(ToString::to_string),
             }))?,
         )?;
@@ -397,36 +400,11 @@ fn rest_client(budget: &RunBudget) -> Result<reqwest::blocking::Client> {
         .context("build bounded scratch namespace client")
 }
 
-fn bind_scratch_namespace(
-    uri: &str,
-    namespace: &str,
-    scope: &str,
-    budget: &RunBudget,
-) -> Result<()> {
-    let path = format!("{}/v1/namespaces/{namespace}", uri.trim_end_matches('/'));
-    rest_client(budget)?
-        .post(format!("{path}/properties"))
-        .json(&json!({"updates":{"location":scope},"removals":[]}))
-        .send()?
-        .error_for_status()
-        .context("bind warm delete namespace to its original scratch scope")?;
-    let answer: serde_json::Value = rest_client(budget)?
-        .get(path)
-        .send()?
-        .error_for_status()?
-        .json()?;
-    ensure!(
-        answer["namespace"] == json!([namespace]) && answer["properties"]["location"] == scope,
-        "warm delete namespace did not retain its exact scratch location"
-    );
-    Ok(())
-}
-
 fn verify_scratch_table(
     uri: &str,
     namespace: &str,
     table: &str,
-    scope: &str,
+    scope: &RunStorageScope,
     budget: &RunBudget,
 ) -> Result<()> {
     let answer: serde_json::Value = rest_client(budget)?
@@ -443,38 +421,63 @@ fn verify_scratch_table(
     verify_table_location(location, scope)
 }
 
-fn verify_table_location(location: &str, scope: &str) -> Result<()> {
-    let location = canonical_s3(location)?;
-    let scope = canonical_s3(scope)?;
+fn verify_table_location(location: &str, scope: &RunStorageScope) -> Result<()> {
     ensure!(
-        location.starts_with(&format!("{scope}/")),
-        "warm delete table escaped its original scratch scope"
+        scope.belongs(location)?,
+        "warm delete table escaped its original run storage ranges"
     );
     Ok(())
 }
 
-fn cleanup_scratch_prefix(
-    budget: &RunBudget,
-    machine: &MachineBinding,
-    scope: &str,
-    root: &Path,
+fn ensure_cleanup_ready(
+    operation: &Result<()>,
+    location_verified: bool,
+    actor_exit: &Result<()>,
 ) -> Result<()> {
     ensure!(
-        scope == format!("{}/warm", budget.identity().scope_root),
-        "warm cleanup requires its exact original prefix"
+        operation.is_ok(),
+        "warm delete operation did not confirm synchronous writer completion; files are retained"
     );
-    let target = format!(
-        "store/{}/",
-        scope
-            .strip_prefix("s3://")
-            .context("warm cleanup has no S3 scope")?
+    ensure!(
+        location_verified,
+        "warm delete cleanup retains an unverified table location"
     );
-    let target = format!("'{}'", target.replace('\'', "'\"'\"'"));
-    let script = format!(
-        "export MC_HOST_store=\"http://${{MINIO_ROOT_USER}}:${{MINIO_ROOT_PASSWORD}}@minio:9000\"\nmc --json rm --recursive --force {target}\n"
+    ensure!(
+        actor_exit.is_ok(),
+        "warm delete actor/resource convergence was not confirmed; files are retained"
     );
-    let script_path = root.join("warm-scratch-cleanup.sh");
-    fs::write(&script_path, script)?;
+    Ok(())
+}
+
+fn cleanup_warm_namespace(uri: &str, namespace: &str, budget: &RunBudget) -> Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(budget.remaining())
+        .build()?;
+    let base = format!("{}/v1/namespaces/{namespace}", uri.trim_end_matches('/'));
+    // Nested execution only releases its catalog entries. Its original outer
+    // owner retains all files until the complete run-wide catalog barrier.
+    client
+        .delete(format!("{base}/tables/visible_rows?purgeRequested=false"))
+        .send()?
+        .error_for_status()?;
+    client.delete(base).send()?.error_for_status()?;
+    Ok(())
+}
+
+fn cleanup_scratch_run(budget: &RunBudget, machine: &MachineBinding, root: &Path) -> Result<()> {
+    ensure!(
+        machine.storage.identity() == budget.identity(),
+        "warm cleanup storage differs from the original run"
+    );
+    let request_path = root.join("warm-scratch-cleanup.json");
+    let storage: serde_json::Value = serde_json::from_str(&machine.storage.to_json()?)?;
+    fs::write(
+        &request_path,
+        serde_json::to_vec(&json!({
+            "identity":budget.identity(), "storage":storage, "users":[]
+        }))?,
+    )?;
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()?;
@@ -506,11 +509,15 @@ fn cleanup_scratch_prefix(
         command.arg(argument).arg(value);
     }
     command
-        .args(["--cleanup", "--script-file"])
-        .arg(&script_path)
+        .args(["--cleanup", "--cleanup-run", "--script-file"])
+        .arg(&request_path)
         .env(
             novarocks_cluster_harness::fixture_run::RUN_CONTEXT_ENV,
             budget.to_json()?,
+        )
+        .env(
+            novarocks_cluster_harness::fixture_run::RUN_STORAGE_ENV,
+            machine.storage.to_json()?,
         );
     let outcome = novarocks_test_support::capture_command_until(
         command,
@@ -563,19 +570,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mutable_table_location_requires_a_canonical_descendant() {
-        let scope = "s3://warehouse/worktrees/test/scratch/run/warm";
-        assert!(verify_table_location(&format!("{scope}/visible_rows"), scope).is_ok());
+    fn converged_counters_do_not_authorize_cleanup_after_an_unknown_write() {
+        let completed = Ok(());
+        let uncertain = Err(anyhow::anyhow!("MySQL connection lost during commit"));
+        assert!(ensure_cleanup_ready(&uncertain, true, &completed).is_err());
+        assert!(ensure_cleanup_ready(&completed, false, &completed).is_err());
+        assert!(ensure_cleanup_ready(&completed, true, &uncertain).is_err());
+        assert!(ensure_cleanup_ready(&completed, true, &completed).is_ok());
+    }
+
+    #[test]
+    fn mutable_table_location_uses_the_same_fixed_run_ranges() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../docker/iceberg-rest/tests/run_storage_scope_vectors.json"
+        ))
+        .unwrap();
+        let identity = serde_json::from_value(vectors["identity"].clone()).unwrap();
+        let scope = RunStorageScope::from_record(&identity, &vectors["record"]).unwrap();
+        let native = format!(
+            "{}{}/visible_rows",
+            vectors["projection"]["ranges"]["rest"]["warehouse"]
+                .as_str()
+                .unwrap(),
+            identity.resource_name("old").unwrap()
+        );
+        assert!(verify_table_location(&native, &scope).is_ok());
+        assert!(
+            verify_table_location(
+                &format!("{}/warm/visible_rows", identity.scope_root),
+                &scope
+            )
+            .is_ok()
+        );
         for location in [
-            scope.to_owned(),
-            format!("{scope}_other/visible_rows"),
-            format!("{scope}/../benchmark/table"),
-            format!("{scope}/%2e%2e/table"),
-            format!("{scope}//table"),
+            format!("{}/../benchmark/table", identity.scope_root),
+            format!("{}/%2e%2e/table", identity.scope_root),
+            format!("{}//table", identity.scope_root),
             "s3://warehouse/benchmarks/table".to_owned(),
         ] {
             assert!(
-                verify_table_location(&location, scope).is_err(),
+                verify_table_location(&location, &scope).is_err(),
                 "{location}"
             );
         }

@@ -156,6 +156,13 @@ fn bounded_output(
         novarocks_cluster_harness::fixture_run::RUN_CONTEXT_ENV,
         budget.to_json()?,
     );
+    if let Some(storage) = std::env::var_os(novarocks_cluster_harness::fixture_run::RUN_STORAGE_ENV)
+    {
+        managed.env(
+            novarocks_cluster_harness::fixture_run::RUN_STORAGE_ENV,
+            storage,
+        );
+    }
     let outcome = novarocks_test_support::capture_command_until(
         managed,
         tempfile::tempfile()?,

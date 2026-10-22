@@ -22,7 +22,7 @@ import time
 import uuid
 
 import fixture_runtime as runtime
-from scratch import RunBudget, ScratchIdentity
+from scratch import RunBudget, RunStorageScope, ScratchIdentity, RUN_STORAGE_ENV
 
 
 def env_values(path):
@@ -59,7 +59,32 @@ def admit(env_file, seconds=None, *, inherited=None):
     identity = ScratchIdentity.from_dict(inherited["identity"]) if inherited else ScratchIdentity.create(
         "s3://novarocks/" + values["NOVA_ENV_ID"])
     budget = RunBudget.admit(record, identity, seconds=int(seconds if seconds is not None else os.environ.get("NOVA_FIXTURE_BUDGET_SECS", "3600")), inherited=inherited, cleanup=os.environ.get("NOVA_FIXTURE_CLEANUP_MODE") == "true")
+    scope = RunStorageScope.from_record(identity, record)
+    raw_scope = os.environ.get(RUN_STORAGE_ENV)
+    if raw_scope not in (None, "null"):
+        if len(raw_scope) > 16384:
+            raise runtime.RuntimeFailure("InvalidScratchScope", "inherited storage exceeds its input bound")
+        RunStorageScope.from_dict(json.loads(raw_scope)).validate_against(identity, record)
+    os.environ["NOVA_FIXTURE_RUN_CONTEXT"] = json.dumps(budget.as_dict(), sort_keys=True)
+    os.environ[RUN_STORAGE_ENV] = json.dumps(scope.as_dict(), sort_keys=True)
     return values, manifest, budget
+
+
+def cleanup_run(env_file, *, budget=None):
+    """The original owner calls this only after every writer actually exited."""
+    from machine_runtime import MachineOwner
+    from scratch import ScratchSweeper
+    _, manifest, admitted = admit(env_file, inherited=budget.as_dict() if budget else None)
+    budget = budget if budget is not None else admitted
+    if budget is None or os.environ.get("NOVA_FIXTURE_CLEANUP_MODE") != "true":
+        raise runtime.RuntimeFailure("RunBudgetRejected", "cleanup requires the original shared run context")
+    record = manifest["runtime"]["machine"]
+    owner = MachineOwner(record["control_root"], daemon=record["daemon_id"],
+                         timeout=max(0.001, budget.remaining_seconds()))
+    with owner.ready_snapshot({"version":record["version"]}, deadline=budget.deadline,
+                              expected_generation=record["generation"]) as current:
+        scope = RunStorageScope.from_dict(json.loads(os.environ[RUN_STORAGE_ENV])).validate_against(budget.identity, current)
+        return ScratchSweeper(current, owner.backend).cleanup_run(scope, [], budget.deadline)
 
 
 def startup_sweep(env_file, *, budget=None):
@@ -325,7 +350,9 @@ def compose(env_file, arguments, *, data=None, capture=False):
     # Bind the actual exec to the immutable container ID: a concurrent machine
     # upgrade must never redirect an old caller into a new credential epoch.
     options = [option for option in tail[:service] if option not in ("-T", "--no-TTY")]
-    wrapped = ["docker", "exec", "-i", *options, expected,
+    run_exports = ["-e", "NOVA_FIXTURE_RUN_CONTEXT=" + json.dumps(budget.as_dict(), sort_keys=True),
+                   "-e", RUN_STORAGE_ENV + "=" + os.environ[RUN_STORAGE_ENV]]
+    wrapped = ["docker", "exec", "-i", *run_exports, *options, expected,
         "python3", "-c", CONTAINER_OWNER, folder, str(budget.deadline_unix_ms / 1000),
         str(0 if cleanup else budget.cleanup_grace_seconds), json.dumps(budget.as_dict(),sort_keys=True), *tail[service + 1:]]
     primary, worker_result = None, None
@@ -405,24 +432,37 @@ def restore_context(path):
     current = os.environ.get("NOVA_FIXTURE_RUN_CONTEXT")
     if current not in (None, "null") and json.loads(current) != original:
         raise runtime.RuntimeFailure("RunBudgetRejected", "producer context differs from its persisted original run")
+    storage = value.get("run_storage")
+    if storage is not None:
+        scope = RunStorageScope.from_dict(storage)
+        if scope.identity.as_dict() != original["identity"]:
+            raise runtime.RuntimeFailure("InvalidScratchScope", "persisted storage differs from the original context")
+        current_storage = os.environ.get(RUN_STORAGE_ENV)
+        if current_storage not in (None, "null") and json.loads(current_storage) != storage:
+            raise runtime.RuntimeFailure("InvalidScratchScope", "producer storage differs from its persisted original run")
+        os.environ[RUN_STORAGE_ENV] = json.dumps(storage, sort_keys=True)
     os.environ["NOVA_FIXTURE_RUN_CONTEXT"] = json.dumps(original,sort_keys=True)
     return True
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("context", "compose", "command", "remaining", "temp-dir", "cleanup-dir", "sweep-start"))
+    parser.add_argument("operation", choices=("context", "storage", "compose", "command", "remaining", "temp-dir", "cleanup-dir", "cleanup-run", "sweep-start"))
     parser.add_argument("--env-file", required=True, type=Path)
     parser.add_argument("--fixture-budget-secs", type=int)
     parser.add_argument("--path")
     args, rest = parser.parse_known_args(argv)
     rest = rest[1:] if rest[:1] == ["--"] else rest
     runtime.install_signal_handlers()
-    if args.operation == "cleanup-dir" and os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") not in (None, "null"):
+    if args.operation in {"cleanup-dir", "cleanup-run"} and os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") not in (None, "null"):
         os.environ["NOVA_FIXTURE_CLEANUP_MODE"] = "true"
     values, manifest, budget = admit(args.env_file, args.fixture_budget_secs)
     if budget:
         os.environ["NOVA_FIXTURE_RUN_CONTEXT"] = json.dumps(budget.as_dict(), sort_keys=True)
+    if args.operation == "cleanup-run":
+        report = cleanup_run(args.env_file, budget=budget)
+        print(json.dumps(report, sort_keys=True))
+        return 0 if report.get("complete") is True else 1
     if args.operation == "sweep-start":
         try:
             report = startup_sweep(args.env_file, budget=budget)
@@ -440,6 +480,9 @@ def main(argv=None):
         return 0
     if args.operation == "remaining":
         print(max(0.001, budget.remaining_seconds(work=True)) if budget else 3600)
+        return 0
+    if args.operation == "storage":
+        print(os.environ[RUN_STORAGE_ENV] if budget else "null")
         return 0
     if args.operation == "context":
         print(json.dumps(budget.as_dict(), sort_keys=True) if budget else "null")

@@ -51,6 +51,8 @@ source "$CURRENT_ENV"
 [[ "${NOVA_ENV_READY:-false}" == "true" ]] || { echo "fixture is not ready; run docker/iceberg-rest/up.sh" >&2; exit 1; }
 NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$SCRIPT_DIR/fixture_run.py" context --env-file "$CURRENT_ENV")"
 export NOVA_FIXTURE_RUN_CONTEXT
+NOVA_FIXTURE_RUN_STORAGE="$(python3 "$SCRIPT_DIR/fixture_run.py" storage --env-file "$CURRENT_ENV")"
+export NOVA_FIXTURE_RUN_STORAGE
 
 
 scala_file="${1:-}"
@@ -93,11 +95,12 @@ cd "$WORKSPACE_ROOT"
 {
   cat "$NOVAROCKS_SPARK_DEFAULTS"
   if [[ "$NOVA_FIXTURE_RUN_CONTEXT" != null ]]; then
-    python3 - "$NOVA_FIXTURE_RUN_CONTEXT" <<'PYRUN'
+    python3 - "$NOVA_FIXTURE_RUN_CONTEXT" "$NOVA_FIXTURE_RUN_STORAGE" <<'PYRUN'
 import json,sys
 value=json.loads(sys.argv[1])
 print("\nspark.novarocks.fixture.scopeRoot " + value["identity"]["scope_root"])
 print("spark.novarocks.fixture.runId " + value["identity"]["run_id"])
+print("spark.novarocks.fixture.storage " + json.dumps(json.loads(sys.argv[2]),separators=(",",":")))
 PYRUN
   fi
   if [[ -n "${NOVAROCKS_SPARK_EXTRA_DEFAULTS:-}" ]]; then

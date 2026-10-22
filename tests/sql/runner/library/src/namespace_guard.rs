@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Runner-owned REST namespace placement; production SQL DDL and its oracle remain unchanged.
+//! Runner-owned shared REST namespace and fixed run-storage checks.
 use crate::types::ConnectionConfig;
 use anyhow::{Context, Result, ensure};
-use novarocks_cluster_harness::fixture_run::{ScratchIdentity, canonical_s3};
+use novarocks_cluster_harness::fixture_run::{RunStorageScope, ScratchIdentity, canonical_s3};
 use novarocks_cluster_harness::isolated_iceberg_rest::{RestObjectStoreOwner, RestStorageBinding};
 use novarocks_parser::ast::{
     CatalogStatement, DmlStatement, IcebergStatement, LiteralKind, MaintenanceStatement,
@@ -86,6 +86,7 @@ impl CatalogFacts {
 #[derive(Clone, Debug)]
 pub(crate) struct NamespaceGuard {
     identity: ScratchIdentity,
+    storage: Option<RunStorageScope>,
     facts: CatalogFacts,
     catalog: Option<String>,
     namespace: Option<String>,
@@ -94,12 +95,14 @@ pub(crate) struct NamespaceGuard {
 impl NamespaceGuard {
     pub fn new(
         identity: &ScratchIdentity,
+        storage: Option<&RunStorageScope>,
         facts: CatalogFacts,
         conn: &ConnectionConfig,
         deadline: Instant,
     ) -> Self {
         Self {
             identity: identity.clone(),
+            storage: storage.cloned(),
             facts,
             catalog: conn.catalog.clone(),
             namespace: conn.db.clone(),
@@ -170,12 +173,17 @@ impl NamespaceGuard {
         })
     }
     fn owned(&self, namespace: &str) -> bool {
+        if let Some(storage) = &self.storage {
+            return storage.owns_namespace(namespace);
+        }
         namespace
             .strip_prefix(&format!("{}_", self.identity.run_id))
-            .is_some_and(|p| {
-                !p.is_empty()
-                    && p.len() <= 5
-                    && p.bytes()
+            .is_some_and(|purpose| {
+                namespace.len() <= 63
+                    && !purpose.is_empty()
+                    && purpose.as_bytes()[0].is_ascii_lowercase()
+                    && purpose
+                        .bytes()
                         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
             })
     }
@@ -339,24 +347,20 @@ impl NamespaceGuard {
                         .map_err(|_| anyhow::anyhow!("SQL catalog facts lock poisoned"))?
                         .insert(value.name.value, fact);
                 }
-                Statement::Catalog(CatalogStatement::CreateDatabase(value)) => {
-                    if let Some((catalog, namespace, _)) = self.target(&value.name, true)?
-                        && let Some(Catalog::Rest(base)) = self.catalog_fact(&catalog)?
-                        && !self.facts.private_rest(&base)?
-                    {
-                        ensure!(
-                            self.owned(&namespace),
-                            "REST placement refused a namespace outside the original run"
-                        );
-                        self.place_namespace(&base, &namespace)?;
-                    }
-                }
                 Statement::Table(TableStatement::Create(value)) => {
-                    self.verify_table(&value.name)?
+                    self.verify_object(&value.name, "tables")?
                 }
                 Statement::Dml(DmlStatement::CreateTableAsSelect(value)) => {
                     let TableStatement::Create(table) = value.table;
-                    self.verify_table(&table.name)?;
+                    self.verify_object(&table.name, "tables")?;
+                }
+                Statement::View(ViewStatement::Create(value)) => {
+                    self.verify_object(&value.name, "views")?
+                }
+                Statement::MaterializedView(MaterializedViewStatement::Create(value)) => {
+                    // MVs are document-managed Iceberg tables published through
+                    // the existing staged-table provider path.
+                    self.verify_object(&value.name, "tables")?
                 }
                 Statement::Session(SessionStatement::Use(value)) => {
                     if let Some(catalog) = value.catalog {
@@ -398,30 +402,7 @@ impl NamespaceGuard {
             .push(namespace);
         Ok(url)
     }
-    fn place_namespace(&self, base: &str, namespace: &str) -> Result<()> {
-        let location = format!("{}/rest/{namespace}", self.identity.scope_root);
-        let url = Self::namespace_url(base, namespace)?;
-        let mut properties = url.clone();
-        properties.path_segments_mut().unwrap().push("properties");
-        reqwest::blocking::Client::new()
-            .post(properties)
-            .timeout(self.remaining()?)
-            .json(&serde_json::json!({"removals":[],"updates":{"location":location}}))
-            .send()?
-            .error_for_status()?;
-        let response: serde_json::Value = reqwest::blocking::Client::new()
-            .get(url)
-            .timeout(self.remaining()?)
-            .send()?
-            .error_for_status()?
-            .json()?;
-        ensure!(
-            response["properties"]["location"].as_str() == Some(location.as_str()),
-            "REST namespace did not retain its exact admitted run location"
-        );
-        Ok(())
-    }
-    fn verify_table(&self, name: &ObjectName) -> Result<()> {
+    fn verify_object(&self, name: &ObjectName, collection: &str) -> Result<()> {
         let Some((catalog, namespace, Some(table))) = self.target(name, false)? else {
             return Ok(());
         };
@@ -434,7 +415,10 @@ impl NamespaceGuard {
                 "REST table validation refused a foreign namespace"
             );
             let mut url = Self::namespace_url(&base, &namespace)?;
-            url.path_segments_mut().unwrap().push("tables").push(&table);
+            url.path_segments_mut()
+                .unwrap()
+                .push(collection)
+                .push(&table);
             let response: serde_json::Value = reqwest::blocking::Client::new()
                 .get(url)
                 .timeout(self.remaining()?)
@@ -445,9 +429,11 @@ impl NamespaceGuard {
                 .as_str()
                 .context("REST table metadata omitted actual location")?;
             ensure!(
-                canonical_s3(location)?
-                    .starts_with(&format!("{}/rest/{namespace}/", self.identity.scope_root)),
-                "REST table actual location lies outside its admitted run namespace scope"
+                self.storage
+                    .as_ref()
+                    .context("shared REST verification omitted original storage projection")?
+                    .belongs(location)?,
+                "REST object actual location lies outside its admitted run storage scope"
             );
         }
         Ok(())
@@ -463,8 +449,14 @@ mod tests {
 
     fn guard() -> NamespaceGuard {
         let identity = ScratchIdentity::create("s3://novarocks/guard-tests").unwrap();
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docker/iceberg-rest/tests/run_storage_scope_vectors.json"
+        ))
+        .unwrap();
+        let storage = RunStorageScope::from_record(&identity, &vectors["record"]).unwrap();
         NamespaceGuard::new(
             &identity,
+            Some(&storage),
             CatalogFacts::default(),
             &ConnectionConfig {
                 mysql: "mysql".into(),
@@ -481,10 +473,23 @@ mod tests {
     fn server(responses: Vec<serde_json::Value>) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
         let thread = std::thread::spawn(move || {
             let mut requests = Vec::new();
             for response in responses {
-                let (mut stream, _) = listener.accept().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(value) => break value,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(error) => panic!("expected REST request before deadline: {error}"),
+                    }
+                };
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
@@ -725,50 +730,75 @@ mod tests {
         }
     }
     #[test]
-    fn successful_sql_namespace_is_placed_then_read_back_at_exact_run_root() {
+    fn create_database_keeps_jdbc_native_layout_without_rest_property_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let mut guard = guard();
-        let namespace = guard.identity.resource_name("d0000").unwrap();
-        let location = format!("{}/rest/{namespace}", guard.identity.scope_root);
-        let (base, thread) = server(vec![
-            serde_json::json!({}),
-            serde_json::json!({"properties":{"location":location}}),
-        ]);
+        guard.facts.0.lock().unwrap().insert(
+            "catalog".into(),
+            Catalog::Rest(format!("http://{}", listener.local_addr().unwrap())),
+        );
+        let namespace = guard.identity.resource_name("db").unwrap();
         guard
-            .facts
-            .0
-            .lock()
-            .unwrap()
-            .insert("catalog".into(), Catalog::Rest(base));
+            .before(&format!("CREATE DATABASE {namespace};"))
+            .unwrap();
         guard
             .after(&format!("CREATE DATABASE {namespace};"))
             .unwrap();
-        let requests = thread.join().unwrap();
-        assert!(requests[0].starts_with(&format!("POST /v1/namespaces/{namespace}/properties ")));
-        assert!(requests[0].contains(&location));
-        assert!(requests[1].starts_with(&format!("GET /v1/namespaces/{namespace} ")));
-    }
-    #[test]
-    fn ignored_namespace_property_is_a_failure() {
-        let mut guard = guard();
-        let namespace = guard.identity.resource_name("d0000").unwrap();
-        let (base, thread) = server(vec![
-            serde_json::json!({}),
-            serde_json::json!({"properties":{"location":"s3://novarocks/default"}}),
-        ]);
-        guard
-            .facts
-            .0
-            .lock()
-            .unwrap()
-            .insert("catalog".into(), Catalog::Rest(base));
-        assert!(
-            guard
-                .after(&format!("CREATE DATABASE {namespace};"))
-                .unwrap_err()
-                .to_string()
-                .contains("did not retain")
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
         );
-        thread.join().unwrap();
+        for bad in [
+            &guard.identity.run_id,
+            &format!("{}_123", guard.identity.run_id),
+            &format!("{}_a12345", guard.identity.run_id),
+        ] {
+            assert!(guard.before(&format!("CREATE DATABASE {bad};")).is_err());
+        }
+    }
+
+    #[test]
+    fn ordinary_rename_explicit_and_ctas_locations_share_one_run_predicate() {
+        for category in ["ordinary", "renamed", "explicit", "ctas", "view", "mv"] {
+            let mut guard = guard();
+            let namespace = guard.identity.resource_name("now").unwrap();
+            let old = guard.identity.resource_name("old").unwrap();
+            let location = match category {
+                "ordinary" => format!("s3://warehouse/service/{namespace}/table"),
+                "renamed" => format!("s3a://warehouse/service/{old}/table"),
+                "view" | "mv" => format!("s3://warehouse/service-mv/{old}/view"),
+                _ => format!("{}/{category}/staged/table", guard.identity.scope_root),
+            };
+            let (base, thread) =
+                server(vec![serde_json::json!({"metadata":{"location":location}})]);
+            guard
+                .facts
+                .0
+                .lock()
+                .unwrap()
+                .insert("catalog".into(), Catalog::Rest(base));
+            let sql = match category {
+                "view" => format!("CREATE VIEW {namespace}.t AS SELECT 1"),
+                "mv" => format!(
+                    "CREATE MATERIALIZED VIEW {namespace}.t DISTRIBUTED BY HASH(id) BUCKETS 1 REFRESH MANUAL AS SELECT 1 AS id"
+                ),
+                "ctas" => format!("CREATE TABLE {namespace}.t AS SELECT 1"),
+                _ => format!("CREATE TABLE {namespace}.t (id INT)"),
+            };
+            novarocks_parser::parse(&sql).expect("test SQL is admitted parser input");
+            guard.after(&sql).unwrap();
+            let requests = thread.join().unwrap();
+            assert_eq!(requests.len(), 1);
+            let collection = if category == "view" {
+                "views"
+            } else {
+                "tables"
+            };
+            assert!(
+                requests[0].starts_with(&format!("GET /v1/namespaces/{namespace}/{collection}/t "))
+            );
+        }
     }
     #[test]
     fn actual_table_location_outside_original_scope_is_a_failure() {
@@ -874,7 +904,7 @@ mod tests {
         );
         assert!(
             guard
-                .place_namespace("http://127.0.0.1:1", &namespace)
+                .remaining()
                 .unwrap_err()
                 .to_string()
                 .contains("expired")

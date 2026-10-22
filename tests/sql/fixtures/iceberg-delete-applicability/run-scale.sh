@@ -36,8 +36,10 @@ done
 [[ -f "$manifest" && ! -e "$output" ]] || { echo "Manifest must exist and output must be new" >&2; exit 2; }
 NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$WORKSPACE_ROOT/docker/iceberg-rest/fixture_run.py" context --env-file "${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}")"
 export NOVA_FIXTURE_RUN_CONTEXT
+NOVA_FIXTURE_RUN_STORAGE="$(python3 "$WORKSPACE_ROOT/docker/iceberg-rest/fixture_run.py" storage --env-file "${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}")"
+export NOVA_FIXTURE_RUN_STORAGE
 if [[ "$NOVA_FIXTURE_RUN_CONTEXT" != null ]]; then
-  namespace="${namespace:-$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["identity"]["run_id"])' "$NOVA_FIXTURE_RUN_CONTEXT")}"
+  namespace="${namespace:-$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["identity"]["run_id"]+"_del")' "$NOVA_FIXTURE_RUN_CONTEXT")}"
 else
   namespace="${namespace:-uea4g_scale_$(python3 -c 'import uuid; print(uuid.uuid4().hex)')}"
 fi

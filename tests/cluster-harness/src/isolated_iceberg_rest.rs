@@ -48,7 +48,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::fixture_run::RunBudget;
+use crate::fixture_run::{RunBudget, RunStorageScope};
 use crate::resource_registration::{Registration, register};
 use std::sync::Mutex;
 
@@ -266,6 +266,7 @@ pub struct IsolatedIcebergRestFixture {
     shared_iam: Mutex<Vec<(String, String, Registration)>>,
     shared_scope_registration: Option<Registration>,
     shared_machine: Option<serde_json::Value>,
+    run_storage: Option<RunStorageScope>,
 }
 
 /// The identity of one generated `docker/iceberg-rest/runtime/<id>` entry.
@@ -425,8 +426,17 @@ impl IsolatedIcebergRestFixture {
         if fixture_budget.is_none() && private_budget.is_none() {
             sweep_stale_fixtures(&repo_root);
         }
-        if let (Some(budget), Some(snapshot)) = (&fixture_budget, &shared_machine) {
-            budget.validate_machine(snapshot)?;
+        let run_storage = match (&fixture_budget, &shared_machine) {
+            (Some(budget), Some(snapshot)) => {
+                budget.validate_machine(snapshot)?;
+                Some(RunStorageScope::from_environment(
+                    budget.identity(),
+                    snapshot,
+                )?)
+            }
+            _ => None,
+        };
+        if let (Some(budget), Some(_snapshot)) = (&fixture_budget, &shared_machine) {
             crate::fixture_run::startup_sweep(&repo_root, shared_env.as_ref().unwrap(), budget)?;
         }
         let scenario_root = ensure_absolute_directory(scenario_root)?;
@@ -492,6 +502,7 @@ impl IsolatedIcebergRestFixture {
             shared_iam: Mutex::new(Vec::new()),
             shared_scope_registration,
             shared_machine,
+            run_storage,
         };
 
         let started = (|| {
@@ -1082,6 +1093,46 @@ impl IsolatedIcebergRestFixture {
                 && !manifest.minio.secret_access_key.trim().is_empty(),
             "isolated fixture manifest is missing REST or MinIO endpoint facts"
         );
+        if let Some(budget) = &self.fixture_budget {
+            let storage = self
+                .run_storage
+                .as_ref()
+                .context("shared private fixture omitted storage projection")?;
+            let snapshot = self
+                .shared_machine
+                .as_ref()
+                .context("shared private fixture omitted machine snapshot")?;
+            let published = manifest
+                .runtime
+                .machine
+                .as_ref()
+                .context("private publication omitted shared storage machine")?;
+            storage.validate_against(budget.identity(), published)?;
+            let projection = serde_json::to_value(storage)?;
+            ensure!(
+                manifest.storage_owner.as_ref() == Some(&projection["storage_owner"])
+                    && manifest.minio.volume.as_deref()
+                        == projection["storage_owner"]["minio_volume"].as_str(),
+                "private publication object-store owner differs from original machine"
+            );
+            let port = snapshot["ports"]["minio"]
+                .as_u64()
+                .context("original machine omitted MinIO port")?;
+            ensure!(
+                manifest.minio.endpoint == format!("http://127.0.0.1:{port}"),
+                "private publication MinIO endpoint differs from original machine"
+            );
+            for warehouse in [
+                &manifest.iceberg_rest.warehouse,
+                &manifest.iceberg_rest_mv.warehouse,
+            ] {
+                let warehouse = crate::fixture_run::canonical_s3(warehouse)?;
+                ensure!(
+                    warehouse.starts_with(&format!("{}/", budget.identity().scope_root)),
+                    "private publication warehouse leaves its original run root"
+                );
+            }
+        }
         let endpoints = IsolatedIcebergRestEndpoints {
             rest_uri: manifest.iceberg_rest.uri,
             rest_warehouse: manifest.iceberg_rest.warehouse,
@@ -1191,6 +1242,13 @@ impl IsolatedIcebergRestFixture {
             )
             .env(crate::fixture_run::RUN_CONTEXT_ENV, budget.to_json()?)
             .env(
+                crate::fixture_run::RUN_STORAGE_ENV,
+                self.run_storage
+                    .as_ref()
+                    .context("shared command omitted original storage projection")?
+                    .to_json()?,
+            )
+            .env(
                 "NOVA_FIXTURE_MACHINE_GENERATION",
                 machine["generation"]
                     .as_str()
@@ -1234,7 +1292,13 @@ impl IsolatedIcebergRestFixture {
             .iter()
             .map(|(user, policy, _)| serde_json::json!({"user":user,"policy":policy}))
             .collect::<Vec<_>>();
-        let request = serde_json::json!({"identity":budget.identity(),"users":pairs}).to_string();
+        let storage = self
+            .run_storage
+            .as_ref()
+            .context("shared cleanup omitted original storage projection")?;
+        let request =
+            serde_json::json!({"identity":budget.identity(),"storage":storage,"users":pairs})
+                .to_string();
         let result = self.run_shared_request(&request, true, true).map(|_| ());
         let mut settlements = Vec::new();
         for (_, _, registration) in self
@@ -1451,6 +1515,13 @@ impl IsolatedIcebergRestFixture {
                 snapshot["daemon_id"].as_str().context("machine daemon")?,
             )
             .env(crate::fixture_run::RUN_CONTEXT_ENV, budget.to_json()?)
+            .env(
+                crate::fixture_run::RUN_STORAGE_ENV,
+                self.run_storage
+                    .as_ref()
+                    .context("shared command omitted original storage projection")?
+                    .to_json()?,
+            )
             .env(
                 "NOVA_FIXTURE_MACHINE_GENERATION",
                 snapshot["generation"]
@@ -2674,6 +2745,8 @@ fn sts_xml_value(xml: &str, element: &str) -> Result<String> {
 struct Manifest {
     env_id: String,
     runtime: ManifestRuntime,
+    #[serde(default)]
+    storage_owner: Option<serde_json::Value>,
     workspace_root: String,
     shared_docker: bool,
     compose_project: String,
@@ -2687,6 +2760,8 @@ struct Manifest {
 
 #[derive(Deserialize)]
 struct ManifestRuntime {
+    #[serde(default)]
+    machine: Option<serde_json::Value>,
     profile: String,
     control_uri: Option<String>,
     template_model_sha256: String,
@@ -2746,6 +2821,8 @@ fn read_manifest(manifest_path: &Path) -> Result<Manifest> {
 
 #[derive(Deserialize)]
 struct ManifestMinio {
+    #[serde(default)]
+    volume: Option<String>,
     endpoint: String,
     access_key_id: String,
     secret_access_key: String,
@@ -3113,6 +3190,7 @@ mod tests {
             shared_iam: Mutex::new(Vec::new()),
             shared_scope_registration: None,
             shared_machine: None,
+            run_storage: None,
         };
         (temp, fixture, manifest)
     }
@@ -3184,8 +3262,20 @@ mod tests {
                 .unwrap(),
             );
             fixture.fixture_budget = Some(budget);
-            fixture.shared_machine = Some(serde_json::json!({"control_root":"/unused",
-                "daemon_id":"daemon", "version":"version", "generation":"generation"}));
+            let vectors: serde_json::Value = serde_json::from_str(include_str!(
+                "../../../docker/iceberg-rest/tests/run_storage_scope_vectors.json"
+            ))
+            .unwrap();
+            let mut snapshot = vectors["record"].clone();
+            snapshot["control_root"] = serde_json::json!("/unused");
+            fixture.run_storage = Some(
+                RunStorageScope::from_record(
+                    fixture.fixture_budget.as_ref().unwrap().identity(),
+                    &snapshot,
+                )
+                .unwrap(),
+            );
+            fixture.shared_machine = Some(snapshot);
             let script_root = fixture.repo_root.join("docker/iceberg-rest");
             let down = script_root.join("down.sh");
             fs::write(
@@ -3202,7 +3292,7 @@ mod tests {
             fs::write(
                 script_root.join("machine_mc.py"),
                 format!(
-                    "from pathlib import Path\nPath({:?}).write_text('called')\n",
+                    "import json,os,sys\nfrom pathlib import Path\nrequest=json.loads(Path(sys.argv[sys.argv.index('--script-file')+1]).read_text())\nassert request['storage']==json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE'])\nassert request['identity']==json.loads(os.environ['NOVA_FIXTURE_RUN_CONTEXT'])['identity']\nPath({:?}).write_text(json.dumps(request))\n",
                     marker.to_str().unwrap()
                 ),
             )
@@ -3211,6 +3301,15 @@ mod tests {
             let result = fixture.shutdown();
             assert_eq!(result.is_ok(), private_succeeds);
             assert_eq!(marker.exists(), private_succeeds);
+            if private_succeeds {
+                let request: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+                assert_eq!(
+                    request["storage"],
+                    serde_json::to_value(fixture.run_storage.as_ref().unwrap()).unwrap()
+                );
+                assert!(request["users"].as_array().unwrap().is_empty());
+            }
             let observed = crate::resource_registration::collect(
                 &fixture.scenario_root,
                 &before,
@@ -3251,6 +3350,79 @@ mod tests {
                 let error = fixture.read_endpoints().unwrap_err();
                 assert!(error.to_string().contains("endpoint facts"), "{error}");
             }
+        }
+    }
+
+    #[test]
+    fn shared_private_manifest_requires_original_storage_owner_endpoint_and_child_roots() {
+        let (_temp, mut fixture, mut value) = manifest_fixture();
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docker/iceberg-rest/tests/run_storage_scope_vectors.json"
+        ))
+        .unwrap();
+        let mut snapshot = vectors["record"].clone();
+        snapshot["ports"]["minio"] = serde_json::json!(38000);
+        let budget = RunBudget::admit(
+            crate::fixture_run::FixturePolicy::default(),
+            crate::fixture_run::ScratchIdentity::create("s3://novarocks/private-fixture").unwrap(),
+            600,
+            None,
+        )
+        .unwrap();
+        fixture.run_storage =
+            Some(RunStorageScope::from_record(budget.identity(), &snapshot).unwrap());
+        value["runtime"]["machine"] = snapshot.clone();
+        value["storage_owner"] =
+            serde_json::json!({"daemon_id":"daemon-test","minio_volume":"minio-test"});
+        value["minio"]["volume"] = serde_json::json!("minio-test");
+        value["minio"]["endpoint"] = serde_json::json!("http://127.0.0.1:38000");
+        for (catalog, suffix) in [("iceberg_rest", "rest"), ("iceberg_rest_mv", "rest-mv")] {
+            value[catalog]["warehouse"] =
+                serde_json::json!(format!("{}/{suffix}", budget.identity().scope_root));
+        }
+        fixture.fixture_budget = Some(budget);
+        fixture.shared_machine = Some(snapshot);
+        let manifest_path = Path::new(value["runtime_dir"].as_str().unwrap()).join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        fixture
+            .read_endpoints()
+            .expect("exact shared owner and private children");
+        for change in [
+            "owner",
+            "volume",
+            "endpoint",
+            "machine",
+            "warehouse",
+            "lookalike",
+        ] {
+            let mut changed = value.clone();
+            match change {
+                "owner" => changed["storage_owner"]["daemon_id"] = serde_json::json!("other"),
+                "volume" => changed["minio"]["volume"] = serde_json::json!("other"),
+                "endpoint" => {
+                    changed["minio"]["endpoint"] = serde_json::json!("http://127.0.0.1:38009")
+                }
+                "machine" => {
+                    changed["runtime"]["machine"]["generation"] = serde_json::json!("other")
+                }
+                "warehouse" => {
+                    changed["iceberg_rest"]["warehouse"] =
+                        serde_json::json!("s3://warehouse/service")
+                }
+                _ => {
+                    changed["iceberg_rest_mv"]["warehouse"] = serde_json::json!(format!(
+                        "{}lookalike/rest",
+                        fixture
+                            .fixture_budget
+                            .as_ref()
+                            .unwrap()
+                            .identity()
+                            .scope_root
+                    ))
+                }
+            }
+            fs::write(&manifest_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+            assert!(fixture.read_endpoints().is_err(), "{change}");
         }
     }
 

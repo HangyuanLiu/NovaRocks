@@ -953,6 +953,8 @@ mod lifecycle_tests {
             },
         ));
         let ctx = SuiteRunContext {
+            fixture_storage: None,
+            fixture_writers_settled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             namespace_catalogs: crate::namespace_guard::CatalogFacts::default(),
             fixture_budget: novarocks_cluster_harness::fixture_run::RunBudget::from_environment(
                 3600,

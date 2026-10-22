@@ -220,6 +220,26 @@
     {
       "uri": "https://warehouse/service/table",
       "error": "InvalidScratchScope"
+    },
+    {
+      "uri": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/da\tta/file",
+      "error": "InvalidScratchScope"
+    },
+    {
+      "uri": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/da\rta/file",
+      "error": "InvalidScratchScope"
+    },
+    {
+      "uri": "s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/da\nta/file",
+      "error": "InvalidScratchScope"
+    },
+    {
+      "uri": "\u0000s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/data/file",
+      "error": "InvalidScratchScope"
+    },
+    {
+      "uri": " s3://novarocks/worktree-a/scratch/nr_scratch_1800000000000_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/data/file",
+      "error": "InvalidScratchScope"
     }
   ],
   "namespaces": [

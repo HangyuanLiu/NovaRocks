@@ -95,6 +95,25 @@ class RendererTests(RendererCase):
         self.assertEqual(before, (self.entry / 'env.sh').read_bytes())
         self.assertEqual(self.backend.events, ['ensure'])
 
+    def test_server_warehouse_and_storage_owner_are_actual_machine_facts(self):
+        first = self.bind()
+        directory = Path(first['published_dir'])
+        manifest = json.loads((directory / 'manifest.json').read_text())
+        env = self.environment(directory / 'env.sh', NOVA_FIXTURE_RUN_CONTEXT='original-budget',
+                               NOVA_FIXTURE_RUN_STORAGE='original-storage')
+        for service, prefix in (('rest', 'NOVA_ENV_REST_SERVER_WAREHOUSE_URI'),
+                                ('rest-mv', 'NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI')):
+            self.assertEqual(env[prefix], self.snapshot['server_warehouses'][service] + '/')
+        self.assertNotEqual(env['NOVA_ENV_REST_SERVER_WAREHOUSE_URI'], env['NOVAROCKS_ICEBERG_REST_WAREHOUSE'])
+        self.assertEqual(manifest['storage_owner'], {'daemon_id': self.snapshot['daemon_id'],
+            'minio_volume': self.snapshot['config']['minio_volume']})
+        self.assertEqual(manifest['storage_domains']['independent']['worktree'], 's3://novarocks/test-worktree/')
+        self.assertEqual(env['NOVA_FIXTURE_RUN_CONTEXT'], 'original-budget')
+        self.assertEqual(env['NOVA_FIXTURE_RUN_STORAGE'], 'original-storage')
+        self.assertNotIn('original-budget', (directory / 'env.sh').read_text())
+        self.assertNotIn('original-storage', (directory / 'manifest.json').read_text())
+        self.assertIn('only writers using the run credentials', (directory / 'README.md').read_text())
+
     def test_sorted_json_roundtrip_reuses_every_publication_byte(self):
         first = self.bind()
         directory = Path(first['published_dir'])
@@ -243,6 +262,61 @@ class RendererTests(RendererCase):
 
 
 class SharedEnvironmentTests(RendererCase):
+    def test_independent_domains_reject_actual_overlap_and_keep_sibling_boundaries(self):
+        domains = entry.storage_domains(self.config, self.snapshot, shared=True)
+        self.assertNotEqual(domains['independent']['rest'], domains['independent']['rest-mv'])
+        for value in ('s3://warehouse/fixture-machine/rest/',
+                      's3://warehouse/fixture-machine/',
+                      's3://novarocks/test-worktree/child/'):
+            record = copy.deepcopy(self.snapshot)
+            record['config']['benchmark_root'] = value
+            with self.subTest(value=value), self.assertRaisesRegex(runtime.RuntimeFailure, 'independent storage domains overlap'):
+                entry.storage_domains(self.config, record, shared=True)
+        record = copy.deepcopy(self.snapshot)
+        record['config']['benchmark_root'] = 's3://warehouse/fixture-machine/rest-other/'
+        entry.storage_domains(self.config, record, shared=True)
+
+    def test_invalid_warehouse_cannot_publish_ready(self):
+        self.bind()
+        self.config['warehouses']['catalog'] = 's3://novarocks/shared/benchmarks/catalog'
+        with self.assertRaisesRegex(runtime.RuntimeFailure, 'exact worktree storage root'):
+            self.bind()
+        self.assertFalse(publication.read(self.entry)['ready'])
+
+    def test_private_run_children_are_legal_without_claiming_unknown_roots(self):
+        original = 's3://novarocks/test-worktree/scratch/original-run'
+        config = copy.deepcopy(self.config)
+        config['warehouses'] = {name: original + '/' + name for name in config['warehouses']}
+        record = {'external_minio': self.snapshot, 'run_context': {'identity': {'scope_root': original}}}
+        domains = entry.storage_domains(config, record, shared=False)
+        self.assertEqual(domains['independent']['run_root'], original + '/')
+        self.assertEqual(len(domains['owned_children']), 4)
+        self.assertNotIn('s3://novarocks/', domains['independent'].values())
+        config['warehouses']['rest_client'] = 's3://warehouse/fixture-machine/rest/private'
+        with self.assertRaisesRegex(runtime.RuntimeFailure, 'original run storage root'):
+            entry.storage_domains(config, record, shared=False)
+        self.assertEqual(entry.storage_domains(config, {}, shared=False), {})
+
+    def test_storage_root_rejects_ambiguous_keys_without_normalizing_them(self):
+        self.assertEqual(entry.storage_root('s3://bucket/root/'), 's3://bucket/root/')
+        self.assertEqual(entry.storage_root('s3://bucket/root'), 's3://bucket/root/')
+        for uri in ('s3://bucket/root//', 's3://bucket/root//child', 's3://bucket/root/./child',
+                    's3://bucket/root/../child', 's3://bucket/root/%2fchild', 's3://bucket/root?',
+                    's3://bucket/root#', 's3://bucket/root?query', 's3a://bucket/root', 's3://bucket/',
+                    '\0s3://bucket/root', 's3://bucket/roo*t', 's3://bucket/roo\tt'):
+            with self.subTest(uri=uri), self.assertRaises(runtime.RuntimeFailure):
+                entry.storage_root(uri)
+
+    def test_offline_request_validates_benchmark_directory_spelling(self):
+        settings = entry.load_settings(HERE / 'shared.env')
+        config = entry.request_config(self.workspace, settings, HERE / 'shared.env', self.entry,
+                                      shared=True, update_current=False)
+        self.assertTrue(config['benchmark']['shared_root'].endswith('/'))
+        settings['NOVA_ENV_SHARED_BENCHMARK_ROOT'] = 's3://novarocks/shared//benchmarks'
+        with self.assertRaisesRegex(runtime.RuntimeFailure, 'ambiguous path component'):
+            entry.request_config(self.workspace, settings, HERE / 'shared.env', self.entry,
+                                 shared=True, update_current=False)
+
     def test_two_worktrees_share_machine_and_benchmark_but_not_worktree_prefixes(self):
         first = self.bind()
         other_entry = self.entry.parent / 'other-worktree'
@@ -332,7 +406,7 @@ class HelperEntryTests(RendererCase):
         return log, {**os.environ, "PATH":str(fakebin)+":"+os.environ["PATH"],
                      "NOVA_ENV_REST_ENV_FILE":str(Path(first["published_dir"])/"env.sh")}
 
-    def test_generated_shared_smoke_expands_exact_original_run_and_purges_its_own_names(self):
+    def test_generated_shared_smoke_uses_native_layout_and_releases_catalog_names_without_purge(self):
         import fixture_run
         first = self.bind()
         publication_dir = Path(first["published_dir"])
@@ -358,12 +432,12 @@ class HelperEntryTests(RendererCase):
         self.assertEqual(len(queries),2)
         for text,context in zip(queries,contexts):
             namespace=context["identity"]["run_id"]+"_smoke"
-            location=context["identity"]["scope_root"]+"/rest/"+namespace
             self.assertEqual(len(namespace),63)
-            self.assertIn("CREATE NAMESPACE ice_rest."+namespace+" LOCATION '"+location+"';",text)
-            self.assertIn("LOCATION '"+location+"/spark_v3_smoke'",text)
-            self.assertIn("DROP TABLE ice_rest."+namespace+".spark_v3_smoke PURGE;",text)
-            self.assertTrue(text.endswith("DROP NAMESPACE ice_rest."+namespace+";\n"))
+            self.assertIn("CREATE NAMESPACE ice_rest."+namespace+";",text)
+            self.assertNotIn("LOCATION",text)
+            self.assertNotIn("PURGE",text)
+            self.assertIn("DROP TABLE IF EXISTS ice_rest."+namespace+".spark_v3_smoke;",text)
+            self.assertTrue(text.endswith("DROP NAMESPACE IF EXISTS ice_rest."+namespace+";\n"))
             self.assertIn("(3, 'spark-v3-c', 'alpha', TIMESTAMP '2026-05-07 00:02:00')",text)
             self.assertIn("SELECT * FROM ice_rest."+namespace+".spark_v3_smoke ORDER BY id;",text)
             self.assertNotIn("__NOVA_SMOKE",text)
@@ -538,7 +612,7 @@ class IsolatedEntryTests(RendererCase):
         self.assertEqual(record['service_ports']['rest-mv'], {'8181/tcp': 24101})
         self.assertIn('http://127.0.0.1:24101/v1/config', record['health_urls'])
         self.assertEqual(manifest['iceberg_rest_mv'], {'uri': 'http://127.0.0.1:24101',
-            'warehouse': 's3://warehouse/test-worktree/rest-mv', 'server_default_warehouse': 's3://warehouse/test-worktree/rest-mv'})
+            'warehouse': 's3://warehouse/test-worktree/rest-mv', 'server_default_warehouse': 's3://warehouse/test-worktree/rest-mv/'})
         self.assertIn("NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI='s3://warehouse/test-worktree/rest-mv'", (self.entry / 'compose.env').read_text())
         self.assertEqual(os.readlink(sentinel), 'existing-worktree')
         hook = self.isolated('publication-hook')

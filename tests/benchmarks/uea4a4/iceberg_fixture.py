@@ -93,7 +93,7 @@ def validate_location(uri: str) -> str:
 def database_for(prefix: str) -> str:
     for part in prefix.split("/"):
         if support.resource_run(part):
-            return support.resource_run(part)
+            return support.resource_run(part) + "_a4"
     return f"uea4a4_{prefix.rsplit('-', 1)[-1]}"
 
 
@@ -240,6 +240,12 @@ def parse_oracle(output: str, files_per_table: int) -> dict[str, int]:
 
 def remove_prefix(runtime: Any, location: str) -> None:
     prefix = validate_location(location)
+    if getattr(runtime, "run_budget", None) is not None:
+        # Nested producers cannot remove the outer run's catalog entries to
+        # establish its catalog-wide barrier. The original owner or TTL does it.
+        print(json.dumps({"complete":False,"objects_reclaimed":False,
+                          "cleanup_owner":"original-run-or-ttl","location":location}), file=sys.stderr)
+        return
     support.compose_mc(
         runtime,
         """
@@ -348,6 +354,8 @@ def prepare(args: argparse.Namespace) -> int:
             "fixture_kind": KIND,
             "run_id": args.run_id,
             "run_context": json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"]) if os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") not in (None, "null") else None,
+            "run_storage": json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]) if os.environ.get("NOVA_FIXTURE_RUN_STORAGE") not in (None, "null") else None,
+            "owns_fixture_run": bool(getattr(runtime, "owns_fixture_run", False)),
             "definition_sha256": definition,
             "warehouse_uri": rest_warehouse,
             "table_location": location,
@@ -408,9 +416,18 @@ def cleanup(args: argparse.Namespace) -> int:
         sql_path = output_dir / "cleanup.sql"
         support.atomic_write(sql_path, sql.encode())
         spark_build(runtime, env_file, sql_path)
-        remove_prefix(runtime, location)
+        cleanup_report = None
+        if runtime.run_budget is not None and manifest.get("owns_fixture_run") is True:
+            cleanup_report = support.governed_run.cleanup_run(env_file, budget=runtime.run_budget)
+            support.write_json(output_dir / "cleanup-report.json", cleanup_report)
+            if cleanup_report.get("complete") is not True:
+                raise support.FixtureError("original run catalog barrier or object cleanup failed")
+        else:
+            remove_prefix(runtime, location)
         (output_dir / "READY").unlink()
-        support.write_json(output_dir / "CLEANED", {"run_id": args.run_id, "table_location": location})
+        support.write_json(output_dir / "CLEANED", {"run_id": args.run_id, "table_location": location,
+            "objects_reclaimed": runtime.run_budget is None or bool(cleanup_report and cleanup_report.get("complete")),
+            "cleanup_owner": "original-run" if cleanup_report else ("original-run-or-ttl" if runtime.run_budget else "private-producer")})
     return 0
 
 

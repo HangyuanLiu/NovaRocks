@@ -25,7 +25,7 @@ class RunTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.env = self.root / "env.sh"
-        self.manifest = {"ready": True, "runtime": {"machine": {
+        self.manifest = {"ready": True, "runtime": {"machine": {"id":"exact-machine","control_root":"/owned/machine","daemon_id":"exact-daemon","version":"exact-version","generation":"exact-generation", "config":{"minio_volume":"exact-volume"},"server_warehouses":{"rest":"s3://warehouse/machine/rest","rest-mv":"s3://warehouse/machine/rest-mv"},
             "containers": {"spark": "exact-spark"},
             "policy": {"max_run_seconds": 86400, "cleanup_grace_seconds": 300,
                        "scratch_ttl_seconds": 604800}}}}
@@ -39,6 +39,70 @@ class RunTests(unittest.TestCase):
         self.manifest["runtime"]["machine"].update(control_root=str(self.root/"machine"), daemon_id="exact-daemon", version="exact-version", generation="exact-generation")
         self.write_manifest()
         return fixture_run.admit(self.env)[2]
+
+    def test_storage_projection_is_fixed_and_revalidated_before_native_effects(self):
+        with patch.dict(os.environ, {}, clear=True):
+            _, manifest, original = fixture_run.admit(self.env)
+            storage = json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"])
+            self.assertEqual(storage["identity"], original.identity.as_dict())
+            self.assertEqual(set(original.as_dict()), {"schema", "identity", "started_unix_ms", "deadline_unix_ms", "cleanup_grace_seconds"})
+            _, _, nested = fixture_run.admit(self.env)
+            self.assertEqual(nested.as_dict(), original.as_dict())
+            self.assertEqual(json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]), storage)
+            storage["ranges"]["rest"]["warehouse"] = "s3://warehouse/foreign/"
+            os.environ["NOVA_FIXTURE_RUN_STORAGE"] = json.dumps(storage)
+            with patch.object(fixture_run, "communicate") as native:
+                with self.assertRaisesRegex(fixture_runtime.RuntimeFailure, "differs from the machine"):
+                    fixture_run.compose(self.env, ["exec", "spark", "true"])
+                native.assert_not_called()
+
+    def test_persisted_storage_restores_with_original_context(self):
+        with patch.dict(os.environ, {}, clear=True):
+            original = fixture_run.admit(self.env)[2].as_dict()
+            storage = json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"])
+            saved = self.root / "state-storage.json"
+            saved.write_text(json.dumps({"run_context": original, "run_storage": storage}))
+            os.environ.pop("NOVA_FIXTURE_RUN_CONTEXT")
+            os.environ.pop("NOVA_FIXTURE_RUN_STORAGE")
+            self.assertTrue(fixture_run.restore_context(saved))
+            self.assertEqual(fixture_run.admit(self.env)[2].as_dict(), original)
+            self.assertEqual(json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]), storage)
+
+    def test_cleanup_run_uses_original_reserve_full_scope_and_retains_failure_report(self):
+        with patch.dict(os.environ, {}, clear=True):
+            original = fixture_run.admit(self.env)[2].as_dict()
+            original["started_unix_ms"] -= 3400000
+            original["deadline_unix_ms"] -= 3400000
+            os.environ["NOVA_FIXTURE_RUN_CONTEXT"] = json.dumps(original)
+            storage = json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"])
+            for complete in (True, False):
+                report = {"complete":complete,"catalog_barrier":{"complete":complete},"errors":[] if complete else [{"code":"ScratchRestUnavailable"}]}
+                with patch("machine_runtime.MachineOwner") as owner, patch("scratch.ScratchSweeper") as sweeper, \
+                        patch.object(fixture_runtime,"install_signal_handlers"), contextlib.redirect_stdout(io.StringIO()) as output:
+                    owner.return_value.ready_snapshot.return_value.__enter__.return_value = self.manifest["runtime"]["machine"]
+                    sweeper.return_value.cleanup_run.return_value = report
+                    self.assertEqual(fixture_run.main(["cleanup-run","--env-file",str(self.env)]),0 if complete else 1)
+                self.assertEqual(json.loads(output.getvalue()), report)
+                scope, pairs, deadline = sweeper.return_value.cleanup_run.call_args.args
+                self.assertEqual(scope.as_dict(), storage)
+                self.assertEqual(pairs, [])
+                self.assertAlmostEqual(deadline-time.monotonic(), original["deadline_unix_ms"]/1000-time.time(), delta=0.1)
+                self.assertEqual(json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"]),original)
+
+    def test_command_owner_propagates_original_storage_and_deadline_to_native_driver(self):
+        with patch.dict(os.environ,{},clear=True):
+            original = fixture_run.admit(self.env)[2]
+            storage = json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"])
+            os.environ["NOVA_FIXTURE_JAVA_DRIVER_OWNER"] = "true"
+            with patch.object(fixture_run, "communicate",return_value=subprocess.CompletedProcess([],0)) as native, \
+                    patch.object(fixture_runtime,"install_signal_handlers"):
+                self.assertEqual(fixture_run.main(["command","--env-file",str(self.env),"--","bash","native-driver.sh"]),0)
+            self.assertEqual(native.call_args.args[0],["bash","native-driver.sh"])
+            kwargs=native.call_args.kwargs
+            self.assertEqual(json.loads(kwargs["environment"]["NOVA_FIXTURE_RUN_CONTEXT"]),original.as_dict())
+            self.assertEqual(json.loads(kwargs["environment"]["NOVA_FIXTURE_RUN_STORAGE"]),storage)
+            self.assertEqual(kwargs["environment"]["NOVA_FIXTURE_JAVA_DRIVER_OWNER"],"true")
+            self.assertLessEqual(kwargs["timeout"],original.remaining_seconds(work=True)+0.05)
 
     def test_explicit_startup_sweep_keeps_original_clock_and_pins_machine_identity(self):
         with patch.dict(os.environ,{},clear=True):

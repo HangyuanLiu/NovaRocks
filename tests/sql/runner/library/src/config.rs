@@ -365,6 +365,16 @@ pub fn placeholder_variables(
             );
         }
     }
+    // Only the admitted shared REST binding changes explicit CTAS warehouses.
+    // Private fixtures and READY dataset roots retain their actual projection.
+    if let Some(root) = runner_config.values.get("__shared_rest_run_root") {
+        for (name, suffix) in [
+            ("iceberg_rest_warehouse", "rest"),
+            ("iceberg_rest_mv_warehouse", "rest-mv"),
+        ] {
+            variables.insert(name.into(), format!("{root}/{suffix}"));
+        }
+    }
     substitute_known_variable_values(&mut variables);
     Ok(variables)
 }
@@ -812,6 +822,48 @@ oss_endpoint = "http://127.0.0.1:9000"
         assert_eq!(
             placeholder_variables(&config, "iceberg").unwrap()["iceberg_test_warehouse"],
             "/tmp/private-extra"
+        );
+    }
+    #[test]
+    fn shared_rest_ctas_warehouses_use_run_root_without_changing_ready_or_private_bindings() {
+        let mut config = RunnerConfig::default();
+        config.fixture_names = Some(std::sync::Arc::new(crate::fixture_context::test_names(
+            "iceberg",
+            &["case"],
+        )));
+        config.values.insert(
+            "iceberg_rest_warehouse".into(),
+            "s3://warehouse/private/actual".into(),
+        );
+        config.values.insert(
+            "iceberg_rest_mv_warehouse".into(),
+            "s3://warehouse/private/mv".into(),
+        );
+        config.values.insert(
+            "dataset_iceberg_rest_warehouse".into(),
+            "s3://warehouse/ready".into(),
+        );
+        let private = placeholder_variables(&config, "iceberg").unwrap();
+        assert_eq!(
+            private["iceberg_rest_warehouse"],
+            "s3://warehouse/private/actual"
+        );
+        config.values.insert(
+            "__shared_rest_run_root".into(),
+            private["__scratch_scope"].clone(),
+        );
+        let shared = placeholder_variables(&config, "iceberg").unwrap();
+        assert_eq!(
+            shared["iceberg_rest_warehouse"],
+            format!("{}/rest", shared["__scratch_scope"])
+        );
+        assert_eq!(
+            shared["iceberg_rest_mv_warehouse"],
+            format!("{}/rest-mv", shared["__scratch_scope"])
+        );
+        assert_eq!(
+            shared["dataset_iceberg_rest_warehouse"],
+            "s3://warehouse/ready"
         );
     }
     #[test]

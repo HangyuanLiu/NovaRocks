@@ -34,6 +34,44 @@ hms = load("startup_hms_fixture", "tests/sql/fixtures/iceberg-hms/fixture.py")
 
 
 class WriterStartupTests(unittest.TestCase):
+    def test_shared_iceberg_namespace_has_finite_suffix_and_cleanup_defers_files(self):
+        identity = ScratchIdentity.create("s3://novarocks/worktree")
+        prefix = identity.scope_root.removeprefix("s3://novarocks/") + "/uea4a4"
+        self.assertEqual(iceberg.database_for(prefix), identity.run_id + "_a4")
+        with patch.object(iceberg.support, "compose_mc") as native:
+            iceberg.remove_prefix(SimpleNamespace(run_budget=object()),"s3://novarocks/" + prefix + "/table")
+        native.assert_not_called()
+
+    def test_standalone_iceberg_cleanup_retains_full_run_report_after_writer_exit(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ,{},clear=True):
+            root=Path(directory); (root/"READY").touch()
+            identity=ScratchIdentity.create("s3://novarocks/worktree")
+            location=identity.scope_root+"/uea4a4/table"
+            manifest={"run_id":"label","table_location":location,"database":identity.run_id+"_a4","owns_fixture_run":True}
+            runtime=SimpleNamespace(run_budget=object(),env_file=root/"env.sh")
+            args=SimpleNamespace(output_dir=str(root),env_file=str(runtime.env_file),fixture_store="unused",run_id="label")
+            for complete in (True,False):
+                (root/"READY").touch()
+                report={"complete":complete,"catalog_barrier":{"complete":complete},"errors":[]}
+                exited=[]
+                def clean(*args,**kwargs):
+                    self.assertEqual(exited,[True],"cleanup must follow actual Spark wrapper return")
+                    return report
+                with patch.object(iceberg.support.governed_run,"restore_context",return_value=True), \
+                        patch.object(iceberg.support,"load_runtime",return_value=runtime), \
+                        patch.object(iceberg,"install_verified_images"),patch.object(iceberg,"verify_ready",return_value=manifest), \
+                        patch.object(iceberg,"spark_build",side_effect=lambda *args:exited.append(True)), \
+                        patch.object(iceberg.support.governed_run,"cleanup_run",side_effect=clean), \
+                        patch.object(iceberg,"remove_prefix") as remove:
+                    if complete:
+                        self.assertEqual(iceberg.cleanup(args),0)
+                    else:
+                        with self.assertRaisesRegex(iceberg.support.FixtureError,"catalog barrier"):
+                            iceberg.cleanup(args)
+                self.assertEqual(json.loads((root/"cleanup-report.json").read_text()),report)
+                remove.assert_not_called()
+                if not complete: self.assertTrue((root/"READY").exists())
+
     def test_iceberg_rejected_inputs_cannot_reach_running_image_inspection(self):
         with patch.object(iceberg.support, "run_command", side_effect=iceberg.support.FixtureError("rejected input")) as command, \
                 patch.object(iceberg.support, "read_json") as read:

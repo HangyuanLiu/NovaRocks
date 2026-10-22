@@ -37,9 +37,8 @@ object VariantFixture {
     if (!readOnly) {
       val scope = spark.conf.getOption("spark.novarocks.fixture.scopeRoot")
       val run = spark.conf.getOption("spark.novarocks.fixture.runId")
-      require(run.forall(id => ns == id || ns.startsWith(id + "_")), "namespace is outside the original scratch run")
-      val location = scope.map(root => s" LOCATION '$root/rest/$ns'").getOrElse("")
-      spark.sql(s"CREATE NAMESPACE IF NOT EXISTS ice_rest.$ns$location")
+      require(run.forall(id => ns.startsWith(id + "_") && ns.length <= 63 && ns.substring(id.length + 1).matches("[a-z][a-z0-9]*")), "namespace is outside the original scratch run")
+      spark.sql(s"CREATE NAMESPACE IF NOT EXISTS ice_rest.$ns")
     }
   }
   def load(): Table = Spark3Util.loadIcebergCatalog(spark,"ice_rest").loadTable(TableIdentifier.of(namespace,tableName))

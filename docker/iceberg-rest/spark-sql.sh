@@ -45,8 +45,12 @@ fi
 # shellcheck disable=SC1090
 source "$CURRENT_ENV"
 [[ "${NOVA_ENV_READY:-false}" == "true" ]] || { echo "fixture is not ready; run docker/iceberg-rest/up.sh" >&2; exit 1; }
+owns_fixture_run=false
+[[ "${NOVA_FIXTURE_RUN_CONTEXT:-null}" == null ]] && owns_fixture_run=true
 NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$SCRIPT_DIR/fixture_run.py" context --env-file "$CURRENT_ENV")"
 export NOVA_FIXTURE_RUN_CONTEXT
+NOVA_FIXTURE_RUN_STORAGE="$(python3 "$SCRIPT_DIR/fixture_run.py" storage --env-file "$CURRENT_ENV")"
+export NOVA_FIXTURE_RUN_STORAGE
 
 
 sql_file="${1:-${NOVAROCKS_SPARK_V3_SMOKE_SQL:-}}"
@@ -87,14 +91,14 @@ try:
         if not text.startswith("-- novarocks-generated-shared-spark-v3-smoke-v1\n") or budget is None:
             raise runtime.RuntimeFailure("InvalidScratchScope", "shared generated smoke has no scoped template")
         namespace = budget.identity.resource_name("smoke")
-        location = budget.identity.scope_root + "/rest/" + namespace
-        replacements = {"__NOVA_SMOKE_NAMESPACE__": namespace,
-            "__NOVA_SMOKE_NAMESPACE_LOCATION__": location,
-            "__NOVA_SMOKE_TABLE_LOCATION__": location + "/spark_v3_smoke"}
+        replacements = {"__NOVA_SMOKE_NAMESPACE__": namespace}
         if any(key not in text for key in replacements):
             raise runtime.RuntimeFailure("InvalidScratchScope", "generated smoke template is incomplete")
         for key, value in replacements.items():
             text = text.replace(key, value.replace("'", "''"))
+        text += ("\n-- Catalog entries must disappear before the original run owner reclaims files.\n"
+                 f"DROP TABLE IF EXISTS ice_rest.{namespace}.spark_v3_smoke;\n"
+                 f"DROP NAMESPACE IF EXISTS ice_rest.{namespace};\n")
     if operation == "classify":
         print("true" if generated else "false")
     elif generated:
@@ -143,7 +147,12 @@ identity=json.loads(sys.argv[1])["identity"]
 print("SharedSmokeFailed: status="+sys.argv[2]+" namespace="+identity["run_id"]+"_smoke remote_cleanup=NOT_CONFIRMED diagnostics="+sys.argv[3],file=sys.stderr)
 PYFAIL
   else
-    python3 "$SCRIPT_DIR/fixture_run.py" cleanup-dir --env-file "$CURRENT_ENV" --path "$tmp_dir" || cleanup=$?
+    if [[ "$generated_smoke" == true && "$owns_fixture_run" == true && "$primary" == 0 ]]; then
+      NOVA_FIXTURE_CLEANUP_MODE=true python3 "$SCRIPT_DIR/fixture_run.py" cleanup-run --env-file "$CURRENT_ENV" >&2 || cleanup=$?
+    fi
+    if (( cleanup == 0 )); then
+      python3 "$SCRIPT_DIR/fixture_run.py" cleanup-dir --env-file "$CURRENT_ENV" --path "$tmp_dir" || cleanup=$?
+    fi
     if (( cleanup != 0 )); then
       echo "ContainerCleanupFailed: status=$cleanup diagnostics=$tmp_sql" >&2
     fi
@@ -158,11 +167,12 @@ cd "$WORKSPACE_ROOT"
 {
   cat "$NOVAROCKS_SPARK_DEFAULTS"
   if [[ "$NOVA_FIXTURE_RUN_CONTEXT" != null ]]; then
-    python3 - "$NOVA_FIXTURE_RUN_CONTEXT" <<'PYRUN'
+    python3 - "$NOVA_FIXTURE_RUN_CONTEXT" "$NOVA_FIXTURE_RUN_STORAGE" <<'PYRUN'
 import json,sys
 value=json.loads(sys.argv[1])
 print("\nspark.novarocks.fixture.scopeRoot " + value["identity"]["scope_root"])
 print("spark.novarocks.fixture.runId " + value["identity"]["run_id"])
+print("spark.novarocks.fixture.storage " + json.dumps(json.loads(sys.argv[2]),separators=(",",":")))
 PYRUN
   fi
   if [[ ${#extra_defaults_files[@]} -gt 0 ]]; then

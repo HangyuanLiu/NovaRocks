@@ -133,6 +133,7 @@ class Runtime:
     sql_config: Path
     env_file: Path | None = None
     run_budget: Any = None
+    owns_fixture_run: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -226,6 +227,7 @@ def require_value(values: Mapping[str, str], name: str) -> str:
 
 def load_runtime(env_file: Path) -> Runtime:
     values = parse_env_file(env_file)
+    owns_run = os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") in (None, "null")
     budget = None
     manifest = env_file.with_name("manifest.json")
     if manifest.is_file() and read_json(manifest).get("runtime", {}).get("machine"):
@@ -265,6 +267,7 @@ def load_runtime(env_file: Path) -> Runtime:
         sql_config=Path(require_value(values, "NOVAROCKS_SQL_TEST_CONFIG")).resolve(),
         env_file=env_file.resolve(),
         run_budget=budget,
+        owns_fixture_run=bool(budget and owns_run),
     )
 
 
@@ -821,13 +824,32 @@ set -eu
     )
 
 
-def cleanup_and_assert_empty(runtime: Runtime, warehouse_uri: str) -> None:
+def cleanup_and_assert_empty(runtime: Runtime, warehouse_uri: str, *, report_path: Path | None = None) -> bool:
+    if getattr(runtime, "run_budget", None) is not None:
+        if getattr(runtime, "owns_fixture_run", False):
+            previous = os.environ.get("NOVA_FIXTURE_CLEANUP_MODE")
+            os.environ["NOVA_FIXTURE_CLEANUP_MODE"] = "true"
+            try:
+                report = governed_run.cleanup_run(runtime.env_file, budget=runtime.run_budget)
+            finally:
+                if previous is None: os.environ.pop("NOVA_FIXTURE_CLEANUP_MODE", None)
+                else: os.environ["NOVA_FIXTURE_CLEANUP_MODE"] = previous
+            if report_path is not None:
+                write_json(report_path, report)
+            print(json.dumps(report, sort_keys=True), file=sys.stderr)
+            if report.get("complete") is not True:
+                raise FixtureError("original run catalog barrier or object cleanup failed")
+            return True
+        print(json.dumps({"complete":False,"objects_reclaimed":False,
+                          "cleanup_owner":"original-run-or-ttl","warehouse_uri":warehouse_uri}), file=sys.stderr)
+        return False
     cleanup_prefix(runtime, warehouse_uri)
     remaining = collect_objects(runtime, warehouse_uri, allow_empty=True)
     if remaining:
         raise FixtureError(
             f"fixture cleanup left {len(remaining)} objects under the owned prefix"
         )
+    return True
 
 
 def collect_objects(
@@ -1204,6 +1226,7 @@ def state_matches(
         "fixture_kind": FIXTURE_KIND,
         "run_id": scope.run_id,
         "run_context": json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"]) if os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") not in (None, "null") else None,
+        "run_storage": json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]) if os.environ.get("NOVA_FIXTURE_RUN_STORAGE") not in (None, "null") else None,
         "warehouse_uri": scope.warehouse_uri,
         "fixture_definition_sha256": definition_sha256,
         "fixture_input_lock_sha256": input_lock_sha256,
@@ -1252,6 +1275,8 @@ def write_manifest(
         "fixture_kind": FIXTURE_KIND,
         "run_id": scope.run_id,
         "run_context": json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"]) if os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") not in (None, "null") else None,
+        "run_storage": json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]) if os.environ.get("NOVA_FIXTURE_RUN_STORAGE") not in (None, "null") else None,
+        "owns_fixture_run": (read_json(output_dir / "state.json").get("owns_fixture_run") is True) if (output_dir / "state.json").is_file() else False,
         "warehouse_uri": scope.warehouse_uri,
         "bucket": scope.bucket,
         "prefix": scope.prefix,
@@ -1342,6 +1367,8 @@ def execute_prepare(args: argparse.Namespace) -> int:
                 "fixture_kind": FIXTURE_KIND,
                 "run_id": scope.run_id,
                 "run_context": json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"]) if os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") not in (None, "null") else None,
+                "run_storage": json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]) if os.environ.get("NOVA_FIXTURE_RUN_STORAGE") not in (None, "null") else None,
+                "owns_fixture_run": bool(getattr(runtime, "owns_fixture_run", False)),
                 "warehouse_uri": scope.warehouse_uri,
                 "target_stage": target_stage,
                 "fixture_definition_sha256": definition_sha256,
@@ -1374,6 +1401,8 @@ def execute_prepare(args: argparse.Namespace) -> int:
                 verify_remote_inventory(output_dir, runtime, str(existing["warehouse_uri"]))
                 print(output_dir / "manifest.json")
                 return 0
+            if isinstance(runtime, Runtime):
+                runtime = dataclasses.replace(runtime, owns_fixture_run=existing.get("owns_fixture_run") is True)
             state_matches(existing, scope, definition_sha256, writer_receipt["lock_sha256"])
             verify_remote_inventory(
                 output_dir, runtime, str(existing["warehouse_uri"])
@@ -1388,8 +1417,11 @@ def execute_prepare(args: argparse.Namespace) -> int:
                     "manifest.json" if (output_dir / "manifest.json").exists() else "state.json"
                 )
             )
+            if isinstance(runtime, Runtime):
+                runtime = dataclasses.replace(runtime, owns_fixture_run=partial.get("owns_fixture_run") is True)
             state_matches(partial, scope, definition_sha256, writer_receipt["lock_sha256"])
-            cleanup_and_assert_empty(runtime, scope.warehouse_uri)
+            if not cleanup_and_assert_empty(runtime, scope.warehouse_uri):
+                raise FixtureError("shared partial fixture files are retained for the original run owner; use a new run")
             remove_generated_paths(output_dir)
             current_stage_number = -1
         elif (output_dir / "dry-run.json").exists():
@@ -1417,6 +1449,8 @@ def execute_prepare(args: argparse.Namespace) -> int:
                 "fixture_kind": FIXTURE_KIND,
                 "run_id": scope.run_id,
                 "run_context": json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"]) if os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") not in (None, "null") else None,
+                "run_storage": json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]) if os.environ.get("NOVA_FIXTURE_RUN_STORAGE") not in (None, "null") else None,
+                "owns_fixture_run": bool(getattr(runtime, "owns_fixture_run", False)),
                 "warehouse_uri": scope.warehouse_uri,
                 "fixture_definition_sha256": definition_sha256,
                 "fixture_input_lock_sha256": writer_receipt["lock_sha256"],
@@ -1439,6 +1473,8 @@ def execute_prepare(args: argparse.Namespace) -> int:
                         "fixture_kind": FIXTURE_KIND,
                         "run_id": scope.run_id,
                         "run_context": json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"]) if os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") not in (None, "null") else None,
+                        "run_storage": json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]) if os.environ.get("NOVA_FIXTURE_RUN_STORAGE") not in (None, "null") else None,
+                        "owns_fixture_run": bool(getattr(runtime, "owns_fixture_run", False)),
                         "warehouse_uri": scope.warehouse_uri,
                         "fixture_definition_sha256": definition_sha256,
                         "fixture_input_lock_sha256": writer_receipt["lock_sha256"],
@@ -1478,6 +1514,8 @@ def execute_prepare(args: argparse.Namespace) -> int:
                     "fixture_kind": FIXTURE_KIND,
                     "run_id": scope.run_id,
                     "run_context": json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"]) if os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") not in (None, "null") else None,
+                    "run_storage": json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]) if os.environ.get("NOVA_FIXTURE_RUN_STORAGE") not in (None, "null") else None,
+                    "owns_fixture_run": bool(getattr(runtime, "owns_fixture_run", False)),
                     "warehouse_uri": scope.warehouse_uri,
                     "target_stage": target_stage,
                     "error": sanitize_output(str(error), runtime),
@@ -1511,14 +1549,18 @@ def execute_cleanup(args: argparse.Namespace) -> int:
               and read_json(Path(args.env_file).resolve().with_name("manifest.json")).get("runtime", {}).get("machine")):
             raise FixtureError("shared producer cleanup needs its persisted original run context")
         runtime = load_runtime(Path(args.env_file).resolve())
+        if isinstance(runtime, Runtime):
+            runtime = dataclasses.replace(runtime, owns_fixture_run=manifest.get("owns_fixture_run") is True)
         verify_remote_inventory(output_dir, runtime, warehouse_uri)
-        cleanup_and_assert_empty(runtime, warehouse_uri)
+        objects_reclaimed = cleanup_and_assert_empty(runtime, warehouse_uri, report_path=output_dir / "cleanup-report.json")
         with contextlib.suppress(FileNotFoundError):
             (output_dir / "READY").unlink()
         write_json(
             output_dir / "CLEANED",
             {
                 "fixture_kind": FIXTURE_KIND,
+                "objects_reclaimed": objects_reclaimed,
+                "cleanup_owner": ("original-run" if runtime.run_budget else "private-producer") if objects_reclaimed else "original-run-or-ttl",
                 "run_id": manifest["run_id"],
                 "warehouse_uri": warehouse_uri,
                 "manifest_sha256": sha256_file(output_dir / "manifest.json"),

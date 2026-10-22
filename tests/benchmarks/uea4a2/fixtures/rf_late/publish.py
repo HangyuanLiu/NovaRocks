@@ -20,7 +20,7 @@ from fixture import BUILD_FILE, MANIFEST_FILE, PROBE_FILE, sha256, verify, write
 REPO = Path(__file__).resolve().parents[5]
 sys.path.insert(0, str(REPO / "docker/iceberg-rest"))
 import fixture_run
-from scratch import resource_run
+from scratch import namespace_run
 
 RUN = None
 
@@ -101,7 +101,7 @@ def publish(directory: Path, receipt_path: Path, namespace: str) -> None:
             if catalog.table_exists((namespace, table_name)):
                 raise ValueError(f"refusing to mutate existing table: {namespace}.{table_name}")
     else:
-        catalog.create_namespace(namespace, properties={"location": RUN.identity.scope_root + "/rest/" + namespace} if RUN else {})
+        catalog.create_namespace(namespace, properties={})
     records = []
     for table_name, (filename, schema) in TABLES.items():
         location = RUN.identity.scope_root + "/rest/" + namespace + "/" + table_name if RUN else None
@@ -120,6 +120,7 @@ def publish(directory: Path, receipt_path: Path, namespace: str) -> None:
             "schema_version": 1,
             "namespace": namespace,
             "run_context": RUN.as_dict() if RUN else None,
+            "run_storage": json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]) if RUN else None,
             "local_manifest_sha256": sha256(directory / MANIFEST_FILE),
             "rest_uri": os.environ["NOVAROCKS_ICEBERG_REST_URI"],
             "warehouse": os.environ["NOVAROCKS_ICEBERG_REST_WAREHOUSE"],
@@ -164,7 +165,7 @@ def admit_run(seconds: int = 3600):
 def writer_namespace(namespace: str | None) -> str:
     if RUN:
         namespace = namespace or RUN.identity.resource_name("rf")
-        if resource_run(namespace) != RUN.identity.run_id:
+        if namespace_run(namespace) != RUN.identity.run_id:
             raise ValueError("shared writer namespace must belong to the original scratch run")
     return namespace or DEFAULT_NAMESPACE
 

@@ -86,6 +86,10 @@ class _DeadlineConnection(http.client.HTTPConnection):
 def s3_parts(uri: str) -> tuple[str, str]:
     if not isinstance(uri, str):
         raise runtime.RuntimeFailure("InvalidScratchScope", "S3 scope must be a string")
+    # urlsplit strips leading C0/space and removes TAB/CR/LF anywhere. Reject
+    # those original bytes before parsing instead of authorizing another key.
+    if any(ord(c) <= 32 for c in uri):
+        raise runtime.RuntimeFailure("InvalidScratchScope", "invalid S3 control or space character")
     parsed = urlsplit(uri)
     parts = parsed.path.strip("/").split("/") if parsed.path.strip("/") else []
     if (parsed.scheme != "s3" or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", parsed.netloc)

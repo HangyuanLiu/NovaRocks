@@ -54,6 +54,7 @@ class RestFixture:
         self.calls = []
         self.config_statuses = []
         self.namespace_properties = {}
+        self.warehouse = None
         fixture = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -99,8 +100,11 @@ class RestFixture:
                 return self.config_statuses.pop(0), {}
             if "warehouse" not in urllib.parse.parse_qs(parsed.query):
                 return 400, {}
+            self.warehouse = urllib.parse.parse_qs(parsed.query)["warehouse"][0]
             return 200, {"defaults": {"prefix": self.prefix}, "overrides": {}}
         base = "/v1/" + (self.prefix + "/" if self.prefix else "") + "namespaces"
+        if parsed.path == "/v1/namespaces" and method == "GET":
+            return 200, {"namespaces":[[name] for name in self.namespaces]}
         if parsed.path == base and method == "POST":
             namespace = payload["namespace"][0]
             self.namespaces[namespace] = {"views": {}, "tables": {}}
@@ -133,12 +137,12 @@ class RestFixture:
                 if self.ordinary_drift and name == "ordinary_view":
                     item["representations"][0]["sql"] = "SELECT 999 AS id"
                 metadata = {"view-uuid": str(uuid.uuid4()), "format-version": 1,
-                            "location": payload["location"], "current-version-id": 1,
+                            "location": payload.get("location", self.warehouse+"/"+parts[0]+"/"+name), "current-version-id": 1,
                             "versions": [item], "schemas": [payload["schema"]],
                             "version-log": [{"version-id": 1, "timestamp-ms": item["timestamp-ms"]}]}
             else:
                 metadata = {"table-uuid": str(uuid.uuid4()), "format-version": 2,
-                            "location": payload["location"], "current-schema-id": 0,
+                            "location": payload.get("location", self.warehouse+"/"+parts[0]+"/"+name), "current-schema-id": 0,
                             "schemas": [payload["schema"]], "properties": {}}
             if self.location_override is not None:
                 metadata["location"] = self.location_override(metadata["location"])
@@ -191,7 +195,7 @@ class RestMVProbeTests(unittest.TestCase):
         directory=tempfile.TemporaryDirectory(); self.addCleanup(directory.cleanup)
         root=Path(directory.name).resolve()
         manifest.update(shared_docker=True,runtime={"publication_dir":str(root),"machine":{
-            "control_root":"/owned/machine", "daemon_id":"captured-daemon", "version":"captured-version",
+            "ports":{"rest":urllib.parse.urlparse(manifest["iceberg_rest"]["uri"]).port,"rest_mv":urllib.parse.urlparse(manifest["iceberg_rest_mv"]["uri"]).port}, "id":"probe-machine", "config":{"minio_volume":"exact-volume"}, "server_warehouses":{"rest":"s3://warehouse/test/rest","rest-mv":"s3://warehouse/test/rest-mv"}, "control_root":"/owned/machine", "daemon_id":"captured-daemon", "version":"captured-version",
             "generation":"captured-generation", "policy":{"max_run_seconds":maximum,
             "cleanup_grace_seconds":grace,"scratch_ttl_seconds":2*(maximum+grace)+1000}}})
         (root/"manifest.json").write_text(json.dumps(manifest))
@@ -216,12 +220,12 @@ class RestMVProbeTests(unittest.TestCase):
                 held[0]+=1
                 try: yield snapshot
                 finally: held[0]-=1
-            def run_mc(inner,record,script,*,deadline,binary):
+            def run_mc(inner,record,script,*,deadline,binary=False):
                 outer.assertEqual(record,snapshot)
-                outer.assertTrue(binary)
                 outer.assertGreater(held[0],0)
                 events.append(("mc",deadline,script))
-                return on_mc(script) if on_mc else b""
+                result = on_mc(script) if on_mc else b""
+                return result if binary else (result.decode() + "NOVA_SCRATCH_MC_EXIT=0\n")
         return Owner,events,held
 
     def test_shared_probe_admits_full_run_locations_and_cleans_metadata_before_exact_s3(self):
@@ -235,8 +239,8 @@ class RestMVProbeTests(unittest.TestCase):
         def mc(script):
             owner_fixture=mv if "/rest-mv/" in script else stock
             self.assertEqual(owner_fixture.namespaces,{})
-            self.assertIn('"$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"',script)
-            self.assertIn("mc rm --recursive --force store/novarocks/probe-worktree/scratch/nr_scratch_",script)
+            self.assertIn('${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000',script)
+            self.assertTrue(all(not item.namespaces for item in (stock,mv)), "both catalogs must be empty before any storage operation")
             self.assertNotIn("shared/benchmarks",script)
             return b""
         owner,events,held=self.machine(manifest,on_mc=mc)
@@ -259,14 +263,26 @@ class RestMVProbeTests(unittest.TestCase):
                 "created_unix_ms":int(namespace.split('_')[2]),
                 "scope_root":"s3://novarocks/probe-worktree/scratch/"+namespace[:-6]})
             self.assertEqual(namespace,run.resource_name("probe"))
-            root=run.scope_root+"/"+label+"/"+namespace
-            self.assertEqual(namespace_calls[0]["properties"],{"location":root})
-            self.assertTrue(all(body["location"].startswith(root+"/") for method,path,body in fixture.calls
+            self.assertEqual(namespace_calls[0]["properties"],{})
+            self.assertTrue(all("location" not in body for method,path,body in fixture.calls
                 if method=="POST" and path.endswith(("/views","/tables"))))
         self.assertEqual(names[0],names[1],"parity retains the exact default-namespace semantics")
-        self.assertEqual(sum(event[0]=="mc" for event in events),2)
-        self.assertEqual(sum(event[0]=="ready" for event in events),len(stock.calls)+len(mv.calls)+2)
+        self.assertEqual(sum(event[0]=="mc" for event in events),3)
+        self.assertEqual(sum(event[0]=="ready" for event in events),len(stock.calls)+len(mv.calls)-4+1)
         self.assertEqual(held[0],0)
+
+    def test_nested_probe_leaves_files_to_original_run_owner(self):
+        stock,mv,manifest=self.fixtures()
+        env=self.publication(manifest)
+        owner,events,_=self.machine(manifest)
+        with mock.patch.dict(os.environ,{},clear=True),mock.patch.object(probe,"MachineOwner",owner):
+            original=probe.fixture_run.admit(env)[2].as_dict()
+            storage=os.environ["NOVA_FIXTURE_RUN_STORAGE"]
+            probe.run_probe(manifest,"contract",env_file=env)
+            self.assertEqual(json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"]),original)
+            self.assertEqual(os.environ["NOVA_FIXTURE_RUN_STORAGE"],storage)
+        self.assertFalse(stock.namespaces or mv.namespaces)
+        self.assertFalse(any(event[0]=="mc" for event in events), "nested probe cannot reclaim a live outer run")
 
     def test_shared_startup_sweep_failure_blocks_config_and_ddl(self):
         stock,mv,manifest=self.fixtures()
@@ -324,14 +340,13 @@ class RestMVProbeTests(unittest.TestCase):
                 self.assertFalse(any(event[0]=="mc" for event in events))
                 self.assertTrue(stock.namespaces)
 
-    def test_shared_namespace_location_must_be_actual_exact_original_root(self):
-        stock,mv,manifest=self.fixtures(stock={"namespace_override":"s3://warehouse/foreign/namespace"})
+    def test_shared_namespace_property_does_not_control_jdbc_table_location(self):
+        stock,mv,manifest=self.fixtures(stock={"namespace_override":"s3://warehouse/display-only/namespace"})
         env=self.publication(manifest); owner,events,_=self.machine(manifest)
         with mock.patch.dict(os.environ,{},clear=True),mock.patch.object(probe,"MachineOwner",owner):
-            with self.assertRaisesRegex(probe.EnvironmentFailure,"cleanup failed.*unknown actual scope"):
-                probe.run_probe(manifest,"contract",env_file=env)
-        self.assertFalse(any(path.endswith(("/tables","/views")) for _,path,_ in stock.calls))
-        self.assertFalse(any(event[0]=="mc" for event in events))
+            probe.run_probe(manifest,"contract",env_file=env)
+        self.assertFalse(stock.namespaces or mv.namespaces)
+
 
     def test_shared_unknown_http_write_outcome_never_claims_cleanup_from_a_later_absent_get(self):
         stock,mv,manifest=self.fixtures()
@@ -365,7 +380,7 @@ class RestMVProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(probe.EnvironmentFailure,"cleanup failed.*HTTP 500"):
                 probe.run_probe(manifest,"contract",env_file=env)
         scripts=[event[2] for event in events if event[0]=="mc"]
-        self.assertEqual(len(scripts),1); self.assertIn("/rest/",scripts[0]); self.assertNotIn("/rest-mv/",scripts[0])
+        self.assertEqual(scripts,[], "one catalog cleanup failure blocks every file deletion for this run")
         self.assertTrue(mv.namespaces); self.assertFalse(stock.namespaces)
 
     def test_shared_native_mc_failure_is_explicit_and_keeps_peer_cleanup(self):
@@ -377,7 +392,7 @@ class RestMVProbeTests(unittest.TestCase):
             return b""
         owner,events,_=self.machine(manifest,on_mc=native_failure)
         with mock.patch.dict(os.environ,{},clear=True),mock.patch.object(probe,"MachineOwner",owner):
-            with self.assertRaisesRegex(probe.EnvironmentFailure,"cleanup failed.*native mc exit 7"):
+            with self.assertRaisesRegex(probe.EnvironmentFailure,"cleanup failed.*MachineOperationFailed"):
                 probe.run_probe(manifest,"contract",env_file=env)
         self.assertEqual(sum(event[0]=="mc" for event in events),2)
 
@@ -395,7 +410,7 @@ class RestMVProbeTests(unittest.TestCase):
         self.assertIn("REST MV PRIMARY FAILED:",error.getvalue())
         self.assertIn("storage-table was lost",error.getvalue())
         self.assertIn("cleanup failed",error.getvalue())
-        self.assertIn("native mc exit 7",error.getvalue())
+        self.assertIn("MachineOperationFailed",error.getvalue())
         self.assertNotIn("PASSED",output.getvalue())
 
     def test_shared_cleanup_consumes_only_original_reserve_without_readmission(self):

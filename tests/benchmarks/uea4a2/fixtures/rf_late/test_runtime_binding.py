@@ -26,7 +26,7 @@ class PublicationBindingTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.env = self.root / "env.sh"
         self.env.write_text("export NOVA_ENV_ID=worktree\n")
-        manifest = {"ready":True,"runtime":{"machine":{"policy":{
+        manifest = {"ready":True,"runtime":{"machine":{"id":"machine-test","control_root":"/owned/machine","daemon_id":"daemon-test","version":"version-test","generation":"generation-test","config":{"minio_volume":"volume-test"},"server_warehouses":{"rest":"s3://warehouse/machine/rest","rest-mv":"s3://warehouse/machine/rest-mv"},"policy":{
             "max_run_seconds":86400,"cleanup_grace_seconds":300,"scratch_ttl_seconds":604800}}}}
         self.env.with_name("manifest.json").write_text(json.dumps(manifest))
         self.addCleanup(lambda: signal.setitimer(signal.ITIMER_REAL,0))
@@ -56,7 +56,7 @@ class PublicationBindingTests(unittest.TestCase):
                 publish.publish(data,self.root/"new.json",namespace)
             receipt=json.loads((self.root/"new.json").read_text())
             self.assertEqual(receipt["run_context"],original)
-            self.assertEqual(captured[0],(namespace,{"location":run.identity.scope_root+"/rest/"+namespace}))
+            self.assertEqual(captured[0],(namespace,{}))
             for identifier,request in captured[1:]:
                 self.assertEqual(request["location"],run.identity.scope_root+"/rest/"+namespace+"/"+identifier[1])
             with self.assertRaisesRegex(ValueError,"original scratch"):

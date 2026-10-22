@@ -28,6 +28,8 @@ source "$publication/env.sh"
 
 NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$fixture_dir/fixture_run.py" context --env-file "$publication/env.sh")"
 export NOVA_FIXTURE_RUN_CONTEXT
+NOVA_FIXTURE_RUN_STORAGE="$(python3 "$fixture_dir/fixture_run.py" storage --env-file "$publication/env.sh")"
+export NOVA_FIXTURE_RUN_STORAGE
 python3 "$fixture_dir/fixture_run.py" sweep-start --env-file "$publication/env.sh" >&2
 run_token="$(date +%s)_$$"
 warehouse_base="${NOVAROCKS_ICEBERG_TEST_WAREHOUSE%/}"

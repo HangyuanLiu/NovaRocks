@@ -21,6 +21,29 @@ spec.loader.exec_module(fixture)
 
 
 class RuntimeBindingTests(unittest.TestCase):
+    def test_shared_cleanup_retains_objects_for_original_run_barrier(self):
+        runtime = SimpleNamespace(run_budget=object())
+        with patch.object(fixture, "cleanup_prefix") as cleanup, patch.object(fixture,"collect_objects") as objects:
+            self.assertFalse(fixture.cleanup_and_assert_empty(runtime,"s3://novarocks/worktree/scratch/original/paimon"))
+        cleanup.assert_not_called(); objects.assert_not_called()
+
+    def test_standalone_cleanup_uses_original_run_barrier_and_retains_report(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ,{},clear=True):
+            report_path = Path(directory)/"cleanup-report.json"
+            budget = object()
+            runtime = SimpleNamespace(run_budget=budget, owns_fixture_run=True,env_file=Path(directory)/"env.sh")
+            for complete in (True,False):
+                report={"complete":complete,"catalog_barrier":{"complete":complete},"errors":[]}
+                with patch.object(fixture.governed_run,"cleanup_run",return_value=report) as cleanup:
+                    if complete:
+                        self.assertTrue(fixture.cleanup_and_assert_empty(runtime,"s3://owned/paimon",report_path=report_path))
+                    else:
+                        with self.assertRaisesRegex(fixture.FixtureError,"catalog barrier"):
+                            fixture.cleanup_and_assert_empty(runtime,"s3://owned/paimon",report_path=report_path)
+                cleanup.assert_called_once_with(runtime.env_file,budget=budget)
+                self.assertEqual(json.loads(report_path.read_text()), report)
+            self.assertNotIn("NOVA_FIXTURE_CLEANUP_MODE",os.environ)
+
     def test_ready_prepare_is_read_only_without_rebinding_saved_scope(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {}, clear=True):
             root=Path(directory); output=root/"output"; output.mkdir()

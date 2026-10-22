@@ -25,7 +25,7 @@ class TrinoTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.env = self.root / "env.sh"
         self.env.write_text("export NOVA_ENV_ID=worktree\nexport NOVA_ENV_REST_WAREHOUSE_URI=s3://novarocks/worktree/rest\nexport AWS_S3_ACCESS_KEY_ID=private-key\nexport AWS_S3_SECRET_ACCESS_KEY=private-secret\n")
-        self.manifest = {"ready":True, "shared_docker":True,"runtime":{"machine":{
+        self.manifest = {"ready":True, "shared_docker":True,"runtime":{"machine":{"id":"exact-machine","control_root":"/owned/machine","daemon_id":"exact-daemon","version":"exact-version","generation":"exact-generation", "config":{"minio_volume":"exact-volume"},"server_warehouses":{"rest":"s3://warehouse/machine/rest","rest-mv":"s3://warehouse/machine/rest-mv"},
             "network":"captured-machine-network", "policy":{"max_run_seconds":86400,
             "cleanup_grace_seconds":300,"scratch_ttl_seconds":604800}}}}
         (self.root / "manifest.json").write_text(json.dumps(self.manifest))

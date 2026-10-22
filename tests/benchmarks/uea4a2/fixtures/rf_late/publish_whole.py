@@ -180,6 +180,7 @@ def publish(directory: Path, receipt_path: Path, namespace: str) -> None:
         "schema_version": 1,
         "namespace": namespace,
         "run_context": run.as_dict() if run else None,
+        "run_storage": json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]) if run else None,
         "rest_uri": os.environ["NOVAROCKS_ICEBERG_REST_URI"],
         "warehouse": os.environ["NOVAROCKS_ICEBERG_REST_WAREHOUSE"],
         "local_manifest_sha256": sha256(directory / MANIFEST_FILE),

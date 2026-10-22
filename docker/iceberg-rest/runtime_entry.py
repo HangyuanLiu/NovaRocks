@@ -33,6 +33,7 @@ import subprocess
 import sys
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 import fixture_runtime as runtime
 import machine_runtime as machine
@@ -83,6 +84,62 @@ def model_hash(repo: Path) -> str:
     return result.hexdigest()
 
 
+def storage_root(uri: str) -> str:
+    """Canonical directory spelling without changing the physical S3 key."""
+    if not isinstance(uri, str) or any(ord(char) <= 32 or char.isspace() for char in uri):
+        raise runtime.RuntimeFailure("InvalidConfiguration", "storage root must be an S3 directory")
+    parsed = urlsplit(uri)
+    if (parsed.scheme != "s3" or not parsed.netloc or parsed.query or parsed.fragment
+            or any(char in uri for char in "%*?#") or "@" in parsed.netloc or ":" in parsed.netloc):
+        raise runtime.RuntimeFailure("InvalidConfiguration", "storage root must be an unambiguous s3://bucket/prefix")
+    key = parsed.path.removeprefix("/")
+    if key.endswith("/"):
+        key = key[:-1]
+    if not key or any(part in ("", ".", "..") for part in key.split("/")):
+        raise runtime.RuntimeFailure("InvalidConfiguration", "storage root contains an ambiguous path component")
+    return f"s3://{parsed.netloc}/{key}/"
+
+
+def root_contains(root: str, child: str) -> bool:
+    outer, inner = urlsplit(storage_root(root)), urlsplit(storage_root(child))
+    left, right = outer.path.strip("/").split("/"), inner.path.strip("/").split("/")
+    return outer.netloc == inner.netloc and right[:len(left)] == left
+
+
+def storage_domains(config: dict, record: dict, *, shared: bool) -> dict:
+    """Validate only known roots on the same object store, never common ancestors."""
+    owner = record if shared else record.get("external_minio")
+    if not owner:
+        return {}
+    independent = {service: storage_root(uri) for service, uri in owner["server_warehouses"].items()}
+    independent["benchmark"] = storage_root(owner["config"]["benchmark_root"])
+    owned_children = {}
+    if shared:
+        env_id = config["env_id"]
+        independent.update(worktree=storage_root(f"s3://novarocks/{env_id}"),
+                           private_catalog=storage_root(f"s3://warehouse/{env_id}"))
+        for name, uri in config["warehouses"].items():
+            base = independent["private_catalog" if name in ("rest_client", "rest_mv_client") else "worktree"]
+            if not root_contains(base, uri):
+                raise runtime.RuntimeFailure("InvalidConfiguration", "configured warehouse leaves its exact worktree storage root")
+    else:
+        # A private REST stack using shared MinIO owns children of the original
+        # run root; those are intentional containment, not independent domains.
+        run_root = storage_root(record["run_context"]["identity"]["scope_root"])
+        independent["run_root"] = run_root
+        for name, uri in config["warehouses"].items():
+            canonical = storage_root(uri)
+            if not root_contains(run_root, canonical):
+                raise runtime.RuntimeFailure("InvalidConfiguration", "private warehouse leaves its original run storage root")
+            owned_children[name] = canonical
+    items = list(independent.items())
+    for index, (name, root) in enumerate(items):
+        for other, candidate in items[index + 1:]:
+            if root_contains(root, candidate) or root_contains(candidate, root):
+                raise runtime.RuntimeFailure("InvalidConfiguration", f"independent storage domains overlap: {name}, {other}")
+    return {"independent": independent, "owned_children": owned_children}
+
+
 def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
     """Write text only. Paths name the final immutable publication."""
     staging = Path(staging_dir)
@@ -121,7 +178,9 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
         machine_record = record if shared else external
         endpoint = machine.endpoints(record) if shared else runtime.endpoints(record)
         credentials = record["credentials"] if shared else record["config"]["credentials"]
-        server_warehouses = record["server_warehouses"] if shared else {service: runtime.server_warehouse(record, service) for service in runtime.rest_services(record)}
+        server_warehouses = {service: storage_root(uri) for service, uri in
+            (record["server_warehouses"] if shared else {service: runtime.server_warehouse(record, service) for service in runtime.rest_services(record)}).items()}
+        domains = storage_domains(config, record, shared=shared)
         ak, sk = credentials["access_key"], credentials["secret_key"]
         warehouse = config["warehouses"]
         ports, trust = config["local_ports"], config["native_trust"]
@@ -136,6 +195,10 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
             manifest["runtime"]["machine"] = copy.deepcopy(external)
         manifest["minio"] = {"endpoint": endpoint["minio_endpoint"], "console": endpoint["minio_console"],
                               "access_key_id": ak, "secret_access_key": sk, "volume": machine_record["config"]["minio_volume"] if machine_record else record["volumes"][0]}
+        if machine_record:
+            manifest["storage_owner"] = {"daemon_id": machine_record["daemon_id"],
+                                         "minio_volume": machine_record["config"]["minio_volume"]}
+            manifest["storage_domains"] = domains
         manifest["iceberg_rest"] = {"uri": endpoint["rest_uri"], "warehouse": rest, "server_default_warehouse": server_warehouses["rest"]}
         if "rest-mv" in record["images"]:
             manifest["iceberg_rest_mv"] = {"uri": endpoint["rest_mv_uri"], "warehouse": warehouse["rest_mv_client"],
@@ -223,16 +286,15 @@ def render_entry(context: dict[str, Any], staging_dir: Path) -> list[str]:
         smoke_sql = "CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_v3;\n\nDROP TABLE IF EXISTS ice_rest.nr_v3.spark_v3_smoke;\n\nCREATE TABLE ice_rest.nr_v3.spark_v3_smoke (\n  id BIGINT,\n  data STRING,\n  category STRING,\n  ts TIMESTAMP\n) USING iceberg\nTBLPROPERTIES (\n  'format-version' = '3',\n  'write.row-lineage' = 'true',\n  'write.format.default' = 'parquet'\n);\n\nINSERT INTO ice_rest.nr_v3.spark_v3_smoke VALUES\n  (1, 'spark-v3-a', 'alpha', TIMESTAMP '2026-05-07 00:00:00'),\n  (2, 'spark-v3-b', 'beta', TIMESTAMP '2026-05-07 00:01:00'),\n  (3, 'spark-v3-c', 'alpha', TIMESTAMP '2026-05-07 00:02:00');\n\nSELECT * FROM ice_rest.nr_v3.spark_v3_smoke ORDER BY id;\n"
         if machine_record:
             # Run identity belongs to the caller, never to this stable publication.
-            smoke_sql = smoke_sql.replace("CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_v3;", "CREATE NAMESPACE ice_rest.__NOVA_SMOKE_NAMESPACE__ LOCATION '__NOVA_SMOKE_NAMESPACE_LOCATION__';")
+            smoke_sql = smoke_sql.replace("CREATE NAMESPACE IF NOT EXISTS ice_rest.nr_v3;", "CREATE NAMESPACE ice_rest.__NOVA_SMOKE_NAMESPACE__;")
             smoke_sql = smoke_sql.replace("DROP TABLE IF EXISTS ice_rest.nr_v3.spark_v3_smoke;\n\n", "")
             smoke_sql = smoke_sql.replace("ice_rest.nr_v3", "ice_rest.__NOVA_SMOKE_NAMESPACE__")
-            smoke_sql = smoke_sql.replace(") USING iceberg\n", ") USING iceberg\nLOCATION '__NOVA_SMOKE_TABLE_LOCATION__'\n")
             smoke_sql = "-- novarocks-generated-shared-spark-v3-smoke-v1\n" + smoke_sql
-            smoke_sql += "\nDROP TABLE ice_rest.__NOVA_SMOKE_NAMESPACE__.spark_v3_smoke PURGE;\nDROP NAMESPACE ice_rest.__NOVA_SMOKE_NAMESPACE__;\n"
         text_file(staging, "spark-iceberg-v3-smoke.sql", smoke_sql)
     text_file(staging, "env.sh", '# Generated fixture publication.\nunset ' + ' '.join(MANAGED) + '\n' + ''.join(f'export {key}={shlex.quote(str(value))}\n' for key, value in sorted(exports.items())))
     text_file(staging, "manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + '\n')
-    text_file(staging, "README.md", f'# NovaRocks fixture {env_id}\n\nReady: {str(ready).lower()}\n\nPublication: `{publication}`\n\nStable runtime data: `{stable}`\n\n' + (f'REST: {manifest["iceberg_rest"]["uri"]}\n\nObject store: {manifest["minio"]["endpoint"]}\n' if ready else 'Run `docker/iceberg-rest/up.sh` to bind this worktree.\n'))
+    text_file(staging, "README.md", f'# NovaRocks fixture {env_id}\n\nReady: {str(ready).lower()}\n\nPublication: `{publication}`\n\nStable runtime data: `{stable}`\n\n' + (f'REST: {manifest["iceberg_rest"]["uri"]}\n\nObject store: {manifest["minio"]["endpoint"]}\n' if ready else 'Run `docker/iceberg-rest/up.sh` to bind this worktree.\n') +
+              ('\nShared REST and Spark use shared storage credentials. Run IAM policies constrain only writers using the run credentials; shared writers rely on run names, location checks, the original budget, and catalog-first cleanup. Run identity and deadlines belong to the caller and are not stored in this publication.\n' if ready and machine_record else ''))
     return list(FILES)
 
 
@@ -470,9 +532,7 @@ def request_config(workspace: Path, settings: dict, config_file: Path, entry: Pa
     missing = {name: base for name, base in starts.items() if name not in ports}
     if missing:
         ports.update(choose_ports(missing, offset, ranges, reserved=set(ports.values())))
-    benchmark_root = settings.get('NOVA_ENV_SHARED_BENCHMARK_ROOT', 's3://novarocks/shared/benchmarks')
-    if not re.fullmatch(r's3://[^/\s]+/[^\s]+', benchmark_root):
-        raise runtime.RuntimeFailure('InvalidConfiguration', 'benchmark root requires s3://bucket/prefix')
+    benchmark_root = storage_root(settings.get('NOVA_ENV_SHARED_BENCHMARK_ROOT', 's3://novarocks/shared/benchmarks'))
     timeout = int(settings.get('NOVA_ENV_BENCHMARK_BUILD_TIMEOUT_SECONDS', '3600'))
     if timeout < 1:
         raise runtime.RuntimeFailure('InvalidConfiguration', 'benchmark timeout must be positive')

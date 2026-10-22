@@ -29,6 +29,8 @@ source "$env_file"
 
 NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" context --env-file "$env_file")"
 export NOVA_FIXTURE_RUN_CONTEXT
+NOVA_FIXTURE_RUN_STORAGE="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" storage --env-file "$env_file")"
+export NOVA_FIXTURE_RUN_STORAGE
 compose=(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" compose --env-file "$env_file" -- --env-file "$NOVA_ENV_COMPOSE_ENV" \
   -p "$NOVA_ENV_COMPOSE_PROJECT" -f "$NOVA_ENV_COMPOSE_FILE")
 "${compose[@]}" ps --status running spark | grep -q spark || {

@@ -28,6 +28,7 @@ ci_set_default_build_jobs
 # Resolve once. The caller owns fixture startup; this driver never changes bindings or inputs.
 publication=$(python3 - "$fixture_dir" <<'PY'
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -52,6 +53,7 @@ fi
 
 input_store=$(python3 - "$publication/manifest.json" <<'PY'
 import json
+import os
 from pathlib import Path
 import sys
 manifest = json.loads(Path(sys.argv[1]).read_text())
@@ -62,6 +64,7 @@ PY
 "$repo_root/docker/fixture-inputs/verify.sh" --store "$input_store" --repo-root "$repo_root" --consumer iceberg-rest
 python3 - "$publication/manifest.json" "$input_store/bom.json" <<'PY'
 import json
+import os
 from pathlib import Path
 import sys
 manifest = json.loads(Path(sys.argv[1]).read_text())
@@ -77,8 +80,28 @@ PY
 : "${AWS_S3_ACCESS_KEY_ID:?pinned S3 access key required}"
 : "${AWS_S3_SECRET_ACCESS_KEY:?pinned S3 secret required}"
 
+owns_fixture_run=false
+[[ "${NOVA_FIXTURE_RUN_CONTEXT:-null}" == null ]] && owns_fixture_run=true
 NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" context --env-file "$publication/env.sh")"
 export NOVA_FIXTURE_RUN_CONTEXT
+NOVA_FIXTURE_RUN_STORAGE="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" storage --env-file "$publication/env.sh")"
+export NOVA_FIXTURE_RUN_STORAGE
+if [[ "$NOVA_FIXTURE_RUN_CONTEXT" != null && "${NOVA_FIXTURE_JAVA_DRIVER_OWNER:-false}" != true ]]; then
+    # The one command owner pins the complete original budget for Cargo and
+    # every native test descendant; recursive admission never creates a run.
+    export NOVA_FIXTURE_JAVA_DRIVER_OWNER=true
+    python3 "$repo_root/docker/iceberg-rest/fixture_run.py" command --env-file "$publication/env.sh" -- bash "$0" "$@" &
+    driver_owner_pid=$!
+    trap 'kill -TERM "$driver_owner_pid" 2>/dev/null || true; wait "$driver_owner_pid" || true; exit 143' TERM
+    trap 'kill -TERM "$driver_owner_pid" 2>/dev/null || true; wait "$driver_owner_pid" || true; exit 130' INT
+    driver_status=0
+    wait "$driver_owner_pid" || driver_status=$?
+    trap - INT TERM
+    if [[ "$driver_status" == 0 && "$owns_fixture_run" == true ]]; then
+        NOVA_FIXTURE_CLEANUP_MODE=true python3 "$repo_root/docker/iceberg-rest/fixture_run.py" cleanup-run --env-file "$publication/env.sh" >&2 || driver_status=$?
+    fi
+    exit "$driver_status"
+fi
 python3 "$repo_root/docker/iceberg-rest/fixture_run.py" sweep-start --env-file "$publication/env.sh" >&2
 run_id=$(python3 -c 'import json,sys,uuid; value=json.loads(sys.argv[1]);print(value["identity"]["run_id"] if value else uuid.uuid4().hex)' "$NOVA_FIXTURE_RUN_CONTEXT")
 interop_root="${NR_IRU13A_INTEROP_ARTIFACT_DIR:-$NOVA_ENV_RUNTIME_DIR/iru13a-java-rest-$run_id}"
@@ -98,11 +121,14 @@ done
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$repo_root/target}"
 python3 - "$publication/manifest.json" "$interop_root/fixture.json" "$publication" <<'PY'
 import json
+import os
 from pathlib import Path
 import sys
 manifest = json.loads(Path(sys.argv[1]).read_text())
 facts = {
     'publication': sys.argv[3],
+    'run_context': json.loads(os.environ['NOVA_FIXTURE_RUN_CONTEXT']),
+    'run_storage': json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE']),
     'fixture_input_lock_sha256': manifest['fixture_inputs']['lock_sha256'],
     'boundary': 'Java REST acceptance of NovaRocks-issued REST requests; native 1FE+3BE SQL acceptance is separate',
 }

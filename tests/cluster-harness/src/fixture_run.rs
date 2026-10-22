@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const RUN_CONTEXT_ENV: &str = "NOVA_FIXTURE_RUN_CONTEXT";
+pub const RUN_STORAGE_ENV: &str = "NOVA_FIXTURE_RUN_STORAGE";
 
 #[derive(Debug)]
 pub struct FixtureBudgetRejected(anyhow::Error);
@@ -152,7 +153,7 @@ pub fn canonical_s3(value: &str) -> Result<String> {
                 .as_bytes()
                 .last()
                 .is_some_and(u8::is_ascii_alphanumeric)
-            && !value.bytes().any(|c| c <= 32 || b"%?#".contains(&c))
+            && !value.bytes().any(|c| c <= 32 || b"%*?#".contains(&c))
             && (key.is_empty()
                 || key
                     .split('/')
@@ -242,6 +243,285 @@ fn validate_purpose(value: &str) -> Result<()> {
         "FixtureBudgetRejected: invalid scratch purpose"
     );
     Ok(())
+}
+
+/// Fixed run storage facts. An inherited projection must be checked against the
+/// original machine publication before granting access or deleting objects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunStorageScope {
+    schema: u8,
+    identity: ScratchIdentity,
+    machine: StorageMachine,
+    storage_owner: StorageOwner,
+    ranges: StorageRanges,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorageMachine {
+    id: String,
+    control_root: String,
+    daemon_id: String,
+    version: String,
+    generation: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorageOwner {
+    daemon_id: String,
+    minio_volume: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorageRanges {
+    run_root: String,
+    rest: NamespaceRange,
+    rest_mv: NamespaceRange,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamespaceRange {
+    warehouse: String,
+    namespace_prefix: String,
+}
+
+fn contains_s3(root: &str, value: &str) -> bool {
+    root == value
+        || value
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+impl RunStorageScope {
+    pub fn from_record(identity: &ScratchIdentity, record: &serde_json::Value) -> Result<Self> {
+        let field = |value: &serde_json::Value, key: &str| -> Result<String> {
+            value[key]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .with_context(|| format!("FixtureBudgetRejected: machine omitted storage {key}"))
+        };
+        let range = |service: &str| -> Result<NamespaceRange> {
+            Ok(NamespaceRange {
+                warehouse: format!(
+                    "{}/",
+                    canonical_s3(&field(&record["server_warehouses"], service)?)?
+                ),
+                namespace_prefix: format!("{}_", identity.run_id),
+            })
+        };
+        let result = Self {
+            schema: 1,
+            identity: identity.clone(),
+            machine: StorageMachine {
+                id: field(record, "id")?,
+                control_root: field(record, "control_root")?,
+                daemon_id: field(record, "daemon_id")?,
+                version: field(record, "version")?,
+                generation: field(record, "generation")?,
+            },
+            storage_owner: StorageOwner {
+                daemon_id: field(record, "daemon_id")?,
+                minio_volume: field(&record["config"], "minio_volume")?,
+            },
+            ranges: StorageRanges {
+                run_root: format!("{}/", identity.scope_root),
+                rest: range("rest")?,
+                rest_mv: range("rest-mv")?,
+            },
+        };
+        result.validate()?;
+        let mut protected: Vec<String> =
+            serde_json::from_value(record["protected_benchmark_roots"].clone())
+                .context("FixtureBudgetRejected: machine omitted protected benchmark roots")?;
+        protected.push(field(&record["config"], "benchmark_root")?);
+        for root in result.roots() {
+            let root = canonical_s3(root)?;
+            for other in &protected {
+                let other = canonical_s3(other)?;
+                ensure!(
+                    !contains_s3(&root, &other) && !contains_s3(&other, &root),
+                    "FixtureBudgetRejected: run storage overlaps protected data"
+                );
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn from_json(value: &str) -> Result<Self> {
+        let result: Self = serde_json::from_str(value)
+            .context("FixtureBudgetRejected: invalid inherited run storage")?;
+        result.validate()?;
+        Ok(result)
+    }
+
+    pub fn from_environment(
+        identity: &ScratchIdentity,
+        record: &serde_json::Value,
+    ) -> Result<Self> {
+        let expected = Self::from_record(identity, record)?;
+        if let Some(value) = std::env::var_os(RUN_STORAGE_ENV) {
+            let value = value
+                .to_str()
+                .context("FixtureBudgetRejected: non-UTF8 inherited run storage")?;
+            let inherited = Self::from_json(value)?;
+            inherited.validate_against(identity, record)?;
+            return Ok(inherited);
+        }
+        Ok(expected)
+    }
+
+    pub fn from_publication(env_file: &Path, budget: &RunBudget) -> Result<Self> {
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            env_file
+                .parent()
+                .context("fixture publication directory")?
+                .join("manifest.json"),
+        )?)?;
+        ensure!(
+            manifest["ready"] == true
+                && manifest["shared_docker"] == true
+                && manifest["runtime"]["machine"]["phase"] == "ready",
+            "FixtureBudgetRejected: storage requires a ready shared machine publication"
+        );
+        let record = &manifest["runtime"]["machine"];
+        budget.validate_machine(record)?;
+        Self::from_environment(budget.identity(), record)
+    }
+
+    fn roots(&self) -> [&str; 3] {
+        [
+            &self.ranges.run_root,
+            &self.ranges.rest.warehouse,
+            &self.ranges.rest_mv.warehouse,
+        ]
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.identity.validate()?;
+        ensure!(
+            self.schema == 1
+                && self.ranges.run_root == format!("{}/", self.identity.scope_root)
+                && self.storage_owner.daemon_id == self.machine.daemon_id
+                && [
+                    &self.machine.id,
+                    &self.machine.control_root,
+                    &self.machine.daemon_id,
+                    &self.machine.version,
+                    &self.machine.generation,
+                    &self.storage_owner.minio_volume
+                ]
+                .iter()
+                .all(|v| !v.is_empty()),
+            "FixtureBudgetRejected: invalid run storage owner or ranges"
+        );
+        for range in [&self.ranges.rest, &self.ranges.rest_mv] {
+            ensure!(
+                range.namespace_prefix == format!("{}_", self.identity.run_id)
+                    && range.warehouse == format!("{}/", canonical_s3(&range.warehouse)?),
+                "FixtureBudgetRejected: invalid warehouse namespace range"
+            );
+        }
+        let roots = self.roots().map(canonical_s3);
+        for (index, root) in roots.iter().enumerate() {
+            let root = root.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
+            for other in &roots[index + 1..] {
+                let other = other.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                ensure!(
+                    !contains_s3(root, other) && !contains_s3(other, root),
+                    "FixtureBudgetRejected: independent run storage roots overlap"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_against(
+        &self,
+        identity: &ScratchIdentity,
+        record: &serde_json::Value,
+    ) -> Result<()> {
+        ensure!(
+            *self == Self::from_record(identity, record)?,
+            "FixtureBudgetRejected: inherited storage projection differs from the machine"
+        );
+        Ok(())
+    }
+
+    pub fn identity(&self) -> &ScratchIdentity {
+        &self.identity
+    }
+    pub fn to_json(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    pub fn owns_namespace(&self, namespace: &str) -> bool {
+        namespace
+            .strip_prefix(&format!("{}_", self.identity.run_id))
+            .is_some_and(|purpose| namespace.len() <= 63 && validate_purpose(purpose).is_ok())
+    }
+
+    pub fn belongs(&self, uri: &str) -> Result<bool> {
+        self.validate()?;
+        // Scheme aliases are comparisons only and require the exact common
+        // MinIO owner captured in this validated projection.
+        let alias;
+        let uri = if let Some(rest) = uri.strip_prefix("s3a://") {
+            alias = format!("s3://{rest}");
+            &alias
+        } else {
+            uri
+        };
+        let uri = canonical_s3(uri)?;
+        if contains_s3(&self.identity.scope_root, &uri) {
+            return Ok(true);
+        }
+        for range in [&self.ranges.rest, &self.ranges.rest_mv] {
+            if let Some(child) = uri.strip_prefix(&range.warehouse)
+                && self.owns_namespace(child.split('/').next().unwrap_or(""))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn iam_policy(&self) -> Result<serde_json::Value> {
+        self.validate()?;
+        let prefixes = [
+            self.ranges.run_root.clone(),
+            format!(
+                "{}{}",
+                self.ranges.rest.warehouse, self.ranges.rest.namespace_prefix
+            ),
+            format!(
+                "{}{}",
+                self.ranges.rest_mv.warehouse, self.ranges.rest_mv.namespace_prefix
+            ),
+        ];
+        let mut buckets = std::collections::BTreeMap::<String, Vec<String>>::new();
+        let mut objects = Vec::new();
+        for uri in prefixes {
+            let (bucket, key) = uri
+                .strip_prefix("s3://")
+                .unwrap()
+                .split_once('/')
+                .context("S3 policy requires a key prefix")?;
+            buckets
+                .entry(bucket.to_owned())
+                .or_default()
+                .push(format!("{key}*"));
+            objects.push(format!("arn:aws:s3:::{bucket}/{key}*"));
+        }
+        let mut statements = Vec::new();
+        for (bucket, values) in buckets {
+            statements.push(serde_json::json!({"Effect":"Allow","Action":["s3:GetBucketLocation"],"Resource":[format!("arn:aws:s3:::{bucket}")]}));
+            statements.push(serde_json::json!({"Effect":"Allow","Action":["s3:ListBucket"],"Resource":[format!("arn:aws:s3:::{bucket}")],"Condition":{"StringLike":{"s3:prefix":values}}}));
+        }
+        statements.push(serde_json::json!({"Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion","s3:PutObject","s3:DeleteObject","s3:DeleteObjectVersion","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],"Resource":objects}));
+        Ok(serde_json::json!({"Version":"2012-10-17","Statement":statements}))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -467,6 +747,7 @@ pub fn startup_sweep(
     let env_file = pinned_env_file
         .canonicalize()
         .context("resolve startup sweep immutable publication")?;
+    let storage = RunStorageScope::from_publication(&env_file, budget)?;
     let mut completed = budget
         .startup_sweep
         .lock()
@@ -494,6 +775,7 @@ pub fn startup_sweep(
         .arg("--env-file")
         .arg(&env_file)
         .env(RUN_CONTEXT_ENV, budget.to_json()?)
+        .env(RUN_STORAGE_ENV, storage.to_json()?)
         .terminate_at(budget.work_deadline(), budget.deadline());
     let outcome = novarocks_test_support::capture_command_until(
         command,
@@ -551,6 +833,10 @@ mod tests {
         std::fs::write(scripts.join("fixture_run.py"), script).unwrap();
         let publication = directory.path().join("env.sh");
         std::fs::write(&publication, "# immutable publication\n").unwrap();
+        let vectors = storage_vectors();
+        let mut record = vectors["record"].clone();
+        record["phase"] = serde_json::json!("ready");
+        std::fs::write(directory.path().join("manifest.json"), serde_json::to_vec(&serde_json::json!({"ready":true,"shared_docker":true,"runtime":{"machine":record}})).unwrap()).unwrap();
         let budget = RunBudget::admit(
             FixturePolicy::default(),
             ScratchIdentity::create("s3://novarocks/worktree").unwrap(),
@@ -564,7 +850,7 @@ mod tests {
     #[test]
     fn startup_sweep_runs_once_across_clones_with_original_context_and_pinned_publication() {
         let (directory, publication, budget) = sweep_fixture(
-            "import json,os,pathlib,sys\np=pathlib.Path('calls.json')\np.write_text(json.dumps({'args':sys.argv[1:],'context':json.loads(os.environ['NOVA_FIXTURE_RUN_CONTEXT'])}))\nprint(json.dumps({'complete':False,'errors':[{'code':'ScratchSweepTimeout'}],'enumeration_complete':False}))\n",
+            "import json,os,pathlib,sys\np=pathlib.Path('calls.json')\np.write_text(json.dumps({'args':sys.argv[1:],'context':json.loads(os.environ['NOVA_FIXTURE_RUN_CONTEXT']),'storage':json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE'])}))\nprint(json.dumps({'complete':False,'errors':[{'code':'ScratchSweepTimeout'}],'enumeration_complete':False}))\n",
         );
         let report = startup_sweep(directory.path(), &publication, &budget).unwrap();
         assert_eq!(report["complete"], false);
@@ -575,6 +861,8 @@ mod tests {
             recorded["context"],
             serde_json::to_value(budget.context()).unwrap()
         );
+        let scope = RunStorageScope::from_publication(&publication, &budget).unwrap();
+        assert_eq!(recorded["storage"], serde_json::to_value(scope).unwrap());
         assert_eq!(
             recorded["args"],
             serde_json::json!([
@@ -616,6 +904,100 @@ mod tests {
                 .unwrap_err()
                 .is::<FixtureBudgetExpired>()
         );
+    }
+
+    #[test]
+    fn invalid_publication_storage_is_rejected_before_startup_dispatch() {
+        let (directory, publication, budget) =
+            sweep_fixture("raise RuntimeError('must not dispatch')\n");
+        let path = directory.path().join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["runtime"]["machine"]["server_warehouses"]["rest"] =
+            serde_json::json!(&budget.identity().scope_root);
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(
+            startup_sweep(directory.path(), &publication, &budget)
+                .unwrap_err()
+                .to_string()
+                .contains("overlap")
+        );
+        assert!(!directory.path().join("calls.json").exists());
+    }
+
+    fn storage_vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../../docker/iceberg-rest/tests/run_storage_scope_vectors.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn storage_scope_matches_shared_python_vectors() {
+        let vectors = storage_vectors();
+        let identity: ScratchIdentity =
+            serde_json::from_value(vectors["identity"].clone()).unwrap();
+        let scope = RunStorageScope::from_record(&identity, &vectors["record"]).unwrap();
+        assert_eq!(serde_json::to_value(&scope).unwrap(), vectors["projection"]);
+        assert_eq!(scope.iam_policy().unwrap(), vectors["policy"]);
+        for case in vectors["membership"].as_array().unwrap() {
+            let actual = scope.belongs(case["uri"].as_str().unwrap());
+            if case.get("error").is_some() {
+                assert!(actual.is_err(), "{case}");
+            } else {
+                assert_eq!(
+                    actual.unwrap(),
+                    case["belongs"].as_bool().unwrap(),
+                    "{case}"
+                );
+            }
+        }
+        for case in vectors["namespaces"].as_array().unwrap() {
+            assert_eq!(
+                scope.owns_namespace(case["name"].as_str().unwrap()),
+                case["owned"].as_bool().unwrap(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_scope_rejects_changed_machine_owner_and_ranges() {
+        let vectors = storage_vectors();
+        let identity: ScratchIdentity =
+            serde_json::from_value(vectors["identity"].clone()).unwrap();
+        for (section, field, replacement) in [
+            ("machine", "generation", "next"),
+            ("storage_owner", "daemon_id", "other"),
+            ("storage_owner", "minio_volume", "other"),
+            ("ranges", "run_root", "s3://elsewhere/root/"),
+        ] {
+            let mut value = vectors["projection"].clone();
+            value[section][field] = serde_json::json!(replacement);
+            let result = RunStorageScope::from_json(&value.to_string())
+                .and_then(|scope| scope.validate_against(&identity, &vectors["record"]));
+            assert!(result.is_err(), "{section}/{field}");
+        }
+        for change in ["overlap", "prefix", "unknown"] {
+            let mut value = vectors["projection"].clone();
+            match change {
+                "overlap" => {
+                    value["ranges"]["rest_mv"]["warehouse"] =
+                        value["ranges"]["rest"]["warehouse"].clone()
+                }
+                "prefix" => {
+                    value["ranges"]["rest"]["namespace_prefix"] = serde_json::json!("foreign_")
+                }
+                _ => value["machine"]["unexpected"] = serde_json::json!(true),
+            }
+            assert!(
+                RunStorageScope::from_json(&value.to_string()).is_err(),
+                "{change}"
+            );
+        }
+        let mut record = vectors["record"].clone();
+        record["config"]["benchmark_root"] = serde_json::json!(&identity.scope_root);
+        assert!(RunStorageScope::from_record(&identity, &record).is_err());
     }
 
     fn identity() -> ScratchIdentity {

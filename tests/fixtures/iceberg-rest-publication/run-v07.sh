@@ -25,6 +25,8 @@ if [[ "${UEA7_USE_SHARED_MINIO:-0}" == "1" && "${NOVA_FIXTURE_PUBLICATION_COMMAN
   runtime_env="${NOVA_ENV_REST_ENV_FILE:-$repo_root/docker/iceberg-rest/runtime/current/env.sh}"
   NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" context --env-file "$runtime_env")"
   export NOVA_FIXTURE_RUN_CONTEXT NOVA_FIXTURE_PUBLICATION_COMMAND_OWNER=true
+  NOVA_FIXTURE_RUN_STORAGE="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" storage --env-file "$runtime_env")"
+  export NOVA_FIXTURE_RUN_STORAGE
   exec python3 "$repo_root/docker/iceberg-rest/fixture_run.py" command --env-file "$runtime_env" -- bash "$0" "$@"
 fi
 image_name="${UEA7_FIXTURE_IMAGE:-novarocks/iceberg-rest-publication-fixture:test}"
@@ -184,6 +186,8 @@ if [[ "${UEA7_USE_SHARED_MINIO:-0}" == "1" ]]; then
   storage_mode="shared-minio"
   NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" context --env-file "$runtime_env")"
   export NOVA_FIXTURE_RUN_CONTEXT
+  NOVA_FIXTURE_RUN_STORAGE="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" storage --env-file "$runtime_env")"
+  export NOVA_FIXTURE_RUN_STORAGE
 python3 "$repo_root/docker/iceberg-rest/fixture_run.py" sweep-start --env-file "$runtime_env" >&2
   shared_network="${NOVAROCKS_PAIMON_DOCKER_NETWORK:?machine network required}"
   minio_container="${NOVA_ENV_OBJECT_STORE_CONTAINER}"
@@ -1004,6 +1008,7 @@ with open(path, "w", encoding="utf-8") as handle:
             "shared_minio_bucket": shared_bucket,
             "shared_minio_scope": os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") and json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"])["identity"]["scope_root"] if storage_mode == "shared-minio" else None,
             "run_context": json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"]) if storage_mode == "shared-minio" else None,
+            "run_storage": json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]) if storage_mode == "shared-minio" else None,
             "machine_version": os.environ.get("NOVA_FIXTURE_MACHINE_VERSION") if storage_mode == "shared-minio" else None,
             "machine_generation": os.environ.get("NOVA_FIXTURE_MACHINE_GENERATION") if storage_mode == "shared-minio" else None,
             "scenarios": ["new-first", "old-first", "client-exit"] + (
