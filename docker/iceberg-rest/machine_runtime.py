@@ -64,6 +64,14 @@ class SweepLockTimeout(runtime.RuntimeFailure):
         super().__init__("MachineMaintaining", "bounded sweep could not acquire the machine lock")
 
 
+class MachineCommandDeadlineExpired(runtime.RuntimeFailure):
+    """The command deadline elapsed before a journal or CLI was created."""
+
+    def __init__(self, *, readonly):
+        super().__init__("RunBudgetExpired", "original machine operation deadline expired")
+        self.readonly_not_dispatched = readonly
+
+
 def endpoints(snapshot: dict[str, Any]) -> dict[str, str]:
     ports = snapshot["ports"]
     result = {
@@ -517,11 +525,12 @@ class MachineDocker(runtime.Docker):
         return result
 
     def command(self, args, *, absent_ok=False):
+        readonly = args[0] in {"ps", "info", "inspect", "version"} or "inspect" in args[:2] or args[:2] == ["context", "show"]
         deadline = min(time.monotonic() + self.timeout,
                        getattr(self, "operation_deadline", None) or float("inf"))
         timeout = deadline - time.monotonic()
         if timeout <= 0:
-            raise runtime.RuntimeFailure("RunBudgetExpired", "original machine operation deadline expired")
+            raise MachineCommandDeadlineExpired(readonly=readonly)
         if getattr(self, "maintenance_fd", None) is None:
             original_timeout = self.timeout
             try:
@@ -531,7 +540,6 @@ class MachineDocker(runtime.Docker):
                 self.timeout = original_timeout
         base = Path(self.maintenance_base)
         journal = base / "operations" / ("control-" + uuid.uuid4().hex + ".json")
-        readonly = args[0] in {"ps", "info", "inspect", "version"} or "inspect" in args[:2] or args[:2] == ["context", "show"]
         fact = dict(schema=1, kind="control", phase="intent", mutating=not readonly,
                     control_root=str(base.parent), machine=base.name)
         state_path = base / "state.json"
@@ -1049,8 +1057,12 @@ class MachineOwner:
                 raise SweepLockTimeout() from error
             raise
         except runtime.RuntimeFailure as error:
-            if (observation_only and error.code == "DockerOperationTimeout"
-                    and getattr(error, "readonly_deadline_settled", False) is True
+            readonly_complete = (
+                error.code == "DockerOperationTimeout"
+                and getattr(error, "readonly_deadline_settled", False) is True
+            ) or (isinstance(error, MachineCommandDeadlineExpired)
+                  and error.readonly_not_dispatched is True)
+            if (observation_only and readonly_complete
                     and not self.backend.unsettled_operations(self.base)):
                 raise runtime.RuntimeFailure("ScratchSweepTimeout",
                     "bounded sweep observation deadline elapsed after confirmed readonly completion") from error
