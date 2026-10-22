@@ -34,6 +34,7 @@ HERE = Path(__file__).resolve()
 sys.path.insert(0, str(HERE.parents[1]))
 import fixture_runtime as runtime
 import machine_runtime as machine
+import machine_operation as operation
 
 
 FAKE_DOCKER = r'''#!/usr/bin/env python3
@@ -43,7 +44,7 @@ args=sys.argv[1:]
 config=json.loads((root/'fake-config.json').read_text())
 state=root/'container.json'
 def event(name, **facts):
-    value=dict(event=name,pid=os.getpid(),ppid=os.getppid(),args=args,**facts)
+    value=dict(event=name,pid=os.getpid(),ppid=os.getppid(),args=args,at_monotonic=time.monotonic(),**facts)
     with (root/'events.jsonl').open('a') as out:
         out.write(json.dumps(value)+'\n');out.flush();os.fsync(out.fileno())
 def gate(name):
@@ -94,11 +95,14 @@ if args[0]=='create':
         if a=='--label':
             key,value=args[i+1].split('=',1);labels[key]=value
     image=args[args.index('--entrypoint')+2]
-    info=dict(Id='container-exact-42',Name=name,Image=image,
+    info=dict(Id='4444444444444444444444444444444444444444444444444444444444444444',Name=name,Image=image,
               Config=dict(Labels=labels),State=dict(Running=False))
     if config.get('foreign'):
         info['Image']='sha256:foreign-image'
     if config.get('hold_create'):gate('create-release')
+    if 'create_exit' in config:
+        event('create.exit',code=config['create_exit'])
+        raise SystemExit(config['create_exit'])
     if config.get('unknown_create'):
         if config.get('late_create'):
             (root/'late-container.json').write_text(json.dumps(info))
@@ -112,7 +116,7 @@ if args[0]=='create':
     if config.get('hold_created'):
         event('create.saved')
         gate('create-release')
-    print(info['Id'],flush=True)
+    print(config.get('create_reply',info['Id']),flush=True)
     event('create.exit',code=0)
     raise SystemExit(0)
 if args[:2]==['container','inspect']:
@@ -218,7 +222,19 @@ def run_owner(root):
                 else:
                     output = owner.backend.command(arguments)
             else:
-                output = owner.backend.run_mc(record, "echo fixture-command", binary=options.get("binary", False))
+                if options.get("gate_start_deadline"):
+                    original_popen = machine.subprocess.Popen
+                    expected = [sys.executable, str(HERE.parents[1] / "machine_operation.py")]
+                    def clocked_start_monitor(argv, **kwargs):
+                        if (len(argv) != 9 or argv[:2] != expected or
+                                argv[3::2] != ["--control-fd", "--lock-fd", "--timeout"]):
+                            raise AssertionError("unexpected production supervisor launch")
+                        return original_popen([sys.executable, str(HERE), "--fixture-clocked-monitor",
+                                               str(root), *argv[2:]], **kwargs)
+                    with patch.object(machine.subprocess, "Popen", side_effect=clocked_start_monitor):
+                        output = owner.backend.run_mc(record, "echo fixture-command", binary=options.get("binary", False))
+                else:
+                    output = owner.backend.run_mc(record, "echo fixture-command", binary=options.get("binary", False))
             if isinstance(output, bytes):
                 result["stdout_hex"] = output.hex()
             else:
@@ -235,9 +251,12 @@ def run_clocked_monitor(root, arguments):
     import machine_operation
 
     options = json.loads((root / "fake-config.json").read_text())
-    if not (options.get("gate_plugin_deadline") and options.get("plugin")
-            and options.get("plugin_ignore_term") and options.get("operation") == "control"):
-        raise AssertionError("clock helper is exclusive to the entered-plugin timeout case")
+    plugin_mode = (options.get("gate_plugin_deadline") and options.get("plugin")
+                   and options.get("plugin_ignore_term") and options.get("operation") == "control")
+    start_mode = options.get("gate_start_deadline") and options.get("hold_start") and options.get("operation") != "control"
+    if not (plugin_mode or start_mode):
+        raise AssertionError("clock helper requires an original entered-plugin or entered-start timeout case")
+    gate = "plugin-deadline-release" if plugin_mode else "start-deadline-release"
     journal = Path(arguments[0])
     if not journal.resolve().is_relative_to((root / "state").resolve()):
         raise AssertionError("clock helper journal is outside this test owner")
@@ -251,7 +270,7 @@ def run_clocked_monitor(root, arguments):
     def controlled_monotonic():
         nonlocal resumed_at
         if resumed_at is None:
-            if not (root / "plugin-deadline-release").exists():
+            if not (root / gate).exists():
                 return deadline - options["timeout"]
             # One existence gate, one real anchor. Never reread a timestamp,
             # extend the original deadline, or freeze the TERM/KILL interval.
@@ -284,7 +303,7 @@ class MachineOperationTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         (self.root / "bin").mkdir()
         cli = self.root / "bin" / "docker"
-        cli.write_text(FAKE_DOCKER)
+        cli.write_text(FAKE_DOCKER.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1))
         cli.chmod(0o700)
         self.owner_process = None
         self.addCleanup(self.finish)
@@ -364,7 +383,7 @@ class MachineOperationTests(unittest.TestCase):
         # Every gate belongs to this test's fake CLI; release before reaping.
         # A failed setup must not leave a clock-frozen creating=True monitor
         # retaining its inherited flock after this test's owner is killed.
-        for name in ("plugin-deadline-release", "create-release", "start-release", "rm-release",
+        for name in ("plugin-deadline-release", "start-deadline-release", "create-release", "start-release", "rm-release",
                      "late-release", "control-release", "plugin-release"):
             self.release(name)
         if self.owner_process is not None and self.owner_process.poll() is None:
@@ -392,8 +411,8 @@ class MachineOperationTests(unittest.TestCase):
         removes = [e for e in events if e["event"] == "rm.entered"]
         self.assertEqual(len(starts), 1)
         self.assertEqual(len(removes), 1)
-        self.assertEqual(starts[0]["args"], ["start", "--attach", "container-exact-42"])
-        self.assertEqual(removes[0]["args"], ["container", "rm", "--force", "container-exact-42"])
+        self.assertEqual(starts[0]["args"], ["start", "--attach", "4444444444444444444444444444444444444444444444444444444444444444"])
+        self.assertEqual(removes[0]["args"], ["container", "rm", "--force", "4444444444444444444444444444444444444444444444444444444444444444"])
         self.assertEqual(self.fact()["phase"], "settled")
         self.assertTrue(self.fact()["container_absent"])
         self.assertFalse((self.root / "container.json").exists())
@@ -402,7 +421,9 @@ class MachineOperationTests(unittest.TestCase):
         self.assertEqual(self.journal_path().with_suffix(".env").stat().st_mode & 0o777, 0o600)
 
     def test_cleaned_start_timeout_with_native_exit_zero_is_typed_timeout(self):
-        self.start_owner(hold_start=True, timeout=0.4, start_term_exit=0)
+        self.start_owner(hold_start=True, timeout=0.4, start_term_exit=0, gate_start_deadline=True)
+        self.until(lambda: self.event("start.entered"), "original START payload")
+        self.release("start-deadline-release")
         self.until(lambda: self.event("start.signal"), "original start deadline")
         (self.root / "start-release").touch()
         self.assertEqual(self.wait_owner(1)["error"], "DockerOperationTimeout")
@@ -426,6 +447,204 @@ class MachineOperationTests(unittest.TestCase):
         self.assertIsNone(self.event("start.entered"))
         self.assertFalse(self.lock_held())
 
+    def release_create_after_work_deadline(self):
+        self.until(lambda: self.event("create.entered"), "original CREATE dispatch")
+        request = self.journal_path().with_suffix(".request")
+        original = request.read_bytes()
+        deadline = json.loads(original)["deadline_monotonic"]
+        self.until(lambda: time.monotonic() >= deadline + 0.05, "original work deadline")
+        self.assertTrue(self.lock_held())
+        self.assertIsNone(self.event("create.exit"), "original CREATE reply must remain in flight")
+        self.release("create-release")
+        return request, original, deadline
+
+    def test_late_authoritative_create_reply_is_cleaned_without_start_and_stays_timeout(self):
+        self.start_owner(hold_create=True, timeout=0.8)
+        request, original, deadline = self.release_create_after_work_deadline()
+        self.assertEqual(self.wait_owner(1)["error"], "DockerOperationTimeout")
+        fact = self.fact()
+        self.assertTrue(fact["create_dispatched"])
+        self.assertEqual(fact["create_exit"], 0)
+        self.assertEqual(fact["create_reply_id"], "4444444444444444444444444444444444444444444444444444444444444444")
+        self.assertEqual(fact["container_id"], fact["create_reply_id"])
+        self.assertTrue(fact["create_timed_out"])
+        self.assertTrue(fact["timed_out"])
+        self.assertEqual(fact["create_reply_deadline_monotonic"], deadline + 5)
+        self.assertEqual(fact["phase"], "settled")
+        self.assertTrue(fact["container_absent"])
+        self.assertFalse(fact["command_succeeded"])
+        self.assertIsNone(self.event("start.entered"))
+        self.assertEqual(self.event("rm.entered")["args"], ["container", "rm", "--force", "4444444444444444444444444444444444444444444444444444444444444444"])
+        self.assertGreater(self.event("create.exit")["at_monotonic"], deadline)
+        self.assertLess(self.event("create.exit")["at_monotonic"], deadline + 5)
+        self.assertEqual(request.read_bytes(), original)
+        self.assertFalse(self.lock_held())
+
+    def test_late_create_reply_with_cleanup_failure_remains_unconfirmed(self):
+        self.start_owner(hold_create=True, timeout=0.8, rm_exit=17)
+        self.release_create_after_work_deadline()
+        self.assertEqual(self.wait_owner(1)["error"], "ContainerCleanupUnconfirmed")
+        fact = self.fact()
+        self.assertEqual(fact["phase"], "cleanup-failed")
+        self.assertEqual(fact["create_exit"], 0)
+        self.assertTrue(fact["timed_out"])
+        self.assertTrue((self.root / "container.json").exists())
+        self.assertIsNone(self.event("start.entered"))
+
+    def test_owner_loss_during_create_still_observes_late_reply_and_cleans_exact_id(self):
+        self.start_owner(hold_create=True, timeout=0.8)
+        self.until(lambda: self.event("create.entered"), "original CREATE dispatch")
+        self.owner_process.kill()
+        self.assertEqual(self.owner_process.wait(timeout=3), -signal.SIGKILL)
+        self.release_create_after_work_deadline()
+        self.until(lambda: not self.lock_held(), "late CREATE reply and exact container cleanup")
+        fact = self.fact()
+        self.assertEqual(fact["phase"], "settled")
+        self.assertEqual(fact["create_exit"], 0)
+        self.assertTrue(fact["interrupted"])
+        self.assertTrue(fact["timed_out"])
+        self.assertTrue(fact["container_absent"])
+        self.assertFalse(fact["command_succeeded"])
+        self.assertIsNone(self.event("start.entered"))
+
+    def test_create_without_reply_by_fixed_settlement_limit_remains_unknown(self):
+        self.start_owner(hold_create=True, timeout=0.4)
+        self.until(lambda: self.event("create.entered"), "original CREATE dispatch")
+        request = json.loads(self.journal_path().with_suffix(".request").read_text())
+        self.assertEqual(self.wait_owner(1)["error"], "ContainerCleanupUnconfirmed")
+        fact = self.fact()
+        self.assertEqual(fact["phase"], "create-unknown")
+        self.assertTrue(fact["create_dispatched"])
+        self.assertTrue(fact["create_timed_out"])
+        self.assertNotIn("container_absent", fact)
+        self.assertIsNone(self.event("start.entered"))
+        self.assertGreaterEqual(fact["group_exit_observed_monotonic"], request["deadline_monotonic"] + 5)
+        self.assertFalse(self.lock_held())
+
+    def test_native_create_exit_124_is_dispatched_unknown_not_predispatch_expiry(self):
+        self.start_owner(create_exit=124)
+        self.assertEqual(self.wait_owner(1)["error"], "ContainerCleanupUnconfirmed")
+        self.assertEqual(self.fact()["phase"], "create-unknown")
+        self.assertTrue(self.fact()["create_dispatched"])
+        self.assertEqual(self.fact()["create_exit"], 124)
+        self.assertFalse(self.fact()["create_timed_out"])
+        self.assertNotIn("container_absent", self.fact())
+
+    def test_successful_create_reply_id_cannot_be_replaced_by_same_name_observation(self):
+        self.start_owner(create_reply="5" * 64)
+        self.assertEqual(self.wait_owner(1)["error"], "ContainerCleanupUnconfirmed")
+        fact = self.fact()
+        self.assertEqual(fact["phase"], "create-unknown")
+        self.assertEqual(fact["create_reply_id"], "5" * 64)
+        self.assertNotIn("container_id", fact)
+        self.assertNotIn("container_absent", fact)
+        self.assertTrue((self.root / "container.json").exists())
+        self.assertEqual(self.event("inspect")["args"][2], "5" * 64)
+        self.assertIsNone(self.event("start.entered"))
+        self.assertIsNone(self.event("rm.entered"))
+        owner = owner_for(self.root)
+        with owner.maintenance_lock():
+            owner.backend.settle_operations(owner.base)
+        self.assertTrue((self.root / "container.json").exists())
+        self.assertEqual(self.fact()["phase"], "settled")
+        self.assertEqual(self.fact()["container_id"], "5" * 64)
+        self.assertFalse(self.fact()["command_succeeded"])
+        self.assertTrue(all(event["args"][2] == "5" * 64 for event in self.events() if event["event"] == "inspect"))
+        self.assertIsNone(self.event("rm.entered"))
+
+    def direct_owner(self, deadline):
+        journal = self.root / "direct.json"
+        runtime.atomic_json(journal, dict(schema=1, phase="intent", container_name="fixture-direct",
+            image_id="sha256:fixture-test-image", labels={}))
+        request = dict(environment={}, deadline_monotonic=deadline, network="none",
+                       env_file=str(self.root / "unused.env"), script="echo unused")
+        return operation.CommandOwner(request, journal, -1, 1)
+
+    def test_create_intent_fsync_crossing_deadline_records_proven_undispatched(self):
+        owner = self.direct_owner(101.0)
+        now = [100.0]
+        original = owner.save
+        def save(**facts):
+            original(**facts)
+            if facts.get("phase") == "creating":
+                now[0] = 101.0
+        with patch.object(owner, "alive", return_value=True), patch.object(owner, "save", side_effect=save), \
+                patch.object(operation.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(operation.subprocess, "Popen") as popen, patch.object(owner, "inspect") as inspect:
+            self.assertEqual(owner.run(), 124)
+        popen.assert_not_called()
+        inspect.assert_not_called()
+        self.assertEqual(owner.fact["phase"], "settled")
+        self.assertFalse(owner.fact["create_dispatched"])
+        self.assertTrue(owner.fact["timed_out"])
+        self.assertTrue(owner.fact["container_absent"])
+        self.assertFalse(owner.fact["command_succeeded"])
+
+    def test_owner_liveness_check_crossing_deadline_never_dispatches_create(self):
+        owner = self.direct_owner(101.0)
+        now, checks = [100.0], []
+        def alive():
+            checks.append(True)
+            if len(checks) == 2:
+                now[0] = 101.0
+            return True
+        with patch.object(owner, "alive", side_effect=alive), \
+                patch.object(operation.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(operation.subprocess, "Popen") as popen, patch.object(owner, "inspect") as inspect:
+            self.assertEqual(owner.run(), 124)
+        popen.assert_not_called()
+        inspect.assert_not_called()
+        self.assertFalse(owner.fact["create_dispatched"])
+        self.assertTrue(owner.fact["timed_out"])
+        self.assertTrue(owner.fact["container_absent"])
+
+    def test_successful_create_reply_requires_one_full_hex_id_before_inspect(self):
+        for reply in (b"", b"4" * 12 + b"\n", b"4" * 64 + b"\n" + b"5" * 64 + b"\n", b"G" * 64 + b"\n"):
+            with self.subTest(reply=reply[:16]):
+                owner = self.direct_owner(101.0)
+                def command(args, output, **kwargs):
+                    Path(output).write_bytes(reply)
+                    return operation.CommandResult(0, False, True)
+                with patch.object(owner, "alive", return_value=True), patch.object(owner, "command", side_effect=command), \
+                        patch.object(operation.time, "monotonic", return_value=100.0), \
+                        patch.object(owner, "inspect") as inspect:
+                    self.assertEqual(owner.run(), 1)
+                inspect.assert_not_called()
+                self.assertEqual(owner.fact["phase"], "create-unknown")
+                self.assertEqual(owner.fact["error"], "DockerCreateReplyInvalid")
+                self.assertTrue(owner.fact["create_dispatched"])
+                self.assertNotIn("container_absent", owner.fact)
+
+    def test_start_intent_fsync_crossing_deadline_never_dispatches_start(self):
+        owner = self.direct_owner(101.0)
+        now = [100.0]
+        original_save, original_command = owner.save, owner.command
+        commands = []
+        def save(**facts):
+            original_save(**facts)
+            if facts.get("phase") == "running":
+                now[0] = 101.0
+        def command(args, output, **kwargs):
+            commands.append(args)
+            if args[0] == "create":
+                Path(output).write_text("4444444444444444444444444444444444444444444444444444444444444444\n")
+                return operation.CommandResult(0, False, True)
+            if args[:2] == ["container", "rm"]:
+                return operation.CommandResult(0, False, True)
+            return original_command(args, output, **kwargs)
+        with patch.object(owner, "alive", return_value=True), patch.object(owner, "save", side_effect=save), \
+                patch.object(owner, "command", side_effect=command), \
+                patch.object(owner, "inspect", side_effect=[dict(Id="4444444444444444444444444444444444444444444444444444444444444444"), None]), \
+                patch.object(operation.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(operation.subprocess, "Popen") as popen:
+            self.assertEqual(owner.run(), 1)
+        popen.assert_not_called()
+        self.assertFalse(owner.fact["start_dispatched"])
+        self.assertTrue(owner.fact["timed_out"])
+        self.assertTrue(owner.fact["container_absent"])
+        self.assertFalse(owner.fact["command_succeeded"])
+        self.assertEqual(commands[-1], ["container", "rm", "--force", "4444444444444444444444444444444444444444444444444444444444444444"])
+
     def test_native_nonzero_start_stays_failure(self):
         self.start_owner(start_exit=17)
         self.assertEqual(self.wait_owner(1)["error"], "DockerOperationFailed")
@@ -433,7 +652,9 @@ class MachineOperationTests(unittest.TestCase):
         self.assertTrue(self.fact()["container_absent"])
 
     def test_timeout_with_native_cleanup_failure_stays_unconfirmed(self):
-        self.start_owner(hold_start=True, timeout=0.4, rm_exit=17)
+        self.start_owner(hold_start=True, timeout=0.4, rm_exit=17, gate_start_deadline=True)
+        self.until(lambda: self.event("start.entered"), "original START payload")
+        self.release("start-deadline-release")
         self.until(lambda: self.event("start.signal"), "original start deadline")
         (self.root / "start-release").touch()
         self.assertEqual(self.wait_owner(1)["error"], "ContainerCleanupUnconfirmed")
@@ -542,6 +763,20 @@ class MachineOperationTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "MachineOperationUnconfirmed")
         self.assertEqual(self.control_fact()["phase"], "command-unknown")
         self.assertEqual(sum(e["event"] == "control.entered" for e in self.events()), entered)
+        self.assertFalse((self.root / "control-side-effect").exists())
+
+    def test_control_rpc_does_not_receive_mc_create_reply_settlement_window(self):
+        self.start_owner(operation="control", hold_control=True, timeout=0.8)
+        self.until(lambda: self.event("control.entered"), "original control RPC")
+        request = next((self.root / "state").glob("*/operations/control-*.request"))
+        deadline = json.loads(request.read_text())["deadline_monotonic"]
+        self.wait_owner(1)
+        self.assertLess(time.monotonic(), deadline + 2)
+        fact = self.control_fact()
+        self.assertEqual(fact["phase"], "command-unknown")
+        self.assertTrue(fact["timed_out"])
+        self.assertTrue(fact["command_dispatched"])
+        self.assertNotIn("create_reply_deadline_monotonic", fact)
         self.assertFalse((self.root / "control-side-effect").exists())
 
     def test_control_leader_stays_unreaped_until_plugin_actually_exits(self):
@@ -688,8 +923,9 @@ class MachineOperationTests(unittest.TestCase):
             owner.backend.settle_operations(owner.base)
         self.assertFalse((self.root / "container.json").exists())
         self.assertEqual(self.fact()["phase"], "settled")
+        self.assertEqual(self.fact()["container_id"], "4" * 64)
         self.assertIsNone(self.event("start.entered"))
-        self.assertEqual(self.event("rm.entered")["args"][-1], "container-exact-42")
+        self.assertEqual(self.event("rm.entered")["args"][-1], "4444444444444444444444444444444444444444444444444444444444444444")
 
     def test_foreign_container_is_never_started_or_removed_even_during_recovery(self):
         self.start_owner(foreign=True)
@@ -702,6 +938,65 @@ class MachineOperationTests(unittest.TestCase):
                 owner.backend.settle_operations(owner.base)
         self.assertEqual(caught.exception.code, "RuntimeIdentityMismatch")
         self.assertTrue((self.root / "container.json").exists())
+        self.assertIsNone(self.event("start.entered"))
+        self.assertIsNone(self.event("rm.entered"))
+
+    def test_recovery_uses_known_id_even_if_owned_container_was_renamed(self):
+        self.start_owner(start_exit=17, rm_exit=17)
+        self.assertEqual(self.wait_owner(1)["error"], "ContainerCleanupUnconfirmed")
+        fact = self.fact()
+        self.assertEqual(fact["container_id"], "4" * 64)
+        self.assertEqual(fact["create_reply_id"], "4" * 64)
+        state = self.root / "container.json"
+        info = json.loads(state.read_text())
+        info["Name"] = "renamed-owned-container"
+        state.write_text(json.dumps(info))
+        self.configure()
+        before = len(self.events())
+        owner = owner_for(self.root)
+        with owner.maintenance_lock():
+            owner.backend.settle_operations(owner.base)
+        self.assertFalse(state.exists())
+        self.assertEqual(self.fact()["phase"], "settled")
+        later = self.events()[before:]
+        self.assertTrue(all(event["args"][2] == "4" * 64 for event in later if event["event"] == "inspect"))
+        self.assertTrue(any(event["args"] == ["container", "rm", "--force", "4" * 64]
+                            for event in later if event["event"] == "rm.entered"))
+
+    def test_recovery_rejects_conflicting_reply_and_inspected_container_ids(self):
+        self.start_owner(start_exit=17, rm_exit=17)
+        self.assertEqual(self.wait_owner(1)["error"], "ContainerCleanupUnconfirmed")
+        fact = self.fact()
+        fact["create_reply_id"] = "5" * 64
+        runtime.atomic_json(self.journal_path(), fact)
+        self.configure()
+        before = len(self.events())
+        owner = owner_for(self.root)
+        with owner.maintenance_lock(), self.assertRaisesRegex(runtime.RuntimeFailure, "RuntimeIdentityMismatch"):
+            owner.backend.settle_operations(owner.base)
+        self.assertTrue((self.root / "container.json").exists())
+        self.assertFalse(self.events()[before:])
+
+    def test_recovery_after_crash_with_authoritative_reply_and_exact_id_absent_is_known_failure(self):
+        self.configure()
+        owner = owner_for(self.root)
+        record = operation_record(self.root, owner)
+        name = machine.PROJECT + "-mc-" + "a" * 32
+        journal = Path(record["compose_file"]).parent / "operations" / (name + ".json")
+        fact = dict(schema=1, phase="created", container_name=name, generation=record["generation"],
+            image_id=record["images"]["mc"]["image_id"], create_dispatched=True, create_exit=0,
+            create_reply_id="4" * 64, create_timed_out=True,
+            labels={**owner.backend.labels(record), "novarocks.fixture.version": record["version"],
+                    "novarocks.fixture.activation": record["generation"]})
+        runtime.atomic_json(journal, fact)
+        with owner.maintenance_lock():
+            owner.backend.settle_operations(owner.base)
+        result = json.loads(journal.read_text())
+        self.assertEqual(result["phase"], "settled")
+        self.assertEqual(result["container_id"], "4" * 64)
+        self.assertTrue(result["container_absent"])
+        self.assertFalse(result["command_succeeded"])
+        self.assertTrue(all(event["args"][2] == "4" * 64 for event in self.events() if event["event"] == "inspect"))
         self.assertIsNone(self.event("start.entered"))
         self.assertIsNone(self.event("rm.entered"))
 
