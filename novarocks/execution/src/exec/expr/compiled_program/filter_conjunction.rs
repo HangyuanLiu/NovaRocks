@@ -28,6 +28,7 @@ pub(crate) struct CompiledFilterConjunctionInstance {
     failed: bool,
 }
 impl CompiledFilterConjunctionInstance {
+    #[cfg(test)]
     pub(crate) fn try_new(
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
@@ -297,6 +298,7 @@ impl CompiledFilterConjunctionInstance {
             None,
         )
     }
+    #[cfg(test)]
     pub(crate) fn evaluate_required_runtime(
         &mut self,
         input: &RecordBatch,

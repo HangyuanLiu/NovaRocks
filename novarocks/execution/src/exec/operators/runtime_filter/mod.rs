@@ -442,6 +442,7 @@ impl RuntimeFilterConsumerState {
     /// Whether input already reached the gate and is still held back. Asking
     /// settles what it can, so a woken consumer observes a publication or an
     /// expired wait. An untouched gate holds nothing back.
+    #[cfg(test)]
     pub(crate) fn gate_holds_input(&self) -> bool {
         let waiting = matches!(
             *self.inner.gate.lock().expect("native RF gate lock"),
@@ -2070,7 +2071,6 @@ mod tests {
         source: Arc<Observable>,
         values: Arc<Mutex<Vec<i32>>>,
         subscription: Arc<ControlledSubscription>,
-        gate: Arc<Observable>,
         input_schema: arrow::datatypes::SchemaRef,
     }
 
@@ -2098,7 +2098,6 @@ mod tests {
         );
         let fixture = compiled_consumers(state.error_state());
         let factory = NativeRuntimeFilterProcessorFactory::new_compiled(5, fixture.consumers);
-        let gate = factory.consumers.state().gate_observable();
         let mut processor = factory.create(1, 0);
         processor.set_construction_factory(actual_evaluation_factory(&state));
         processor
@@ -2135,7 +2134,6 @@ mod tests {
             source,
             values,
             subscription,
-            gate,
             input_schema: fixture.input_schema,
         }
     }

@@ -142,7 +142,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct Opaque {
         drops: Arc<AtomicUsize>,
-        data: Arc<Vec<u8>>,
+        _data: Arc<Vec<u8>>,
     }
     impl Drop for Opaque {
         fn drop(&mut self) {
@@ -163,7 +163,7 @@ mod tests {
             if self.call_panic {
                 std::panic::panic_any(Opaque {
                     drops: self.payload_drops.clone(),
-                    data: self.data.clone(),
+                    _data: self.data.clone(),
                 });
             }
         }
@@ -174,7 +174,7 @@ mod tests {
             if self.drop_panic {
                 std::panic::panic_any(Opaque {
                     drops: self.payload_drops.clone(),
-                    data: self.data.clone(),
+                    _data: self.data.clone(),
                 });
             }
         }

@@ -368,10 +368,12 @@ fn compiled_submission_prepares_and_runs_into_the_result_session() {
     .expect("compiled submission");
     assert_eq!(submission.sink_kind(), FragmentSinkKind::Result);
     let session = Arc::new(CollectingSession::default());
-    let mut context = FragmentPrepareContext::default();
-    context.result_writer = Arc::new(CollectingWriter {
-        session: Arc::clone(&session),
-    });
+    let context = FragmentPrepareContext {
+        result_writer: Arc::new(CollectingWriter {
+            session: Arc::clone(&session),
+        }),
+        ..FragmentPrepareContext::default()
+    };
     let handle = prepare_compiled_fragment(submission, context).expect("compiled prepare");
     assert!(matches!(
         handle.start().join().outcome(),
@@ -451,8 +453,10 @@ fn a_host_root_sink_width_must_equal_the_compiled_width() {
         ),
     )
     .expect("compiled submission");
-    let mut context = FragmentPrepareContext::default();
-    context.root_sink_dop = Some(4);
+    let context = FragmentPrepareContext {
+        root_sink_dop: Some(4),
+        ..FragmentPrepareContext::default()
+    };
     let error = refused(prepare_compiled_fragment(submission, context));
     assert!(error.to_string().contains("root sink width"), "{error}");
 }

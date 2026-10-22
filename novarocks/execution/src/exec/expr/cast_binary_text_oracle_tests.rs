@@ -87,11 +87,11 @@ fn binary_text_oracle_exact_profile_source_nullability_policies_every_byte_slice
                     ),
                 ] {
                     assert_eq!(source.len(), expected_rows.len());
-                    for row in 0..source.len() {
+                    for (row, expected) in expected_rows.iter().enumerate() {
                         if source.is_null(row) && !nullable {
                             continue;
                         }
-                        let expected = expected_rows[row]
+                        let expected = expected
                             .map_or(CastRowResult::Null, |text| CastRowResult::Text(text.into()));
                         assert_eq!(
                             recipe

@@ -210,6 +210,7 @@ pub(crate) enum JoinHashMapMethodKind {
 }
 
 impl JoinHashMapMethodKind {
+    #[cfg(test)]
     pub(crate) fn as_profile_str(&self) -> &'static str {
         match self {
             Self::Chained => "Chained",

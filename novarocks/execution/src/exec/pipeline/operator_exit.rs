@@ -764,7 +764,7 @@ mod tests {
             }
         }
         struct Secondary {
-            capture: Arc<Capture>,
+            _capture: Arc<Capture>,
             drops: Arc<AtomicUsize>,
         }
         impl Drop for Secondary {
@@ -782,7 +782,7 @@ mod tests {
                 self.primary_drops.fetch_add(1, Ordering::SeqCst);
                 let capture = unsafe { ManuallyDrop::take(&mut self.capture) };
                 std::panic::panic_any(Secondary {
-                    capture,
+                    _capture: capture,
                     drops: self.secondary_drops.clone(),
                 });
             }
@@ -974,7 +974,6 @@ mod tests {
             final_events.pop().unwrap().progress,
             ExitProgress::Exited
         ));
-        drop(observe);
         assert_eq!(polls, 2);
         assert!(weak.upgrade().is_none());
         assert_eq!(drops.load(Ordering::SeqCst), 1);

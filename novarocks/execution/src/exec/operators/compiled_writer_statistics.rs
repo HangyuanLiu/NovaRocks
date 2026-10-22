@@ -51,8 +51,8 @@ use arrow::array::{Array, ArrayRef, Int8Array, Int32Array, new_null_array};
 use arrow::datatypes::{DataType, Field};
 use novarocks_functions::{
     AggregateCallContract, AggregateKernelPhase, AggregateStateAllocator, AggregateStateColumn,
-    EvaluatedArgument, KernelDiagnostic, KernelEvaluationControl, KernelFailure,
-    PreparedAggregateHandle, SelectedAggregateMergeInput, SelectedAggregateUpdateInput, Selection,
+    EvaluatedArgument, KernelEvaluationControl, KernelFailure, PreparedAggregateHandle,
+    SelectedAggregateMergeInput, SelectedAggregateUpdateInput, Selection,
 };
 use novarocks_local_program::{
     LocalProgram, ProgramCallSite, ProgramExpressionRootSite, ProgramNodeExpressionRole,
@@ -276,7 +276,7 @@ fn project_statistics_schema(
 fn statistics_copy_failure(
     failure: novarocks_functions::selected_copy::CopyConstructionError<ConstructionFailure>,
 ) -> ExecutionFailure {
-    use novarocks_functions::selected_copy::{CopyConstructionError, CopyError};
+    use novarocks_functions::selected_copy::CopyConstructionError;
     match failure {
         CopyConstructionError::Creator(cause) => cause.into(),
         CopyConstructionError::Resource(cause) => ConstructionFailure::Resource(cause).into(),
@@ -416,6 +416,7 @@ enum PartialCallSource {
         calls: Arc<[WriterCall]>,
         positions: Arc<[usize]>,
     },
+    #[cfg(test)]
     Prepared(novarocks_local_program::PreparedWriterAggregateCalls),
 }
 struct PartialCallRef<'a> {
@@ -425,6 +426,7 @@ struct PartialCallRef<'a> {
 }
 enum PartialCallIter<'a> {
     Compiled(std::slice::Iter<'a, WriterCall>),
+    #[cfg(test)]
     Prepared(std::slice::Iter<'a, novarocks_local_program::PreparedWriterAggregateCall>),
 }
 impl<'a> Iterator for PartialCallIter<'a> {
@@ -436,6 +438,7 @@ impl<'a> Iterator for PartialCallIter<'a> {
                 contract: &call.contract,
                 input: call.input,
             }),
+            #[cfg(test)]
             Self::Prepared(calls) => calls.next().map(|call| PartialCallRef {
                 handle: call.handle(),
                 contract: call.handle().contract(),
@@ -452,12 +455,14 @@ impl ExactSizeIterator for PartialCallIter<'_> {
     fn len(&self) -> usize {
         match self {
             Self::Compiled(calls) => calls.len(),
+            #[cfg(test)]
             Self::Prepared(calls) => calls.len(),
         }
     }
 }
 enum PartialPositionIter<'a> {
     Compiled(std::iter::Copied<std::slice::Iter<'a, usize>>),
+    #[cfg(test)]
     Prepared(std::slice::Iter<'a, novarocks_local_program::PreparedWriterAggregateCall>),
 }
 impl Iterator for PartialPositionIter<'_> {
@@ -465,6 +470,7 @@ impl Iterator for PartialPositionIter<'_> {
     fn next(&mut self) -> Option<usize> {
         match self {
             Self::Compiled(values) => values.next(),
+            #[cfg(test)]
             Self::Prepared(values) => values.next().map(|call| call.output_position()),
         }
     }
@@ -477,6 +483,7 @@ impl ExactSizeIterator for PartialPositionIter<'_> {
     fn len(&self) -> usize {
         match self {
             Self::Compiled(values) => values.len(),
+            #[cfg(test)]
             Self::Prepared(values) => values.len(),
         }
     }
@@ -485,12 +492,14 @@ impl PartialCallSource {
     fn len(&self) -> usize {
         match self {
             Self::Compiled { calls, .. } => calls.len(),
+            #[cfg(test)]
             Self::Prepared(calls) => calls.calls().len(),
         }
     }
     fn iter(&self) -> PartialCallIter<'_> {
         match self {
             Self::Compiled { calls, .. } => PartialCallIter::Compiled(calls.iter()),
+            #[cfg(test)]
             Self::Prepared(calls) => PartialCallIter::Prepared(calls.calls().iter()),
         }
     }
@@ -499,6 +508,7 @@ impl PartialCallSource {
             Self::Compiled { positions, .. } => {
                 PartialPositionIter::Compiled(positions.iter().copied())
             }
+            #[cfg(test)]
             Self::Prepared(calls) => PartialPositionIter::Prepared(calls.calls().iter()),
         }
     }
@@ -514,6 +524,7 @@ pub(crate) struct CompiledWriterPartialFactory {
 }
 
 impl CompiledWriterPartialFactory {
+    #[cfg(test)]
     /// The PlanTree/local host already prepared its independent frozen calls.
     /// Create only this runtime header under the actual installed preparation
     /// owner, retaining that finite responsibility through the last processor.
@@ -546,6 +557,7 @@ impl CompiledWriterPartialFactory {
                 name,
                 calls: PartialCallSource::Prepared(calls),
                 output_layout,
+                #[cfg(test)]
                 input_layout: Some(input_layout),
                 _creation: Some(owner.storage_lifetime()),
                 output: None,
@@ -656,6 +668,7 @@ impl OperatorFactory for CompiledWriterPartialFactory {
             name: self.name.clone(),
             calls: self.calls.clone(),
             output_layout: self.output_layout.clone(),
+            #[cfg(test)]
             input_layout: None,
             _creation: None,
             output: None,
@@ -669,6 +682,7 @@ impl OperatorFactory for CompiledWriterPartialFactory {
     }
 }
 
+#[cfg(test)]
 type WriterPartialStep = Transform<CompiledWriterPartialProcessor, HydrateInput>;
 
 /// One driver's partial statistics: one state per call, all in one group.
@@ -676,6 +690,7 @@ struct CompiledWriterPartialProcessor {
     name: String,
     calls: PartialCallSource,
     output_layout: StaticLayout,
+    #[cfg(test)]
     input_layout: Option<StaticLayout>,
     _creation: Option<ValueTypeStorageLifetime>,
     output: Option<ChunkSchemaRef>,
@@ -808,6 +823,7 @@ impl OperatorLifecycle for CompiledWriterPartialProcessor {
             .as_ref()
             .ok_or(ConstructionFailure::MissingOwner)?;
         let owner = factory.begin_compiled_layout_construction(&self.output_layout)?;
+        #[cfg(test)]
         if let (PartialCallSource::Prepared(source), Some(input)) =
             (&self.calls, &self.input_layout)
         {
@@ -1643,18 +1659,21 @@ impl FinishStatisticsFactory for CompiledFinishStatistics {
 #[derive(Clone)]
 enum FinalCallSource {
     Compiled(Arc<[WriterCall]>),
+    #[cfg(test)]
     Prepared(novarocks_local_program::PreparedWriterAggregateCalls),
 }
 impl FinalCallSource {
     fn len(&self) -> usize {
         match self {
             Self::Compiled(calls) => calls.len(),
+            #[cfg(test)]
             Self::Prepared(calls) => calls.calls().len(),
         }
     }
     fn iter(&self) -> PartialCallIter<'_> {
         match self {
             Self::Compiled(calls) => PartialCallIter::Compiled(calls.iter()),
+            #[cfg(test)]
             Self::Prepared(calls) => PartialCallIter::Prepared(calls.calls().iter()),
         }
     }
@@ -1662,6 +1681,7 @@ impl FinalCallSource {
 #[derive(Clone)]
 enum FinalOutputSlots {
     Compiled(Arc<[SlotId]>),
+    #[cfg(test)]
     Prepared {
         grouping: SlotId,
         calls: novarocks_local_program::PreparedWriterAggregateCalls,
@@ -1669,6 +1689,7 @@ enum FinalOutputSlots {
 }
 enum FinalSlotIter<'a> {
     Compiled(std::iter::Copied<std::slice::Iter<'a, SlotId>>),
+    #[cfg(test)]
     Prepared {
         grouping: Option<SlotId>,
         calls: std::slice::Iter<'a, novarocks_local_program::PreparedWriterAggregateCall>,
@@ -1679,6 +1700,7 @@ impl Iterator for FinalSlotIter<'_> {
     fn next(&mut self) -> Option<SlotId> {
         match self {
             Self::Compiled(slots) => slots.next(),
+            #[cfg(test)]
             Self::Prepared { grouping, calls } => grouping
                 .take()
                 .or_else(|| calls.next().map(|call| call.output())),
@@ -1693,6 +1715,7 @@ impl ExactSizeIterator for FinalSlotIter<'_> {
     fn len(&self) -> usize {
         match self {
             Self::Compiled(slots) => slots.len(),
+            #[cfg(test)]
             Self::Prepared { grouping, calls } => usize::from(grouping.is_some()) + calls.len(),
         }
     }
@@ -1701,6 +1724,7 @@ impl FinalOutputSlots {
     fn iter(&self) -> FinalSlotIter<'_> {
         match self {
             Self::Compiled(slots) => FinalSlotIter::Compiled(slots.iter().copied()),
+            #[cfg(test)]
             Self::Prepared { grouping, calls } => FinalSlotIter::Prepared {
                 grouping: Some(*grouping),
                 calls: calls.calls().iter(),
@@ -1709,27 +1733,7 @@ impl FinalOutputSlots {
     }
 }
 
-/// The default host lends independently guarded prepared calls. It creates
-/// no aggregate graph or programme, and runs the same final state algorithm.
-pub(crate) fn create_prepared_final_in(
-    calls: novarocks_local_program::PreparedWriterAggregateCalls,
-    grouping_input: SlotId,
-    grouping_output: SlotId,
-    input_schema: ChunkSchemaRef,
-    error: Arc<RuntimeErrorState>,
-    owner: &dyn InputConstructionOwner,
-) -> ExecutionResult<Box<dyn Operator>> {
-    prepared_final_in(
-        calls,
-        grouping_input,
-        grouping_output,
-        input_schema,
-        error,
-        owner,
-    )
-    .map(|operator| operator as Box<dyn Operator>)
-}
-
+#[cfg(test)]
 fn prepared_final_in(
     calls: novarocks_local_program::PreparedWriterAggregateCalls,
     grouping_input: SlotId,
@@ -2059,7 +2063,7 @@ impl OperatorLifecycle for CompiledWriterFinalAggregate {
                 )
                 .into());
             }
-            for (position, call) in self.calls.iter().enumerate() {
+            for call in self.calls.iter() {
                 statistics_work(owner.as_ref(), 1)?;
                 if call.contract.phase() != AggregateKernelPhase::Final {
                     return Err(ConstructionFailure::InvalidSource(
@@ -2083,14 +2087,6 @@ impl OperatorLifecycle for CompiledWriterFinalAggregate {
                 {
                     return Err(ConstructionFailure::InvalidSource(
                         "writer final state differs from its complete prepared declaration".into(),
-                    )
-                    .into());
-                }
-                if let FinalCallSource::Prepared(calls) = &self.calls
-                    && calls.calls()[position].output_position() != position + 1
-                {
-                    return Err(ConstructionFailure::InvalidSource(
-                        "writer final output occurrence changed".into(),
                     )
                     .into());
                 }
@@ -2341,10 +2337,6 @@ impl OperatorLifecycle for CompiledGroupedUnpivot {
         "COMPILED_GROUPED_WRITER_UNPIVOT"
     }
 }
-
-#[cfg(test)]
-#[path = "opaque_memory_host_tests.rs"]
-mod opaque_memory_host_tests;
 
 #[cfg(test)]
 #[path = "compiled_writer_statistics/prepared_source_tests.rs"]

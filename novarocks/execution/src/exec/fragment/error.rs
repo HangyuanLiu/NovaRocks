@@ -358,6 +358,7 @@ pub(crate) fn program_binding_failure(
 }
 
 /// Explicit frozen-node guard selected by its construction owner.
+#[cfg(test)]
 pub(crate) fn node_construction_failure(
     detail: impl std::fmt::Display,
 ) -> crate::runtime::fragment::ExecutionFailure {

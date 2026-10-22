@@ -18,10 +18,10 @@
 //! Source protocol: one reported output and next action per actual poll.
 
 use super::{ControlStep, InputResult, NextStep, RawInput, StepContext, StepOperator, StepResult};
+#[cfg(test)]
+use crate::exec::pipeline::operator::ExitProgress;
 use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::exec::pipeline::operator::{
-    ExitObservation, ExitProgress, FinishWatch, InputConstructionFactory, Operator,
-};
+use crate::exec::pipeline::operator::{ExitObservation, FinishWatch, InputConstructionFactory};
 use crate::runtime::{
     fragment::{ExecutionFailure, ExecutionResult, io::FragmentEventSink},
     mem_tracker::MemTracker,

@@ -30,7 +30,7 @@ use crate::exec::fragment::error::{
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use std::{cmp::Ordering, sync::Arc};
 
-use arrow::array::{Array, ArrayRef, Decimal128Array};
+use arrow::array::{Array, Decimal128Array};
 use arrow::compute::SortOptions;
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
@@ -53,7 +53,7 @@ use super::compiled_grouped_topn_resources::{
     ArrowWorkBudget, ArrowWorkShape, retain_new_key_array,
 };
 use super::sort::creation::SortCreation;
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, OutputColumnMetadata};
+use crate::exec::chunk::{Chunk, ChunkSchemaRef, OutputColumnMetadata};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::hash_table::allocation::{AggregateAllocator, AggregateVec};
 use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
@@ -267,11 +267,7 @@ impl OperatorFactory for CompiledGroupedTopNProcessorFactory {
 }
 
 #[cfg(test)]
-#[path = "../pipeline/builder/compiled_aggregate_fixture.rs"]
-mod aggregate_fixture;
-#[cfg(test)]
-#[path = "../pipeline/builder/compiled_family_fixture.rs"]
-mod family_fixture;
+use super::{aggregate_fixture, family_fixture};
 #[cfg(test)]
 #[path = "compiled_grouped_topn_tests.rs"]
 mod tests;

@@ -21,6 +21,7 @@
 //!   full-sort vs. top-n behavior explicitly.
 //! - Keep sorting algorithms isolated from operator state transitions.
 
+#[cfg(test)]
 use crate::exec::chunk::Chunk;
 #[cfg(test)]
 use crate::exec::chunk::type_compatibility::check_exact;
@@ -191,7 +192,6 @@ pub(crate) enum SortKeyConstruction<'a> {
         source: &'a Field,
         target: &'a DataType,
     },
-    Type(&'a DataType),
     Work(usize),
 }
 

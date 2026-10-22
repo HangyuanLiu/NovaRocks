@@ -113,11 +113,8 @@ impl AnalyticInputWork for Constructors<'_> {
                 self.taken.push(Arc::clone(&column));
                 Ok(column)
             }
-            Err(stages::AnalyticCopyFailure::OriginalArrow(error)) => {
-                Err(stages::AnalyticCopyFailure::OriginalArrow(error))
-            }
-            Err(stages::AnalyticCopyFailure::Source(message)) => {
-                Err(stages::AnalyticCopyFailure::Source(message))
+            Err(stages::AnalyticCopyFailure::OriginalArrow { source, .. }) => {
+                Err(stages::AnalyticCopyFailure::original_arrow(source))
             }
             Err(stages::AnalyticCopyFailure::Control(never)) => match never {},
         }

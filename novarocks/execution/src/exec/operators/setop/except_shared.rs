@@ -28,7 +28,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use super::distinct_set_shared::{DistinctSetSemantics, DistinctSetSharedState};
+use super::distinct_set_shared::DistinctSetSemantics;
 
 #[derive(Clone)]
 pub struct ExceptSemantics;
@@ -54,5 +54,3 @@ impl DistinctSetSemantics for ExceptSemantics {
         !*marker
     }
 }
-
-pub(crate) type ExceptSharedState = DistinctSetSharedState<ExceptSemantics>;

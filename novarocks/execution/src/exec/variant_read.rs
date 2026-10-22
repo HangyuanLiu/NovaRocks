@@ -26,8 +26,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use arrow::array::LargeBinaryBuilder;
 use arrow::array::{
-    Array, ArrayRef, BinaryBuilder, BooleanBufferBuilder, LargeBinaryArray, RecordBatch,
-    StructArray,
+    Array, ArrayRef, BooleanBufferBuilder, LargeBinaryArray, RecordBatch, StructArray,
 };
 use arrow::buffer::NullBuffer;
 use arrow::compute::CastOptions;
@@ -649,7 +648,7 @@ mod tests {
         assert!(!is_variant_struct_data_type(&DataType::LargeBinary));
     }
 
-    use arrow::array::{Float64Array, Int64Array, LargeBinaryArray};
+    use arrow::array::{Float64Array, Int64Array};
 
     use super::VariantPathSpec;
     use novarocks_types::SlotId;

@@ -22,6 +22,8 @@
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionReason, ExecutionResult};
 
+#[cfg(test)]
+use crate::runtime::runtime_state::RuntimeState;
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -48,7 +50,7 @@ use crate::exec::pipeline::operator::{
 };
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::{
-    input::{AcceptedInput, InputPreparationFailure, PreparedInput, RawInput},
+    input::{AcceptedInput, InputPreparationFailure, RawInput},
     shape::{
         HydrateInput, InputPreparation, PreparationStep, ReceiverPreparation, ReceiverSlot,
         StepOperator,
@@ -57,7 +59,6 @@ use crate::exec::pipeline::{
     step_context::StepContext,
 };
 use crate::runtime::fragment::io::RootInputPermit;
-use crate::runtime::runtime_state::RuntimeState;
 use novarocks_local_program::StaticLayout;
 use novarocks_type_contract::ValueKind;
 
@@ -149,10 +150,6 @@ struct Definition {
 
 pub(crate) struct StatisticsMaterializerFactory(Arc<Definition>);
 impl StatisticsMaterializerFactory {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Frozen source roles and bounds are independently validated"
-    )]
     #[cfg(test)]
     fn from_test_facts(
         literals: Arc<[novarocks_local_program::StaticLiteral]>,
@@ -209,7 +206,7 @@ impl StatisticsMaterializerFactory {
         literal_slots: Vec<SlotId>,
         mappings: Vec<UnpivotValueMapping>,
         input_slots: &[SlotId],
-        mut schema: StatisticsSchemaPreparation,
+        schema: StatisticsSchemaPreparation,
         passthrough_count: usize,
         max_rows: usize,
         max_bytes: usize,
@@ -287,7 +284,12 @@ impl StatisticsMaterializerFactory {
                 "statistics properties have an invalid entries schema",
             ));
         }
-        if let StatisticsSchemaPreparation::Compiled(layout) = &schema {
+        let layout = match &schema {
+            StatisticsSchemaPreparation::Compiled(layout) => Some(layout),
+            #[cfg(test)]
+            StatisticsSchemaPreparation::Fixture { .. } => None,
+        };
+        if let Some(layout) = layout {
             if !layout.is_typed() || layout.slots().len() != 4 {
                 return Err(statistics_contract(
                     "compiled statistics require their complete frozen layout",
@@ -366,6 +368,8 @@ impl StatisticsMaterializerFactory {
             })
             .collect::<Result<Vec<_>, _>>()?;
         #[cfg(test)]
+        let mut schema = schema;
+        #[cfg(test)]
         if let StatisticsSchemaPreparation::Fixture {
             schema,
             fixed_capacity,
@@ -388,7 +392,7 @@ impl StatisticsMaterializerFactory {
 /// are the same as the explicit legacy source adapter.
 fn statistics_fixed_capacity(schema: &ChunkSchemaRef) -> ExecutionResult<usize> {
     let metadata = borrowed_root_chunk_schema_storage(
-        &schema,
+        schema,
         RootArrayStorageLimits {
             bytes: MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
             nodes: 2 * RootProfileV1::SCHEMA_TYPE_NODES,
@@ -480,12 +484,20 @@ impl OperatorLifecycle for StatisticsMaterializer {
         if self.output.is_some() {
             return Ok(());
         }
-        let StatisticsSchemaPreparation::Compiled(layout) = &self.definition.schema else {
-            return Err(ConstructionFailure::InvalidSource(
-                "legacy statistics schema source is absent".to_owned(),
-            )
-            .into());
+        #[cfg(test)]
+        let layout = match &self.definition.schema {
+            StatisticsSchemaPreparation::Compiled(layout) => layout,
+            StatisticsSchemaPreparation::Fixture {
+                schema,
+                fixed_capacity,
+            } => {
+                self.output = Some(Arc::clone(schema));
+                self.fixed_capacity = *fixed_capacity;
+                return Ok(());
+            }
         };
+        #[cfg(not(test))]
+        let StatisticsSchemaPreparation::Compiled(layout) = &self.definition.schema;
         let factory = self
             .construction
             .as_ref()
@@ -623,7 +635,7 @@ impl StatisticsMaterializer {
                 ));
             }
             for &ordinal in &self.definition.input_ordinals {
-                let array = body_array(&chunk, ordinal)?;
+                let array = body_array(chunk, ordinal)?;
                 if array.len() != chunk.len() {
                     return Err(statistics_contract(
                         "statistics body row count differs from input",

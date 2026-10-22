@@ -32,7 +32,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::build_artifact::JoinBuildArtifact;
-use super::build_state::JoinBuildSinkState;
+#[cfg(test)]
 use super::join_hash_map::match_flags::BuildMatchMerge;
 use crate::exec::pipeline::dependency::{DependencyHandle, DependencyManager};
 
@@ -40,9 +40,9 @@ use crate::exec::pipeline::dependency::{DependencyHandle, DependencyManager};
 pub(crate) struct BroadcastJoinSharedState {
     dep: DependencyHandle,
     build: Mutex<Option<Arc<JoinBuildArtifact>>>,
-    /// Merge accumulator for per-driver build-matched flags (RIGHT SEMI/ANTI,
-    /// FULL OUTER, RIGHT OUTER).  Initialised lazily on first merge call.
+    #[cfg(test)]
     build_match_merge: Mutex<Option<BuildMatchMerge>>,
+    #[cfg(test)]
     total_probe_drivers: usize,
 }
 
@@ -50,14 +50,16 @@ impl BroadcastJoinSharedState {
     pub(crate) fn new(
         node_id: i32,
         dep_manager: DependencyManager,
-        total_probe_drivers: usize,
+        _total_probe_drivers: usize,
     ) -> Self {
         let dep = dep_manager.get_or_create(format!("broadcast_join_build:{}", node_id));
         Self {
             dep,
             build: Mutex::new(None),
+            #[cfg(test)]
             build_match_merge: Mutex::new(None),
-            total_probe_drivers,
+            #[cfg(test)]
+            total_probe_drivers: _total_probe_drivers,
         }
     }
 
@@ -98,6 +100,7 @@ impl BroadcastJoinSharedState {
     /// accumulator.  Returns `Some(merged_flags)` when this is the last
     /// driver to merge (meaning all probing is done and it is safe to
     /// compute the unmatched-row output).  All other drivers receive `None`.
+    #[cfg(test)]
     pub(crate) fn merge_build_matched(
         &self,
         local_flags: Vec<bool>,
@@ -110,24 +113,6 @@ impl BroadcastJoinSharedState {
             BuildMatchMerge::new(self.total_probe_drivers, local_flags.len())
         });
         merge.merge_one(local_flags)
-    }
-}
-
-impl JoinBuildSinkState for BroadcastJoinSharedState {
-    fn partition_for_driver(&self, _driver_id: i32) -> usize {
-        0
-    }
-
-    fn dep_name(&self, _partition: usize) -> &str {
-        self.dep.name()
-    }
-
-    fn set_build(
-        &self,
-        _partition: usize,
-        artifact: Arc<JoinBuildArtifact>,
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
-        BroadcastJoinSharedState::set_build(self, artifact)
     }
 }
 

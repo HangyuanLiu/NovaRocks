@@ -27,6 +27,9 @@
 mod aggregate;
 pub use aggregate::topn_boundary::AggregateTopNBoundaryError;
 pub(crate) use aggregate::topn_boundary::OwnedTopNBoundaryError;
+#[cfg(test)]
+#[path = "../pipeline/builder/compiled_aggregate_fixture.rs"]
+pub(crate) mod aggregate_fixture;
 pub(crate) mod analytic_shared;
 mod assert_num_rows_processor;
 mod blocked_duration;
@@ -49,6 +52,9 @@ mod compiled_writer_failure;
 pub(crate) mod compiled_writer_statistics;
 mod data_stream_sink;
 mod exchange_source;
+#[cfg(test)]
+#[path = "../pipeline/builder/compiled_family_fixture.rs"]
+pub(crate) mod family_fixture;
 pub(crate) mod hashjoin;
 mod limit_processor;
 mod local_exchange_sink;
@@ -56,6 +62,8 @@ mod local_exchange_source;
 pub(crate) mod local_exchanger;
 mod nljoin;
 mod noop_sink;
+#[cfg(test)]
+mod opaque_memory_host_tests;
 mod project_processor;
 mod repeat_processor;
 mod result_buffer_sink;
@@ -86,18 +94,11 @@ pub(crate) use nljoin::NlJoinSharedState;
 pub use noop_sink::NoopSinkFactory;
 #[cfg(test)]
 pub(crate) use project_processor::materialize_project_output;
-#[cfg(test)]
-pub(crate) use repeat_processor::RepeatFixtureFactory;
-pub(crate) use repeat_processor::{
-    repeat_output_chunk_schema, repeat_output_chunk_schema_observed,
-};
 pub use result_buffer_sink::ResultBufferSinkFactory;
 #[cfg(test)]
 pub(crate) use result_sink::{ResultSinkFactory, ResultSinkHandle};
 pub use root_result_sink::RootResultSinkFactory;
-pub(crate) use setop::{
-    ExceptSharedState, IntersectSharedState, SetOpStageController, UnionAllSharedState,
-};
+pub(crate) use setop::UnionAllSharedState;
 pub use setop::{
     ExceptSinkFactory, ExceptSourceFactory, IntersectSinkFactory, IntersectSourceFactory,
     UnionAllSinkFactory, UnionAllSourceFactory,

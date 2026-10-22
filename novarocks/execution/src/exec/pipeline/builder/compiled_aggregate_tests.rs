@@ -136,7 +136,7 @@ fn result_port(
             .zip(types)
             .enumerate()
             .map(|(ordinal, (value, ty))| ResultField {
-                domain: crate::test_result_domain::result_value_domain(&ty),
+                domain: crate::test_result_domain::result_value_domain(ty),
                 name: format!("c{ordinal}").into_boxed_str(),
                 alias: None,
                 value: *value,

@@ -205,7 +205,7 @@ fn unary_program(case: UnaryCase) -> Arc<LocalProgram> {
             .unwrap();
         for (ordinal, (value, ty)) in columns.iter().enumerate() {
             result_fields.push(ResultField {
-                domain: crate::test_result_domain::result_value_domain(&ty),
+                domain: crate::test_result_domain::result_value_domain(ty),
                 name: format!("input_{ordinal}").into(),
                 alias: None,
                 value: *value,

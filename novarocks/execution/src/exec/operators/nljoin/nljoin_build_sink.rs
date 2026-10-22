@@ -185,7 +185,7 @@ mod tests {
             Some(root.clone()),
             None,
         );
-        let shared = Arc::new(NlJoinSharedState::new(17, 1, DependencyManager::default()));
+        let shared = Arc::new(NlJoinSharedState::new(17, DependencyManager::default()));
         let factory = NlJoinBuildSinkFactory::new(shared.clone());
         let mut sink = factory.create(1, 0);
         sink.set_mem_tracker(MemTracker::new_child("sink", &root));

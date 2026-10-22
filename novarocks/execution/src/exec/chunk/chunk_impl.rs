@@ -32,8 +32,6 @@ use arrow::array::ListArray;
 use arrow::array::StructArray;
 use arrow::array::{Array, ArrayRef, RecordBatch, RecordBatchOptions};
 #[cfg(test)]
-use arrow::datatypes::DataType;
-#[cfg(test)]
 use arrow::datatypes::Int32Type;
 use arrow::datatypes::{Schema, SchemaRef};
 
@@ -105,21 +103,21 @@ pub struct ChunkBatchProjection {
 // Shared source custody contains only existing buffer charges, exact schema
 // references and finite creation holds. It carries no query/context capability.
 struct ChunkSourceStorageHold {
-    schema: ChunkSchemaRef,
-    accounting: Option<ChunkAccountingHandle>,
-    connector_output_memory: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
-    array_type_storage: ValueTypeStorageLifetime,
-    construction_storage: ValueTypeStorageLifetime,
-    storage: ValueTypeStorageLifetime,
-    output_column_metadata: Option<super::OutputColumnMetadata>,
+    _schema: ChunkSchemaRef,
+    _accounting: Option<ChunkAccountingHandle>,
+    _connector_output_memory: Option<Arc<Mutex<ConnectorOutputMemoryToken>>>,
+    _array_type_storage: ValueTypeStorageLifetime,
+    _construction_storage: ValueTypeStorageLifetime,
+    _storage: ValueTypeStorageLifetime,
+    _output_column_metadata: Option<super::OutputColumnMetadata>,
 }
 impl novarocks_type_contract::ValueTypeStorageHold for ChunkSourceStorageHold {}
 
 // A multi-source result shares one flat set of finite source holders. Folding
 // singleton holders would form an input-sized recursive destruction chain.
 struct ChunkSourceStorageSet {
-    sources: Vec<ChunkSourceStorageHold>,
-    storage: ValueTypeStorageLifetime,
+    _sources: Vec<ChunkSourceStorageHold>,
+    _storage: ValueTypeStorageLifetime,
 }
 impl novarocks_type_contract::ValueTypeStorageHold for ChunkSourceStorageSet {}
 
@@ -208,13 +206,13 @@ impl Chunk {
         )?;
         Ok(ValueTypeStorageLifetime::held(Arc::new(
             ChunkSourceStorageHold {
-                schema: self.chunk_schema.clone(),
-                accounting: self.accounting.clone(),
-                connector_output_memory: self.connector_output_memory.clone(),
-                array_type_storage: self.array_type_storage.clone(),
-                construction_storage: self.construction_storage.clone(),
-                output_column_metadata: self.output_column_metadata.clone(),
-                storage,
+                _schema: self.chunk_schema.clone(),
+                _accounting: self.accounting.clone(),
+                _connector_output_memory: self.connector_output_memory.clone(),
+                _array_type_storage: self.array_type_storage.clone(),
+                _construction_storage: self.construction_storage.clone(),
+                _output_column_metadata: self.output_column_metadata.clone(),
+                _storage: storage,
             },
         )))
     }
@@ -241,19 +239,19 @@ impl Chunk {
         let mut held = Vec::with_capacity(sources.len());
         for source in sources {
             held.push(ChunkSourceStorageHold {
-                schema: source.chunk_schema.clone(),
-                accounting: source.accounting.clone(),
-                connector_output_memory: source.connector_output_memory.clone(),
-                array_type_storage: source.array_type_storage.clone(),
-                construction_storage: source.construction_storage.clone(),
-                output_column_metadata: source.output_column_metadata.clone(),
-                storage: ValueTypeStorageLifetime::pure(),
+                _schema: source.chunk_schema.clone(),
+                _accounting: source.accounting.clone(),
+                _connector_output_memory: source.connector_output_memory.clone(),
+                _array_type_storage: source.array_type_storage.clone(),
+                _construction_storage: source.construction_storage.clone(),
+                _output_column_metadata: source.output_column_metadata.clone(),
+                _storage: ValueTypeStorageLifetime::pure(),
             });
         }
         Ok(ValueTypeStorageLifetime::held(Arc::new(
             ChunkSourceStorageSet {
-                sources: held,
-                storage,
+                _sources: held,
+                _storage: storage,
             },
         )))
     }
@@ -1929,9 +1927,6 @@ mod shared_batch_projection_tests {
         assert_eq!(tracker.current(), 0);
     }
 }
-
-#[path = "evaluation_creation.rs"]
-mod evaluation_creation;
 
 /// Immutable slot-access facts. Failure capture neither retains the batch nor
 /// enumerates/allocates the whole schema while execution is already failing.

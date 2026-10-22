@@ -55,6 +55,7 @@ use crate::exec::pipeline::{
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
+#[cfg(test)]
 pub(super) use crate::runtime::kernel_memory as runtime_kernel_memory;
 #[cfg(test)]
 #[path = "runtime_kernel_memory_tests.rs"]
@@ -83,9 +84,6 @@ impl RuntimeKernelControl {
             allocator: None,
             construction: None,
         }
-    }
-    pub(crate) fn failure_port(&self) -> Arc<RuntimeErrorState> {
-        Arc::clone(&self.error)
     }
     /// Bind a nested receiver to the same fragment services. Its allocator is
     /// installed separately on that receiver; this creates no memory authority.
@@ -123,6 +121,7 @@ impl RuntimeKernelControl {
     pub(crate) fn query_memory(&self) -> Option<&crate::runtime::query_memory::QueryMemoryBinding> {
         self.query_memory.as_ref()
     }
+    #[cfg(test)]
     pub(super) fn request_kernel_memory(
         &self,
         request: runtime_kernel_memory::KernelMemoryRequest,
@@ -193,9 +192,6 @@ impl RuntimeKernelControl {
             Some(error) => Err(error),
             None => Ok(()),
         }
-    }
-    pub(crate) fn wait_execution(&self, duration: Duration) -> ExecutionResult<()> {
-        self.error.wait_interruptibly(duration)
     }
 }
 
@@ -639,9 +635,7 @@ pub(crate) fn project_chunk_with_source_observer(
         .output
         .ok_or_else(|| {
             novarocks_functions::KernelFailure::Internal(
-                novarocks_functions::KernelDiagnostic::new(
-                    &("source fixture Project has no output"),
-                ),
+                novarocks_functions::KernelDiagnostic::new("source fixture Project has no output"),
             )
             .into()
         })

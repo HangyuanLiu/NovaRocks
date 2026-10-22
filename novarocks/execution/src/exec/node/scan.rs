@@ -20,7 +20,7 @@ use std::sync::Arc;
 use futures::Stream;
 use futures::future::BoxFuture;
 
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+use crate::exec::chunk::Chunk;
 use crate::runtime::profile::RuntimeProfile;
 use novarocks_spi::connector::read_stack::ConnectorPollBudget;
 
@@ -178,7 +178,7 @@ impl ScanStreamSource for UnusedScanStream {
         _construction: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) -> crate::runtime::fragment::ExecutionResult<ScanOutputStream> {
         Err(novarocks_functions::KernelFailure::Internal(
-            novarocks_functions::KernelDiagnostic::new(&("this test scan is never run")),
+            novarocks_functions::KernelDiagnostic::new("this test scan is never run"),
         )
         .into())
     }

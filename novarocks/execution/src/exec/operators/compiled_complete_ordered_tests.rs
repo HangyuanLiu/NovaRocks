@@ -22,6 +22,7 @@
 
 use super::super::super::super::{Event, session_for};
 use super::*;
+use arrow::array::ArrayRef;
 
 #[derive(Clone, Copy, Debug)]
 enum CompleteMode {

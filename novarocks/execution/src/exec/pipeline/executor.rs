@@ -27,7 +27,6 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use novarocks_local_program::KernelAbiVersion;
 
@@ -272,10 +271,7 @@ impl RunningPipelineExecution {
 /// instance this program runs as. The program reads no scan: a compiled scan
 /// runs only with its Task's bound operations, through
 /// [`prepare_compiled_program_pipeline_execution_with_profiler`].
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The compiled program and its Task capabilities are independent inputs"
-)]
+#[cfg(test)]
 pub(crate) fn prepare_compiled_program_pipeline_execution(
     program: Arc<novarocks_local_program::LocalProgram>,
     time_slice: Duration,
@@ -308,6 +304,7 @@ pub(crate) fn prepare_compiled_program_pipeline_execution(
 /// exactly the program's compiled TableWriter and TableFinish nodes. The
 /// program's runtime-filter sites bind to `runtime_state`'s runtime-filter
 /// session, which every such site requires.
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
     reason = "The compiled program and its Task capabilities are independent inputs"
@@ -341,6 +338,10 @@ pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Program, task capabilities, and schema preparation remain independently owned inputs."
+)]
 pub(crate) fn prepare_compiled_program_pipeline_execution_with_profiler_and_schema_preparation(
     program: Arc<novarocks_local_program::LocalProgram>,
     time_slice: Duration,
@@ -568,10 +569,9 @@ fn prepare_pipeline_execution_from_graph(
 
 #[cfg(test)]
 mod tests {
+    use crate::exec::chunk::Chunk;
     use crate::exec::pipeline::operator::OperatorLifecycle;
     use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
-    use novarocks_local_program::KernelAbiVersion;
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock, mpsc};
     use std::time::{Duration, Instant};
@@ -580,7 +580,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use crate::exec::chunk::Chunk;
     use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
     use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
     use crate::exec::pipeline::driver::PipelineDriver;
@@ -594,7 +593,6 @@ mod tests {
     use crate::runtime::query_options::QueryOptions;
     use crate::runtime::runtime_state::RuntimeState;
     use crate::runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
-    use novarocks_functions::{FunctionResultType, FunctionValueType};
     use novarocks_types::QueryId;
     use novarocks_types::SlotId;
 
@@ -1218,16 +1216,16 @@ mod tests {
         }
     }
 
-    fn scan_holder_fixture(
-        end_of_stream: bool,
-    ) -> (
+    type ScanHolderFixture = (
         Arc<novarocks_local_program::LocalProgram>,
         Arc<ScanHolderStaticSource>,
         Arc<ScanHolderExitState>,
         std::sync::Weak<dyn Array>,
         mpsc::Receiver<()>,
         ScanHolderDropRelease,
-    ) {
+    );
+
+    fn scan_holder_fixture(end_of_stream: bool) -> ScanHolderFixture {
         let (entered_send, entered) = mpsc::channel();
         let (release, release_recv) = mpsc::channel();
         let state = Arc::new(ScanHolderExitState {
@@ -1971,9 +1969,7 @@ mod tests {
             ))
         }
     }
-    fn start_source_probe(
-        unknown: bool,
-    ) -> (
+    type StartSourceProbeFixture = (
         PreparedPipelineExecution,
         ExecutionFailure,
         Arc<crate::runtime::runtime_state::RuntimeErrorState>,
@@ -1983,7 +1979,9 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<AtomicUsize>,
         Arc<AtomicUsize>,
-    ) {
+    );
+
+    fn start_source_probe(unknown: bool) -> StartSourceProbeFixture {
         let runtime = Arc::new(RuntimeState::default());
         let control = runtime.error_state();
         let original: ExecutionFailure =

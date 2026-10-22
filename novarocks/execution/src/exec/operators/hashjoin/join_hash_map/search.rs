@@ -97,6 +97,7 @@ impl JoinSelection {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn append_cross_selection(
     selection: &mut JoinSelection,
     probe_rows: &[u32],

@@ -59,7 +59,7 @@ fn literal_program(cases: &[(FunctionValueType, LiteralValue)]) -> Arc<LocalProg
         assignments.push((expr, value));
         output.push(value);
         result_fields.push(ResultField {
-            domain: crate::test_result_domain::result_value_domain(&ty),
+            domain: crate::test_result_domain::result_value_domain(ty),
             name: format!("literal_{ordinal}").into(),
             alias: None,
             value,
@@ -290,7 +290,7 @@ fn check_literal_roots(cases: Vec<(FunctionValueType, LiteralValue)>) {
                 .unwrap();
             assert_eq!(result.selection(), selection);
             assert!(result.errors().is_empty());
-            assert_literal_payload(result.values(), &ty.data_type(), literal, 2);
+            assert_literal_payload(result.values(), ty.data_type(), literal, 2);
         }
         let result = evaluator
             .evaluate(
@@ -301,7 +301,7 @@ fn check_literal_roots(cases: Vec<(FunctionValueType, LiteralValue)>) {
             .unwrap();
         assert!(result.selection().is_empty());
         assert!(result.errors().is_empty());
-        assert_literal_payload(result.values(), &ty.data_type(), literal, 0);
+        assert_literal_payload(result.values(), ty.data_type(), literal, 0);
         assert!(evaluator.instances.is_empty());
     }
 }

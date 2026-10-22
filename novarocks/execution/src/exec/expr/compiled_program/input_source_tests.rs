@@ -138,7 +138,7 @@ fn record_batch_without_chunk_and_chunk_without_authority_are_distinct() {
     let program = program(SeedMode::Input, false);
     let chunk = input_chunk(&program, vec![Some(42)]);
     assert!(matches!(
-        CompiledInputLoan::RecordBatch(&chunk.record_batch())
+        CompiledInputLoan::RecordBatch(chunk.record_batch())
             .checked_column(1)
             .unwrap()
             .into_parts()
@@ -154,7 +154,7 @@ fn record_batch_without_chunk_and_chunk_without_authority_are_distinct() {
         BorrowedInputSource::NoAttachedAuthority
     ));
     let results = [
-        CompiledInputLoan::RecordBatch(&chunk.record_batch()),
+        CompiledInputLoan::RecordBatch(chunk.record_batch()),
         CompiledInputLoan::from_chunk(&chunk),
     ]
     .map(|input| {
@@ -183,7 +183,7 @@ fn chunk_and_batch_entries_keep_full_sparse_empty_null_results() {
         let mut actual = evaluator(&program);
         let before = old
             .evaluate_evaluation(
-                &chunk.record_batch(),
+                chunk.record_batch(),
                 selection,
                 if selection.is_empty() {
                     ScalarInvocationActivation::ValidateOnly
@@ -263,7 +263,7 @@ fn chunk_entry_keeps_original_validation_and_failed_instance_latch() {
     let mut actual = evaluator(&program);
     let a = old
         .evaluate_evaluation(
-            &bad.record_batch(),
+            bad.record_batch(),
             Selection::all(1),
             ScalarInvocationActivation::Activated,
             &Control,
@@ -278,7 +278,7 @@ fn chunk_entry_keeps_original_validation_and_failed_instance_latch() {
     assert_eq!(format!("{a:?}"), format!("{b:?}"));
     let a = old
         .evaluate_evaluation(
-            &chunk.record_batch(),
+            chunk.record_batch(),
             Selection::all(1),
             ScalarInvocationActivation::Activated,
             &Control,

@@ -29,10 +29,13 @@
 
 // Design: ADR-0159 (docs/adr/ADR-0159-driver-polled-connector-scan-streams.md)
 
+#[cfg(test)]
+use crate::exec::chunk::Chunk;
+#[cfg(test)]
+use crate::exec::node::scan::ScanExitObservation;
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 
-use std::future::Future;
 use std::mem::ManuallyDrop;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -47,13 +50,8 @@ use super::output_filter::{
     CompiledOrderedOutputFactory, ScanDriverFilter, ScanLimitDecision, ScanOutputFilter,
     record_rows_read, scan_limit_decision,
 };
-use crate::exec::chunk::Chunk;
-use crate::exec::node::scan::{
-    ScanExitBodyProof, ScanExitObservation, ScanOp, ScanOutputStream, ScanStreamSource,
-};
-use crate::exec::operators::runtime_filter::{
-    CompiledRuntimeFilterConsumers, RuntimeFilterConsumerState, RuntimeFilterGate,
-};
+use crate::exec::node::scan::{ScanExitBodyProof, ScanOp, ScanOutputStream, ScanStreamSource};
+use crate::exec::operators::runtime_filter::{CompiledRuntimeFilterConsumers, RuntimeFilterGate};
 use crate::exec::pipeline::operator::{FinishWatch, Operator, forward_observable};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
@@ -67,6 +65,7 @@ use crate::runtime::scan_stream_metrics::{ScanStreamPending, observe_scan_stream
 
 /// CPU budget of one driver turn inside a scan stream, in provider work
 /// units (roughly one decoded batch each).
+#[cfg(test)]
 pub(crate) const SCAN_STREAM_TURN_BUDGET: u64 =
     crate::exec::pipeline::step_context::DEFAULT_TURN_WORK_UNITS as u64;
 
@@ -1157,7 +1156,7 @@ mod tests {
         ) -> ExecutionResult<ScanOutputStream> {
             if self.claims.fetch_add(1, Ordering::AcqRel) > 0 {
                 return Err(novarocks_functions::KernelFailure::Internal(
-                    novarocks_functions::KernelDiagnostic::new(&("scan stream already claimed")),
+                    novarocks_functions::KernelDiagnostic::new("scan stream already claimed"),
                 )
                 .into());
             }
@@ -1246,6 +1245,12 @@ mod tests {
         }
     }
 
+    type ObservedStreamScanSource = (
+        Box<dyn Operator>,
+        Arc<ScriptedSource>,
+        Arc<Mutex<Vec<bool>>>,
+    );
+
     fn stream_scan_source(
         control: &Arc<StreamControl>,
     ) -> (Box<dyn Operator>, Arc<ScriptedSource>) {
@@ -1253,32 +1258,14 @@ mod tests {
         (operator, source)
     }
 
-    #[expect(
-        clippy::type_complexity,
-        reason = "The scan operator is returned with the source and the backpressure log it reports to."
-    )]
-    fn observed_stream_scan_source(
-        control: &Arc<StreamControl>,
-    ) -> (
-        Box<dyn Operator>,
-        Arc<ScriptedSource>,
-        Arc<Mutex<Vec<bool>>>,
-    ) {
+    fn observed_stream_scan_source(control: &Arc<StreamControl>) -> ObservedStreamScanSource {
         observed_stream_scan_source_in(control, &RuntimeState::default())
     }
 
-    #[expect(
-        clippy::type_complexity,
-        reason = "The scan operator is returned with the source and the backpressure log it reports to."
-    )]
     fn observed_stream_scan_source_in(
         control: &Arc<StreamControl>,
         state: &RuntimeState,
-    ) -> (
-        Box<dyn Operator>,
-        Arc<ScriptedSource>,
-        Arc<Mutex<Vec<bool>>>,
-    ) {
+    ) -> ObservedStreamScanSource {
         observed_stream_scan_source_in_with_limit(control, state, None)
     }
 
@@ -1286,11 +1273,7 @@ mod tests {
         control: &Arc<StreamControl>,
         state: &RuntimeState,
         limit: Option<usize>,
-    ) -> (
-        Box<dyn Operator>,
-        Arc<ScriptedSource>,
-        Arc<Mutex<Vec<bool>>>,
-    ) {
+    ) -> ObservedStreamScanSource {
         let source = Arc::new(ScriptedSource {
             control: Arc::clone(control),
             claims: AtomicUsize::new(0),

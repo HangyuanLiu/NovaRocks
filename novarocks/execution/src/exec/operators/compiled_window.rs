@@ -678,10 +678,14 @@ impl CompiledWindowProcessor {
             host.clone(),
             &self.control,
         )?;
-        for root in 0..self.partition_keys + self.order_keys {
+        for (root, instance) in instances
+            .iter_mut()
+            .enumerate()
+            .take(self.partition_keys + self.order_keys)
+        {
             keys.try_push(
                 evaluate_all(
-                    &mut instances[root],
+                    instance,
                     self.sites[root],
                     ordered.record_batch(),
                     &self.control,
@@ -705,9 +709,13 @@ impl CompiledWindowProcessor {
             )?;
             // Original source really re-invokes these roots even when the
             // permutation happened to be identity. No source CSE is invented.
-            for root in 0..self.partition_keys + self.order_keys {
+            for (root, instance) in instances
+                .iter_mut()
+                .enumerate()
+                .take(self.partition_keys + self.order_keys)
+            {
                 keys.as_mut_slice()[root] = evaluate_all(
-                    &mut instances[root],
+                    instance,
                     self.sites[root],
                     ordered.record_batch(),
                     &self.control,
@@ -749,10 +757,15 @@ impl CompiledWindowProcessor {
                 host.clone(),
                 &self.control,
             )?;
-            for root in call.first_root..call.first_root + call.roots {
+            for (root, instance) in instances
+                .iter_mut()
+                .enumerate()
+                .skip(call.first_root)
+                .take(call.roots)
+            {
                 arguments.try_push(
                     evaluate_all(
-                        &mut instances[root],
+                        instance,
                         self.sites[root],
                         ordered.record_batch(),
                         &self.control,
@@ -1751,14 +1764,18 @@ struct WindowOutputFailure {
 }
 impl std::fmt::Display for WindowOutputFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self.violation {
-            WindowOutputViolation::RowErrors { .. } => {
-                "compiled window kernel returned row errors on a channel without row masking"
-            }
-            WindowOutputViolation::Length { .. } => {
-                "compiled window kernel output differs from its partition rows"
-            }
-        })
+        match &self.violation {
+            WindowOutputViolation::RowErrors { count } => write!(
+                f,
+                "compiled window kernel returned {count} row errors on a channel without row masking (call={} partition={})",
+                self.call, self.partition
+            ),
+            WindowOutputViolation::Length { expected, actual } => write!(
+                f,
+                "compiled window kernel output length differs from its partition rows (call={} partition={} expected={} actual={})",
+                self.call, self.partition, expected, actual
+            ),
+        }
     }
 }
 impl std::error::Error for WindowOutputFailure {}
@@ -1821,6 +1838,23 @@ mod frame_source_properties {
                 .source()
                 .unwrap()
                 .is::<super::super::compiled_window_geometry::WindowGeometryError>()
+        );
+    }
+
+    #[test]
+    fn window_output_failure_reports_call_partition_and_observed_shape() {
+        let row_errors = validate_unmasked_window_output(7, 11, 3, 3, 2).unwrap_err();
+        assert!(
+            row_errors
+                .detail()
+                .contains("2 row errors on a channel without row masking (call=7 partition=11)")
+        );
+
+        let length = validate_unmasked_window_output(7, 11, 3, 4, 0).unwrap_err();
+        assert!(
+            length
+                .detail()
+                .contains("call=7 partition=11 expected=3 actual=4")
         );
     }
 }

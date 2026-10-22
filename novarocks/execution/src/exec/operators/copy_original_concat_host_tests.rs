@@ -138,13 +138,14 @@ fn by_copy_original_concat_nested_empty_slice_nullable_alias_and_union_paths() {
     let second: ArrayRef =
         Arc::new(DictionaryArray::<Int8Type>::try_new(Int8Array::from(vec![1]), values).unwrap());
     matching(vec![first, second]);
-    let fields = UnionFields::new(
+    let fields = UnionFields::try_new(
         vec![0, 127],
         vec![
             Field::new("left", DataType::Int32, true),
             Field::new("right", DataType::Int32, true),
         ],
-    );
+    )
+    .unwrap();
     for dense in [false, true] {
         let first: ArrayRef = Arc::new(
             UnionArray::try_new(

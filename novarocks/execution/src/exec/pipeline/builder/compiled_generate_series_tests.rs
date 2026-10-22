@@ -31,7 +31,7 @@ use novarocks_local_program::{
 };
 use novarocks_physical_plan::{
     ConstantPoolId, ConstantPools, ConstantReference, ExprKind, FragmentBuilder, FragmentId,
-    FragmentPackage, LiteralValue, NodeId, ValueOrigin,
+    FragmentPackage, NodeId, ValueOrigin,
 };
 use novarocks_type_contract::{CompilePhase, FunctionValueType, ValueLogicalType};
 use std::sync::Arc;

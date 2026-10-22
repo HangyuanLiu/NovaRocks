@@ -259,8 +259,8 @@ impl RuntimeMembershipFilter {
         }
         if !keep.iter().all(|v| *v) {
             let mask = BooleanArray::from(keep);
-            let filtered_batch = filter_record_batch(&current_chunk.record_batch(), &mask)
-                .map_err(|source| {
+            let filtered_batch =
+                filter_record_batch(current_chunk.record_batch(), &mask).map_err(|source| {
                     crate::exec::runtime_filter::failure::arrow("membership selection", source)
                 })?;
             let filtered_array = filter(&current_array, &mask).map_err(|source| {
@@ -277,29 +277,6 @@ impl RuntimeMembershipFilter {
                 filter.filter_chunk_with_array(&current_array, current_chunk)
             }
             RuntimeMembershipFilter::Empty(_) => Ok(Some(current_chunk)),
-        }
-    }
-
-    pub(in crate::exec::runtime_filter) fn apply_to_value_selection(
-        &self,
-        array: &ArrayRef,
-        keep: &mut [bool],
-    ) -> Result<(), crate::runtime::fragment::ExecutionFailure> {
-        if keep.len() != array.len() {
-            return Err(crate::exec::runtime_filter::failure::contract(
-                "runtime membership filter value selection size mismatch",
-            ));
-        }
-        let check_null = matches!(self, RuntimeMembershipFilter::Empty(_));
-        self.min_max()
-            .apply_to_array(array, self.has_null(), check_null, keep)?;
-        if keep.iter().all(|v| !*v) {
-            return Ok(());
-        }
-        match self {
-            RuntimeMembershipFilter::Bloom(filter) => filter.apply_to_selection(array, keep),
-            RuntimeMembershipFilter::Bitset(filter) => filter.apply_to_selection(array, keep),
-            RuntimeMembershipFilter::Empty(_) => Ok(()),
         }
     }
 

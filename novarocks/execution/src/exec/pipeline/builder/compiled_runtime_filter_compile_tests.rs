@@ -49,8 +49,7 @@ use novarocks_spi::connector::ConnectorScalarValue;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDemand,
     EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-    ExpressionInvocation, ExpressionUseId, PureCompileControl, ValueLogicalType,
-    control_argument_semantics,
+    ExpressionInvocation, ExpressionUseId, PureCompileControl, control_argument_semantics,
 };
 
 use crate::exec::node::scan::ScanOp;

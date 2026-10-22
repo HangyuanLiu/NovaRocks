@@ -366,7 +366,11 @@ fn by_copy_child_scratch_host_actual_tracker_capacity_refusal_rolls_back() {
     else {
         panic!("the real child scratch host must refuse");
     };
-    super::opaque_memory_host_tests::assert_tracker_refusal(&refusal, required_peak - 1, None);
+    crate::exec::operators::opaque_memory_host_tests::assert_tracker_refusal(
+        &refusal,
+        required_peak - 1,
+        None,
+    );
     assert_released(&host);
 }
 #[test]

@@ -207,11 +207,7 @@ pub(super) fn build_nested_loop_join(
     let mut probe_build = build_node(program, probe, ctx, error, ordered)?;
     let build_build = build_node(program, build, ctx, error, ordered)?;
     let mut build_build = gather_to_one(build_build, ctx, node_id);
-    let state = Arc::new(NlJoinSharedState::new(
-        node_id,
-        probe_build.pipeline.dop.max(1) as usize,
-        ctx.dep_manager.clone(),
-    ));
+    let state = Arc::new(NlJoinSharedState::new(node_id, ctx.dep_manager.clone()));
     probe_build
         .pipeline
         .factories

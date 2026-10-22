@@ -30,8 +30,8 @@
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
+#[cfg(test)]
 use crate::exec::chunk::Chunk;
-
 use crate::exec::pipeline::operator::{
     ConstructionFailure, InputConstructionFactory, InputEncodingPolicy, Operator,
 };

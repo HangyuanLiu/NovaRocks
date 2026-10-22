@@ -51,8 +51,9 @@ fn project(
     error: AnalyticCopyFailure<std::convert::Infallible>,
 ) -> AnalyticCopyFailure<KernelFailure> {
     match error {
-        AnalyticCopyFailure::OriginalArrow(error) => AnalyticCopyFailure::OriginalArrow(error),
-        AnalyticCopyFailure::Source(text) => AnalyticCopyFailure::Source(text),
+        AnalyticCopyFailure::OriginalArrow { source, .. } => {
+            AnalyticCopyFailure::original_arrow(source)
+        }
         AnalyticCopyFailure::Control(never) => match never {},
     }
 }

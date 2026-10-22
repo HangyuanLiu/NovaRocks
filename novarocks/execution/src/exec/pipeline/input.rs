@@ -51,6 +51,7 @@ impl RawInput {
     pub(crate) fn original_for_test(&self) -> &Chunk {
         &self.chunk
     }
+    #[cfg(test)]
     pub(super) fn original(&self) -> &Chunk {
         &self.chunk
     }

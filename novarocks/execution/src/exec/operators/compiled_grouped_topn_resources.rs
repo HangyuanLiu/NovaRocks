@@ -27,9 +27,8 @@ use std::sync::Arc;
 use arrow::array::ArrayRef;
 use novarocks_functions::opaque_memory::OpaqueRetainedCharge;
 use novarocks_functions::{
-    AggregateStateAllocator, EvaluationCheckpoints, KernelDiagnostic, KernelEvaluationControl,
-    KernelFailure, PreparedSourceCustody, ScalarResourceError, SourceBackingOwner,
-    source_custody_prefix_facts,
+    EvaluationCheckpoints, KernelDiagnostic, KernelEvaluationControl, KernelFailure,
+    PreparedSourceCustody, ScalarResourceError, SourceBackingOwner, source_custody_prefix_facts,
 };
 
 pub(super) use crate::exec::arrow_work::{ArrowWorkBudget, ArrowWorkShape};

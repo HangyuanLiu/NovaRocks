@@ -26,6 +26,7 @@
 //!
 //! Key exported interfaces:
 //! - Types: `SourcePageConverter`, `PageAdapterError`, `PageAdapterErrorKind`.
+//!
 //! Every page binds the scan's immutable complete typed output declaration.
 //! Runtime construction uses the installed scan factory; page arrays never
 //! author a competing schema.

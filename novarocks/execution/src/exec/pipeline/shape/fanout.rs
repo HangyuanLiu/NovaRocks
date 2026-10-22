@@ -68,7 +68,6 @@ pub(crate) trait FanoutRouter: InputEncodingPolicy {
 }
 pub(crate) enum RouteStep {
     Input { branch: usize, chunk: Chunk },
-    Progress,
     Finished,
 }
 #[derive(Default)]
@@ -316,11 +315,6 @@ impl<R: FanoutRouter> Fanout<R> {
             pending_rows: None,
             receiver_exit: OperatorExitScope::new(),
             cursor_exit: OperatorExitScope::new(),
-        }
-    }
-    fn report_cleanup(&self, failure: ExecutionFailure) {
-        if let Some(control) = &self.control {
-            control.report_cleanup(&failure);
         }
     }
     fn fail(&mut self, ctx: &StepContext<'_>, failure: ExecutionFailure) -> ExecutionFailure {
@@ -650,7 +644,6 @@ impl<R: FanoutRouter> Fanout<R> {
                         child.pending = Some(super::super::input::derived_raw_input(chunk));
                     }
                 }
-                RouteStep::Progress => {}
                 RouteStep::Finished => {
                     drop(self.cursor.take());
                 }
@@ -1048,6 +1041,7 @@ impl<R: FanoutRouter> OperatorLifecycle for Fanout<R> {
 pub(crate) mod test_support {
     use super::*;
     use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+
     use arrow::{
         array::{ArrayRef, Int32Array},
         datatypes::{DataType, Field},
@@ -1321,16 +1315,6 @@ pub(crate) mod test_support {
             Arc::new(Int32Array::from(rows)),
         )])
     }
-    pub(crate) fn push<R: FanoutRouter>(fanout: &mut Fanout<R>, chunk: Chunk) {
-        let result = context(|ctx| fanout.try_push(ctx, RawInput::for_test(chunk)));
-        match result {
-            InputResult::Accepted(result) => {
-                result.unwrap();
-            }
-            InputResult::Rejected { failure, .. } => panic!("{failure}"),
-            InputResult::Deferred { .. } => panic!("input not accepted"),
-        }
-    }
     pub(crate) fn until_wait_or_input<R: FanoutRouter>(fanout: &mut Fanout<R>) -> NextStep {
         for _ in 0..64 {
             let next = context(|ctx| fanout.drive(ctx)).unwrap().next;
@@ -1499,7 +1483,7 @@ pub(crate) mod test_support {
     fn branch_boxes_retire_independently_after_actual_join_and_unknown_keeps_the_parent_owner() {
         use crate::exec::pipeline::{
             driver::{DriverState, PipelineDriver},
-            operator::{ExitProgress, FinishWatch},
+            operator::FinishWatch,
             shape::{Source, SourceKernel, SourceStart},
         };
         use crate::runtime::mem_tracker::TrackedBytes;
@@ -1738,7 +1722,7 @@ pub(crate) mod test_support {
             let mut branches = Vec::new();
             let (release, gate) = tokio::sync::oneshot::channel();
             let mut gate = Some(gate);
-            for i in 0..3 {
+            for (i, tracker) in trackers.iter().enumerate() {
                 let bytes = if i == 2 {
                     vec![5, 6, 7]
                 } else {
@@ -1747,7 +1731,7 @@ pub(crate) mod test_support {
                 let capacity = bytes.capacity();
                 let data = Arc::new(Data {
                     bytes,
-                    _funding: TrackedBytes::try_new(capacity, trackers[i].clone()).unwrap(),
+                    _funding: TrackedBytes::try_new(capacity, tracker.clone()).unwrap(),
                 });
                 weak.push(Arc::downgrade(&data));
                 let d = Arc::new(AtomicUsize::new(0));

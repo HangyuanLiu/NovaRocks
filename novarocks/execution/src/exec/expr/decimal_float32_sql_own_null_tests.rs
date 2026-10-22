@@ -25,7 +25,6 @@ use novarocks_functions::{KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_physical_plan::ExprKind;
 use novarocks_query_application::api::QueryExecutionKind;
 use novarocks_query_application::preparation::{CompletedPhysicalPlanCandidate, OutputContract};
-use novarocks_sql::compiler::SqlCompileControl;
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
 use std::{sync::Arc, time::Duration};
 

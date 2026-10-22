@@ -528,7 +528,7 @@ fn invocation_program_with(
                 .iter()
                 .enumerate()
                 .map(|(ordinal, (value, ty))| ResultField {
-                    domain: crate::test_result_domain::result_value_domain(&ty),
+                    domain: crate::test_result_domain::result_value_domain(ty),
                     name: format!("original_input_{ordinal}").into(),
                     alias: None,
                     value: *value,

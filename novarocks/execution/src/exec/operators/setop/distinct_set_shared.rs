@@ -88,6 +88,7 @@ pub(crate) struct DistinctSetSharedState<S: DistinctSetSemantics> {
 }
 
 impl<S: DistinctSetSemantics> DistinctSetSharedState<S> {
+    #[cfg(test)]
     pub(crate) fn new(
         controller: SetOpStageController,
         output_chunk_schema: ChunkSchemaRef,

@@ -17,17 +17,13 @@
 
 //! Lifecycle forwarding for the receiving preparation and computation owners.
 
-use super::{
-    HydrateInput, InputPreparation, NextStep, PreparedInput, StepContext, StepOperator, Transform,
-    TransformKernel,
-};
+use super::{HydrateInput, InputPreparation, NextStep, Transform, TransformKernel};
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::exec::pipeline::operator::{
-    EncodedValueOccurrence, ExitObservation, ExitProgress, FinishWatch, InputConstructionFactory,
-    InputEncodingPolicy, Operator,
+    ExitObservation, FinishWatch, InputConstructionFactory, InputEncodingPolicy,
 };
 use crate::runtime::{
-    fragment::{ExecutionFailure, ExecutionResult, io::FragmentEventSink},
+    fragment::{ExecutionResult, io::FragmentEventSink},
     mem_tracker::MemTracker,
     profile::OperatorProfiles,
     runtime_state::RuntimeState,

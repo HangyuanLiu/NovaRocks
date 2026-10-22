@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 use allocator_api2::alloc::{AllocError, Allocator, Global};
 use allocator_api2::vec::Vec as AllocVec;
-use hashbrown::hash_map::DefaultHashBuilder;
 
 use crate::runtime::mem_tracker::MemTracker;
 
@@ -260,14 +259,14 @@ pub(crate) struct AggregateTransientReservation {
     bytes: usize,
 }
 
-/// Persistent query-memory charge for a state owned by a library that exposes
-/// allocation preflight evidence but cannot accept a Rust allocator. The
-/// charge itself is inline and clones only the existing query tracker.
+/// Persistent query-memory charge used only by allocator contract tests.
+#[cfg(test)]
 pub(crate) struct AggregateRetainedCharge {
     allocator: AggregateAllocator,
     bytes: usize,
 }
 
+#[cfg(test)]
 impl AggregateRetainedCharge {
     pub(crate) fn new(allocator: AggregateAllocator) -> Self {
         Self {
@@ -300,11 +299,6 @@ impl AggregateRetainedCharge {
         )
         .map_err(novarocks_functions::KernelFailure::from_domain)
     }
-
-    #[cfg(test)]
-    pub(crate) fn bytes(&self) -> usize {
-        self.bytes
-    }
 }
 
 impl Drop for AggregateTransientReservation {
@@ -313,6 +307,7 @@ impl Drop for AggregateTransientReservation {
     }
 }
 
+#[cfg(test)]
 impl Drop for AggregateRetainedCharge {
     fn drop(&mut self) {
         self.allocator.release_charge(self.bytes);
@@ -320,18 +315,6 @@ impl Drop for AggregateRetainedCharge {
 }
 
 pub(crate) type AggregateVec<T> = AllocVec<T, AggregateAllocator>;
-pub(crate) type AggregateHashSet<T> = hashbrown::HashSet<T, DefaultHashBuilder, AggregateAllocator>;
-pub(crate) type AggregateHashMap<K, V> =
-    hashbrown::HashMap<K, V, DefaultHashBuilder, AggregateAllocator>;
-
-pub(crate) fn aggregate_hash_set<T>(allocator: AggregateAllocator) -> AggregateHashSet<T> {
-    AggregateHashSet::with_hasher_in(DefaultHashBuilder::default(), allocator)
-}
-
-pub(crate) fn aggregate_hash_map<K, V>(allocator: AggregateAllocator) -> AggregateHashMap<K, V> {
-    AggregateHashMap::with_hasher_in(DefaultHashBuilder::default(), allocator)
-}
-
 pub(crate) fn aggregate_bytes(
     allocator: AggregateAllocator,
     bytes: &[u8],

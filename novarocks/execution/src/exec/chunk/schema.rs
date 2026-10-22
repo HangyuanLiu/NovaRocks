@@ -48,6 +48,7 @@ pub struct ChunkFieldSchema {
     value_type: ValueTypeRef,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ChunkFieldSchemaCloneRequest {
     pub allocation_requests: usize,
@@ -111,7 +112,12 @@ impl ChunkFieldSchema {
         }
     }
 
-    pub(crate) fn original_clone_request_observed<E: From<novarocks_type_contract::owned_resources::metadata_materialization::MetadataMaterializationError>>(
+    #[cfg(test)]
+    pub(crate) fn original_clone_request_observed<
+        E: From<
+            novarocks_type_contract::owned_resources::metadata_materialization::MetadataMaterializationError,
+        >,
+    >(
         &self,
         observe: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<ChunkFieldSchemaCloneRequest, E>{
@@ -119,10 +125,17 @@ impl ChunkFieldSchema {
         Ok(ChunkFieldSchemaCloneRequest::default())
     }
 
-    pub(crate) fn original_clone_allocation_requests_observed<E: From<novarocks_type_contract::owned_resources::metadata_materialization::MetadataMaterializationError>>(
+    #[cfg(test)]
+    pub(crate) fn original_clone_allocation_requests_observed<
+        E: From<
+            novarocks_type_contract::owned_resources::metadata_materialization::MetadataMaterializationError,
+        >,
+    >(
         &self,
         observe: &mut impl FnMut() -> Result<(), E>,
-        _allocations: &mut Option<novarocks_type_contract::owned_resources::metadata_materialization::MetadataAllocationLoan<'_, E>>,
+        _allocations: &mut Option<
+            novarocks_type_contract::owned_resources::metadata_materialization::MetadataAllocationLoan<'_, E>,
+        >,
     ) -> Result<ChunkFieldSchemaCloneRequest, E>{
         self.original_clone_request_observed(observe)
     }
@@ -948,9 +961,6 @@ pub(crate) fn execution_carrier_matches_layout_observed<E: From<ChunkConstructio
 }
 
 /// The current engine's encoding set is independent of the pure vocabulary.
-fn validate_chunk_carrier_encoding(carrier: &DataType) -> Result<(), ChunkConstructionFailure> {
-    validate_chunk_carrier_encoding_observed(carrier, &mut |_| Ok(()))
-}
 pub(crate) fn validate_chunk_carrier_encoding_observed<E: From<ChunkConstructionFailure>>(
     carrier: &DataType,
     observe: &mut impl FnMut(&DataType) -> Result<(), E>,
@@ -1464,6 +1474,7 @@ impl ChunkSchema {
         self.typed_representation
     }
 
+    #[cfg(test)]
     pub(crate) fn from_static_layout(
         layout: &novarocks_local_program::StaticLayout,
     ) -> Result<ChunkSchemaRef, ChunkConstructionFailure> {
@@ -1716,6 +1727,7 @@ impl ChunkSchema {
 
     /// Derive from this positively paired original Schema map and inherit its
     /// exact field loans. Structural equality never elects an original source.
+    #[cfg(test)]
     pub(crate) fn try_new_with_original_schema_metadata(
         slots: Vec<ChunkSlotSchema>,
         source: &SchemaMetadataMaterializations,
@@ -2329,7 +2341,7 @@ pub(super) fn align_chunk_schema_to_columns(
 
 #[cfg(test)]
 mod tests {
-    use novarocks_type_contract::{ValueKind, ValueLogicalType, ValueTypeStorageLifetime};
+    use novarocks_type_contract::ValueLogicalType;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -2853,15 +2865,15 @@ mod tests {
 
         #[derive(Debug)]
         enum ProbeFailure {
-            Construction(crate::exec::chunk::construction_failure::ChunkConstructionFailure),
+            Construction,
             Request(usize),
             Work,
         }
         impl From<crate::exec::chunk::construction_failure::ChunkConstructionFailure> for ProbeFailure {
             fn from(
-                source: crate::exec::chunk::construction_failure::ChunkConstructionFailure,
+                _source: crate::exec::chunk::construction_failure::ChunkConstructionFailure,
             ) -> Self {
-                Self::Construction(source)
+                Self::Construction
             }
         }
         struct Control;
@@ -3391,6 +3403,7 @@ enum ChunkMetadataSource {
 #[path = "metadata_materialization_tests.rs"]
 mod metadata_materialization_tests;
 
+#[cfg(test)]
 #[path = "metadata_request.rs"]
 mod metadata_request;
 

@@ -16,15 +16,20 @@
 // under the License.
 //! Pure finalize helpers for join selection vectors and match flags.
 
+#[cfg(test)]
 use crate::runtime::fragment::ExecutionFailure;
+#[cfg(test)]
 #[derive(Debug)]
 struct JoinFinalizeContract(novarocks_failure_contract::BoundedDetail);
+#[cfg(test)]
 impl std::fmt::Display for JoinFinalizeContract {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.0.as_str())
     }
 }
+#[cfg(test)]
 impl std::error::Error for JoinFinalizeContract {}
+#[cfg(test)]
 impl novarocks_failure_contract::FailureProjection for JoinFinalizeContract {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         novarocks_failure_contract::FailureFact::new(
@@ -33,21 +38,25 @@ impl novarocks_failure_contract::FailureProjection for JoinFinalizeContract {
         )
     }
 }
+#[cfg(test)]
 fn contract(detail: impl std::fmt::Display) -> ExecutionFailure {
     ExecutionFailure::from_domain(JoinFinalizeContract(
         novarocks_failure_contract::BoundedDetail::truncating_display(detail),
     ))
 }
 
+#[cfg(test)]
 use super::match_flags::BuildMatchFlags;
 use super::search::JoinSelection;
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProbeFinalize {
     pub(crate) matched: Vec<bool>,
     pub(crate) selected: Vec<u32>,
 }
 
+#[cfg(test)]
 fn validate_selection_pair_lengths(selection: &JoinSelection) -> Result<(), ExecutionFailure> {
     if selection.probe.len() != selection.build.len() {
         return Err(contract(format_args!(
@@ -59,6 +68,7 @@ fn validate_selection_pair_lengths(selection: &JoinSelection) -> Result<(), Exec
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn probe_matched_flags(
     probe_len: usize,
     selection: &JoinSelection,
@@ -78,6 +88,7 @@ pub(crate) fn probe_matched_flags(
     Ok(matched)
 }
 
+#[cfg(test)]
 pub(crate) fn select_probe_rows_from_flags(flags: &[bool], want_matched: bool) -> Vec<u32> {
     flags
         .iter()
@@ -87,6 +98,7 @@ pub(crate) fn select_probe_rows_from_flags(flags: &[bool], want_matched: bool) -
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn finalize_probe_rows(
     probe_len: usize,
     selection: &JoinSelection,
@@ -98,6 +110,7 @@ pub(crate) fn finalize_probe_rows(
     Ok(ProbeFinalize { matched, selected })
 }
 
+#[cfg(test)]
 pub(crate) fn mark_build_matches(
     flags: &mut BuildMatchFlags,
     selection: &JoinSelection,

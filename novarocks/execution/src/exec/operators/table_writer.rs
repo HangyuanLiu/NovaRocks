@@ -34,6 +34,8 @@
 //! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
 use crate::exec::pipeline::operator::OperatorLifecycle;
+#[cfg(test)]
+use crate::exec::pipeline::shape::TransformStart;
 use crate::exec::pipeline::writer_failure::WriterFailure;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 fn writer_contract(detail: impl std::fmt::Display) -> ExecutionFailure {
@@ -116,7 +118,7 @@ use novarocks_spi::connector::write_stack::{
     target_ordinal_to_wire,
 };
 
-use crate::exec::chunk::{Chunk, ChunkSchema, record_batch_additional_bytes, record_batch_bytes};
+use crate::exec::chunk::{Chunk, record_batch_additional_bytes, record_batch_bytes};
 use crate::exec::node::table_write_relation::{
     ConnectorCommitFragmentEncoder, WriterMultiplexRelationTemplate, WriterRelationPreparation,
 };
@@ -134,9 +136,7 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::pipeline::{
     input::{PreparedInput, RawInput},
-    shape::{
-        ControlStep, HydrateInput, Transform, TransformKernel, TransformStart, child::ChildStep,
-    },
+    shape::{ControlStep, HydrateInput, Transform, TransformKernel, child::ChildStep},
     step::{AdmissionNext, NextStep, StepResult, WaitFact, WaitReason},
     step_context::StepContext,
 };
@@ -1431,7 +1431,7 @@ impl TableWriterOperator {
         {
             let mut writer =
                 StreamWriter::try_new(&mut encoded, &chunk.schema()).map_err(writer_arrow)?;
-            writer.write(&chunk.record_batch()).map_err(writer_arrow)?;
+            writer.write(chunk.record_batch()).map_err(writer_arrow)?;
             writer.finish().map_err(writer_arrow)?;
         }
         let _accounting = self
@@ -1900,7 +1900,6 @@ pub(crate) mod tests {
     struct ProjectedInputObserver {
         value_slot: SlotId,
         values: Arc<std::sync::Mutex<Vec<i64>>>,
-        finishing: bool,
         cancelled: bool,
     }
 
@@ -2419,10 +2418,6 @@ pub(crate) mod tests {
         }
     }
     impl WriterFixture {
-        #[expect(
-            clippy::too_many_arguments,
-            reason = "independent writer fixture declarations and runtime capability"
-        )]
         pub(crate) fn try_new(
             node_id: i32,
             handle: ConnectorWriterHandle,
@@ -3000,9 +2995,15 @@ pub(crate) mod tests {
 
     #[derive(Debug)]
     enum CountPreparationFailure {
-        Creator(crate::exec::pipeline::operator::ConstructionFailure),
-        Layout(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
-        Calls(novarocks_local_program::PreparedWriterCallsError),
+        Creator {
+            _cause: crate::exec::pipeline::operator::ConstructionFailure,
+        },
+        Layout {
+            _cause: novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+        },
+        Calls {
+            _cause: novarocks_local_program::PreparedWriterCallsError,
+        },
     }
     impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
         for CountPreparationFailure
@@ -3010,12 +3011,12 @@ pub(crate) mod tests {
         fn from(
             cause: novarocks_type_contract::owned_resources::layout::LayoutResourceError,
         ) -> Self {
-            Self::Layout(cause)
+            Self::Layout { _cause: cause }
         }
     }
     impl From<novarocks_local_program::PreparedWriterCallsError> for CountPreparationFailure {
         fn from(cause: novarocks_local_program::PreparedWriterCallsError) -> Self {
-            Self::Calls(cause)
+            Self::Calls { _cause: cause }
         }
     }
     pub(super) fn relation_layout(
@@ -3035,7 +3036,7 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         crate::exec::chunk::typed_fixture::layout(
             schema.arrow_schema_ref(),
-            &schema.slot_ids(),
+            schema.slot_ids(),
             &types,
         )
     }
@@ -3173,7 +3174,7 @@ pub(crate) mod tests {
             |layout| {
                 owner
                     .request(layout)
-                    .map_err(CountPreparationFailure::Creator)
+                    .map_err(|_cause| CountPreparationFailure::Creator { _cause })
             },
             || {
                 owner
@@ -3184,7 +3185,7 @@ pub(crate) mod tests {
                             units: 1,
                         },
                     )
-                    .map_err(CountPreparationFailure::Creator)
+                    .map_err(|_cause| CountPreparationFailure::Creator { _cause })
             },
         )
         .unwrap();
@@ -3356,7 +3357,6 @@ pub(crate) mod tests {
                 ProjectedInputObserver {
                     value_slot: projection_layout.slots()[0],
                     values: Arc::clone(&observed),
-                    finishing: false,
                     cancelled: false,
                 },
             )));
@@ -3537,10 +3537,7 @@ pub(crate) mod tests {
         for chunk in &chunks {
             assert_eq!(
                 chunk.schema().as_ref(),
-                node.writer_multiplex_schema()
-                    .contract()
-                    .arrow_schema()
-                    .as_ref(),
+                node.writer_multiplex_schema().contract().arrow_schema(),
             );
             let prefix = TableWriteRelationColumns::try_from_relation(chunk).expect("prefix");
             for row in 0..chunk.len() {

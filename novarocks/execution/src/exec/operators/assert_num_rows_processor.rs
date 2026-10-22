@@ -36,18 +36,9 @@ use novarocks_failure_contract::{
 #[derive(Debug)]
 enum AssertRowsFailure {
     Contract(BoundedDetail),
-    Mismatch {
-        actual: u64,
-        expected: u64,
-        predicate: Assertion,
-        early: bool,
-        detail: BoundedDetail,
-    },
+    Mismatch { detail: BoundedDetail },
     DuplicateKey(BoundedDetail),
-    CounterOverflow {
-        current: u64,
-        incoming: u64,
-    },
+    CounterOverflow { current: u64, incoming: u64 },
     KeyDisplay(arrow::error::ArrowError),
 }
 impl std::fmt::Display for AssertRowsFailure {
@@ -125,8 +116,6 @@ use crate::exec::pipeline::{
     step::{NextStep, StepResult},
     step_context::StepContext,
 };
-#[cfg(test)]
-use crate::runtime::runtime_state::RuntimeState;
 use novarocks_types::SlotId;
 
 /// Factory for processors that enforce ASSERT NUM ROWS runtime constraints.
@@ -295,10 +284,6 @@ impl RuntimeAssertNumRowsMode {
             base
         };
         Err(ExecutionFailure::from_domain(AssertRowsFailure::Mismatch {
-            actual,
-            expected: desired,
-            predicate: assertion.clone(),
-            early: false,
             detail: BoundedDetail::truncating(&msg),
         }))
     }
@@ -411,10 +396,6 @@ impl RuntimeAssertNumRowsMode {
             base
         };
         Err(ExecutionFailure::from_domain(AssertRowsFailure::Mismatch {
-            actual,
-            expected: desired,
-            predicate: assertion.clone(),
-            early: true,
             detail: BoundedDetail::truncating(&msg),
         }))
     }

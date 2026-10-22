@@ -86,9 +86,7 @@ use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::operators::compiled_expression::RuntimeKernelControl;
 use crate::exec::operators::table_writer::TableWriteRelationColumns;
 use crate::exec::pipeline::input::{PreparedInput, RawInput};
-use crate::exec::pipeline::operator::{
-    FinishWatch, InputConstructionFactory, InputEncodingPolicy, Operator, forward_observable,
-};
+use crate::exec::pipeline::operator::{InputConstructionFactory, InputEncodingPolicy, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::pipeline::shape::{ControlStep, HydrateInput, Transform, TransformKernel};
@@ -203,13 +201,6 @@ impl GroupedOutput {
             next: NextStep::Runnable,
             retiring: false,
         })
-    }
-    fn runnable(&self) -> bool {
-        match &self.next {
-            NextStep::Wait(wait) => wait.is_ready(),
-            NextStep::NeedInput => false,
-            _ => true,
-        }
     }
     fn step(&mut self, ctx: &mut StepContext<'_>) -> ExecutionResult<StepResult> {
         if let NextStep::Wait(wait) = &self.next
@@ -955,7 +946,7 @@ impl TableFinishOperator {
         partial_rows: &[bool],
     ) -> ExecutionResult<Chunk> {
         let mask = BooleanArray::from(partial_rows.to_vec());
-        let batch = filter_record_batch(&chunk.record_batch(), &mask)
+        let batch = filter_record_batch(chunk.record_batch(), &mask)
             .map_err(|error| finish_arrow(FinishArrowOperation::Filter, error))?;
         Ok(Chunk::try_new_with_chunk_schema(
             batch,
@@ -1090,6 +1081,7 @@ enum RootArtifactStep {
     MapWrapper,
 }
 
+#[cfg(test)]
 pub(crate) fn root_artifact_chunk(
     artifact: Chunk,
     root_schema: &crate::exec::chunk::ChunkSchemaRef,
@@ -1770,10 +1762,7 @@ impl TableFinishOperator {
         }
         // The chunk is exactly the frozen relation (checked above), so its
         // prefix is read at the relation's positions, whatever its slots.
-        let columns = match TableWriteRelationColumns::try_from_relation(&chunk) {
-            Ok(columns) => columns,
-            Err(error) => return Err(error),
-        };
+        let columns = TableWriteRelationColumns::try_from_relation(chunk)?;
         let mut partial_rows = vec![false; chunk.len()];
         for (row, is_partial) in partial_rows.iter_mut().enumerate() {
             let raw_kind = if columns.kinds.is_null(row) {
@@ -1781,13 +1770,11 @@ impl TableFinishOperator {
             } else {
                 Some(columns.kinds.value(row))
             };
-            if let Err(error) = self.accept_row(&chunk, &columns, row) {
-                return Err(error);
-            }
+            self.accept_row(chunk, &columns, row)?;
             *is_partial = raw_kind == Some(WriterRowKind::AGGREGATE_PARTIAL);
         }
         if partial_rows.iter().any(|value| *value) {
-            let filtered = self.filter_aggregate_rows(&chunk, &partial_rows)?;
+            let filtered = self.filter_aggregate_rows(chunk, &partial_rows)?;
             #[cfg(novarocks_dev_controls)]
             if let Err(error) = self
                 .aggregate_guard
@@ -1964,8 +1951,7 @@ mod tests {
         MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES, MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES,
         MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES, ROOT_WRITE_RESULT_BLOB_TYPE_INDEX,
         ROOT_WRITE_RESULT_BODY_INDEX, ROOT_WRITE_RESULT_INPUT_FIELDS_INDEX,
-        ROOT_WRITE_RESULT_PROPERTIES_INDEX, ROOT_WRITE_RESULT_TARGET_INDEX, RootWriteResultSchema,
-        WriterAuxiliaryChannel, WriterMultiplexSchema, root_write_result_column_id,
+        ROOT_WRITE_RESULT_PROPERTIES_INDEX,
     };
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
@@ -2167,15 +2153,15 @@ mod tests {
         ) else {
             panic!("input_fields is a List");
         };
-        assert!(Arc::ptr_eq(expected_item, &actual_item));
-        assert!(!Arc::ptr_eq(item, &actual_item));
+        assert!(Arc::ptr_eq(expected_item, actual_item));
+        assert!(!Arc::ptr_eq(item, actual_item));
         let (DataType::Map(expected_entries, _), DataType::Map(actual_entries, _)) = (
             root_arrow.field(7).data_type(),
             output.record_batch().column(7).data_type(),
         ) else {
             panic!("properties is a Map");
         };
-        assert!(Arc::ptr_eq(expected_entries, &actual_entries));
+        assert!(Arc::ptr_eq(expected_entries, actual_entries));
         let rebound = output
             .record_batch()
             .column(7)
@@ -2723,22 +2709,6 @@ mod tests {
         )
     }
 
-    fn install_composite_input_creator(
-        operator: &mut dyn Operator,
-        state: &RuntimeState,
-        tracker: Arc<MemTracker>,
-    ) {
-        operator.set_mem_tracker(Arc::clone(&tracker));
-        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
-            crate::exec::pipeline::pipeline::representation_construction_profile()
-                .expect("actual runtime construction profile"),
-            tracker,
-            state.error_state(),
-        )
-        .expect("actual composite input construction factory");
-        operator.set_construction_factory(factory);
-    }
-
     fn scripted_final_chunk(
         fixture: &CompositeFactory,
         rows: Vec<(i32, Vec<Option<Vec<u8>>>)>,
@@ -3272,7 +3242,7 @@ mod tests {
         {
             {
                 assert!(
-                    root_output_size(&output.record_batch(), None).expect("output size")
+                    root_output_size(output.record_batch(), None).expect("output size")
                         <= MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES
                 );
                 outputs.push(output);

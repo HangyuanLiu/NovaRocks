@@ -476,11 +476,6 @@ impl<'a> SortCreation<'a> {
                     )?,
                 )?),
                 SortKeyConstruction::BufferAdoption => self.buffer_adoption(owner),
-                SortKeyConstruction::Type(ty) => types.observe(
-                    0,
-                    &[],
-                    crate::exec::chunk::ArrayNormalizationStep::RebuildType { source: ty },
-                ),
                 SortKeyConstruction::Work(units) => self.factory.observe_input_work(units),
                 SortKeyConstruction::ArrayHeader(ty) => {
                     let layout = match ty {
@@ -710,7 +705,7 @@ impl<'a> SortCreation<'a> {
 fn copy_failure(
     error: novarocks_functions::selected_copy::CopyConstructionError<ConstructionFailure>,
 ) -> crate::runtime::fragment::ExecutionFailure {
-    use novarocks_functions::selected_copy::{CopyConstructionError, CopyError};
+    use novarocks_functions::selected_copy::CopyConstructionError;
     match error {
         CopyConstructionError::Creator(cause) => cause.into(),
         CopyConstructionError::Resource(cause) => ConstructionFailure::Resource(cause).into(),

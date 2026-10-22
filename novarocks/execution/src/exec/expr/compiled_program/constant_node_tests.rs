@@ -16,7 +16,7 @@
 // under the License.
 
 use super::constant_node::*;
-use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array};
 use arrow::datatypes::DataType;
 use novarocks_functions::{
     ConstantPolicy, ConstantValue, FunctionValueType, KernelEvaluationControl,

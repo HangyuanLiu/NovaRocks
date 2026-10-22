@@ -17,22 +17,10 @@
 //! Actual corpus CREATE TABLE facts and the original MAP_AGG call source.
 use arrow::datatypes::DataType;
 use arrow::datatypes::{Field, Schema};
-use novarocks_physical_plan::{
-    ExactInputVersion, PredicateGuaranteeKind, ProviderColumnReference, ProviderReadReference,
-};
-use novarocks_spi::connector::read_stack::ConnectorReadBinding;
-use novarocks_spi::connector::{
-    CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
-    ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorProviderId, ConnectorReadRelationPayload, ConnectorReadSelector,
-    ConnectorTablePlanningFacts,
-};
+use novarocks_spi::connector::{ConnectorReadSelector, ConnectorTablePlanningFacts};
 use novarocks_sql::binding::SqlTableBindingAllocator;
 use novarocks_sql::compiler::{
-    CatalogRelationFact, ProviderReadColumnFact, ProviderReadFact, ProviderReadLimitFact,
-    ProviderReadNeed, ProviderReadPredicateFact, ProviderReadProperties,
-    ProviderReadRequestBinding, ProviderReadStaticContract, SqlFactBatch, SqlNeedBatch,
-    StatisticsFact,
+    CatalogRelationFact, ProviderReadFact, SqlFactBatch, SqlNeedBatch, StatisticsFact,
 };
 use novarocks_sql::planning::catalog::{
     ConnectorReadTableFacts, catalog_table, materialize_connector_read_table,

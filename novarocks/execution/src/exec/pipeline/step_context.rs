@@ -57,10 +57,6 @@ impl TurnWork {
         Ok(())
     }
 
-    pub(crate) fn yield_count(&self) -> u64 {
-        self.budget.exhaustions()
-    }
-
     pub fn generation(&self) -> NonZeroU64 {
         self.generation
     }
@@ -149,18 +145,6 @@ impl<'a> StepContext<'a> {
     /// submits the cause.
     pub fn report_failure(&self, failure: ExecutionFailure) {
         self.control.set_error(self.locate(failure));
-    }
-    pub(crate) fn report_cleanup(&self, failure: &ExecutionFailure) {
-        self.control.report_cleanup(failure);
-    }
-    pub(crate) fn report_unresolved_exit(&self, failure: &ExecutionFailure) {
-        self.control.report_unresolved_exit(failure);
-    }
-    pub(crate) fn observe_exit(
-        &self,
-        observation: super::operator::ExitObservation,
-    ) -> super::operator::ExitProgress {
-        observation.report_to(self.control)
     }
     pub(crate) fn failure_port(&self) -> &RuntimeErrorState {
         self.control

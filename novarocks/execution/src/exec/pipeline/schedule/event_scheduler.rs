@@ -30,7 +30,9 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+#[cfg(test)]
 use crate::exec::pipeline::operator::OperatorLifecycle;
+#[cfg(test)]
 use crate::runtime::fragment::ExecutionResult;
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -1319,9 +1321,7 @@ mod tests {
     use crate::exec::pipeline::fragment_context::FragmentContext;
     use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
     use crate::exec::pipeline::input::{PreparedInput, RawInput};
-    use crate::exec::pipeline::operator::{
-        ExitProgress, FinishWatch, InputEncodingPolicy, Operator,
-    };
+    use crate::exec::pipeline::operator::{FinishWatch, InputEncodingPolicy};
     use crate::exec::pipeline::shape::{
         SinkKernel, SinkStep, Source, SourceKernel, Transform, TransformStart,
     };
@@ -2163,7 +2163,6 @@ mod tests {
             "COUNTING_SINK"
         }
         fn observe_exit(&mut self) -> crate::exec::pipeline::operator::ExitObservation {
-            use crate::exec::pipeline::operator::ExitProgress;
             match &self.exit {
                 Some((pending, event)) if pending.load(Ordering::Acquire) => {
                     crate::exec::pipeline::operator::ExitObservation::pending(FinishWatch::Notify(

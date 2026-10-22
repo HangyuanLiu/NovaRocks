@@ -20,7 +20,7 @@ pub use novarocks_failure_contract::SharedFailureCause as SharedDomainFailure;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+
     use crate::runtime::fragment::{ExecutionFailure, ExecutionFailureCause, PipelineOperation};
     use novarocks_failure_contract::{
         FailureClass, FailureFact, FailureProjection, FailureReason, ResourceDimension,

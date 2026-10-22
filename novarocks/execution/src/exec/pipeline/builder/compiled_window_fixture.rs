@@ -204,12 +204,6 @@ impl Call {
             ..Self::window(name, args)
         }
     }
-    pub(super) fn uninstalled_aggregate(name: &'static str, args: &[Arg]) -> Self {
-        Self {
-            uninstalled: true,
-            ..Self::aggregate(name, args)
-        }
-    }
     pub(super) fn framed(
         mut self,
         units: WindowFrameUnits,

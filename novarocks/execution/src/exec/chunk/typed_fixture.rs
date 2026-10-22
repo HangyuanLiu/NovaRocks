@@ -28,6 +28,7 @@ use novarocks_types::SlotId;
 use std::sync::Arc;
 
 struct DeclarationControl;
+
 impl novarocks_type_contract::PureCompileControl for DeclarationControl {
     fn checkpoint(
         &self,
@@ -36,44 +37,6 @@ impl novarocks_type_contract::PureCompileControl for DeclarationControl {
     ) -> Result<(), novarocks_type_contract::CompileControlError> {
         Ok(())
     }
-}
-
-/// Freeze a declared original logical call from the fixture's actual catalog.
-/// Merge input state arrays are not logical arguments or type-domain authors.
-pub(crate) fn frozen_aggregate(
-    catalog: &novarocks_functions::EngineFunctionCatalog,
-    name: &str,
-    logical_types: &[FunctionValueType],
-) -> Arc<novarocks_local_program::FrozenAggregateSelection> {
-    use novarocks_functions::{FunctionArgument, FunctionBindingRequest, FunctionKind};
-    let arguments = logical_types
-        .iter()
-        .cloned()
-        .map(|value_type| FunctionArgument::Value {
-            value_type,
-            constant: None,
-        })
-        .collect::<Vec<_>>();
-    let request = FunctionBindingRequest {
-        arguments: &arguments,
-        logical_argument_count: arguments.len(),
-        expected_result_type: None,
-    };
-    let bound = catalog
-        .resolve_bound_trusted(name, FunctionKind::Aggregate, request, &DeclarationControl)
-        .expect("original complete aggregate declaration");
-    catalog
-        .validate_bound(&bound, request, &DeclarationControl)
-        .expect("installed original aggregate selection");
-    Arc::new(
-        novarocks_local_program::FrozenAggregateSelection::try_new(
-            bound.function_id,
-            Arc::new(bound.selected),
-            arguments.len(),
-            ValueTypeStorageLifetime::pure(),
-        )
-        .expect("complete original aggregate fixture"),
-    )
 }
 
 pub(crate) fn layout(

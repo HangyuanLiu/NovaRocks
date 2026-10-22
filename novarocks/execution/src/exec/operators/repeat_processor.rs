@@ -27,29 +27,41 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use crate::exec::pipeline::operator::OperatorLifecycle;
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+#[cfg(test)]
+use crate::runtime::fragment::ExecutionFailure;
+use crate::runtime::fragment::ExecutionResult;
 
+#[cfg(test)]
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::exec::chunk::{Chunk, ChunkSchemaRef, ChunkSlotSchema};
-use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator};
+#[cfg(test)]
+use crate::exec::chunk::ChunkSlotSchema;
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
+#[cfg(test)]
+use crate::exec::pipeline::input::PreparedInput;
+#[cfg(test)]
+use crate::exec::pipeline::operator::{InputEncodingPolicy, Operator, OperatorLifecycle};
+#[cfg(test)]
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::exec::pipeline::{
-    input::PreparedInput,
-    shape::{Transform, TransformKernel},
-    step::{NextStep, StepResult},
-    step_context::StepContext,
-};
+#[cfg(test)]
+use crate::exec::pipeline::shape::{Transform, TransformKernel};
+#[cfg(test)]
+use crate::exec::pipeline::step::{NextStep, StepResult};
+#[cfg(test)]
+use crate::exec::pipeline::step_context::StepContext;
 #[cfg(test)]
 use crate::runtime::runtime_state::RuntimeState;
-use arrow::array::{Int64Array, new_null_array};
+#[cfg(test)]
+use arrow::array::Int64Array;
+use arrow::array::new_null_array;
+#[cfg(test)]
 use arrow::datatypes::{DataType, Field, Schema};
 use novarocks_types::SlotId;
 
 /// Mirror the output contract used by the running Repeat operator when a
 /// fragment is frozen, including grouping slots appended after its input.
+#[cfg(test)]
 pub(crate) fn repeat_output_chunk_schema(
     input: &ChunkSchemaRef,
     null_slot_ids: &[Vec<SlotId>],
@@ -76,6 +88,7 @@ pub(crate) fn repeat_output_chunk_schema(
     Ok(Arc::new(crate::exec::chunk::ChunkSchema::try_new(slots)?))
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 enum RepeatSchemaViolation {
     Configuration(novarocks_failure_contract::BoundedDetail),
@@ -86,6 +99,7 @@ enum RepeatSchemaViolation {
     MissingBinding { ordinal: usize },
     NullDeclaration { ordinal: usize },
 }
+#[cfg(test)]
 impl std::fmt::Display for RepeatSchemaViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -115,7 +129,9 @@ impl std::fmt::Display for RepeatSchemaViolation {
         }
     }
 }
+#[cfg(test)]
 impl std::error::Error for RepeatSchemaViolation {}
+#[cfg(test)]
 impl novarocks_failure_contract::FailureProjection for RepeatSchemaViolation {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         use crate::runtime::fragment::ExecutionReason;
@@ -135,6 +151,7 @@ impl novarocks_failure_contract::FailureProjection for RepeatSchemaViolation {
     }
 }
 
+#[cfg(test)]
 fn repeat_configuration(detail: impl std::fmt::Display) -> ExecutionFailure {
     ExecutionFailure::from_domain(RepeatSchemaViolation::Configuration(
         novarocks_failure_contract::BoundedDetail::truncating_display(detail),
@@ -144,6 +161,7 @@ fn repeat_configuration(detail: impl std::fmt::Display) -> ExecutionFailure {
 /// Author only Repeat's original root-NULL widening and fixed GROUPING fields.
 /// The caller owns two actual ports: the null-membership table is temporary;
 /// fields, immutable types and the returned schema retain their creating scope.
+#[cfg(test)]
 pub(crate) fn repeat_output_chunk_schema_observed<'a, E>(
     input_schema: &'a arrow::datatypes::Schema,
     input_slots: &[SlotId],
@@ -371,30 +389,6 @@ impl RepeatFixtureFactory {
         );
         factory.input_layout = Some(input);
         factory.output_layout = Some(output);
-        Ok(factory)
-    }
-
-    pub(crate) fn new_from_declared_input(
-        node_id: i32,
-        null_slot_ids: Vec<Vec<SlotId>>,
-        grouping_slot_ids: Vec<SlotId>,
-        grouping_list: Vec<Vec<i64>>,
-        repeat_times: usize,
-        input: ChunkSchemaRef,
-    ) -> ExecutionResult<Self> {
-        if !input.is_typed() {
-            return Err(repeat_configuration(
-                "Repeat construction requires a complete input declaration",
-            ));
-        }
-        let mut factory = Self::new(
-            node_id,
-            null_slot_ids,
-            grouping_slot_ids,
-            grouping_list,
-            repeat_times,
-        );
-        factory.declared_input = Some(input);
         Ok(factory)
     }
 }
@@ -1171,7 +1165,7 @@ mod typed_owner_tests {
             "rejected request adds no fee or tail allocation"
         );
         let caller = ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
-            novarocks_functions::KernelDiagnostic::new(&("repeat original caller")),
+            novarocks_functions::KernelDiagnostic::new("repeat original caller"),
         ));
         errors.set_error(caller.clone());
         temporary_requests = 0;
@@ -1263,6 +1257,7 @@ mod typed_owner_tests {
     }
 }
 
+#[cfg(test)]
 fn validate_repeat_layouts(
     input: &novarocks_local_program::StaticLayout,
     output: &novarocks_local_program::StaticLayout,
@@ -1425,7 +1420,7 @@ pub(crate) fn repeat_output_columns_owned(
     mut grouping_array: impl FnMut(i64, usize) -> arrow::array::ArrayRef,
 ) -> ExecutionResult<Chunk> {
     use crate::exec::pipeline::operator::ConstructionFailure;
-    use novarocks_functions::selected_copy::{self, CopyConstructionError, CopyError};
+    use novarocks_functions::selected_copy::{self, CopyConstructionError};
     use novarocks_type_contract::ValueSchemaCreation;
     use std::alloc::Layout;
     fn failure(

@@ -21,7 +21,9 @@
 //! then exclusively owned by one `sink_io` task for its complete lifecycle, so
 //! no provider future is polled on a driver thread and no writer mutex exists.
 
-use crate::exec::pipeline::operator::{ExitFailure, ExitObservation, ExitProgress, FinishWatch};
+#[cfg(test)]
+use crate::exec::pipeline::operator::ExitProgress;
+use crate::exec::pipeline::operator::{ExitFailure, ExitObservation, FinishWatch};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,7 +33,6 @@ use novarocks_spi::connector::write_stack::{
     ConnectorBatchWriter, ConnectorCommitFragment, ConnectorOpenWriterRequest,
     ConnectorWriteExecution,
 };
-use std::future::Future;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
@@ -129,7 +130,7 @@ struct AppendCommand {
 }
 
 enum WriterCommand {
-    Append(AppendCommand),
+    Append(Box<AppendCommand>),
     Finish,
 }
 
@@ -349,13 +350,13 @@ impl<O: Send + 'static> AsyncWriterReservation<O> {
         if let Some(accounting) = self.transferred_accounting.as_mut() {
             accounting.release_unshared_connector_bytes()?;
         }
-        let command = WriterCommand::Append(AppendCommand {
+        let command = WriterCommand::Append(Box::new(AppendCommand {
             batch,
             rows: self.rows,
             bytes: self.bytes,
             _transferred_accounting: self.transferred_accounting.take(),
             _additional_accounting: self.additional_accounting.take(),
-        });
+        }));
         self.permit
             .take()
             .expect("async writer reservation permit")
@@ -1464,7 +1465,7 @@ async fn run_writer_actor<O: Send + 'static>(
         finish_mapper,
     } = start;
     let execution_ref = execution.as_ref();
-    let mut writer = match await_supervised(
+    let writer = match await_supervised(
         move || execution_ref.open_writer(request),
         shared.as_ref(),
         &runtime_error,
@@ -4408,7 +4409,7 @@ pub(crate) mod tests {
             }
         }
         struct NoticeSecondary {
-            data: Arc<NoticeData>,
+            _data: Arc<NoticeData>,
             drops: Arc<AtomicUsize>,
         }
         impl Drop for NoticeSecondary {
@@ -4431,7 +4432,7 @@ pub(crate) mod tests {
                 self.primary.fetch_add(1, Ordering::SeqCst);
                 let data = unsafe { std::mem::ManuallyDrop::take(&mut self.data) };
                 std::panic::panic_any(NoticeSecondary {
-                    data,
+                    _data: data,
                     drops: self.secondary.clone(),
                 });
             }
@@ -4804,10 +4805,10 @@ pub(crate) mod tests {
         };
         #[derive(Clone, Copy, Eq, PartialEq)]
         enum Mode {
-            KnownCallPanic,
-            UnknownCallPanic,
-            MapperDropPanic,
-            FragmentDropPanic,
+            KnownCall,
+            UnknownCall,
+            MapperDrop,
+            FragmentDrop,
         }
         struct Data {
             bytes: Vec<u8>,
@@ -4862,7 +4863,7 @@ pub(crate) mod tests {
             fn drop(&mut self) {
                 self.drops.fetch_add(1, Ordering::SeqCst);
                 let data = unsafe { std::mem::ManuallyDrop::take(&mut self.data) };
-                if self.mode == Mode::FragmentDropPanic {
+                if self.mode == Mode::FragmentDrop {
                     std::panic::panic_any(Primary {
                         data: std::mem::ManuallyDrop::new(data),
                         primary: self.primary.clone(),
@@ -4908,8 +4909,8 @@ pub(crate) mod tests {
                     "the real provider encoder reads its original fragment"
                 );
                 match self.mode {
-                    Mode::KnownCallPanic => panic!("actual connector fragment encoder panicked"),
-                    Mode::UnknownCallPanic => std::panic::panic_any(Primary {
+                    Mode::KnownCall => panic!("actual connector fragment encoder panicked"),
+                    Mode::UnknownCall => std::panic::panic_any(Primary {
                         data: std::mem::ManuallyDrop::new(Arc::clone(&source.data)),
                         primary: self.primary.clone(),
                         secondary: self.secondary.clone(),
@@ -4934,7 +4935,7 @@ pub(crate) mod tests {
             fn drop(&mut self) {
                 self.drops.fetch_add(1, Ordering::SeqCst);
                 let data = unsafe { std::mem::ManuallyDrop::take(&mut self.data) };
-                if self.mode == Mode::MapperDropPanic {
+                if self.mode == Mode::MapperDrop {
                     std::panic::panic_any(Primary {
                         data: std::mem::ManuallyDrop::new(data),
                         primary: self.primary.clone(),
@@ -5022,10 +5023,10 @@ pub(crate) mod tests {
             }
         }
         for mode in [
-            Mode::KnownCallPanic,
-            Mode::UnknownCallPanic,
-            Mode::MapperDropPanic,
-            Mode::FragmentDropPanic,
+            Mode::KnownCall,
+            Mode::UnknownCall,
+            Mode::MapperDrop,
+            Mode::FragmentDrop,
         ] {
             let runtime = runtime();
             let signal = Arc::new(RuntimeErrorState::default());
@@ -5108,7 +5109,7 @@ pub(crate) mod tests {
                 owner.take_output().is_none(),
                 "no output is published across unknown or failed finalization"
             );
-            if mode == Mode::KnownCallPanic {
+            if mode == Mode::KnownCall {
                 wait_until(|| owner.actor_exited());
                 let observed = owner.observe_actor_exit();
                 assert!(matches!(observed.progress, ExitProgress::Exited));
@@ -5134,7 +5135,7 @@ pub(crate) mod tests {
                 let original = signal.error();
                 assert_eq!(
                     original.is_some(),
-                    mode == Mode::UnknownCallPanic,
+                    mode == Mode::UnknownCall,
                     "only the actual mapper call is Required; owner/input retirement is Cleanup"
                 );
                 if let Some(original) = &original {
@@ -5162,11 +5163,11 @@ pub(crate) mod tests {
                 assert_eq!(secondary.load(Ordering::SeqCst), 0);
                 assert_eq!(
                     fragment_drops.load(Ordering::SeqCst),
-                    usize::from(mode == Mode::FragmentDropPanic)
+                    usize::from(mode == Mode::FragmentDrop)
                 );
                 assert_eq!(
                     capture_drops.load(Ordering::SeqCst),
-                    usize::from(mode != Mode::UnknownCallPanic)
+                    usize::from(mode != Mode::UnknownCall)
                 );
                 for _ in 0..3 {
                     let observed = owner.observe_actor_exit();

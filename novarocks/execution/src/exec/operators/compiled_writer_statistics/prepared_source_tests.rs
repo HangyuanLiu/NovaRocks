@@ -23,25 +23,30 @@ use novarocks_local_program::{PreparedWriterAggregateCall, PreparedWriterAggrega
 
 #[derive(Debug)]
 enum PreparedFixtureFailure {
-    Creator(ConstructionFailure),
-    Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
-    Source(novarocks_local_program::PreparedWriterCallsError),
+    Creator {
+        _cause: ConstructionFailure,
+    },
+    Resource {
+        _cause: novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    },
+    Source {
+        _cause: novarocks_local_program::PreparedWriterCallsError,
+    },
 }
 impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
     for PreparedFixtureFailure
 {
     fn from(value: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
-        Self::Resource(value)
+        Self::Resource { _cause: value }
     }
 }
 impl From<novarocks_local_program::PreparedWriterCallsError> for PreparedFixtureFailure {
     fn from(value: novarocks_local_program::PreparedWriterCallsError) -> Self {
-        Self::Source(value)
+        Self::Source { _cause: value }
     }
 }
 
 struct Source {
-    program: Arc<LocalProgram>,
     state: RuntimeState,
     tracker: Arc<MemTracker>,
     factory: Arc<dyn InputConstructionFactory>,
@@ -106,16 +111,18 @@ fn source_fixture() -> Source {
         |layout| {
             owner
                 .request(layout)
-                .map_err(PreparedFixtureFailure::Creator)
+                .map_err(|_cause| PreparedFixtureFailure::Creator { _cause })
         },
-        || statistics_work(owner.as_ref(), 1).map_err(PreparedFixtureFailure::Creator),
+        || {
+            statistics_work(owner.as_ref(), 1)
+                .map_err(|_cause| PreparedFixtureFailure::Creator { _cause })
+        },
     )
     .unwrap();
     let input = projection.layout.clone();
     let output = writer_multiplex_layout.clone();
     drop(owner);
     Source {
-        program,
         state,
         tracker,
         factory,

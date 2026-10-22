@@ -622,7 +622,7 @@ mod tests {
     fn typed_failure_text_cannot_impersonate_a_kernel_category_or_replace_context() {
         let failure = ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
             novarocks_functions::KernelDiagnostic::new(
-                &("ResourceExhausted: kernel evaluation was cancelled"),
+                "ResourceExhausted: kernel evaluation was cancelled",
             ),
         ))
         .at_operator(7, PipelineOperation::Push)

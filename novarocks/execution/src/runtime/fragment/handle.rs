@@ -16,7 +16,6 @@
 // under the License.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::exec::pipeline::executor::PreparedPipelineExecution;
 use crate::runtime::execution_runtime::ExecutionRuntime;
@@ -59,7 +58,6 @@ pub struct FragmentPrepareContext {
     result_identity: Option<novarocks_execution_contract::TaskIdentity>,
     task_control: Option<Arc<crate::runtime::task_control::TaskExecutionControl>>,
     root_sink_dop: Option<i32>,
-    group_execution_scan_dop: Option<i32>,
     execution_runtime: Option<Arc<ExecutionRuntime>>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     commit_port: Arc<dyn FragmentCommitPort>,
@@ -1029,10 +1027,12 @@ mod owner_tests {
         finst_id: UniqueId,
         session: &Arc<BlockingResultSession>,
     ) -> RunningFragmentHandle {
-        let mut context = FragmentPrepareContext::default();
-        context.result_writer = Arc::new(BlockingResultWriter {
-            session: Arc::clone(session),
-        });
+        let context = FragmentPrepareContext {
+            result_writer: Arc::new(BlockingResultWriter {
+                session: Arc::clone(session),
+            }),
+            ..FragmentPrepareContext::default()
+        };
         prepare_compiled_fragment(
             submission(
                 finst_id,
@@ -1095,7 +1095,7 @@ mod owner_tests {
             assert!(port.snapshot(key).is_some());
             let running = if failed {
                 dormant.start_failed(novarocks_functions::KernelFailure::Internal(
-                    novarocks_functions::KernelDiagnostic::new(&("original execution failure")),
+                    novarocks_functions::KernelDiagnostic::new("original execution failure"),
                 ))
             } else {
                 dormant.start()
@@ -1234,7 +1234,7 @@ mod owner_tests {
             assert!(dormant.take_exchange_retirement().is_none());
             let running = if failed {
                 dormant.start_failed(novarocks_functions::KernelFailure::Internal(
-                    novarocks_functions::KernelDiagnostic::new(&("original execution failure")),
+                    novarocks_functions::KernelDiagnostic::new("original execution failure"),
                 ))
             } else {
                 dormant.start()
@@ -1409,10 +1409,12 @@ mod owner_tests {
     #[test]
     fn stopped_observer_panic_before_terminal_freeze_is_isolated() {
         let session = BlockingResultSession::new();
-        let mut context = FragmentPrepareContext::default();
-        context.result_writer = Arc::new(BlockingResultWriter {
-            session: Arc::clone(&session),
-        });
+        let context = FragmentPrepareContext {
+            result_writer: Arc::new(BlockingResultWriter {
+                session: Arc::clone(&session),
+            }),
+            ..FragmentPrepareContext::default()
+        };
         let running = prepare_compiled_fragment(
             submission(
                 UniqueId::new(95, 96),
@@ -1486,7 +1488,7 @@ mod owner_tests {
     struct UnknownResultHolder {
         drops: Arc<AtomicUsize>,
         payload_drops: Arc<AtomicUsize>,
-        charge: std::mem::ManuallyDrop<crate::runtime::mem_tracker::TrackedBytes>,
+        _charge: std::mem::ManuallyDrop<crate::runtime::mem_tracker::TrackedBytes>,
     }
     impl Drop for UnknownResultHolder {
         fn drop(&mut self) {
@@ -1635,17 +1637,19 @@ mod owner_tests {
             crate::runtime::mem_tracker::MemTracker::new_root("unresolved fragment holder");
         let result_drops = Arc::new(AtomicUsize::new(0));
         let payload_drops = Arc::new(AtomicUsize::new(0));
-        let mut context = FragmentPrepareContext::default();
-        context.commit_port = Arc::new(GatedCommitPort {
-            gate: gate.clone(),
-            tracker: healthy_tracker.clone(),
-        });
+        let context = FragmentPrepareContext {
+            commit_port: Arc::new(GatedCommitPort {
+                gate: gate.clone(),
+                tracker: healthy_tracker.clone(),
+            }),
+            ..FragmentPrepareContext::default()
+        };
         let mut dormant = prepare_compiled_fragment(empty_result_submission(id), context).unwrap();
         let writer: Arc<dyn FragmentResultWriter> = Arc::new(SingleResultHolderWriter(Mutex::new(
             Some(Arc::new(UnknownResultHolder {
                 drops: result_drops.clone(),
                 payload_drops: payload_drops.clone(),
-                charge: std::mem::ManuallyDrop::new(
+                _charge: std::mem::ManuallyDrop::new(
                     crate::runtime::mem_tracker::TrackedBytes::try_new(
                         512,
                         unknown_tracker.clone(),
@@ -1849,9 +1853,11 @@ mod owner_tests {
         let fragment = crate::runtime::mem_tracker::MemTracker::new_child("fragment_test", &query);
         fragment.consume(4096);
 
-        let mut context = FragmentPrepareContext::default();
-        context.profiler = Some(crate::runtime::profile::fragment_root_profiler(0));
-        context.mem_tracker = Some(Arc::clone(&fragment));
+        let context = FragmentPrepareContext {
+            profiler: Some(crate::runtime::profile::fragment_root_profiler(0)),
+            mem_tracker: Some(Arc::clone(&fragment)),
+            ..FragmentPrepareContext::default()
+        };
         // A real execution runtime, so the fragment runs through the driver
         // executor production uses: the test executor never publishes the
         // stopped fact the terminal path depends on.
@@ -2013,7 +2019,6 @@ impl Default for FragmentPrepareContext {
             result_identity: None,
             task_control: None,
             root_sink_dop: None,
-            group_execution_scan_dop: None,
             execution_runtime: Some(crate::runtime::execution_runtime::test_execution_runtime()),
             query_memory: None,
             commit_port: Arc::new(TestFragmentCommitPort),
@@ -2058,7 +2063,6 @@ impl FragmentPrepareContext {
             result_identity: None,
             task_control: None,
             root_sink_dop: None,
-            group_execution_scan_dop: None,
             execution_runtime: None,
             query_memory: None,
             commit_port: Arc::new(UnavailableFragmentCommitPort),
@@ -2201,16 +2205,12 @@ impl FragmentPrepareContext {
         )
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Fault-injection construction keeps independently-owned execution services explicit."
-    )]
     pub fn new_with_execution_overrides(
         profiler: Option<Profiler>,
         mem_tracker: Option<Arc<MemTracker>>,
         result_spec: Option<ResultWriteSpec>,
         root_sink_dop: Option<i32>,
-        group_execution_scan_dop: Option<i32>,
+        _group_execution_scan_dop: Option<i32>,
         exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
         result_writer: Arc<dyn FragmentResultWriter>,
         event_sink: Arc<dyn FragmentEventSink>,
@@ -2230,7 +2230,6 @@ impl FragmentPrepareContext {
             result_identity: None,
             task_control: None,
             root_sink_dop,
-            group_execution_scan_dop,
             execution_runtime: None,
             query_memory: None,
             commit_port: Arc::new(UnavailableFragmentCommitPort),
@@ -2432,7 +2431,7 @@ impl DormantFragmentHandle {
         #[cfg(test)]
         let initial_failure = self.start_failure.map(|failure| {
             super::ExecutionFailure::from(novarocks_functions::KernelFailure::Internal(
-                novarocks_functions::KernelDiagnostic::new(&(failure.detail())),
+                novarocks_functions::KernelDiagnostic::new(failure.detail()),
             ))
         });
         #[cfg(not(test))]

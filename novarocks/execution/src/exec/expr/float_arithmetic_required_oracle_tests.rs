@@ -19,8 +19,7 @@
 //! Historical test names retain the P12/P13 trace. The retired dual-author
 //! arithmetic NaN payload comparator is not an IEEE payload contract; only
 //! arithmetic NaN uses a semantic assertion. Stored payload bits remain exact.
-#[path = "float_arithmetic_independent_fixture.rs"]
-mod raw;
+use super::float_arithmetic_independent_fixture as raw;
 use arrow::{
     array::{Array, ArrayRef, Float32Array, Float64Array},
     datatypes::DataType,

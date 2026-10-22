@@ -20,7 +20,7 @@
 //! This permanent original-equivalence expectation must not be changed to #1.
 use super::super::window_fixture::package_typed;
 use super::*;
-use crate::exec::pipeline::{step::NextStep, test_driver::TestDriver};
+use crate::exec::pipeline::test_driver::TestDriver;
 use crate::runtime::fragment::ExecutionFailureCause;
 use crate::runtime::mem_tracker::MemTracker;
 use arrow::datatypes::DataType;

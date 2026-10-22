@@ -27,13 +27,14 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+#[cfg(test)]
+use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::ExecutionResult;
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::binding::ExchangeBinding;
 use crate::exec::pipeline::operator::{DriverBlockDeadline, Operator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -795,7 +796,7 @@ mod tests {
             let error = crate::runtime::fragment::ExecutionFailure::from(
                 novarocks_functions::KernelFailure::Internal(
                     novarocks_functions::KernelDiagnostic::new(
-                        &("exchange timeout test did not complete"),
+                        "exchange timeout test did not complete",
                     ),
                 ),
             );

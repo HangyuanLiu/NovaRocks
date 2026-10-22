@@ -18,7 +18,6 @@
 //! Actual installed COUNT Final -> erased state -> production driver panic owner.
 //! The test allocator measures real blocks; it grants no invocation capacity.
 use super::*;
-use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::runtime_state::RuntimeState;
 use arrow::array::{ArrayRef, Int64Array};

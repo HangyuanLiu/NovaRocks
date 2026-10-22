@@ -30,6 +30,7 @@ use arrow::array::{Array, ArrayRef, UInt32Builder};
 use arrow::compute::take;
 use arrow::datatypes::DataType;
 use std::cmp::Ordering;
+#[cfg(test)]
 use std::collections::VecDeque;
 
 /// Borrowed result of the ONE original analytic output-layout validator.
@@ -136,6 +137,7 @@ pub(crate) fn validate_analytic_output_columns_typed<'a>(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn compute_partitions(
     keys: &[ArrayRef],
     rows: usize,
@@ -158,6 +160,7 @@ pub(crate) fn compute_partitions(
     Ok(parts)
 }
 
+#[cfg(test)]
 pub(crate) fn split_analytic_output_chunks(
     output_chunk_schema: ChunkSchemaRef,
     columns: &[ArrayRef],
@@ -182,6 +185,7 @@ pub(crate) fn reorder_chunk_by_partition_keys(
     ))
 }
 
+#[cfg(test)]
 fn compare_rows_on_partition_keys(
     keys: &[ArrayRef],
     left: usize,

@@ -38,7 +38,6 @@ use super::key_builder::{
 
 use super::key_builder::{
     GroupKeyOutputKind, GroupKeyOutputTally, group_key_decode_arrow, group_key_decode_utf8,
-    group_key_decoding_contract, group_key_request_arithmetic,
 };
 use crate::runtime::fragment::{ExecutionFailure, ExecutionReason};
 
@@ -246,24 +245,6 @@ pub(crate) enum KeyColumn {
 }
 
 impl KeyColumn {
-    #[cfg(test)]
-    pub(crate) fn int8_for_test(values: Vec<i8>, nulls: Vec<u8>) -> Self {
-        let allocator = test_allocator();
-        Self::Int8 {
-            values: tracked_test_vec(values, allocator.clone()),
-            nulls: tracked_test_vec(nulls, allocator),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn int64_for_test(values: Vec<i64>, nulls: Vec<u8>) -> Self {
-        let allocator = test_allocator();
-        Self::Int64 {
-            values: tracked_test_vec(values, allocator.clone()),
-            nulls: tracked_test_vec(nulls, allocator),
-        }
-    }
-
     pub(crate) fn try_reserve_value_from_view(
         &mut self,
         view: &GroupKeyArrayView<'_>,
@@ -1296,61 +1277,6 @@ impl KeyColumn {
         }
     }
 
-    pub fn data_type(&self) -> DataType {
-        match self {
-            KeyColumn::Int8 { .. } => DataType::Int8,
-            KeyColumn::Int16 { .. } => DataType::Int16,
-            KeyColumn::Int32 { .. } => DataType::Int32,
-            KeyColumn::Int64 { .. } => DataType::Int64,
-            KeyColumn::Float32 { .. } => DataType::Float32,
-            KeyColumn::Float64 { .. } => DataType::Float64,
-            KeyColumn::Boolean { .. } => DataType::Boolean,
-            KeyColumn::Utf8 { .. } => DataType::Utf8,
-            KeyColumn::Date32 { .. } => DataType::Date32,
-            KeyColumn::Timestamp { unit, tz, .. } => {
-                let tz_arc = tz.as_deref().map(Arc::<str>::from);
-                DataType::Timestamp(*unit, tz_arc)
-            }
-            KeyColumn::Decimal128 {
-                precision, scale, ..
-            } => DataType::Decimal128(*precision, *scale),
-            KeyColumn::Decimal256 {
-                precision, scale, ..
-            } => DataType::Decimal256(*precision, *scale),
-            KeyColumn::LargeIntBinary { .. } => {
-                DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH)
-            }
-            KeyColumn::ListUtf8 { .. } => {
-                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
-            }
-            KeyColumn::ListInt32 { .. } => {
-                DataType::List(Arc::new(Field::new("item", DataType::Int32, true)))
-            }
-            KeyColumn::Complex { data_type, .. } => data_type.clone(),
-        }
-    }
-
-    pub fn has_nulls(&self) -> bool {
-        match self {
-            KeyColumn::Int8 { nulls, .. }
-            | KeyColumn::Int16 { nulls, .. }
-            | KeyColumn::Int32 { nulls, .. }
-            | KeyColumn::Int64 { nulls, .. }
-            | KeyColumn::Float32 { nulls, .. }
-            | KeyColumn::Float64 { nulls, .. }
-            | KeyColumn::Boolean { nulls, .. }
-            | KeyColumn::Utf8 { nulls, .. }
-            | KeyColumn::Date32 { nulls, .. }
-            | KeyColumn::Timestamp { nulls, .. }
-            | KeyColumn::Decimal128 { nulls, .. }
-            | KeyColumn::Decimal256 { nulls, .. }
-            | KeyColumn::LargeIntBinary { nulls, .. } => nulls.contains(&0),
-            KeyColumn::ListUtf8 { values } => values.iter().any(|value| value.is_none()),
-            KeyColumn::ListInt32 { values } => values.iter().any(|value| value.is_none()),
-            KeyColumn::Complex { keys, .. } => keys.iter().any(|value| value.is_none()),
-        }
-    }
-
     /// Returns heap memory retained exclusively by this column in O(1).
     ///
     /// Inline enum storage is part of `KeyTable::key_columns` and is therefore
@@ -1415,16 +1341,6 @@ fn test_allocator() -> AggregateAllocator {
         "KeyColumnTest",
         &process_mem_tracker(),
     ))
-}
-
-#[cfg(test)]
-fn tracked_test_vec<T>(values: Vec<T>, allocator: AggregateAllocator) -> AggregateVec<T> {
-    let mut tracked = AggregateVec::new_in(allocator);
-    tracked
-        .try_reserve_exact(values.len())
-        .expect("reserve test key-column values");
-    tracked.extend(values);
-    tracked
 }
 
 #[cfg(test)]
@@ -1531,7 +1447,7 @@ pub(crate) fn key_column_from_type_in(
 
 #[cfg(test)]
 mod tests {
-    use super::{KeyColumn, RetainedVec, key_column_from_type, test_allocator};
+    use super::{RetainedVec, key_column_from_type, test_allocator};
     use arrow::array::{Array, ArrayRef, DictionaryArray, StringArray};
     use arrow::datatypes::{DataType, Int32Type};
     use std::sync::Arc;

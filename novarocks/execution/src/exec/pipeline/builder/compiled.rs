@@ -46,8 +46,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::program_failure;
 use super::runtime_filter::{runtime_filter_consumer_contract, runtime_filter_producer};
 use super::*;
-#[cfg(test)]
-use crate::exec::chunk::Chunk;
 use crate::exec::fragment::error::FragmentBindingErrorKind;
 use crate::exec::operators::compiled_aggregate::CompiledAggregateProcessorFactory;
 use crate::exec::operators::compiled_change_events::CompiledChangeEventProcessorFactory;
@@ -65,7 +63,7 @@ use crate::exec::operators::compiled_window::CompiledWindowProcessorFactory;
 use crate::exec::operators::runtime_filter::{
     CompiledOrderedScanFactory, CompiledRuntimeFilterConsumers,
 };
-use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+use crate::runtime::fragment::ExecutionResult;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 use crate::runtime_filter::OrderedTopNAllocationHost;
 use novarocks_local_program::{
@@ -419,10 +417,6 @@ fn compiled_runtime_filter_consumers(
 
 /// The ordered Scan keeps full-list root ordinals while sharing the original
 /// blocking membership gate and contract author.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "This is the original builder context plus the explicit Scan selection policy"
-)]
 fn compiled_runtime_filter_consumers_selected(
     owner: &'static str,
     display_owner: &'static str,
@@ -487,10 +481,6 @@ fn compiled_runtime_filter_consumers_selected(
 }
 
 #[cfg(any(test, novarocks_dev_controls))]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The test port preserves the production graph builder inputs"
-)]
 pub fn build_compiled_pipeline_graph_for_test(
     program: &Arc<LocalProgram>,
     exchange_bindings: ExchangeBindings,
@@ -517,10 +507,6 @@ pub fn build_compiled_pipeline_graph_for_test(
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The compiled program and its Task capabilities are independent inputs"
-)]
 pub(crate) fn build_compiled_pipeline_graph(
     program: &Arc<LocalProgram>,
     exchange_bindings: ExchangeBindings,
@@ -1381,8 +1367,7 @@ mod exchange_tests;
 mod scan_tests;
 
 #[cfg(test)]
-#[path = "compiled_family_fixture.rs"]
-pub(super) mod family_fixture;
+pub(crate) use crate::exec::operators::family_fixture;
 
 #[cfg(test)]
 #[path = "compiled_sort_tests.rs"]
@@ -1413,8 +1398,7 @@ pub(crate) mod values_tests;
 mod generate_series_tests;
 
 #[cfg(test)]
-#[path = "compiled_aggregate_fixture.rs"]
-mod aggregate_fixture;
+pub(crate) use crate::exec::operators::aggregate_fixture;
 
 #[cfg(test)]
 #[path = "compiled_aggregate_tests.rs"]

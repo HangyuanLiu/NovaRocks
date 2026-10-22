@@ -24,29 +24,39 @@ use arrow::array::{Array, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow::compute::concat;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
-use std::{collections::VecDeque, convert::Infallible, sync::Arc};
+#[cfg(test)]
+use std::collections::VecDeque;
+use std::{convert::Infallible, sync::Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AnalyticInputStage {
     Gather,
     Regroup,
+    #[cfg(test)]
     OutputSplit,
 }
 
 pub(crate) enum AnalyticInputSource<'a> {
     Gather {
+        #[cfg(test)]
         chunks: &'a [Chunk],
+        #[cfg(not(test))]
+        _lifetime: std::marker::PhantomData<&'a ()>,
     },
     Regroup {
+        #[cfg(test)]
         chunk: &'a Chunk,
+        #[cfg(test)]
         keys: &'a [ArrayRef],
     },
+    #[cfg(test)]
     OutputSplit {
         output: &'a ChunkSchemaRef,
         columns: &'a [ArrayRef],
         chunks: &'a [Chunk],
     },
 }
+#[cfg(test)]
 impl AnalyticInputSource<'_> {
     pub(crate) fn stage(&self) -> AnalyticInputStage {
         match self {
@@ -56,17 +66,32 @@ impl AnalyticInputSource<'_> {
         }
     }
 }
-
 /// Preserve the original Arrow or domain error across the actual copy occurrence.
 pub(crate) enum AnalyticCopyFailure<E> {
-    OriginalArrow(ArrowError),
-    Source(ExecutionFailure),
+    OriginalArrow {
+        source: ArrowError,
+        _marker: std::marker::PhantomData<fn() -> E>,
+    },
+    #[cfg(test)]
     Control(E),
+}
+impl<E> AnalyticCopyFailure<E> {
+    pub(crate) fn original_arrow(source: ArrowError) -> Self {
+        Self::OriginalArrow {
+            source,
+            _marker: std::marker::PhantomData,
+        }
+    }
 }
 
 /// Keep a constructor failure distinct from a Work refusal. Each retains its
 /// own domain facts; the stage adds only operation context.
 pub(crate) type AnalyticChunkConstruction<E> = Result<Chunk, Result<ExecutionFailure, E>>;
+
+pub(crate) type AnalyticStageOperationResult<W> = Result<
+    AnalyticStageResult<Chunk, <W as AnalyticInputWork>::Scope>,
+    AnalyticStageFailure<<W as AnalyticInputWork>::Scope, <W as AnalyticInputWork>::Failure>,
+>;
 
 /// Admission precedes the original stage's allocation. A tracked adapter must
 /// return its real host lease, not an observation token. Success and original
@@ -94,7 +119,7 @@ pub(crate) trait AnalyticInputWork {
                 .map(|batch| batch.column(ordinal).as_ref())
                 .collect::<Vec<_>>(),
         )
-        .map_err(AnalyticCopyFailure::OriginalArrow)
+        .map_err(AnalyticCopyFailure::original_arrow)
     }
     fn take_column(
         &mut self,
@@ -108,8 +133,9 @@ pub(crate) trait AnalyticInputWork {
             indices.as_ref(),
             None,
         )
-        .map_err(AnalyticCopyFailure::OriginalArrow)
+        .map_err(AnalyticCopyFailure::original_arrow)
     }
+    #[cfg(test)]
     fn slice_column(
         &mut self,
         _scope: &mut Self::Scope,
@@ -144,25 +170,31 @@ pub(crate) trait AnalyticInputWork {
 }
 #[derive(Debug)]
 pub(crate) struct AnalyticStageResult<T, S> {
+    #[cfg(test)]
     pub stage: AnalyticInputStage,
-    // Field order keeps the payload alive under its scope until payload Drop.
     pub value: T,
-    pub scope: S,
+    _scope: S,
 }
 #[derive(Debug)]
 pub(crate) enum AnalyticStageFailure<S, E> {
     Control {
+        #[cfg(test)]
         stage: AnalyticInputStage,
         cause: E,
     },
     Operation {
+        #[cfg(test)]
         stage: AnalyticInputStage,
         cause: ExecutionFailure,
-        scope: S,
+        _scope: S,
     },
 }
-fn controlled<S, E>(stage: AnalyticInputStage, cause: E) -> AnalyticStageFailure<S, E> {
-    AnalyticStageFailure::Control { stage, cause }
+fn controlled<S, E>(_stage: AnalyticInputStage, cause: E) -> AnalyticStageFailure<S, E> {
+    AnalyticStageFailure::Control {
+        #[cfg(test)]
+        stage: _stage,
+        cause,
+    }
 }
 
 pub(crate) struct UnscopedWork;
@@ -204,7 +236,7 @@ fn original_concat_batches<W: AnalyticInputWork>(
         let mut options = RecordBatchOptions::default();
         options.row_count = Some(num_rows);
         return RecordBatch::try_new_with_options(schema.clone(), vec![], &options)
-            .map_err(AnalyticCopyFailure::OriginalArrow);
+            .map_err(AnalyticCopyFailure::original_arrow);
     }
     let batches = input_batches;
     if batches.is_empty() {
@@ -216,16 +248,21 @@ fn original_concat_batches<W: AnalyticInputWork>(
         let array = work.concat_column(scope, batches, sources, i)?;
         arrays.push(array);
     }
-    RecordBatch::try_new(schema.clone(), arrays).map_err(AnalyticCopyFailure::OriginalArrow)
+    RecordBatch::try_new(schema.clone(), arrays).map_err(AnalyticCopyFailure::original_arrow)
 }
 
 pub(crate) fn gather<W: AnalyticInputWork>(
     input: &[Chunk],
     work: &mut W,
-) -> Result<AnalyticStageResult<Chunk, W::Scope>, AnalyticStageFailure<W::Scope, W::Failure>> {
+) -> AnalyticStageOperationResult<W> {
     let stage = AnalyticInputStage::Gather;
     let mut scope = work
-        .admit(AnalyticInputSource::Gather { chunks: input })
+        .admit(AnalyticInputSource::Gather {
+            #[cfg(test)]
+            chunks: input,
+            #[cfg(not(test))]
+            _lifetime: std::marker::PhantomData,
+        })
         .map_err(|e| controlled(stage, e))?;
     let result = if input.len() == 1 {
         Ok(input[0].clone())
@@ -240,14 +277,12 @@ pub(crate) fn gather<W: AnalyticInputWork>(
         }
         work.boundary().map_err(|e| controlled(stage, e))?;
         match original_concat_batches(&input_schema, &batches, input, &mut scope, work) {
+            #[cfg(test)]
             Err(AnalyticCopyFailure::Control(cause)) => return Err(controlled(stage, cause)),
-            Err(AnalyticCopyFailure::OriginalArrow(error)) => Err(analytic_failure::stage(
+            Err(AnalyticCopyFailure::OriginalArrow { source, .. }) => Err(analytic_failure::stage(
                 "concat_batches",
-                analytic_failure::arrow(error),
+                analytic_failure::arrow(source),
             )),
-            Err(AnalyticCopyFailure::Source(error)) => {
-                Err(analytic_failure::stage("concat_batches", error))
-            }
             Ok(batch) => {
                 work.boundary().map_err(|e| controlled(stage, e))?;
                 match work.construct_batch_chunk(&mut scope, batch, input[0].chunk_schema_ref()) {
@@ -265,15 +300,17 @@ pub(crate) fn gather<W: AnalyticInputWork>(
         Ok(value) => {
             work.boundary().map_err(|e| controlled(stage, e))?;
             Ok(AnalyticStageResult {
+                #[cfg(test)]
                 stage,
                 value,
-                scope,
+                _scope: scope,
             })
         }
         Err(cause) => Err(AnalyticStageFailure::Operation {
+            #[cfg(test)]
             stage,
             cause,
-            scope,
+            _scope: scope,
         }),
     }
 }
@@ -304,6 +341,7 @@ pub(crate) fn compare_keys<W: AnalyticInputWork>(
     }
     Ok(Ordering::Equal)
 }
+#[cfg(test)]
 pub(crate) fn unscoped_compare(
     keys: &[ArrayRef],
     left: usize,
@@ -320,18 +358,24 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
     chunk: &Chunk,
     keys: &[ArrayRef],
     work: &mut W,
-) -> Result<AnalyticStageResult<Chunk, W::Scope>, AnalyticStageFailure<W::Scope, W::Failure>> {
+) -> AnalyticStageOperationResult<W> {
     let stage = AnalyticInputStage::Regroup;
     let mut scope = work
-        .admit(AnalyticInputSource::Regroup { chunk, keys })
+        .admit(AnalyticInputSource::Regroup {
+            #[cfg(test)]
+            chunk,
+            #[cfg(test)]
+            keys,
+        })
         .map_err(|e| controlled(stage, e))?;
     let rows = chunk.len();
     if rows <= 1 || keys.is_empty() {
         work.boundary().map_err(|e| controlled(stage, e))?;
         return Ok(AnalyticStageResult {
+            #[cfg(test)]
             stage,
             value: chunk.clone(),
-            scope,
+            _scope: scope,
         });
     }
     work.boundary().map_err(|e| controlled(stage, e))?;
@@ -363,9 +407,10 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
     if let Some(error) = sort_error {
         return Err(match error {
             Ok(cause) => AnalyticStageFailure::Operation {
+                #[cfg(test)]
                 stage,
                 cause,
-                scope,
+                _scope: scope,
             },
             Err(cause) => controlled(stage, cause),
         });
@@ -382,9 +427,10 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
     if unchanged {
         work.boundary().map_err(|e| controlled(stage, e))?;
         return Ok(AnalyticStageResult {
+            #[cfg(test)]
             stage,
             value: chunk.clone(),
-            scope,
+            _scope: scope,
         });
     }
     work.boundary().map_err(|e| controlled(stage, e))?;
@@ -395,9 +441,10 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
             Ok(index) => index,
             Err(cause) => {
                 return Err(AnalyticStageFailure::Operation {
+                    #[cfg(test)]
                     stage,
                     cause,
-                    scope,
+                    _scope: scope,
                 });
             }
         };
@@ -411,19 +458,14 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
         work.boundary().map_err(|e| controlled(stage, e))?;
         let value = match work.take_column(&mut scope, chunk, ordinal, &indices) {
             Ok(value) => value,
+            #[cfg(test)]
             Err(AnalyticCopyFailure::Control(cause)) => return Err(controlled(stage, cause)),
-            Err(AnalyticCopyFailure::OriginalArrow(error)) => {
+            Err(AnalyticCopyFailure::OriginalArrow { source, .. }) => {
                 return Err(AnalyticStageFailure::Operation {
+                    #[cfg(test)]
                     stage,
-                    cause: analytic_failure::arrow(error),
-                    scope,
-                });
-            }
-            Err(AnalyticCopyFailure::Source(cause)) => {
-                return Err(AnalyticStageFailure::Operation {
-                    stage,
-                    cause,
-                    scope,
+                    cause: analytic_failure::arrow(source),
+                    _scope: scope,
                 });
             }
         };
@@ -435,29 +477,35 @@ pub(crate) fn regroup<W: AnalyticInputWork>(
         Ok(value) => {
             work.boundary().map_err(|e| controlled(stage, e))?;
             Ok(AnalyticStageResult {
+                #[cfg(test)]
                 stage,
                 value,
-                scope,
+                _scope: scope,
             })
         }
         Err(Ok(error)) => Err(AnalyticStageFailure::Operation {
+            #[cfg(test)]
             stage,
             cause: analytic_failure::stage("build reordered analytic batch", error),
-            scope,
+            _scope: scope,
         }),
         Err(Err(cause)) => Err(controlled(stage, cause)),
     }
 }
 
+#[cfg(test)]
+pub(crate) type AnalyticSplitResult<W> = Result<
+    AnalyticStageResult<VecDeque<Chunk>, <W as AnalyticInputWork>::Scope>,
+    AnalyticStageFailure<<W as AnalyticInputWork>::Scope, <W as AnalyticInputWork>::Failure>,
+>;
+
+#[cfg(test)]
 pub(crate) fn split<W: AnalyticInputWork>(
     output: ChunkSchemaRef,
     columns: &[ArrayRef],
     input: &[Chunk],
     work: &mut W,
-) -> Result<
-    AnalyticStageResult<VecDeque<Chunk>, W::Scope>,
-    AnalyticStageFailure<W::Scope, W::Failure>,
-> {
+) -> AnalyticSplitResult<W> {
     let stage = AnalyticInputStage::OutputSplit;
     let mut scope = work
         .admit(AnalyticInputSource::OutputSplit {
@@ -492,9 +540,10 @@ pub(crate) fn split<W: AnalyticInputWork>(
             }
             Err(Ok(error)) => {
                 return Err(AnalyticStageFailure::Operation {
+                    #[cfg(test)]
                     stage,
                     cause: analytic_failure::stage("build analytic output batch", error),
-                    scope,
+                    _scope: scope,
                 });
             }
             Err(Err(cause)) => return Err(controlled(stage, cause)),
@@ -503,8 +552,9 @@ pub(crate) fn split<W: AnalyticInputWork>(
     }
     work.boundary().map_err(|e| controlled(stage, e))?;
     Ok(AnalyticStageResult {
+        #[cfg(test)]
         stage,
         value,
-        scope,
+        _scope: scope,
     })
 }

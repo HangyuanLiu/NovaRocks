@@ -28,7 +28,6 @@ use std::{
 #[derive(Debug)]
 struct AnalyticGuard {
     detail: BoundedDetail,
-    parameter: bool,
 }
 impl fmt::Display for AnalyticGuard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -38,31 +37,21 @@ impl fmt::Display for AnalyticGuard {
 impl Error for AnalyticGuard {}
 impl FailureProjection for AnalyticGuard {
     fn failure_fact(&self) -> FailureFact {
-        let (class, reason) = if self.parameter {
-            (FailureClass::Data, ExecutionReason::AnalyticParameter)
-        } else {
-            (FailureClass::Invariant, ExecutionReason::AnalyticContract)
-        };
-        FailureFact::new(class, reason.reason())
+        FailureFact::new(
+            FailureClass::Invariant,
+            ExecutionReason::AnalyticContract.reason(),
+        )
     }
 }
 pub(super) fn contract(detail: impl fmt::Display) -> ExecutionFailure {
     ExecutionFailure::from_domain(AnalyticGuard {
         detail: BoundedDetail::truncating_display(detail),
-        parameter: false,
-    })
-}
-pub(super) fn parameter(detail: &'static str) -> ExecutionFailure {
-    ExecutionFailure::from_domain(AnalyticGuard {
-        detail: BoundedDetail::truncating(detail),
-        parameter: true,
     })
 }
 
 #[derive(Debug)]
 struct AnalyticArrowFailure {
     source: arrow::error::ArrowError,
-    cast: bool,
 }
 impl fmt::Display for AnalyticArrowFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -77,18 +66,11 @@ impl Error for AnalyticArrowFailure {
 impl FailureProjection for AnalyticArrowFailure {
     fn failure_fact(&self) -> FailureFact {
         use arrow::error::ArrowError;
-        let (class, reason) = match (&self.source, self.cast) {
-            (ArrowError::MemoryError(_), _) => (
+        let (class, reason) = match &self.source {
+            ArrowError::MemoryError(_) => (
                 FailureClass::Resource,
                 ExecutionReason::AnalyticArrowAllocation,
             ),
-            (
-                ArrowError::CastError(_)
-                | ArrowError::ParseError(_)
-                | ArrowError::ArithmeticOverflow(_)
-                | ArrowError::DivideByZero,
-                true,
-            ) => (FailureClass::Data, ExecutionReason::AnalyticArrowValue),
             _ => (
                 FailureClass::Invariant,
                 ExecutionReason::AnalyticArrowContract,
@@ -98,28 +80,23 @@ impl FailureProjection for AnalyticArrowFailure {
     }
 }
 pub(super) fn arrow(source: arrow::error::ArrowError) -> ExecutionFailure {
-    ExecutionFailure::from_domain(AnalyticArrowFailure {
-        source,
-        cast: false,
-    })
-}
-pub(super) fn cast(source: arrow::error::ArrowError) -> ExecutionFailure {
-    ExecutionFailure::from_domain(AnalyticArrowFailure { source, cast: true })
+    ExecutionFailure::from_domain(AnalyticArrowFailure { source })
 }
 
 #[derive(Debug)]
 struct AnalyticContext {
     stage: Option<&'static str>,
+    #[cfg(test)]
     call: Option<usize>,
     source: ExecutionFailure,
 }
 impl fmt::Display for AnalyticContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        #[cfg(test)]
         if let Some(call) = self.call {
-            write!(f, "window function #{call}: {}", self.source)
-        } else {
-            write!(f, "{}: {}", self.stage.unwrap(), self.source)
+            return write!(f, "window function #{call}: {}", self.source);
         }
+        write!(f, "{}: {}", self.stage.unwrap(), self.source)
     }
 }
 impl Error for AnalyticContext {
@@ -135,10 +112,12 @@ impl FailureProjection for AnalyticContext {
 pub(super) fn stage(stage: &'static str, source: ExecutionFailure) -> ExecutionFailure {
     ExecutionFailure::from_domain(AnalyticContext {
         stage: Some(stage),
+        #[cfg(test)]
         call: None,
         source,
     })
 }
+#[cfg(test)]
 pub(super) fn call(call: usize, source: ExecutionFailure) -> ExecutionFailure {
     ExecutionFailure::from_domain(AnalyticContext {
         stage: None,
@@ -147,37 +126,36 @@ pub(super) fn call(call: usize, source: ExecutionFailure) -> ExecutionFailure {
     })
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 enum AnalyticNumericFailure {
     SumNarrow(TryFromIntError),
-    Overflow(&'static str),
 }
+#[cfg(test)]
 impl fmt::Display for AnalyticNumericFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SumNarrow(_) => f.write_str("sum overflow"),
-            Self::Overflow(operation) => write!(f, "{operation} overflow"),
         }
     }
 }
+#[cfg(test)]
 impl Error for AnalyticNumericFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::SumNarrow(source) => Some(source),
-            _ => None,
         }
     }
 }
+#[cfg(test)]
 impl FailureProjection for AnalyticNumericFailure {
     fn failure_fact(&self) -> FailureFact {
         novarocks_functions::DataFailureReason::NumericOutOfRange.failure_fact()
     }
 }
+#[cfg(test)]
 pub(super) fn sum_narrow(source: TryFromIntError) -> ExecutionFailure {
     ExecutionFailure::from_domain(AnalyticNumericFailure::SumNarrow(source))
-}
-pub(super) fn numeric_overflow(operation: &'static str) -> ExecutionFailure {
-    ExecutionFailure::from_domain(AnalyticNumericFailure::Overflow(operation))
 }
 
 #[derive(Debug)]
@@ -237,6 +215,7 @@ fn extent(required: usize, key: bool) -> ExecutionResult<u32> {
         })
     })
 }
+#[cfg(test)]
 pub(super) fn key_extent(required: usize) -> ExecutionResult<u32> {
     extent(required, true)
 }

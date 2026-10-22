@@ -20,8 +20,8 @@
 use super::compiled_program::CompiledExpressionInstance;
 use super::numeric_unary_owned_transaction_tests::programs_with_catalogue_and_original_inlist_source;
 use super::sql_test_source::sql_source_with_single_field_and_core_residuals;
-use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{Array, ArrayRef, StringArray};
+use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
 use novarocks_functions::{KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection};
 use novarocks_local_program::{
@@ -95,16 +95,6 @@ fn batch(program: &LocalProgram, site: ProgramExpressionRootSite, input: ArrayRe
     assert_eq!(schema.field(0).data_type(), input.data_type());
     RecordBatch::try_new(schema, vec![input]).unwrap()
 }
-fn values(output: &novarocks_functions::SelectedValues<'_>) -> Vec<Option<bool>> {
-    output
-        .values()
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .unwrap()
-        .iter()
-        .collect()
-}
-
 #[test]
 fn like_actual_source_original_ordered_definitions_exact_recipe_and_negation() {
     for (sql, negated) in [

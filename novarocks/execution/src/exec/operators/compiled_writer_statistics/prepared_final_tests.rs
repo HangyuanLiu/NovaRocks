@@ -25,24 +25,29 @@ use novarocks_local_program::{
 
 #[derive(Debug)]
 enum TestSourceFailure {
-    Creator(ConstructionFailure),
-    Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
-    Source(PreparedWriterCallsError),
+    Creator {
+        _cause: ConstructionFailure,
+    },
+    Resource {
+        _cause: novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+    },
+    Source {
+        _cause: PreparedWriterCallsError,
+    },
 }
 impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
     for TestSourceFailure
 {
     fn from(cause: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
-        Self::Resource(cause)
+        Self::Resource { _cause: cause }
     }
 }
 impl From<PreparedWriterCallsError> for TestSourceFailure {
     fn from(cause: PreparedWriterCallsError) -> Self {
-        Self::Source(cause)
+        Self::Source { _cause: cause }
     }
 }
 struct Source {
-    program: Arc<LocalProgram>,
     state: RuntimeState,
     tracker: Arc<MemTracker>,
     factory: Arc<dyn InputConstructionFactory>,
@@ -108,8 +113,15 @@ fn source() -> Source {
         calls.into_boxed_slice(),
         AggregateKernelPhase::Final,
         owner.storage_lifetime(),
-        |layout| owner.request(layout).map_err(TestSourceFailure::Creator),
-        || statistics_work(owner.as_ref(), 1).map_err(TestSourceFailure::Creator),
+        |layout| {
+            owner
+                .request(layout)
+                .map_err(|_cause| TestSourceFailure::Creator { _cause })
+        },
+        || {
+            statistics_work(owner.as_ref(), 1)
+                .map_err(|_cause| TestSourceFailure::Creator { _cause })
+        },
     )
     .unwrap();
     let unpivot = final_aggregates
@@ -120,7 +132,6 @@ fn source() -> Source {
     let grouping_output = unpivot.grouping_output_slot_id;
     drop(owner);
     Source {
-        program,
         state,
         tracker,
         factory,

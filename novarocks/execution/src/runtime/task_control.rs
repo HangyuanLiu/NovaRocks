@@ -21,6 +21,8 @@ use crate::runtime::{
     fragment::{ExecutionFailure, ExecutionReason, ExecutionResult},
     observable::Observable,
 };
+#[cfg(test)]
+use novarocks_execution_contract::{AbortCause, CancelReason};
 use novarocks_execution_contract::{
     AcceptedTaskConclusion, SettledContinuation, TaskConclusion, TaskConclusionPort,
     TaskConclusionProposal, TaskFailurePhase, TaskIdentity, TerminationDetail,
@@ -274,8 +276,7 @@ impl FailureProjection for TaskStopObservation {
 pub(crate) mod test_support {
     use super::*;
     use novarocks_execution_contract::{
-        AbortCause, AcceptedConclusion, CancelReason, ConclusionDecision, SafeDetail, TaskFailure,
-        decide_conclusion,
+        AcceptedConclusion, ConclusionDecision, TaskFailure, decide_conclusion,
     };
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
@@ -1132,6 +1133,7 @@ pub(crate) mod test_support {
         );
     }
 
+    #[cfg(test)]
     fn cause() -> ExecutionFailure {
         novarocks_functions::KernelFailure::ResourceExhausted.into()
     }

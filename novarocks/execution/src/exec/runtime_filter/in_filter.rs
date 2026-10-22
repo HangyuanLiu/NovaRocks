@@ -1240,17 +1240,6 @@ impl RuntimeInFilter {
         }
     }
 
-    pub(in crate::exec::runtime_filter) fn contains_non_null_value(
-        &self,
-        array: &ArrayRef,
-        row: usize,
-    ) -> Result<bool, crate::runtime::fragment::ExecutionFailure> {
-        if array.is_null(row) {
-            return Ok(false);
-        }
-        self.values.contains(array, row)
-    }
-
     pub fn filter_chunk_with_array(
         &self,
         array: &ArrayRef,
@@ -1289,7 +1278,7 @@ impl RuntimeInFilter {
         }
         let mask = BooleanArray::from(keep);
         let filtered_batch =
-            filter_record_batch(&chunk.record_batch(), &mask).map_err(|source| {
+            filter_record_batch(chunk.record_batch(), &mask).map_err(|source| {
                 crate::exec::runtime_filter::failure::arrow("filter batch", source)
             })?;
         Ok(Some(Chunk::new_like(filtered_batch, &chunk)))

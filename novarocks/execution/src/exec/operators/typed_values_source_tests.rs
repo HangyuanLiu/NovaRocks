@@ -18,7 +18,7 @@ use super::*;
 use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionFailureCause, PipelineOperation};
 use crate::runtime::mem_tracker::MemTracker;
-use arrow::array::{Array, StringArray};
+use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use novarocks_local_program::StaticLayout;

@@ -81,9 +81,11 @@ mod tests {
             assert_eq!(merged.estimate().unwrap(), 2);
             let payload = merged.serialize().unwrap();
             assert_eq!(payload[6], 2);
-            let mut coupons: Vec<_> = payload[8..16]
-                .chunks_exact(4)
-                .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            let (coupon_bytes, remainder) = payload[8..16].as_chunks::<4>();
+            assert!(remainder.is_empty());
+            let mut coupons: Vec<_> = coupon_bytes
+                .iter()
+                .map(|bytes| u32::from_le_bytes(*bytes))
                 .collect();
             coupons.sort_unstable();
             assert_eq!(coupons, vec![0x0695_86f8, 0x1cf5_9c3d]);

@@ -16,9 +16,11 @@
 // under the License.
 
 //! The single neutral Arrow representation body is shared with pure authors.
+#[cfg(test)]
+pub use novarocks_functions::array_projection::rebuild_array_mode;
 pub use novarocks_functions::array_projection::{
     ArrayNormalizationStep, ArrayPathStep, execution_field_is_normalized,
     execution_field_is_normalized_observed, normalize_execution_array,
-    normalize_execution_array_observed, normalize_execution_field_observed, rebuild_array_mode,
+    normalize_execution_array_observed, normalize_execution_field_observed,
     rebuild_array_mode_with_decoded, rebuild_field,
 };

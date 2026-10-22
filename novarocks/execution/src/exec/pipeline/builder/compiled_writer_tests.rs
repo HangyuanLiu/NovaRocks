@@ -990,7 +990,8 @@ fn a_null_into_a_not_null_provider_field_is_refused_before_any_page_is_written()
     let recorded = Arc::new(Mutex::new(Recorded::default()));
     let error = run_insert(&insert, 1, &recorded).expect_err("the NULL row is refused");
     assert!(
-        error.contains("Column 'c1' is declared as non-nullable but contains null values"),
+        error.contains("Column 'c1'")
+            && error.contains("is declared as non-nullable but contains null values"),
         "{error}"
     );
     assert!(
@@ -1099,8 +1100,7 @@ mod statistics {
     use novarocks_spi::connector::write_stack::{
         ROOT_WRITE_RESULT_BLOB_TYPE_INDEX, ROOT_WRITE_RESULT_BODY_INDEX,
         ROOT_WRITE_RESULT_INPUT_FIELDS_INDEX, ROOT_WRITE_RESULT_PROPERTIES_INDEX,
-        ROOT_WRITE_RESULT_TARGET_INDEX, WriterAuxiliaryChannel, WriterMultiplexSchema,
-        WriterRowKind, root_write_result_column_id,
+        WriterAuxiliaryChannel, WriterMultiplexSchema, WriterRowKind,
     };
     use novarocks_type_contract::{
         CallProofScope, DecimalOverflowPolicy, EvaluationDemand, ExpressionEffects,
@@ -1927,7 +1927,6 @@ mod statistics {
     struct Compiled {
         writer: Arc<LocalProgram>,
         finish: Arc<LocalProgram>,
-        target: WriteTargetOrdinal,
         receiver: NodeId,
     }
 
@@ -2004,7 +2003,6 @@ mod statistics {
         Compiled {
             writer: compile(FragmentId::new(1), writer_dop, false),
             finish: compile(FragmentId::new(2), 1, true),
-            target: ordinal,
             receiver,
         }
     }
@@ -2586,7 +2584,7 @@ mod statistics {
                             .collect::<Vec<_>>(),
                     );
                     let batch =
-                        arrow::compute::filter_record_batch(&chunk.record_batch(), &mask).unwrap();
+                        arrow::compute::filter_record_batch(chunk.record_batch(), &mask).unwrap();
                     Chunk::try_new_with_chunk_schema(batch, chunk.chunk_schema_ref()).unwrap()
                 })
                 .filter(|chunk| !chunk.is_empty())
@@ -2823,7 +2821,7 @@ mod statistics {
                             .collect::<Vec<_>>(),
                     );
                     let batch =
-                        arrow::compute::filter_record_batch(&chunk.record_batch(), &mask).unwrap();
+                        arrow::compute::filter_record_batch(chunk.record_batch(), &mask).unwrap();
                     (batch.num_rows() > 0).then_some(batch)
                 })
                 .collect::<Vec<_>>()

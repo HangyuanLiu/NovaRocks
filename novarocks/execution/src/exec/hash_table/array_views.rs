@@ -22,7 +22,6 @@ use arrow::datatypes::DataType;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AggregateViewFailure {
-    InputContract(novarocks_failure_contract::BoundedDetail),
     PhysicalWrapper {
         expected: &'static str,
     },
@@ -34,7 +33,6 @@ pub enum AggregateViewFailure {
 impl std::fmt::Display for AggregateViewFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InputContract(detail) => detail.fmt(f),
             Self::PhysicalWrapper { expected } => write!(f, "failed to downcast to {expected}"),
             Self::Unsupported { view, actual } => {
                 write!(f, "unsupported {view} input type: {actual}")
@@ -46,9 +44,6 @@ impl std::error::Error for AggregateViewFailure {}
 impl novarocks_failure_contract::FailureProjection for AggregateViewFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         let reason = match self {
-            Self::InputContract(_) => {
-                crate::runtime::fragment::ExecutionReason::AggregateInputContract
-            }
             Self::PhysicalWrapper { .. } => {
                 crate::runtime::fragment::ExecutionReason::AggregateViewWrapper
             }
@@ -66,14 +61,6 @@ impl From<AggregateViewFailure> for crate::runtime::fragment::ExecutionFailure {
     fn from(source: AggregateViewFailure) -> Self {
         Self::from_domain(source)
     }
-}
-
-pub(crate) fn aggregate_input_contract(
-    detail: impl std::fmt::Display,
-) -> crate::runtime::fragment::ExecutionFailure {
-    crate::runtime::fragment::ExecutionFailure::from_domain(AggregateViewFailure::InputContract(
-        novarocks_failure_contract::BoundedDetail::truncating_display(detail),
-    ))
 }
 
 #[derive(Clone, Debug)]

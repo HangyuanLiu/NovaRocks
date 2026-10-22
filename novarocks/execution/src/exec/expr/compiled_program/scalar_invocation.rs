@@ -73,12 +73,14 @@ pub(super) enum CallInstance {
     Invocation(InvocationScalarEvaluationInstance),
 }
 impl CallInstance {
+    #[cfg(test)]
     pub(super) fn contract(&self) -> &ScalarCallContract {
         match self {
             Self::Kernel(instance) => instance.contract(),
             Self::Invocation(instance) => instance.contract(),
         }
     }
+
     pub(super) fn evaluate<'a>(
         &mut self,
         selection: Selection<'a>,

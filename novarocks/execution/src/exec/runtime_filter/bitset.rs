@@ -64,10 +64,6 @@ pub struct RuntimeBitsetFilter {
     reason = "Bitset inspection helpers are retained for runtime-filter codec compatibility."
 )]
 impl RuntimeBitsetFilter {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The compact bitset filter is decoded directly from its wire representation."
-    )]
     pub(in crate::exec::runtime_filter) fn new(
         filter_id: i32,
         slot_id: SlotId,
@@ -220,7 +216,7 @@ impl RuntimeBitsetFilter {
         }
         let mask = BooleanArray::from(keep);
         let filtered_batch =
-            filter_record_batch(&chunk.record_batch(), &mask).map_err(|source| {
+            filter_record_batch(chunk.record_batch(), &mask).map_err(|source| {
                 crate::exec::runtime_filter::failure::arrow("filter batch", source)
             })?;
         Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
@@ -254,7 +250,7 @@ impl RuntimeBitsetFilter {
         }
         let mask = BooleanArray::from(keep);
         let filtered_batch =
-            filter_record_batch(&chunk.record_batch(), &mask).map_err(|source| {
+            filter_record_batch(chunk.record_batch(), &mask).map_err(|source| {
                 crate::exec::runtime_filter::failure::arrow("filter batch", source)
             })?;
         Ok(Some(Chunk::new_like(filtered_batch, &chunk)))

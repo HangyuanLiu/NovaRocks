@@ -166,10 +166,6 @@ impl NativeRuntimeFilterProducerFactory {
         })
     }
 
-    pub(crate) fn binding_count(&self) -> usize {
-        self.bindings.len()
-    }
-
     #[cfg(test)]
     pub(crate) fn for_test(
         session: execution::RuntimeFilterSessionRef,

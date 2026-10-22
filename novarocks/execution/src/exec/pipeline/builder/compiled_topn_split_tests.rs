@@ -38,8 +38,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow::array::{Array, Int64Array};
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_local_compiler::{
     LocalCompileOptions, compile_fragment, validate_fragment_providers,
@@ -62,14 +60,14 @@ use novarocks_type_contract::{
 use novarocks_types::UniqueId;
 
 use super::family_fixture::{FixtureControl, cell, constant_policy, int64, values};
-use crate::exec::chunk::{Chunk, ChunkSchema};
+use crate::exec::chunk::Chunk;
 use crate::exec::fragment::program::FragmentNodeId;
 use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
 use crate::exec::pipeline::binding::ExchangeBindings;
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use crate::runtime::exchange::{decode_chunks, encode_chunks};
+use crate::runtime::exchange::decode_chunks;
 use crate::runtime::fragment::exchange::{
     CompiledExchangeReceivers, materialize_compiled_exchange_receivers,
 };

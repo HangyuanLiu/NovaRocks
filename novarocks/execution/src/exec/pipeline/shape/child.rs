@@ -20,9 +20,8 @@
 //! A refused derived input stays here unchanged; an accepted input is never
 //! offered again. Data completion does not retire the child's lifecycle owner.
 
-use super::{ControlStep, StepOperator};
+use super::ControlStep;
 use crate::exec::chunk::Chunk;
-use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::exec::pipeline::{
     input::{RawInput, derived_raw_input},
     operator::{ExitFailure, ExitObservation, ExitProgress, FinishWatch, Operator},
@@ -137,12 +136,6 @@ impl ChildStep {
             close_started: false,
             exit_started: false,
         }
-    }
-    pub(crate) fn name(&self) -> &str {
-        self.operator.name()
-    }
-    pub(crate) fn control_observable(&self) -> Option<Arc<Observable>> {
-        self.operator.control_observable()
     }
     pub(crate) fn prepare(&mut self) -> ExecutionResult<()> {
         self.operator.prepare()?;
@@ -650,6 +643,7 @@ impl DerefMut for ChildStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::pipeline::operator::OperatorLifecycle;
     use crate::exec::pipeline::shape::fanout::test_support::{Probe, context, sink, typed_i32};
     use std::sync::atomic::Ordering;
 
@@ -1144,7 +1138,7 @@ mod tests {
             }
         }
         struct Secondary {
-            data: Arc<Data>,
+            _data: Arc<Data>,
             drops: Arc<AtomicUsize>,
         }
         impl Drop for Secondary {
@@ -1164,7 +1158,7 @@ mod tests {
                 let data = unsafe { std::mem::ManuallyDrop::take(&mut self.data) };
                 if self.opaque {
                     std::panic::panic_any(Secondary {
-                        data,
+                        _data: data,
                         drops: self.secondary.clone(),
                     });
                 }

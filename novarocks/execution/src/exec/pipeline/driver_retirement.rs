@@ -247,15 +247,15 @@ impl EdgeRetirement {
 }
 
 pub(crate) struct RetainedDriverOwners {
-    pub process_panic: ProcessPanicCustody,
-    pub operators: Vec<OperatorInstance>,
-    pub edges: Vec<EdgeRetirement>,
-    pub edge_inputs: Vec<Option<RawInput>>,
-    pub upstream_grant: Option<(usize, RootInputPermit)>,
-    pub runtime: Arc<RuntimeState>,
-    pub query_memory: Option<QueryMemoryBinding>,
-    pub edge_trackers: Vec<Option<Arc<MemTracker>>>,
-    pub event_sink: Arc<dyn FragmentEventSink>,
+    pub _process_panic: ProcessPanicCustody,
+    pub _operators: Vec<OperatorInstance>,
+    pub _edges: Vec<EdgeRetirement>,
+    pub _edge_inputs: Vec<Option<RawInput>>,
+    pub _upstream_grant: Option<(usize, RootInputPermit)>,
+    pub _runtime: Arc<RuntimeState>,
+    pub _query_memory: Option<QueryMemoryBinding>,
+    pub _edge_trackers: Vec<Option<Arc<MemTracker>>>,
+    pub _event_sink: Arc<dyn FragmentEventSink>,
 }
 /// One original driver has exactly one slot. Only an unresolved Drop retains
 /// its own slot; there is no process-global list or unbounded parking service.

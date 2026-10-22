@@ -133,7 +133,6 @@ impl ChunkSchema {
                 .ok_or_else(|| {
                     E::from(MetadataMaterializationError::MissingOriginalFieldOrigin)
                 })??;
-            drop(repeated);
             allocation(allocations, arc_request::<Field, E>()?, 3)?;
             result.field_clone_requests_bytes = add::<E>(
                 result.field_clone_requests_bytes,
@@ -174,7 +173,6 @@ impl ChunkSchema {
                                         MetadataMaterializationError::MissingOriginalFieldOrigin,
                                     )
                                 })?;
-                            drop(repeated);
                             allocation(allocations, arc_request::<Field, E>()?, 3)?;
                             result.nested_field_occurrences =
                                 add::<E>(result.nested_field_occurrences, 1)?;
@@ -234,7 +232,6 @@ impl ChunkSchema {
             roots,
             &mut Some(&mut repeated),
         )?;
-        drop(repeated);
         result.sidecar_requests_bytes = times::<E>(sidecar.coexistence_request_bytes, 2)?;
         result.sidecar_requests_bytes = add::<E>(
             result.sidecar_requests_bytes,

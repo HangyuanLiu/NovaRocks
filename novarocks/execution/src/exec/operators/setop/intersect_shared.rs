@@ -28,7 +28,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use super::distinct_set_shared::{DistinctSetSemantics, DistinctSetSharedState};
+use super::distinct_set_shared::DistinctSetSemantics;
 
 #[derive(Clone)]
 pub struct IntersectSemantics;
@@ -56,8 +56,6 @@ impl DistinctSetSemantics for IntersectSemantics {
         *marker == stage_total.saturating_sub(1)
     }
 }
-
-pub(crate) type IntersectSharedState = DistinctSetSharedState<IntersectSemantics>;
 
 #[cfg(test)]
 mod stage_marker_tests {

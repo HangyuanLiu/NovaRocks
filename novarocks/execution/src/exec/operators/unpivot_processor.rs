@@ -106,10 +106,6 @@ use novarocks_types::SlotId;
 /// constructor must return a fully typed immutable Chunk and retain its own
 /// actual creation/source ownership; this function adds no declaration author
 /// or fallback. Each IPC/logical-size measurement has independent temp scopes.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Independent expansion limits, tracker and actual construction/control remain explicit."
-)]
 pub(crate) fn next_bounded_output_with_construction(
     remaining: usize,
     max_output_rows: usize,
@@ -145,10 +141,6 @@ pub(crate) fn next_bounded_output_with_construction(
     )
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "One shared search separates construction, admission and measurement owners."
-)]
 fn next_bounded_output_core<E>(
     remaining: usize,
     max_output_rows: usize,
@@ -238,12 +230,6 @@ pub(crate) struct Segment {
     pub(crate) mapping_index: usize,
     pub(crate) input_offset: usize,
     pub(crate) len: usize,
-}
-
-pub(crate) fn flattened_segments(start: usize, len: usize, input_rows: usize) -> Vec<Segment> {
-    let mut segments = Vec::new();
-    visit_flattened_segments(start, len, input_rows, |segment| segments.push(segment));
-    segments
 }
 
 pub(crate) fn visit_flattened_segments(
@@ -391,7 +377,7 @@ pub(crate) fn unpivot_copy_failure(
     >,
 ) -> crate::runtime::fragment::ExecutionFailure {
     use crate::exec::pipeline::operator::input_construction::ConstructionFailure;
-    use novarocks_functions::selected_copy::{CopyConstructionError, CopyError};
+    use novarocks_functions::selected_copy::CopyConstructionError;
     match failure {
         CopyConstructionError::Creator(cause) => cause.into(),
         CopyConstructionError::Resource(cause) => ConstructionFailure::Resource(cause).into(),

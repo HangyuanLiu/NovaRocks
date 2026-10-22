@@ -88,10 +88,11 @@ fn sql_dependency_artifact_storage_actual_data_charge_and_release_match_request(
     let scope = work.owner.scope();
     let resources = owner.resources().expect("test workload resource authority");
     let mut buffer = AdmittedCaptureBytes::try_new(&resources, &scope, 4096).unwrap();
-    assert_eq!(buffer.capacity(), 4096);
+    let bytes = buffer.write_zeroed();
+    assert_eq!(bytes.len(), 4096);
     assert_eq!(resources.snapshot().data_reserved_bytes, 0);
     assert_eq!(resources.snapshot().data_used_bytes, 4096);
-    buffer.write_zeroed()[2048] = 7;
+    bytes[2048] = 7;
     assert_eq!(buffer.as_slice()[2048], 7);
     drop(buffer);
     assert_eq!(resources.snapshot().data_used_bytes, 0);
@@ -167,12 +168,26 @@ fn sql_dependency_artifact_storage_distinct_tokens_and_create_new_preserve_origi
     let mut first = factory
         .begin(token(13), &[0x71; 32], &work.owner.scope())
         .unwrap();
+    assert_eq!(first.bytes_written(), 64);
+    let (loan_authority, loan_scope) = first.resource_loan();
+    let data_used_before_loan = loan_authority.snapshot().data_used_bytes;
+    let loan_bytes = AdmittedCaptureBytes::try_new(loan_authority, loan_scope, 32).unwrap();
+    assert_eq!(
+        loan_authority.snapshot().data_used_bytes,
+        data_used_before_loan + 32
+    );
+    drop(loan_bytes);
+    assert_eq!(
+        loan_authority.snapshot().data_used_bytes,
+        data_used_before_loan
+    );
     first
         .write_record(2, 9, 3, |bytes| -> Result<(), ()> {
             bytes.copy_from_slice(b"abc");
             Ok(())
         })
         .unwrap();
+    assert_eq!(first.bytes_written(), 84);
     first.finish_storage().unwrap();
     let original = std::fs::read(dir.file(13)).unwrap();
     assert_eq!(&original[..8], b"NRDEPS01");

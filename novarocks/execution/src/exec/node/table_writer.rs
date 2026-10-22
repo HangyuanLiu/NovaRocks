@@ -115,8 +115,8 @@ impl std::fmt::Display for WriterRequiredValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "build table writer projected batch: Invalid argument error: Column '{}' is declared as non-nullable but contains null values",
-            self.field
+            "build table writer projected batch: Invalid argument error: Column '{}' (column={}, row={:?}) is declared as non-nullable but contains null values",
+            self.field, self.column, self.row
         )
     }
 }
@@ -155,6 +155,8 @@ mod required_value_source_properties {
         let source = source.downcast_ref::<WriterRequiredValue>().unwrap();
         assert_eq!(source.column, 0);
         assert_eq!(source.row, Some(1));
+        assert!(failure.detail().contains("column=0"));
+        assert!(failure.detail().contains("row=Some(1)"));
         drop(column);
         drop(schema);
         drop(field);
@@ -222,7 +224,7 @@ impl TableWriterRuntimeBinding {
 
 #[cfg(test)]
 mod runtime_projection_tests {
-    use super::*;
+
     use crate::exec::chunk::Chunk;
     use crate::exec::pipeline::operator::ConstructionFailure;
     use crate::runtime::fragment::ExecutionFailure;

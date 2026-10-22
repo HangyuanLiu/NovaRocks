@@ -160,8 +160,8 @@ impl Phase {
 }
 
 enum Work {
-    Prepared(ManuallyDrop<DriverTask>),
-    Retiring(Retirement),
+    Prepared(Box<ManuallyDrop<DriverTask>>),
+    Retiring(Box<Retirement>),
     Transferred,
 }
 struct Slot {
@@ -177,7 +177,7 @@ impl Slot {
     fn new(task: DriverTask) -> Self {
         let activation = task.completion.clone();
         Self {
-            work: Work::Prepared(ManuallyDrop::new(task)),
+            work: Work::Prepared(Box::new(ManuallyDrop::new(task))),
             attachment: Phase::new(),
             activation: Some(ManuallyDrop::new(activation)),
             activation_held: false,
@@ -211,7 +211,7 @@ pub(crate) struct DriverBatch {
     inner: Arc<BatchOwner>,
     drop_drain: bool,
 }
-struct BatchOwner {
+pub(super) struct BatchOwner {
     state: Mutex<State>,
     pin: Mutex<Option<Arc<Self>>>,
     count: usize,
@@ -320,9 +320,7 @@ impl DriverBatch {
             }
             phase
         };
-        let Some(mut phase) = phase else {
-            return None;
-        };
+        let mut phase = phase?;
         let result = phase.run(control, 615 + ordinal as u16, action);
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         state.metadata_unknown |= phase.unknown;
@@ -349,6 +347,7 @@ impl DriverBatch {
         drop(state);
         self.inner.release_if_finished();
     }
+    #[cfg(not(test))]
     pub(crate) fn record_invariant(&self, control: &RuntimeErrorState) {
         self.inner.pin();
         let mut phase = {
@@ -456,7 +455,7 @@ impl DriverBatch {
                 else {
                     unreachable!("matched original prepared slot")
                 };
-                let mut task = ManuallyDrop::into_inner(task);
+                let mut task = ManuallyDrop::into_inner(*task);
                 task.lease = Some(ExecutorTaskLease::acquire(shared));
                 task.mark_queued();
                 queue.push_back(task);
@@ -570,10 +569,10 @@ impl BatchOwner {
             let Work::Prepared(task) = std::mem::replace(&mut slot.work, Work::Transferred) else {
                 unreachable!("matched original prepared slot")
             };
-            slot.work = Work::Retiring(Retirement::new(
-                ManuallyDrop::into_inner(task),
+            slot.work = Work::Retiring(Box::new(Retirement::new(
+                ManuallyDrop::into_inner(*task),
                 shutdown_failure,
-            ));
+            )));
         }
         let Work::Retiring(retirement) = &mut slot.work else {
             return Poll::Exited;
@@ -777,12 +776,9 @@ impl Retirement {
             let needs_failure = self.shutdown_failure && !control.is_stopped();
             // The original source is stored before cloning it for the one
             // accepted owner. A rejected candidate cannot destroy it inline.
-            let proposal = self
-                .proposal
-                .as_ref()
-                .map(|cause| ExecutionFailure::clone(cause));
+            let proposal = self.proposal.as_deref().cloned();
             let reason = if proposal.is_some() { 632 } else { 620 };
-            self.phases[0].run(&control, reason, || {
+            self.phases[0].run(control, reason, || {
                 if let Some(proposal) = proposal {
                     context.set_final_status(proposal);
                 } else if needs_failure {
@@ -793,11 +789,11 @@ impl Retirement {
             });
         }
         if let Some(proposal) = self.proposal.take() {
-            self.phases[11].run(&control, 633, || drop(ManuallyDrop::into_inner(proposal)));
+            self.phases[11].run(control, 633, || drop(ManuallyDrop::into_inner(proposal)));
         }
         if !self.phases[1].started {
             let driver = self.driver.as_mut().expect("original driver");
-            self.phases[1].run(&control, 621, || {
+            self.phases[1].run(control, 621, || {
                 driver.cancel_for_fragment_abort();
             });
         }
@@ -807,7 +803,7 @@ impl Retirement {
         }
         if self.driver.is_some() {
             let driver = self.driver.as_mut().expect("original driver");
-            match self.phases[2].run(&control, 622, || driver.has_pending_finish()) {
+            match self.phases[2].run(control, 622, || driver.has_pending_finish()) {
                 Some(true) => {
                     self.phases[2].reset_observation();
                     return Poll::Pending;
@@ -819,17 +815,17 @@ impl Retirement {
                 }
             }
             let driver = self.driver.take().expect("one actual driver destructor");
-            self.phases[3].run(&control, 623, || drop(ManuallyDrop::into_inner(driver)));
+            self.phases[3].run(control, 623, || drop(ManuallyDrop::into_inner(driver)));
         }
         if self.phases[3].unknown {
             self.unresolved = true;
             return Poll::Unresolved;
         }
-        match self.phases[10].run(&control, 631, || !self.custody.has_retained_work()) {
+        match self.phases[10].run(control, 631, || !self.custody.has_retained_work()) {
             Some(true) => {}
             Some(false) => {
                 self.phases[10].unknown = true;
-                self.phases[10].report(&control, 631);
+                self.phases[10].report(control, 631);
                 self.unresolved = true;
                 return Poll::Unresolved;
             }
@@ -839,7 +835,7 @@ impl Retirement {
             }
         }
         if let Some(context) = self.context.take() {
-            self.phases[4].run(&control, 624, || drop(ManuallyDrop::into_inner(context)));
+            self.phases[4].run(control, 624, || drop(ManuallyDrop::into_inner(context)));
         }
         if self.phases[4].unknown {
             self.unresolved = true;
@@ -852,7 +848,7 @@ impl Retirement {
             return Poll::Unresolved;
         }
         if let Some(lease) = self.lease.take() {
-            self.phases[5].run(&control, 625, || drop(ManuallyDrop::into_inner(lease)));
+            self.phases[5].run(control, 625, || drop(ManuallyDrop::into_inner(lease)));
         }
         if self.phases[5].unknown {
             self.unresolved = true;
@@ -861,7 +857,7 @@ impl Retirement {
         // This is not ordinary Drop: the real driver and its context/lease
         // already returned from their explicit once destructors.
         let completion = self.completion.as_ref().expect("original completion");
-        if let Some(last) = self.phases[6].run(&control, 626, || completion.driver_finished()) {
+        if let Some(last) = self.phases[6].run(control, 626, || completion.driver_finished()) {
             self.last = last;
         }
         if self.phases[6].unknown {
@@ -873,16 +869,16 @@ impl Retirement {
                 .scheduler
                 .as_ref()
                 .expect("original scheduler metadata");
-            self.phases[7].run(&control, 627, || scheduler.shutdown());
+            self.phases[7].run(control, 627, || scheduler.shutdown());
         }
         if let Some(scheduler) = self.scheduler.take() {
-            self.phases[8].run(&control, 628, || drop(ManuallyDrop::into_inner(scheduler)));
+            self.phases[8].run(control, 628, || drop(ManuallyDrop::into_inner(scheduler)));
         }
         let completion = self
             .completion
             .take()
             .expect("original completion metadata");
-        self.phases[9].run(&control, 629, || drop(ManuallyDrop::into_inner(completion)));
+        self.phases[9].run(control, 629, || drop(ManuallyDrop::into_inner(completion)));
         // Last control/source/observer captures are a separate metadata role.
         // Its failure cannot revoke the already frozen actual work receipt.
         let control = self

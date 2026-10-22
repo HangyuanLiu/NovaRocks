@@ -37,7 +37,7 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use novarocks_functions::{
     KernelDiagnostic, KernelEvaluationControl, KernelFailure, MAX_UNOBSERVED_KERNEL_WORK,
-    selected_copy::{self, CopyConstructionError, CopyError},
+    selected_copy::{self, CopyConstructionError},
 };
 use novarocks_local_program::{
     LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
@@ -451,9 +451,6 @@ impl<'a> Work<'a> {
         self.control.checkpoint(self.pending)?;
         self.pending = 0;
         Ok(())
-    }
-    fn observe(&mut self, boundary: bool) -> Result<(), KernelFailure> {
-        if boundary { self.flush() } else { self.step() }
     }
 }
 

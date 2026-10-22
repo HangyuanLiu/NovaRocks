@@ -28,6 +28,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+#[cfg(test)]
 use crate::exec::pipeline::operator::OperatorLifecycle;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 
@@ -445,6 +446,7 @@ impl DriverTask {
         self.completion.should_abort()
     }
 
+    #[cfg(test)]
     pub(crate) fn has_pending_finish(&mut self) -> bool {
         self.driver.has_pending_finish()
     }
@@ -459,6 +461,7 @@ impl DriverTask {
     fn finish_abort_with_failure(self, cause: Option<ExecutionFailure>) -> Option<Self> {
         Retirement::on_worker(self, true, cause)
     }
+    #[cfg(test)]
     pub(crate) fn reject_due_to_executor_shutdown(self) -> Option<Self> {
         Retirement::on_worker_shutdown(self)
     }
@@ -468,9 +471,6 @@ impl DriverTask {
         } else {
             self.finish_due_to_abort()
         }
-    }
-    pub(crate) fn fail(&self, err: impl Into<ExecutionFailure>) {
-        self.fragment_ctx.set_final_status(err.into());
     }
     pub(crate) fn driver_finished(self) {
         if let Some(task) = Retirement::on_worker(self, false, None) {
@@ -600,6 +600,9 @@ impl novarocks_failure_contract::FailureProjection for ExecutorDrainDeadline {
     }
 }
 
+#[cfg(test)]
+type StartActivationGate = Arc<(Mutex<bool>, Condvar)>;
+
 /// Global executor that schedules and runs pipeline driver tasks across worker threads.
 pub struct GlobalDriverExecutor {
     shared: Arc<ExecutorShared>,
@@ -607,7 +610,7 @@ pub struct GlobalDriverExecutor {
     event_dispatcher: EventDispatcher,
     lifecycle: Arc<ExecutorLifecycleOwner>,
     #[cfg(test)]
-    start_activation_gate: Mutex<Option<Arc<(Mutex<bool>, Condvar)>>>,
+    start_activation_gate: Mutex<Option<StartActivationGate>>,
 }
 
 #[cfg(test)]
@@ -1163,8 +1166,7 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
-    use crate::exec::chunk::Chunk;
-    use crate::exec::pipeline::operator::{FinishWatch, Operator};
+    use crate::exec::pipeline::operator::FinishWatch;
     use crate::runtime::runtime_state::RuntimeState;
 
     fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) -> bool {
