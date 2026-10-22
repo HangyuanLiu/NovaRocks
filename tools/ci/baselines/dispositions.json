@@ -2352,16 +2352,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:decimal/test_decimal256_arithmetic_overflow",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Observed on clean f1227548a4a8ca0cfbd000698f9d0e69e54f0395, step 1, substatement 8/12, sha256=139c1941229e1c23207a196eeeae55017c11b1b9a662f9e054a3bb2a4273ec80: Decimal256(39,38) -> Decimal128(38,38) CAST. No failed independent expectation. P00 same-statement detail plus current exact owner predicate identifies the capability; current sanitized message alone is not a recipe trace. Exit: B8 implements Decimal256(39,38) -> Decimal128(38,38) CAST; the original entire decimal/test_decimal256_arithmetic_overflow native case passes with all required oracles, then remove this disposition. Unreached suffixes remain unverified until that run. Re-observed same exact statement and actual code on clean fffbffe8; no executed independent oracle failed and no secondary cleanup failure observed.",
-      "owner": "B8 scalar remainder and statement-environment capability",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:decimal/test_decimal256_complex_types",
       "failure": {
         "class": "error_code",
@@ -2379,16 +2369,6 @@
       },
       "reason": "Decimal128(38,15) native IN-list source outside installed signed integer/Utf8 profile. Actual clean fffbffe8 step13; no executed independent oracle failed. B8 restores the original Decimal128 native IN-list profile, coordinating F3 helper ownership, then this entire unchanged case passes all original result/expected-error oracles; review any new first failure independently.",
       "owner": "B8",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:decimal/test_decimal256_string_functions",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Observed on clean f1227548a4a8ca0cfbd000698f9d0e69e54f0395, step 5, substatement 1/1, sha256=b09b9e5c9c7d5d63ad45c6fd33915e8c99d10538da77cc83d2979835cb7845ed: Decimal128(38,20) -> Decimal256(39,20) CAST. No failed independent expectation. P00 same-statement detail plus current exact owner predicate identifies the capability; current sanitized message alone is not a recipe trace. Exit: B8 implements Decimal128(38,20) -> Decimal256(39,20) CAST; the original entire decimal/test_decimal256_string_functions native case passes with all required oracles, then remove this disposition. Unreached suffixes remain unverified until that run. Re-observed same exact statement and actual code on clean fffbffe8; no executed independent oracle failed and no secondary cleanup failure observed.",
-      "owner": "B8 scalar remainder and statement-environment capability",
       "expires": "2026-12-15"
     },
     {
@@ -2419,16 +2399,6 @@
       },
       "reason": "builtin.scalar/array_sum/dynamic-v1 missing installed pure implementation. Actual clean fffbffe8 step29; no executed independent oracle failed. B7 installs the original array_sum pure owner/effect/carrier contract, then the entire unchanged case passes all original result/numeric expected-error oracles; admission alone does not close this record.",
       "owner": "B7",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:decimal/test_read_write_decimal256",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Observed on clean f1227548a4a8ca0cfbd000698f9d0e69e54f0395, step 1, substatement 18/387, sha256=eab9ab054bec085f0b5b148384c33cd1efd8ebbd52193663420535355d209136: Decimal256(39,38) -> Decimal128(38,38) CAST. No failed independent expectation. P00 same-statement detail plus current exact owner predicate identifies the capability; current sanitized message alone is not a recipe trace. Exit: B8 implements Decimal256(39,38) -> Decimal128(38,38) CAST; the original entire decimal/test_read_write_decimal256 native case passes with all required oracles, then remove this disposition. Unreached suffixes remain unverified until that run. Re-observed same exact statement and actual code on clean fffbffe8; no executed independent oracle failed and no secondary cleanup failure observed.",
-      "owner": "B8 scalar remainder and statement-environment capability",
       "expires": "2026-12-15"
     },
     {
