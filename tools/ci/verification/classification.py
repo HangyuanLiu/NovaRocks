@@ -16,6 +16,7 @@
 # under the License.
 """Single-invocation SQL classification from native facts, never terminal text."""
 import argparse
+from collections.abc import Mapping
 import datetime
 import json
 from pathlib import Path
@@ -48,7 +49,9 @@ def classify(path, dispositions=None, admission_membership=False):
     assertion_failures = {}
     independent_assertions = {}
     for observation in observations:
-        failed = [value for value in observation.detail.get('oracle', {}).get('executed', [])
+        oracle = observation.detail.get('oracle')
+        executed = oracle.get('executed', []) if isinstance(oracle, Mapping) else []
+        failed = [value for value in executed
                   if value.get('outcome') == 'fail']
         if failed:
             key = (str(observation.unit), observation.lifecycle, observation.ref)
