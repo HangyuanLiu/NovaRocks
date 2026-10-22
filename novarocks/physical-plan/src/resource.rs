@@ -421,17 +421,21 @@ fn fragment_cut_usage_core<P: TypeValidationPolicy>(
             break;
         }
         usage.add_items(cut.imports.len());
-        if let Some(writer) = &cut.change_stream_writer {
-            usage.add_items(writer.fields.len());
-        }
-        if let Some(writer) = &cut.writer_result {
-            add_writer_result_cut_usage_core(
-                writer,
-                &format!("{prefix}.inbound[{index}].writer_result"),
-                &mut usage,
-                errors,
-                policy,
-            )?;
+        match &cut.payload {
+            crate::ExchangePayloadContract::Relational => {}
+            crate::ExchangePayloadContract::ProviderRoute(writer) => {
+                usage.add_items(writer.fields.len())
+            }
+            crate::ExchangePayloadContract::WriterResults(writer) => {
+                add_writer_result_cut_usage_core(
+                    writer,
+                    &format!("{prefix}.inbound[{index}].writer_result"),
+                    &mut usage,
+                    errors,
+                    policy,
+                )?
+            }
+            crate::ExchangePayloadContract::LogicalSummary(_) => usage.add_items(6),
         }
         add_distribution_usage(&cut.partitioning.source, &mut usage);
         add_distribution_usage(&cut.partitioning.destination, &mut usage);
@@ -453,17 +457,21 @@ fn fragment_cut_usage_core<P: TypeValidationPolicy>(
             break;
         }
         usage.add_item_counts([cut.projection.len(), cut.destination_imports.len()]);
-        if let Some(writer) = &cut.change_stream_writer {
-            usage.add_items(writer.fields.len());
-        }
-        if let Some(writer) = &cut.writer_result {
-            add_writer_result_cut_usage_core(
-                writer,
-                &format!("{prefix}.outbound[{index}].writer_result"),
-                &mut usage,
-                errors,
-                policy,
-            )?;
+        match &cut.payload {
+            crate::ExchangePayloadContract::Relational => {}
+            crate::ExchangePayloadContract::ProviderRoute(writer) => {
+                usage.add_items(writer.fields.len())
+            }
+            crate::ExchangePayloadContract::WriterResults(writer) => {
+                add_writer_result_cut_usage_core(
+                    writer,
+                    &format!("{prefix}.outbound[{index}].writer_result"),
+                    &mut usage,
+                    errors,
+                    policy,
+                )?
+            }
+            crate::ExchangePayloadContract::LogicalSummary(_) => usage.add_items(6),
         }
         add_distribution_usage(&cut.partitioning.source, &mut usage);
         add_distribution_usage(&cut.partitioning.destination, &mut usage);
@@ -857,6 +865,12 @@ fn fragment_usage_core<P: TypeValidationPolicy>(
         fragment.nodes().len(),
         fragment.runtime_filters().len(),
     ]);
+    if let crate::StagePlacementPolicy::FollowSources { sources } = fragment.stage_placement() {
+        usage.add_item_counts([sources.len()]);
+        usage.add_byte_counts([sources
+            .len()
+            .saturating_mul(std::mem::size_of::<crate::FragmentId>())]);
+    }
     // Mandatory request type validation remains the original Plain author.
     add_call_request_table_usage(fragment.call_requests(), &mut usage, errors);
     for (id, value) in fragment.values() {
@@ -1285,8 +1299,16 @@ fn add_node_usage_core<P: TypeValidationPolicy>(
                 keys,
                 labels,
                 message,
+                applicability,
             } => {
-                usage.add_item_counts([keys.len(), labels.len()]);
+                usage.add_item_counts([
+                    keys.len(),
+                    labels.len(),
+                    usize::from(matches!(
+                        applicability,
+                        crate::AssertionApplicability::WhenTrue(_)
+                    )),
+                ]);
                 usage.add_bytes(message.len());
                 for label in labels {
                     if usage.exhausted() {
@@ -1371,6 +1393,7 @@ fn add_writer_finish_usage_core<P: TypeValidationPolicy>(
     usage.add_item_counts([
         spec.expected_target_ordinals.len(),
         spec.final_aggregates.len(),
+        if spec.logical_summary.is_some() { 3 } else { 0 },
     ]);
     add_writer_schema_usage_core(
         &spec.input_schema,
@@ -1519,6 +1542,7 @@ fn add_sink_usage(sink: &FragmentSink, usage: &mut ResourceUsage) {
     match sink {
         FragmentSink::Multicast { edges } => usage.add_items(edges.len()),
         FragmentSink::Router { routes, .. } => {
+            usage.add_items(3);
             usage.add_items(routes.len());
             for route in routes {
                 if usage.exhausted() {
@@ -1527,7 +1551,8 @@ fn add_sink_usage(sink: &FragmentSink, usage: &mut ResourceUsage) {
                 usage.add_item_counts([
                     route.accepted_effects.len(),
                     route.input_mapping.len(),
-                    route.partition_by.len(),
+                    route.requirements.colocation_keys().len(),
+                    route.requirements.layout_keys().len(),
                 ]);
             }
         }
@@ -1677,11 +1702,7 @@ fn add_distribution_usage(distribution: &crate::Distribution, usage: &mut Resour
 }
 
 fn distribution_items(distribution: &crate::Distribution) -> usize {
-    match distribution {
-        crate::Distribution::Hash { keys, .. }
-        | crate::Distribution::BucketShuffle { keys, .. } => keys.len(),
-        _ => 0,
-    }
+    distribution.value_references().count()
 }
 
 // The same type laws have two storage/observation policies. ResourceUsage

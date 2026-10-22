@@ -511,6 +511,13 @@ impl DmlFinalWritePlanContext {
 }
 
 impl DmlWritePlanInput {
+    /// Preserve the admitted application's logical affected-row owner.
+    /// The physical writer's row and artifact checks still apply.
+    pub fn with_external_count_owner(mut self) -> Self {
+        self.0.finish_count_mode = novarocks_physical_plan::FinishCountMode::ExternalOwner;
+        self
+    }
+
     /// What the provider calls each field this target accepts, by the token it
     /// issued for it.
     ///
@@ -566,6 +573,7 @@ impl DmlWritePlanInput {
             crate::planner::distributed::write::contract::SqlWritePlanInput {
                 contract: SqlWriteSinkContract::try_new(mode.into(), target, input_columns)?,
                 input,
+                finish_count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
                 root_output_exprs: None,
             },
         ))
@@ -1115,6 +1123,7 @@ pub struct DmlChangeStreamRoute {
     /// output occurrence. SQL validates these ordinals against the completed
     /// producer; it never recovers them from display names.
     pub input_ordinals: Vec<novarocks_spi::connector::ConnectorMutationRouteInput>,
+    pub requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements,
     pub partition_input_tokens: Vec<novarocks_spi::connector::ConnectorWriteFieldToken>,
     pub sink: DmlWritePlanInput,
 }
@@ -1147,6 +1156,10 @@ pub enum DmlChangeStreamKind {
 /// connector fencing remain application-owned.
 #[derive(Clone, Debug)]
 pub struct DmlPreExpandKeyedAssert {
+    /// Exact output occurrence in the native ChangeEventExpand child.
+    /// None explicitly preserves the existing all-row assertion.
+    /// Some names an already materialized Boolean; SQL never reevaluates it.
+    pub applicability_output_ordinal: Option<usize>,
     pub key_column_name: String,
     pub key_label: String,
     pub message_prefix: String,
@@ -1325,6 +1338,7 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
         crate::planner::pipeline::insert_pre_expand_keyed_assert(
             &mut physical,
             &crate::planner::physical::PreExpandKeyedAssertSpec {
+                applicability_output_ordinal: assertion.applicability_output_ordinal,
                 key_column_name: assertion.key_column_name,
                 key_label: assertion.key_label,
                 message_prefix: assertion.message_prefix,
@@ -1573,6 +1587,7 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     let dag = bind_route_layout(&producer.output_columns, routes, effect_output_ordinal)?;
     let keyed_assert = context.pre_expand_keyed_assert.map(|assertion| {
         crate::planner::physical::PreExpandKeyedAssertSpec {
+            applicability_output_ordinal: assertion.applicability_output_ordinal,
             key_column_name: assertion.key_column_name,
             key_label: assertion.key_label,
             message_prefix: assertion.message_prefix,
@@ -1763,6 +1778,7 @@ fn bind_route_layout(
                 write_target_ordinal: route.write_target_ordinal,
                 accepted_effects: route.accepted_effects,
                 input_ordinals: route.input_ordinals,
+                requirements: route.requirements,
                 partition_input_tokens: route.partition_input_tokens,
                 sink: route.sink.0,
             })
@@ -3829,6 +3845,10 @@ mod tests {
 
     fn statistics_route(target: u32) -> DmlChangeStreamRoute {
         DmlChangeStreamRoute {
+            requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             route_id: novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([
                 u8::try_from(target + 1).expect("small target");
                 32

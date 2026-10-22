@@ -185,7 +185,12 @@ fn literal_fragment(
             },
         })
         .unwrap();
-    (builder.finish_definition(node, sink, dop()).unwrap(), value)
+    (
+        builder
+            .finish_definition(node, sink, dop(), crate::StagePlacementPolicy::Singleton)
+            .unwrap(),
+        value,
+    )
 }
 
 fn connector_binding() -> ConnectorReadBinding {
@@ -290,7 +295,12 @@ fn finish_scan_relation_at(
             },
         })
         .unwrap();
-    builder.finish_definition(scan, FragmentSink::Noop, dop())
+    builder.finish_definition(
+        scan,
+        FragmentSink::Noop,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )
 }
 
 #[test]
@@ -407,7 +417,12 @@ fn finish_scan_predicate_contract(
             },
         })
         .unwrap();
-    builder.finish_definition(scan, FragmentSink::Noop, dop())
+    builder.finish_definition(
+        scan,
+        FragmentSink::Noop,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )
 }
 
 #[test]
@@ -540,16 +555,24 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
         })
         .unwrap();
     let destination = destination_builder
-        .finish_definition(result_node, FragmentSink::Result, dop())
+        .finish_definition(
+            result_node,
+            FragmentSink::Result,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_edge(Edge {
+        role: crate::OutputRole::Relational,
+        delivery: crate::DeliveryRequirement::DemandDriven,
         id: edge,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: crate::FragmentOutputPort::Root,
             fragment: FragmentId::new(1),
             projection: Box::from([source_value]),
         },
@@ -650,15 +673,23 @@ fn edge_rejects_a_receiver_that_narrows_nullability_before_plan_publication() {
         })
         .unwrap();
     let destination = destination_builder
-        .finish_definition(destination_node, FragmentSink::Noop, dop())
+        .finish_definition(
+            destination_node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_edge(Edge {
+        role: crate::OutputRole::Relational,
+        delivery: crate::DeliveryRequirement::DemandDriven,
         id: edge,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: crate::FragmentOutputPort::Root,
             fragment: FragmentId::new(1),
             projection: Box::from([source_value]),
         },
@@ -709,15 +740,23 @@ fn edge_accepts_a_receiver_that_admits_null_the_sender_never_writes() {
         })
         .unwrap();
     let destination = destination_builder
-        .finish_definition(destination_node, FragmentSink::Noop, dop())
+        .finish_definition(
+            destination_node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_edge(Edge {
+        role: crate::OutputRole::Relational,
+        delivery: crate::DeliveryRequirement::DemandDriven,
         id: edge,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: crate::FragmentOutputPort::Root,
             fragment: FragmentId::new(1),
             projection: Box::from([source_value]),
         },
@@ -772,15 +811,23 @@ fn broadcast_edge_plan(
         })
         .unwrap();
     let destination = destination_builder
-        .finish_definition(receiver, FragmentSink::Noop, dop())
+        .finish_definition(
+            receiver,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(destination).unwrap();
     plan.add_edge(Edge {
+        role: crate::OutputRole::Relational,
+        delivery: crate::DeliveryRequirement::DemandDriven,
         id: edge,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: crate::FragmentOutputPort::Root,
             fragment: FragmentId::new(3),
             projection: Box::from([source_value]),
         },
@@ -851,7 +898,12 @@ fn broadcast_properties_cannot_claim_single_copy_rows() {
         .unwrap();
 
     let error = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap_err()
         .to_string();
     assert!(error.contains("broadcast physical properties require replicated row multiplicity"));
@@ -894,7 +946,12 @@ fn non_empty_values_require_an_exact_singleton_or_replicated_broadcast_placement
                 },
             })
             .unwrap();
-        builder.finish_definition(node, FragmentSink::Noop, dop())
+        builder.finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
     };
 
     let error = finish(65, unconstrained()).unwrap_err().to_string();
@@ -965,7 +1022,12 @@ fn metadata_relation_retains_its_closed_source_contract() {
                 },
             })
             .unwrap();
-        builder.finish_definition(node, FragmentSink::Noop, dop())
+        builder.finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
     };
     let fragment = build(relation.clone()).unwrap();
     let mut plan = PlanBuilder::new(version());
@@ -1094,7 +1156,12 @@ fn cte_import_is_proven_by_the_exact_multicast_cut() {
         })
         .unwrap();
     let consumer = consumer_builder
-        .finish_definition(receiver, FragmentSink::Noop, dop())
+        .finish_definition(
+            receiver,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut builder = PlanBuilder::new(version());
@@ -1102,9 +1169,12 @@ fn cte_import_is_proven_by_the_exact_multicast_cut() {
     builder.add_fragment(consumer).unwrap();
     builder
         .add_edge(Edge {
+            role: crate::OutputRole::Relational,
+            delivery: crate::DeliveryRequirement::DemandDriven,
             id: edge,
             kind: EdgeKind::CteMulticast,
             source: EdgeSource {
+                port: crate::FragmentOutputPort::Root,
                 fragment: producer_id,
                 projection: Box::from([producer_value]),
             },
@@ -1138,8 +1208,9 @@ fn cte_import_is_proven_by_the_exact_multicast_cut() {
                 destination: Distribution::Unconstrained,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
             },
-            change_stream_writer: None,
-            writer_result: None,
+            source_port: crate::FragmentOutputPort::Root,
+            payload: crate::ExchangePayloadContract::Relational,
+            delivery: crate::DeliveryRequirement::DemandDriven,
         }]),
         outbound: Box::default(),
         ..FragmentCuts::default()
@@ -1209,7 +1280,12 @@ fn expression_semantic_depth_is_bounded_without_recursive_validation() {
         .unwrap();
 
     let errors = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap_err();
     assert!(
         errors
@@ -1270,7 +1346,12 @@ fn wide_connective_fragment(
             },
         })
         .unwrap();
-    builder.finish_definition(node, FragmentSink::Noop, dop())
+    builder.finish_definition(
+        node,
+        FragmentSink::Noop,
+        dop(),
+        crate::StagePlacementPolicy::Singleton,
+    )
 }
 
 /// Builds a single-copy singleton `Values` node returning one boolean column,
@@ -1375,7 +1456,12 @@ fn a_typed_constructor_refuses_before_a_node_exists() {
         derive_filter_output_properties(&singleton(), true)
     );
     builder
-        .finish_definition(filter, FragmentSink::Noop, dop())
+        .finish_definition(
+            filter,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .expect("a derived filter validates");
 }
 
@@ -1453,7 +1539,12 @@ fn a_violated_contract_invariant_is_reported_as_a_producer_defect() {
     // planner, cannot succeed on another backend, and cannot be cleared by
     // raising a limit.
     let errors = builder
-        .finish_definition(NodeId::new(999), FragmentSink::Noop, dop())
+        .finish_definition(
+            NodeId::new(999),
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap_err();
     assert!(errors.is_producer_defect());
     assert!(!errors.has(ValidationErrorCategory::ResourceLimit));
@@ -1514,7 +1605,12 @@ fn output_properties_cannot_name_a_value_absent_from_the_output_port() {
         .unwrap();
 
     let error = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap_err()
         .to_string();
     assert!(error.contains("physical property key 1 is absent from the port"));
@@ -1589,7 +1685,12 @@ fn project_cannot_publish_an_uncomputed_output() {
         .unwrap();
 
     let error = builder
-        .finish_definition(project, FragmentSink::Noop, dop())
+        .finish_definition(
+            project,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap_err()
         .to_string();
     assert!(error.contains("exact produced/pass-through sequence"));
@@ -1632,7 +1733,12 @@ fn literal_representation_must_match_its_declared_type() {
         .unwrap();
 
     let error = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap_err()
         .to_string();
     assert!(error.contains("differs from its declared type"));
@@ -1668,15 +1774,23 @@ fn exchange_partitioning_maps_source_and_destination_value_domains() {
         })
         .unwrap();
     let receiver = receiver
-        .finish_definition(receiver_node, FragmentSink::Noop, dop())
+        .finish_definition(
+            receiver_node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let mut plan = PlanBuilder::new(version());
     plan.add_fragment(source).unwrap();
     plan.add_fragment(receiver).unwrap();
     plan.add_edge(Edge {
+        role: crate::OutputRole::Relational,
+        delivery: crate::DeliveryRequirement::DemandDriven,
         id: edge,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: crate::FragmentOutputPort::Root,
             fragment: FragmentId::new(21),
             projection: Box::from([source_value]),
         },
@@ -1762,7 +1876,12 @@ fn integer_division_keeps_its_resolved_float_result() {
         })
         .unwrap();
     builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 }
 
@@ -1846,7 +1965,12 @@ fn left_outer_join_cannot_publish_the_original_build_value() {
         })
         .unwrap();
     let error = builder
-        .finish_definition(join, FragmentSink::Noop, dop())
+        .finish_definition(
+            join,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap_err()
         .to_string();
     assert!(error.contains("join output value"));
@@ -1958,7 +2082,12 @@ fn project_drops_ordering_when_its_key_is_not_projected() {
         })
         .unwrap();
     builder
-        .finish_definition(project, FragmentSink::Noop, dop())
+        .finish_definition(
+            project,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 }
 
@@ -2026,7 +2155,12 @@ fn repeat_publishes_a_distinct_nullable_grouping_value() {
         })
         .unwrap();
     builder
-        .finish_definition(repeat, FragmentSink::Noop, dop())
+        .finish_definition(
+            repeat,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 }
 
@@ -2080,7 +2214,12 @@ fn lambda_parameter_type_is_part_of_its_declaration() {
         })
         .unwrap();
     let error = builder
-        .finish_definition(node, FragmentSink::Noop, dop())
+        .finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap_err()
         .to_string();
     assert!(error.contains("lambda parameter does not reference a matching lambda owner"));
@@ -2230,8 +2369,9 @@ fn independent_fragment_cut_checks_complete_valid_value_binding() {
                 destination: Distribution::Unconstrained,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
             },
-            change_stream_writer: None,
-            writer_result: None,
+            source_port: crate::FragmentOutputPort::Root,
+            payload: crate::ExchangePayloadContract::Relational,
+            delivery: crate::DeliveryRequirement::DemandDriven,
         }]),
         runtime_filters: Box::default(),
         runtime_filter_bindings: Box::default(),
@@ -2312,7 +2452,12 @@ fn physical_binary_policy_rejects_reporting_comparisons_before_publication() {
                 },
             })
             .unwrap();
-        let result = builder.finish_definition(node, FragmentSink::Noop, dop());
+        let result = builder.finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        );
         if accepted {
             result.unwrap();
         } else {
@@ -2395,7 +2540,12 @@ fn physical_nested_decimal_cast_requires_a_supported_frozen_policy() {
                 },
             })
             .unwrap();
-        let result = builder.finish_definition(node, FragmentSink::Noop, dop());
+        let result = builder.finish_definition(
+            node,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        );
         if accepted {
             result.unwrap();
         } else {

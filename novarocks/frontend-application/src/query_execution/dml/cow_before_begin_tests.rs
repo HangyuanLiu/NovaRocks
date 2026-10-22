@@ -269,7 +269,10 @@ fn small_signed_rewrite_and_append_reach_original_builders_without_false_refusal
             .enumerate()
             .map(|(n, f)| spi::ConnectorMutationRouteInput::new(f.token(), n as u32))
             .collect(),
-        Vec::new(),
+        novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+            colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+            layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+        },
         append_preparation
             .match_contract()
             .after_fields()

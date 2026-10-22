@@ -992,6 +992,9 @@ fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
     let trust = context.handle().native_backend_probe_trust()?;
     let authorization = authorization_header(&trust)?;
     let exchange = proto::ExchangeRequest {
+        permit_token: Vec::new(),
+        stream: None,
+        frame_kind: novarocks_proto_models::novarocks::ExchangeFrameKind::Unspecified as i32,
         finst_id_hi: 11,
         finst_id_lo: 12,
         node_id: 0,

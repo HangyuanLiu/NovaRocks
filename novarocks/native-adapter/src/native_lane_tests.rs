@@ -258,6 +258,10 @@ async fn served_stream_position_outlives_the_handler_and_returns_at_body_eof() {
             NativeLane::Observation,
         ),
         (NativeRpcMethod::ExchangeUnary, NativeLane::Exchange),
+        (
+            NativeRpcMethod::AcquireExchangePermit,
+            NativeLane::ExchangeFlowControl,
+        ),
     ] {
         let (service, mut senders) = ingress(&admission);
         // The handler has returned and Tonic's response future resolved.
@@ -279,7 +283,13 @@ async fn served_stream_position_outlives_the_handler_and_returns_at_body_eof() {
         assert_eq!(held(&admission, lane), 0);
     }
     let events = recorder.events();
-    for lane in ["submission", "result_data", "observation", "exchange"] {
+    for lane in [
+        "submission",
+        "result_data",
+        "observation",
+        "exchange",
+        "exchange_flow_control",
+    ] {
         assert!(events.contains(&format!("streams:{lane}:incoming:1")));
         assert!(events.contains(&format!("streams:{lane}:incoming:-1")));
     }
@@ -510,6 +520,18 @@ impl NovaRocksGrpc for LaneProbe {
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("probe"))
     }
+    async fn acquire_exchange_permit(
+        &self,
+        _request: tonic::Request<novarocks_proto_models::novarocks::AcquireExchangePermitRequest>,
+    ) -> Result<
+        tonic::Response<novarocks_proto_models::novarocks::AcquireExchangePermitResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "exchange permit owner is not installed",
+        ))
+    }
+
     async fn exchange_unary(
         &self,
         _request: tonic::Request<proto::ExchangeRequest>,

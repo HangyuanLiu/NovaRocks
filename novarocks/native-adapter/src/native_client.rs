@@ -80,7 +80,12 @@ impl NativeChannelKey {
         method: NativeRpcMethod,
     ) -> Result<Self, String> {
         match (method.contract().traffic, backend_process_id) {
-            (NativeTrafficClass::Exchange | NativeTrafficClass::RuntimeFilter, Some(_))
+            (
+                NativeTrafficClass::Exchange
+                | NativeTrafficClass::ExchangeFlowControl
+                | NativeTrafficClass::RuntimeFilter,
+                Some(_),
+            )
             | (NativeTrafficClass::Membership, None) => Ok(Self {
                 backend_process_id,
                 endpoint,
@@ -214,6 +219,9 @@ impl NativeRpcClient {
         stop: CancellationToken,
     ) -> Result<Option<proto::ExchangeNormalClosed>, String> {
         let request = proto::ExchangeRequest {
+            permit_token: Vec::new(),
+            stream: None,
+            frame_kind: novarocks_proto_models::novarocks::ExchangeFrameKind::Unspecified as i32,
             finst_id_hi: finst_id.high(),
             finst_id_lo: finst_id.low(),
             node_id,

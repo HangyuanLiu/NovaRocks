@@ -321,9 +321,12 @@ fn edge(
     destination: Distribution,
 ) -> Edge {
     Edge {
+        role: novarocks_physical_plan::OutputRole::Relational,
+        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
         id,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: from.0,
             projection: Box::from(from.1),
         },
@@ -362,6 +365,7 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
             values_node,
             FragmentSink::Stream { edge: HASH_EDGE },
             dop(1),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
 
@@ -388,6 +392,7 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
             partial_topn,
             FragmentSink::Stream { edge: GATHER_EDGE },
             dop(u32::try_from(PARTIAL_DOP).unwrap()),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
 
@@ -412,7 +417,12 @@ fn plan(keys: &[Key], limit: u64, offset: u64) -> PhysicalPlan {
     )
     .unwrap();
     let last = last
-        .finish_definition(final_topn, FragmentSink::Result, dop(1))
+        .finish_definition(
+            final_topn,
+            FragmentSink::Result,
+            dop(1),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let output = last.nodes()[&final_topn].output.clone();
 

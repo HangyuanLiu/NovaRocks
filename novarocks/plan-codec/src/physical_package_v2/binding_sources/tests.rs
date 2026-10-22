@@ -343,6 +343,7 @@ fn package() -> p::FragmentPackage {
     .collect();
     let fragment = p::Fragment::try_from_structure_observed(
         p::FragmentStructureInput {
+            stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
             id: p::FragmentId::new(u32::MAX),
             root: table,
             values,
@@ -1258,6 +1259,7 @@ fn wide_package() -> p::FragmentPackage {
     .unwrap();
     let fragment = p::Fragment::try_from_structure_observed(
         p::FragmentStructureInput {
+            stage_placement: novarocks_physical_plan::StagePlacementPolicy::Singleton,
             id: p::FragmentId::new(320),
             root: node_id,
             values: BTreeMap::from([(

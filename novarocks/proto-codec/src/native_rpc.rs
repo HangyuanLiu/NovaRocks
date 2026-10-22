@@ -43,6 +43,7 @@ pub enum NativeDirection {
 pub enum NativeTrafficClass {
     Frontend(FrontendNativeLane),
     Exchange,
+    ExchangeFlowControl,
     RuntimeFilter,
     Membership,
     Retired,
@@ -66,6 +67,7 @@ pub enum NativeRpcMethod {
     Heartbeat,
     PruneCatalogs,
     ExchangeUnary,
+    AcquireExchangePermit,
     TransmitRuntimeFilterEnvelope,
     AnnounceBackend,
     RetiredFetchResult,
@@ -94,7 +96,7 @@ macro_rules! contract {
 }
 use FrontendNativeLane::{LifecycleControl, Observation, ResultData, Submission};
 use NativeTrafficClass::Frontend;
-pub const NATIVE_METHODS: [NativeMethodContract; 14] = [
+pub const NATIVE_METHODS: [NativeMethodContract; 15] = [
     contract!(
         FetchTaskResult,
         "FetchTaskResult",
@@ -171,6 +173,14 @@ pub const NATIVE_METHODS: [NativeMethodContract; 14] = [
         ExchangeUnary,
         "ExchangeUnary",
         NativeTrafficClass::Exchange,
+        BackendData,
+        BackendToBackend,
+        Unary
+    ),
+    contract!(
+        AcquireExchangePermit,
+        "AcquireExchangePermit",
+        NativeTrafficClass::ExchangeFlowControl,
         BackendData,
         BackendToBackend,
         Unary
@@ -294,6 +304,32 @@ mod tests {
             NativeTrafficClass::Frontend(FrontendNativeLane::ResultData)
         );
         assert!(!NativeRpcMethod::RetiredExchange.is_allowed_at(NativeEndpointDomain::BackendData));
+    }
+    #[test]
+    fn exchange_permits_have_their_own_backend_flow_control_owner() {
+        let permit = NativeRpcMethod::AcquireExchangePermit;
+        assert_eq!(
+            permit.contract().traffic,
+            NativeTrafficClass::ExchangeFlowControl
+        );
+        assert_eq!(
+            permit.contract().direction,
+            NativeDirection::BackendToBackend
+        );
+        assert_eq!(permit.contract().body, NativeBodyKind::Unary);
+        assert!(permit.is_allowed_at(NativeEndpointDomain::BackendData));
+        assert!(!permit.is_allowed_at(NativeEndpointDomain::BackendControl));
+        assert!(!permit.is_allowed_at(NativeEndpointDomain::FrontendMembership));
+        assert_ne!(
+            permit.contract().traffic,
+            NativeRpcMethod::ExchangeUnary.contract().traffic
+        );
+        assert_ne!(
+            permit.contract().traffic,
+            NativeRpcMethod::ApplyTaskControlOperations
+                .contract()
+                .traffic
+        );
     }
     #[test]
     fn new_work_and_mixed_updates_never_use_urgent_control() {

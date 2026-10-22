@@ -229,6 +229,20 @@ fn decode_inbound(
         src.destination_node_id,
         path.clone().field("destination_node_id"),
     )?;
+    let delivery = match novarocks::ExchangeDeliveryRequirement::try_from(src.delivery) {
+        Ok(novarocks::ExchangeDeliveryRequirement::DemandDriven) => {
+            novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven
+        }
+        Ok(novarocks::ExchangeDeliveryRequirement::MustDrain) => {
+            novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+        }
+        Ok(novarocks::ExchangeDeliveryRequirement::Unspecified) | Err(_) => {
+            return Err(invalid_enum(
+                path.field("delivery"),
+                "inbound delivery must be a known non-default value",
+            ));
+        }
+    };
     if src.sources.is_empty() {
         return Err(missing(
             path.clone().field("sources"),
@@ -258,7 +272,7 @@ fn decode_inbound(
         )?;
         sources.push(ExchangeSource::new(task, key, source.sender_ordinal));
     }
-    ExchangeInbound::try_new(node, sources).map_err(|error| match error {
+    ExchangeInbound::try_new(node, sources, delivery).map_err(|error| match error {
         novarocks_execution_contract::task_execution::descriptor::DescriptorError::DuplicateInboundSource(
             _,
         ) => duplicate(path, error.to_string()),
@@ -272,6 +286,14 @@ fn decode_inbound(
 fn encode_inbound(value: &ExchangeInbound) -> novarocks::TaskExchangeInbound {
     novarocks::TaskExchangeInbound {
         destination_node_id: value.node_id().get(),
+        delivery: (match value.delivery() {
+            novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven => {
+                novarocks::ExchangeDeliveryRequirement::DemandDriven
+            }
+            novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain => {
+                novarocks::ExchangeDeliveryRequirement::MustDrain
+            }
+        }) as i32,
         sources: value
             .sources()
             .iter()
@@ -400,5 +422,27 @@ pub fn encode_task_descriptor(value: &TaskDescriptor) -> novarocks::TaskDescript
             .map(|node| node.get())
             .collect(),
         topology: Some(encode_topology(value.topology())),
+    }
+}
+
+#[cfg(test)]
+mod inbound_delivery_tests {
+    use super::*;
+
+    #[test]
+    fn inbound_delivery_rejects_unspecified_or_unknown() {
+        let inbound = |delivery| novarocks::TaskExchangeInbound {
+            destination_node_id: 1,
+            sources: Vec::new(),
+            delivery,
+        };
+        for delivery in [0, -1, 99] {
+            let error = decode_inbound(&inbound(delivery), FieldPath::root("inbound")).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &novarocks_proto_codec::ProtocolErrorKind::InvalidEnum
+            );
+            assert_eq!(error.path().to_string(), "inbound.delivery");
+        }
     }
 }

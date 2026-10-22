@@ -609,6 +609,8 @@ mod tests {
             Arc::new(
                 ExecutionRuntime::new(
                     ExecutionRuntimeConfig {
+                        exchange_receive_staging_max_bytes: 64 * 1024 * 1024,
+                        keyed_assertion_state_max_bytes: 64 * 1024 * 1024,
                         driver_threads: 1,
                         exchange_wait_ms: 120_000,
                         exchange_io_threads: 1,

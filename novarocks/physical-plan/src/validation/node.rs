@@ -213,6 +213,9 @@ pub(crate) fn validate_value(
             )),
             None => require_node(fragment, *node, &path, errors),
         },
+        ValueOrigin::LogicalSummary { field } => {
+            validate_logical_summary_value(fragment, value, *field, errors);
+        }
         ValueOrigin::ExchangeImport { .. } | ValueOrigin::CteImport { .. } => {
             // Cross-fragment definitions are checked with the complete graph.
         }
@@ -702,6 +705,17 @@ pub(crate) fn validate_node_arity(node: &PhysicalNode, path: &str, errors: &mut 
         | NodeKind::ExchangeSource { .. } => node.inputs.is_empty(),
         NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. } => node.inputs.len() == 2,
         NodeKind::SetOp { .. } => node.inputs.len() >= 2,
+        NodeKind::TableFinish(spec) => {
+            let logical = matches!(spec.count_mode, crate::FinishCountMode::LogicalChanges);
+            node.inputs.len() == if logical { 2 } else { 1 }
+                && usize::try_from(spec.inputs.writer_results).is_ok_and(|i| i < node.inputs.len())
+                && logical == spec.inputs.logical_summary.is_some()
+                && logical == spec.logical_summary.is_some()
+                && spec.inputs.logical_summary.is_none_or(|i| {
+                    i != spec.inputs.writer_results
+                        && usize::try_from(i).is_ok_and(|i| i < node.inputs.len())
+                })
+        }
         NodeKind::TableFunction { .. } => node.inputs.len() <= 1,
         _ => node.inputs.len() == 1,
     };
@@ -1435,22 +1449,25 @@ pub(crate) fn validate_node_semantics(
             validate_writer_aggregates(fragment, &spec.final_aggregates, path, errors);
             let child_output = node
                 .inputs
-                .first()
+                .get(spec.inputs.writer_results as usize)
                 .and_then(|child| fragment.nodes().get(child))
                 .map(|child| child.output.columns.as_ref())
                 .unwrap_or_default();
             let finish_input_is_single_copy = node
                 .inputs
-                .first()
+                .get(spec.inputs.writer_results as usize)
                 .and_then(|child| fragment.nodes().get(child))
                 .is_some_and(|child| {
                     child.output_properties.distribution == Distribution::Singleton
                         && child.output_properties.row_multiplicity == RowMultiplicity::SingleCopy
                 })
-                && node.required_inputs.first().is_some_and(|required| {
-                    required.distribution == Distribution::Singleton
-                        && required.row_multiplicity == RowMultiplicity::SingleCopy
-                });
+                && node
+                    .required_inputs
+                    .get(spec.inputs.writer_results as usize)
+                    .is_some_and(|required| {
+                        required.distribution == Distribution::Singleton
+                            && required.row_multiplicity == RowMultiplicity::SingleCopy
+                    });
             if !finish_input_is_single_copy {
                 errors.push(ValidationError::new(
                     path,
@@ -1469,9 +1486,54 @@ pub(crate) fn validate_node_semantics(
                     "table finish input schema differs from its exact child output",
                 ));
             }
-            let child_values = indexes
-                .visible_input(node.id)
-                .expect("every fragment node has one indexed visible-input port");
+            if let (Some(input), Some(columns)) =
+                (spec.inputs.logical_summary, spec.logical_summary)
+            {
+                let summary = node
+                    .inputs
+                    .get(input as usize)
+                    .and_then(|id| fragment.nodes().get(id));
+                if summary.is_none_or(|child| {
+                    child.output.columns.as_ref() != columns.values()
+                        || child.output_properties.distribution != Distribution::Singleton
+                        || child.output_properties.row_multiplicity != RowMultiplicity::SingleCopy
+                }) || node
+                    .required_inputs
+                    .get(input as usize)
+                    .is_none_or(|required| {
+                        required.distribution != Distribution::Singleton
+                            || required.row_multiplicity != RowMultiplicity::SingleCopy
+                    })
+                {
+                    errors.push(ValidationError::new(
+                        path,
+                        "logical summary input differs from its declared exact port",
+                    ));
+                }
+                let values = columns.values();
+                if values[0] == values[1] || values[0] == values[2] || values[1] == values[2] {
+                    errors.push(ValidationError::new(
+                        path,
+                        "logical summary columns must be distinct",
+                    ));
+                }
+                for value in values {
+                    if fragment.values().get(&value).is_none_or(|value| {
+                        *value.ty.data_type() != DataType::Int64 || value.ty.nullable()
+                    }) {
+                        errors.push(ValidationError::new(
+                            path,
+                            "logical summary requires exact non-null Int64 columns",
+                        ));
+                    }
+                }
+            }
+            let child_values = node
+                .inputs
+                .get(spec.inputs.writer_results as usize)
+                .and_then(|id| indexes.output_ports.get(id))
+                .map(|port| VisibleInputIndex::One(std::sync::Arc::clone(port)))
+                .unwrap_or(VisibleInputIndex::Empty);
             if spec
                 .final_aggregates
                 .iter()
@@ -1486,7 +1548,7 @@ pub(crate) fn validate_node_semantics(
                 fragment,
                 &spec.final_aggregates,
                 node.id,
-                child_values,
+                &child_values,
                 path,
                 errors,
             );
@@ -1645,6 +1707,7 @@ pub(crate) fn validate_node_semantics(
                     keys,
                     labels,
                     message,
+                    applicability,
                 } => {
                     if keys.is_empty() || keys.len() != labels.len() {
                         errors.push(ValidationError::new(
@@ -1661,6 +1724,17 @@ pub(crate) fn validate_node_semantics(
                     let input_values = indexes
                         .visible_input(node.id)
                         .expect("every fragment node has one indexed visible-input port");
+                    if let crate::AssertionApplicability::WhenTrue(value) = applicability {
+                        require_value(fragment, *value, path, errors);
+                        if !input_values.contains(value)
+                            || fragment
+                                .values()
+                                .get(value)
+                                .is_none_or(|value| *value.ty.data_type() != DataType::Boolean)
+                        {
+                            errors.push(ValidationError::new(path, "keyed assertion applicability must be a Boolean from its exact child port"));
+                        }
+                    }
                     for value in keys {
                         require_value(fragment, *value, path, errors);
                         if !input_values.contains(value) {

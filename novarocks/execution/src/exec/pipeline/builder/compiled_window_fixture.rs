@@ -723,6 +723,7 @@ pub(super) fn package_typed(
                 max: max_dop,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap()
         .with_call_requests_observed(requests, &FixtureControl)

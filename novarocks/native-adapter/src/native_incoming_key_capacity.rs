@@ -37,6 +37,8 @@ const ROWS: usize = FRONTENDS
     + BACKENDS
         * (GEOMETRY.transport_exchange_connections_per_peer
             + GEOMETRY.transport_exchange_closing_positions_per_peer
+            + GEOMETRY.transport_exchange_flow_control_connections_per_peer
+            + GEOMETRY.transport_exchange_flow_control_closing_positions_per_peer
             + GEOMETRY.transport_runtime_filter_connections_per_peer
             + GEOMETRY.transport_runtime_filter_closing_positions_per_peer
             + 1
@@ -164,6 +166,10 @@ fn limits(key: NativeIncomingKey) -> (usize, usize) {
         NativeTrafficClass::Exchange => (
             GEOMETRY.transport_exchange_connections_per_peer,
             GEOMETRY.transport_exchange_closing_positions_per_peer,
+        ),
+        NativeTrafficClass::ExchangeFlowControl => (
+            GEOMETRY.transport_exchange_flow_control_connections_per_peer,
+            GEOMETRY.transport_exchange_flow_control_closing_positions_per_peer,
         ),
         NativeTrafficClass::RuntimeFilter => (
             GEOMETRY.transport_runtime_filter_connections_per_peer,
@@ -298,7 +304,9 @@ mod tests {
     use super::*;
     use FrontendNativeLane::{LifecycleControl, Observation, ResultData, Submission};
     use NativeEndpointDomain::{BackendControl, BackendData, FrontendMembership};
-    use NativeTrafficClass::{Exchange, Frontend, Membership, Retired, RuntimeFilter};
+    use NativeTrafficClass::{
+        Exchange, ExchangeFlowControl, Frontend, Membership, Retired, RuntimeFilter,
+    };
     use novarocks_types::{BackendProcessId, FrontendProcessId};
 
     fn peer(frontend: bool, suffix: u8) -> NativeProcessIdentity {
@@ -326,7 +334,7 @@ mod tests {
 
     #[test]
     fn finite_embedded_layout_and_all_exact_live_quotas() {
-        assert_eq!(ROWS, 254);
+        assert_eq!(ROWS, 318);
         let capacity = NativeIncomingKeyCapacity::new().unwrap();
         for (traffic, expected) in [
             (Frontend(ResultData), 4),
@@ -341,7 +349,12 @@ mod tests {
             }
             blocked(capacity.claim(exact));
         }
-        for (traffic, expected) in [(Exchange, 2), (RuntimeFilter, 1), (Membership, 1)] {
+        for (traffic, expected) in [
+            (Exchange, 2),
+            (ExchangeFlowControl, 1),
+            (RuntimeFilter, 1),
+            (Membership, 1),
+        ] {
             let exact = key(false, 1, traffic);
             assert_eq!(limits(exact), (expected, 1));
             for _ in 0..expected {
@@ -475,7 +488,7 @@ mod tests {
             }
         }
         for p in 1..=BACKENDS as u8 {
-            for traffic in [Exchange, RuntimeFilter, Membership] {
+            for traffic in [Exchange, ExchangeFlowControl, RuntimeFilter, Membership] {
                 fill(key(false, p, traffic));
             }
         }

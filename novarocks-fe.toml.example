@@ -52,6 +52,9 @@ maintenance_interval_commits = 256
 incremental_vacuum_pages = 1024
 
 [runtime]
+# Transient receive staging and exact keyed-assertion state are distinct limits.
+exchange_receive_staging_max_bytes = 67108864
+keyed_assertion_state_max_bytes = 67108864
 # TaskUpdate treats only typed unknown-outcome network failures as retryable.
 query_control_task_update_rpc_timeout_ms = 5000
 query_control_task_update_retry_error_duration_ms = 30000

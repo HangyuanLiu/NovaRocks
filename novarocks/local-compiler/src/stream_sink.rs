@@ -51,6 +51,37 @@ pub(crate) struct SinkFlow {
     pub slots: Vec<ProgramSlotBinding>,
 }
 
+pub(crate) fn cut_role(
+    role: novarocks_physical_plan::OutputRole,
+) -> novarocks_local_program::ProgramOutputRole {
+    match role {
+        novarocks_physical_plan::OutputRole::Relational => {
+            novarocks_local_program::ProgramOutputRole::Relational
+        }
+        novarocks_physical_plan::OutputRole::ProviderRoute { target } => {
+            novarocks_local_program::ProgramOutputRole::ProviderRoute { target }
+        }
+        novarocks_physical_plan::OutputRole::LogicalSummary => {
+            novarocks_local_program::ProgramOutputRole::LogicalSummary
+        }
+        novarocks_physical_plan::OutputRole::WriterResults => {
+            novarocks_local_program::ProgramOutputRole::WriterResults
+        }
+    }
+}
+pub(crate) fn cut_delivery(
+    delivery: novarocks_physical_plan::DeliveryRequirement,
+) -> novarocks_local_program::ExchangeDeliveryRequirement {
+    match delivery {
+        novarocks_physical_plan::DeliveryRequirement::DemandDriven => {
+            novarocks_local_program::ExchangeDeliveryRequirement::DemandDriven
+        }
+        novarocks_physical_plan::DeliveryRequirement::MustDrain => {
+            novarocks_local_program::ExchangeDeliveryRequirement::MustDrain
+        }
+    }
+}
+
 const NO_KEYS: &[ValueId] = &[];
 
 pub(crate) struct LoweredStreamSink {
@@ -131,6 +162,13 @@ fn lower_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCreationFa
                     .into());
                 }
                 (DataStreamPartitionType::HashPartitioned, &keys[..])
+            }
+            Distribution::ConditionalKey { .. } => {
+                return Err((FragmentCompileError::Unsupported {
+                    node: None,
+                    feature: "conditional-key stream partitioning",
+                })
+                .into());
             }
             Distribution::BucketShuffle { keys, scheme } => {
                 if scheme.hash != PartitionHashAlgorithm::NativeBucketCrc32V1
@@ -260,13 +298,23 @@ fn lower_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCreationFa
         partition_exprs,
         output_columns,
         None,
+        novarocks_local_program::StaticStreamContract {
+            role: cut_role(cut.payload.role()),
+            delivery: cut_delivery(cut.delivery),
+            routing: novarocks_local_program::StaticStreamRouting::Ordinary,
+        },
     )
     .map_err(sink_error)?;
     let sink = StaticSinkProgram::try_data_stream(branch, arena).map_err(sink_error)?;
     work.flush()?;
     Ok(LoweredStreamSink {
         sink,
-        requirement: BindingRequirement::ExchangeOutput { branch: 0, layout },
+        requirement: BindingRequirement::ExchangeOutput {
+            branch: 0,
+            layout,
+            role: cut_role(cut.payload.role()),
+            delivery: cut_delivery(cut.delivery),
+        },
         flow: SinkFlow {
             flow,
             types,

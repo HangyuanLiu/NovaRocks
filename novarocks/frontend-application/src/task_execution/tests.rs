@@ -654,6 +654,7 @@ fn stream_edge(
         target_fragment_id: target,
         target_exchange_node_id: node_id,
         partition_kind: AttemptPartitionKind::Hash,
+        delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
     }
 }
 

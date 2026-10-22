@@ -485,7 +485,7 @@ pub(crate) fn register_partition_identity(
     errors: &mut ValidationContext,
 ) {
     let (space, definition) = match distribution {
-        Distribution::Hash { scheme, .. } => {
+        Distribution::Hash { scheme, .. } | Distribution::ConditionalKey { scheme, .. } => {
             if counts
                 .insert(scheme.count.id, scheme.count.admissible)
                 .is_some_and(|existing| existing != scheme.count.admissible)
@@ -526,12 +526,41 @@ pub(crate) fn validate_distribution(
     let path = format!("fragments[{}].{label}", fragment.id().get());
     let (keys, algorithm) = match distribution {
         Distribution::Hash { keys, scheme } => {
-            if scheme.definition.algorithm
-                != novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
-            {
+            if !matches!(
+                scheme.definition.algorithm,
+                novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
+                    | novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
+            ) {
                 errors.push(ValidationError::new(
                     &path,
                     "ordinary hash partitioning uses the wrong hash algorithm",
+                ));
+            }
+            validate_partition_count_domain(&scheme.count.admissible, &path, errors);
+            (Some(keys), Some(scheme.definition.algorithm))
+        }
+        Distribution::ConditionalKey {
+            applies,
+            keys,
+            scheme,
+        } => {
+            require_value(fragment, *applies, &path, errors);
+            if fragment
+                .values()
+                .get(applies)
+                .is_some_and(|value| value.ty.data_type() != &arrow_schema::DataType::Boolean)
+            {
+                errors.push(ValidationError::new(
+                    &path,
+                    "conditional partition applicability is not Boolean",
+                ));
+            }
+            if scheme.definition.algorithm
+                != novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
+            {
+                errors.push(ValidationError::new(
+                    &path,
+                    "conditional partitioning requires the hierarchical hash identity",
                 ));
             }
             validate_partition_count_domain(&scheme.count.admissible, &path, errors);
@@ -1669,6 +1698,7 @@ fn derive_node_output_properties_from(
                         Distribution::Unconstrained
                         | Distribution::RoundRobin
                         | Distribution::Hash { .. }
+                        | Distribution::ConditionalKey { .. }
                         | Distribution::BucketShuffle { .. },
                         _,
                     ) => false,
@@ -1697,10 +1727,17 @@ fn derive_node_output_properties_from(
                     {
                         input.distribution.clone()
                     }
+                    Distribution::ConditionalKey { applies, keys, .. }
+                        if output_values.contains(applies)
+                            && keys.iter().all(|key| output_values.contains(key)) =>
+                    {
+                        input.distribution.clone()
+                    }
                     Distribution::Unconstrained
                     | Distribution::RoundRobin
                     | Distribution::Broadcast
                     | Distribution::Hash { .. }
+                    | Distribution::ConditionalKey { .. }
                     | Distribution::BucketShuffle { .. } => Distribution::Unconstrained,
                 })
                 .unwrap_or(Distribution::Unconstrained);
@@ -2003,7 +2040,10 @@ pub(crate) fn distribution_colocates_by(distribution: &Distribution, keys: &[Val
             keys: distribution_keys,
             ..
         } => distribution_keys.iter().all(|key| key_index.contains(key)),
-        Distribution::Unconstrained | Distribution::RoundRobin | Distribution::Broadcast => false,
+        Distribution::Unconstrained
+        | Distribution::RoundRobin
+        | Distribution::Broadcast
+        | Distribution::ConditionalKey { .. } => false,
     }
 }
 
@@ -2088,10 +2128,14 @@ fn validate_assertion_properties_from(
                 && input.distribution == Distribution::Singleton
                 && actual.distribution == Distribution::Singleton
         }
-        crate::RowCountAssertionSpec::PerKeyAtMostOne { keys, .. } => {
+        crate::RowCountAssertionSpec::PerKeyAtMostOne {
+            keys,
+            applicability,
+            ..
+        } => {
             properties_satisfy(input, required)
                 && input.distribution == actual.distribution
-                && distribution_colocates_by(&input.distribution, keys)
+                && assertion_keys_are_colocated(&input.distribution, keys, *applicability)
         }
     };
     let single_copy = required.row_multiplicity == RowMultiplicity::SingleCopy
@@ -2110,6 +2154,29 @@ fn validate_assertion_properties_from(
         ));
     }
     Some(expected)
+}
+
+fn assertion_keys_are_colocated(
+    distribution: &Distribution,
+    keys: &[ValueId],
+    applicability: crate::AssertionApplicability,
+) -> bool {
+    match applicability {
+        crate::AssertionApplicability::AllRows => distribution_colocates_by(distribution, keys),
+        crate::AssertionApplicability::WhenTrue(mask) => match distribution {
+            Distribution::Singleton => true,
+            Distribution::ConditionalKey {
+                applies,
+                keys: partition_keys,
+                ..
+            } => {
+                *applies == mask
+                    && !partition_keys.is_empty()
+                    && partition_keys.iter().all(|key| keys.contains(key))
+            }
+            _ => false,
+        },
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2182,9 +2249,15 @@ fn table_function_output_properties_from(
         {
             input.distribution.clone()
         }
-        Distribution::Hash { .. } | Distribution::BucketShuffle { .. } => {
-            Distribution::Unconstrained
+        Distribution::ConditionalKey { applies, keys, .. }
+            if passthrough.contains(applies)
+                && keys.iter().all(|key| passthrough.contains(key)) =>
+        {
+            input.distribution.clone()
         }
+        Distribution::Hash { .. }
+        | Distribution::ConditionalKey { .. }
+        | Distribution::BucketShuffle { .. } => Distribution::Unconstrained,
         Distribution::Broadcast
             if !source.table_safe(fragment, node.id, function, arguments)? =>
         {
@@ -2225,20 +2298,7 @@ pub(crate) fn validate_property_keys_on_port(
         .iter()
         .map(|key| key.value)
         .collect::<Vec<_>>();
-    match &properties.distribution {
-        Distribution::Hash {
-            keys: partition_keys,
-            ..
-        }
-        | Distribution::BucketShuffle {
-            keys: partition_keys,
-            ..
-        } => keys.extend(partition_keys.iter().copied()),
-        Distribution::Unconstrained
-        | Distribution::Singleton
-        | Distribution::RoundRobin
-        | Distribution::Broadcast => {}
-    }
+    keys.extend(properties.distribution.value_references());
     for key in keys {
         require_value(fragment, key, path, errors);
         if !port_values.contains(&key) {
@@ -2250,5 +2310,74 @@ pub(crate) fn validate_property_keys_on_port(
                 ),
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod conditional_requirement_tests {
+    use super::*;
+    fn requirement(applies: u32) -> crate::PhysicalProperties {
+        crate::PhysicalProperties {
+            distribution: Distribution::ConditionalKey {
+                applies: ValueId::new(applies),
+                keys: Box::new([ValueId::new(10)]),
+                scheme: crate::HashPartitionScheme {
+                    space: novarocks_type_contract::PartitionSpaceId::try_new([1; 32]).unwrap(),
+                    count: crate::PartitionCountParameter {
+                        id: novarocks_type_contract::PartitionCountParameterId::try_new([2; 32])
+                            .unwrap(),
+                        admissible: crate::PartitionCountDomain {
+                            min: 1,
+                            max: 16,
+                            requires_power_of_two: false,
+                        },
+                    },
+                    definition: crate::HashDefinition {
+                        algorithm:
+                            novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1,
+                    },
+                },
+            },
+            row_multiplicity: RowMultiplicity::SingleCopy,
+            ordering: Box::default(),
+        }
+    }
+    #[test]
+    fn applicability_is_part_of_the_exact_requirement() {
+        let expected = requirement(1);
+        assert!(properties_satisfy(&expected, &expected));
+        assert!(!properties_satisfy(&requirement(2), &expected));
+        let mut hash = expected.clone();
+        let Distribution::ConditionalKey { keys, scheme, .. } = hash.distribution else {
+            unreachable!()
+        };
+        hash.distribution = Distribution::Hash { keys, scheme };
+        assert!(!properties_satisfy(&hash, &expected));
+        assert!(!properties_satisfy(&expected, &hash));
+        assert!(!distribution_colocates_by(
+            &expected.distribution,
+            &[ValueId::new(10)]
+        ));
+        let keys = [ValueId::new(10)];
+        assert!(assertion_keys_are_colocated(
+            &expected.distribution,
+            &keys,
+            crate::AssertionApplicability::WhenTrue(ValueId::new(1))
+        ));
+        assert!(!assertion_keys_are_colocated(
+            &expected.distribution,
+            &keys,
+            crate::AssertionApplicability::WhenTrue(ValueId::new(2))
+        ));
+        assert!(!assertion_keys_are_colocated(
+            &expected.distribution,
+            &keys,
+            crate::AssertionApplicability::AllRows
+        ));
+        assert!(!assertion_keys_are_colocated(
+            &hash.distribution,
+            &keys,
+            crate::AssertionApplicability::WhenTrue(ValueId::new(1))
+        ));
     }
 }

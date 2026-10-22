@@ -86,6 +86,7 @@ async fn exact_key_connecting_position_refuses_before_the_connector_runs() {
     let endpoint = NativeEndpoint::from_host_port("127.0.0.1", 1).unwrap();
     for (peer, method) in [
         (Some(process), NativeRpcMethod::ExchangeUnary),
+        (Some(process), NativeRpcMethod::AcquireExchangePermit),
         (
             Some(process),
             NativeRpcMethod::TransmitRuntimeFilterEnvelope,

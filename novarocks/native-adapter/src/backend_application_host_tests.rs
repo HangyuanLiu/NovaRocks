@@ -90,6 +90,8 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         inbound_capability_limits: novarocks_worker::TaskInboundCapabilityLimits::default(),
         preparation_limits: novarocks_worker::TaskPreparationLimits::default(),
         execution_runtime_config: ExecutionRuntimeConfig {
+            exchange_receive_staging_max_bytes: 64 * 1024 * 1024,
+            keyed_assertion_state_max_bytes: 64 * 1024 * 1024,
             driver_threads: 1,
             exchange_wait_ms: 1,
             exchange_io_threads: 1,

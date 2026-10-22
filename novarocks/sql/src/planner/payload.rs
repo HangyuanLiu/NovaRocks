@@ -919,6 +919,8 @@ pub(crate) struct PlanAssertOneRowNode {
     pub group_key_column_ids: Vec<ColumnId>,
     pub group_key_labels: Vec<String>,
     pub keyed_message_prefix: Option<String>,
+    /// Exact identity of the already materialized Boolean applicability mask.
+    pub applicability_column_id: Option<ColumnId>,
 }
 
 impl PlanAssertOneRowNode {
@@ -930,6 +932,7 @@ impl PlanAssertOneRowNode {
             group_key_column_ids: Vec::new(),
             group_key_labels: Vec::new(),
             keyed_message_prefix: None,
+            applicability_column_id: None,
         }
     }
 
@@ -938,6 +941,7 @@ impl PlanAssertOneRowNode {
         group_key_column_ids: Vec<ColumnId>,
         group_key_labels: Vec<String>,
         keyed_message_prefix: impl Into<String>,
+        applicability_column_id: Option<ColumnId>,
     ) -> Self {
         Self {
             subquery_text: subquery_text.into(),
@@ -946,6 +950,7 @@ impl PlanAssertOneRowNode {
             group_key_column_ids,
             group_key_labels,
             keyed_message_prefix: Some(keyed_message_prefix.into()),
+            applicability_column_id,
         }
     }
 }

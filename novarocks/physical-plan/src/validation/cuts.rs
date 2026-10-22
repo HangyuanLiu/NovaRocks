@@ -215,6 +215,9 @@ pub(crate) fn preflight_fragment_cut_resources(
     {
         let edge = plan.edges().get(edge_id)?;
         let source = plan.fragments().get(&edge.source.fragment)?;
+        if edge.role == crate::OutputRole::LogicalSummary {
+            usage.add_items(6);
+        }
         usage.add_items(edge.destination.receive_mapping.len() * if is_outbound { 2 } else { 1 });
         usage.add_distribution(&edge.partitioning.source);
         usage.add_distribution(&edge.partitioning.destination);
@@ -280,8 +283,9 @@ pub(crate) fn fragment_cuts_from_edges(
                 destination_node: edge.destination.node,
                 imports: imports.into_boxed_slice(),
                 partitioning: edge.partitioning.clone(),
-                change_stream_writer: derivation.change_stream_writer(edge.id),
-                writer_result: writer_result_cut(plan, edge),
+                source_port: edge.source.port,
+                delivery: edge.delivery,
+                payload: edge_payload(plan, edge, derivation)?,
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -324,8 +328,9 @@ pub(crate) fn fragment_cuts_from_edges(
                     .collect::<Option<Vec<_>>>()?
                     .into_boxed_slice(),
                 partitioning: edge.partitioning.clone(),
-                change_stream_writer: derivation.change_stream_writer(edge.id),
-                writer_result: writer_result_cut(plan, edge),
+                source_port: edge.source.port,
+                delivery: edge.delivery,
+                payload: edge_payload(plan, edge, derivation)?,
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -340,6 +345,44 @@ pub(crate) fn fragment_cuts_from_edges(
         runtime_filters: runtime_filters.into_boxed_slice(),
         runtime_filter_bindings: Box::from(derivation.runtime_filter_bindings(fragment_id)),
     })
+}
+
+fn edge_payload(
+    plan: &PhysicalPlan,
+    edge: &Edge,
+    derivation: &FragmentCutDerivation,
+) -> Option<crate::ExchangePayloadContract> {
+    use crate::ExchangePayloadContract as Payload;
+    match edge.role {
+        crate::OutputRole::Relational => Some(Payload::Relational),
+        crate::OutputRole::ProviderRoute { target } => {
+            let proof = derivation.change_stream_writer(edge.id)?;
+            (proof.write_target_ordinal == target).then_some(Payload::ProviderRoute(proof))
+        }
+        crate::OutputRole::WriterResults => {
+            writer_result_cut(plan, edge).map(Payload::WriterResults)
+        }
+        crate::OutputRole::LogicalSummary => {
+            let source = plan.fragments().get(&edge.source.fragment)?;
+            let FragmentSink::Router { summary, .. } = source.sink() else {
+                return None;
+            };
+            let [(s0, d0), (s1, d1), (s2, d2)] = edge.destination.receive_mapping.as_ref() else {
+                return None;
+            };
+            if [*s0, *s1, *s2] != summary.columns.values() {
+                return None;
+            }
+            Some(Payload::LogicalSummary(crate::LogicalSummaryCut {
+                source: summary.columns,
+                destination: crate::LogicalSummaryColumns {
+                    inserted: *d0,
+                    replaced: *d1,
+                    deleted: *d2,
+                },
+            }))
+        }
+    }
 }
 
 pub(crate) fn change_stream_writer_cut(
@@ -410,6 +453,15 @@ pub(crate) fn validate_fragment_cuts_into(
     );
     let mut inbound_ids = BTreeSet::new();
     for cut in &cuts.inbound {
+        validate_logical_summary_cut(
+            fragment,
+            cut.source_port,
+            &cut.payload,
+            cut.delivery,
+            &cut.imports,
+            false,
+            errors,
+        );
         bounded_count(
             errors,
             &format!("{path}.inbound.imports"),
@@ -562,6 +614,15 @@ pub(crate) fn validate_fragment_cuts_into(
         .map(|root| root.output_properties.row_multiplicity);
     let mut outbound_ids = BTreeSet::new();
     for cut in &cuts.outbound {
+        validate_logical_summary_cut(
+            fragment,
+            cut.source_port,
+            &cut.payload,
+            cut.delivery,
+            &cut.destination_imports,
+            true,
+            errors,
+        );
         bounded_count(
             errors,
             &format!("{path}.outbound.projection"),
@@ -611,18 +672,21 @@ pub(crate) fn validate_fragment_cuts_into(
             &path,
             errors,
         );
-        if root_values.as_ref().is_some_and(|root_values| {
-            cut.projection
-                .iter()
-                .any(|projected| !root_values.contains(&projected.value))
-        }) {
+        if cut.source_port == crate::FragmentOutputPort::Root
+            && root_values.as_ref().is_some_and(|root_values| {
+                cut.projection
+                    .iter()
+                    .any(|projected| !root_values.contains(&projected.value))
+            })
+        {
             errors.push(ValidationError::new(
                 &path,
                 "outbound cut projects a value absent from the fragment root output",
             ));
         }
-        if root_multiplicity
-            .is_some_and(|multiplicity| multiplicity != cut.partitioning.source_multiplicity)
+        if cut.source_port == crate::FragmentOutputPort::Root
+            && root_multiplicity
+                .is_some_and(|multiplicity| multiplicity != cut.partitioning.source_multiplicity)
         {
             errors.push(ValidationError::new(
                 &path,
@@ -636,11 +700,12 @@ pub(crate) fn validate_fragment_cuts_into(
             "outbound_cut.source_partitioning",
             errors,
         );
-        if root_values.as_ref().is_some_and(|root_values| {
-            distribution_values(&cut.partitioning.source)
-                .iter()
-                .any(|value| !root_values.contains(value))
-        }) {
+        if cut.source_port == crate::FragmentOutputPort::Root
+            && root_values.as_ref().is_some_and(|root_values| {
+                distribution_values(&cut.partitioning.source)
+                    .any(|value| !root_values.contains(&value))
+            })
+        {
             errors.push(ValidationError::new(
                 &path,
                 "outbound partition key is absent from the fragment root output",
@@ -650,7 +715,13 @@ pub(crate) fn validate_fragment_cuts_into(
     let sink_edges = match fragment.sink() {
         FragmentSink::Stream { edge } => vec![*edge],
         FragmentSink::Multicast { edges } => edges.to_vec(),
-        FragmentSink::Router { routes, .. } => routes.iter().map(|route| route.edge).collect(),
+        FragmentSink::Router {
+            routes, summary, ..
+        } => routes
+            .iter()
+            .map(|route| route.edge)
+            .chain(std::iter::once(summary.edge))
+            .collect(),
         FragmentSink::Result | FragmentSink::RootResult(_) | FragmentSink::Noop => Vec::new(),
     };
     let sink_edge_ids = sink_edges.iter().copied().collect::<BTreeSet<_>>();
@@ -671,7 +742,31 @@ pub(crate) fn validate_fragment_cuts_into(
         .iter()
         .map(|cut| (cut.edge, cut))
         .collect::<BTreeMap<_, _>>();
-    if let FragmentSink::Router { routes, .. } = fragment.sink() {
+    if let FragmentSink::Router {
+        routes, summary, ..
+    } = fragment.sink()
+    {
+        let valid = outbound_by_edge.get(&summary.edge).is_some_and(|cut| {
+            cut.source_port == crate::FragmentOutputPort::LogicalSummary
+                && cut.delivery == crate::DeliveryRequirement::MustDrain
+                && cut.kind == crate::EdgeKind::Stream
+                && cut.partitioning.destination == crate::Distribution::Singleton
+                && cut.partitioning.source_multiplicity == crate::RowMultiplicity::SingleCopy
+                && cut.partitioning.destination_multiplicity == crate::RowMultiplicity::SingleCopy
+                && matches!(cut.payload, crate::ExchangePayloadContract::LogicalSummary(proof)
+                    if proof.source == summary.columns)
+                && cut
+                    .projection
+                    .iter()
+                    .map(|value| value.value)
+                    .eq(summary.columns.values())
+        });
+        if !valid {
+            errors.push(ValidationError::new(
+                &path,
+                "router summary cut differs from its exact independent output contract",
+            ));
+        }
         for route in routes {
             let cut = outbound_by_edge.get(&route.edge).copied();
             if cut.is_none_or(|cut| {
@@ -687,7 +782,7 @@ pub(crate) fn validate_fragment_cuts_into(
             }
             if let Some(cut) = cut {
                 validate_router_partitioning(route, &cut.partitioning.source, &path, errors);
-                let proof_matches = cut.change_stream_writer.as_ref().is_some_and(|proof| {
+                let proof_matches = cut.change_stream_writer().is_some_and(|proof| {
                     proof.route_id == route.route_id
                         && proof.write_target_ordinal == route.write_target_ordinal
                         && proof.fields.len() == route.input_mapping.len()
@@ -714,7 +809,7 @@ pub(crate) fn validate_fragment_cuts_into(
         }
     }
     for cut in &cuts.outbound {
-        if cut.kind != crate::EdgeKind::ChangeStreamRouter && cut.change_stream_writer.is_some() {
+        if cut.kind != crate::EdgeKind::ChangeStreamRouter && cut.change_stream_writer().is_some() {
             errors.push(ValidationError::new(
                 &path,
                 "non-router outbound cut carries a change-stream writer proof",
@@ -722,6 +817,7 @@ pub(crate) fn validate_fragment_cuts_into(
         }
     }
     validate_fragment_writer_results(fragment, cuts, &path, errors);
+    validate_fragment_summary_inputs(fragment, cuts, errors);
     validate_fragment_runtime_filter_cuts(fragment, cuts, &path, errors);
     validate_fragment_runtime_filter_binding_cuts(
         fragment,
@@ -738,7 +834,7 @@ pub(crate) fn validate_inbound_change_stream_writer(
     errors: &mut ValidationContext,
 ) {
     if cut.kind != crate::EdgeKind::ChangeStreamRouter {
-        if cut.change_stream_writer.is_some() {
+        if cut.change_stream_writer().is_some() {
             errors.push(ValidationError::new(
                 path,
                 "non-router inbound cut carries a change-stream writer proof",
@@ -746,7 +842,7 @@ pub(crate) fn validate_inbound_change_stream_writer(
         }
         return;
     }
-    let Some(proof) = &cut.change_stream_writer else {
+    let Some(proof) = &cut.change_stream_writer() else {
         errors.push(ValidationError::new(
             path,
             "router inbound cut lacks its destination writer proof",
@@ -797,7 +893,7 @@ pub(crate) fn validate_inbound_writer_result_structure(
     errors: &mut ValidationContext,
 ) {
     if cut.kind != crate::EdgeKind::Stream {
-        if cut.writer_result.is_some() {
+        if cut.writer_result().is_some() {
             errors.push(ValidationError::new(
                 path,
                 "non-stream inbound cut carries a writer result proof",
@@ -805,7 +901,7 @@ pub(crate) fn validate_inbound_writer_result_structure(
         }
         return;
     }
-    let Some(proof) = &cut.writer_result else {
+    let Some(proof) = &cut.writer_result() else {
         return;
     };
     let matches = proof.schema_revision == crate::WRITER_MULTIPLEX_SCHEMA_REVISION
@@ -838,7 +934,7 @@ pub(crate) fn validate_outbound_writer_result(
     errors: &mut ValidationContext,
 ) {
     if cut.kind != crate::EdgeKind::Stream {
-        if cut.writer_result.is_some() {
+        if cut.writer_result().is_some() {
             errors.push(ValidationError::new(
                 path,
                 "non-stream outbound cut carries a writer result proof",
@@ -851,7 +947,7 @@ pub(crate) fn validate_outbound_writer_result(
         NodeKind::TableWriter { target } => Some(target),
         _ => None,
     });
-    match (target, &cut.writer_result) {
+    match (target, &cut.writer_result()) {
         (None, None) => {}
         (None, Some(_)) => errors.push(ValidationError::new(
             path,
@@ -907,7 +1003,7 @@ pub(crate) fn validate_fragment_writer_results(
         && matches!(root.kind, NodeKind::TableWriter { .. })
     {
         for cut in &cuts.outbound {
-            if cut.writer_result.is_some() {
+            if cut.writer_result().is_some() {
                 *consumed_writers.entry(root.id).or_default() += 1;
             }
         }
@@ -934,7 +1030,8 @@ pub(crate) fn validate_fragment_writer_results(
             .collect::<Box<[_]>>();
         let mut pending = finish_node
             .inputs
-            .iter()
+            .get(finish.inputs.writer_results as usize)
+            .into_iter()
             .map(|input| (*input, finish_values.clone()))
             .collect::<Vec<_>>();
         let mut visited = BTreeSet::new();
@@ -968,7 +1065,7 @@ pub(crate) fn validate_fragment_writer_results(
                 NodeKind::ExchangeSource { edge, .. } => {
                     let proof = inbound_by_edge
                         .get(edge)
-                        .and_then(|cut| cut.writer_result.as_ref());
+                        .and_then(|cut| cut.writer_result());
                     let Some(proof) = proof else {
                         errors.push(ValidationError::new(
                             path,
@@ -1027,7 +1124,7 @@ pub(crate) fn validate_fragment_writer_results(
         }
     }
     for cut in &cuts.inbound {
-        if cut.writer_result.is_some() && consumed_inbound.get(&cut.edge).copied() != Some(1) {
+        if cut.writer_result().is_some() && consumed_inbound.get(&cut.edge).copied() != Some(1) {
             errors.push(ValidationError::new(
                 path,
                 "inbound writer result proof must feed exactly one local table finish",

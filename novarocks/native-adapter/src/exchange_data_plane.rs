@@ -376,6 +376,7 @@ pub fn handle_transmit_chunk(
         ExchangeRouteDelivery::Delivered => {}
         ExchangeRouteDelivery::NormallyClosed(proof) => {
             response.normal_closed = Some(proto::novarocks::ExchangeNormalClosed {
+            disposition: Some(novarocks_proto_models::novarocks::exchange_normal_closed::Disposition::Withdrawn(novarocks_proto_models::novarocks::ExchangeWithdrawn {})),
                 destination_task: Some(novarocks_task_codec::identity::encode_task_identity(
                     proof.destination(),
                 )),
@@ -436,6 +437,9 @@ mod tests {
 
     fn frame() -> proto::novarocks::ExchangeRequest {
         proto::novarocks::ExchangeRequest {
+            permit_token: Vec::new(),
+            stream: None,
+            frame_kind: novarocks_proto_models::novarocks::ExchangeFrameKind::Unspecified as i32,
             finst_id_hi: 1,
             finst_id_lo: 2,
             node_id: 7,

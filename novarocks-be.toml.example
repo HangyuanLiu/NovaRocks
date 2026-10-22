@@ -31,6 +31,9 @@ advertise_host = "127.0.0.1"
 # advertise_control_port = 29082
 
 [runtime]
+# Transient receive staging and exact keyed-assertion state are distinct limits.
+exchange_receive_staging_max_bytes = 67108864
+keyed_assertion_state_max_bytes = 67108864
 # Per-scan speculative successor bounds. Demand reads use the shared range
 # service windows independently of these limits.
 prefetch_input_bytes_per_stream = 67108864

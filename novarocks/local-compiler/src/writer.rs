@@ -169,6 +169,9 @@ pub(crate) fn admit_writer_family(
             crate::writer_statistics::admit_partial_calls(node, target, work)
         }
         NodeKind::TableFinish(spec) => {
+            if spec.count_mode == novarocks_physical_plan::FinishCountMode::LogicalChanges {
+                return Err(unsupported("logical-change summary finish"));
+            }
             if !matches!(
                 fragment.sink(),
                 FragmentSink::Result | FragmentSink::RootResult(_)
@@ -191,7 +194,7 @@ pub(crate) fn admit_writer_family(
             }
             let mut carried = false;
             for cut in package.cuts().inbound.iter() {
-                let addressed = cut.destination_node == input.id && cut.writer_result.is_some();
+                let addressed = cut.destination_node == input.id && cut.writer_result().is_some();
                 work.step()?;
                 carried |= addressed;
             }
@@ -238,12 +241,9 @@ pub(crate) fn admit_writer_result_cut(
             feature: "writer-result stream from a fragment not rooted at a table writer",
         });
     };
-    let writer_result = cut
-        .writer_result
-        .as_ref()
-        .ok_or(FragmentCompileError::Invalid(
-            "table writer stream carries no writer-result cut",
-        ))?;
+    let writer_result = cut.writer_result().ok_or(FragmentCompileError::Invalid(
+        "table writer stream carries no writer-result cut",
+    ))?;
     if cut.kind != EdgeKind::Stream
         || writer_result.write_target_ordinal != target.write_target_ordinal
         || writer_result.schema_revision != target.output_schema.revision
@@ -812,6 +812,9 @@ pub(crate) fn lower_finish_with_creation<H>(
         work.flush()?;
         Ok(LoweredFinish {
             kind: ProgramNodeKind::TableFinish {
+                count_mode: spec.count_mode,
+                input_roles: spec.inputs,
+                logical_summary_layout: None,
                 inputs: vec![child],
                 expected_targets: spec.expected_target_ordinals.to_vec(),
                 writer_multiplex_layout: child_layout.clone(),

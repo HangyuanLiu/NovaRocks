@@ -523,7 +523,10 @@ fn completed_plan_scheduling_facts(
         }
         fragments.insert(
             u32::from(fragment.id().get()),
-            SchedulingFragmentFacts { scans },
+            SchedulingFragmentFacts {
+                placement: fragment.stage_placement().clone(),
+                scans,
+            },
         );
     }
     let edges = plan
@@ -536,14 +539,14 @@ fn completed_plan_scheduling_facts(
                 target_exchange_node_id: wire_node_id(edge.destination.node)?,
                 native_hash_partitioned: matches!(
                     edge.partitioning.destination,
-                    Distribution::Hash { .. }
+                    Distribution::Hash { .. } | Distribution::ConditionalKey { .. }
                 ),
                 stream_kind: match edge.partitioning.destination {
                     Distribution::Singleton => SchedulingStreamKind::Gather,
                     Distribution::Broadcast => SchedulingStreamKind::Broadcast,
-                    Distribution::Hash { .. } | Distribution::BucketShuffle { .. } => {
-                        SchedulingStreamKind::Partitioned
-                    }
+                    Distribution::Hash { .. }
+                    | Distribution::ConditionalKey { .. }
+                    | Distribution::BucketShuffle { .. } => SchedulingStreamKind::Partitioned,
                     Distribution::Unconstrained | Distribution::RoundRobin => {
                         SchedulingStreamKind::Other
                     }
@@ -657,6 +660,14 @@ fn completed_plan_edge_facts(plan: &PhysicalPlan) -> Result<Vec<AttemptEdgeFacts
                 target_fragment_id: u32::from(edge.destination.fragment.get()),
                 target_exchange_node_id: wire_node_id(edge.destination.node)?,
                 partition_kind: completed_edge_partition_kind(&edge.partitioning.destination),
+                delivery: match edge.delivery {
+                    novarocks_physical_plan::DeliveryRequirement::DemandDriven => {
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven
+                    }
+                    novarocks_physical_plan::DeliveryRequirement::MustDrain => {
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+                    }
+                },
             })
         })
         .collect()
@@ -671,9 +682,9 @@ fn completed_plan_edge_facts(plan: &PhysicalPlan) -> Result<Vec<AttemptEdgeFacts
 const fn completed_edge_partition_kind(destination: &Distribution) -> AttemptPartitionKind {
     match destination {
         Distribution::Singleton | Distribution::Broadcast => AttemptPartitionKind::Unpartitioned,
-        Distribution::Hash { .. } | Distribution::BucketShuffle { .. } => {
-            AttemptPartitionKind::Hash
-        }
+        Distribution::Hash { .. }
+        | Distribution::ConditionalKey { .. }
+        | Distribution::BucketShuffle { .. } => AttemptPartitionKind::Hash,
         Distribution::Unconstrained | Distribution::RoundRobin => AttemptPartitionKind::Random,
     }
 }
@@ -1085,6 +1096,14 @@ mod tests {
             .expect("a writer and its finish have a compiled shape");
         assert!(
             compiled_sink_refusal(&FragmentSink::Router {
+                summary: novarocks_physical_plan::LogicalSummaryOutput {
+                    edge: novarocks_physical_plan::EdgeId::new(1),
+                    columns: novarocks_physical_plan::LogicalSummaryColumns {
+                        inserted: ValueId::new(1),
+                        replaced: ValueId::new(2),
+                        deleted: ValueId::new(3),
+                    },
+                },
                 effect: ValueId::new(0),
                 routes: Box::default(),
             })
@@ -1952,6 +1971,7 @@ mod tests {
                     max: 8,
                     requires_power_of_two: true,
                 },
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .expect("scan fragment");
         let mut builder = PlanBuilder::new(PlanVersionId::try_new([11; 16]).expect("version"));

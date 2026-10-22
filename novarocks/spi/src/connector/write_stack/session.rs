@@ -399,12 +399,60 @@ impl ConnectorWriteRewriteSource {
 /// its [`WriteTargetOrdinal`], and its recipe is the opaque writer handle beside
 /// it -- neither is derivable from these facts, and none of them reaches a
 /// commit fragment.
+/// Correctness colocation is independent of writer instance count and layout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorWriteColocation {
+    None,
+    Singleton,
+    ByKey(Vec<ConnectorWriteFieldToken>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorWriteLayoutPreference {
+    None,
+    ClusterBy(Vec<ConnectorWriteFieldToken>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorWriteRouteRequirements {
+    pub colocation: ConnectorWriteColocation,
+    pub layout: ConnectorWriteLayoutPreference,
+}
+
+impl ConnectorWriteRouteRequirements {
+    pub fn validate(&self) -> Result<(), ConnectorError> {
+        let validate_keys = |keys: &[ConnectorWriteFieldToken]| {
+            if keys.is_empty()
+                || keys
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != keys.len()
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "write route key must be nonempty and contain no duplicate fields",
+                ));
+            }
+            Ok(())
+        };
+        if let ConnectorWriteColocation::ByKey(keys) = &self.colocation {
+            validate_keys(keys)?;
+        }
+        if let ConnectorWriteLayoutPreference::ClusterBy(keys) = &self.layout {
+            validate_keys(keys)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ConnectorWriteRouteFacts {
     route_id: ConnectorWriteRouteId,
     accepted_effects: Vec<ConnectorRowMutationEffect>,
     input_ordinals: Vec<ConnectorMutationRouteInput>,
-    partition_fields: Vec<ConnectorWriteFieldToken>,
+    requirements: ConnectorWriteRouteRequirements,
     selection_bindings: Arc<[ConnectorWriteSelectionBinding]>,
 }
 
@@ -571,7 +619,7 @@ impl ConnectorWriteRouteFacts {
         route_id: ConnectorWriteRouteId,
         accepted_effects: Vec<ConnectorRowMutationEffect>,
         input_ordinals: Vec<ConnectorMutationRouteInput>,
-        partition_fields: Vec<ConnectorWriteFieldToken>,
+        requirements: ConnectorWriteRouteRequirements,
         selection_bindings: impl Into<Arc<[ConnectorWriteSelectionBinding]>>,
     ) -> Result<Self, ConnectorError> {
         if accepted_effects.is_empty() {
@@ -580,11 +628,34 @@ impl ConnectorWriteRouteFacts {
                 "a row-mutation route must accept at least one change event",
             ));
         }
+        requirements.validate()?;
+        let input_tokens = input_ordinals
+            .iter()
+            .map(|input| input.token())
+            .collect::<std::collections::BTreeSet<_>>();
+        let keys = match &requirements.colocation {
+            ConnectorWriteColocation::ByKey(keys) => keys.as_slice(),
+            ConnectorWriteColocation::None | ConnectorWriteColocation::Singleton => &[],
+        };
+        let layout_keys = match &requirements.layout {
+            ConnectorWriteLayoutPreference::None => &[][..],
+            ConnectorWriteLayoutPreference::ClusterBy(keys) => keys.as_slice(),
+        };
+        if keys
+            .iter()
+            .chain(layout_keys.iter())
+            .any(|key| !input_tokens.contains(key))
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "write route requirement refers to a field outside its input",
+            ));
+        }
         Ok(Self {
             route_id,
             accepted_effects,
             input_ordinals,
-            partition_fields,
+            requirements,
             selection_bindings: selection_bindings.into(),
         })
     }
@@ -601,8 +672,15 @@ impl ConnectorWriteRouteFacts {
         &self.input_ordinals
     }
 
+    pub const fn requirements(&self) -> &ConnectorWriteRouteRequirements {
+        &self.requirements
+    }
+
     pub fn partition_fields(&self) -> &[ConnectorWriteFieldToken] {
-        &self.partition_fields
+        match &self.requirements.colocation {
+            ConnectorWriteColocation::ByKey(keys) => keys,
+            ConnectorWriteColocation::None | ConnectorWriteColocation::Singleton => &[],
+        }
     }
 
     pub fn selection_bindings(&self) -> &[ConnectorWriteSelectionBinding] {
@@ -1394,7 +1472,10 @@ mod tests {
                 ConnectorWriteFieldToken::from_bytes([1; 32]),
                 0,
             )],
-            Vec::new(),
+            crate::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: crate::connector::write_stack::ConnectorWriteColocation::None,
+                layout: crate::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             Vec::new(),
         )
         .expect("route facts")
@@ -1499,7 +1580,10 @@ mod tests {
                 ConnectorWriteFieldToken::from_bytes([1; 32]),
                 0,
             )],
-            Vec::new(),
+            crate::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: crate::connector::write_stack::ConnectorWriteColocation::None,
+                layout: crate::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             vec![ConnectorWriteSelectionBinding::new(
                 ConnectorWriteFieldToken::from_bytes([1; 32]),
                 ConnectorWriteFieldToken::from_bytes([4; 32]),
@@ -1524,7 +1608,10 @@ mod tests {
                     ordinals[1],
                 ),
             ],
-            Vec::new(),
+            crate::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: crate::connector::write_stack::ConnectorWriteColocation::None,
+                layout: crate::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             vec![
                 ConnectorWriteSelectionBinding::new(
                     ConnectorWriteFieldToken::from_bytes([1; 32]),
@@ -1788,7 +1875,10 @@ mod tests {
                 ConnectorWriteRouteId::from_bytes([1; 32]),
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
+                crate::connector::write_stack::ConnectorWriteRouteRequirements {
+                    colocation: crate::connector::write_stack::ConnectorWriteColocation::None,
+                    layout: crate::connector::write_stack::ConnectorWriteLayoutPreference::None
+                },
                 Vec::new(),
             )
             .expect_err("no accepted effects")
@@ -1884,7 +1974,10 @@ mod tests {
             ConnectorWriteRouteId::from_bytes([9; 32]),
             vec![ConnectorRowMutationEffect::Replace],
             cow_route([1, 0]).input_ordinals().to_vec(),
-            Vec::new(),
+            crate::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: crate::connector::write_stack::ConnectorWriteColocation::None,
+                layout: crate::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             Vec::new(),
         )
         .expect("route");
@@ -1900,7 +1993,10 @@ mod tests {
             ConnectorWriteRouteId::from_bytes([10; 32]),
             vec![ConnectorRowMutationEffect::Replace],
             cow_route([1, 0]).input_ordinals().to_vec(),
-            Vec::new(),
+            crate::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: crate::connector::write_stack::ConnectorWriteColocation::None,
+                layout: crate::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             vec![
                 ConnectorWriteSelectionBinding::new(
                     ConnectorWriteFieldToken::from_bytes([1; 32]),
@@ -1931,7 +2027,10 @@ mod tests {
             ConnectorWriteRouteId::from_bytes([13; 32]),
             vec![ConnectorRowMutationEffect::Replace],
             cow_route([1, 0]).input_ordinals().to_vec(),
-            Vec::new(),
+            crate::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: crate::connector::write_stack::ConnectorWriteColocation::None,
+                layout: crate::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             tampered_bindings,
         )
         .expect("route");
@@ -1965,7 +2064,10 @@ mod tests {
                 ConnectorMutationRouteInput::new(ConnectorWriteFieldToken::from_bytes([1; 32]), 0),
                 ConnectorMutationRouteInput::new(ConnectorWriteFieldToken::from_bytes([2; 32]), 0),
             ],
-            Vec::new(),
+            crate::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: crate::connector::write_stack::ConnectorWriteColocation::None,
+                layout: crate::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             vec![
                 ConnectorWriteSelectionBinding::new(
                     ConnectorWriteFieldToken::from_bytes([1; 32]),
@@ -2005,7 +2107,10 @@ mod tests {
             ConnectorWriteRouteId::from_bytes([12; 32]),
             vec![ConnectorRowMutationEffect::Insert],
             vec![ConnectorMutationRouteInput::new(writer, 0)],
-            Vec::new(),
+            crate::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: crate::connector::write_stack::ConnectorWriteColocation::None,
+                layout: crate::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             vec![ConnectorWriteSelectionBinding::provider_derived(
                 writer,
                 ConnectorWriteProviderDerivedValue::Inherit,

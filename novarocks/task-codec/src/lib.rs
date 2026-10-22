@@ -33,6 +33,7 @@ pub mod context_convergence;
 pub mod creation;
 pub mod descriptor;
 pub mod domain;
+pub mod exchange_flow_codec;
 pub mod identity;
 pub mod lease;
 pub mod operation;
@@ -602,6 +603,7 @@ mod tests {
             }],
             inbound: vec![novarocks::TaskExchangeInbound {
                 destination_node_id: 30,
+                delivery: novarocks::ExchangeDeliveryRequirement::DemandDriven as i32,
                 sources: vec![
                     novarocks::TaskExchangeSource {
                         task: Some(encode_task_identity(identity(1, 1, process))),
@@ -618,6 +620,19 @@ mod tests {
         };
         let decoded = decode_topology(&wire, FieldPath::root("topology")).expect("legal topology");
         assert_eq!(decoded.outbound().len(), 1);
+        assert_eq!(
+            decoded.inbound()[0].delivery(),
+            novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven
+        );
+        for delivery in [
+            novarocks::ExchangeDeliveryRequirement::DemandDriven,
+            novarocks::ExchangeDeliveryRequirement::MustDrain,
+        ] {
+            let mut changed = wire.clone();
+            changed.inbound[0].delivery = delivery as i32;
+            let decoded = decode_topology(&changed, FieldPath::root("topology")).unwrap();
+            assert_eq!(encode_topology(&decoded), changed);
+        }
         assert_eq!(
             decoded.outbound()[0].destinations()[0].fragment_instance_id(),
             novarocks_types::UniqueId::new(3, 1)

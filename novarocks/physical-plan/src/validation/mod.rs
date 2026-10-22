@@ -28,6 +28,7 @@ mod node;
 mod package;
 mod properties;
 mod runtime_filter;
+mod summary;
 
 #[cfg(test)]
 mod tests;
@@ -50,6 +51,7 @@ pub use properties::{
     validate_fragment_output_properties_observed,
 };
 pub(crate) use runtime_filter::*;
+pub(crate) use summary::*;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -446,6 +448,32 @@ fn validate_fragment_structure_into_core<S: FragmentStructureScratch>(
         ));
     }
     let dop = fragment.dop_domain();
+    match fragment.stage_placement() {
+        crate::StagePlacementPolicy::FollowSources { sources } => {
+            if sources.is_empty()
+                || sources.windows(2).any(|pair| pair[0] >= pair[1])
+                || sources.contains(&fragment.id())
+            {
+                errors.push(ValidationError::new(
+                    format!("{prefix}.stage_placement"),
+                    "placement sources must be nonempty, strictly ordered and exclude self",
+                ));
+            }
+        }
+        crate::StagePlacementPolicy::ScanWork => {
+            if !fragment
+                .nodes()
+                .values()
+                .any(|node| matches!(node.kind, crate::NodeKind::Scan { .. }))
+            {
+                errors.push(ValidationError::new(
+                    format!("{prefix}.stage_placement"),
+                    "scan-work placement requires an actual scan",
+                ));
+            }
+        }
+        crate::StagePlacementPolicy::Singleton | crate::StagePlacementPolicy::Spread { .. } => {}
+    }
     if dop.min == 0 || dop.min > dop.max || dop.max > MAX_PIPELINE_DOP {
         errors.push(ValidationError::new(
             format!("{prefix}.dop_domain"),

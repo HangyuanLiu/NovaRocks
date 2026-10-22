@@ -47,6 +47,7 @@ pub(crate) struct ChangeStreamWriteLayoutRoute {
     /// ordinal. SQL never recovers that mapping from an internal column name.
     pub(crate) input_ordinals: Vec<ConnectorMutationRouteInput>,
     /// The provider-selected subset of `input_ordinals` used for partitioning.
+    pub(crate) requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements,
     pub(crate) partition_input_tokens: Vec<ConnectorWriteFieldToken>,
     pub(crate) sink: SqlWritePlanInput,
 }
@@ -70,6 +71,7 @@ pub(crate) struct ChangeStreamWriteRouteSpec {
     /// Positions in `input_ordinals` selected by the Provider's ordered
     /// partition-token list. This retains the exact route-field occurrence even
     /// when multiple fields read the same producer output ordinal.
+    pub(crate) requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements,
     pub(crate) partition_input_positions: Vec<usize>,
     pub(crate) output_partition_ordinals: Vec<usize>,
     pub(crate) sink: SqlWritePlanInput,
@@ -175,6 +177,20 @@ pub(crate) fn bind_change_stream_write_layout(
                 )
             })
             .collect();
+        route
+            .requirements
+            .validate()
+            .map_err(|error| error.to_string())?;
+        let expected_keys = match &route.requirements.colocation {
+            novarocks_spi::connector::write_stack::ConnectorWriteColocation::ByKey(keys) => {
+                keys.as_slice()
+            }
+            novarocks_spi::connector::write_stack::ConnectorWriteColocation::None
+            | novarocks_spi::connector::write_stack::ConnectorWriteColocation::Singleton => &[],
+        };
+        if expected_keys != route.partition_input_tokens {
+            return Err("write route colocation and input-token projection disagree".to_string());
+        }
         let mut partition_tokens = HashSet::new();
         let partition_bindings = route
             .partition_input_tokens
@@ -204,6 +220,7 @@ pub(crate) fn bind_change_stream_write_layout(
             write_target_ordinal: route.write_target_ordinal,
             accepted_effects: route.accepted_effects,
             input_ordinals: route.input_ordinals,
+            requirements: route.requirements,
             partition_input_positions,
             output_partition_ordinals,
             sink: route.sink,
@@ -419,6 +436,10 @@ mod tests {
         effects: Vec<ConnectorRowMutationEffect>,
     ) -> ChangeStreamWriteLayoutRoute {
         ChangeStreamWriteLayoutRoute {
+            requirements: novarocks_spi::connector::write_stack::ConnectorWriteRouteRequirements {
+                colocation: novarocks_spi::connector::write_stack::ConnectorWriteColocation::None,
+                layout: novarocks_spi::connector::write_stack::ConnectorWriteLayoutPreference::None,
+            },
             route_id: ConnectorWriteRouteId::from_bytes([byte; 32]),
             write_target_ordinal: ordinal(write_target_ordinal),
             accepted_effects: effects,

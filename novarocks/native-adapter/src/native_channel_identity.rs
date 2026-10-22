@@ -53,7 +53,12 @@ impl InlineNativeChannelIdentity {
         method: NativeRpcMethod,
     ) -> io::Result<Self> {
         match (method.contract().traffic, peer) {
-            (NativeTrafficClass::Exchange | NativeTrafficClass::RuntimeFilter, Some(peer)) => {
+            (
+                NativeTrafficClass::Exchange
+                | NativeTrafficClass::ExchangeFlowControl
+                | NativeTrafficClass::RuntimeFilter,
+                Some(peer),
+            ) => {
                 BackendProcessId::try_from_uuid(peer.as_uuid())
                     .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
             }
@@ -167,6 +172,12 @@ mod tests {
             InlineNativeChannelIdentity::from_parts(
                 Some(peer(1)),
                 &endpoint,
+                NativeRpcMethod::AcquireExchangePermit,
+            )
+            .unwrap(),
+            InlineNativeChannelIdentity::from_parts(
+                Some(peer(1)),
+                &endpoint,
                 NativeRpcMethod::TransmitRuntimeFilterEnvelope,
             )
             .unwrap(),
@@ -252,7 +263,9 @@ mod tests {
             let without_peer =
                 InlineNativeChannelIdentity::from_parts(None, &endpoint, entry.method);
             match entry.method {
-                NativeRpcMethod::ExchangeUnary | NativeRpcMethod::TransmitRuntimeFilterEnvelope => {
+                NativeRpcMethod::ExchangeUnary
+                | NativeRpcMethod::AcquireExchangePermit
+                | NativeRpcMethod::TransmitRuntimeFilterEnvelope => {
                     assert!(with_peer.is_ok());
                     assert_eq!(
                         without_peer.unwrap_err().kind(),

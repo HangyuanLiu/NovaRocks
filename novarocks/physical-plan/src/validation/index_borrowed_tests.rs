@@ -75,7 +75,12 @@ fn empty() -> Fragment {
         .add_values(NodeId::new(0), Box::from([Box::default()]), Box::default())
         .unwrap();
     builder
-        .finish_definition(NodeId::new(0), FragmentSink::Noop, dop())
+        .finish_definition(
+            NodeId::new(0),
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap()
 }
 fn node(id: u32, inputs: &[u32], outputs: &[u32]) -> PhysicalNode {
@@ -427,7 +432,12 @@ fn genuine_wide_project_fanout_keeps_one_source_port_with_full_original_occurren
     };
     builder.insert_node_unchecked(item).unwrap();
     let fragment = builder
-        .finish_definition(union, FragmentSink::Noop, dop())
+        .finish_definition(
+            union,
+            FragmentSink::Noop,
+            dop(),
+            crate::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let (borrowed, _) = run(&fragment, &Control::default()).unwrap();
     assert_same(&FragmentValidationIndexes::new(&fragment), &borrowed);

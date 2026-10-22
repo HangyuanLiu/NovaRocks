@@ -35,17 +35,67 @@ pub(crate) fn validate_fragment_graph(plan: &PhysicalPlan, errors: &mut Validati
         .copied()
         .map(|fragment| (fragment, 0_usize))
         .collect::<BTreeMap<_, _>>();
-    let mut successors: BTreeMap<FragmentId, Vec<FragmentId>> = BTreeMap::new();
+    let mut successors: BTreeMap<FragmentId, BTreeMap<FragmentId, usize>> = BTreeMap::new();
     for edge in plan.edges().values() {
         if indegree.contains_key(&edge.source.fragment)
             && let Some(degree) = indegree.get_mut(&edge.destination.fragment)
         {
             *degree += 1;
-            successors
+            *successors
                 .entry(edge.source.fragment)
                 .or_default()
-                .push(edge.destination.fragment);
+                .entry(edge.destination.fragment)
+                .or_default() += 1;
         }
+    }
+    for fragment in plan.fragments().values() {
+        if let crate::StagePlacementPolicy::FollowSources { sources } = fragment.stage_placement() {
+            for source in sources {
+                if !successors
+                    .get(source)
+                    .is_some_and(|targets| targets.contains_key(&fragment.id()))
+                {
+                    errors.push(ValidationError::new(
+                        format!("fragments[{}].stage_placement", fragment.id().get()),
+                        "placement source is not an actual predecessor",
+                    ));
+                }
+            }
+        }
+    }
+    for edge in plan.edges().values() {
+        if matches!(edge.partitioning.destination, Distribution::Singleton)
+            && plan
+                .fragments()
+                .get(&edge.destination.fragment)
+                .is_some_and(|fragment| {
+                    !matches!(
+                        fragment.stage_placement(),
+                        crate::StagePlacementPolicy::Singleton
+                    )
+                })
+        {
+            errors.push(ValidationError::new(
+                "edges.placement",
+                "gather destination must declare singleton placement",
+            ));
+        }
+    }
+    if let Some(result) = plan.result_port()
+        && plan
+            .fragments()
+            .get(&result.fragment)
+            .is_some_and(|fragment| {
+                !matches!(
+                    fragment.stage_placement(),
+                    crate::StagePlacementPolicy::Singleton
+                )
+            })
+    {
+        errors.push(ValidationError::new(
+            "result_port.placement",
+            "execution anchor must declare singleton placement",
+        ));
     }
     let mut ready = indegree
         .iter()
@@ -55,9 +105,9 @@ pub(crate) fn validate_fragment_graph(plan: &PhysicalPlan, errors: &mut Validati
     while let Some(fragment) = ready.pop() {
         visited += 1;
         if let Some(next) = successors.get(&fragment) {
-            for successor in next {
+            for (successor, edges) in next {
                 if let Some(degree) = indegree.get_mut(successor) {
-                    *degree -= 1;
+                    *degree -= edges;
                     if *degree == 0 {
                         ready.push(*successor);
                     }
@@ -108,7 +158,13 @@ pub(crate) fn validate_fragment_sink(fragment: &Fragment, errors: &mut Validatio
                 }
             }
         }
-        FragmentSink::Router { effect, routes } => {
+        FragmentSink::Router {
+            effect,
+            routes,
+            summary,
+        } => {
+            validate_logical_summary_output(fragment, summary, errors);
+            edge_ids.insert(summary.edge);
             if root_multiplicity != Some(RowMultiplicity::SingleCopy) {
                 errors.push(ValidationError::new(
                     &path,
@@ -177,15 +233,18 @@ pub(crate) fn validate_fragment_sink(fragment: &Fragment, errors: &mut Validatio
                         "router data input cannot contain its generated effect value",
                     ));
                 }
-                let mut partition_values = BTreeSet::new();
-                if route
-                    .partition_by
-                    .iter()
-                    .any(|value| !partition_values.insert(*value) || !input_values.contains(value))
+                if matches!(&route.requirements.colocation, crate::WriteColocation::ByKey(keys) if keys.is_empty())
+                    || matches!(&route.requirements.layout, crate::WriteLayoutPreference::ClusterBy(keys) if keys.is_empty())
+                    || route
+                        .requirements
+                        .colocation_keys()
+                        .iter()
+                        .chain(route.requirements.layout_keys())
+                        .any(|value| !input_values.contains(value))
                 {
                     errors.push(ValidationError::new(
                         &path,
-                        "router partition values must be unique route inputs",
+                        "router requirements must name nonempty exact route inputs",
                     ));
                 }
                 if !edge_ids.insert(route.edge) {
@@ -643,7 +702,27 @@ pub(crate) fn validate_edge(
             "source projection and receive mapping have different widths",
         ));
     }
-    if let Some(root) = source.nodes().get(&source.root()) {
+    if edge.source.port == crate::FragmentOutputPort::LogicalSummary {
+        match source.sink() {
+            FragmentSink::Router { summary, .. } => {
+                validate_logical_summary_edge(source, summary, edge, errors);
+            }
+            _ => errors.push(ValidationError::new(
+                &path,
+                "summary source has no summary output",
+            )),
+        }
+        if edge.kind != crate::EdgeKind::Stream
+            || edge.partitioning.destination != Distribution::Singleton
+            || edge.partitioning.source_multiplicity != RowMultiplicity::SingleCopy
+            || edge.partitioning.destination_multiplicity != RowMultiplicity::SingleCopy
+        {
+            errors.push(ValidationError::new(
+                &path,
+                "summary requires a single-copy gather stream",
+            ));
+        }
+    } else if let Some(root) = source.nodes().get(&source.root()) {
         let root_values = root_port_indexes
             .entry(source.id())
             .or_insert_with(|| ValuePortIndex::new(&root.output.columns));
@@ -662,6 +741,27 @@ pub(crate) fn validate_edge(
             errors.push(ValidationError::new(
                 &path,
                 "edge source row multiplicity differs from the source fragment root",
+            ));
+        }
+        let role_matches = match edge.role {
+            crate::OutputRole::LogicalSummary => false,
+            crate::OutputRole::WriterResults => {
+                matches!(root.kind, NodeKind::TableWriter { .. })
+                    && edge.delivery == crate::DeliveryRequirement::MustDrain
+            }
+            crate::OutputRole::ProviderRoute { .. } => {
+                matches!(source.sink(), FragmentSink::Router { .. })
+                    && edge.delivery == crate::DeliveryRequirement::MustDrain
+            }
+            crate::OutputRole::Relational => {
+                !matches!(root.kind, NodeKind::TableWriter { .. })
+                    && !matches!(source.sink(), FragmentSink::Router { .. })
+            }
+        };
+        if !role_matches {
+            errors.push(ValidationError::new(
+                &path,
+                "edge output role differs from its exact source",
             ));
         }
     }
@@ -797,6 +897,26 @@ pub(crate) fn validate_mapped_partitioning(
                 && mapped_partition_keys_match(source_keys, destination_keys, mapping)
         }
         (
+            Distribution::ConditionalKey {
+                applies: source_applies,
+                keys: source_keys,
+                scheme: source_scheme,
+            },
+            Distribution::ConditionalKey {
+                applies: destination_applies,
+                keys: destination_keys,
+                scheme: destination_scheme,
+            },
+        ) => {
+            source_scheme == destination_scheme
+                && mapped_partition_keys_match(
+                    std::slice::from_ref(source_applies),
+                    std::slice::from_ref(destination_applies),
+                    mapping,
+                )
+                && mapped_partition_keys_match(source_keys, destination_keys, mapping)
+        }
+        (
             Distribution::BucketShuffle {
                 keys: source_keys,
                 scheme: source_scheme,
@@ -838,14 +958,10 @@ pub(crate) fn mapped_partition_keys_match(
             .all(|(source, destination)| mapping.contains(*source, *destination))
 }
 
-pub(crate) fn distribution_values(distribution: &Distribution) -> &[ValueId] {
-    match distribution {
-        Distribution::Hash { keys, .. } | Distribution::BucketShuffle { keys, .. } => keys,
-        Distribution::Unconstrained
-        | Distribution::Singleton
-        | Distribution::RoundRobin
-        | Distribution::Broadcast => &[],
-    }
+pub(crate) fn distribution_values(
+    distribution: &Distribution,
+) -> impl Iterator<Item = ValueId> + '_ {
+    distribution.value_references()
 }
 
 pub(crate) fn validate_sinks(plan: &PhysicalPlan, errors: &mut ValidationContext) {
@@ -855,7 +971,19 @@ pub(crate) fn validate_sinks(plan: &PhysicalPlan, errors: &mut ValidationContext
         let edges: &[EdgeId] = match fragment.sink() {
             FragmentSink::Stream { edge } => std::slice::from_ref(edge),
             FragmentSink::Multicast { edges } => edges,
-            FragmentSink::Router { routes, .. } => {
+            FragmentSink::Router {
+                routes, summary, ..
+            } => {
+                if !referenced.insert(summary.edge) {
+                    errors.push(ValidationError::new(
+                        &path,
+                        "edge is referenced by more than one sink",
+                    ));
+                }
+                match plan.edges().get(&summary.edge) {
+                    Some(edge) => validate_logical_summary_edge(fragment, summary, edge, errors),
+                    None => errors.push(ValidationError::new(&path, "summary edge is not defined")),
+                }
                 for route in routes {
                     if !referenced.insert(route.edge) {
                         errors.push(ValidationError::new(
@@ -868,6 +996,18 @@ pub(crate) fn validate_sinks(plan: &PhysicalPlan, errors: &mut ValidationContext
                             if edge.source.fragment == fragment.id()
                                 && edge.kind == crate::EdgeKind::ChangeStreamRouter =>
                         {
+                            if edge.source.port != crate::FragmentOutputPort::Root
+                                || edge.role
+                                    != (crate::OutputRole::ProviderRoute {
+                                        target: route.write_target_ordinal,
+                                    })
+                                || edge.delivery != crate::DeliveryRequirement::MustDrain
+                            {
+                                errors.push(ValidationError::new(
+                                    &path,
+                                    "provider route edge role or delivery differs",
+                                ));
+                            }
                             if !edge
                                 .source
                                 .projection
@@ -995,12 +1135,16 @@ pub(crate) fn validate_router_partitioning(
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    let matches = match source_distribution {
-        Distribution::Singleton => route.partition_by.is_empty(),
-        Distribution::Hash { keys, .. } | Distribution::BucketShuffle { keys, .. } => {
-            !route.partition_by.is_empty() && keys.as_ref() == route.partition_by.as_ref()
+    let matches = match (&route.requirements.colocation, source_distribution) {
+        (crate::WriteColocation::None, Distribution::RoundRobin)
+        | (crate::WriteColocation::Singleton, Distribution::Singleton) => true,
+        (crate::WriteColocation::ByKey(required), Distribution::Hash { keys, scheme }) => {
+            !required.is_empty()
+                && keys.as_ref() == required.as_ref()
+                && scheme.definition.algorithm
+                    == novarocks_type_contract::PartitionHashAlgorithm::NativeHierarchicalV1
         }
-        Distribution::Unconstrained | Distribution::RoundRobin | Distribution::Broadcast => false,
+        _ => false,
     };
     if !matches {
         errors.push(ValidationError::new(
@@ -1060,8 +1204,9 @@ pub(crate) fn validate_writer_flows(plan: &PhysicalPlan, errors: &mut Validation
                 .collect::<Box<[_]>>();
             let mut pending = finish_node
                 .inputs
+                .get(finish.inputs.writer_results as usize)
                 .iter()
-                .copied()
+                .map(|node| **node)
                 .map(|node| (fragment.id(), node, finish_values.clone()))
                 .collect::<Vec<_>>();
             let mut visited = BTreeSet::new();
@@ -1489,6 +1634,7 @@ mod scalar_binding_tests {
                         max: 1,
                         requires_power_of_two: false,
                     },
+                    crate::StagePlacementPolicy::Singleton,
                 )
                 .unwrap();
             let result = ResultPort {

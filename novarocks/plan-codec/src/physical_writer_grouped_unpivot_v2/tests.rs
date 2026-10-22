@@ -732,6 +732,12 @@ fn grouped_nonempty_header_parent_merges_value_occurrences_and_source_invoice_on
             ]),
         },
         kind: p::NodeKind::TableFinish(p::WriterFinishSpec {
+            count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
+            inputs: novarocks_physical_plan::FinishInputs {
+                writer_results: 0,
+                logical_summary: None,
+            },
+            logical_summary: None,
             expected_target_ordinals: Box::default(),
             input_schema: p::WriterRelationSchema {
                 revision: 0,

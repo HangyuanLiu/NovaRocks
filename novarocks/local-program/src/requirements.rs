@@ -59,10 +59,14 @@ pub enum BindingRequirement {
         layout: StaticLayout,
     },
     ExchangeInput {
+        role: crate::ProgramOutputRole,
+        delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
         node: ProgramNodeId,
         layout: StaticLayout,
     },
     ExchangeOutput {
+        role: crate::ProgramOutputRole,
+        delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
         branch: usize,
         layout: StaticLayout,
     },

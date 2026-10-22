@@ -31,6 +31,9 @@ const ROWS: usize = BACKENDS
     * (GEOMETRY.transport_exchange_connections_per_peer
         + GEOMETRY.transport_exchange_connecting_positions_per_peer
         + GEOMETRY.transport_exchange_closing_positions_per_peer
+        + GEOMETRY.transport_exchange_flow_control_connections_per_peer
+        + GEOMETRY.transport_exchange_flow_control_connecting_positions_per_peer
+        + GEOMETRY.transport_exchange_flow_control_closing_positions_per_peer
         + GEOMETRY.transport_runtime_filter_connections_per_peer
         + GEOMETRY.transport_runtime_filter_connecting_positions_per_peer
         + GEOMETRY.transport_runtime_filter_closing_positions_per_peer) as usize
@@ -99,6 +102,12 @@ fn limits(key: InlineNativeChannelIdentity) -> io::Result<Limits> {
             live: GEOMETRY.transport_exchange_connections_per_peer as usize,
             connecting: GEOMETRY.transport_exchange_connecting_positions_per_peer as usize,
             closing: GEOMETRY.transport_exchange_closing_positions_per_peer as usize,
+        }),
+        (Some(_), NativeRpcMethod::AcquireExchangePermit) => Ok(Limits {
+            live: GEOMETRY.transport_exchange_flow_control_connections_per_peer as usize,
+            connecting: GEOMETRY.transport_exchange_flow_control_connecting_positions_per_peer
+                as usize,
+            closing: GEOMETRY.transport_exchange_flow_control_closing_positions_per_peer as usize,
         }),
         (Some(_), NativeRpcMethod::TransmitRuntimeFilterEnvelope) => Ok(Limits {
             live: GEOMETRY.transport_runtime_filter_connections_per_peer as usize,
@@ -313,6 +322,9 @@ mod tests {
             port,
         )
     }
+    fn flow_control(peer: u8, port: u16) -> InlineNativeChannelIdentity {
+        key(Some(peer), NativeRpcMethod::AcquireExchangePermit, port)
+    }
     fn membership(port: u16) -> InlineNativeChannelIdentity {
         key(None, NativeRpcMethod::AnnounceBackend, port)
     }
@@ -322,7 +334,7 @@ mod tests {
 
     #[test]
     fn frozen_rows_and_embedded_layout_are_finite() {
-        assert_eq!(ROWS, 230);
+        assert_eq!(ROWS, 326);
     }
 
     #[test]
@@ -343,6 +355,26 @@ mod tests {
         capacity.install(other_lane).unwrap();
         let extra_filter = capacity.claim(filter(1, 9003)).unwrap();
         blocked(capacity.install(extra_filter));
+    }
+
+    #[test]
+    fn exchange_flow_control_has_an_independent_finite_peer_lane() {
+        let capacity = NativeConnectionKeyCapacity::new().unwrap();
+        for port in [9000, 9001] {
+            let data = capacity.claim(exchange(1, port)).unwrap();
+            capacity.install(data).unwrap();
+        }
+        let permit = capacity.claim(flow_control(1, 9000)).unwrap();
+        blocked(capacity.claim(flow_control(1, 9001)));
+        capacity.install(permit).unwrap();
+        let extra = capacity.claim(flow_control(1, 9001)).unwrap();
+        blocked(capacity.install(extra));
+        capacity.exit(extra).unwrap();
+        capacity.retire(permit).unwrap();
+        let replacement = capacity.claim(flow_control(1, 9001)).unwrap();
+        capacity.install(replacement).unwrap();
+        capacity.exit(permit).unwrap();
+        capacity.exit(replacement).unwrap();
     }
 
     #[test]
@@ -450,6 +482,7 @@ mod tests {
         };
         for peer in 1..=BACKENDS as u8 {
             fill_lane(exchange(peer, 9000));
+            fill_lane(flow_control(peer, 9000));
             fill_lane(filter(peer, 9000));
         }
         fill_lane(membership(9000));

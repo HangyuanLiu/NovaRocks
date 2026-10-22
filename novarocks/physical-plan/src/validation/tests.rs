@@ -348,6 +348,7 @@ mod validation_error_tests {
                     max: 1,
                     requires_power_of_two: false,
                 },
+                crate::StagePlacementPolicy::Singleton,
             )
             .unwrap();
         let node = fragment.nodes().get(&node).unwrap();
@@ -462,6 +463,7 @@ mod validation_error_tests {
                     max: 1,
                     requires_power_of_two: false,
                 },
+                crate::StagePlacementPolicy::Singleton,
             )
             .expect("a wide identity project is semantically valid");
         validate_fragment(&fragment, &FragmentCuts::default())
@@ -716,6 +718,7 @@ mod validation_error_tests {
                     max: 1,
                     requires_power_of_two: false,
                 },
+                crate::StagePlacementPolicy::Singleton,
             )
             .expect("the wide shared-child project fanout is semantically valid");
 

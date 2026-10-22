@@ -44,6 +44,11 @@ pub(crate) fn entry_positions() -> io::Result<usize> {
         .transport_exchange_connections_per_peer
         .checked_add(g.transport_exchange_connecting_positions_per_peer)
         .and_then(|n| n.checked_add(g.transport_exchange_closing_positions_per_peer))
+        .and_then(|n| n.checked_add(g.transport_exchange_flow_control_connections_per_peer))
+        .and_then(|n| {
+            n.checked_add(g.transport_exchange_flow_control_connecting_positions_per_peer)
+        })
+        .and_then(|n| n.checked_add(g.transport_exchange_flow_control_closing_positions_per_peer))
         .and_then(|n| n.checked_add(g.transport_runtime_filter_connections_per_peer))
         .and_then(|n| n.checked_add(g.transport_runtime_filter_connecting_positions_per_peer))
         .and_then(|n| n.checked_add(g.transport_runtime_filter_closing_positions_per_peer))

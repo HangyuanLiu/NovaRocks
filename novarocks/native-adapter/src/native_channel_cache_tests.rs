@@ -41,11 +41,11 @@ fn fixture() -> (NativeChannelCache, (), (), ()) {
     (NativeChannelCache::bounded().unwrap(), (), (), ())
 }
 
-fn identity(suffix: u8, port: u16, method: NativeRpcMethod) -> InlineNativeChannelIdentity {
+fn identity(suffix: u16, port: u16, method: NativeRpcMethod) -> InlineNativeChannelIdentity {
     let mut bytes = [0; 16];
     bytes[6] = 0x70;
     bytes[8] = 0x80;
-    bytes[15] = suffix;
+    bytes[14..].copy_from_slice(&suffix.to_be_bytes());
     let peer = BackendProcessId::try_from_bytes(bytes).unwrap();
     let endpoint = NativeEndpoint::from_host_port("cache.example.com", port).unwrap();
     InlineNativeChannelIdentity::from_parts(Some(peer), &endpoint, method).unwrap()
@@ -376,12 +376,12 @@ fn leader_cancellation_during_outer_unwind_notifies_all_without_double_panic() {
 async fn full_ready_cache_recycles_cold_entries_with_fresh_generations_and_rotation() {
     let (cache, _factory, _budget, _) = fixture();
     let count = entry_positions().unwrap();
-    assert_eq!(count, 230);
+    assert_eq!(count, 326);
     let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:9").connect_lazy();
     let keys: Vec<_> = (1..=count)
         .map(|suffix| {
             identity(
-                u8::try_from(suffix).unwrap(),
+                u16::try_from(suffix).unwrap(),
                 9000,
                 NativeRpcMethod::ExchangeUnary,
             )
@@ -393,7 +393,11 @@ async fn full_ready_cache_recycles_cold_entries_with_fresh_generations_and_rotat
         previous_generations[leader.entry] = leader.generation;
         leader.publish(channel.clone()).unwrap();
     }
-    let first_key = identity(231, 9000, NativeRpcMethod::ExchangeUnary);
+    let first_key = identity(
+        u16::try_from(count + 1).unwrap(),
+        9000,
+        NativeRpcMethod::ExchangeUnary,
+    );
     let first = elect(&cache, first_key);
     let first_entry = first.entry;
     assert_eq!(first.generation, previous_generations[first_entry] + 1);
@@ -403,7 +407,14 @@ async fn full_ready_cache_recycles_cold_entries_with_fresh_generations_and_rotat
         poll(&mut cache.acquire(first_key), Waker::noop()),
         Poll::Ready(Ok(Election::Ready(_)))
     ));
-    let second = elect(&cache, identity(232, 9000, NativeRpcMethod::ExchangeUnary));
+    let second = elect(
+        &cache,
+        identity(
+            u16::try_from(count + 2).unwrap(),
+            9000,
+            NativeRpcMethod::ExchangeUnary,
+        ),
+    );
     assert_ne!(
         second.entry, first_entry,
         "eviction must rotate instead of replacing the newest row repeatedly"
@@ -427,13 +438,17 @@ async fn full_connecting_occupied_ready_or_exhausted_rows_refuse_cold_eviction()
     let keys: Vec<_> = (1..=count)
         .map(|suffix| {
             identity(
-                u8::try_from(suffix).unwrap(),
+                u16::try_from(suffix).unwrap(),
                 9000,
                 NativeRpcMethod::ExchangeUnary,
             )
         })
         .collect();
-    let cold_key = identity(231, 9000, NativeRpcMethod::ExchangeUnary);
+    let cold_key = identity(
+        u16::try_from(count + 1).unwrap(),
+        9000,
+        NativeRpcMethod::ExchangeUnary,
+    );
     let leaders: Vec<_> = keys.iter().map(|&key| elect(&cache, key)).collect();
     assert_error(
         poll(&mut cache.acquire(cold_key), Waker::noop()),

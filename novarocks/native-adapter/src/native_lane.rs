@@ -59,12 +59,13 @@ pub enum NativeLane {
     Observation,
     LifecycleControl,
     Exchange,
+    ExchangeFlowControl,
     RuntimeFilter,
     Membership,
 }
 
 impl NativeLane {
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
     pub const ALL: [Self; Self::COUNT] = [
         Self::ResultData,
         Self::Submission,
@@ -73,6 +74,7 @@ impl NativeLane {
         Self::Exchange,
         Self::RuntimeFilter,
         Self::Membership,
+        Self::ExchangeFlowControl,
     ];
 
     /// The lane of a manifest traffic class; retired traffic has none.
@@ -80,6 +82,7 @@ impl NativeLane {
         match traffic {
             NativeTrafficClass::Frontend(lane) => Some(Self::frontend(lane)),
             NativeTrafficClass::Exchange => Some(Self::Exchange),
+            NativeTrafficClass::ExchangeFlowControl => Some(Self::ExchangeFlowControl),
             NativeTrafficClass::RuntimeFilter => Some(Self::RuntimeFilter),
             NativeTrafficClass::Membership => Some(Self::Membership),
             NativeTrafficClass::Retired => None,
@@ -104,6 +107,7 @@ impl NativeLane {
             Self::Exchange => 4,
             Self::RuntimeFilter => 5,
             Self::Membership => 6,
+            Self::ExchangeFlowControl => 7,
         }
     }
 
@@ -115,6 +119,7 @@ impl NativeLane {
             Self::Observation => "observation",
             Self::LifecycleControl => "lifecycle_control",
             Self::Exchange => "exchange",
+            Self::ExchangeFlowControl => "exchange_flow_control",
             Self::RuntimeFilter => "runtime_filter",
             Self::Membership => "membership",
         }

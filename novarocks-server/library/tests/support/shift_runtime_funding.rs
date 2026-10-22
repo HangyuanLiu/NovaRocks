@@ -160,6 +160,8 @@ pub(super) fn runtime_for_names(
     Arc::new(
         ExecutionRuntime::new(
             ExecutionRuntimeConfig {
+                exchange_receive_staging_max_bytes: 64 * 1024 * 1024,
+                keyed_assertion_state_max_bytes: 64 * 1024 * 1024,
                 driver_threads: 1,
                 exchange_wait_ms: 50,
                 exchange_io_threads: 1,
@@ -290,6 +292,7 @@ fn source_for_arguments(
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap()
         .with_call_requests_observed(

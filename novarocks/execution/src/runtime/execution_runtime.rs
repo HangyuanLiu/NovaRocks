@@ -21,6 +21,8 @@ pub struct ExecutionRuntimeConfig {
     pub exchange_wait_ms: u64,
     pub exchange_io_threads: usize,
     pub exchange_io_max_inflight_bytes: usize,
+    pub exchange_receive_staging_max_bytes: usize,
+    pub keyed_assertion_state_max_bytes: usize,
     pub exchange_max_transmit_batched_bytes: usize,
     pub operator_buffer_chunks: usize,
     pub local_exchange_buffer_mem_limit_per_driver: usize,
@@ -43,6 +45,14 @@ impl ExecutionRuntimeConfig {
             (
                 "exchange_max_transmit_batched_bytes",
                 self.exchange_max_transmit_batched_bytes,
+            ),
+            (
+                "exchange_receive_staging_max_bytes",
+                self.exchange_receive_staging_max_bytes,
+            ),
+            (
+                "keyed_assertion_state_max_bytes",
+                self.keyed_assertion_state_max_bytes,
             ),
             ("operator_buffer_chunks", self.operator_buffer_chunks),
             (
@@ -201,6 +211,8 @@ pub(crate) fn test_execution_runtime() -> Arc<ExecutionRuntime> {
     Arc::new(
         ExecutionRuntime::new(
             ExecutionRuntimeConfig {
+                exchange_receive_staging_max_bytes: 64 * 1024 * 1024,
+                keyed_assertion_state_max_bytes: 64 * 1024 * 1024,
                 driver_threads: 1,
                 exchange_wait_ms: 120_000,
                 exchange_io_threads: 1,
@@ -279,6 +291,8 @@ mod tests {
 
     fn config() -> ExecutionRuntimeConfig {
         ExecutionRuntimeConfig {
+            exchange_receive_staging_max_bytes: 64 * 1024 * 1024,
+            keyed_assertion_state_max_bytes: 64 * 1024 * 1024,
             driver_threads: 1,
             exchange_wait_ms: 120_000,
             exchange_io_threads: 1,
@@ -320,6 +334,22 @@ mod tests {
         )
         .expect("valid runtime config");
         assert_eq!(runtime.config(), &config);
+    }
+
+    #[test]
+    fn refuses_zero_change_stream_capacity_before_any_runtime_threads_start() {
+        let mut staging = config();
+        staging.exchange_receive_staging_max_bytes = 0;
+        assert_eq!(
+            staging.validate().unwrap_err().to_string(),
+            "execution runtime configuration error: exchange_receive_staging_max_bytes must be non-zero"
+        );
+        let mut keys = config();
+        keys.keyed_assertion_state_max_bytes = 0;
+        assert_eq!(
+            keys.validate().unwrap_err().to_string(),
+            "execution runtime configuration error: keyed_assertion_state_max_bytes must be non-zero"
+        );
     }
 
     #[test]

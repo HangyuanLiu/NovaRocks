@@ -43,9 +43,10 @@ use sha2::{Digest, Sha256};
 // Design: ADR-0124 (docs/adr/ADR-0124-native-compatibility-islands-and-ingress-admission.md)
 /// Domain separator for the immutable Native compatibility identity encoding.
 ///
-/// Version 7 removes the retired execution implementation manifest component.
-/// The static-plan interpreter component keeps its frozen v1 domain and bytes.
-pub const NATIVE_COMPATIBILITY_DOMAIN: &[u8] = b"novarocks.native-compatibility-id/v7\0";
+/// Version 8 freezes change-stream output roles, permit geometry and the
+/// independent hierarchy hash. The static interpreter component retains its
+/// sealed catalogue encoding.
+pub const NATIVE_COMPATIBILITY_DOMAIN: &[u8] = b"novarocks.native-compatibility-id/v8\0";
 
 /// Domain separator for the pure physical-plan contract component.
 const PLAN_CONTRACT_DOMAIN: &[u8] = b"novarocks.physical-plan-contract/v1\0";
@@ -88,6 +89,8 @@ impl StaticPlanInterpreter {
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
 ///
+/// Epoch 8 adds strict exchange flow control, independent logical write results,
+/// explicit stage placement and selected-action assertion contracts.
 /// Epoch 7 removes the retired evaluator implementation from compatibility
 /// material. Catalogue, provider, descriptor and compiled static facts retain
 /// their own authority. Pre-F3 binaries stay in another island.
@@ -104,11 +107,11 @@ impl StaticPlanInterpreter {
 /// boundary under the synchronous creation and direct release contract, so
 /// the two never share an island.
 #[cfg(not(feature = "native-compatibility-test-fixture"))]
-pub const NATIVE_COMPAT_EPOCH: u64 = 7;
+pub const NATIVE_COMPAT_EPOCH: u64 = 8;
 
 /// Test-only alternate epoch used to produce an actual different-island binary.
 #[cfg(feature = "native-compatibility-test-fixture")]
-pub const NATIVE_COMPAT_EPOCH: u64 = 8;
+pub const NATIVE_COMPAT_EPOCH: u64 = 9;
 
 #[cfg(all(feature = "native-compatibility-test-fixture", not(debug_assertions)))]
 compile_error!("native-compatibility-test-fixture is only supported by debug and dev-opt builds");
@@ -440,7 +443,7 @@ mod tests {
 
         assert_eq!(
             material.id().to_string(),
-            "5d9045a98612cebc1069648d014c64e33c9712641dcdcc60bf00cdf06372cd16"
+            "75a4b247c42dbd484cb49d189891c03d0a844add97aa3d185ad2e4fe505dcf3b"
         );
         assert_eq!(material.function_catalog_digest(), [0x31; 32]);
         assert_eq!(material.plan_contract_revision(), 1);
@@ -659,9 +662,9 @@ mod tests {
     #[test]
     fn test_fixture_epoch_is_explicit_and_never_ambient() {
         #[cfg(feature = "native-compatibility-test-fixture")]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 8);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 9);
         #[cfg(not(feature = "native-compatibility-test-fixture"))]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 7);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 8);
     }
     #[test]
     fn signed_process_claims_do_not_share_the_subject_only_epoch() {
@@ -715,7 +718,7 @@ mod tests {
         });
         assert_eq!(
             material.id().to_string(),
-            "5d9045a98612cebc1069648d014c64e33c9712641dcdcc60bf00cdf06372cd16"
+            "75a4b247c42dbd484cb49d189891c03d0a844add97aa3d185ad2e4fe505dcf3b"
         );
         assert_eq!(
             material.static_plan_interpreter(),

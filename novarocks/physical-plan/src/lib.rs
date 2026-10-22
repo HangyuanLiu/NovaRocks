@@ -41,6 +41,7 @@ mod resource;
 mod runtime_filter_binding;
 mod structure_input;
 mod validation;
+mod write_execution;
 
 pub use builder::*;
 pub use call_requests::*;
@@ -86,11 +87,12 @@ pub use resource::{
 pub use runtime_filter_binding::*;
 pub use structure_input::FragmentStructureInput;
 pub use validation::*;
+pub use write_execution::*;
 
 /// Exact revision of the semantic plan contract implemented by this crate.
 ///
 /// It is part of the repository's complete Native compatibility material.
-pub const PLAN_CONTRACT_REVISION: u32 = 15;
+pub const PLAN_CONTRACT_REVISION: u32 = 16;
 
 #[cfg(test)]
 mod tests;

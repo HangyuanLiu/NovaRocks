@@ -70,6 +70,7 @@ pub struct NativeResultSupportGeometry {
     pub transport_data_handshake_positions: u64,
     pub transport_control_handshake_positions: u64,
     pub transport_exchange_connections_per_peer: u64,
+    pub transport_exchange_flow_control_connections_per_peer: u64,
     pub transport_runtime_filter_connections_per_peer: u64,
     pub transport_exchange_inflight_per_peer: u64,
     pub transport_exchange_short_tails_per_peer: u64,
@@ -101,6 +102,8 @@ pub struct NativeResultSupportGeometry {
     pub transport_closing_positions_per_lane: u64,
     pub transport_exchange_connecting_positions_per_peer: u64,
     pub transport_exchange_closing_positions_per_peer: u64,
+    pub transport_exchange_flow_control_connecting_positions_per_peer: u64,
+    pub transport_exchange_flow_control_closing_positions_per_peer: u64,
     pub transport_runtime_filter_connecting_positions_per_peer: u64,
     pub transport_runtime_filter_closing_positions_per_peer: u64,
 }
@@ -152,6 +155,7 @@ impl NativeResultSupportGeometry {
         transport_data_handshake_positions: 32,
         transport_control_handshake_positions: 8,
         transport_exchange_connections_per_peer: 2,
+        transport_exchange_flow_control_connections_per_peer: 1,
         transport_runtime_filter_connections_per_peer: 1,
         transport_exchange_inflight_per_peer: 32,
         transport_exchange_short_tails_per_peer: 32,
@@ -183,6 +187,8 @@ impl NativeResultSupportGeometry {
         transport_closing_positions_per_lane: 1,
         transport_exchange_connecting_positions_per_peer: 1,
         transport_exchange_closing_positions_per_peer: 1,
+        transport_exchange_flow_control_connecting_positions_per_peer: 1,
+        transport_exchange_flow_control_closing_positions_per_peer: 1,
         transport_runtime_filter_connecting_positions_per_peer: 1,
         transport_runtime_filter_closing_positions_per_peer: 1,
     };

@@ -838,6 +838,7 @@ mod tests {
                 ExchangeInbound::try_new(
                     FragmentNodeId::new(7),
                     vec![ExchangeSource::new(source, source_kernel, 0)],
+                    novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
                 )
                 .unwrap(),
             ],

@@ -921,6 +921,7 @@ fn two_source_consumer(
                             b_ordinal,
                         ),
                     ],
+                    novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
                 )
                 .expect("legal inbound"),
             ],

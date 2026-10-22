@@ -466,9 +466,12 @@ pub(super) fn edge(
     destination: Distribution,
 ) -> Edge {
     Edge {
+        role: novarocks_physical_plan::OutputRole::Relational,
+        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
         id,
         kind: EdgeKind::Stream,
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: from.0,
             projection: Box::from(from.1),
         },
@@ -500,7 +503,14 @@ pub(super) fn finish(
     sink: FragmentSink,
     max_dop: u32,
 ) -> Fragment {
-    let fragment = builder.finish_definition(root, sink, dop(max_dop)).unwrap();
+    let fragment = builder
+        .finish_definition(
+            root,
+            sink,
+            dop(max_dop),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
     let mut entries = fragment
         .call_requests()
         .entries()

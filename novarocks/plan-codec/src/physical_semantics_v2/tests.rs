@@ -74,6 +74,7 @@ fn input() -> FragmentPackageInput {
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let flow = ExpressionControlFlow::try_new(

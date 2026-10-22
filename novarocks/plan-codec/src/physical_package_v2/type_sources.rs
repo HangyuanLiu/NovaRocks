@@ -457,7 +457,7 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
         for (ordinal, import) in cut.imports.iter().enumerate() {
             walk.value(owner, C::CutImport(ordinal), &import.source.ty)?;
         }
-        if let Some(result) = &cut.writer_result {
+        if let p::ExchangePayloadContract::WriterResults(result) = &cut.payload {
             for (ordinal, field) in result.fields.iter().enumerate() {
                 walk.value(owner, C::CutWriterResult(ordinal), &field.ty)?;
             }
@@ -477,7 +477,7 @@ pub(crate) fn visit_package_type_sources_admitted_in<'source, E: From<CompileCon
         for (ordinal, import) in cut.destination_imports.iter().enumerate() {
             walk.value(owner, C::CutDestinationImport(ordinal), &import.source.ty)?;
         }
-        if let Some(result) = &cut.writer_result {
+        if let p::ExchangePayloadContract::WriterResults(result) = &cut.payload {
             for (ordinal, field) in result.fields.iter().enumerate() {
                 walk.value(owner, C::CutWriterResult(ordinal), &field.ty)?;
             }
@@ -774,7 +774,12 @@ mod tests {
                 ),
                 (
                     cut_roots[ordinal + 8],
-                    &cut.writer_result.as_ref().unwrap().fields[ordinal].ty,
+                    &match &cut.payload {
+                        p::ExchangePayloadContract::WriterResults(result) => result,
+                        _ => panic!("expected writer result proof"),
+                    }
+                    .fields[ordinal]
+                        .ty,
                 ),
             ] {
                 let PackageTypeSource::Value(actual) = root.1 else {

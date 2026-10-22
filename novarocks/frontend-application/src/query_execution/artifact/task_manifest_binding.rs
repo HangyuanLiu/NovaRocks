@@ -225,6 +225,7 @@ pub(crate) struct BoundManifestEdge {
     target_fragment_id: FragmentId,
     target_exchange_node_id: i32,
     partition_kind: BoundManifestPartitionKind,
+    delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
     producers: Box<[BoundManifestProducer]>,
     destinations: Box<[TaskIdentity]>,
     sender_count: NonZeroU32,
@@ -249,6 +250,12 @@ impl BoundManifestEdge {
 
     pub(crate) const fn partition_kind(&self) -> BoundManifestPartitionKind {
         self.partition_kind
+    }
+
+    pub(crate) const fn delivery(
+        &self,
+    ) -> novarocks_execution_contract::ExchangeDeliveryRequirement {
+        self.delivery
     }
 
     pub(crate) fn producers(&self) -> &[BoundManifestProducer] {
@@ -712,13 +719,19 @@ enum PreparedScanSource {
 /// This projection is constructed from the retained preparation/template
 /// owners. Tests can exercise the validation core without creating a second
 /// scheduling authority or making `AttemptSchedule` forgeable.
+#[derive(Clone, Copy, Debug)]
+struct PreparedEdgeFacts {
+    partition_kind: BoundManifestPartitionKind,
+    delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
+}
+
 #[derive(Debug)]
 struct PreparedManifestFacts {
     fragments: BTreeSet<FragmentId>,
     execution_anchor: FragmentId,
     scans: BTreeMap<PlanScanIdentity, PreparedScanSource>,
     scans_by_node: BTreeMap<(FragmentId, i32), PlanScanIdentity>,
-    edges: BTreeMap<PreparedEdgeKey, BoundManifestPartitionKind>,
+    edges: BTreeMap<PreparedEdgeKey, PreparedEdgeFacts>,
 }
 
 impl PreparedManifestFacts {
@@ -777,7 +790,10 @@ impl PreparedManifestFacts {
             if edges
                 .insert(
                     key,
-                    BoundManifestPartitionKind::from_plan(edge.partition_kind),
+                    PreparedEdgeFacts {
+                        partition_kind: BoundManifestPartitionKind::from_plan(edge.partition_kind),
+                        delivery: edge.delivery,
+                    },
                 )
                 .is_some()
             {
@@ -1177,7 +1193,8 @@ fn validate_edges(
                 source_fragment_id: edge.source_fragment_id,
                 target_fragment_id: edge.target_fragment_id,
                 target_exchange_node_id: edge.target_exchange_node_id,
-                partition_kind: prepared.edges[&key],
+                partition_kind: prepared.edges[&key].partition_kind,
+                delivery: prepared.edges[&key].delivery,
                 producers: edge
                     .producers
                     .into_iter()
@@ -1629,7 +1646,10 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, (&(source, target, exchange), &partition))| {
-                assert_eq!(partition, super::BoundManifestPartitionKind::Unpartitioned);
+                assert_eq!(
+                    partition.partition_kind,
+                    super::BoundManifestPartitionKind::Unpartitioned
+                );
                 let original = scheduling
                     .edges
                     .iter()
@@ -2101,9 +2121,16 @@ mod tests {
             execution_anchor: target,
             scans: Default::default(),
             scans_by_node: Default::default(),
-            edges: [((source, target, exchange), BoundManifestPartitionKind::Hash)]
-                .into_iter()
-                .collect(),
+            edges: [(
+                (source, target, exchange),
+                super::PreparedEdgeFacts {
+                    partition_kind: BoundManifestPartitionKind::Hash,
+                    delivery:
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                },
+            )]
+            .into_iter()
+            .collect(),
         }
     }
 
@@ -2176,8 +2203,22 @@ mod tests {
             scans: Default::default(),
             scans_by_node: Default::default(),
             edges: [
-                ((1, 3, 77), BoundManifestPartitionKind::Hash),
-                ((2, 3, 77), BoundManifestPartitionKind::Hash),
+                (
+                    (1, 3, 77),
+                    super::PreparedEdgeFacts {
+                        partition_kind: BoundManifestPartitionKind::Hash,
+                        delivery:
+                            novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                    },
+                ),
+                (
+                    (2, 3, 77),
+                    super::PreparedEdgeFacts {
+                        partition_kind: BoundManifestPartitionKind::Hash,
+                        delivery:
+                            novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                    },
+                ),
             ]
             .into_iter()
             .collect(),

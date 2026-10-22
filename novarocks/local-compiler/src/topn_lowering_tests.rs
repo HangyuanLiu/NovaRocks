@@ -62,6 +62,7 @@ fn complete(
             max: 1,
             requires_power_of_two: false,
         },
+        novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     let roots = PhysicalExpressionRoots::try_new(&fragment, &Control::good())?;
     let domain = EvaluationDomainId::new(0);
@@ -1140,7 +1141,12 @@ mod scan_split {
             requires_power_of_two: false,
         };
         let producer = producer
-            .finish_definition(PARTIAL, FragmentSink::Stream { edge: EDGE }, dop)
+            .finish_definition(
+                PARTIAL,
+                FragmentSink::Stream { edge: EDGE },
+                dop,
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            )
             .map_err(|error| error.to_string())?;
 
         let mut consumer = FragmentBuilder::new(CONSUMER);
@@ -1187,16 +1193,24 @@ mod scan_split {
             )
             .map_err(|error| error.to_string())?;
         let consumer = consumer
-            .finish_definition(FINAL, FragmentSink::Result, dop)
+            .finish_definition(
+                FINAL,
+                FragmentSink::Result,
+                dop,
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            )
             .map_err(|error| error.to_string())?;
 
         let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
         plan.add_fragment(producer).unwrap();
         plan.add_fragment(consumer).unwrap();
         plan.add_edge(Edge {
+            role: novarocks_physical_plan::OutputRole::Relational,
+            delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
             id: EDGE,
             kind: EdgeKind::Stream,
             source: EdgeSource {
+                port: novarocks_physical_plan::FragmentOutputPort::Root,
                 fragment: PRODUCER,
                 projection: provider.clone().into_boxed_slice(),
             },

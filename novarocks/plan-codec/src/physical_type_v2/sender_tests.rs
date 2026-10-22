@@ -971,7 +971,12 @@ fn checked_writer_plan_packages(
         })
         .unwrap();
     let producer = builder
-        .finish_definition(writer, p::FragmentSink::Stream { edge }, dop())
+        .finish_definition(
+            writer,
+            p::FragmentSink::Stream { edge },
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let mut builder = p::FragmentBuilder::new(p::FragmentId::new(2));
     let exchange = builder.reserve_node_id().unwrap();
@@ -1028,6 +1033,12 @@ fn checked_writer_plan_packages(
                 columns: outputs.iter().map(|field| field.value).collect(),
             },
             kind: p::NodeKind::TableFinish(p::WriterFinishSpec {
+                count_mode: novarocks_physical_plan::FinishCountMode::WriterReported,
+                inputs: novarocks_physical_plan::FinishInputs {
+                    writer_results: 0,
+                    logical_summary: None,
+                },
+                logical_summary: None,
                 expected_target_ordinals: Box::from([ordinal]),
                 input_schema: p::WriterRelationSchema {
                     revision: p::WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -1043,7 +1054,12 @@ fn checked_writer_plan_packages(
         })
         .unwrap();
     let consumer = builder
-        .finish_definition(finish, p::FragmentSink::Noop, dop())
+        .finish_definition(
+            finish,
+            p::FragmentSink::Noop,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
     let mut plan = p::PlanBuilder::new(p::PlanVersionId::try_new([1; 16]).unwrap());
     if constant_row {
@@ -1075,9 +1091,12 @@ fn checked_writer_plan_packages(
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(p::Edge {
+        role: p::OutputRole::WriterResults,
+        delivery: p::DeliveryRequirement::MustDrain,
         id: edge,
         kind: p::EdgeKind::Stream,
         source: p::EdgeSource {
+            port: p::FragmentOutputPort::Root,
             fragment: p::FragmentId::new(1),
             projection: fields.iter().map(|field| field.value).collect(),
         },

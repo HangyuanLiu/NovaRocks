@@ -4128,6 +4128,7 @@ fn failed_accepted_preparation_returns_uninstalled_normal_close_reservation() {
             ExchangeInbound::try_new(
                 FragmentNodeId::new(7),
                 vec![ExchangeSource::new(source, UniqueId::new(30, 31), 0)],
+                novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
             )
             .expect("frozen inbound"),
         ],

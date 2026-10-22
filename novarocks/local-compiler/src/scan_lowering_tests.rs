@@ -456,7 +456,12 @@ fn fixture(spec: Spec) -> Fixture {
             .add_values(VALUES, Box::from([Box::from([cell])]), Box::from([column]))
             .unwrap();
         let fragment = build
-            .finish_definition(VALUES, FragmentSink::Stream { edge: BUILD_EDGE }, dop)
+            .finish_definition(
+                VALUES,
+                FragmentSink::Stream { edge: BUILD_EDGE },
+                dop,
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            )
             .unwrap();
         let imported = builder
             .add_value(
@@ -605,16 +610,26 @@ fn fixture(spec: Spec) -> Fixture {
         Sink::Gather => FragmentSink::Stream { edge: EDGE },
         Sink::Result(_) => FragmentSink::Result,
     };
-    let producer = builder.finish_definition(root, producer_sink, dop).unwrap();
+    let producer = builder
+        .finish_definition(
+            root,
+            producer_sink,
+            dop,
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     plan.add_fragment(producer).unwrap();
     if let Some((fragment, column, imported)) = build_fragment {
         plan.add_fragment(fragment).unwrap();
         plan.add_edge(Edge {
+            role: novarocks_physical_plan::OutputRole::Relational,
+            delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
             id: BUILD_EDGE,
             kind: EdgeKind::Stream,
             source: EdgeSource {
+                port: novarocks_physical_plan::FragmentOutputPort::Root,
                 fragment: BUILD,
                 projection: Box::from([column]),
             },
@@ -666,14 +681,22 @@ fn fixture(spec: Spec) -> Fixture {
                 .unwrap();
             plan.add_fragment(
                 consumer
-                    .finish_definition(RECEIVER, FragmentSink::Result, dop)
+                    .finish_definition(
+                        RECEIVER,
+                        FragmentSink::Result,
+                        dop,
+                        novarocks_physical_plan::StagePlacementPolicy::Singleton,
+                    )
                     .unwrap(),
             )
             .unwrap();
             plan.add_edge(Edge {
+                role: novarocks_physical_plan::OutputRole::Relational,
+                delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
                 id: EDGE,
                 kind: EdgeKind::Stream,
                 source: EdgeSource {
+                    port: novarocks_physical_plan::FragmentOutputPort::Root,
                     fragment: PRODUCER,
                     projection: output.clone().into_boxed_slice(),
                 },

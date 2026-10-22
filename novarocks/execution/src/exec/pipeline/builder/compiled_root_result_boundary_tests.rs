@@ -75,6 +75,7 @@ pub(crate) fn boundary_program(project: Option<bool>) -> Arc<LocalProgram> {
                 max: 1,
                 requires_power_of_two: false,
             },
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     compile(

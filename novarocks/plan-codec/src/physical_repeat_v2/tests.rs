@@ -351,6 +351,7 @@ fn complete_repeat_node_matches_independent_wire_and_real_builder_structure() {
             },
             p::PlanLimits::FROZEN,
             &control,
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     let original = fragment.nodes().get(&p::NodeId::new(u32::MAX)).unwrap();
@@ -384,6 +385,7 @@ fn complete_repeat_node_matches_independent_wire_and_real_builder_structure() {
                 },
                 p::PlanLimits::FROZEN,
                 &control,
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .unwrap();
     });

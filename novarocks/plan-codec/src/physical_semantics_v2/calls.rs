@@ -1134,7 +1134,12 @@ mod tests {
         let mut builder = FragmentBuilder::new(FragmentId::new(fragment_id));
         let node = add_values(&mut builder, count, true);
         let fragment = builder
-            .finish_definition(node, FragmentSink::Noop, dop())
+            .finish_definition(
+                node,
+                FragmentSink::Noop,
+                dop(),
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            )
             .unwrap();
         // finish_definition already applies the real definition validator.
         let uses = leaf_roots(&fragment);
@@ -1318,7 +1323,12 @@ mod tests {
             },
         );
         let fragment = builder
-            .finish_definition(table, FragmentSink::Noop, dop())
+            .finish_definition(
+                table,
+                FragmentSink::Noop,
+                dop(),
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            )
             .unwrap();
         // finish_definition already applies the real definition validator.
         let uses = leaf_roots(&fragment);

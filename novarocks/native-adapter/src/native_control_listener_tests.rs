@@ -80,6 +80,18 @@ impl NovaRocksGrpc for ProbeService {
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         panic!("unexpected generated handler: exchange")
     }
+    async fn acquire_exchange_permit(
+        &self,
+        _request: tonic::Request<novarocks_proto_models::novarocks::AcquireExchangePermitRequest>,
+    ) -> Result<
+        tonic::Response<novarocks_proto_models::novarocks::AcquireExchangePermitResponse>,
+        tonic::Status,
+    > {
+        Err(tonic::Status::unimplemented(
+            "exchange permit owner is not installed",
+        ))
+    }
+
     async fn exchange_unary(
         &self,
         _request: tonic::Request<proto::ExchangeRequest>,

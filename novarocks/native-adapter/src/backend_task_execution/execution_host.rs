@@ -3133,7 +3133,14 @@ pub(crate) mod tests {
     fn inbound_topology(node: FragmentNodeId, sources: Vec<ExchangeSource>) -> ExchangeTopology {
         ExchangeTopology::try_new(
             Vec::new(),
-            vec![ExchangeInbound::try_new(node, sources).expect("a legal inbound")],
+            vec![
+                ExchangeInbound::try_new(
+                    node,
+                    sources,
+                    novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
+                )
+                .expect("a legal inbound"),
+            ],
         )
         .expect("a legal topology")
     }
@@ -3394,6 +3401,8 @@ pub(crate) mod tests {
         Arc::new(
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
+                    exchange_receive_staging_max_bytes: 64 * 1024 * 1024,
+                    keyed_assertion_state_max_bytes: 64 * 1024 * 1024,
                     driver_threads: 1,
                     exchange_wait_ms: 120_000,
                     exchange_io_threads: 1,
@@ -3769,6 +3778,9 @@ pub(crate) mod tests {
             ))],
         );
         let request = |destination: UniqueId, source: UniqueId| proto::ExchangeRequest {
+            permit_token: Vec::new(),
+            stream: None,
+            frame_kind: novarocks_proto_models::novarocks::ExchangeFrameKind::Unspecified as i32,
             finst_id_hi: destination.high(),
             finst_id_lo: destination.low(),
             node_id: node.get(),

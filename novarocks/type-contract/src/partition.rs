@@ -20,6 +20,39 @@ use arrow_schema::DataType;
 
 use crate::LARGEINT_BYTE_WIDTH;
 
+/// Fixed domains decorrelate instance selection from local driver selection.
+/// Each level uses the same domain across all sources; no Task identity enters.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum PartitionHashDomain {
+    InstanceV1,
+    DriverV1,
+}
+
+impl PartitionHashDomain {
+    pub const fn stable_name(self) -> &'static str {
+        match self {
+            Self::InstanceV1 => "novarocks.partition.instance.v1",
+            Self::DriverV1 => "novarocks.partition.driver.v1",
+        }
+    }
+    pub const fn mix(self, canonical_hash: u64) -> u64 {
+        let domain = match self {
+            Self::InstanceV1 => 0x3b8d_9f26_4a71_c5e0,
+            Self::DriverV1 => 0xa5c1_68e3_7d02_b94f,
+        };
+        avalanche_hash_u64(canonical_hash ^ domain)
+    }
+}
+
+/// Full-width avalanche shared with native key hashing. This freezes the
+/// existing execution author; a low-bit XOR is not a substitute for it.
+pub const fn avalanche_hash_u64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
+}
+
 /// Complete row-hash identity shared by planner, codec and execution.
 ///
 /// A variant freezes value canonicalization, NULL handling, multi-column
@@ -28,6 +61,10 @@ use crate::LARGEINT_BYTE_WIDTH;
 pub enum PartitionHashAlgorithm {
     /// Native exchange FNV-based row combination followed by unsigned modulo.
     NativeExchangeV1,
+    /// The same canonical row encoding and combination as NativeExchangeV1,
+    /// followed by InstanceV1 or DriverV1 full-width domain mixing before
+    /// unsigned modulo at that level. Source and Task identities never enter.
+    NativeHierarchicalV1,
     /// Native bucket-shuffle CRC32 combination followed by bucket modulo.
     NativeBucketCrc32V1,
 }
@@ -36,13 +73,14 @@ impl PartitionHashAlgorithm {
     pub const fn stable_name(self) -> &'static str {
         match self {
             Self::NativeExchangeV1 => "novarocks.native-exchange.v1",
+            Self::NativeHierarchicalV1 => "novarocks.native-hierarchical.v1",
             Self::NativeBucketCrc32V1 => "novarocks.native-bucket-crc32.v1",
         }
     }
 
     pub const fn nulls_equal(self) -> bool {
         match self {
-            Self::NativeExchangeV1 | Self::NativeBucketCrc32V1 => true,
+            Self::NativeExchangeV1 | Self::NativeHierarchicalV1 | Self::NativeBucketCrc32V1 => true,
         }
     }
 
@@ -63,7 +101,7 @@ impl PartitionHashAlgorithm {
     /// encoding is frozen under a new algorithm identity.
     pub fn supports_partition_key(self, data_type: &DataType) -> bool {
         match self {
-            Self::NativeExchangeV1 => {
+            Self::NativeExchangeV1 | Self::NativeHierarchicalV1 => {
                 canonical_key_leaf(data_type)
                     || matches!(
                         data_type,
@@ -310,6 +348,70 @@ mod tests {
         assert_eq!(
             PartitionCountParameterId::try_new([0; 32]),
             Err(PartitionCountParameterIdentityError::Zero)
+        );
+    }
+}
+
+#[cfg(test)]
+mod hierarchical_hash_tests {
+    use super::PartitionHashDomain::{DriverV1, InstanceV1};
+
+    // Independent integer SplitMix64 vectors freeze both domains and wrapping.
+    #[test]
+    fn hierarchy_v1_domains_have_fixed_full_width_vectors() {
+        assert_eq!(InstanceV1.stable_name(), "novarocks.partition.instance.v1");
+        assert_eq!(DriverV1.stable_name(), "novarocks.partition.driver.v1");
+        for (input, instance, driver) in [
+            (0, 0x16b2_7825_bb4c_c82c, 0x8423_7b5b_9fcc_d701),
+            (1, 0x06c5_6cd3_8f24_7929, 0x31af_a579_a3e8_bcad),
+            (u64::MAX, 0x13ec_1345_992c_6b53, 0x6232_109b_2327_1493),
+        ] {
+            assert_eq!(InstanceV1.mix(input), instance);
+            assert_eq!(DriverV1.mix(input), driver);
+        }
+    }
+
+    // Distribution is a functional property. The fixed input is independent
+    // of writer count, batching and the partition implementation's output.
+    #[test]
+    fn both_levels_use_all_lanes_for_equal_and_shared_factor_counts() {
+        for (instances, drivers) in [(4_usize, 4_usize), (4, 2), (3, 4)] {
+            let mut seen = vec![vec![false; drivers]; instances];
+            for key in 0_u64..4096 {
+                let instance = (InstanceV1.mix(key) % instances as u64) as usize;
+                let driver = (DriverV1.mix(key) % drivers as u64) as usize;
+                seen[instance][driver] = true;
+            }
+            assert!(seen.into_iter().flatten().all(|present| present));
+        }
+    }
+}
+
+#[cfg(test)]
+mod hierarchical_contract_tests {
+    use super::*;
+
+    #[test]
+    fn hierarchy_has_its_own_identity_and_the_same_canonical_key_domain() {
+        assert_ne!(
+            PartitionHashAlgorithm::NativeHierarchicalV1.stable_name(),
+            PartitionHashAlgorithm::NativeExchangeV1.stable_name()
+        );
+        for ty in [
+            DataType::Int64,
+            DataType::Utf8,
+            DataType::Float64,
+            DataType::UInt64,
+            DataType::Binary,
+        ] {
+            assert_eq!(
+                PartitionHashAlgorithm::NativeHierarchicalV1.supports_partition_key(&ty),
+                PartitionHashAlgorithm::NativeExchangeV1.supports_partition_key(&ty)
+            );
+        }
+        assert_ne!(
+            PartitionHashDomain::InstanceV1.mix(17),
+            PartitionHashDomain::DriverV1.mix(17)
         );
     }
 }

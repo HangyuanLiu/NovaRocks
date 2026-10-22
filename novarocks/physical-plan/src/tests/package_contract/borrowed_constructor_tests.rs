@@ -510,6 +510,7 @@ fn collection_fragment(
             },
             PlanLimits::FROZEN,
             &Control,
+            crate::StagePlacementPolicy::Singleton,
         )
         .unwrap();
     (fragment, literal)

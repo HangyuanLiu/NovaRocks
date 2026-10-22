@@ -55,7 +55,7 @@ use crate::native_lane::{
 /// Independent admission domains; incoming Membership never borrows outgoing positions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportClass {
-    /// Incoming FE data and both directions of peer exchange/runtime filters.
+    /// Incoming FE data and both directions of peer exchange, flow control and runtime filters.
     Data,
     /// Incoming FE lifecycle, conservative outgoing reports, and handshakes.
     Control,
@@ -136,6 +136,13 @@ impl AdmissionDimensions {
                 value(g.transport_exchange_closing_positions_per_peer)?,
             )?,
         )?;
+        let exchange_flow_control = add(
+            value(g.transport_exchange_flow_control_connections_per_peer)?,
+            add(
+                value(g.transport_exchange_flow_control_connecting_positions_per_peer)?,
+                value(g.transport_exchange_flow_control_closing_positions_per_peer)?,
+            )?,
+        )?;
         let filters = add(
             value(g.transport_runtime_filter_connections_per_peer)?,
             add(
@@ -146,7 +153,7 @@ impl AdmissionDimensions {
         // Both peer directions conservatively include every live peer.
         let peer_data = mul(
             mul(2, value(g.transport_maximum_live_backends)?)?,
-            add(exchange, filters)?,
+            add(add(exchange, exchange_flow_control)?, filters)?,
         )?;
         let data_handshakes = value(g.transport_data_handshake_positions)?;
         let control_handshakes = value(g.transport_control_handshake_positions)?;
@@ -341,6 +348,10 @@ pub fn incoming_lane_stream_limit(
             value(g.transport_connections_per_frontend_backend_lifecycle_control)?,
         )?,
         NativeLane::Exchange => mul(backends, value(g.transport_exchange_connections_per_peer)?)?,
+        NativeLane::ExchangeFlowControl => mul(
+            backends,
+            value(g.transport_exchange_flow_control_connections_per_peer)?,
+        )?,
         NativeLane::RuntimeFilter => mul(
             backends,
             value(g.transport_runtime_filter_connections_per_peer)?,
@@ -1037,6 +1048,24 @@ mod tests {
         assert!(dimensions.control_positions > dimensions.control_handshakes);
         assert_eq!(dimensions.data_handshakes, 32);
         assert_eq!(dimensions.control_handshakes, 8);
+    }
+
+    #[test]
+    fn flow_control_stream_capacity_is_independent_and_finite() {
+        let admission = NativeTransportAdmission::new().unwrap();
+        let flow = admission.incoming_streams(NativeLane::ExchangeFlowControl);
+        let data = admission.incoming_streams(NativeLane::Exchange);
+        assert_eq!(flow.limit(), 32 * 128);
+        assert_eq!(data.limit(), 32 * 2 * 128);
+        let mut held = Vec::with_capacity(flow.limit());
+        for _ in 0..flow.limit() {
+            held.push(flow.try_acquire().unwrap());
+        }
+        assert!(flow.try_acquire().is_none());
+        let data_permit = data.try_acquire().unwrap();
+        drop(held);
+        assert_eq!(flow.available(), flow.limit());
+        drop(data_permit);
     }
 
     #[test]

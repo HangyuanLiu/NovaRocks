@@ -693,6 +693,8 @@ fn encode_support_geometry(
         transport_data_handshake_positions: value.transport_data_handshake_positions,
         transport_control_handshake_positions: value.transport_control_handshake_positions,
         transport_exchange_connections_per_peer: value.transport_exchange_connections_per_peer,
+        transport_exchange_flow_control_connections_per_peer: value
+            .transport_exchange_flow_control_connections_per_peer,
         transport_runtime_filter_connections_per_peer: value
             .transport_runtime_filter_connections_per_peer,
         transport_exchange_inflight_per_peer: value.transport_exchange_inflight_per_peer,
@@ -732,6 +734,10 @@ fn encode_support_geometry(
             .transport_exchange_connecting_positions_per_peer,
         transport_exchange_closing_positions_per_peer: value
             .transport_exchange_closing_positions_per_peer,
+        transport_exchange_flow_control_connecting_positions_per_peer: value
+            .transport_exchange_flow_control_connecting_positions_per_peer,
+        transport_exchange_flow_control_closing_positions_per_peer: value
+            .transport_exchange_flow_control_closing_positions_per_peer,
         transport_runtime_filter_connecting_positions_per_peer: value
             .transport_runtime_filter_connecting_positions_per_peer,
         transport_runtime_filter_closing_positions_per_peer: value
@@ -961,6 +967,45 @@ mod tests {
             announce.descriptor().unwrap().to_contract().unwrap(),
             contract
         );
+
+        let geometry = encoded
+            .as_proto()
+            .bounded_root_support
+            .as_ref()
+            .unwrap()
+            .geometry
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            geometry.transport_exchange_flow_control_connections_per_peer,
+            1
+        );
+        assert_eq!(
+            geometry.transport_exchange_flow_control_connecting_positions_per_peer,
+            1
+        );
+        assert_eq!(
+            geometry.transport_exchange_flow_control_closing_positions_per_peer,
+            1
+        );
+        let drift: [fn(&mut novarocks::NativeResultSupportGeometry); 3] = [
+            |g| g.transport_exchange_flow_control_connections_per_peer = 0,
+            |g| g.transport_exchange_flow_control_connecting_positions_per_peer = 0,
+            |g| g.transport_exchange_flow_control_closing_positions_per_peer = 0,
+        ];
+        for mutate in drift {
+            let mut changed = encoded.as_proto().clone();
+            mutate(
+                changed
+                    .bounded_root_support
+                    .as_mut()
+                    .unwrap()
+                    .geometry
+                    .as_mut()
+                    .unwrap(),
+            );
+            assert!(BackendProcessDescriptor::parse(changed).is_err());
+        }
 
         let mut missing_control = encoded.as_proto().clone();
         missing_control

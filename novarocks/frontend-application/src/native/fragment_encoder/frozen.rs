@@ -60,6 +60,7 @@ use crate::query_execution::package_freeze::{PackageFreezeError, encode_checked_
 pub(crate) struct StaticSinkTarget {
     target_fragment_id: FragmentId,
     target_exchange_node_id: i32,
+    delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
 }
 
 impl StaticSinkTarget {
@@ -71,7 +72,14 @@ impl StaticSinkTarget {
         Self {
             target_fragment_id,
             target_exchange_node_id,
+            delivery: novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
         }
+    }
+
+    pub(crate) const fn delivery(
+        self,
+    ) -> novarocks_execution_contract::ExchangeDeliveryRequirement {
+        self.delivery
     }
 
     pub(crate) const fn target_fragment_id(self) -> FragmentId {
@@ -252,6 +260,14 @@ fn package_sink_targets(
             Ok(StaticSinkTarget {
                 target_fragment_id: u32::from(edge.destination.fragment.get()),
                 target_exchange_node_id,
+                delivery: match edge.delivery {
+                    novarocks_physical_plan::DeliveryRequirement::DemandDriven => {
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven
+                    }
+                    novarocks_physical_plan::DeliveryRequirement::MustDrain => {
+                        novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+                    }
+                },
             })
         })
         .collect()
@@ -366,7 +382,12 @@ pub(crate) mod tests {
             p::FragmentSink::Result
         };
         let fragment = builder
-            .finish_definition(node, sink, dop_domain)
+            .finish_definition(
+                node,
+                sink,
+                dop_domain,
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
+            )
             .expect("checked fragment definition");
         let roots = p::PhysicalExpressionRoots::try_new(&fragment, &control).expect("roots");
         let bindings = roots
@@ -424,9 +445,12 @@ pub(crate) mod tests {
                 edges.insert(
                     edge_id,
                     p::Edge {
+                        role: novarocks_physical_plan::OutputRole::Relational,
+                        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
                         id: edge_id,
                         kind: p::EdgeKind::Stream,
                         source: p::EdgeSource {
+                            port: novarocks_physical_plan::FragmentOutputPort::Root,
                             fragment: id,
                             projection: values.clone().into_boxed_slice(),
                         },
@@ -461,8 +485,9 @@ pub(crate) mod tests {
                         })
                         .collect(),
                     partitioning,
-                    change_stream_writer: None,
-                    writer_result: None,
+                    source_port: novarocks_physical_plan::FragmentOutputPort::Root,
+                    delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
+                    payload: novarocks_physical_plan::ExchangePayloadContract::Relational,
                 }]
                 .into_boxed_slice();
                 None

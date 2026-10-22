@@ -110,7 +110,8 @@ pub(crate) fn materialize_compiled_sink(
         }
         (
             StaticSinkProgram::MultiCastDataStream { .. }
-            | StaticSinkProgram::SplitDataStream { .. },
+            | StaticSinkProgram::SplitDataStream { .. }
+            | StaticSinkProgram::ChangeStreamRouter { .. },
             _,
         ) => Err(materialization_contract(format!(
             "compiled {} sink not executable yet",
@@ -178,6 +179,7 @@ fn sink_program_name(program: &StaticSinkProgram) -> &'static str {
         StaticSinkProgram::DataStream { .. } => "data_stream",
         StaticSinkProgram::MultiCastDataStream { .. } => "multi_cast_data_stream",
         StaticSinkProgram::SplitDataStream { .. } => "split_data_stream",
+        StaticSinkProgram::ChangeStreamRouter { .. } => "change_stream_router",
     }
 }
 

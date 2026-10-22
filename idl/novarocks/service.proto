@@ -43,6 +43,10 @@ service NovaRocksGrpc {
   rpc Exchange(stream ExchangeRequest) returns (stream ExchangeResponse);
   // Single-message exchange path used by the current gRPC sender.
   rpc ExchangeUnary(ExchangeRequest) returns (ExchangeResponse);
+  // Capacity only: waits without carrying a data payload. This never proves
+  // delivery, EOS consumption, Task completion, or permission to commit.
+  rpc AcquireExchangePermit(AcquireExchangePermitRequest)
+      returns (AcquireExchangePermitResponse);
   // Native runtime-filter envelope propagation.
   rpc TransmitRuntimeFilterEnvelope(novarocks.filter.RuntimeFilterEnvelope)
       returns (novarocks.filter.RuntimeFilterEnvelopeResponse);
@@ -194,6 +198,9 @@ message NativeResultSupportGeometry {
   uint64 transport_exchange_closing_positions_per_peer = 77;
   uint64 transport_runtime_filter_connecting_positions_per_peer = 78;
   uint64 transport_runtime_filter_closing_positions_per_peer = 79;
+  uint64 transport_exchange_flow_control_connections_per_peer = 80;
+  uint64 transport_exchange_flow_control_connecting_positions_per_peer = 81;
+  uint64 transport_exchange_flow_control_closing_positions_per_peer = 82;
 }
 message BoundedRootSupport {
   QueryControlEndpoint control_endpoint = 1;
@@ -447,7 +454,51 @@ message ExchangeRequest {
   int64 source_finst_id_lo = 10;
   uint32 sender_ordinal = 11;
   uint32 sender_count = 12;
+  bytes permit_token = 13; // Exactly 16 bytes, bound to stream/sequence/geometry.
+  ExchangeStreamIdentity stream = 14;
+  ExchangeFrameKind frame_kind = 15;
 }
+
+message ExchangeStreamIdentity {
+  TaskIdentity source_task = 1;
+  int64 source_finst_id_hi = 2;
+  int64 source_finst_id_lo = 3;
+  uint32 sender_ordinal = 4;
+  TaskIdentity destination_task = 5;
+  int64 destination_finst_id_hi = 6;
+  int64 destination_finst_id_lo = 7;
+  int32 destination_node_id = 8;
+}
+enum ExchangeFrameKind {
+  EXCHANGE_FRAME_KIND_UNSPECIFIED = 0;
+  EXCHANGE_FRAME_KIND_DATA = 1;
+  EXCHANGE_FRAME_KIND_LOGICAL_SUMMARY = 2;
+  EXCHANGE_FRAME_KIND_WRITER_RESULTS = 3;
+  EXCHANGE_FRAME_KIND_END = 4;
+}
+message ExchangeFrameGeometry {
+  uint64 wire_bytes = 1;
+  uint64 decoded_bytes = 2;
+  uint64 decode_scratch_bytes = 3;
+}
+message AcquireExchangePermitRequest {
+  ExchangeStreamIdentity stream = 1;
+  int64 sequence = 2;
+  ExchangeFrameKind frame_kind = 3;
+  ExchangeFrameGeometry geometry = 4;
+}
+message ExchangePermitGrant {
+  AcquireExchangePermitRequest request = 1;
+  bytes token = 2; // Receiver-scoped, single claim; expiry uses receiver time.
+}
+message AcquireExchangePermitResponse {
+  novarocks.common.Status status = 1;
+  oneof result {
+    ExchangePermitGrant granted = 2;
+    ExchangeNormalClosed normal_closed = 3;
+  }
+}
+message ExchangeConsumed { int64 final_sequence = 1; }
 
 // Exact receiver-side normal closure for one frozen inbound occurrence and
 // sender. It is not an acknowledgement that the frame payload was delivered.
@@ -460,7 +511,12 @@ message ExchangeNormalClosed {
   int64 source_finst_id_lo = 6;
   uint32 sender_ordinal = 7;
   uint32 sender_count = 8;
+  oneof disposition {
+    ExchangeConsumed consumed = 9;
+    ExchangeWithdrawn withdrawn = 10;
+  }
 }
+message ExchangeWithdrawn {}
 
 // Result for one ExchangeRequest.
 message ExchangeResponse {
@@ -748,10 +804,18 @@ message TaskExchangeEdge {
 
 // One inbound exchange node. The frozen source set doubles as the expected
 // sender count, so the two can never disagree.
+enum ExchangeDeliveryRequirement {
+  EXCHANGE_DELIVERY_REQUIREMENT_UNSPECIFIED = 0;
+  EXCHANGE_DELIVERY_REQUIREMENT_DEMAND_DRIVEN = 1;
+  EXCHANGE_DELIVERY_REQUIREMENT_MUST_DRAIN = 2;
+}
+
 message TaskExchangeInbound {
   int32 destination_node_id = 1;          // nonnegative, unique inside one topology
   repeated TaskExchangeSource sources = 2;  // 1..=4096, no duplicate task and no
                                             // duplicate fragment instance id
+  // Required closed value: ordinary demand withdrawal cannot close MustDrain.
+  ExchangeDeliveryRequirement delivery = 3;
 }
 
 // The complete, frozen push exchange topology of one task. Exchange membership

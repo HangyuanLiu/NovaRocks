@@ -211,6 +211,18 @@ pub fn validate_native_transport_geometry(
             g.transport_exchange_connections_per_peer,
         ),
         (
+            "transport_exchange_flow_control_connections_per_peer",
+            g.transport_exchange_flow_control_connections_per_peer,
+        ),
+        (
+            "transport_exchange_flow_control_connecting_positions_per_peer",
+            g.transport_exchange_flow_control_connecting_positions_per_peer,
+        ),
+        (
+            "transport_exchange_flow_control_closing_positions_per_peer",
+            g.transport_exchange_flow_control_closing_positions_per_peer,
+        ),
+        (
             "transport_runtime_filter_connections_per_peer",
             g.transport_runtime_filter_connections_per_peer,
         ),
@@ -360,6 +372,13 @@ fn per_peer_connections(g: &NativeResultSupportGeometry, lane: NativeLane) -> io
                 g.transport_exchange_closing_positions_per_peer,
             )?,
         ),
+        NativeLane::ExchangeFlowControl => add(
+            g.transport_exchange_flow_control_connections_per_peer,
+            add(
+                g.transport_exchange_flow_control_connecting_positions_per_peer,
+                g.transport_exchange_flow_control_closing_positions_per_peer,
+            )?,
+        ),
         NativeLane::RuntimeFilter => add(
             g.transport_runtime_filter_connections_per_peer,
             add(
@@ -388,8 +407,10 @@ fn envelope(
             (Observation, Incoming, frontends),
             (LifecycleControl, Incoming, frontends),
             (Exchange, Incoming, backends),
+            (ExchangeFlowControl, Incoming, backends),
             (RuntimeFilter, Incoming, backends),
             (Exchange, Outgoing, backends),
+            (ExchangeFlowControl, Outgoing, backends),
             (RuntimeFilter, Outgoing, backends),
             (Membership, Outgoing, frontends),
         ],
@@ -517,6 +538,28 @@ mod tests {
     }
 
     #[test]
+    fn flow_control_connections_have_their_own_accounted_geometry() {
+        let g = NativeResultSupportGeometry::V1;
+        let report = validate_native_transport_geometry(&g).unwrap();
+        let flow: Vec<_> = report
+            .backend
+            .lanes
+            .iter()
+            .filter(|lane| lane.lane == NativeLane::ExchangeFlowControl)
+            .collect();
+        assert_eq!(flow.len(), 2);
+        for lane in flow {
+            assert_eq!(lane.connections, 32 * (1 + 1 + 1));
+            assert_eq!(lane.streams_per_connection, 128);
+        }
+        assert_eq!(report.backend_admission.data_positions, 710);
+        assert_eq!(report.backend_socket_positions, 738);
+        assert_eq!(g.transport_exchange_connections_per_peer, 2);
+        assert_eq!(g.transport_exchange_connecting_positions_per_peer, 1);
+        assert_eq!(g.transport_exchange_closing_positions_per_peer, 1);
+    }
+
+    #[test]
     fn coefficients_extend_the_structural_part_with_checked_arithmetic() {
         let mut envelope = validate_native_transport_geometry(&NativeResultSupportGeometry::V1)
             .unwrap()
@@ -557,6 +600,15 @@ mod tests {
             |g: &mut NativeResultSupportGeometry| {
                 g.transport_exchange_closing_positions_per_peer = u64::MAX
             },
+            |g: &mut NativeResultSupportGeometry| {
+                g.transport_exchange_flow_control_connections_per_peer = u64::MAX
+            },
+            |g: &mut NativeResultSupportGeometry| {
+                g.transport_exchange_flow_control_connecting_positions_per_peer = u64::MAX
+            },
+            |g: &mut NativeResultSupportGeometry| {
+                g.transport_exchange_flow_control_closing_positions_per_peer = u64::MAX
+            },
         ] {
             let mut g = NativeResultSupportGeometry::V1;
             mutate(&mut g);
@@ -568,12 +620,24 @@ mod tests {
 
     #[test]
     fn geometry_inconsistency_is_refused_at_startup() {
-        let cases: [(Mutation, &str); 9] = [
+        let cases: [(Mutation, &str); 12] = [
             (|g| g.transport_streams_per_connection = 0, "streams"),
             (|g| g.transport_tonic_pending_per_connection = 0, "pending"),
             (
                 |g| g.transport_connections_per_frontend_backend_observation = 0,
                 "observation",
+            ),
+            (
+                |g| g.transport_exchange_flow_control_connections_per_peer = 0,
+                "flow_control_connections",
+            ),
+            (
+                |g| g.transport_exchange_flow_control_connecting_positions_per_peer = 0,
+                "flow_control_connecting",
+            ),
+            (
+                |g| g.transport_exchange_flow_control_closing_positions_per_peer = 0,
+                "flow_control_closing",
             ),
             (|g| g.transport_h2_frame_bytes = 1024, "frame"),
             (

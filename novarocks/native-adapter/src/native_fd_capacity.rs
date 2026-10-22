@@ -286,14 +286,14 @@ mod tests {
         ] {
             let report = check(domain, 1024, NativeResultSupportGeometry::V1).unwrap();
             assert_eq!(report.required_soft_limit, 1024);
-            assert_eq!(report.backend_data_socket_positions, 518);
+            assert_eq!(report.backend_data_socket_positions, 710);
             assert_eq!(report.backend_control_socket_positions, 20);
             assert_eq!(report.backend_listener_positions, 2);
             assert_eq!(report.backend_refusal_positions, 2);
             assert_eq!(report.frontend_refusal_positions, 1);
             assert_eq!(report.dns_resolution_positions, 4);
-            assert_eq!(report.backend_native_socket_positions, 546);
-            assert_eq!(report.backend_baseline_headroom, 478);
+            assert_eq!(report.backend_native_socket_positions, 738);
+            assert_eq!(report.backend_baseline_headroom, 286);
             // 32 BEs * (10 data + 3 lanes * 2 tails) + 32 * (1 control + 2 tails).
             assert_eq!(report.frontend_outgoing_socket_positions, 512 + 96);
             assert_eq!(report.frontend_membership_socket_positions, 96);
@@ -381,17 +381,17 @@ mod tests {
         let mut control = NativeResultSupportGeometry::V1;
         control.transport_control_handshake_positions = 9;
         let report = check(NativeEndpointDomain::BackendControl, 1024, control).unwrap();
-        assert_eq!(report.backend_data_socket_positions, 518);
+        assert_eq!(report.backend_data_socket_positions, 710);
         assert_eq!(report.backend_control_socket_positions, 21);
-        assert_eq!(report.backend_baseline_headroom, 477);
+        assert_eq!(report.backend_baseline_headroom, 285);
 
         let mut peer = NativeResultSupportGeometry::V1;
         peer.transport_maximum_live_backends = 33;
         let report = check(NativeEndpointDomain::BackendData, 1024, peer).unwrap();
-        assert_eq!(report.backend_data_socket_positions, 532);
+        assert_eq!(report.backend_data_socket_positions, 730);
         assert_eq!(report.backend_control_socket_positions, 20);
-        assert_eq!(report.backend_native_socket_positions, 560);
-        assert_eq!(report.backend_baseline_headroom, 464);
+        assert_eq!(report.backend_native_socket_positions, 758);
+        assert_eq!(report.backend_baseline_headroom, 266);
     }
 
     #[test]

@@ -75,6 +75,7 @@ impl FragmentBuilder {
         dop_domain: PipelineDopDomain,
         limits: crate::PlanLimits,
         control: &dyn PureCompileControl,
+        stage_placement: crate::StagePlacementPolicy,
     ) -> Result<Fragment, FragmentStructureError> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
         let result = (|| {
@@ -93,7 +94,8 @@ impl FragmentBuilder {
                     ValidationErrors::from_collector(errors),
                 ));
             }
-            let (parts, runtime_filters) = self.into_fragment_parts(root, sink, dop_domain);
+            let (parts, runtime_filters) =
+                self.into_fragment_parts(root, sink, dop_domain, stage_placement);
             let source = Fragment::from(parts);
             // Account the exact source before the new reference array exists.
             // The pending set contributes its actual reference count once;

@@ -1283,6 +1283,10 @@ pub struct RuntimeConfig {
     pub exchange_io_threads: usize,
     #[serde(default = "default_exchange_io_max_inflight_bytes")]
     pub exchange_io_max_inflight_bytes: usize,
+    #[serde(default = "default_exchange_receive_staging_max_bytes")]
+    pub exchange_receive_staging_max_bytes: usize,
+    #[serde(default = "default_keyed_assertion_state_max_bytes")]
+    pub keyed_assertion_state_max_bytes: usize,
     #[serde(default = "default_catalog_prune_interval_ms")]
     pub catalog_prune_interval_ms: u64,
     #[serde(default = "default_catalog_prune_rpc_timeout_ms")]
@@ -1859,6 +1863,13 @@ fn default_exchange_max_transmit_batched_bytes() -> usize {
 
 fn default_exchange_io_threads() -> usize {
     4
+}
+
+fn default_exchange_receive_staging_max_bytes() -> usize {
+    64 * 1024 * 1024
+}
+fn default_keyed_assertion_state_max_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 fn default_exchange_io_max_inflight_bytes() -> usize {
@@ -2620,6 +2631,8 @@ impl Default for RuntimeConfig {
             exchange_max_transmit_batched_bytes: default_exchange_max_transmit_batched_bytes(),
             exchange_io_threads: default_exchange_io_threads(),
             exchange_io_max_inflight_bytes: default_exchange_io_max_inflight_bytes(),
+            exchange_receive_staging_max_bytes: default_exchange_receive_staging_max_bytes(),
+            keyed_assertion_state_max_bytes: default_keyed_assertion_state_max_bytes(),
             catalog_prune_interval_ms: default_catalog_prune_interval_ms(),
             catalog_prune_rpc_timeout_ms: default_catalog_prune_rpc_timeout_ms(),
             catalog_prune_max_inflight: default_catalog_prune_max_inflight(),

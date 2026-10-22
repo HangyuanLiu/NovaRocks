@@ -1230,6 +1230,7 @@ fn decode_fragment_package_factory_core<
             nodes,
             sink: envelope.sink,
             dop_domain: envelope.dop_domain,
+            stage_placement: envelope.stage_placement,
             runtime_filters: envelope.runtime_filters,
         },
         plan_limits,

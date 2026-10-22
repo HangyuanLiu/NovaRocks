@@ -45,6 +45,7 @@ pub(crate) struct DecodedFragmentEnvelope {
     pub(crate) root: p::NodeId,
     pub(crate) sink: p::FragmentSink,
     pub(crate) dop_domain: p::PipelineDopDomain,
+    pub(crate) stage_placement: p::StagePlacementPolicy,
     pub(crate) runtime_filters: Box<[p::RuntimeFilterId]>,
 }
 #[derive(Debug, PartialEq)]
@@ -53,6 +54,7 @@ pub(crate) struct EncodedFragmentEnvelope {
     pub(crate) root_node_id: u32,
     pub(crate) sink: wire::FragmentSink,
     pub(crate) dop_domain: wire::PipelineDopDomain,
+    pub(crate) stage_placement: wire::StagePlacementPolicy,
     pub(crate) runtime_filter_ids: Vec<u32>,
 }
 fn required<T>(
@@ -99,12 +101,84 @@ fn list<T, U>(
 fn token_vec(bytes: [u8; 32], w: &mut CompileCheckpoints<'_>) -> Result<Vec<u8>, Error> {
     list(&bytes, w, |v, _| Ok(*v))
 }
+fn physical_placement_sources(input: &p::StagePlacementPolicy) -> usize {
+    match input {
+        p::StagePlacementPolicy::FollowSources { sources } => sources.len(),
+        _ => 0,
+    }
+}
+fn wire_placement_sources(input: Option<&wire::StagePlacementPolicy>) -> usize {
+    match input.and_then(|value| value.kind.as_ref()) {
+        Some(wire::stage_placement_policy::Kind::FollowSources(value)) => value.fragment_ids.len(),
+        _ => 0,
+    }
+}
+fn wire_placement_capacity(input: Option<&wire::StagePlacementPolicy>) -> usize {
+    match input.and_then(|value| value.kind.as_ref()) {
+        Some(wire::stage_placement_policy::Kind::FollowSources(value)) => {
+            value.fragment_ids.capacity()
+        }
+        _ => 0,
+    }
+}
+fn encode_placement(
+    value: &p::StagePlacementPolicy,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<wire::StagePlacementPolicy, Error> {
+    use wire::stage_placement_policy::Kind;
+    let kind = match value {
+        p::StagePlacementPolicy::Singleton => Kind::Singleton(Empty {}),
+        p::StagePlacementPolicy::ScanWork => Kind::ScanWork(Empty {}),
+        p::StagePlacementPolicy::Spread { max_instances } => {
+            Kind::Spread(wire::SpreadStagePlacement {
+                max_instances: max_instances.map(|n| n.get()),
+            })
+        }
+        p::StagePlacementPolicy::FollowSources { sources } => {
+            Kind::FollowSources(wire::FollowSourcesStagePlacement {
+                fragment_ids: list(sources, w, |id, _| Ok(id.get()))?,
+            })
+        }
+    };
+    w.step()?;
+    Ok(wire::StagePlacementPolicy { kind: Some(kind) })
+}
+fn decode_placement(
+    value: &wire::StagePlacementPolicy,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<p::StagePlacementPolicy, Error> {
+    use wire::stage_placement_policy::Kind;
+    Ok(
+        match required(value.kind.as_ref(), "stage placement kind is absent", w)? {
+            Kind::Singleton(_) => p::StagePlacementPolicy::Singleton,
+            Kind::ScanWork(_) => p::StagePlacementPolicy::ScanWork,
+            Kind::Spread(value) => p::StagePlacementPolicy::Spread {
+                max_instances: value
+                    .max_instances
+                    .map(|n| {
+                        std::num::NonZeroU32::new(n)
+                            .ok_or_else(|| invalid("stage instance cap must be positive"))
+                    })
+                    .transpose()?,
+            },
+            Kind::FollowSources(value) => p::StagePlacementPolicy::FollowSources {
+                sources: boxed(
+                    list(&value.fragment_ids, w, |id, _| Ok(p::FragmentId::new(*id)))?,
+                    w,
+                )?,
+            },
+        },
+    )
+}
 fn physical_outer(input: &p::Fragment) -> Result<usize, Error> {
     add(
-        input.runtime_filters().len(),
+        add(
+            input.runtime_filters().len(),
+            physical_placement_sources(input.stage_placement()),
+        )?,
         match input.sink() {
             p::FragmentSink::Multicast { edges } => edges.len(),
-            p::FragmentSink::Router { routes, .. } => routes.len(),
+            p::FragmentSink::Router { routes, .. } => add(routes.len(), 4)?,
             _ => 0,
         },
     )
@@ -114,6 +188,12 @@ fn raw_kind<'a>(
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<&'a wire::fragment_sink::Kind, Error> {
     required(input.root_node_id, "fragment root ID is absent", w)?;
+    let placement = required(
+        input.stage_placement.as_ref(),
+        "fragment stage placement is absent",
+        w,
+    )?;
+    required(placement.kind.as_ref(), "stage placement kind is absent", w)?;
     required(
         input.dop_domain.as_ref(),
         "fragment DOP domain is absent",
@@ -124,10 +204,13 @@ fn raw_kind<'a>(
 }
 fn wire_outer(input: &wire::Fragment, kind: &wire::fragment_sink::Kind) -> Result<usize, Error> {
     add(
-        input.runtime_filter_ids.len(),
+        add(
+            input.runtime_filter_ids.len(),
+            wire_placement_sources(input.stage_placement.as_ref()),
+        )?,
         match kind {
             wire::fragment_sink::Kind::Multicast(v) => v.edge_ids.len(),
-            wire::fragment_sink::Kind::Router(v) => v.routes.len(),
+            wire::fragment_sink::Kind::Router(v) => add(v.routes.len(), 4)?,
             _ => 0,
         },
     )
@@ -192,7 +275,7 @@ fn encode_sink_requests(
         }
         p::FragmentSink::Multicast { edges } => admission.request::<u32>(model, edges.len(), 1)?,
         p::FragmentSink::Router { routes, .. } => {
-            model.refs = 1;
+            model.refs = 5;
             admission.request::<wire::ChangeStreamRoute>(model, routes.len(), 1)?;
         }
         _ => {}
@@ -213,12 +296,169 @@ fn decode_sink_requests(
             admission.request::<p::EdgeId>(model, v.edge_ids.len(), 2)?;
         }
         Some(wire::fragment_sink::Kind::Router(v)) => {
-            model.refs = 1;
+            model.refs = 5;
             admission.request::<p::ChangeStreamRoute>(model, v.routes.len(), 2)?;
         }
         _ => {}
     }
     Ok(())
+}
+fn encode_summary_columns(columns: p::LogicalSummaryColumns) -> wire::LogicalSummaryColumns {
+    wire::LogicalSummaryColumns {
+        inserted_value_id: Some(columns.inserted.get()),
+        replaced_value_id: Some(columns.replaced.get()),
+        deleted_value_id: Some(columns.deleted.get()),
+    }
+}
+fn decode_summary_output(
+    value: Option<&wire::LogicalSummaryOutput>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<p::LogicalSummaryOutput, Error> {
+    let value = required(value, "router summary output is absent", w)?;
+    let columns = required(
+        value.columns.as_ref(),
+        "router summary columns are absent",
+        w,
+    )?;
+    Ok(p::LogicalSummaryOutput {
+        edge: p::EdgeId::new(required(value.edge_id, "router summary edge is absent", w)?),
+        columns: p::LogicalSummaryColumns {
+            inserted: p::ValueId::new(required(
+                columns.inserted_value_id,
+                "inserted summary field is absent",
+                w,
+            )?),
+            replaced: p::ValueId::new(required(
+                columns.replaced_value_id,
+                "replaced summary field is absent",
+                w,
+            )?),
+            deleted: p::ValueId::new(required(
+                columns.deleted_value_id,
+                "deleted summary field is absent",
+                w,
+            )?),
+        },
+    })
+}
+fn physical_route_keys(route: &p::ChangeStreamRoute) -> Result<usize, Error> {
+    if matches!(&route.requirements.colocation, p::WriteColocation::ByKey(keys) if keys.is_empty())
+        || matches!(&route.requirements.layout, p::WriteLayoutPreference::ClusterBy(keys) if keys.is_empty())
+    {
+        return Err(invalid("write requirement key must be nonempty"));
+    }
+    add(
+        route.requirements.colocation_keys().len(),
+        route.requirements.layout_keys().len(),
+    )
+}
+fn wire_requirement_lists(
+    value: Option<&wire::WriteRouteRequirements>,
+) -> Result<(&[u32], &[u32]), Error> {
+    let value = value.ok_or_else(|| invalid("write route requirements are absent"))?;
+    let colocation = match value
+        .colocation
+        .as_ref()
+        .ok_or_else(|| invalid("write colocation is absent"))?
+    {
+        wire::write_route_requirements::Colocation::NoColocation(_)
+        | wire::write_route_requirements::Colocation::Singleton(_) => &[][..],
+        wire::write_route_requirements::Colocation::ByKey(keys) if !keys.value_ids.is_empty() => {
+            keys.value_ids.as_slice()
+        }
+        _ => return Err(invalid("write ByKey colocation is empty")),
+    };
+    let layout = match value
+        .layout
+        .as_ref()
+        .ok_or_else(|| invalid("write layout is absent"))?
+    {
+        wire::write_route_requirements::Layout::NoLayout(_) => &[][..],
+        wire::write_route_requirements::Layout::ClusterBy(keys) if !keys.value_ids.is_empty() => {
+            keys.value_ids.as_slice()
+        }
+        _ => return Err(invalid("write ClusterBy layout is empty")),
+    };
+    Ok((colocation, layout))
+}
+fn wire_route_keys(route: &wire::ChangeStreamRoute) -> Result<usize, Error> {
+    let (colocation, layout) = wire_requirement_lists(route.requirements.as_ref())?;
+    add(colocation.len(), layout.len())
+}
+fn wire_requirement_backing(value: Option<&wire::WriteRouteRequirements>) -> Result<usize, Error> {
+    wire_requirement_lists(value)?;
+    let value = value.expect("checked requirement presence");
+    let colocation = match &value.colocation {
+        Some(wire::write_route_requirements::Colocation::ByKey(keys)) => keys.value_ids.capacity(),
+        _ => 0,
+    };
+    let layout = match &value.layout {
+        Some(wire::write_route_requirements::Layout::ClusterBy(keys)) => keys.value_ids.capacity(),
+        _ => 0,
+    };
+    add(bytes::<u32>(colocation)?, bytes::<u32>(layout)?)
+}
+fn encode_requirements(
+    value: &p::WriteRouteRequirements,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<wire::WriteRouteRequirements, Error> {
+    let keys = |ids: &[p::ValueId],
+                w: &mut CompileCheckpoints<'_>|
+     -> Result<wire::WriteRouteKeyFields, Error> {
+        if ids.is_empty() {
+            return Err(invalid("write requirement key must be nonempty"));
+        }
+        Ok(wire::WriteRouteKeyFields {
+            value_ids: list(ids, w, |id, _| Ok(id.get()))?,
+        })
+    };
+    Ok(wire::WriteRouteRequirements {
+        colocation: Some(match &value.colocation {
+            p::WriteColocation::None => {
+                wire::write_route_requirements::Colocation::NoColocation(Empty {})
+            }
+            p::WriteColocation::Singleton => {
+                wire::write_route_requirements::Colocation::Singleton(Empty {})
+            }
+            p::WriteColocation::ByKey(ids) => {
+                wire::write_route_requirements::Colocation::ByKey(keys(ids, w)?)
+            }
+        }),
+        layout: Some(match &value.layout {
+            p::WriteLayoutPreference::None => {
+                wire::write_route_requirements::Layout::NoLayout(Empty {})
+            }
+            p::WriteLayoutPreference::ClusterBy(ids) => {
+                wire::write_route_requirements::Layout::ClusterBy(keys(ids, w)?)
+            }
+        }),
+    })
+}
+fn decode_requirements(
+    value: Option<&wire::WriteRouteRequirements>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<p::WriteRouteRequirements, Error> {
+    let (colocation, layout) = wire_requirement_lists(value)?;
+    let value = value.expect("checked requirement presence");
+    let colocation = match value.colocation.as_ref().expect("checked colocation") {
+        wire::write_route_requirements::Colocation::NoColocation(_) => p::WriteColocation::None,
+        wire::write_route_requirements::Colocation::Singleton(_) => p::WriteColocation::Singleton,
+        wire::write_route_requirements::Colocation::ByKey(_) => p::WriteColocation::ByKey(boxed(
+            list(colocation, w, |id, _| Ok(p::ValueId::new(*id)))?,
+            w,
+        )?),
+    };
+    let layout = match value.layout.as_ref().expect("checked layout") {
+        wire::write_route_requirements::Layout::NoLayout(_) => p::WriteLayoutPreference::None,
+        wire::write_route_requirements::Layout::ClusterBy(_) => {
+            p::WriteLayoutPreference::ClusterBy(boxed(
+                list(layout, w, |id, _| Ok(p::ValueId::new(*id)))?,
+                w,
+            )?)
+        }
+    };
+    w.step()?;
+    Ok(p::WriteRouteRequirements { colocation, layout })
 }
 fn encode_route_requests(
     route: &p::ChangeStreamRoute,
@@ -228,7 +468,8 @@ fn encode_route_requests(
     admission.request::<u8>(model, 32, 1)?;
     admission.request::<i32>(model, route.accepted_effects.len(), 1)?;
     admission.request::<wire::WriteInputMapping>(model, route.input_mapping.len(), 1)?;
-    admission.request::<u32>(model, route.partition_by.len(), 1)?;
+    admission.request::<u32>(model, route.requirements.colocation_keys().len(), 1)?;
+    admission.request::<u32>(model, route.requirements.layout_keys().len(), 1)?;
     admission.request::<u8>(model, 32, route.input_mapping.len())
 }
 fn decode_route_requests(
@@ -242,7 +483,9 @@ fn decode_route_requests(
         route.input_mapping.len(),
         2,
     )?;
-    admission.request::<p::ValueId>(model, route.partition_value_ids.len(), 2)
+    let (colocation, layout) = wire_requirement_lists(route.requirements.as_ref())?;
+    admission.request::<p::ValueId>(model, colocation.len(), 2)?;
+    admission.request::<p::ValueId>(model, layout.len(), 2)
 }
 fn preflight_encode(
     input: &p::Fragment,
@@ -258,12 +501,20 @@ fn preflight_encode(
     };
     if admission.observed() {
         admission.request::<u32>(&mut model, input.runtime_filters().len(), 1)?;
+        admission.request::<u32>(
+            &mut model,
+            physical_placement_sources(input.stage_placement()),
+            1,
+        )?;
         encode_sink_requests(input.sink(), &mut model, admission)?;
         admission.gate(&model, source, l)?;
     }
     let mut known = add(
         size_of::<p::Fragment>(),
-        bytes::<p::RuntimeFilterId>(input.runtime_filters().len())?,
+        add(
+            bytes::<p::RuntimeFilterId>(input.runtime_filters().len())?,
+            bytes::<p::FragmentId>(physical_placement_sources(input.stage_placement()))?,
+        )?,
     )?;
     known = add(
         known,
@@ -276,6 +527,11 @@ fn preflight_encode(
     count_prefix(0, outer, source, known, l, w)?;
     if !admission.observed() {
         admission.request::<u32>(&mut model, input.runtime_filters().len(), 1)?;
+        admission.request::<u32>(
+            &mut model,
+            physical_placement_sources(input.stage_placement()),
+            1,
+        )?;
     }
     admission.facts(&model, source, l, w)?;
     if !admission.observed() {
@@ -286,13 +542,13 @@ fn preflight_encode(
         for route in routes {
             let inner = admission.sum(
                 route.accepted_effects.len(),
-                admission.sum(route.input_mapping.len(), route.partition_by.len())?,
+                admission.sum(route.input_mapping.len(), physical_route_keys(route)?)?,
             )?;
             model.items = admission.sum(model.items, inner)?;
             let references = || {
                 admission.sum(
                     model.refs,
-                    admission.sum(route.input_mapping.len(), route.partition_by.len())?,
+                    admission.sum(route.input_mapping.len(), physical_route_keys(route)?)?,
                 )
             };
             if admission.observed() {
@@ -304,7 +560,7 @@ fn preflight_encode(
             if !admission.observed() {
                 model.refs = admission.sum(
                     model.refs,
-                    admission.sum(route.input_mapping.len(), route.partition_by.len())?,
+                    admission.sum(route.input_mapping.len(), physical_route_keys(route)?)?,
                 )?;
             }
             cap(model.refs, l.max_value_references, w)?;
@@ -314,7 +570,7 @@ fn preflight_encode(
                     bytes::<ConnectorRowMutationEffect>(route.accepted_effects.len())?,
                     add(
                         bytes::<(ConnectorWriteFieldToken, p::ValueId)>(route.input_mapping.len())?,
-                        bytes::<p::ValueId>(route.partition_by.len())?,
+                        bytes::<p::ValueId>(physical_route_keys(route)?)?,
                     )?,
                 )?,
             )?;
@@ -350,6 +606,11 @@ fn preflight_decode(
             ..Model::default()
         };
         admission.request::<p::RuntimeFilterId>(&mut model, input.runtime_filter_ids.len(), 2)?;
+        admission.request::<p::FragmentId>(
+            &mut model,
+            wire_placement_sources(input.stage_placement.as_ref()),
+            2,
+        )?;
         decode_sink_requests(captured, &mut model, admission)?;
         admission.gate(&model, source, l)?;
         initial = Some(model);
@@ -358,7 +619,10 @@ fn preflight_decode(
     let outer = admission.numeric(wire_outer(input, kind))?;
     let mut known = add(
         size_of::<wire::Fragment>(),
-        bytes::<u32>(input.runtime_filter_ids.capacity())?,
+        add(
+            bytes::<u32>(input.runtime_filter_ids.capacity())?,
+            bytes::<u32>(wire_placement_capacity(input.stage_placement.as_ref()))?,
+        )?,
     )?;
     known = add(
         known,
@@ -377,6 +641,11 @@ fn preflight_decode(
     });
     if !admission.observed() {
         admission.request::<p::RuntimeFilterId>(&mut model, input.runtime_filter_ids.len(), 2)?;
+        admission.request::<p::FragmentId>(
+            &mut model,
+            wire_placement_sources(input.stage_placement.as_ref()),
+            2,
+        )?;
     }
     admission.facts(&model, source, l, w)?;
     match kind {
@@ -392,6 +661,7 @@ fn preflight_decode(
         }
         wire::fragment_sink::Kind::Router(v) => {
             required(v.effect_value_id, "router effect ValueId is absent", w)?;
+            decode_summary_output(v.summary.as_ref(), w)?;
             if !admission.observed() {
                 decode_sink_requests(Some(kind), &mut model, admission)?;
             }
@@ -399,14 +669,13 @@ fn preflight_decode(
             for route in &v.routes {
                 let inner = admission.sum(
                     route.accepted_effects.len(),
-                    admission.sum(route.input_mapping.len(), route.partition_value_ids.len())?,
+                    admission.sum(route.input_mapping.len(), wire_route_keys(route)?)?,
                 )?;
                 model.items = admission.sum(model.items, inner)?;
                 let references = || {
                     admission.sum(
                         model.refs,
-                        admission
-                            .sum(route.input_mapping.len(), route.partition_value_ids.len())?,
+                        admission.sum(route.input_mapping.len(), wire_route_keys(route)?)?,
                     )
                 };
                 if admission.observed() {
@@ -418,8 +687,7 @@ fn preflight_decode(
                 if !admission.observed() {
                     model.refs = admission.sum(
                         model.refs,
-                        admission
-                            .sum(route.input_mapping.len(), route.partition_value_ids.len())?,
+                        admission.sum(route.input_mapping.len(), wire_route_keys(route)?)?,
                     )?;
                 }
                 cap(model.refs, l.max_value_references, w)?;
@@ -431,7 +699,7 @@ fn preflight_decode(
                             bytes::<i32>(route.accepted_effects.capacity())?,
                             add(
                                 bytes::<wire::WriteInputMapping>(route.input_mapping.capacity())?,
-                                bytes::<u32>(route.partition_value_ids.capacity())?,
+                                wire_requirement_backing(route.requirements.as_ref())?,
                             )?,
                         )?,
                     )?,
@@ -480,7 +748,15 @@ fn emit_encode(
         p::FragmentSink::Multicast { edges } => Kind::Multicast(wire::MulticastSink {
             edge_ids: list(edges, w, |id, _| Ok(id.get()))?,
         }),
-        p::FragmentSink::Router { effect, routes } => Kind::Router(wire::RouterSink {
+        p::FragmentSink::Router {
+            effect,
+            routes,
+            summary,
+        } => Kind::Router(wire::RouterSink {
+            summary: Some(wire::LogicalSummaryOutput {
+                edge_id: Some(summary.edge.get()),
+                columns: Some(encode_summary_columns(summary.columns)),
+            }),
             effect_value_id: Some(effect.get()),
             routes: list(routes, w, |route, w| {
                 Ok(wire::ChangeStreamRoute {
@@ -495,7 +771,7 @@ fn emit_encode(
                             value_id: Some(value.get()),
                         })
                     })?,
-                    partition_value_ids: list(&route.partition_by, w, |id, _| Ok(id.get()))?,
+                    requirements: Some(encode_requirements(&route.requirements, w)?),
                     edge_id: Some(route.edge.get()),
                 })
             })?,
@@ -505,6 +781,7 @@ fn emit_encode(
     let output = EncodedFragmentEnvelope {
         id: input.id().get(),
         root_node_id: input.root().get(),
+        stage_placement: encode_placement(input.stage_placement(), w)?,
         sink: wire::FragmentSink { kind: Some(kind) },
         dop_domain: wire::PipelineDopDomain {
             min: dop.min,
@@ -556,6 +833,7 @@ fn emit_decode(
             edges: boxed(list(&v.edge_ids, w, |id, _| Ok(p::EdgeId::new(*id)))?, w)?,
         },
         Kind::Router(v) => p::FragmentSink::Router {
+            summary: decode_summary_output(v.summary.as_ref(), w)?,
             effect: p::ValueId::new(required(
                 v.effect_value_id,
                 "prepared router effect ID is absent",
@@ -586,18 +864,13 @@ fn emit_decode(
                         })?,
                         w,
                     )?;
-                    let partition_by = boxed(
-                        list(&route.partition_value_ids, w, |id, _| {
-                            Ok(p::ValueId::new(*id))
-                        })?,
-                        w,
-                    )?;
+                    let requirements = decode_requirements(route.requirements.as_ref(), w)?;
                     Ok(p::ChangeStreamRoute {
                         route_id,
                         write_target_ordinal,
                         accepted_effects,
                         input_mapping,
-                        partition_by,
+                        requirements,
                         edge: p::EdgeId::new(required(
                             route.edge_id,
                             "prepared router edge ID is absent",
@@ -612,6 +885,14 @@ fn emit_decode(
     let dop = required(input.dop_domain.as_ref(), "prepared DOP is absent", w)?;
     let output = DecodedFragmentEnvelope {
         id: p::FragmentId::new(input.id),
+        stage_placement: decode_placement(
+            required(
+                input.stage_placement.as_ref(),
+                "fragment stage placement is absent",
+                w,
+            )?,
+            w,
+        )?,
         root: p::NodeId::new(required(
             input.root_node_id,
             "prepared fragment root is absent",

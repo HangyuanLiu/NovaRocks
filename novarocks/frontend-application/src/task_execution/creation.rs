@@ -108,6 +108,7 @@ pub(crate) struct SharedEdge {
     edge_id: ExchangeEdgeId,
     destination_node_id: FragmentNodeId,
     partitioning: DataStreamPartitionType,
+    delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
     sender_count: NonZeroU32,
     producers: Box<[EdgeProducer]>,
     destinations: Box<[EdgeDestination]>,
@@ -118,6 +119,7 @@ impl SharedEdge {
         edge_id: ExchangeEdgeId,
         destination_node_id: FragmentNodeId,
         partitioning: DataStreamPartitionType,
+        delivery: novarocks_execution_contract::ExchangeDeliveryRequirement,
         sender_count: NonZeroU32,
         producers: Vec<EdgeProducer>,
         destinations: Vec<EdgeDestination>,
@@ -126,6 +128,7 @@ impl SharedEdge {
             edge_id,
             destination_node_id,
             partitioning,
+            delivery,
             sender_count,
             producers: producers.into_boxed_slice(),
             destinations: destinations.into_boxed_slice(),
@@ -245,13 +248,27 @@ impl AttemptTopology {
         edge_ids: &[ExchangeEdgeId],
     ) -> Result<ExchangeInbound, TaskExecutionError> {
         let mut sources = Vec::new();
+        let mut delivery = None;
         for edge_id in edge_ids {
             let edge = self.edge(*edge_id)?;
+            if delivery.is_some_and(|frozen| frozen != edge.delivery) {
+                return Err(TaskExecutionError::Schedule(format!(
+                    "exchange input {} has conflicting delivery requirements",
+                    node.get()
+                )));
+            }
+            delivery = Some(edge.delivery);
             sources.extend(edge.producers.iter().map(|producer| {
                 ExchangeSource::new(producer.task, producer.kernel_key, producer.sender_ordinal)
             }));
         }
-        Ok(ExchangeInbound::try_new(node, sources)?)
+        let delivery = delivery.ok_or_else(|| {
+            TaskExecutionError::Schedule(format!(
+                "exchange input {} has no producer edge",
+                node.get()
+            ))
+        })?;
+        Ok(ExchangeInbound::try_new(node, sources, delivery)?)
     }
 }
 
@@ -699,6 +716,7 @@ pub(crate) mod tests {
             ExchangeEdgeId::new(1).expect("nonzero edge"),
             FragmentNodeId::new(20),
             DataStreamPartitionType::HashPartitioned,
+            novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven,
             NonZeroU32::new(2).expect("nonzero"),
             producers
                 .iter()
@@ -724,6 +742,32 @@ pub(crate) mod tests {
             backend,
             frontend: FrontendProcessId::new_v7(),
         }
+    }
+
+    #[test]
+    fn inbound_preserves_must_drain_and_rejects_mixed_delivery() {
+        let fixture = fixture();
+        let mut edge = fixture.topology.edges.values().next().unwrap().clone();
+        edge.delivery = novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain;
+        let first_id = edge.edge_id;
+        let node = edge.destination_node_id;
+        let mut topology = AttemptTopology::try_new(vec![edge.clone()], &[]).unwrap();
+        let input = topology.inbound(node, &[first_id]).unwrap();
+        assert_eq!(
+            input.delivery(),
+            novarocks_execution_contract::ExchangeDeliveryRequirement::MustDrain
+        );
+        edge.edge_id = ExchangeEdgeId::new(2).unwrap();
+        edge.delivery = novarocks_execution_contract::ExchangeDeliveryRequirement::DemandDriven;
+        let second_id = edge.edge_id;
+        topology.edges.insert(second_id, edge);
+        let error = topology.inbound(node, &[first_id, second_id]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting delivery requirements")
+        );
+        assert!(topology.inbound(node, &[]).is_err());
     }
 
     fn scan_range() -> ScanRangeParams {

@@ -1684,6 +1684,8 @@ pub(crate) mod tests {
         let runtime = Arc::new(
             crate::runtime::ExecutionRuntime::new(
                 crate::runtime::ExecutionRuntimeConfig {
+                    exchange_receive_staging_max_bytes: 64 * 1024 * 1024,
+                    keyed_assertion_state_max_bytes: 64 * 1024 * 1024,
                     driver_threads: 1,
                     exchange_wait_ms: 120_000,
                     exchange_io_threads: 1,
@@ -2810,6 +2812,7 @@ pub(crate) mod tests {
                     max: 1,
                     requires_power_of_two: false,
                 },
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .unwrap();
         let roots = PhysicalExpressionRoots::try_new(&fragment, &control).unwrap();
@@ -2873,22 +2876,25 @@ pub(crate) mod tests {
                 destination: Distribution::Singleton,
                 destination_multiplicity: RowMultiplicity::SingleCopy,
             },
-            change_stream_writer: None,
-            writer_result: Some(WriterResultCut {
-                write_target_ordinal: ordinal,
-                schema_revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
-                fields: fields
-                    .iter()
-                    .enumerate()
-                    .map(|(i, f)| WriterResultCutField {
-                        source: f.value,
-                        destination: ValueId::new(i as u32),
-                        name: f.name.clone(),
-                        ty: f.ty.clone(),
-                        role: f.role,
-                    })
-                    .collect(),
-            }),
+            source_port: novarocks_physical_plan::FragmentOutputPort::Root,
+            delivery: novarocks_physical_plan::DeliveryRequirement::MustDrain,
+            payload: novarocks_physical_plan::ExchangePayloadContract::WriterResults(
+                WriterResultCut {
+                    write_target_ordinal: ordinal,
+                    schema_revision: WRITER_MULTIPLEX_SCHEMA_REVISION,
+                    fields: fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| WriterResultCutField {
+                            source: f.value,
+                            destination: ValueId::new(i as u32),
+                            name: f.name.clone(),
+                            ty: f.ty.clone(),
+                            role: f.role,
+                        })
+                        .collect(),
+                },
+            ),
         };
         let package = FragmentPackage::try_new(
             FragmentPackageInput {

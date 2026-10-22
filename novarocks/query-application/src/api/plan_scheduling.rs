@@ -87,6 +87,7 @@ pub struct ScanSchedulingFacts {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FragmentSchedulingFacts {
     pub fragment_id: u32,
+    pub placement: novarocks_physical_plan::StagePlacementPolicy,
     pub scans: Vec<ScanSchedulingFacts>,
 }
 
@@ -176,6 +177,12 @@ impl ExecutionSchedulingFacts {
                     id.get(),
                     FragmentSchedulingFacts {
                         fragment_id: id.get(),
+                        placement: plan
+                            .fragments()
+                            .get(id)
+                            .expect("listed fragment")
+                            .stage_placement()
+                            .clone(),
                         scans: Vec::new(),
                     },
                 )
@@ -213,16 +220,16 @@ impl ExecutionSchedulingFacts {
                     stream_kind: match edge.partitioning.destination {
                         Distribution::Singleton => SchedulingStreamKind::Gather,
                         Distribution::Broadcast => SchedulingStreamKind::Broadcast,
-                        Distribution::Hash { .. } | Distribution::BucketShuffle { .. } => {
-                            SchedulingStreamKind::Partitioned
-                        }
+                        Distribution::Hash { .. }
+                        | Distribution::ConditionalKey { .. }
+                        | Distribution::BucketShuffle { .. } => SchedulingStreamKind::Partitioned,
                         Distribution::Unconstrained | Distribution::RoundRobin => {
                             SchedulingStreamKind::Other
                         }
                     },
                     hash_partitioned: matches!(
                         edge.partitioning.destination,
-                        Distribution::Hash { .. }
+                        Distribution::Hash { .. } | Distribution::ConditionalKey { .. }
                     ),
                 })
                 .collect(),

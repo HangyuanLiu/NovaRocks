@@ -261,6 +261,7 @@ fn fixture(op: Connective, mode: Use, width: usize) -> Result<Fixture, Validatio
             max: 1,
             requires_power_of_two: false,
         },
+        novarocks_physical_plan::StagePlacementPolicy::Singleton,
     )?;
     Ok(Fixture { fragment })
 }
@@ -875,6 +876,7 @@ fn dual_demand_program() -> Arc<LocalProgram> {
                     max: 1,
                     requires_power_of_two: false,
                 },
+                novarocks_physical_plan::StagePlacementPolicy::Singleton,
             )
             .unwrap()
             .with_call_requests_observed(

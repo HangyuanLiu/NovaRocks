@@ -148,7 +148,14 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
     } else {
         FragmentSink::Stream { edge: EDGE }
     };
-    let producer = producer.finish_definition(VALUES, sink, dop()).unwrap();
+    let producer = producer
+        .finish_definition(
+            VALUES,
+            sink,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
+        .unwrap();
 
     let mut consumer = FragmentBuilder::new(CONSUMER);
     let import = |builder: &mut FragmentBuilder, source_value| {
@@ -192,13 +199,20 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
         FragmentSink::Noop
     };
     let consumer = consumer
-        .finish_definition(RECEIVER, consumer_sink, dop())
+        .finish_definition(
+            RECEIVER,
+            consumer_sink,
+            dop(),
+            novarocks_physical_plan::StagePlacementPolicy::Singleton,
+        )
         .unwrap();
 
     let mut plan = PlanBuilder::new(PlanVersionId::try_new([7; 16]).unwrap());
     plan.add_fragment(producer).unwrap();
     plan.add_fragment(consumer).unwrap();
     plan.add_edge(Edge {
+        role: novarocks_physical_plan::OutputRole::Relational,
+        delivery: novarocks_physical_plan::DeliveryRequirement::DemandDriven,
         id: EDGE,
         kind: if multicast {
             EdgeKind::CteMulticast
@@ -206,6 +220,7 @@ fn packages(shape: Shape) -> BTreeMap<FragmentId, FragmentPackage> {
             EdgeKind::Stream
         },
         source: EdgeSource {
+            port: novarocks_physical_plan::FragmentOutputPort::Root,
             fragment: PRODUCER,
             projection: Box::from([b, a]),
         },
@@ -442,7 +457,7 @@ fn gather_producer_streams_and_consumer_receives_one_addressed_edge() {
     assert_eq!(requirements.len(), 1);
     assert!(matches!(
         &requirements[0],
-        BindingRequirement::ExchangeOutput { branch: 0, layout }
+        BindingRequirement::ExchangeOutput { branch: 0, layout , ..}
             if layout.slots() == [root_slots[1], root_slots[0]]
     ));
     // The empty Sink arena still owns its (empty) flow.
@@ -484,6 +499,9 @@ fn gather_producer_streams_and_consumer_receives_one_addressed_edge() {
         &BTreeMap::from([(
             ProgramNodeId::new(0),
             CompiledExchangeInput {
+                role: novarocks_local_program::ProgramOutputRole::Relational,
+                delivery: novarocks_local_program::ExchangeDeliveryRequirement::DemandDriven,
+                routing: novarocks_local_program::CompiledExchangeRouting::Unpartitioned,
                 receiver_node: RECEIVER.get(),
                 edge: EDGE.get(),
                 source_fragment: PRODUCER.get(),
@@ -495,7 +513,7 @@ fn gather_producer_streams_and_consumer_receives_one_addressed_edge() {
     assert_eq!(requirements.len(), 2);
     assert!(requirements.iter().any(|requirement| matches!(
         requirement,
-        BindingRequirement::ExchangeInput { node, layout: required }
+        BindingRequirement::ExchangeInput { node, layout: required , ..}
             if *node == ProgramNodeId::new(0) && required.slots() == layout.slots()
     )));
     assert!(

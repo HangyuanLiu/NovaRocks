@@ -57,6 +57,7 @@ fn global(desired_rows: u64, comparison: RowCountAssertion) -> RowCountAssertion
 
 fn keyed(columns: &[ValueId]) -> RowCountAssertionSpec {
     RowCountAssertionSpec::PerKeyAtMostOne {
+        applicability: novarocks_physical_plan::AssertionApplicability::AllRows,
         keys: Box::from([columns[0]]),
         labels: Box::from(["k".into()]),
         message: "duplicate merge source row".into(),

@@ -1609,6 +1609,7 @@ mod value_arithmetic_tests {
                 max: 1,
                 requires_power_of_two: false,
             },
+            crate::StagePlacementPolicy::Singleton,
         )
     }
 
