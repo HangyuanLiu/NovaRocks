@@ -173,14 +173,9 @@ impl RuntimeErrorState {
         }
     }
     pub fn set_error(&self, err: impl Into<ExecutionFailure>) {
-        let _ = self.accept_error(err.into());
-    }
-    pub(crate) fn accept_error(&self, err: ExecutionFailure) -> bool {
+        let err = err.into();
         match &self.control {
-            RuntimeFailureControl::Task(owner) => {
-                owner.report_failure(err).decision
-                    != novarocks_execution_contract::ConclusionDecision::Keep
-            }
+            RuntimeFailureControl::Task(owner) => owner.report_failure(err),
             RuntimeFailureControl::Local(local) => {
                 let accepted = {
                     let mut guard = local.error.lock().expect("local runtime error lock");
@@ -196,8 +191,16 @@ impl RuntimeErrorState {
                     local.stopped.notify_all();
                     local.stop_observable.notify_observers();
                 }
-                accepted
             }
+        }
+    }
+    pub(crate) fn on_settled(
+        &self,
+        continuation: novarocks_execution_contract::SettledContinuation<ExecutionFailure>,
+    ) {
+        match &self.control {
+            RuntimeFailureControl::Task(owner) => owner.on_settled(continuation),
+            RuntimeFailureControl::Local(_) => continuation(None),
         }
     }
     pub(crate) fn stop_observable(&self) -> std::sync::Arc<crate::runtime::observable::Observable> {

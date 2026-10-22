@@ -28,7 +28,7 @@
 //! "a metrics producer must not mutate lifecycle state" a property of the
 //! type, not of a review comment.
 
-use crate::task_conclusion::{PreparedTaskConclusion, TaskConclusionState};
+use crate::task_conclusion::{ConclusionAcceptance, PreparedTaskConclusion, TaskConclusionState};
 use crate::task_diagnostics::{
     DiagnosticRecordOutcome, PreparedCleanupDiagnostic, TaskSecondaryDiagnostics,
     TaskSecondaryDiagnosticsSnapshot,
@@ -40,7 +40,7 @@ use novarocks_execution::runtime::{
     task_control::{TaskExecutionControl, TaskExecutionPort},
 };
 use novarocks_execution_contract::{
-    AcceptedTaskConclusion, ConclusionAcceptance, ConclusionDecision, TaskConclusion,
+    AcceptedTaskConclusion, ConclusionDecision, SettledContinuation, TaskConclusion,
     TaskConclusionPort, TaskConclusionProposal, TaskFailurePhase,
 };
 use std::fmt;
@@ -1120,15 +1120,33 @@ impl TaskConclusionPort<ExecutionFailure> for TaskStatusOwner {
             .conclusions
             .accepted()
     }
-    fn submit(
-        &self,
-        proposal: TaskConclusionProposal<ExecutionFailure>,
-    ) -> ConclusionAcceptance<ExecutionFailure> {
+    fn submit(&self, proposal: TaskConclusionProposal<ExecutionFailure>) {
         let candidate = PreparedTaskConclusion::new(proposal);
-        self.submit_prepared(candidate, false).publish()
+        self.submit_prepared(candidate, false).publish();
+    }
+    fn on_settled(&self, continuation: SettledContinuation<ExecutionFailure>) {
+        // Every earlier input already adjudicated in its own transaction.
+        // Copy under the status lock; the continuation may reenter this owner.
+        let snapshot = self.accepted();
+        continuation(snapshot);
     }
 }
 impl TaskStatusOwner {
+    /// Owner-internal settled read: submission has completed its transaction.
+    /// Keep the two publications and the original output release ordering.
+    fn conclude_failure(&self, cause: ExecutionFailure, phase: TaskFailurePhase) -> StatusAdvance {
+        self.submit(TaskConclusionProposal::Failed { cause, phase });
+        let accepted = self
+            .accepted()
+            .expect("failure submission has a winning conclusion");
+        match accepted.neutral().conclusion() {
+            TaskConclusion::Terminated(detail) => {
+                self.conclude_termination(detail.clone(), TaskOutputFacts::default())
+            }
+            TaskConclusion::Succeeded => StatusAdvance::AlreadyTerminal(self.current().state()),
+        }
+    }
+
     /// Worker-local only: Task retirement export and wire projection are not
     /// connected to these secondary records. Snapshotting changes no lifecycle.
     pub fn secondary_diagnostics(&self) -> TaskSecondaryDiagnosticsSnapshot {
@@ -1173,10 +1191,7 @@ impl TaskStatusOwner {
     /// Prepare both bounded projections before locking, then choose the legal
     /// lifecycle phase at the same transaction that accepts its original cause.
     /// Execution means installation committed, never that a driver ran.
-    pub(crate) fn report_preparation_body_failure(
-        &self,
-        cause: ExecutionFailure,
-    ) -> ConclusionAcceptance<ExecutionFailure> {
+    pub(crate) fn report_preparation_body_failure(&self, cause: ExecutionFailure) {
         let preparation = PreparedTaskConclusion::new(TaskConclusionProposal::Failed {
             cause: cause.clone(),
             phase: TaskFailurePhase::Preparation,
@@ -1187,11 +1202,10 @@ impl TaskStatusOwner {
         });
         let (pending, unused) =
             self.submit_prepared_with_installed(preparation, Some(installed), false);
-        let accepted = pending.publish();
+        pending.publish();
         // The unselected rich projection and any losing source leave only
         // after the acceptance lock and its detached notification have exited.
         drop(unused);
-        accepted
     }
 
     /// Accept through the same Task transaction while a caller installs its
@@ -1210,6 +1224,7 @@ impl TaskStatusOwner {
     }
 
     // Design: ADR-0187 (docs/adr/ADR-0187-receiver-owned-steps-and-single-task-conclusion.md)
+    // Design: ADR-0193 (docs/adr/ADR-0193-task-conclusion-proposals-and-settled-points.md)
     fn submit_prepared_with_installed(
         &self,
         mut candidate: PreparedTaskConclusion,
@@ -1366,15 +1381,14 @@ impl TaskStatusReporter {
         self.owner.current()
     }
 
-    /// Submit the actual local cause through this Task's sole acceptance
-    /// transaction. Phase is explicit; a control observation is not intent.
-    pub fn report_failure(
+    /// Submit the actual failure and complete termination on the winning cause.
+    /// Acceptance publishes its terminating version before terminal publication.
+    pub fn conclude_failure(
         &self,
         cause: ExecutionFailure,
         phase: TaskFailurePhase,
-    ) -> ConclusionAcceptance<ExecutionFailure> {
-        self.owner
-            .submit(TaskConclusionProposal::Failed { cause, phase })
+    ) -> StatusAdvance {
+        self.owner.conclude_failure(cause, phase)
     }
 
     /// Record a prepared cleanup effect without competing for the conclusion.
@@ -1816,11 +1830,12 @@ mod conclusion_tests {
         let owner = Arc::new(owner());
         let runtime =
             RuntimeErrorState::for_task(owner.execution_control(TaskFailurePhase::Execution));
-        let canceled = owner.submit(TaskConclusionProposal::Canceled(
+        owner.submit(TaskConclusionProposal::Canceled(
             CancelReason::UpstreamNoLongerNeeded,
         ));
+        let canceled = owner.accepted().unwrap();
         runtime.set_error(novarocks_functions::KernelFailure::ResourceExhausted);
-        assert!(Arc::ptr_eq(&canceled.accepted, &owner.accepted().unwrap()));
+        assert!(Arc::ptr_eq(&canceled, &owner.accepted().unwrap()));
         assert!(owner.accepted().unwrap().originating_failure().is_none());
         assert_eq!(
             runtime.error().unwrap().failure_fact().evidence(),
@@ -1901,19 +1916,25 @@ mod conclusion_tests {
             projections: projections.clone(),
         });
         let owner = owner();
-        let peer = owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
-        let accepted = owner.submit(TaskConclusionProposal::Failed {
+        owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let peer = owner.accepted().unwrap();
+        let before_accepted = owner.accepted();
+        owner.submit(TaskConclusionProposal::Failed {
             cause: source.clone(),
             phase: TaskFailurePhase::Preparation,
         });
-        assert_eq!(accepted.decision, ConclusionDecision::RefineDerived);
+        let accepted = owner.accepted().unwrap();
+        assert_eq!(
+            accepted.neutral().generation().get(),
+            before_accepted.unwrap().neutral().generation().get() + 1
+        );
         assert_eq!(projections.load(Ordering::Acquire), 1);
         assert!(std::ptr::eq(
-            accepted.accepted.originating_failure().unwrap().cause(),
+            accepted.originating_failure().unwrap().cause(),
             source.cause(),
         ));
         let TaskConclusion::Terminated(TerminationDetail::Failed(neutral)) =
-            accepted.accepted.neutral().conclusion()
+            accepted.neutral().conclusion()
         else {
             panic!("authored failure")
         };
@@ -1926,10 +1947,11 @@ mod conclusion_tests {
                 .as_str()
                 .contains("private-provider-credential")
         );
-        let canceled = owner.submit(TaskConclusionProposal::Canceled(
+        owner.submit(TaskConclusionProposal::Canceled(
             CancelReason::UpstreamNoLongerNeeded,
         ));
-        assert!(Arc::ptr_eq(&accepted.accepted, &canceled.accepted));
+        let canceled = owner.accepted().unwrap();
+        assert!(Arc::ptr_eq(&accepted, &canceled));
         assert_eq!(drops.load(Ordering::Acquire), 0);
         drop(canceled);
         drop(accepted);
@@ -1952,9 +1974,10 @@ mod conclusion_tests {
     fn task_port_keeps_one_original_receipt_and_refines_only_a_live_peer_placeholder() {
         let owner = Arc::new(owner());
         let control = owner.execution_control(TaskFailurePhase::Preparation);
-        let peer = owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let peer = owner.accepted().unwrap();
         assert_eq!(owner.state(), TaskState::Aborting);
-        assert_eq!(peer.accepted.neutral().generation().get(), 1);
+        assert_eq!(peer.neutral().generation().get(), 1);
         let cleanup = ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted);
         assert_eq!(
             TaskStatusReporter::new(owner.clone()).report_cleanup(
@@ -1962,18 +1985,25 @@ mod conclusion_tests {
             ),
             DiagnosticRecordOutcome::Stored
         );
-        assert!(Arc::ptr_eq(&peer.accepted, &owner.accepted().unwrap()));
+        assert!(Arc::ptr_eq(&peer, &owner.accepted().unwrap()));
         let observation = control.error().unwrap();
-        let kept = control.report_failure(observation);
-        assert_eq!(kept.decision, ConclusionDecision::Keep);
-        assert!(Arc::ptr_eq(&peer.accepted, &kept.accepted));
+        let before_kept = control.accepted();
+        control.report_failure(observation);
+        let kept = control.accepted().unwrap();
+        assert!(Arc::ptr_eq(&before_kept.unwrap(), &kept));
+        assert!(Arc::ptr_eq(&peer, &kept));
         let original =
             ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted);
-        let refined = control.report_failure(original.clone());
-        assert_eq!(refined.decision, ConclusionDecision::RefineDerived);
-        assert_eq!(refined.accepted.neutral().generation().get(), 2);
+        let before_refined = control.accepted();
+        control.report_failure(original.clone());
+        let refined = control.accepted().unwrap();
+        assert_eq!(
+            refined.neutral().generation().get(),
+            before_refined.unwrap().neutral().generation().get() + 1
+        );
+        assert_eq!(refined.neutral().generation().get(), 2);
         assert!(std::ptr::eq(
-            refined.accepted.originating_failure().unwrap().cause(),
+            refined.originating_failure().unwrap().cause(),
             original.cause()
         ));
         assert!(std::ptr::eq(
@@ -1993,7 +2023,7 @@ mod conclusion_tests {
         assert_eq!(secondary.dropped(), 0);
         assert_eq!(owner.state(), TaskState::Failing);
         let TaskConclusion::Terminated(TerminationDetail::Failed(failure)) =
-            refined.accepted.neutral().conclusion()
+            refined.neutral().conclusion()
         else {
             panic!("original failure receipt required");
         };
@@ -2003,7 +2033,7 @@ mod conclusion_tests {
         owner.force_conclusion(AbortCause::LeaseExpired);
         assert_eq!(owner.state(), TaskState::Failed);
         assert!(!owner.convergence().actual_stopped());
-        assert!(Arc::ptr_eq(&refined.accepted, &owner.accepted().unwrap()));
+        assert!(Arc::ptr_eq(&refined, &owner.accepted().unwrap()));
     }
 
     #[test]
@@ -2069,17 +2099,22 @@ mod conclusion_tests {
         let pending = {
             let mut closed = closed.lock().unwrap();
             let pending = owner.submit_prepared_owned(candidate);
+            let previous = owner.accepted().unwrap();
             let driver = owner.clone();
             let refined = std::thread::spawn(move || {
                 driver.submit(TaskConclusionProposal::Failed {
                     cause: novarocks_functions::KernelFailure::ResourceExhausted.into(),
                     phase: TaskFailurePhase::Execution,
-                })
+                });
+                driver.accepted().unwrap()
             })
             .join()
             .expect("the producer report itself remains nonblocking");
-            assert_eq!(refined.decision, ConclusionDecision::RefineDerived);
-            assert!(Arc::ptr_eq(&refined.accepted, &owner.accepted().unwrap()));
+            assert_eq!(
+                refined.neutral().generation().get(),
+                previous.neutral().generation().get() + 1
+            );
+            assert!(Arc::ptr_eq(&refined, &owner.accepted().unwrap()));
             assert_eq!(callbacks.load(Ordering::SeqCst), 0);
             *closed = true;
             pending
@@ -2177,7 +2212,8 @@ mod conclusion_tests {
         let job = std::thread::spawn(move || {
             worker.submit(TaskConclusionProposal::Canceled(
                 CancelReason::UpstreamNoLongerNeeded,
-            ))
+            ));
+            worker.accepted().unwrap()
         });
         entered.wait();
         assert!(unlocked.load(std::sync::atomic::Ordering::Acquire));
@@ -2190,12 +2226,13 @@ mod conclusion_tests {
                 CancelReason::UpstreamNoLongerNeeded
             ))
         );
-        let later =
-            control.report_failure(novarocks_functions::KernelFailure::ResourceExhausted.into());
-        assert_eq!(later.decision, ConclusionDecision::Keep);
-        assert!(Arc::ptr_eq(&first, &later.accepted));
+        let before_later = control.accepted();
+        control.report_failure(novarocks_functions::KernelFailure::ResourceExhausted.into());
+        let later = control.accepted().unwrap();
+        assert!(Arc::ptr_eq(&before_later.unwrap(), &later));
+        assert!(Arc::ptr_eq(&first, &later));
         leave.wait();
-        assert!(Arc::ptr_eq(&first, &job.join().unwrap().accepted));
+        assert!(Arc::ptr_eq(&first, &job.join().unwrap()));
         assert!(!owner.convergence().actual_stopped());
     }
 
@@ -2321,11 +2358,13 @@ mod conclusion_tests {
             owner: Arc::downgrade(&owner),
             dropped_unlocked: dropped.clone(),
         });
-        let held = owner
+        let before = owner.accepted().unwrap();
+        owner
             .execution_control(TaskFailurePhase::Execution)
             .report_failure(original);
-        assert_eq!(held.decision, ConclusionDecision::Keep);
-        assert!(held.accepted.originating_failure().is_none());
+        let held = owner.accepted().unwrap();
+        assert!(Arc::ptr_eq(&before, &held));
+        assert!(held.originating_failure().is_none());
         assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
         let snapshot = owner.secondary_diagnostics();
         let diagnostic = snapshot.entries().next().unwrap();
@@ -2383,6 +2422,83 @@ mod conclusion_tests {
         )
     }
 
+    // These tests protect the production synchronous owner, including both
+    // terminating and terminal publication. The port itself allows delay.
+    #[test]
+    fn conclude_failure_preserves_the_winning_termination_publication_sequence() {
+        for initial in [None, Some(false), Some(true)] {
+            let owner = Arc::new(owner());
+            owner.release_to_observers();
+            match initial {
+                None => {}
+                Some(false) => owner.submit(TaskConclusionProposal::Canceled(
+                    CancelReason::UpstreamNoLongerNeeded,
+                )),
+                Some(true) => {
+                    owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
+                }
+            }
+            let before = owner.current();
+            let previous = owner.accepted();
+            let notifications = Arc::new(Mutex::new(Vec::new()));
+            let seen = notifications.clone();
+            let weak = Arc::downgrade(&owner);
+            owner.stop_observable().add_observer(Arc::new(move || {
+                let owner = weak.upgrade().unwrap();
+                assert!(
+                    owner.state.try_lock().is_ok(),
+                    "callbacks run outside the owner lock"
+                );
+                seen.lock().unwrap().push(owner.current());
+            }));
+            let original: ExecutionFailure =
+                novarocks_functions::KernelFailure::ResourceExhausted.into();
+            let reporter = TaskStatusReporter::new(owner.clone());
+            let result = reporter.conclude_failure(original.clone(), TaskFailurePhase::Execution);
+            assert!(matches!(result, StatusAdvance::Published(_)));
+            let terminal = owner.current();
+            assert_eq!(terminal.output(), TaskOutputFacts::default());
+            assert_eq!(terminal.installed(), before.installed());
+            assert!(
+                !owner.convergence().actual_stopped(),
+                "terminal publication is not physical exit"
+            );
+            let seen = notifications.lock().unwrap();
+            if initial == Some(false) {
+                assert!(
+                    seen.is_empty(),
+                    "losing failure publishes no new terminating version"
+                );
+                assert_eq!(terminal.state(), TaskState::Canceled);
+                assert_eq!(terminal.version(), before.version().next().unwrap());
+                assert_eq!(terminal.termination(), before.termination());
+                assert!(Arc::ptr_eq(
+                    previous.as_ref().unwrap(),
+                    &owner.accepted().unwrap()
+                ));
+                assert_eq!(owner.secondary_diagnostics().entries().len(), 1);
+            } else {
+                assert_eq!(seen.len(), 1);
+                let terminating = &seen[0];
+                assert_eq!(terminating.state(), TaskState::Failing);
+                assert_eq!(terminating.version(), before.version().next().unwrap());
+                assert_eq!(terminal.version(), terminating.version().next().unwrap());
+                assert_eq!(terminal.state(), TaskState::Failed);
+                assert_eq!(terminal.termination(), terminating.termination());
+                let accepted = owner.accepted().unwrap();
+                assert!(std::ptr::eq(
+                    accepted.originating_failure().unwrap().cause(),
+                    original.cause()
+                ));
+                assert_eq!(
+                    accepted.neutral().generation().get(),
+                    if initial.is_some() { 2 } else { 1 }
+                );
+                assert_eq!(owner.secondary_diagnostics().entries().len(), 0);
+            }
+        }
+    }
+
     fn failure(detail: &str) -> TaskFailure {
         TaskFailure::new(
             novarocks_execution_contract::failure::FailureFact::new(
@@ -2435,7 +2551,7 @@ mod conclusion_tests {
                 source: Some(source),
             }
         }
-        fn submit(&self, owner: &TaskStatusOwner) -> ConclusionAcceptance<ExecutionFailure> {
+        fn submit(&self, owner: &TaskStatusOwner) -> Arc<AcceptedTaskConclusion<ExecutionFailure>> {
             let proposal = match (&self.expected, &self.source) {
                 (TerminationDetail::Canceled(reason), None) => {
                     TaskConclusionProposal::Canceled(*reason)
@@ -2449,7 +2565,8 @@ mod conclusion_tests {
                 },
                 _ => panic!("a fixture cannot reconstruct a cause from a summary"),
             };
-            owner.submit(proposal)
+            owner.submit(proposal);
+            owner.accepted().unwrap()
         }
     }
     fn resource_fixture() -> TerminationFixture {
@@ -2472,10 +2589,11 @@ mod conclusion_tests {
     fn start(start: &Start) -> TaskStatusOwner {
         let owner = owner();
         let enter = |fixture: &TerminationFixture| {
+            assert!(owner.accepted().is_none());
             let accepted = fixture.submit(&owner);
-            assert_eq!(accepted.decision, ConclusionDecision::Accept);
+            assert_eq!(accepted.neutral().generation().get(), 1);
             assert_eq!(
-                accepted.accepted.neutral().conclusion(),
+                accepted.neutral().conclusion(),
                 &TaskConclusion::Terminated(fixture.expected.clone())
             );
         };
@@ -2661,12 +2779,15 @@ mod conclusion_tests {
             assert_eq!(owner.current().termination(), Some(&derived));
         }
         let original = resource_fixture();
+        let previous = owner.accepted().unwrap();
+        let refined = original.submit(&owner);
         assert_eq!(
-            original.submit(&owner).decision,
-            ConclusionDecision::RefineDerived
+            refined.neutral().generation().get(),
+            previous.neutral().generation().get() + 1
         );
         let later = internal_fixture();
-        assert_eq!(later.submit(&owner).decision, ConclusionDecision::Keep);
+        let kept = later.submit(&owner);
+        assert!(Arc::ptr_eq(&refined, &kept));
         owner.conclude_termination(later.expected, TaskOutputFacts::default());
         assert_concluded(
             &owner,
@@ -2791,13 +2912,16 @@ mod conclusion_tests {
 
         let peer = Arc::new(owner());
         let control = peer.execution_control(TaskFailurePhase::Preparation);
-        let receipt = peer.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        peer.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let receipt = peer.accepted().unwrap();
         check(&peer);
         for _ in 0..32 {
             let observation = control.error().unwrap();
-            let kept = control.report_failure(observation);
-            assert_eq!(kept.decision, ConclusionDecision::Keep);
-            assert!(Arc::ptr_eq(&receipt.accepted, &kept.accepted));
+            let before_kept = control.accepted();
+            control.report_failure(observation);
+            let kept = control.accepted().unwrap();
+            assert!(Arc::ptr_eq(&before_kept.unwrap(), &kept));
+            assert!(Arc::ptr_eq(&receipt, &kept));
         }
         assert_eq!(peer.secondary_diagnostics().entries().len(), 1);
         assert_eq!(
@@ -2806,11 +2930,16 @@ mod conclusion_tests {
             "stop observations are not late origin reports"
         );
         let origin = ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted);
-        let refined = control.report_failure(origin.clone());
-        assert_eq!(refined.decision, ConclusionDecision::RefineDerived);
-        assert_eq!(refined.accepted.neutral().generation().get(), 2);
+        let before_refined = control.accepted();
+        control.report_failure(origin.clone());
+        let refined = control.accepted().unwrap();
+        assert_eq!(
+            refined.neutral().generation().get(),
+            before_refined.unwrap().neutral().generation().get() + 1
+        );
+        assert_eq!(refined.neutral().generation().get(), 2);
         assert!(std::ptr::eq(
-            refined.accepted.originating_failure().unwrap().cause(),
+            refined.originating_failure().unwrap().cause(),
             origin.cause()
         ));
         assert_eq!(
@@ -2842,9 +2971,10 @@ mod conclusion_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let owner = Arc::new(owner());
         owner.release_to_observers();
-        let first = owner.submit(TaskConclusionProposal::Canceled(
+        owner.submit(TaskConclusionProposal::Canceled(
             CancelReason::UpstreamNoLongerNeeded,
         ));
+        let first = owner.accepted().unwrap();
         let stable = owner.current();
         let convergence = owner.convergence();
         let callbacks = Arc::new(AtomicUsize::new(0));
@@ -2870,9 +3000,11 @@ mod conclusion_tests {
                     expected
                 );
             } else {
-                let kept = reporter.report_failure(source, TaskFailurePhase::Preparation);
-                assert_eq!(kept.decision, ConclusionDecision::Keep);
-                assert!(Arc::ptr_eq(&first.accepted, &kept.accepted));
+                owner
+                    .execution_control(TaskFailurePhase::Preparation)
+                    .report_failure(source);
+                let kept = owner.accepted().unwrap();
+                assert!(Arc::ptr_eq(&first, &kept));
             }
         }
         let snapshot = reporter.secondary_diagnostics();
@@ -2903,15 +3035,16 @@ mod conclusion_tests {
         assert_eq!(owner.current(), stable);
         assert_eq!(owner.convergence(), convergence);
         assert_eq!(callbacks.load(Ordering::Acquire), 0);
-        assert!(Arc::ptr_eq(&first.accepted, &owner.accepted().unwrap()));
+        assert!(Arc::ptr_eq(&first, &owner.accepted().unwrap()));
     }
 
     #[test]
     fn concurrent_cleanup_observations_only_consume_the_same_bounded_local_journal() {
         let owner = Arc::new(owner());
-        let accepted = owner.submit(TaskConclusionProposal::Canceled(
+        owner.submit(TaskConclusionProposal::Canceled(
             CancelReason::UpstreamNoLongerNeeded,
         ));
+        let accepted = owner.accepted().unwrap();
         let stable = owner.current();
         let convergence = owner.convergence();
         let jobs = (0..16)
@@ -2940,7 +3073,7 @@ mod conclusion_tests {
         assert_eq!(snapshot.dropped(), 12);
         assert_eq!(owner.current(), stable);
         assert_eq!(owner.convergence(), convergence);
-        assert!(Arc::ptr_eq(&accepted.accepted, &owner.accepted().unwrap()));
+        assert!(Arc::ptr_eq(&accepted, &owner.accepted().unwrap()));
     }
 }
 
@@ -3063,9 +3196,8 @@ mod exit_health_port_tests {
             Duration::ZERO,
             health.clone(),
         ));
-        let accepted = owner
-            .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
-            .accepted;
+        owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let accepted = owner.accepted().unwrap();
         let before = owner.current();
         let convergence = owner.convergence();
         let cause = ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted);
@@ -3091,10 +3223,12 @@ mod exit_health_port_tests {
             diagnostics.entries().next().unwrap().role(),
             crate::TaskDiagnosticRole::Cleanup
         );
-        let refined = control.report_failure(cause);
+        let before_refined = control.accepted();
+        control.report_failure(cause);
+        let refined = control.accepted().unwrap();
         assert_eq!(
-            refined.decision,
-            novarocks_execution_contract::ConclusionDecision::RefineDerived
+            refined.neutral().generation().get(),
+            before_refined.unwrap().neutral().generation().get() + 1
         );
     }
 }
@@ -3317,10 +3451,13 @@ mod preparation_body_phase_tests {
         let original = source();
         let fact = original.failure_fact();
         let pointer = original.cause() as *const _;
-        let accepted = owner.report_preparation_body_failure(original);
-        assert_eq!(accepted.decision, ConclusionDecision::Accept);
+        let before_accepted = owner.accepted();
+        owner.report_preparation_body_failure(original);
+        let accepted = owner.accepted().unwrap();
+        assert!(before_accepted.is_none());
+        assert_eq!(accepted.neutral().generation().get(), 1);
         assert_eq!(
-            accepted.accepted.originating_failure().unwrap().cause() as *const _,
+            accepted.originating_failure().unwrap().cause() as *const _,
             pointer
         );
         let before = owner.current();
@@ -3343,10 +3480,13 @@ mod preparation_body_phase_tests {
         let original = source();
         let fact = original.failure_fact();
         let pointer = original.cause() as *const _;
-        let accepted = owner.report_preparation_body_failure(original);
-        assert_eq!(accepted.decision, ConclusionDecision::Accept);
+        let before_accepted = owner.accepted();
+        owner.report_preparation_body_failure(original);
+        let accepted = owner.accepted().unwrap();
+        assert!(before_accepted.is_none());
+        assert_eq!(accepted.neutral().generation().get(), 1);
         assert_eq!(
-            accepted.accepted.originating_failure().unwrap().cause() as *const _,
+            accepted.originating_failure().unwrap().cause() as *const _,
             pointer
         );
         assert_original_failure(&owner, true, TaskFailurePhase::Execution, fact);
@@ -3372,13 +3512,14 @@ mod preparation_body_phase_tests {
             let fact = original.failure_fact();
             let accepted = std::thread::spawn(move || {
                 start.wait();
-                reporter.report_preparation_body_failure(original)
+                reporter.report_preparation_body_failure(original);
+                reporter.accepted().unwrap()
             });
             let installation = installed
                 .join()
                 .expect("the actual installation setter exits");
             let accepted = accepted.join().expect("the actual failure author exits");
-            assert_eq!(accepted.decision, ConclusionDecision::Accept);
+            assert_eq!(accepted.neutral().generation().get(), 1);
             match installation {
                 StatusAdvance::Published(_) => {
                     assert_original_failure(&owner, true, TaskFailurePhase::Execution, fact)
@@ -3398,13 +3539,14 @@ mod preparation_body_phase_tests {
                 if installed {
                     owner.note_installed();
                 }
-                let first = if peer {
+                if peer {
                     owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
                 } else {
                     owner.submit(TaskConclusionProposal::Canceled(
                         CancelReason::UpstreamNoLongerNeeded,
                     ))
                 };
+                let first = owner.accepted().unwrap();
                 let stable = owner.current();
                 let original = source();
                 let fact = original.failure_fact();
@@ -3413,13 +3555,18 @@ mod preparation_body_phase_tests {
                 } else {
                     TaskFailurePhase::Preparation
                 };
-                let late = owner.report_preparation_body_failure(original);
+                let before_late = owner.accepted();
+                owner.report_preparation_body_failure(original);
+                let late = owner.accepted().unwrap();
                 if peer {
-                    assert_eq!(late.decision, ConclusionDecision::RefineDerived);
+                    assert_eq!(
+                        late.neutral().generation().get(),
+                        before_late.unwrap().neutral().generation().get() + 1
+                    );
                     assert_original_failure(&owner, installed, phase, fact);
                 } else {
-                    assert_eq!(late.decision, ConclusionDecision::Keep);
-                    assert!(Arc::ptr_eq(&first.accepted, &late.accepted));
+                    assert!(Arc::ptr_eq(&before_late.unwrap(), &late));
+                    assert!(Arc::ptr_eq(&first, &late));
                     assert_eq!(owner.current(), stable);
                     let diagnostics = owner.secondary_diagnostics();
                     assert_eq!(diagnostics.entries().len(), 1);
@@ -3460,17 +3607,19 @@ mod preparation_body_phase_tests {
             if installed {
                 owner.note_installed();
             }
-            let original = owner.submit(TaskConclusionProposal::Canceled(
+            owner.submit(TaskConclusionProposal::Canceled(
                 CancelReason::UpstreamNoLongerNeeded,
             ));
+            let original = owner.accepted().unwrap();
             let sample = Arc::new(Mutex::new(None));
-            let late =
-                owner.report_preparation_body_failure(ExecutionFailure::from_domain(DropProbe {
-                    owner: Arc::downgrade(&owner),
-                    sample: sample.clone(),
-                }));
-            assert_eq!(late.decision, ConclusionDecision::Keep);
-            assert!(Arc::ptr_eq(&original.accepted, &late.accepted));
+            let before_late = owner.accepted();
+            owner.report_preparation_body_failure(ExecutionFailure::from_domain(DropProbe {
+                owner: Arc::downgrade(&owner),
+                sample: sample.clone(),
+            }));
+            let late = owner.accepted().unwrap();
+            assert!(Arc::ptr_eq(&before_late.unwrap(), &late));
+            assert!(Arc::ptr_eq(&original, &late));
             assert_eq!(*sample.lock().unwrap(), Some(true));
         }
     }

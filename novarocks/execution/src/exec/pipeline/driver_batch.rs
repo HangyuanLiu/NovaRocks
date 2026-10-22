@@ -773,6 +773,8 @@ impl Retirement {
         let control: &RuntimeErrorState = self.control.as_ref().expect("original control holder");
         if !self.phases[0].started {
             let context = self.context.as_ref().expect("original context");
+            // A hint: a delayed stop only causes an extra losing proposal.
+            // Repeated handoff preserves this retirement's causal exit order.
             let needs_failure = self.shutdown_failure && !control.is_stopped();
             // The original source is stored before cloning it for the one
             // accepted owner. A rejected candidate cannot destroy it inline.
@@ -845,8 +847,8 @@ impl Retirement {
             return Poll::Unresolved;
         }
         if self.phases[11].unknown || (self.phases[0].unknown && !control.is_stopped()) {
-            // No conclusion was actually accepted. Retain the original
-            // completion/lease instead of fabricating either failure or success.
+            // This hint may lag adjudication. Conservatively retain the
+            // original completion/lease instead of fabricating local exit.
             self.unresolved = true;
             return Poll::Unresolved;
         }

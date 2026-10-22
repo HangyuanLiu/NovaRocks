@@ -3741,7 +3741,7 @@ mod terminal_signal_tests {
     struct PeerCleanupObservation {
         before: Option<ExecutionResult<()>>,
         peer: DriverState,
-        peer_accepted: Option<bool>,
+        peer_conclusion: Option<ExecutionResult<()>>,
         after: Option<ExecutionResult<()>>,
     }
 
@@ -3763,8 +3763,11 @@ mod terminal_signal_tests {
             // here could be swallowed without failing the test thread.
             let before = self.completion.conclusion();
             let peer = self.peer.lock().unwrap().process(Duration::ZERO);
-            let peer_accepted = match &peer {
-                DriverState::Failed(error) => Some(self.completion.fail(error.clone())),
+            let peer_conclusion = match &peer {
+                DriverState::Failed(error) => {
+                    self.completion.fail(error.clone());
+                    self.completion.conclusion()
+                }
                 _ => None,
             };
             self.observations
@@ -3773,7 +3776,7 @@ mod terminal_signal_tests {
                 .push(PeerCleanupObservation {
                     before,
                     peer,
-                    peer_accepted,
+                    peer_conclusion,
                     after: self.completion.conclusion(),
                 });
         }
@@ -3785,6 +3788,90 @@ mod terminal_signal_tests {
         }
     }
 
+    #[test]
+    fn deferred_originating_failure_precedes_cleanup_induced_peer_failure() {
+        use super::super::global_driver_executor::FragmentCompletion;
+
+        use novarocks_execution_contract::{TaskConclusionPort, TaskFailurePhase};
+        let owner = crate::runtime::task_control::test_support::DeferredOwner::new();
+        let runtime = Arc::new(RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::for_task(
+                Arc::new(owner.view(TaskFailurePhase::Execution)),
+            )),
+        ));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let completion = FragmentCompletion::new(2, runtime.error_state());
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let peer = Arc::new(Mutex::new(PipelineDriver::new(
+            2,
+            vec![Box::new(crate::exec::pipeline::shape::Source::new(
+                RootCancelledDuringFailure(Arc::clone(&cancelled)),
+            ))],
+            None,
+            vec![],
+            Arc::clone(&runtime),
+            None,
+        )));
+        let mut origin = PipelineDriver::new(
+            1,
+            vec![Box::new(crate::exec::pipeline::shape::Source::new(
+                RunPeerDuringFailure {
+                    cancelled,
+                    peer,
+                    completion: Arc::clone(&completion),
+                    observations: Arc::clone(&observations),
+                },
+            ))],
+            None,
+            vec![],
+            Arc::clone(&runtime),
+            None,
+        );
+        let original =
+            ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted)
+                .at_operator(3, PipelineOperation::Push);
+        assert_eq!(
+            origin.finish_with_state(DriverState::Failed(original.clone())),
+            DriverState::Failed(original.clone())
+        );
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1, "the actual cleanup hook ran once");
+        let observed = &observations[0];
+        assert!(matches!(observed.peer, DriverState::Failed(_)));
+        assert!(observed.before.is_none());
+        assert!(observed.peer_conclusion.is_none());
+        assert!(observed.after.is_none());
+        assert!(
+            owner.accepted().is_none(),
+            "both real failures remain unadjudicated"
+        );
+        assert!(owner.pending_len() >= 2);
+        owner.advance_all();
+        let accepted = owner.accepted().unwrap();
+        assert!(
+            accepted
+                .originating_failure()
+                .unwrap()
+                .same_occurrence(&original),
+            "the original proposal preceded cleanup, so its cause wins over the peer stop"
+        );
+        assert_eq!(accepted.neutral().generation().get(), 1);
+        completion.fail(original.clone());
+        owner.advance_all();
+        assert!(Arc::ptr_eq(&accepted, &owner.accepted().unwrap()));
+        assert!(runtime.error().unwrap().same_occurrence(&original));
+        assert!(
+            completion.stopped_fact().is_none(),
+            "the test did not invent driver exit"
+        );
+    }
     #[test]
     fn originating_failure_precedes_cleanup_induced_peer_failure() {
         use super::super::global_driver_executor::FragmentCompletion;
@@ -3848,7 +3935,7 @@ mod terminal_signal_tests {
                 .unwrap_err()
                 .same_occurrence(&original)
         );
-        assert_eq!(observed.peer_accepted, Some(false));
+        assert_eq!(observed.peer_conclusion, Some(Err(original.clone())));
         assert_eq!(observed.after, Some(Err(original.clone())));
         assert!(
             observed
@@ -3861,7 +3948,15 @@ mod terminal_signal_tests {
         );
         // The peer already reached completion, just as an executor worker can
         // while the originating worker remains in an operator callback.
-        assert!(!completion.fail(original.clone()));
+        let previous = completion.conclusion().unwrap().unwrap_err();
+        completion.fail(original.clone());
+        assert!(
+            completion
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&previous)
+        );
         assert_eq!(completion.conclusion(), Some(Err(original.clone())));
         assert_eq!(runtime.error(), Some(original));
         assert!(completion.stopped_fact().is_none());

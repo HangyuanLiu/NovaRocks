@@ -8,6 +8,9 @@ partially-supersedes: [ADR-0095]
 partially-supersedes-scope:
   ADR-0095: "Only the permission to erase known non-analyze execution facts into an opaque engine failure; Analyze code/span and the separate historical MV lineage facade remain unchanged; absence of SQL source/span does not authorize erasing known execution facts."
 superseded-by: null
+partially-superseded-by: [ADR-0193]
+partially-superseded-by-scope:
+  ADR-0193: "Only rule 5's implicit synchronous receipt contract in runtime/completion caching and notification; the single Task acceptance owner, refinement rules and every other rule remain effective."
 date: 2026-10-20
 provenance:
   - "discussion: 2026-10 receiver-owned preparation, domain failure projection and single Task conclusion"

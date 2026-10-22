@@ -1140,8 +1140,8 @@ mod cleanup_notification_tests {
         TaskExecutionControl, TaskExecutionPort, test_support::Owner,
     };
     use novarocks_execution_contract::{
-        AcceptedTaskConclusion, ConclusionAcceptance, TaskConclusionPort, TaskConclusionProposal,
-        TaskFailurePhase, TaskIdentity,
+        AcceptedTaskConclusion, TaskConclusionPort, TaskConclusionProposal, TaskFailurePhase,
+        TaskIdentity,
     };
     use novarocks_failure_contract::{FailureFact, FailureProjection};
     use std::sync::{
@@ -1168,10 +1168,16 @@ mod cleanup_notification_tests {
         fn accepted(&self) -> Option<Arc<AcceptedTaskConclusion<ExecutionFailure>>> {
             self.owner.accepted()
         }
-        fn submit(
+        fn on_settled(
             &self,
-            proposal: TaskConclusionProposal<ExecutionFailure>,
-        ) -> ConclusionAcceptance<ExecutionFailure> {
+            continuation: novarocks_execution_contract::SettledContinuation<ExecutionFailure>,
+        ) {
+            novarocks_execution_contract::TaskConclusionPort::on_settled(
+                self.owner.as_ref(),
+                continuation,
+            );
+        }
+        fn submit(&self, proposal: TaskConclusionProposal<ExecutionFailure>) {
             self.owner.submit(proposal)
         }
     }
@@ -1219,11 +1225,10 @@ mod cleanup_notification_tests {
     #[test]
     fn failed_cleanup_notification_does_not_retain_exited_resource_or_task_authority() {
         let owner = Owner::new();
-        let accepted = owner
-            .submit(TaskConclusionProposal::Aborted(
-                novarocks_execution_contract::AbortCause::PeerTaskFailed,
-            ))
-            .accepted;
+        owner.submit(TaskConclusionProposal::Aborted(
+            novarocks_execution_contract::AbortCause::PeerTaskFailed,
+        ));
+        let accepted = owner.accepted().unwrap();
         let payload_drops = Arc::new(AtomicUsize::new(0));
         let port = Arc::new(FailingNotification {
             owner: owner.clone(),

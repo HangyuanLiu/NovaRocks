@@ -2363,10 +2363,19 @@ mod tests {
         {
             self.task.accepted()
         }
+        fn on_settled(
+            &self,
+            continuation: novarocks_execution_contract::SettledContinuation<ExecutionFailure>,
+        ) {
+            novarocks_execution_contract::TaskConclusionPort::on_settled(
+                self.task.as_ref(),
+                continuation,
+            );
+        }
         fn submit(
             &self,
             proposal: novarocks_execution_contract::TaskConclusionProposal<ExecutionFailure>,
-        ) -> novarocks_execution_contract::ConclusionAcceptance<ExecutionFailure> {
+        ) {
             self.required.fetch_add(1, Ordering::AcqRel);
             self.task.submit(proposal)
         }
@@ -2474,9 +2483,9 @@ mod tests {
             AbortCause, TaskConclusionPort, TaskConclusionProposal,
         };
         let (port, state) = task_binding();
-        let first = port
-            .task
+        port.task
             .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let first = port.task.accepted().unwrap();
         let drops = Arc::new(AtomicUsize::new(0));
         let abort = ExecutionFailure::from_domain(TestWriteFailure(81));
         let close = ExecutionFailure::from_domain(TestWriteFailure(82));
@@ -2512,7 +2521,7 @@ mod tests {
             assert!(matches!(pure_observation(&mut op), ExitProgress::Exited));
         }
         assert_eq!(port.required.load(Ordering::Acquire), 0);
-        assert!(Arc::ptr_eq(&port.task.accepted().unwrap(), &first.accepted));
+        assert!(Arc::ptr_eq(&port.task.accepted().unwrap(), &first));
         assert!(port.health.failure().is_none());
     }
     #[test]
@@ -2541,9 +2550,9 @@ mod tests {
         op.activate(&state).unwrap();
         op.finish_for_test(&state).unwrap();
         receiver.recv_timeout(Duration::from_secs(5)).unwrap();
-        let first = port
-            .task
+        port.task
             .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let first = port.task.accepted().unwrap();
         assert!(matches!(
             pure_observation(&mut op),
             ExitProgress::Pending(_)
@@ -2554,7 +2563,7 @@ mod tests {
             Duration::from_secs(5)
         ));
         let accepted = port.task.accepted().unwrap();
-        assert!(!Arc::ptr_eq(&accepted, &first.accepted));
+        assert!(!Arc::ptr_eq(&accepted, &first));
         assert!(
             accepted
                 .originating_failure()

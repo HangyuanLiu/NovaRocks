@@ -117,7 +117,8 @@ code-anchors:
 
 - [ADR-0192](ADR-0192-provider-work-units-share-one-runtime-split-path.md) — Provider 工作单元为何统一走 runtime split，单例提示为何只影响放置，分布聚合与恢复为何各守原 owner（active）
 - [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）
-- [ADR-0187](ADR-0187-receiver-owned-steps-and-single-task-conclusion.md) — 接收方为何接受后准备、领域失败为何贯穿唯一 Task 结论，并由原 owner 继续观察真实退出（active；仅部分替代 ADR-0095 对已知非 Analyze 执行事实的不透明化，Analyze code/span 与历史 MV 边界保留）
+- [ADR-0193](ADR-0193-task-conclusion-proposals-and-settled-points.md) — Task 结论为何只交接提议、以结算屏障支撑定局，并由唯一 owner 推进终止（active；仅部分替代 ADR-0187 规则 5 的隐含同步收据，单一接受事务、细化及其余规则保留）
+- [ADR-0187](ADR-0187-receiver-owned-steps-and-single-task-conclusion.md) — 接收方为何接受后准备、领域失败为何贯穿唯一 Task 结论，并由原 owner 继续观察真实退出（active；仅部分替代 ADR-0095 对已知非 Analyze 执行事实的不透明化，Analyze code/span 与历史 MV 边界保留；规则 5 的隐含同步收据由 ADR-0193 部分替代，单一接受事务、细化及其余规则保留）
 - [ADR-0185](ADR-0185-compiled-packages-are-the-sole-static-plan-path.md) — 静态计划为何只走 compiled package，能力缺口为何以准确拒绝与完整失败账交接，最终为何仍须全量清账（active；部分替代 ADR-0124 的兼容材料，exact-island 与 ingress 规则保留）
 - ADR-0159 — connector scan 为何由 driver 直接 poll page stream、在 scan 分支内扇出，并以观察到的退出为结束（active）
 
@@ -218,7 +219,8 @@ code-anchors:
 丢失、过期 ownership 与进程失败，使分布式生命周期可测试、可观察并可独立演进。
 
 - [ADR-0191](ADR-0191-frozen-fold-facts-and-shared-compiled-evaluation.md) — 折叠为何冻结真实 binding 并复用 compiled 单节点核心，COW 赋值为何属于选择查询，兼容材料为何只保留真实 owner（active；部分替代 ADR-0100 的请求词汇与旧实现映射，其余有效规则保留）
-- [ADR-0187](ADR-0187-receiver-owned-steps-and-single-task-conclusion.md) — 接收方为何接受后准备、领域失败为何贯穿唯一 Task 结论，并由原 owner 继续观察真实退出（active；仅部分替代 ADR-0095 对已知非 Analyze 执行事实的不透明化，Analyze code/span 与历史 MV 边界保留）
+- [ADR-0193](ADR-0193-task-conclusion-proposals-and-settled-points.md) — Task 结论为何只交接提议、以结算屏障支撑定局，并由唯一 owner 推进终止（active；仅部分替代 ADR-0187 规则 5 的隐含同步收据，单一接受事务、细化及其余规则保留）
+- [ADR-0187](ADR-0187-receiver-owned-steps-and-single-task-conclusion.md) — 接收方为何接受后准备、领域失败为何贯穿唯一 Task 结论，并由原 owner 继续观察真实退出（active；仅部分替代 ADR-0095 对已知非 Analyze 执行事实的不透明化，Analyze code/span 与历史 MV 边界保留；规则 5 的隐含同步收据由 ADR-0193 部分替代，单一接受事务、细化及其余规则保留）
 - [ADR-0185](ADR-0185-compiled-packages-are-the-sole-static-plan-path.md) — 静态计划为何只走 compiled package，能力缺口为何以准确拒绝与完整失败账交接，最终为何仍须全量清账（active；部分替代 ADR-0124 的兼容材料，exact-island 与 ingress 规则保留）
 - ADR-0007 — FE 全局协调与 BE 本地查询生命周期为何保持进程和状态机分离（active）
 - ADR-0011 — 请求执行为何使用 immutable context、一次 topology capture 并拒绝 ambient fallback（active）
@@ -532,7 +534,8 @@ debug/test 开关归启动进程环境。跨域 wire section 不因名字相似�
 NotFound；Connector 不让通用 field lookup 遮蔽 table-format invariant；Frontend router 不根据文本或错误字符串重猜 SQL
 statement family。边界层只能传递或编码 owner 的事实，测试只能验证既定契约，不能成为第二错误 authority。
 
-- [ADR-0187](ADR-0187-receiver-owned-steps-and-single-task-conclusion.md) — 接收方为何接受后准备、领域失败为何贯穿唯一 Task 结论，并由原 owner 继续观察真实退出（active；仅部分替代 ADR-0095 对已知非 Analyze 执行事实的不透明化，Analyze code/span 与历史 MV 边界保留）
+- [ADR-0193](ADR-0193-task-conclusion-proposals-and-settled-points.md) — Task 结论为何只交接提议、以结算屏障支撑定局，并由唯一 owner 推进终止（active；仅部分替代 ADR-0187 规则 5 的隐含同步收据，单一接受事务、细化及其余规则保留）
+- [ADR-0187](ADR-0187-receiver-owned-steps-and-single-task-conclusion.md) — 接收方为何接受后准备、领域失败为何贯穿唯一 Task 结论，并由原 owner 继续观察真实退出（active；仅部分替代 ADR-0095 对已知非 Analyze 执行事实的不透明化，Analyze code/span 与历史 MV 边界保留；规则 5 的隐含同步收据由 ADR-0193 部分替代，单一接受事务、细化及其余规则保留）
 - ADR-0088 — SQL、Iceberg 与 MV 的错误为何必须在各自 owner 内、跨域 fallback 前收敛（active）
 - ADR-0095 — SQL analyze 错误为何以 typed code/span 穿过 Frontend、由 MySQL 边界映射（active；已知非 Analyze 执行事实的不透明化由 ADR-0187 部分替代，Analyze 与历史 MV 规则保留）
 

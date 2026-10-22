@@ -3534,8 +3534,15 @@ mod tests {
             None,
         );
         let completion = FragmentCompletion::new(1, state.error_state());
+        let submitted_failure: crate::runtime::fragment::ExecutionFailure =
+            (crate::exec::pipeline::driver_failure::DriverFailure::ExecutorShutdown).into();
+        completion.fail(submitted_failure.clone());
         assert!(
-            completion.fail(crate::exec::pipeline::driver_failure::DriverFailure::ExecutorShutdown)
+            completion
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&submitted_failure)
         );
         let context = Arc::new(FragmentContext::new(None, state, None, None, None, None));
         let task = DriverTask::new(

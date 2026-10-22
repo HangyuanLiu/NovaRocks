@@ -140,12 +140,15 @@ impl PreparedPipelineExecution {
             // Keep the actual source before the accepting call. A clone is
             // offered through the same control; no catch invents another cause.
             let proposal = tasks.install_initial_failure(error);
-            tasks.metadata(1, &control, || fragment_ctx.set_final_status(proposal));
-            if control.is_stopped() {
+            let handed_off = tasks
+                .metadata(1, &control, || fragment_ctx.set_final_status(proposal))
+                .is_some();
+            if handed_off {
                 start_work_exited = tasks.dispose_initial_failure(&control);
             } else {
-                // The accepting call did not establish a conclusion. Its
-                // original source and start-work obligation remain owned.
+                // Unwind cannot distinguish a pre-handoff panic from a
+                // post-handoff notification panic. Retain the original source
+                // and start-work obligation rather than infer acceptance.
                 start_work_exited = false;
             }
         }
@@ -198,13 +201,12 @@ impl RunningPipelineExecution {
     }
 
     /// Locally cancel this fragment and wake any blocked drivers so join can drain them.
-    pub fn cancel(&self, err: impl Into<ExecutionFailure>) -> bool {
+    pub fn cancel(&self, err: impl Into<ExecutionFailure>) {
         let err = err.into();
-        let accepted = self.fragment_ctx.set_final_status(err);
-        accepted
+        self.fragment_ctx.set_final_status(err);
     }
 
-    pub fn fail(&self, err: impl Into<ExecutionFailure>) -> bool {
+    pub fn fail(&self, err: impl Into<ExecutionFailure>) {
         self.cancel(err)
     }
 
@@ -836,14 +838,91 @@ mod tests {
             runtime_state.error().expect("same runtime latch").cause(),
             error.cause()
         );
-        assert!(!running.fail(novarocks_functions::KernelFailure::Internal(
+        let previous = running.conclusion().unwrap().unwrap_err();
+        running.fail(novarocks_functions::KernelFailure::Internal(
             novarocks_functions::KernelDiagnostic::new(
-                &("later identical-looking failure".to_owned())
-            )
-        )));
+                &("later identical-looking failure".to_owned()),
+            ),
+        ));
+        assert!(
+            running
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&previous)
+        );
         assert_eq!(running.join(), Err(original.clone()));
         assert_eq!(failure_signals.load(Ordering::SeqCst), 1);
         original
+    }
+    #[test]
+    fn initial_failure_start_does_not_read_its_own_submission() {
+        use novarocks_execution_contract::{TaskConclusionPort, TaskFailurePhase};
+        let owner = crate::runtime::task_control::test_support::DeferredOwner::new();
+        let control = Arc::new(owner.view(TaskFailurePhase::Execution));
+        let runtime_state = Arc::new(RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(test_execution_runtime()),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::for_task(
+                control.clone(),
+            )),
+        ));
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let driver = PipelineDriver::new(
+            1,
+            vec![Box::new(crate::exec::pipeline::shape::Source::new(
+                ParkedSourceOperator {
+                    observable: Arc::new(Observable::new()),
+                    ready: Arc::new(AtomicBool::new(false)),
+                    cancel_calls: cancels.clone(),
+                },
+            ))],
+            None,
+            Vec::new(),
+            runtime_state.clone(),
+            None,
+        );
+        let original: ExecutionFailure =
+            novarocks_functions::KernelFailure::ResourceExhausted.into();
+        let running = manually_prepared_execution(driver, runtime_state.clone(), None)
+            .start_failed(original.clone());
+        assert!(
+            owner.accepted().is_none(),
+            "handoff returns before any adjudication"
+        );
+        assert!(!control.is_stopped());
+        owner.advance_all();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while running.stopped_fact().is_none() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            running.stopped_fact().is_some(),
+            "a normally returned handoff releases start work and permits actual driver exit"
+        );
+        assert!(running.join().unwrap_err().same_occurrence(&original));
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+        owner.advance_all();
+        assert!(
+            owner
+                .accepted()
+                .unwrap()
+                .originating_failure()
+                .unwrap()
+                .same_occurrence(&original)
+        );
+        assert!(
+            runtime_state
+                .error_state()
+                .exit_health_reporter()
+                .failure()
+                .is_none()
+        );
     }
     #[test]
     fn typed_failure_all_kernel_causes_survive_activation_pull_completion_and_runtime_latches() {
@@ -1318,7 +1397,8 @@ mod tests {
             crate::runtime::fragment::prepare_compiled_fragment(submission, context).unwrap();
         let original: ExecutionFailure =
             novarocks_functions::KernelFailure::ResourceExhausted.into();
-        let _ = control.report_failure(original.clone());
+        control.report_failure(original.clone());
+        let _ = control.accepted().unwrap();
         state.armed.store(true, Ordering::Release);
         let mut slot = Some(dormant);
         let running = DormantFragmentHandle::try_drain_stopped(&mut slot).unwrap();
@@ -1501,11 +1581,11 @@ mod tests {
             std::thread::yield_now();
         }
         let entered_wait = state.error_state().waiting_count() == 1;
-        assert!(
-            running.cancel(crate::runtime::fragment::FragmentCancelReason::new(
-                "cancel actual SLEEP".to_string()
-            ))
-        );
+        let original_cancel: ExecutionFailure =
+            crate::runtime::fragment::FragmentCancelReason::new("cancel actual SLEEP".to_string())
+                .into();
+        running.cancel(original_cancel.clone());
+        assert!(state.error().unwrap().same_occurrence(&original_cancel));
         let cancellation = state.error().expect("cancel installed its actual cause");
         let (tx, rx) = mpsc::channel();
         let join = std::thread::spawn(move || {

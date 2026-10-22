@@ -300,7 +300,7 @@ mod preparation_stop_view_tests {
 
     #[test]
     fn a_real_accepted_task_failure_interrupts_the_preparation_view() {
-        use novarocks_execution_contract::{ConclusionDecision, TaskFailurePhase};
+        use novarocks_execution_contract::TaskFailurePhase;
         let owner = accepted_owner();
         let cell = CreationCell::for_accepted_fixture(&owner);
         cell.accept(owner.clone());
@@ -308,12 +308,13 @@ mod preparation_stop_view_tests {
         let original = novarocks_execution::runtime::fragment::ExecutionFailure::from(
             novarocks_functions::KernelFailure::ResourceExhausted,
         );
-        let receipt = owner
-            .execution_control(TaskFailurePhase::Preparation)
-            .report_failure(original.clone());
-        assert_eq!(receipt.decision, ConclusionDecision::Accept);
+        let control = owner.execution_control(TaskFailurePhase::Preparation);
+        assert!(control.accepted().is_none());
+        control.report_failure(original.clone());
+        let receipt = control.accepted().unwrap();
+        assert_eq!(receipt.neutral().generation().get(), 1);
         assert!(std::ptr::eq(
-            receipt.accepted.originating_failure().unwrap().cause(),
+            receipt.originating_failure().unwrap().cause(),
             original.cause()
         ));
         let loan = view.borrow_control();

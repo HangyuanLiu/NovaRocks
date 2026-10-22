@@ -5269,14 +5269,20 @@ fn preparation_rollback_concludes_on_the_stand_down_that_won() {
             TaskFailurePhase::Execution,
         );
         if escalate {
-            let accepted =
-                peer_reporter.report_failure(peer_cause.clone(), TaskFailurePhase::Execution);
-            assert_eq!(
-                accepted.decision,
-                novarocks_execution_contract::ConclusionDecision::Accept
-            );
+            let peer_owner = fixture
+                .task_host
+                .preparation_stop(peer_identity)
+                .control()
+                .0
+                .unwrap();
+            let control = peer_owner.execution_control(TaskFailurePhase::Execution);
+            let before_accepted = control.accepted();
+            control.report_failure(peer_cause.clone());
+            let accepted = control.accepted().unwrap();
+            assert!(before_accepted.is_none());
+            assert_eq!(accepted.neutral().generation().get(), 1);
             assert!(std::ptr::eq(
-                accepted.accepted.originating_failure().unwrap().cause(),
+                accepted.originating_failure().unwrap().cause(),
                 peer_cause.cause()
             ));
             assert_eq!(peer_reporter.current().state(), TaskState::Failing);

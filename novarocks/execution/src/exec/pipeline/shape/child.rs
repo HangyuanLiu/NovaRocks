@@ -1034,9 +1034,8 @@ mod tests {
             .unwrap();
         for required in [false, true] {
             let task = Owner::new();
-            let accepted = task
-                .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
-                .accepted;
+            task.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+            let accepted = task.accepted().unwrap();
             let failures = Arc::new(RuntimeErrorState::for_task(Arc::new(
                 task.view(TaskFailurePhase::Execution),
             )));
@@ -1279,9 +1278,8 @@ mod tests {
             .build()
             .unwrap();
         let task = Owner::new();
-        let accepted = task
-            .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
-            .accepted;
+        task.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let accepted = task.accepted().unwrap();
         let failures = Arc::new(RuntimeErrorState::for_task(Arc::new(
             task.view(TaskFailurePhase::Execution),
         )));

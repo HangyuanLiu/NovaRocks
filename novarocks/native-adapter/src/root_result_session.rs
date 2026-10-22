@@ -1355,7 +1355,7 @@ impl RootProducerJob for NativeRootWork {
                     .expect("root failure reporter lock")
                     .clone();
                 if let Some(RootFailureReporter::Task(reporter)) = reporter {
-                    let _ = reporter.report_failure(failure);
+                    reporter.report_failure(failure);
                 }
             }
         }
@@ -1868,8 +1868,7 @@ mod terminal_observation_tests {
             let controller_lifetime = root_control_lifetime(&fixture.session);
             let rollback = matches!(&reason, ResultAbort::PrepareRollback);
             if rollback {
-                let _ = task
-                    .status()
+                task.status()
                     .execution_control(TaskFailurePhase::Preparation)
                     .report_failure(
                         novarocks_execution::runtime::fragment::ExecutionFailure::from(

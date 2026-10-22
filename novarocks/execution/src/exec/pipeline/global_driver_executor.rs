@@ -179,10 +179,10 @@ impl FragmentCompletion {
         self.control.is_stopped()
     }
 
-    pub fn fail(&self, err: impl Into<ExecutionFailure>) -> bool {
+    pub fn fail(&self, err: impl Into<ExecutionFailure>) {
         // The shared owner publishes outside the physical completion lock.
         // A parked driver's notification may reenter completion inspection.
-        self.control.accept_error(err.into())
+        self.control.set_error(err.into())
     }
 
     pub fn driver_finished(&self) -> bool {
@@ -291,7 +291,7 @@ impl FragmentCompletion {
                 // Time does not prove exit. Submit the real deadline cause,
                 // request local stand-down even if an earlier cause won, and
                 // still join the exact submitted driver group.
-                let _ = self.fail(err);
+                self.fail(err);
                 on_timeout();
                 return self.wait();
             }
@@ -1001,6 +1001,9 @@ fn worker_loop(shared: Arc<ExecutorShared>) {
         };
         task.observe_worker_start();
 
+        // Stop is a hint, not a verdict about a just-handed-off proposal.
+        // A delayed stop takes the ordinary failure retirement below, handing
+        // off the same occurrence again before its own physical exit.
         if shared.admission_closed.load(Ordering::Acquire) || task.completion.should_abort() {
             if let Some(task) =
                 task.finish_abort_for_control(shared.admission_closed.load(Ordering::Acquire))
@@ -1405,7 +1408,15 @@ mod tests {
         );
 
         let failure = ExecutionFailure::from(novarocks_functions::KernelFailure::DeadlineExceeded);
-        assert!(completion.fail(failure.clone()));
+        let submitted_failure: crate::runtime::fragment::ExecutionFailure = failure.clone();
+        completion.fail(submitted_failure.clone());
+        assert!(
+            completion
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&submitted_failure)
+        );
         assert_eq!(completion.conclusion(), Some(Err(failure.clone())));
         assert_eq!(completion.remaining_drivers(), 2);
         assert_eq!(completion.stopped_fact(), None);
@@ -1437,7 +1448,15 @@ mod tests {
         });
         let original: ExecutionFailure =
             novarocks_functions::KernelFailure::DeadlineExceeded.into();
-        assert!(completion.fail(original.clone()));
+        let submitted_failure: crate::runtime::fragment::ExecutionFailure = original.clone();
+        completion.fail(submitted_failure.clone());
+        assert!(
+            completion
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&submitted_failure)
+        );
         assert!(
             seen.lock().unwrap().is_none(),
             "binding a dormant no-job scope is not activation"
@@ -1865,7 +1884,16 @@ mod tests {
         // The fragment fails elsewhere: the parked driver gets one turn to
         // deliver cancellation, then waits for its owner again.
         let failure = ExecutionFailure::from(novarocks_functions::KernelFailure::DeadlineExceeded);
-        assert!(harness.completion.fail(failure.clone()));
+        let submitted_failure: crate::runtime::fragment::ExecutionFailure = failure.clone();
+        harness.completion.fail(submitted_failure.clone());
+        assert!(
+            harness
+                .completion
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&submitted_failure)
+        );
         harness.fragment_ctx.set_final_status(failure.clone());
         assert!(wait_until(Duration::from_secs(1), || {
             harness.cancelled.load(Ordering::Acquire)
@@ -1976,9 +2004,8 @@ mod tests {
         let executor = GlobalDriverExecutor::new(1);
         executor.shutdown().unwrap();
         let owner = crate::runtime::task_control::test_support::Owner::new();
-        let receipt = owner
-            .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
-            .accepted;
+        owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let receipt = owner.accepted().unwrap();
         let control = Arc::new(RuntimeErrorState::for_task(Arc::new(
             owner.view(TaskFailurePhase::Execution),
         )));
@@ -2083,6 +2110,145 @@ mod tests {
         assert_executor_shutdown(stopped.conclusion());
     }
 
+    // Exercise the production panic catch and retirement paths with delayed adjudication.
+    #[test]
+    fn deferred_verdict_driver_panic_retires_through_the_failure_path() {
+        use crate::runtime::runtime_state::RuntimeErrorState;
+        use crate::runtime::task_control::test_support::DeferredOwner;
+        use novarocks_execution_contract::{TaskConclusionPort, TaskFailurePhase};
+        struct ReleasePendingOnDrop(Arc<AtomicBool>);
+        impl Drop for ReleasePendingOnDrop {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let executor = GlobalDriverExecutor::new(1);
+        let pending = Arc::new(AtomicBool::new(true));
+        let _release = ReleasePendingOnDrop(pending.clone());
+        let observed = Arc::new(AtomicBool::new(false));
+        let cancel_requested = Arc::new(AtomicBool::new(false));
+        let owner = DeferredOwner::new();
+        let runtime_state = Arc::new(RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(RuntimeErrorState::for_task(Arc::new(
+                owner.view(TaskFailurePhase::Execution),
+            ))),
+        ));
+        let fragment_ctx = Arc::new(FragmentContext::new(
+            None,
+            runtime_state.clone(),
+            Some((33_041, 33_042)),
+            None,
+            None,
+            None,
+        ));
+        let completion = FragmentCompletion::new(1, runtime_state.error_state());
+        let task = DriverTask::new(
+            PipelineDriver::new(
+                1,
+                vec![
+                    Box::new(crate::exec::pipeline::shape::Source::new(PanickingSource)),
+                    Box::new(crate::exec::pipeline::shape::Source::new(
+                        PendingAbortOperator {
+                            pending: pending.clone(),
+                            observed: observed.clone(),
+                            cancel_requested: cancel_requested.clone(),
+                            only_after_cancel: true,
+                            awaiting_cancel: Arc::new(Observable::new()),
+                        },
+                    )),
+                ],
+                None,
+                Vec::new(),
+                runtime_state.clone(),
+                Some((33_041, 33_042)),
+            ),
+            completion.clone(),
+            fragment_ctx,
+            Duration::from_secs(1),
+        );
+        assert!(executor.submit(vec![task]));
+        assert!(wait_until(Duration::from_secs(2), || cancel_requested
+            .load(Ordering::Acquire)
+            && observed.load(Ordering::Acquire)));
+        // The catch handler really ran and signaled operators, but its proposal is
+        // still pending. A synchronous status expectation would hide this branch.
+        assert!(owner.accepted().is_none());
+        assert!(!runtime_state.error_state().is_stopped());
+        assert!(completion.conclusion().is_none());
+        assert!(owner.pending_len() > 0);
+        assert!(completion.stopped_fact().is_none());
+        assert_eq!(completion.remaining_drivers(), 1);
+        assert_eq!(executor.shared.live_tasks.load(Ordering::Acquire), 1);
+        pending.store(false, Ordering::Release);
+        assert!(wait_until(Duration::from_secs(2), || completion
+            .stopped_fact()
+            .is_some()));
+        assert!(wait_until(Duration::from_secs(2), || executor
+            .shared
+            .live_tasks
+            .load(Ordering::Acquire)
+            == 0));
+        assert_eq!(completion.remaining_drivers(), 0);
+        assert!(
+            owner.accepted().is_none(),
+            "physical exit precedes adjudication"
+        );
+        assert!(
+            completion.stopped_fact().unwrap().conclusion().is_ok(),
+            "the completion payload is only a lagging hint, never the fragment's final outcome"
+        );
+        assert!(
+            owner.pending_len() >= 2,
+            "panic capture and failed retirement hand off the original occurrence"
+        );
+        let settled = Arc::new(Mutex::new(None));
+        let result = settled.clone();
+        owner.on_settled(Box::new(move |snapshot| *result.lock().unwrap() = snapshot));
+        assert!(settled.lock().unwrap().is_none());
+        assert!(owner.advance_one());
+        let accepted = owner
+            .accepted()
+            .expect("the actual caught panic is accepted first");
+        let original = accepted.originating_failure().unwrap().clone();
+        assert!(
+            original
+                .detail()
+                .contains("panic in driver execution: injected driver panic")
+        );
+        assert_eq!(accepted.neutral().generation().get(), 1);
+        owner.advance_all();
+        let current = owner.accepted().unwrap();
+        assert!(
+            Arc::ptr_eq(&accepted, &current),
+            "duplicate handoffs lose without changing the accepted source"
+        );
+        assert!(
+            settled
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .originating_failure()
+                .unwrap()
+                .same_occurrence(&original)
+        );
+        assert_eq!(owner.pending_len(), 0);
+        assert!(
+            crate::runtime::task_control::TaskExecutionPort::execution_health(owner.as_ref())
+                .failure()
+                .is_none()
+        );
+        executor
+            .shutdown()
+            .expect("the actual admitted driver and executor converge");
+    }
     #[test]
     fn driver_panic_waits_for_operator_cleanup_before_actual_stop() {
         let executor = GlobalDriverExecutor::new(1);
@@ -2374,8 +2540,24 @@ mod tests {
             Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         );
         let first: ExecutionFailure = novarocks_functions::KernelFailure::ResourceExhausted.into();
-        assert!(completion.fail(first.clone()));
-        assert!(!completion.fail(novarocks_functions::KernelFailure::Cancelled));
+        let submitted_failure: crate::runtime::fragment::ExecutionFailure = first.clone();
+        completion.fail(submitted_failure.clone());
+        assert!(
+            completion
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&submitted_failure)
+        );
+        let previous = completion.conclusion().unwrap().unwrap_err();
+        completion.fail(novarocks_functions::KernelFailure::Cancelled);
+        assert!(
+            completion
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&previous)
+        );
         assert_eq!(completion.conclusion(), Some(Err(first.clone())));
         assert_eq!(completion.remaining_drivers(), 2);
         assert!(completion.stopped_fact().is_none());

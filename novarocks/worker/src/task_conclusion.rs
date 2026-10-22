@@ -23,12 +23,26 @@ use crate::failure_reason::WorkerFailureReason;
 use crate::task_diagnostics::TaskSecondaryDiagnostic;
 use novarocks_execution::runtime::fragment::ExecutionFailure;
 use novarocks_execution_contract::{
-    AcceptedConclusion, AcceptedTaskConclusion, ConclusionAcceptance, ConclusionDecision,
-    TaskConclusion, TaskConclusionProposal, TaskFailure, TaskIdentity, TerminationDetail,
-    decide_conclusion, decide_reported_failure,
+    AcceptedConclusion, AcceptedTaskConclusion, ConclusionDecision, TaskConclusion,
+    TaskConclusionProposal, TaskFailure, TaskIdentity, TerminationDetail, decide_conclusion,
+    decide_reported_failure,
     failure::{FailureClass, FailureEvidence, FailureFact, FailureProjection},
 };
 use std::{num::NonZeroU64, sync::Arc};
+
+#[derive(Debug)]
+pub(crate) struct ConclusionAcceptance<C> {
+    pub decision: ConclusionDecision,
+    pub accepted: Arc<AcceptedTaskConclusion<C>>,
+}
+impl<C> Clone for ConclusionAcceptance<C> {
+    fn clone(&self) -> Self {
+        Self {
+            decision: self.decision,
+            accepted: Arc::clone(&self.accepted),
+        }
+    }
+}
 
 #[derive(Debug)]
 struct UnownedStopReport(ExecutionFailure);

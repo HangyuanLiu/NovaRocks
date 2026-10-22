@@ -410,8 +410,8 @@ mod tests {
         task_control::{TaskExecutionControl, TaskExecutionPort, test_support::Owner},
     };
     use novarocks_execution_contract::{
-        AbortCause, AcceptedTaskConclusion, ConclusionAcceptance, TaskConclusionPort,
-        TaskConclusionProposal, TaskFailurePhase, TaskIdentity,
+        AbortCause, AcceptedTaskConclusion, TaskConclusionPort, TaskConclusionProposal,
+        TaskFailurePhase, TaskIdentity,
     };
     use novarocks_failure_contract::{
         FailureClass, FailureFact, FailureProjection, FailureReason, domain,
@@ -462,10 +462,16 @@ mod tests {
         fn accepted(&self) -> Option<Arc<AcceptedTaskConclusion<ExecutionFailure>>> {
             self.task.accepted()
         }
-        fn submit(
+        fn on_settled(
             &self,
-            proposed: TaskConclusionProposal<ExecutionFailure>,
-        ) -> ConclusionAcceptance<ExecutionFailure> {
+            continuation: novarocks_execution_contract::SettledContinuation<ExecutionFailure>,
+        ) {
+            novarocks_execution_contract::TaskConclusionPort::on_settled(
+                self.task.as_ref(),
+                continuation,
+            );
+        }
+        fn submit(&self, proposed: TaskConclusionProposal<ExecutionFailure>) {
             self.task.submit(proposed)
         }
     }
@@ -664,9 +670,8 @@ mod tests {
             }
         }
         let (port, failures) = binding();
-        let accepted = port
-            .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
-            .accepted;
+        port.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let accepted = port.accepted().unwrap();
         let drops = Arc::new(AtomicUsize::new(0));
         let capture_drops = Arc::new(AtomicUsize::new(0));
         let capture = Arc::new(Capture {

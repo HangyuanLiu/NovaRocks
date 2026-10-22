@@ -223,7 +223,9 @@ impl TestPreparationControl {
                 TerminationDetail::Aborted(cause),
             ),
         };
-        self.status.submit(proposal).accepted.neutral().conclusion()
+        self.status.submit(proposal);
+        // This helper binds the synchronous Worker implementation.
+        self.status.accepted().unwrap().neutral().conclusion()
             == &TaskConclusion::Terminated(expected)
     }
 }

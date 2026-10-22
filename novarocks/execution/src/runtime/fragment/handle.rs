@@ -126,6 +126,8 @@ mod owner_tests {
     /// all registration, decoding and cleanup stay on the original port.
     pub(in crate::runtime::fragment::handle) struct ReceiverConstructionPort {
         delegate: ExecutionRuntimeExchangeReceiverPort,
+        cancelled: AtomicUsize,
+        removed: AtomicUsize,
         pub(in crate::runtime::fragment::handle) registrations:
             Mutex<Vec<ExchangeReceiverRegistration>>,
     }
@@ -136,6 +138,8 @@ mod owner_tests {
         ) -> Arc<Self> {
             Arc::new(Self {
                 delegate: ExecutionRuntimeExchangeReceiverPort::new(runtime),
+                cancelled: AtomicUsize::new(0),
+                removed: AtomicUsize::new(0),
                 registrations: Mutex::new(Vec::new()),
             })
         }
@@ -158,9 +162,11 @@ mod owner_tests {
             self.delegate.push(key, frame)
         }
         fn cancel(&self, key: ExchangeReceiverKey) {
+            self.cancelled.fetch_add(1, Ordering::SeqCst);
             self.delegate.cancel(key);
         }
         fn remove(&self, key: ExchangeReceiverKey) {
+            self.removed.fetch_add(1, Ordering::SeqCst);
             self.delegate.remove(key);
         }
         fn cancel_fragment(&self, fragment_instance_id: UniqueId) {
@@ -561,7 +567,7 @@ mod owner_tests {
             std::thread::yield_now();
         }
         assert!(root.finishing.load(Ordering::Acquire));
-        let _ = novarocks_execution_contract::TaskConclusionPort::submit(
+        novarocks_execution_contract::TaskConclusionPort::submit(
             task.as_ref(),
             novarocks_execution_contract::TaskConclusionProposal::Canceled(
                 novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded,
@@ -585,7 +591,46 @@ mod owner_tests {
         );
     }
 
+    #[derive(Default)]
+    struct ResultAbortGate {
+        entered: AtomicBool,
+        released: Mutex<bool>,
+        cv: Condvar,
+    }
+    impl ResultAbortGate {
+        fn wait(&self) {
+            self.entered.store(true, Ordering::Release);
+            let guard = self.released.lock().unwrap();
+            drop(self.cv.wait_while(guard, |released| !*released).unwrap());
+        }
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.cv.notify_all();
+        }
+    }
+    struct ResultAbortInterrupt {
+        gate: Arc<ResultAbortGate>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl ResultAbortInterrupt {
+        fn join(&mut self) {
+            self.gate.release();
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+    impl Drop for ResultAbortInterrupt {
+        fn drop(&mut self) {
+            self.gate.release();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
     struct BlockingResultSession {
+        write_failure: Option<super::super::ExecutionFailure>,
+        write_panic: bool,
+        abort_gate: Mutex<Option<Arc<ResultAbortGate>>>,
         entered: AtomicBool,
         released: Mutex<bool>,
         released_cv: Condvar,
@@ -595,6 +640,9 @@ mod owner_tests {
     impl BlockingResultSession {
         fn new() -> Arc<Self> {
             Arc::new(Self {
+                write_failure: None,
+                write_panic: false,
+                abort_gate: Mutex::new(None),
                 entered: AtomicBool::new(false),
                 released: Mutex::new(false),
                 released_cv: Condvar::new(),
@@ -645,6 +693,11 @@ mod owner_tests {
                     .wait(released)
                     .expect("result release wait");
             }
+            drop(released);
+            assert!(!self.write_panic, "deferred fragment result write panic");
+            if let Some(failure) = &self.write_failure {
+                return Err(failure.clone().into());
+            }
             Ok(())
         }
 
@@ -653,6 +706,10 @@ mod owner_tests {
         }
 
         fn abort(&self, _reason: ResultAbort) {
+            let gate = self.abort_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.wait();
+            }
             self.aborted.store(true, Ordering::Release);
             self.released_cv.notify_all();
         }
@@ -671,6 +728,303 @@ mod owner_tests {
         }
     }
 
+    fn deferred_fragment_owner(
+        id: UniqueId,
+    ) -> Arc<crate::runtime::task_control::test_support::DeferredOwner> {
+        use novarocks_execution_contract::TaskIdentity;
+        use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId, StageId, TaskId};
+        crate::runtime::task_control::test_support::deferred_owner_for(TaskIdentity::new(
+            QueryExecutionId::new(
+                QueryId::new(id.high() - 2, id.low() - 2),
+                AttemptId::new(1).unwrap(),
+            )
+            .unwrap(),
+            StageId::new(1).unwrap(),
+            TaskId::new(1).unwrap(),
+            BackendProcessId::new_v7(),
+        ))
+    }
+    fn deferred_fragment_with_receiver(
+        id: UniqueId,
+        owner: &Arc<crate::runtime::task_control::test_support::DeferredOwner>,
+        session: Option<Arc<BlockingResultSession>>,
+    ) -> (
+        super::DormantFragmentHandle,
+        Arc<ReceiverConstructionPort>,
+        ExchangeReceiverKey,
+    ) {
+        use novarocks_execution_contract::{TaskConclusionPort, TaskFailurePhase};
+        let runtime = crate::runtime::execution_runtime::test_execution_runtime();
+        let port = ReceiverConstructionPort::new(runtime.clone());
+        let control = Arc::new(owner.view(TaskFailurePhase::Execution));
+        let mut context = FragmentPrepareContext::default()
+            .with_task_control(control)
+            .with_result_identity(owner.identity())
+            .with_execution_runtime(runtime)
+            .with_exchange_receiver_port(port.clone());
+        let input = if let Some(session) = session {
+            context.result_writer = Arc::new(BlockingResultWriter { session });
+            submission(
+                id,
+                one_row_chunk(),
+                novarocks_physical_plan::FragmentSink::Result,
+            )
+        } else {
+            empty_result_submission(id)
+        };
+        let mut dormant = prepare_compiled_fragment(input, context).unwrap();
+        let tracker =
+            crate::runtime::mem_tracker::MemTracker::new_root("deferred retirement fixture");
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker, Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        ).unwrap();
+        let declaration =
+            crate::exec::chunk::typed_fixture::layout(Arc::new(Schema::empty()), &[], &[]);
+        let schema = factory.create_compiled_chunk_schema(&declaration).unwrap();
+        let key = ExchangeReceiverKey {
+            fragment_instance_id: id,
+            node_id: 73,
+        };
+        dormant
+            .resources
+            .acquire_compiled_exchange(
+                vec![ExchangeReceiverRegistration {
+                    key,
+                    expected_senders: 1,
+                    expected_chunk_schema: schema,
+                    column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
+                    creation_factory: factory,
+                }],
+                None,
+            )
+            .unwrap();
+        (dormant, port, key)
+    }
+    fn wait_for_fragment_probe(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(ready(), "the actual driver reaches the controlled point");
+    }
+    // The actual result callback fails on the driver thread. The same owned
+    // source is handed off before physical exit; retirement must wait for it.
+    #[test]
+    fn deferred_settlement_retires_as_failed_after_a_pre_exit_proposal() {
+        use novarocks_execution_contract::TaskConclusionPort;
+        let id = UniqueId::new(84031, 1);
+        let owner = deferred_fragment_owner(id);
+        let original: super::super::ExecutionFailure =
+            novarocks_functions::KernelFailure::ResourceExhausted.into();
+        let mut session = BlockingResultSession::new();
+        Arc::get_mut(&mut session).unwrap().write_failure = Some(original.clone());
+        let (dormant, port, key) =
+            deferred_fragment_with_receiver(id, &owner, Some(session.clone()));
+        let running = dormant.start();
+        wait_for_fragment_probe(|| session.entered.load(Ordering::Acquire));
+        session.release();
+        wait_for_fragment_probe(|| {
+            running.inner.pipeline.stopped_fact().is_some() && owner.pending_settlements() > 0
+        });
+        assert!(owner.accepted().is_none());
+        assert!(
+            running.stopped_fact().is_none(),
+            "physical exit does not bypass settlement"
+        );
+        assert!(port.snapshot(key).is_some());
+        assert_eq!(port.cancelled.load(Ordering::SeqCst), 0);
+        assert_eq!(port.removed.load(Ordering::SeqCst), 0);
+        owner.advance_all();
+        let fact = running.stopped_fact().unwrap();
+        let FragmentOutcome::Failed(failure) = fact.outcome() else {
+            panic!("the handed-off driver failure wins")
+        };
+        assert!(failure.cause().same_occurrence(&original));
+        assert!(port.snapshot(key).is_none());
+        assert_eq!(port.cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(port.removed.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn deferred_settlement_observes_the_refined_placeholder() {
+        use novarocks_execution_contract::{
+            AbortCause, TaskConclusionPort, TaskConclusionProposal,
+        };
+        let id = UniqueId::new(84032, 1);
+        let owner = deferred_fragment_owner(id);
+        let original: super::super::ExecutionFailure =
+            novarocks_functions::KernelFailure::ResourceExhausted.into();
+        let mut session = BlockingResultSession::new();
+        Arc::get_mut(&mut session).unwrap().write_failure = Some(original.clone());
+        let (dormant, port, _) = deferred_fragment_with_receiver(id, &owner, Some(session.clone()));
+        let running = dormant.start();
+        wait_for_fragment_probe(|| session.entered.load(Ordering::Acquire));
+        owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        owner.advance_all();
+        assert_eq!(owner.accepted().unwrap().neutral().generation().get(), 1);
+        session.release();
+        wait_for_fragment_probe(|| {
+            running.inner.pipeline.stopped_fact().is_some() && owner.pending_settlements() > 0
+        });
+        assert!(running.stopped_fact().is_none());
+        let settled = Arc::new(Mutex::new(None));
+        let seen = settled.clone();
+        owner.on_settled(Box::new(move |snapshot| *seen.lock().unwrap() = snapshot));
+        owner.advance_all();
+        let snapshot = settled.lock().unwrap().take().unwrap();
+        assert_eq!(snapshot.neutral().generation().get(), 2);
+        assert!(
+            snapshot
+                .originating_failure()
+                .unwrap()
+                .same_occurrence(&original)
+        );
+        let fact = running.stopped_fact().unwrap();
+        let FragmentOutcome::Failed(failure) = fact.outcome() else {
+            panic!("refined failure decides retirement")
+        };
+        assert!(failure.cause().same_occurrence(&original));
+        assert_eq!(port.cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(port.removed.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn deferred_settlement_without_proposal_retires_as_success() {
+        use novarocks_execution_contract::TaskConclusionPort;
+        let id = UniqueId::new(84033, 1);
+        let owner = deferred_fragment_owner(id);
+        let (dormant, port, key) = deferred_fragment_with_receiver(id, &owner, None);
+        let running = dormant.start();
+        wait_for_fragment_probe(|| {
+            running.inner.pipeline.stopped_fact().is_some() && owner.pending_settlements() > 0
+        });
+        assert!(running.stopped_fact().is_none());
+        assert!(port.snapshot(key).is_some());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        owner.on_settled(Box::new(move |snapshot| {
+            assert!(snapshot.is_none());
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        owner.advance_all();
+        assert!(matches!(
+            running.stopped_fact().unwrap().outcome(),
+            FragmentOutcome::Succeeded
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(owner.accepted().is_none());
+        assert!(port.snapshot(key).is_none());
+        assert_eq!(port.removed.load(Ordering::SeqCst), 1);
+        assert_eq!(port.cancelled.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn cancellation_accepted_after_settlement_still_retires_as_cancelled() {
+        use novarocks_execution_contract::{
+            CancelReason, TaskConclusionPort, TaskConclusionProposal,
+        };
+        let id = UniqueId::new(84034, 1);
+        let owner = deferred_fragment_owner(id);
+        let session = BlockingResultSession::new();
+        session.release();
+        let gate = Arc::new(ResultAbortGate::default());
+        let (dormant, port, key) =
+            deferred_fragment_with_receiver(id, &owner, Some(session.clone()));
+        let running = dormant.start();
+        wait_for_fragment_probe(|| {
+            running.inner.pipeline.stopped_fact().is_some() && owner.pending_settlements() > 0
+        });
+        // Install the blocking abort only after preparation and physical exit.
+        // This guard drops before running, releases the gate and joins the owner
+        // even when an assertion fails inside the controlled interleaving.
+        let mut interrupt = ResultAbortInterrupt {
+            gate: gate.clone(),
+            thread: None,
+        };
+        *session.abort_gate.lock().unwrap() = Some(gate.clone());
+        let lifecycle = running.inner.lifecycle.clone();
+        interrupt.thread = Some(std::thread::spawn(move || {
+            lifecycle.interrupt("controlled cancellation retirement")
+        }));
+        wait_for_fragment_probe(|| gate.entered.load(Ordering::Acquire));
+        assert!(running.inner.lifecycle.state.lock().unwrap().advancing);
+        owner.advance_all();
+        assert!(
+            running
+                .inner
+                .lifecycle
+                .state
+                .lock()
+                .unwrap()
+                .pipeline_result
+                .is_some(),
+            "the barrier ran while resources remain loaned"
+        );
+        assert!(running.stopped_fact().is_none());
+        owner.submit(TaskConclusionProposal::Canceled(
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        owner.advance_all();
+        interrupt.join();
+        let fact = running.stopped_fact().unwrap();
+        assert!(matches!(fact.outcome(), FragmentOutcome::Cancelled { .. }));
+        assert_eq!(
+            port.cancelled.load(Ordering::SeqCst),
+            1,
+            "retirement reads the later accepted cancellation"
+        );
+        assert_eq!(port.removed.load(Ordering::SeqCst), 0);
+        assert!(port.snapshot(key).is_none());
+    }
+    // A real result callback panic must await settlement before fragment retirement.
+    #[test]
+    fn deferred_driver_write_panic_is_failed_only_after_fragment_settlement() {
+        use novarocks_execution_contract::TaskConclusionPort;
+        let id = UniqueId::new(84035, 1);
+        let owner = deferred_fragment_owner(id);
+        let mut session = BlockingResultSession::new();
+        Arc::get_mut(&mut session).unwrap().write_panic = true;
+        let (dormant, port, key) =
+            deferred_fragment_with_receiver(id, &owner, Some(session.clone()));
+        let running = dormant.start();
+        wait_for_fragment_probe(|| session.entered.load(Ordering::Acquire));
+        session.release();
+        wait_for_fragment_probe(|| {
+            running.inner.pipeline.stopped_fact().is_some() && owner.pending_settlements() > 0
+        });
+        assert!(owner.accepted().is_none());
+        assert!(running.stopped_fact().is_none());
+        assert!(port.snapshot(key).is_some());
+        assert_eq!(port.cancelled.load(Ordering::SeqCst), 0);
+        assert_eq!(port.removed.load(Ordering::SeqCst), 0);
+        assert!(owner.advance_one());
+        let accepted = owner.accepted().unwrap();
+        let original = accepted.originating_failure().unwrap().clone();
+        assert!(
+            original
+                .detail()
+                .contains("panic in driver execution: deferred fragment result write panic")
+        );
+        assert!(
+            running.stopped_fact().is_none(),
+            "acceptance alone does not run the later settlement barrier"
+        );
+        owner.advance_all();
+        let fact = running
+            .stopped_fact()
+            .expect("settled fragment retires after actual driver exit");
+        let FragmentOutcome::Failed(error) = fact.outcome() else {
+            panic!("a real driver panic cannot retire as success")
+        };
+        assert!(error.cause().same_occurrence(&original));
+        assert!(Arc::ptr_eq(&accepted, &owner.accepted().unwrap()));
+        assert_eq!(owner.accepted().unwrap().neutral().generation().get(), 1);
+        assert!(port.snapshot(key).is_none());
+        assert_eq!(port.cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(port.removed.load(Ordering::SeqCst), 0);
+        assert!(
+            session.aborted.load(Ordering::Acquire),
+            "the result owner was actually aborted"
+        );
+    }
     fn start_blocked_result_fragment(
         finst_id: UniqueId,
         session: &Arc<BlockingResultSession>,
@@ -2133,7 +2487,7 @@ impl DormantFragmentHandle {
                 crate::exec::pipeline::global_driver_executor::FragmentStoppedFact,
             >,
         > = Some(Box::new(move |stopped| {
-            lifecycle_on_stop.finish_from_stopped(stopped.conclusion())
+            lifecycle_on_stop.settle_after_stop(stopped.conclusion())
         }));
         // The original lifecycle and its mandatory finisher exist before any
         // driver can finish, including a zero-driver execution.
@@ -2221,12 +2575,12 @@ impl RunningFragmentHandle {
         if self.stopped_fact().is_some() {
             return;
         }
-        let _ = self.inner.pipeline.cancel(reason.clone());
+        self.inner.pipeline.cancel(reason.clone());
         self.inner.lifecycle.interrupt(reason.detail());
     }
     pub fn join(&self) -> FragmentTerminalFact {
         let result = self.inner.pipeline.join();
-        self.inner.lifecycle.finish_from_stopped(result);
+        self.inner.lifecycle.settle_after_stop(result);
         let mut state = self
             .inner
             .lifecycle
@@ -2247,6 +2601,8 @@ impl RunningFragmentHandle {
                 .unwrap_or_else(|e| e.into_inner());
         }
     }
+    /// A hint from the current published state, which can lag handed-off
+    /// proposals. Only the settled lifecycle publishes a terminal outcome.
     pub fn conclusion(&self) -> Option<FragmentOutcome> {
         self.inner
             .pipeline
@@ -2300,6 +2656,21 @@ impl RunningFragmentLifecycle {
             }
         }
         self.advance();
+    }
+
+    // Design: ADR-0193 (docs/adr/ADR-0193-task-conclusion-proposals-and-settled-points.md)
+    fn settle_after_stop(self: &Arc<Self>, result: super::ExecutionResult<()>) -> bool {
+        let lifecycle = Arc::clone(self);
+        self.control.on_settled(Box::new(move |_snapshot| {
+            // Settlement is a barrier, not a frozen outcome. Retirement keeps
+            // reading the current owner snapshot at the actual decision point.
+            lifecycle.finish_from_stopped(result);
+        }));
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .terminal
+            .is_some()
     }
 
     fn finish_from_stopped(self: &Arc<Self>, result: super::ExecutionResult<()>) -> bool {
@@ -2451,7 +2822,7 @@ impl Drop for RunningFragmentInner {
             .is_none()
         {
             let reason = FragmentCancelReason::new("running fragment handle dropped");
-            let _ = self.pipeline.cancel(reason.clone());
+            self.pipeline.cancel(reason.clone());
             self.lifecycle.interrupt(reason.detail());
         }
     }

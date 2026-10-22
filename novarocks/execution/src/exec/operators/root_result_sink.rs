@@ -1968,14 +1968,23 @@ mod tests {
         > {
             novarocks_execution_contract::TaskConclusionPort::accepted(self.owner.as_ref())
         }
+        fn on_settled(
+            &self,
+            continuation: novarocks_execution_contract::SettledContinuation<
+                crate::runtime::fragment::ExecutionFailure,
+            >,
+        ) {
+            novarocks_execution_contract::TaskConclusionPort::on_settled(
+                self.owner.as_ref(),
+                continuation,
+            );
+        }
         fn submit(
             &self,
             proposed: novarocks_execution_contract::TaskConclusionProposal<
                 crate::runtime::fragment::ExecutionFailure,
             >,
-        ) -> novarocks_execution_contract::ConclusionAcceptance<
-            crate::runtime::fragment::ExecutionFailure,
-        > {
+        ) {
             novarocks_execution_contract::TaskConclusionPort::submit(self.owner.as_ref(), proposed)
         }
     }
@@ -2171,11 +2180,10 @@ mod tests {
             session.held_bytes.load(Ordering::SeqCst),
             session.authority.required_bytes()
         );
-        let accepted = port
-            .submit(TaskConclusionProposal::Canceled(
-                CancelReason::UpstreamNoLongerNeeded,
-            ))
-            .accepted;
+        port.submit(TaskConclusionProposal::Canceled(
+            CancelReason::UpstreamNoLongerNeeded,
+        ));
+        let accepted = port.accepted().unwrap();
         sink.cancel();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_workspace_exited_before_credit(&session);
