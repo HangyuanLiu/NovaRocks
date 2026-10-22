@@ -94,7 +94,7 @@ impl fmt::Debug for RestEndpoints {
 /// reuse only the exact complete metadata validated by this ETag.
 pub(crate) enum ConditionalTableLoad {
     Complete {
-        table: FrozenLoadTable,
+        table: Box<FrozenLoadTable>,
         delegation: RestDelegation,
         etag: Option<HeaderValue>,
     },
@@ -341,7 +341,7 @@ impl RestEndpoints {
                 let (table, delegation) =
                     FrozenLoadTable::from_response(table.clone(), response, self.runtime.clone());
                 Ok(ConditionalTableLoad::Complete {
-                    table,
+                    table: Box::new(table),
                     delegation,
                     etag,
                 })
@@ -464,7 +464,7 @@ impl RestEndpoints {
         {
             ConditionalTableLoad::Complete {
                 table, delegation, ..
-            } => Ok((table, delegation)),
+            } => Ok((*table, delegation)),
             ConditionalTableLoad::NotModified => unreachable!("unconditional load rejects 304"),
         }
     }

@@ -298,6 +298,7 @@ pub(crate) async fn build_read_snapshot_in_domain(
 }
 
 /// COW needs the same validated read facts, but not the scan metadata graph.
+#[cfg(test)]
 pub(crate) async fn build_cow_read_files_at_with_control(
     table: &Table,
     snapshot_id: i64,
@@ -388,7 +389,7 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
         .iter()
         .map(|f| (f.id, f.name.clone()))
         .collect();
-    let manifest_list = crate::manifest::load_manifest_list(&snapshot, table.file_io(), metadata)
+    let manifest_list = crate::manifest::load_manifest_list(snapshot, table.file_io(), metadata)
         .await
         .map_err(|e| format!("load manifest list: {e}"))?;
     let mut seen_manifests = HashSet::new();
@@ -403,7 +404,7 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
         if !seen_manifests.insert(manifest_file.manifest_path.as_str()) {
             continue;
         }
-        let manifest = crate::manifest::load_manifest(&manifest_file, table.file_io())
+        let manifest = crate::manifest::load_manifest(manifest_file, table.file_io())
             .await
             .map_err(|e| {
                 crate::manifest::with_variant_statistics_hint(

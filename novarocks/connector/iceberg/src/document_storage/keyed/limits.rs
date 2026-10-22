@@ -100,6 +100,7 @@ pub(crate) fn check_record(
 }
 /// A definition owner can budget a record using its declared maximum payload
 /// length without allocating a dummy payload. Base64url has no padding.
+#[cfg(test)]
 pub(crate) fn check_record_structure(
     owner: &str,
     name: &str,

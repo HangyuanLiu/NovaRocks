@@ -103,17 +103,6 @@ fn scalar(
     };
     bind(kind, ty, nullable, creation)
 }
-fn json(
-    nullable: bool,
-    creation: &mut ConnectorReadSchemaCreation<'_>,
-) -> Result<FunctionValueType, Failure> {
-    bind(
-        ValueKind::Nominal(ValueLogicalType::Json),
-        DataType::Utf8,
-        nullable,
-        creation,
-    )
-}
 fn primitive(
     ty: &PrimitiveType,
     nullable: bool,
@@ -257,114 +246,6 @@ fn partition(
     }
     row(compact(columns, creation)?, true, creation).map(Some)
 }
-fn count_primitives(
-    field: &NestedField,
-    depth: usize,
-    creation: &mut ConnectorReadSchemaCreation<'_>,
-) -> Result<usize, Failure> {
-    creation.work(1)?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(extent());
-    }
-    let count = match field.field_type.as_ref() {
-        Type::Variant(_) => 0,
-        Type::Primitive(_) => 1,
-        Type::Struct(fields) => fields.fields().iter().try_fold(0usize, |count, field| {
-            count
-                .checked_add(count_primitives(field, depth + 1, creation)?)
-                .ok_or_else(extent)
-        })?,
-        Type::List(list) => count_primitives(&list.element_field, depth + 1, creation)?,
-        Type::Map(map) => count_primitives(&map.key_field, depth + 1, creation)?
-            .checked_add(count_primitives(&map.value_field, depth + 1, creation)?)
-            .ok_or_else(extent)?,
-    };
-    if count > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
-        return Err(extent());
-    }
-    Ok(count)
-}
-fn collect_primitives<'a>(
-    field: &'a NestedField,
-    depth: usize,
-    output: &mut Vec<&'a NestedField>,
-    creation: &mut ConnectorReadSchemaCreation<'_>,
-) -> Result<(), Failure> {
-    creation.work(1)?;
-    if depth > novarocks_type_contract::MAX_VALUE_TYPE_DEPTH {
-        return Err(extent());
-    }
-    match field.field_type.as_ref() {
-        Type::Variant(_) => {}
-        Type::Primitive(_) => {
-            if output.len() == output.capacity() {
-                return Err(extent());
-            }
-            output.push(field);
-        }
-        Type::Struct(fields) => {
-            for field in fields.fields() {
-                collect_primitives(field, depth + 1, output, creation)?;
-            }
-        }
-        Type::List(list) => collect_primitives(&list.element_field, depth + 1, output, creation)?,
-        Type::Map(map) => {
-            collect_primitives(&map.key_field, depth + 1, output, creation)?;
-            collect_primitives(&map.value_field, depth + 1, output, creation)?;
-        }
-    }
-    Ok(())
-}
-fn bounds(
-    schema: &Schema,
-    creation: &mut ConnectorReadSchemaCreation<'_>,
-) -> Result<Option<FunctionValueType>, Failure> {
-    let count = schema
-        .as_struct()
-        .fields()
-        .iter()
-        .try_fold(0usize, |count, field| {
-            count
-                .checked_add(count_primitives(field, 1, creation)?)
-                .ok_or_else(extent)
-        })?;
-    if count > novarocks_type_contract::MAX_VALUE_TYPE_NODES {
-        return Err(extent());
-    }
-    let mut fields = creation.reserve(count)?;
-    for field in schema.as_struct().fields() {
-        collect_primitives(field, 1, &mut fields, creation)?;
-    }
-    if fields.is_empty() {
-        return Ok(None);
-    }
-    creation.work(
-        fields
-            .len()
-            .checked_mul(fields.len().ilog2() as usize + 1)
-            .ok_or_else(extent)?,
-    )?;
-    fields.sort_unstable_by_key(|field| field.id);
-    creation.work(1)?;
-    let mut columns = creation.reserve(fields.len())?;
-    for field in fields {
-        let Type::Primitive(ty) = field.field_type.as_ref() else {
-            return Err(bad("bounds source is not primitive"));
-        };
-        // Decimal ID formatting is bounded by i32's exact maximum spelling.
-        let len = if field.id < 0 { 1 } else { 0 }
-            + field.id.unsigned_abs().checked_ilog10().unwrap_or(0) as usize
-            + 1;
-        let backing = creation.reserve::<u8>(len)?;
-        let mut id = String::from_utf8(backing).map_err(|_| bad("invalid ID spelling backing"))?;
-        creation.work(len)?;
-        use std::fmt::Write as _;
-        write!(&mut id, "{}", field.id).map_err(|_| bad("source ID formatting failed"))?;
-        let value = primitive(ty, true, creation)?;
-        add(&mut columns, &id, value, creation)?;
-    }
-    row(columns, true, creation).map(Some)
-}
 fn s(
     columns: &mut Columns,
     name: &str,
@@ -396,45 +277,6 @@ fn l(
     let item = scalar(ty, true, creation)?;
     let value = list(item, true, creation)?;
     add(columns, name, value, creation)
-}
-fn j(
-    columns: &mut Columns,
-    name: &str,
-    creation: &mut ConnectorReadSchemaCreation<'_>,
-) -> Result<(), Failure> {
-    let value = json(true, creation)?;
-    add(columns, name, value, creation)
-}
-fn metrics(
-    schema: &Schema,
-    creation: &mut ConnectorReadSchemaCreation<'_>,
-) -> Result<Option<FunctionValueType>, Failure> {
-    let mut count = 0;
-    for field in schema.as_struct().fields() {
-        creation.work(1)?;
-        if matches!(field.field_type.as_ref(), Type::Primitive(_)) {
-            count += 1;
-        }
-    }
-    if count == 0 {
-        return Ok(None);
-    }
-    let mut columns = creation.reserve(count)?;
-    for field in schema.as_struct().fields() {
-        let Type::Primitive(ty) = field.field_type.as_ref() else {
-            continue;
-        };
-        let mut children = creation.reserve(4)?;
-        for name in ["min", "max"] {
-            let value = primitive(ty, true, creation)?;
-            add(&mut children, name, value, creation)?;
-        }
-        s(&mut children, "null_count", DataType::Int64, true, creation)?;
-        s(&mut children, "nan_count", DataType::Int64, true, creation)?;
-        let value = row(children, true, creation)?;
-        add(&mut columns, &field.name, value, creation)?;
-    }
-    row(columns, true, creation).map(Some)
 }
 fn files(
     partition: Option<FunctionValueType>,
@@ -686,6 +528,7 @@ fn columns(
 
 /// Publish only selected columns, borrowing the real frozen system relation's
 /// formal metadata and the caller's exact creation/control context.
+#[cfg(test)]
 pub(crate) fn publish_read_schema(
     kind: IcebergSystemTableType,
     requested: &[&IcebergColumnHandle],

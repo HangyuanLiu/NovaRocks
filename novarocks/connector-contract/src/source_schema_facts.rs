@@ -49,7 +49,7 @@ fn arc_layout<T>() -> Result<Layout, ConnectorError> {
 #[derive(Clone, Debug)]
 pub struct ConnectorSourceSchemaShape {
     schema: Arc<Schema>,
-    storage: ValueTypeStorageLifetime,
+    _storage: ValueTypeStorageLifetime,
 }
 impl ConnectorSourceSchemaShape {
     /// The caller has already covered the supplied Schema and each Field.
@@ -66,7 +66,10 @@ impl ConnectorSourceSchemaShape {
         mut work: impl FnMut(usize) -> Result<(), E>,
     ) -> Result<Self, E> {
         validate_empty_metadata_shape(&schema, &mut work)?;
-        Ok(Self { schema, storage })
+        Ok(Self {
+            schema,
+            _storage: storage,
+        })
     }
     pub fn schema(&self) -> &Schema {
         &self.schema

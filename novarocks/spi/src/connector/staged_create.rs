@@ -553,6 +553,10 @@ impl std::fmt::Debug for ConnectorStagedTableHandle {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The public mode carries exact application-managed admission by value; boxing it would change the shared SPI contract"
+)]
 #[derive(Clone)]
 pub enum ConnectorStagedCreateMode {
     Ordinary,
@@ -659,6 +663,10 @@ impl ConnectorStagedCreateReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The public outcome preserves the complete successful preparation evidence by value; boxing would change the shared SPI result contract"
+)]
 pub enum ConnectorStagedCreatePrepareOutcome {
     Prepared {
         handle: ConnectorStagedTableHandle,
@@ -684,6 +692,10 @@ pub enum ConnectorStagedCreatePrepareOutcome {
 }
 
 #[derive(Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "This public payload is a closed owned publication contract; boxing keyed intent would change its shared SPI representation"
+)]
 pub enum ConnectorStagedCreatePublicationPayload {
     Ordinary,
     KeyedDocuments(super::KeyedCreateIntent),
@@ -2409,22 +2421,17 @@ mod tests {
     /// that observes its own in-flight state.
     type SharedOperations =
         Arc<Mutex<HashMap<ConnectorStagedCreateOperationId, LeaseOperationState>>>;
+    type PublicationAdjudicationOverride = dyn Fn(
+            ConnectorStagedCreatePublicationAdjudicationRequest,
+        ) -> Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError>
+        + Send
+        + Sync;
 
     struct PoisoningCapability {
         inner: FakeCapability,
         poison_on_plan_write: Mutex<Option<SharedOperations>>,
         poison_on_abort: Mutex<Option<SharedOperations>>,
-        adjudication_override: Option<
-            Arc<
-                dyn Fn(
-                        ConnectorStagedCreatePublicationAdjudicationRequest,
-                    ) -> Result<
-                        ConnectorStagedCreatePublicationAdjudicationOutcome,
-                        ConnectorError,
-                    > + Send
-                    + Sync,
-            >,
-        >,
+        adjudication_override: Option<Arc<PublicationAdjudicationOverride>>,
     }
 
     impl ConnectorStagedCreate for PoisoningCapability {

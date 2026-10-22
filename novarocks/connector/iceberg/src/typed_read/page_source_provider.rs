@@ -53,8 +53,8 @@ use super::change_window_page_source::{
 use super::column_handle::{IcebergColumnHandle, invalid};
 use super::delete_manager::{DeleteEvaluationMode, DeleteManager};
 use super::page_source::{
-    IcebergPageSourceRequest, IcebergReadRelation, ParquetFooterCache, create_iceberg_page_stream,
-    plan_iceberg_prepared_input,
+    IcebergPageSourceRequest, IcebergReadRelation, ParquetFooterCache, PreparedInputRequest,
+    create_iceberg_page_stream, plan_iceberg_prepared_input,
 };
 use super::preparation::PreparedRangeCandidate;
 use super::preparation::{PlannedInput, SuccessorPreparationGroup};
@@ -205,21 +205,21 @@ impl IcebergPreparedPageSource {
             .footer
             .as_ref()
             .ok_or_else(|| invalid("iceberg preparation planned data without its parsed footer"))?;
-        let planned = plan_iceberg_prepared_input(
-            &relation,
-            &self.split,
-            &self.columns,
-            &super::delete_manager::DeleteEvaluationMode::ExcludeDeleted,
+        let planned = plan_iceberg_prepared_input(PreparedInputRequest {
+            relation: &relation,
+            split: &self.split,
+            columns: &self.columns,
+            delete_mode: &super::delete_manager::DeleteEvaluationMode::ExcludeDeleted,
             footer,
-            &self.access_binding,
-            self.context.clone(),
-            Some(DataCacheContext::external(
+            access_binding: &self.access_binding,
+            context: self.context.clone(),
+            cache: Some(DataCacheContext::external(
                 self.options.cache_options.clone(),
             )),
-            self.options.budget,
-            self.options.reader_options,
-            None,
-        )?;
+            budget: self.options.budget,
+            reader_options: self.options.reader_options,
+            row_group_ordinal: None,
+        })?;
         let Some(planned) = planned else {
             self.phase = FuturePreparationPhase::Ready;
             return Ok(false);

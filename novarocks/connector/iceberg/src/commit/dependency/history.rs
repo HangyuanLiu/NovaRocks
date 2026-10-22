@@ -26,7 +26,6 @@ pub enum HistoryGap {
     StartExpired(i64),
     SnapshotMissing(i64),
     StartNotAncestor { start: i64, parent: Option<i64> },
-    Cycle(i64),
 }
 
 #[derive(Debug)]
@@ -69,9 +68,7 @@ pub fn history_window(
                 parent,
             });
         };
-        if !visited.insert(id) {
-            return Err(HistoryGap::Cycle(id));
-        }
+        assert!(visited.insert(id), "Iceberg history contains a cycle");
         let snapshot = metadata
             .snapshot_by_id(id)
             .ok_or(HistoryGap::SnapshotMissing(id))?;

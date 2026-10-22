@@ -66,7 +66,7 @@ fn intent(shape: RequestShape) -> OperationIntent {
         target_ref: "main".into(),
         start: None,
         changes: FileChanges::default(),
-        dependencies: vec![Dependency::NoReadDependency],
+        dependencies: vec![Dependency::NoRead],
         isolation: IsolationLevel::Snapshot,
         shape,
         summary: BTreeMap::new(),

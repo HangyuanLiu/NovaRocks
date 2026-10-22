@@ -852,7 +852,7 @@ impl IcebergMetadataContext {
             && let Some(table) = self
                 .control_state
                 .physical_table_cache()
-                .get(&namespace, &table)
+                .get(namespace, table)
                 .map_err(unavailable)?
         {
             return Ok(table);
@@ -977,7 +977,7 @@ impl IcebergMetadataContext {
         if request_context.is_none() && snapshots == crate::catalog::SnapshotLoading::All {
             self.control_state
                 .physical_table_cache()
-                .insert(&namespace, &table, physical.clone())
+                .insert(namespace, table, physical.clone())
                 .map_err(unavailable)?;
         }
         Ok(physical)

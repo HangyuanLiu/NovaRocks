@@ -12,21 +12,17 @@ use async_trait::async_trait;
 use novarocks_spi::connector::ConnectorError;
 
 use crate::catalog::error::{CatalogOutcome, CatalogUnsupported};
-use crate::catalog::{
-    CatalogNamespaceName, CatalogTableName, CatalogTablePage, ConditionalCreateAttempt,
-    ConditionalCreateEvidence, ConditionalCreateReceipt, ConditionalCreateRequest,
-    ConditionalCreateVerdict, NovaRocksCatalog,
-};
+use crate::catalog::{CatalogNamespaceName, CatalogTableName, CatalogTablePage, NovaRocksCatalog};
 
 #[derive(Debug)]
-pub(super) struct AdmissionCatalogSpy {
+pub(crate) struct AdmissionCatalogSpy {
     inner: Arc<dyn NovaRocksCatalog>,
     reads: AtomicUsize,
     mutations: AtomicUsize,
 }
 
 impl AdmissionCatalogSpy {
-    pub(super) fn new(inner: Arc<dyn NovaRocksCatalog>) -> Self {
+    pub(crate) fn new(inner: Arc<dyn NovaRocksCatalog>) -> Self {
         Self {
             inner,
             reads: AtomicUsize::new(0),
@@ -34,7 +30,7 @@ impl AdmissionCatalogSpy {
         }
     }
 
-    pub(super) fn assert_no_io(&self) {
+    pub(crate) fn assert_no_io(&self) {
         assert_eq!(self.reads.load(Ordering::SeqCst), 0, "catalog reads");
         assert_eq!(
             self.mutations.load(Ordering::SeqCst),
@@ -198,39 +194,18 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
     ) -> CatalogOutcome<CatalogTableName> {
         self.mutation()
     }
-
-    async fn prepare_conditional_create(
-        &self,
-        _request: ConditionalCreateRequest,
-    ) -> CatalogOutcome<ConditionalCreateAttempt> {
-        self.mutation()
-    }
-
-    async fn publish_conditional_create(
-        &self,
-        _attempt: ConditionalCreateAttempt,
-    ) -> CatalogOutcome<ConditionalCreateReceipt> {
-        self.mutation()
-    }
-
-    async fn adjudicate_conditional_create(
-        &self,
-        _evidence: ConditionalCreateEvidence,
-    ) -> Result<ConditionalCreateVerdict, ConnectorError> {
-        self.read()
-    }
 }
 
 /// Records every filesystem runtime entry without driving a future. The
 /// warehouse and reserved metastore endpoint are checked separately, so a
 /// passing test does not confuse an unpolled request with an external effect.
 #[derive(Default)]
-pub(super) struct AdmissionFileIoSpy {
+pub(crate) struct AdmissionFileIoSpy {
     dispatches: AtomicUsize,
 }
 
 impl AdmissionFileIoSpy {
-    pub(super) fn assert_no_dispatch(&self) {
+    pub(crate) fn assert_no_dispatch(&self) {
         assert_eq!(
             self.dispatches.load(Ordering::SeqCst),
             0,

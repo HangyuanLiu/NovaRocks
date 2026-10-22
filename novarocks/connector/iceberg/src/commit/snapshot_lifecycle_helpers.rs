@@ -80,10 +80,10 @@ pub async fn enumerate_files_for_snapshots(
         })?;
         out.insert(snapshot.manifest_list().to_string());
         let manifest_list =
-            crate::manifest::load_manifest_list(&snapshot, file_io, metadata).await?;
+            crate::manifest::load_manifest_list(snapshot, file_io, metadata).await?;
         for manifest_file in manifest_list.entries() {
             out.insert(manifest_file.manifest_path.clone());
-            let manifest = crate::manifest::load_manifest(&manifest_file, file_io).await?;
+            let manifest = crate::manifest::load_manifest(manifest_file, file_io).await?;
             for entry in manifest.entries() {
                 let data_file = entry.data_file();
                 out.insert(data_file.file_path().to_string());

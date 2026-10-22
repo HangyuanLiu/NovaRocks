@@ -750,6 +750,10 @@ pub struct ConnectorRowMutationPreparation {
 }
 
 impl ConnectorRowMutationPreparation {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The public constructor validates all frozen preparation facts together before sealing the provider payload"
+    )]
     pub fn try_new(
         owner: ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
@@ -1446,6 +1450,10 @@ impl ConnectorRowMutationCohortRecipe {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The public rewrite constructor binds the exact source, schema, token, and payload facts into one cohort recipe"
+    )]
     pub fn try_rewrite(
         cohort_id: ConnectorWriteCohortId,
         route_id: ConnectorWriteRouteId,
@@ -2614,6 +2622,10 @@ fn execution_plan_digest(
 }
 // Same reasoning as `match_digest`: these are the sealed digest's fields, not a
 // parameter list that wants grouping.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The digest covers each sealed preparation field in canonical order before the record is constructed"
+)]
 fn preparation_digest(
     owner: &ConnectorProviderBindingKey,
     operation: ConnectorWriteOperationId,

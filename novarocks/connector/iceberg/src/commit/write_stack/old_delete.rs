@@ -174,6 +174,10 @@ pub struct IcebergOldDeleteArtifactRef {
 }
 
 impl IcebergOldDeleteArtifactRef {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "This public constructor validates each independently frozen delete-artifact fact without changing its callers."
+    )]
     pub fn try_new(
         path: String,
         content: IcebergFileContent,

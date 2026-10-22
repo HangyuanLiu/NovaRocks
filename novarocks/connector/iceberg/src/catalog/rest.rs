@@ -30,11 +30,8 @@ use novarocks_spi::connector::{
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::error::CatalogOutcome;
 use super::{
-    CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, CatalogTablePage,
-    ConditionalCreateEvidence, ConditionalCreateVerdict, NovaRocksCatalog,
+    CatalogCreateIntent, CatalogNamespaceName, CatalogTableName, CatalogTablePage, NovaRocksCatalog,
 };
-#[cfg(test)]
-use super::{ConditionalCreateAttempt, ConditionalCreateReceipt, ConditionalCreateRequest};
 use crate::catalog_runtime::RestAccessDelegationMode;
 use crate::loaded_table::{IcebergAccessDelegation, IcebergLoadedTable, parse_rest_delegation};
 use crate::rest_protocol::boundary::sanitize_upstream_error;
@@ -215,7 +212,9 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 )
             }
             RestAccessDelegationMode::Vended => (
-                crate::loaded_table::IcebergLoadedTableMaterialization::DeferredRest(frozen),
+                crate::loaded_table::IcebergLoadedTableMaterialization::DeferredRest(Box::new(
+                    frozen,
+                )),
                 parse_rest_delegation(delegation)
                     .map_err(|_| invalid("REST staged delegation could not be decoded"))?,
             ),
@@ -1041,38 +1040,6 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             table,
             novarocks_spi::connector::ExternalMutationEffect::NoOp,
         )
-    }
-
-    #[cfg(test)]
-
-    async fn prepare_conditional_create(
-        &self,
-        _request: ConditionalCreateRequest,
-    ) -> CatalogOutcome<ConditionalCreateAttempt> {
-        CatalogOutcome::unsupported(
-            "REST Iceberg catalog publishes a create through the catalog, not through a conditional metadata write",
-        )
-    }
-
-    #[cfg(test)]
-
-    async fn publish_conditional_create(
-        &self,
-        _attempt: ConditionalCreateAttempt,
-    ) -> CatalogOutcome<ConditionalCreateReceipt> {
-        CatalogOutcome::unsupported(
-            "REST Iceberg catalog publishes a create through the catalog, not through a conditional metadata write",
-        )
-    }
-
-    async fn adjudicate_conditional_create(
-        &self,
-        _evidence: ConditionalCreateEvidence,
-    ) -> Result<ConditionalCreateVerdict, ConnectorError> {
-        Err(novarocks_spi::connector::ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-            "REST Iceberg catalog publishes a create through the catalog, not through a conditional metadata write",
-        ))
     }
 }
 

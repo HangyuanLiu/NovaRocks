@@ -344,7 +344,7 @@ async fn original_stop_prohibits_io_and_original_deadline_bounds_streamed_body()
 
 #[tokio::test]
 async fn default_hadoop_path_uses_real_request_bound_metadata_without_a_validator() {
-    use crate::iceberg::{Catalog, NamespaceIdent, TableCreation};
+    use crate::iceberg::{NamespaceIdent, TableCreation};
     let directory = tempfile::tempdir().unwrap();
     let location = directory.path().to_str().unwrap();
     let stop = ConnectorStopOwner::new();

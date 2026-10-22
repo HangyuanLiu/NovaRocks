@@ -41,13 +41,16 @@ use novarocks_types::naming::normalize_identifier;
 use crate::catalog::admission::{
     CatalogAdmissionRequest, CatalogAdmissionTarget, CatalogOperation, connector_unsupported,
 };
+#[cfg(test)]
 use crate::catalog::error::CatalogOutcome;
 use crate::catalog::{CatalogCreateIntent, CatalogNamespaceName, CatalogTableName};
 use crate::commit::lower_ref_action;
 use crate::iceberg::spec::{
-    FormatVersion, NestedField, Operation, PrimitiveType, Schema, Snapshot, StructType, Summary,
-    Transform, Type, UnboundPartitionField, UnboundPartitionSpec, UnboundPartitionSpecBuilder,
+    FormatVersion, NestedField, PrimitiveType, Schema, StructType, Transform, Type,
+    UnboundPartitionField, UnboundPartitionSpec, UnboundPartitionSpecBuilder,
 };
+#[cfg(test)]
+use crate::iceberg::spec::{Operation, Snapshot, Summary};
 use crate::iceberg::{NamespaceIdent, TableCreation, TableIdent, TableRequirement, TableUpdate};
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
@@ -348,7 +351,6 @@ fn validate_context(
 /// Nothing is lost by returning two states here: the caller reads dispatch
 /// certainty off the error's kind and turns an unknown into `CommitUnknown`,
 /// so `Unavailable` is the unknown rather than a flat failure.
-
 fn publish_existing_frozen(
     provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
@@ -585,9 +587,11 @@ fn execute_create_table(
     enum PreparedCreate {
         NoOp(ConnectorCatalogMutationReceipt),
         Mutation(
-            crate::catalog::catalog_request::FrozenCatalogPublication,
-            ExternalMutationEvidence,
-            PublicationReceipts<ConnectorCatalogMutationReceipt>,
+            Box<(
+                crate::catalog::catalog_request::FrozenCatalogPublication,
+                ExternalMutationEvidence,
+                PublicationReceipts<ConnectorCatalogMutationReceipt>,
+            )>,
         ),
     }
     let setup = provider
@@ -681,11 +685,11 @@ fn execute_create_table(
                         seed.clone(),
                     ),
                 };
-                Ok(PreparedCreate::Mutation(
+                Ok(PreparedCreate::Mutation(Box::new((
                     frozen,
                     evidence,
                     PublicationReceipts::for_effects(applied, seed),
-                ))
+                ))))
             },
             |error| error.0.clone(),
         );
@@ -699,7 +703,8 @@ fn execute_create_table(
             receipt,
             finalization: ExternalMutationFinalization::Complete,
         }),
-        Ok(PreparedCreate::Mutation(frozen, evidence, receipts)) => {
+        Ok(PreparedCreate::Mutation(prepared)) => {
+            let (frozen, evidence, receipts) = *prepared;
             let outcome = execute_catalog_publication_with_receipts(
                 provider, request, frozen, evidence, receipts,
             )?;
@@ -913,6 +918,7 @@ fn drop_table(
 }
 
 /// Project a typed catalog mutation failure onto the neutral error vocabulary.
+#[cfg(test)]
 fn map_mutation_failure(
     failure: &novarocks_spi::connector::ConnectorMutationFailure,
 ) -> ConnectorError {
@@ -2063,11 +2069,13 @@ fn execute_view_publication(
     use crate::catalog::publication_dispatch::{PreparationFailure, PreparationResult};
     enum PreparedView {
         NoOp(ConnectorCatalogMutationReceipt),
-        Mutation {
-            request: crate::catalog::catalog_request::FrozenCatalogPublication,
-            evidence: ExternalMutationEvidence,
-            receipt: ConnectorCatalogMutationReceipt,
-        },
+        Mutation(
+            Box<(
+                crate::catalog::catalog_request::FrozenCatalogPublication,
+                ExternalMutationEvidence,
+                ConnectorCatalogMutationReceipt,
+            )>,
+        ),
     }
     let preparation = provider
         .runtime()
@@ -2205,11 +2213,11 @@ fn execute_view_publication(
                     request.operation.kind(),
                     target,
                 )?;
-                Ok(PreparedView::Mutation {
-                    request: publication,
+                Ok(PreparedView::Mutation(Box::new((
+                    publication,
                     evidence,
-                    receipt: seed,
-                })
+                    seed,
+                ))))
             },
             |error| error.0.clone(),
         );
@@ -2223,11 +2231,10 @@ fn execute_view_publication(
             receipt,
             finalization: ExternalMutationFinalization::Complete,
         }),
-        Ok(PreparedView::Mutation {
-            request: publication,
-            evidence,
-            receipt: seed,
-        }) => execute_catalog_publication(provider, request, publication, evidence, seed),
+        Ok(PreparedView::Mutation(prepared)) => {
+            let (publication, evidence, seed) = *prepared;
+            execute_catalog_publication(provider, request, publication, evidence, seed)
+        }
     }
 }
 
@@ -2999,24 +3006,6 @@ fn reconcile_evidence(
     Ok(outcome)
 }
 
-fn metadata_only_base_uuid(
-    object_id: &novarocks_spi::connector::ConnectorTableObjectId,
-) -> Result<String, ConnectorError> {
-    let value = std::str::from_utf8(object_id.as_bytes())
-        .map_err(|_| invalid("metadata-only MV base object ID is not a UTF-8 Iceberg UUID"))?;
-    let parsed = uuid::Uuid::parse_str(value).map_err(|error| {
-        invalid(format!(
-            "metadata-only MV base object ID is not an Iceberg UUID: {error}"
-        ))
-    })?;
-    if parsed.to_string() != value {
-        return Err(invalid(
-            "metadata-only MV base object ID is not a canonical Iceberg UUID",
-        ));
-    }
-    Ok(value.to_string())
-}
-
 fn load_optional_table(
     runtime: &IcebergMetadataContext,
     table: &ConnectorTableIdentity,
@@ -3045,21 +3034,6 @@ fn receipt(
         operation_id,
         operation_kind,
         None,
-    )
-}
-
-fn receipt_with_version(
-    provider: &IcebergMetadata,
-    operation_id: ConnectorMutationOperationId,
-    operation_kind: &str,
-    metadata_location: Option<&str>,
-) -> Result<ConnectorCatalogMutationReceipt, ConnectorError> {
-    ConnectorCatalogMutationReceipt::try_new(
-        provider.descriptor().clone(),
-        provider.incarnation(),
-        operation_id,
-        operation_kind,
-        metadata_location.map(|location| Bytes::copy_from_slice(location.as_bytes())),
     )
 }
 
@@ -3168,16 +3142,6 @@ fn hadoop_create_receipt(
     )
 }
 
-fn hadoop_finalization(failure: Option<String>) -> ExternalMutationFinalization {
-    match failure {
-        Some(message) => ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
-            ConnectorMutationFailureKind::Unavailable,
-            message,
-        )),
-        None => ExternalMutationFinalization::Complete,
-    }
-}
-
 fn hex_encode(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
@@ -3216,29 +3180,6 @@ fn failure(error: &ConnectorError) -> ConnectorMutationFailure {
 #[cfg(test)]
 fn failure_kind(kind: ConnectorErrorKind) -> ConnectorMutationFailureKind {
     kind.into()
-}
-
-fn map_iceberg(error: crate::iceberg::Error) -> ConnectorError {
-    use crate::iceberg::ErrorKind;
-    let kind = match error.kind() {
-        ErrorKind::NamespaceAlreadyExists | ErrorKind::TableAlreadyExists => {
-            ConnectorErrorKind::InvalidRequest
-        }
-        ErrorKind::NamespaceNotFound | ErrorKind::TableNotFound => ConnectorErrorKind::NotFound,
-        ErrorKind::PreconditionFailed | ErrorKind::CatalogCommitConflicts => {
-            ConnectorErrorKind::InvalidRequest
-        }
-        ErrorKind::FeatureUnsupported => ConnectorErrorKind::Unsupported,
-        ErrorKind::DataInvalid => ConnectorErrorKind::CorruptData,
-        ErrorKind::Unexpected => ConnectorErrorKind::Unavailable,
-        _ => ConnectorErrorKind::Internal,
-    };
-    ConnectorError::new(kind, error.to_string())
-}
-
-fn map_iceberg_message(action: &str, error: crate::iceberg::Error) -> ConnectorError {
-    let mapped = map_iceberg(error);
-    ConnectorError::new(mapped.kind(), format!("{action}: {mapped}"))
 }
 
 #[cfg(test)]
@@ -3298,8 +3239,8 @@ mod tests {
         ConnectorDocumentStorageBinding, ConnectorDocumentStorageManagement, ConnectorInstanceId,
         ConnectorMetadata, ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRefKind,
         ConnectorRequestContext, ConnectorTableObjectBindingFailure,
-        ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
-        ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
+        ConnectorTableObjectCaptureRequest, ConnectorTableObjectRebindRequest,
+        ConnectorTableObjectSelector, ConnectorTableResolution,
     };
 
     use crate::access_binding::IcebergReadBinding;
@@ -3434,62 +3375,6 @@ mod tests {
                                     original,
                                     Default::default(),
                                     binding,
-                                )
-                                .await
-                                .map(lose_positive_response)
-                        },
-                    )
-                    .await
-            })
-            .unwrap()
-            .unwrap();
-        let ExternalMutationOutcome::CommitUnknown { evidence, .. } =
-            journal.catalog_entry_outcome(entry)
-        else {
-            panic!("lost response must be recorded Unknown");
-        };
-        evidence
-    }
-
-    fn lose_table_response(
-        provider: &IcebergMetadata,
-        request: &ConnectorCatalogMutationRequest,
-        frozen: crate::commit::model::FrozenRequest,
-        external_evidence: ExternalMutationEvidence,
-    ) -> ExternalMutationEvidence {
-        let journal = crate::commit::attempt::observation::PublicationJournal::for_runtime(
-            crate::commit::model::OperationToken::from_mutation(request.operation_id),
-            provider.runtime().resources().catalog_runtime(),
-        );
-        journal
-            .record(
-                external_evidence,
-                receipt(provider, request.operation_id, request.operation.kind()).unwrap(),
-                &frozen,
-            )
-            .unwrap();
-        let catalog = Arc::clone(provider.runtime().novarocks_catalog());
-        let policy = catalog.evidence_policy();
-        let publication = journal.clone();
-        let context = request.context.clone();
-        let entry = provider
-            .runtime()
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                publication
-                    .publish_once(
-                        context,
-                        policy,
-                        move |descriptor, generation, original| async move {
-                            catalog
-                                .prepare_frozen_publication(
-                                    frozen,
-                                    CatalogOperation::UpdateDocuments,
-                                    None,
-                                    descriptor,
-                                    generation,
-                                    original,
                                 )
                                 .await
                                 .map(lose_positive_response)
@@ -8419,7 +8304,6 @@ mod tests {
         .build()
         .unwrap()
         .metadata;
-        let _ident = || TableIdent::from_strs(["atomic", "events"]).unwrap();
         let path = || ConnectorColumnPath {
             segments: vec!["payload".into()],
         };

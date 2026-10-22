@@ -148,7 +148,7 @@ pub(super) fn execute(
         dependencies: vec![if shape == RequestShape::SnapshotProducing {
             Dependency::RefUnchanged
         } else {
-            Dependency::NoReadDependency
+            Dependency::NoRead
         }],
         isolation: IsolationLevel::Snapshot,
         shape,

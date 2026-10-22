@@ -1493,7 +1493,6 @@ fn validate_operation_kind(kind: &str) -> Result<(), ConnectorError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;

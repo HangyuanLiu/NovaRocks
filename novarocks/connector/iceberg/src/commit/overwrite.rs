@@ -655,7 +655,7 @@ mod tests {
                     .collect(),
                 removed: Vec::new(),
             },
-            dependencies: vec![Dependency::NoReadDependency],
+            dependencies: vec![Dependency::NoRead],
             isolation: IsolationLevel::Snapshot,
             shape: RequestShape::SnapshotProducing,
             summary,
@@ -768,16 +768,15 @@ mod tests {
         let Some(snapshot) = table.metadata().snapshot_for_ref(target_ref) else {
             return BTreeSet::new();
         };
-        let list =
-            crate::manifest::load_manifest_list(&snapshot, table.file_io(), table.metadata())
-                .await
-                .unwrap();
+        let list = crate::manifest::load_manifest_list(snapshot, table.file_io(), table.metadata())
+            .await
+            .unwrap();
         let mut paths = BTreeSet::new();
         for descriptor in list.entries() {
             if descriptor.content != ManifestContentType::Data {
                 continue;
             }
-            let manifest = crate::manifest::load_manifest(&descriptor, table.file_io())
+            let manifest = crate::manifest::load_manifest(descriptor, table.file_io())
                 .await
                 .unwrap();
             paths.extend(
@@ -1096,7 +1095,7 @@ pub(crate) mod preparer_tests {
                     added,
                     removed: Vec::new(),
                 },
-                dependencies: vec![Dependency::NoReadDependency],
+                dependencies: vec![Dependency::NoRead],
                 isolation: IsolationLevel::Snapshot,
                 shape: RequestShape::SnapshotProducing,
                 summary: BTreeMap::new(),
@@ -1160,7 +1159,7 @@ pub(crate) mod preparer_tests {
     ) -> Vec<crate::iceberg::spec::ManifestEntry> {
         use crate::commit::model::ArtifactWriter;
         let snapshot = metadata.snapshot_for_ref(target_ref).unwrap();
-        let list = crate::manifest::load_manifest_list(&snapshot, attempt.file_io(), metadata)
+        let list = crate::manifest::load_manifest_list(snapshot, attempt.file_io(), metadata)
             .await
             .unwrap();
         let mut entries = Vec::new();

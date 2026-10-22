@@ -62,6 +62,10 @@ impl<'a> ConnectorReadSchemaCreation<'a> {
     }
     /// Split the independent observers for constructors accepting two borrowed
     /// callbacks. Both remain borrowed from this creation call.
+    #[expect(
+        clippy::type_complexity,
+        reason = "Both independent borrowed observers must retain their callback types and lifetimes without allocation"
+    )]
     pub fn observers(
         &mut self,
     ) -> (

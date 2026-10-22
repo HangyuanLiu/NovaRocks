@@ -24,6 +24,7 @@
 //! `equality_ids` populated for `RowDeltaCommit`.
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::Arc;
 
 use crate::iceberg::io::FileIO;

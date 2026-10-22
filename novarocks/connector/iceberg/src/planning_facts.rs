@@ -714,7 +714,7 @@ mod tests {
 
     #[test]
     fn spi5g_undecodable_write_default_fails_closed() {
-        use crate::iceberg::spec::{Literal, PrimitiveType, Type};
+        use crate::iceberg::spec::{Literal, Type};
 
         // Variant column defaults have no neutral projection. Reporting the
         // failure keeps generic write admission from silently substituting NULL

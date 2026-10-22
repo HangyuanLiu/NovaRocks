@@ -17,13 +17,16 @@
 
 //! Declarative statistics preparation for a frozen metadata-only request.
 
+#[cfg(test)]
 use crate::iceberg::spec::StatisticsFile;
 /// A metadata-only change, independent of the current ref head. The measured
 /// snapshot dependency is checked by the operation before preparation.
+#[cfg(test)]
 pub(crate) struct StatisticsPreparer {
     pub(crate) statistics: StatisticsFile,
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl super::staging::Preparer for StatisticsPreparer {
     async fn prepare(

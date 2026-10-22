@@ -59,7 +59,6 @@ use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, FunctionValueType, ValueLogicalType, ValueTypeError,
 };
-use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
 use crate::access_binding::IcebergReadBinding;
 use crate::iceberg::spec::{
@@ -123,11 +122,6 @@ pub(crate) fn system_column_domain(_kind: IcebergSystemTableType, _name: &str) -
     // readable_metrics JSON column in the accepted schema.
     ValueLogicalType::Physical
 }
-/// Arrow library projection of the same explicit JSON source declaration.
-fn json_column(name: &str) -> Field {
-    field_with_logical_type(nullable(name, DataType::Utf8), LogicalType::Json)
-}
-
 // ---------------------------------------------------------------------------
 // Type mapping
 // ---------------------------------------------------------------------------
@@ -633,23 +627,6 @@ pub fn partition_row_type(
     Ok(crate::partition_row::UnifiedPartitionRow::of(schema, specs)?.arrow_type())
 }
 
-/// Every primitive field of a schema, in field-id order, with its Arrow type.
-///
-/// Iceberg keys metrics by field ID, including the IDs of fields nested inside
-/// structs, lists and maps, so this walks the whole id index rather than only
-/// the top level.
-fn primitive_fields_by_id(schema: &Schema) -> Result<Vec<(i32, DataType)>, ConnectorError> {
-    let mut fields: Vec<(i32, DataType)> = Vec::new();
-    for (field_id, field) in schema.field_id_to_fields() {
-        let Type::Primitive(primitive) = field.field_type.as_ref() else {
-            continue;
-        };
-        fields.push((*field_id, iceberg_primitive_to_arrow(primitive)?));
-    }
-    fields.sort_by_key(|(field_id, _)| *field_id);
-    Ok(fields)
-}
-
 /// The `lower_bounds` / `upper_bounds` ROW type of `$files`.
 ///
 /// Field names are Iceberg field IDs rendered as decimal text and values carry
@@ -698,49 +675,6 @@ fn files_fields(partition_row: Option<&DataType>, _bounds_row: Option<&DataType>
         fields.push(nullable("partition", partition.clone()));
     }
     fields
-}
-
-/// The `$entries.data_file` ROW: the file's own facts, nested rather than
-/// flattened.
-///
-/// The bounds are `MAP(INTEGER, VARCHAR)` here, not the typed ROW `$files`
-/// uses. That is the frozen contract: `$entries` reports what the manifest
-/// literally recorded for every field ID it mentions, including IDs the current
-/// schema no longer has, and a ROW cannot name a field the schema dropped.
-fn entries_data_file_type(partition_row: Option<&DataType>) -> DataType {
-    let mut fields: Vec<Arc<Field>> = vec![
-        Arc::new(required("content", DataType::Int32)),
-        Arc::new(required("file_path", DataType::Utf8)),
-        Arc::new(required("file_format", DataType::Utf8)),
-        Arc::new(required("spec_id", DataType::Int32)),
-    ];
-    if let Some(partition_row) = partition_row {
-        fields.push(Arc::new(nullable("partition", partition_row.clone())));
-    }
-    fields.extend(
-        [
-            required("record_count", DataType::Int64),
-            required("file_size_in_bytes", DataType::Int64),
-            nullable("column_sizes", map_type(DataType::Int32, DataType::Int64)),
-            nullable("value_counts", map_type(DataType::Int32, DataType::Int64)),
-            nullable(
-                "null_value_counts",
-                map_type(DataType::Int32, DataType::Int64),
-            ),
-            nullable(
-                "nan_value_counts",
-                map_type(DataType::Int32, DataType::Int64),
-            ),
-            nullable("lower_bounds", map_type(DataType::Int32, DataType::Utf8)),
-            nullable("upper_bounds", map_type(DataType::Int32, DataType::Utf8)),
-            nullable("key_metadata", DataType::Binary),
-            nullable("split_offsets", list_type(DataType::Int64)),
-            nullable("equality_ids", list_type(DataType::Int32)),
-            nullable("sort_order_id", DataType::Int32),
-        ]
-        .map(Arc::new),
-    );
-    DataType::Struct(Fields::from(fields))
 }
 
 fn entries_fields(partition_row: Option<&DataType>) -> Vec<Field> {
@@ -840,7 +774,9 @@ pub fn system_relation_schema(
 }
 
 mod schema_author;
-pub(crate) use schema_author::{publish_read_schema, publish_read_schema_with_metadata};
+#[cfg(test)]
+pub(crate) use schema_author::publish_read_schema;
+pub(crate) use schema_author::publish_read_schema_with_metadata;
 
 // ---------------------------------------------------------------------------
 // Frozen-metadata I/O
@@ -1526,38 +1462,6 @@ fn partition_struct_array(
     ))
 }
 
-/// Build the typed `lower_bounds` / `upper_bounds` ROW column.
-///
-/// The bound of a field ID the current schema no longer has simply has no field
-/// to land in; it is dropped rather than degraded into text. `$entries` reports
-/// those IDs, which is why its bounds are a map.
-fn bounds_struct_array(
-    row_type: &DataType,
-    rows: &[&BTreeMap<i32, Datum>],
-) -> Result<ArrayRef, ConnectorError> {
-    let DataType::Struct(fields) = row_type else {
-        return Err(internal("iceberg bounds row type must be a struct"));
-    };
-    let mut children = Vec::with_capacity(fields.len());
-    for field in fields {
-        let field_id: i32 = field.name().parse().map_err(|_| {
-            internal(format!(
-                "iceberg bounds row field {} is not a field id",
-                field.name()
-            ))
-        })?;
-        let values = rows
-            .iter()
-            .map(|row| row.get(&field_id).map(Datum::literal))
-            .collect::<Vec<_>>();
-        children.push(primitive_array(field, &values)?);
-    }
-    Ok(Arc::new(
-        StructArray::try_new(fields.clone(), children, None)
-            .map_err(|error| internal(format!("build iceberg bounds row: {error}")))?,
-    ))
-}
-
 /// The `readable_metrics` JSON of one file row.
 ///
 /// Keys are column names in a stable order, and each value reports the metrics
@@ -1749,70 +1653,6 @@ fn entries_columns(
     table_schema: &Schema,
 ) -> Result<Vec<ArrayRef>, ConnectorError> {
     files_columns(schema, rows, table_schema)
-}
-
-fn entries_data_file_array(
-    row_type: &DataType,
-    rows: &[FileRow],
-) -> Result<ArrayRef, ConnectorError> {
-    let DataType::Struct(fields) = row_type else {
-        return Err(internal("iceberg $entries data_file must be a struct"));
-    };
-    let partitions = rows.iter().map(|row| &row.partition).collect::<Vec<_>>();
-    let mut children = Vec::with_capacity(fields.len());
-    for field in fields {
-        let array: ArrayRef = match field.name().as_str() {
-            "content" => Arc::new(Int32Array::from(
-                rows.iter().map(|row| row.content).collect::<Vec<_>>(),
-            )),
-            "file_path" => Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row.file_path.as_str())
-                    .collect::<Vec<_>>(),
-            )),
-            "file_format" => Arc::new(StringArray::from(
-                rows.iter().map(|row| row.file_format).collect::<Vec<_>>(),
-            )),
-            "spec_id" => Arc::new(Int32Array::from(
-                rows.iter().map(|row| row.spec_id).collect::<Vec<_>>(),
-            )),
-            "partition" => partition_struct_array(field.data_type(), &partitions)?,
-            "record_count" => Arc::new(Int64Array::from(
-                rows.iter().map(|row| row.record_count).collect::<Vec<_>>(),
-            )),
-            "file_size_in_bytes" => Arc::new(Int64Array::from(
-                rows.iter()
-                    .map(|row| row.file_size_in_bytes)
-                    .collect::<Vec<_>>(),
-            )),
-            "column_sizes" => int_to_long_map_array(rows.iter().map(|row| &row.column_sizes))?,
-            "value_counts" => int_to_long_map_array(rows.iter().map(|row| &row.value_counts))?,
-            "null_value_counts" => {
-                int_to_long_map_array(rows.iter().map(|row| &row.null_value_counts))?
-            }
-            "nan_value_counts" => {
-                int_to_long_map_array(rows.iter().map(|row| &row.nan_value_counts))?
-            }
-            "lower_bounds" => int_to_binary_map_array(rows.iter().map(|row| &row.lower_bounds))?,
-            "upper_bounds" => int_to_binary_map_array(rows.iter().map(|row| &row.upper_bounds))?,
-            "key_metadata" => binary_array(rows.iter().map(|row| row.key_metadata.as_ref()))?,
-            "split_offsets" => long_list_array(rows.iter().map(|row| row.split_offsets.as_ref()))?,
-            "equality_ids" => int_list_array(rows.iter().map(|row| row.equality_ids.as_ref()))?,
-            "sort_order_id" => Arc::new(Int32Array::from(
-                rows.iter().map(|row| row.sort_order_id).collect::<Vec<_>>(),
-            )),
-            other => {
-                return Err(internal(format!(
-                    "iceberg $entries data_file has no field named {other}"
-                )));
-            }
-        };
-        children.push(array);
-    }
-    Ok(Arc::new(
-        StructArray::try_new(fields.clone(), children, None)
-            .map_err(|error| internal(format!("build iceberg $entries data_file: {error}")))?,
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -3091,7 +2931,6 @@ mod tests {
         TokioFileTaskSpawner,
     };
     use novarocks_spi::connector::read_stack::SchemaTableName;
-    use novarocks_types::logical::logical_type_of_field;
 
     use crate::iceberg::spec::{
         DataFileBuilder, DataFileFormat, FormatVersion, ManifestListWriter, ManifestWriterBuilder,

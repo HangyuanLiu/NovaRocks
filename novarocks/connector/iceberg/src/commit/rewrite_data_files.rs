@@ -27,6 +27,7 @@ use crate::iceberg::spec::{
     DataContentType, DataFile, FormatVersion, ManifestContentType, Operation,
 };
 use crate::iceberg::table::Table;
+#[cfg(test)]
 use async_trait::async_trait;
 
 struct LiveManifestEntry {
@@ -89,12 +90,12 @@ async fn enumerate_live_files(table: &Table, file_io: &FileIO) -> Result<LiveFil
         Some(s) => s,
         None => return Ok(out),
     };
-    let list = crate::manifest::load_manifest_list(&snapshot, file_io, m)
+    let list = crate::manifest::load_manifest_list(snapshot, file_io, m)
         .await
         .map_err(|e| format!("load manifest list failed: {e}"))?;
 
     for mf in list.entries() {
-        let manifest = crate::manifest::load_manifest(&mf, file_io)
+        let manifest = crate::manifest::load_manifest(mf, file_io)
             .await
             .map_err(|e| format!("load manifest {} failed: {e}", mf.manifest_path))?;
         for entry in manifest.entries() {
@@ -117,8 +118,10 @@ async fn enumerate_live_files(table: &Table, file_io: &FileIO) -> Result<LiveFil
 
 /// Whole-table physical replacement under the operation's frozen dependency.
 /// It never expands the removed set to include a concurrent writer's files.
+#[cfg(test)]
 pub(crate) struct RewriteDataFilesPreparer;
 
+#[cfg(test)]
 #[async_trait]
 impl super::staging::Preparer for RewriteDataFilesPreparer {
     async fn prepare(

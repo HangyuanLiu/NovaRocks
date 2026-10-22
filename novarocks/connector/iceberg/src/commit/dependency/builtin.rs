@@ -62,7 +62,7 @@ async fn validate_dependencies(
 ) -> Result<Verdict> {
     for dependency in dependencies {
         let culprit = match dependency {
-            Dependency::NoReadDependency => None,
+            Dependency::NoRead => None,
             Dependency::RefUnchanged => (inputs.parent != start).then_some(Culprit::Ref {
                 expected: start,
                 actual: inputs.parent,
@@ -224,17 +224,11 @@ mod tests {
     async fn no_read_dependency_survives_expired_start_and_ref_rollback() {
         let metadata = append_snapshot(metadata(), 11, None, Operation::Append);
         assert_eq!(
-            check(
-                &[Dependency::NoReadDependency],
-                Some(99),
-                &metadata,
-                Some(11)
-            )
-            .await,
+            check(&[Dependency::NoRead], Some(99), &metadata, Some(11)).await,
             Verdict::Holds
         );
         assert_eq!(
-            check(&[Dependency::NoReadDependency], Some(11), &metadata, None).await,
+            check(&[Dependency::NoRead], Some(11), &metadata, None).await,
             Verdict::Holds
         );
     }

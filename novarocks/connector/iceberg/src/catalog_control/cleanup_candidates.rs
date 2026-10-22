@@ -322,11 +322,11 @@ async fn build_dv_index(
         let Some(snapshot) = metadata.snapshot_by_id(*snapshot_id) else {
             continue;
         };
-        let manifest_list = crate::manifest::load_manifest_list(&snapshot, file_io, metadata)
+        let manifest_list = crate::manifest::load_manifest_list(snapshot, file_io, metadata)
             .await
             .map_err(|error| format!("load orphan cleanup manifest list: {error}"))?;
         for manifest_file in manifest_list.entries() {
-            let manifest = crate::manifest::load_manifest(&manifest_file, file_io)
+            let manifest = crate::manifest::load_manifest(manifest_file, file_io)
                 .await
                 .map_err(|error| format!("load orphan cleanup manifest: {error}"))?;
             for entry in manifest.entries() {

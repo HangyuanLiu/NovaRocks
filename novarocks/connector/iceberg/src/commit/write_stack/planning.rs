@@ -128,6 +128,10 @@ impl IcebergWriteTargetPlan {
     pub const fn rewrite_group_digest(&self) -> Option<[u8; 32]> {
         self.rewrite_group_digest
     }
+    #[expect(
+        clippy::type_complexity,
+        reason = "The public tuple return is the existing plan decomposition contract; a named type would change the exported API."
+    )]
     pub fn into_parts(
         self,
     ) -> (

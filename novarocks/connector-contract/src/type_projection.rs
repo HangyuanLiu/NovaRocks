@@ -83,7 +83,7 @@ pub fn connector_type_for_value_type(
     if value_type.logical_type() == novarocks_type_contract::ValueLogicalType::Uuid {
         Some(ConnectorValueType::Uuid)
     } else {
-        connector_type_for_arrow(&value_type.data_type())
+        connector_type_for_arrow(value_type.data_type())
     }
 }
 

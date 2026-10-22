@@ -148,7 +148,7 @@ impl WriteRecipe {
         ) && handle.repartition().is_none()
             && handle.document_publication().is_none()
         {
-            Dependency::NoReadDependency
+            Dependency::NoRead
         } else {
             Dependency::RefUnchanged
         }];
@@ -1155,7 +1155,7 @@ mod recovery_tests {
                     added,
                     removed: Vec::new(),
                 },
-                dependencies: vec![Dependency::NoReadDependency],
+                dependencies: vec![Dependency::NoRead],
                 isolation: IsolationLevel::Serializable,
                 shape: RequestShape::SnapshotProducing,
                 summary: BTreeMap::from([(

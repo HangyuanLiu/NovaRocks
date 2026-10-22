@@ -45,7 +45,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 
 use futures::Stream;
 use futures::future::BoxFuture;
@@ -53,7 +53,9 @@ use futures::future::BoxFuture;
 use super::page_source::{
     ConnectorPreparationControl, ConnectorPreparationProgress, PageSourceMetrics, SourcePage,
 };
-use crate::connector::{ConnectorError, ConnectorErrorKind};
+use crate::connector::ConnectorError;
+#[cfg(test)]
+use crate::connector::ConnectorErrorKind;
 
 /// A connector read the host polls for pages.
 ///

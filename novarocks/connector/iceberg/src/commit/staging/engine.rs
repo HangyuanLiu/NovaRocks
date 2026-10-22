@@ -30,6 +30,10 @@ use crate::iceberg::{Error, ErrorKind, Result, TableIdent, TableRequirement, Tab
 use async_trait::async_trait;
 use novarocks_spi::connector::{ConnectorOperationControl, ConnectorRequestContext};
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The metadata snapshot is moved directly into staging; boxing it would add an allocation without avoiding a copy"
+)]
 #[derive(Clone)]
 pub enum StagingBase {
     Existing {

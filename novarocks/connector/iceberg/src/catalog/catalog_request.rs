@@ -89,7 +89,7 @@ impl CatalogResponseDocument {
 enum FrozenCatalogPayload {
     CatalogJson {
         route: MutationRoute,
-        expectation: AttributionExpectation,
+        expectation: Box<AttributionExpectation>,
         request: Vec<u8>,
     },
     HadoopCreate(Box<crate::hadoop_catalog::HadoopCreateAttempt>),
@@ -192,7 +192,7 @@ impl FrozenCatalogPublication {
         match &self.payload {
             FrozenCatalogPayload::CatalogJson {
                 route, expectation, ..
-            } => Ok((route.clone(), expectation.clone())),
+            } => Ok((route.clone(), expectation.as_ref().clone())),
             FrozenCatalogPayload::HadoopCreate(_) => {
                 Err(novarocks_spi::connector::ConnectorError::new(
                     novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
@@ -490,7 +490,7 @@ impl CatalogPublicationRequest {
             target,
             payload: FrozenCatalogPayload::CatalogJson {
                 route,
-                expectation,
+                expectation: Box::new(expectation),
                 request,
             },
             stage_create,

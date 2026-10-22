@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 
 use super::super::model::{ArtifactWriter, EntryIdentity, FrozenEntry};
+#[cfg(test)]
 use super::{HistoryGap, HistoryWindow, history_window};
 use crate::iceberg::spec::{DataContentType, DataFile, ManifestFile, SnapshotRef, TableMetadata};
 use crate::iceberg::{Error, ErrorKind, Result};
@@ -75,11 +76,13 @@ impl<'a> ValidationInputs<'a> {
         Ok(self.live.as_ref().expect("live set initialized"))
     }
 
+    #[cfg(test)]
     pub fn history(&self, start: Option<i64>) -> std::result::Result<HistoryWindow, HistoryGap> {
         history_window(self.metadata, start, self.parent)
     }
 
     /// Reads only manifests written by this snapshot. Inherited manifests are not new history.
+    #[cfg(test)]
     pub async fn own_snapshot_entries(
         &self,
         snapshot: &SnapshotRef,
@@ -93,8 +96,8 @@ impl<'a> ValidationInputs<'a> {
         own_only: bool,
     ) -> Result<Vec<(EntryIdentity, LiveEntry)>> {
         self.io.check_active()?;
-        let list = crate::manifest::load_manifest_list(&snapshot, self.io.file_io(), self.metadata)
-            .await?;
+        let list =
+            crate::manifest::load_manifest_list(snapshot, self.io.file_io(), self.metadata).await?;
         self.io.check_active()?;
         let mut entries = Vec::new();
         for manifest in list.entries() {
@@ -112,7 +115,7 @@ impl<'a> ValidationInputs<'a> {
         include_deleted: bool,
     ) -> Result<Vec<(EntryIdentity, LiveEntry)>> {
         self.io.check_active()?;
-        let loaded = crate::manifest::load_manifest(&manifest, self.io.file_io()).await?;
+        let loaded = crate::manifest::load_manifest(manifest, self.io.file_io()).await?;
         self.io.check_active()?;
         let mut next_row = manifest
             .first_row_id

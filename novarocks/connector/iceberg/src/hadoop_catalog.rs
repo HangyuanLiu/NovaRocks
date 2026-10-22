@@ -91,15 +91,17 @@ pub(crate) struct HadoopCreateResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HadoopCreateFailureKind {
     Invalid,
+    #[cfg(test)]
     Unsupported,
+    #[cfg(test)]
     Uncommitted,
+    #[cfg(test)]
     Unknown,
 }
 
 #[derive(Debug)]
 pub(crate) struct HadoopCreateFailure {
     pub(crate) kind: HadoopCreateFailureKind,
-    pub(crate) facts: Option<HadoopCreateAttemptFacts>,
     pub(crate) message: String,
 }
 
@@ -854,10 +856,6 @@ impl HadoopFileSystemCatalog {
         Ok(Some(metadata_location))
     }
 
-    #[expect(
-        clippy::result_large_err,
-        reason = "Create-attempt errors are propagated unchanged to preserve the catalog error contract."
-    )]
     pub(crate) fn prepare_create_attempt(
         &self,
         namespace: &NamespaceIdent,
@@ -876,20 +874,17 @@ impl HadoopFileSystemCatalog {
         let build_result = TableMetadataBuilder::from_table_creation(creation_with_location)
             .map_err(|error| HadoopCreateFailure {
                 kind: HadoopCreateFailureKind::Invalid,
-                facts: None,
                 message: format!("build metadata from creation: {error}"),
             })?
             .build()
             .map_err(|error| HadoopCreateFailure {
                 kind: HadoopCreateFailureKind::Invalid,
-                facts: None,
                 message: format!("build metadata: {error}"),
             })?;
         let metadata = build_result.metadata;
         let metadata_bytes =
             serde_json::to_vec(&metadata).map_err(|error| HadoopCreateFailure {
                 kind: HadoopCreateFailureKind::Invalid,
-                facts: None,
                 message: format!("serialize Hadoop table metadata: {error}"),
             })?;
         let metadata_location = Self::metadata_path(&table_location, 1);
@@ -978,14 +973,12 @@ impl HadoopFileSystemCatalog {
     ) -> std::result::Result<HadoopCreateResult, HadoopCreateFailure> {
         let binding = self.binding.as_ref().ok_or_else(|| HadoopCreateFailure {
             kind: HadoopCreateFailureKind::Invalid,
-            facts: Some(attempt.facts.clone()),
             message: "Hadoop catalog has no admitted filesystem capability".to_string(),
         })?;
         let access =
             crate::fs_io::resolve_access_for_location(&attempt.facts.metadata_location, binding)
                 .map_err(|message| HadoopCreateFailure {
                     kind: HadoopCreateFailureKind::Invalid,
-                    facts: Some(attempt.facts.clone()),
                     message: format!("resolve Hadoop metadata fence: {message}"),
                 })?;
 
@@ -994,7 +987,6 @@ impl HadoopFileSystemCatalog {
         if !access.supports_conditional_create() {
             return Err(HadoopCreateFailure {
                 kind: HadoopCreateFailureKind::Unsupported,
-                facts: Some(attempt.facts.clone()),
                 message: "Hadoop catalog storage does not support native conditional create"
                     .to_string(),
             });
@@ -1004,7 +996,6 @@ impl HadoopFileSystemCatalog {
             .await
             .map_err(|message| HadoopCreateFailure {
                 kind: HadoopCreateFailureKind::Uncommitted,
-                facts: Some(attempt.facts.clone()),
                 message: format!("create Hadoop metadata directory: {message}"),
             })?;
 
@@ -1012,7 +1003,6 @@ impl HadoopFileSystemCatalog {
         if self.take_test_fault(HadoopCatalogTestFault::BeforeConditionalRequest) {
             return Err(HadoopCreateFailure {
                 kind: HadoopCreateFailureKind::Uncommitted,
-                facts: Some(attempt.facts.clone()),
                 message: "injected failure before Hadoop conditional create request".to_string(),
             });
         }
@@ -1046,7 +1036,6 @@ impl HadoopFileSystemCatalog {
             Err(error) if error.kind() == FileErrorKind::Unsupported => {
                 return Err(HadoopCreateFailure {
                     kind: HadoopCreateFailureKind::Unsupported,
-                    facts: Some(attempt.facts.clone()),
                     message: error.to_string(),
                 });
             }
@@ -1055,7 +1044,6 @@ impl HadoopFileSystemCatalog {
                 Err(_) => {
                     return Err(HadoopCreateFailure {
                         kind: HadoopCreateFailureKind::Unknown,
-                        facts: Some(attempt.facts.clone()),
                         message: format!(
                             "conditionally create Hadoop v1 metadata and authoritative reread failed: {error}"
                         ),
@@ -1086,7 +1074,6 @@ impl HadoopFileSystemCatalog {
             )
             .map_err(|error| HadoopCreateFailure {
                 kind: HadoopCreateFailureKind::Unknown,
-                facts: Some(attempt.facts.clone()),
                 message: format!("build committed Hadoop table: {error}"),
             })?;
         Ok(HadoopCreateResult {
@@ -1109,7 +1096,6 @@ impl HadoopFileSystemCatalog {
         if self.take_test_fault(HadoopCatalogTestFault::AuthoritativeV1Read) {
             return Err(HadoopCreateFailure {
                 kind: HadoopCreateFailureKind::Unknown,
-                facts: Some(attempt.facts.clone()),
                 message: "injected authoritative Hadoop v1 reread failure".to_string(),
             });
         }
@@ -1142,35 +1128,12 @@ impl HadoopFileSystemCatalog {
                 Err(error) => {
                     return Err(HadoopCreateFailure {
                         kind: HadoopCreateFailureKind::Unknown,
-                        facts: Some(attempt.facts.clone()),
                         message: format!("read authoritative Hadoop v1 metadata: {error}"),
                     });
                 }
             }
         }
         unreachable!("authoritative reread either succeeds or returns its final failure")
-    }
-
-    pub(crate) async fn reconcile_create_attempt(
-        &self,
-        namespace: &str,
-        table: &str,
-        expected_uuid: &str,
-        expected_metadata_location: &str,
-        expected_metadata_digest: &str,
-    ) -> std::result::Result<HadoopCreateReconciliation, String> {
-        self.reconcile_create_using_io(
-            namespace,
-            table,
-            expected_uuid,
-            expected_metadata_location,
-            expected_metadata_digest,
-            &self.file_io,
-            || Ok(()),
-            crate::catalog::error::map_read_error,
-        )
-        .await
-        .map_err(|error| error.to_string())
     }
 
     pub(crate) async fn reconcile_create_attempt_for_read(

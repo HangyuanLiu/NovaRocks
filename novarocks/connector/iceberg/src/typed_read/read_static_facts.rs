@@ -97,14 +97,6 @@ impl Work<'_> {
         self.flush()?;
         Ok(value)
     }
-    fn copy(&mut self, input: &[u8]) -> Result<Vec<u8>, ReadStaticFactsError> {
-        let mut output = self.opaque(|| Vec::with_capacity(input.len()))?;
-        for bytes in input.chunks(256) {
-            output.extend_from_slice(bytes);
-            self.step()?;
-        }
-        Ok(output)
-    }
 }
 
 pub(crate) fn iceberg_final_static_facts(

@@ -978,7 +978,7 @@ impl StatisticsScanColumn {
     }
 
     pub fn data_type(&self) -> &DataType {
-        &self.value_type.data_type()
+        self.value_type.data_type()
     }
 
     pub fn nullable(&self) -> bool {

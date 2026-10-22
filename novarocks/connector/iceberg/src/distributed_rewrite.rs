@@ -1218,7 +1218,7 @@ fn live_delete_file_paths_of(
             if manifest_file.content != crate::iceberg::spec::ManifestContentType::Deletes {
                 continue;
             }
-            let manifest = crate::manifest::load_manifest(&manifest_file, &file_io)
+            let manifest = crate::manifest::load_manifest(manifest_file, &file_io)
                 .await
                 .map_err(|error| format!("load Iceberg rewrite delete manifest: {error}"))?;
             check_active()?;
@@ -2301,7 +2301,9 @@ mod hex {
         }
         value
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| Ok((nibble(pair[0])? << 4) | nibble(pair[1])?))
             .collect()
     }

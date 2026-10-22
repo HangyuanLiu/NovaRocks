@@ -53,9 +53,7 @@ const MAX_WRITE_BATCH_ROWS: usize = 1024;
 const ROW_GROUP_WRITE_BATCH_DIVISOR: usize = 64;
 
 fn row_group_write_batch_rows(max_row_group_bytes: usize) -> usize {
-    (max_row_group_bytes / ROW_GROUP_WRITE_BATCH_DIVISOR)
-        .max(1)
-        .min(MAX_WRITE_BATCH_ROWS)
+    (max_row_group_bytes / ROW_GROUP_WRITE_BATCH_DIVISOR).clamp(1, MAX_WRITE_BATCH_ROWS)
 }
 
 pub(crate) fn parquet_row_group_size_bytes(

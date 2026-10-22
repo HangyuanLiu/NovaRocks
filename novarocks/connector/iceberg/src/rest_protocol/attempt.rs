@@ -362,7 +362,7 @@ mod establishment_tests {
     use reqwest::header::HeaderMap;
 
     use super::*;
-    use crate::iceberg::{Catalog, NamespaceIdent, TableIdent};
+    use crate::iceberg::{NamespaceIdent, TableIdent};
     use crate::rest_protocol::binding::protocol_headers;
     use crate::rest_protocol::http::RestHttpClient;
     use crate::rest_protocol::test_server::{

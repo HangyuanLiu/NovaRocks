@@ -99,7 +99,7 @@ pub(crate) async fn append_contents_for_test(
             added: contents,
             removed: Vec::new(),
         },
-        dependencies: vec![Dependency::NoReadDependency],
+        dependencies: vec![Dependency::NoRead],
         isolation: IsolationLevel::Snapshot,
         shape: RequestShape::SnapshotProducing,
         summary: summary.clone(),
@@ -208,20 +208,17 @@ mod keyed_publication_trace_tests {
         ConnectorWriteBaseVersion, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
         ConnectorWriteIntent, ConnectorWriteOperationId, ConnectorWriteTargetRef,
         ExternalMutationEffect, ExternalMutationFinalization, ExternalMutationOutcome,
-        LakePublicationId, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+        LakePublicationId,
     };
 
     use super::*;
-    use crate::catalog::error::CatalogOutcome;
     use crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_MARKER_PROPERTY;
     use crate::iceberg::spec::{
         DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema, Struct,
         Type,
     };
     use crate::iceberg::table::Table;
-    use crate::iceberg::{
-        Catalog, NamespaceIdent, TableCreation, TableIdent, TableRequirement, TableUpdate,
-    };
+    use crate::iceberg::{Catalog, TableCreation, TableIdent, TableRequirement, TableUpdate};
     use uuid::Uuid;
 
     #[derive(Clone, Debug, Eq, PartialEq)]

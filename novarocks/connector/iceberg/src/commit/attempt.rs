@@ -80,10 +80,12 @@ pub(crate) type RecoveryPreflight =
     std::sync::Arc<dyn Fn(&FrozenRequest, &IcebergCommitOperation) -> Result<()> + Send + Sync>;
 
 /// Dispatch through the same owner while preserving one observed expiry base.
+#[cfg(test)]
 pub(crate) struct PinnedExpiryPublisher<'a> {
     pub inner: std::sync::Arc<dyn Publisher + 'a>,
     pub base: StagingBase,
 }
+#[cfg(test)]
 #[async_trait]
 impl Publisher for PinnedExpiryPublisher<'_> {
     async fn load_target(&self, _attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
@@ -576,7 +578,7 @@ mod tests {
 
     enum Dispatch {
         Commit,
-        ConflictThen(TableMetadata),
+        ConflictThen(Box<TableMetadata>),
         Unknown,
         AlwaysConflict,
         CancelAfterCommit,
@@ -678,7 +680,7 @@ mod tests {
             if let Dispatch::ConflictThen(metadata) = &self.dispatch
                 && call == 1
             {
-                *self.metadata.lock().unwrap() = metadata.clone();
+                *self.metadata.lock().unwrap() = metadata.as_ref().clone();
                 return CatalogOutcome::uncommitted(
                     ConnectorMutationFailureKind::Conflict,
                     "Injected concurrent catalog commit",
@@ -1009,9 +1011,12 @@ mod tests {
         let competitor = Fixture::new();
         let raced = append_state(&competitor, metadata.clone(), 4).await;
         let fixture = Fixture::new();
-        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoReadDependency]);
-        let publisher =
-            ControlledPublisher::new(&fixture, metadata, Dispatch::ConflictThen(raced.clone()));
+        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoRead]);
+        let publisher = ControlledPublisher::new(
+            &fixture,
+            metadata,
+            Dispatch::ConflictThen(Box::new(raced.clone())),
+        );
         let report = invoke(&fixture, &intent, &publisher).await;
         assert!(matches!(
             report.publication,
@@ -1077,7 +1082,7 @@ mod tests {
                 target_ref: "main".into(),
                 start: None,
                 changes: FileChanges::default(),
-                dependencies: vec![Dependency::NoReadDependency],
+                dependencies: vec![Dependency::NoRead],
                 isolation: IsolationLevel::Snapshot,
                 shape: RequestShape::DocumentExpiry,
                 summary: std::collections::BTreeMap::new(),
@@ -1085,7 +1090,7 @@ mod tests {
             })
             .unwrap();
             let dispatch = if conflict {
-                Dispatch::ConflictThen(metadata.clone())
+                Dispatch::ConflictThen(Box::new(metadata.clone()))
             } else {
                 Dispatch::Commit
             };
@@ -1139,7 +1144,7 @@ mod tests {
             target_ref: "main".into(),
             start: None,
             changes: FileChanges::default(),
-            dependencies: vec![Dependency::NoReadDependency],
+            dependencies: vec![Dependency::NoRead],
             isolation: IsolationLevel::Snapshot,
             shape: RequestShape::DocumentExpiry,
             summary: std::collections::BTreeMap::new(),
@@ -1172,7 +1177,8 @@ mod tests {
         let raced = append_state(&competitor, metadata.clone(), 4).await;
         let fixture = Fixture::new();
         let intent = append_intent(&fixture, &metadata, vec![Dependency::RefUnchanged]);
-        let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::ConflictThen(raced));
+        let publisher =
+            ControlledPublisher::new(&fixture, metadata, Dispatch::ConflictThen(Box::new(raced)));
         let prepares = CountingPreparer {
             inner: &FastAppendPreparer,
             calls: AtomicUsize::new(0),
@@ -1230,9 +1236,9 @@ mod tests {
             let dispatch = if mode == "cancel-before-observation" {
                 Dispatch::AlwaysConflict
             } else if mode == "same-ref" {
-                Dispatch::ConflictThen(metadata.clone())
+                Dispatch::ConflictThen(Box::new(metadata.clone()))
             } else {
-                Dispatch::ConflictThen(raced)
+                Dispatch::ConflictThen(Box::new(raced))
             };
             let mut publisher = ControlledPublisher::new(&fixture, metadata, dispatch);
             publisher.diagnostic_refused = mode == "load-error";
@@ -1292,7 +1298,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_dispatch_retains_every_owned_object_without_retry_or_cleanup() {
-        for dependency in [Dependency::NoReadDependency, Dependency::RefUnchanged] {
+        for dependency in [Dependency::NoRead, Dependency::RefUnchanged] {
             let fixture = Fixture::new();
             let metadata = fixture.metadata(FormatVersion::V3);
             let intent = append_intent(&fixture, &metadata, vec![dependency]);
@@ -1335,7 +1341,7 @@ mod tests {
         for after_load in [true, false] {
             let fixture = Fixture::new();
             let metadata = fixture.metadata(FormatVersion::V3);
-            let intent = append_intent(&fixture, &metadata, vec![Dependency::NoReadDependency]);
+            let intent = append_intent(&fixture, &metadata, vec![Dependency::NoRead]);
             let mut publisher =
                 ControlledPublisher::new(&fixture, metadata, Dispatch::AlwaysConflict);
             publisher.cancel_after_load = after_load;
@@ -1358,7 +1364,7 @@ mod tests {
     {
         let fixture = Fixture::new();
         let metadata = fixture.metadata(FormatVersion::V3);
-        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoReadDependency]);
+        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoRead]);
         let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::CancelAfterCommit);
         let report = invoke(&fixture, &intent, &publisher).await;
         assert!(matches!(
@@ -1423,7 +1429,7 @@ mod tests {
             let intent = append_intent(
                 &fixture,
                 if rollback { &latest } else { &first },
-                vec![Dependency::NoReadDependency],
+                vec![Dependency::NoRead],
             );
             assert!(
                 current
@@ -1475,7 +1481,7 @@ mod tests {
         ));
         let fixture = Fixture::new_observed(root.generation());
         let metadata = fixture.metadata(FormatVersion::V3);
-        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoReadDependency]);
+        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoRead]);
         let publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Commit);
         let report = run(
             &fixture.operation,
@@ -1506,7 +1512,7 @@ mod tests {
     async fn elapsed_retry_budget_after_load_prevents_preparation_and_dispatch() {
         let fixture = Fixture::new();
         let metadata = fixture.metadata(FormatVersion::V3);
-        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoReadDependency]);
+        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoRead]);
         let mut publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Commit);
         publisher.load_delay = Duration::from_millis(10);
         let policy = RetryPolicy {
@@ -1537,7 +1543,7 @@ mod tests {
     async fn recovery_preflight_refusal_is_undispatched_and_cleans_all_owned_artifacts() {
         let fixture = Fixture::new();
         let metadata = fixture.metadata(FormatVersion::V3);
-        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoReadDependency]);
+        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoRead]);
         let file = intent.changes().added[0].file().file_path();
         std::fs::write(file.strip_prefix("file://").unwrap(), b"session data").unwrap();
         fixture
@@ -1739,7 +1745,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             request.artifacts().operation_references(),
-            [selected_object.clone()]
+            std::slice::from_ref(&selected_object)
         );
         fixture
             .operation
@@ -1767,7 +1773,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             request.artifacts().operation_references(),
-            [selected_object.clone()]
+            std::slice::from_ref(&selected_object)
         );
         assert!(!retained.contains(&unused));
         fixture.operation.cleanup_after_commit(&retained).await;
@@ -1850,7 +1856,7 @@ mod tests {
         );
         assert_eq!(
             request.artifacts().operation_references(),
-            [selected_object.clone()]
+            std::slice::from_ref(&selected_object)
         );
         assert!(!retained.contains(&unused));
         fixture.operation.cleanup_after_commit(&retained).await;
@@ -1958,8 +1964,11 @@ mod tests {
         };
         // Deliberately retain the same main in the injected catalog conflict. A
         // mistaken retry would otherwise pass RefUnchanged and commit attempt 2.
-        let publisher =
-            ControlledPublisher::new(&fixture, metadata.clone(), Dispatch::ConflictThen(metadata));
+        let publisher = ControlledPublisher::new(
+            &fixture,
+            metadata.clone(),
+            Dispatch::ConflictThen(Box::new(metadata)),
+        );
         let counted = CountingPreparer {
             inner: &preparer,
             calls: AtomicUsize::new(0),

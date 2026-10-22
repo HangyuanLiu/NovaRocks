@@ -38,6 +38,7 @@ pub enum ArtifactKind {
     ManifestList,
     Statistics,
     DeletionVector,
+    #[cfg(test)]
     Metadata,
 }
 
@@ -46,6 +47,7 @@ impl ArtifactKind {
         match self {
             Self::Manifest | Self::ManifestList => "avro",
             Self::Statistics | Self::DeletionVector => "puffin",
+            #[cfg(test)]
             Self::Metadata => "json",
         }
     }
@@ -146,9 +148,6 @@ impl ArtifactLedger {
         record.write_state = ArtifactWriteState::Written;
         Ok(())
     }
-    pub fn record(&self, object: &ObjectIdentity) -> Option<&ArtifactRecord> {
-        self.records.get(object)
-    }
     pub fn records(&self) -> impl Iterator<Item = &ArtifactRecord> {
         self.records.values()
     }
@@ -208,7 +207,10 @@ impl ArtifactLedger {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleanupScope {
     ThisAttempt(AttemptToken),
-    AbandonedAttempts { committed: AttemptToken },
+    #[cfg(test)]
+    AbandonedAttempts {
+        committed: AttemptToken,
+    },
     EntireOperation,
 }
 
@@ -218,6 +220,7 @@ impl CleanupScope {
             Self::ThisAttempt(attempt) => {
                 record.class == ArtifactClass::Attempt && record.attempt == Some(attempt)
             }
+            #[cfg(test)]
             Self::AbandonedAttempts { committed } => {
                 record.class == ArtifactClass::Attempt
                     && record.attempt.is_some_and(|attempt| attempt != committed)

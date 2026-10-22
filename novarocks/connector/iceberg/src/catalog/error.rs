@@ -107,11 +107,6 @@ impl CatalogCommitEvidence {
         self
     }
 
-    pub(crate) fn with_target_uuid(mut self, uuid: impl Into<Arc<str>>) -> Self {
-        self.target_uuid = Some(uuid.into());
-        self
-    }
-
     #[allow(dead_code)]
     pub(crate) fn with_target_ref(mut self, target_ref: impl Into<Arc<str>>) -> Self {
         self.target_ref = Some(target_ref.into());
@@ -121,11 +116,6 @@ impl CatalogCommitEvidence {
     #[allow(dead_code)]
     pub(crate) fn with_base_snapshot_id(mut self, base: Option<i64>) -> Self {
         self.base_snapshot_id = base;
-        self
-    }
-
-    pub(crate) fn with_metadata_location(mut self, location: impl Into<Arc<str>>) -> Self {
-        self.metadata_location = Some(location.into());
         self
     }
 }
@@ -175,6 +165,7 @@ impl<T> CatalogOutcome<T> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn unsupported(message: impl Into<Arc<str>>) -> Self {
         Self::Unsupported(CatalogUnsupported::new(message))
     }

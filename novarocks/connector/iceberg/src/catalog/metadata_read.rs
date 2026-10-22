@@ -28,7 +28,7 @@ pub(crate) use crate::rest_protocol::endpoints::CatalogMetadataValidator;
 #[derive(Debug)]
 pub(crate) enum CatalogMetadataLoad {
     Complete {
-        base: CatalogCommitBase,
+        base: Box<CatalogCommitBase>,
         validator: Option<CatalogMetadataValidator>,
     },
     NotModified,
@@ -48,10 +48,10 @@ pub(crate) fn complete_metadata(
             )
         })?;
     Ok(CatalogMetadataLoad::Complete {
-        base: CatalogCommitBase {
+        base: Box::new(CatalogCommitBase {
             metadata,
             metadata_location: location.to_owned(),
-        },
+        }),
         validator,
     })
 }

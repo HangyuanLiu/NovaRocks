@@ -526,7 +526,7 @@ mod document_expiry_recovery_tests {
             target_ref: "main".into(),
             start: None,
             changes: FileChanges::default(),
-            dependencies: vec![Dependency::NoReadDependency],
+            dependencies: vec![Dependency::NoRead],
             isolation: IsolationLevel::Snapshot,
             shape: RequestShape::DocumentExpiry,
             summary: Default::default(),

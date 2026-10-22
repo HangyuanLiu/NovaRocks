@@ -56,6 +56,13 @@ pub struct OperationIntentParts {
     pub start: Option<StartSnapshot>,
     pub changes: FileChanges,
     pub dependencies: Vec<Dependency>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "The immutable intent retains the caller's isolation contract for diagnostics; concrete dependency checks encode its validation behavior."
+        )
+    )]
     pub isolation: IsolationLevel,
     pub shape: RequestShape,
     pub summary: BTreeMap<String, String>,
@@ -120,6 +127,7 @@ impl OperationIntent {
     pub fn dependencies(&self) -> &[Dependency] {
         &self.parts.dependencies
     }
+    #[cfg(test)]
     pub const fn isolation(&self) -> IsolationLevel {
         self.parts.isolation
     }

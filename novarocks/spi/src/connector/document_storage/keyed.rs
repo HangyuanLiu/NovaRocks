@@ -532,6 +532,10 @@ impl Default for KeyedDocumentLimits {
 }
 
 /// The exact admission remains attached to every catalog mutation.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "The public keyed-mutation union carries exact owned intents by value; boxing a payload would change the shared SPI contract"
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KeyedMutation {
     Markers(KeyedMarkerWrite),

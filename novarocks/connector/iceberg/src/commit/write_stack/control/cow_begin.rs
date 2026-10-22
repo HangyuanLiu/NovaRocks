@@ -43,7 +43,7 @@ pub(crate) fn mul(a: u64, b: u64) -> Result<u64, Cause> {
 pub(crate) fn projection_error(e: projection::Error<OriginalResultCheckError>) -> Cause {
     match e {
         projection::Error::Control(e) => e.into(),
-        projection::Error::Json(_) => ConnectorError::new(
+        projection::Error::Json => ConnectorError::new(
             ConnectorErrorKind::CorruptData,
             "Iceberg COW canonical projection failed",
         )
@@ -347,20 +347,20 @@ impl IcebergWriteSessionControl {
                 .max()
                 .unwrap() as u64,
             };
-            let loaded = own::loaded_facts(
-                &metadata,
+            let loaded = own::loaded_facts(own::LoadedFactsInput {
+                metadata: &metadata,
                 namespace,
-                table_name,
-                request.target_ref.as_str(),
-                snapshot_id,
-                source_snapshot_sequence(&metadata, snapshot_id)?,
-                metadata.current_schema_id(),
-                metadata.default_partition_spec_id(),
-                format_version_number(&metadata),
-                scope.upper(),
-                &validator,
-                &scope,
-            )
+                table: table_name,
+                target_ref: request.target_ref.as_str(),
+                base_snapshot_id: snapshot_id,
+                base_sequence_number: source_snapshot_sequence(&metadata, snapshot_id)?,
+                schema_id: metadata.current_schema_id(),
+                spec_id: metadata.default_partition_spec_id(),
+                format_version: format_version_number(&metadata),
+                original_caller_existing: scope.upper(),
+                validation: &validator,
+                scope: &scope,
+            })
             .map_err(own_error)?;
             scope.reserve(loaded.retained_upper())?;
             let facts = loaded.into_facts();

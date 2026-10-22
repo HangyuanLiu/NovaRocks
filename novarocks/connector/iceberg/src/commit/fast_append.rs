@@ -43,12 +43,9 @@ impl super::staging::Preparer for FastAppendPreparer {
                     "Append target ref snapshot is absent",
                 )
             })?;
-            let list = crate::manifest::load_manifest_list(
-                &snapshot,
-                view.artifacts().file_io(),
-                metadata,
-            )
-            .await?;
+            let list =
+                crate::manifest::load_manifest_list(snapshot, view.artifacts().file_io(), metadata)
+                    .await?;
             view.artifacts().check_active()?;
             list.entries().to_vec()
         } else {

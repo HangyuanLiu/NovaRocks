@@ -80,7 +80,7 @@ pub(crate) struct IcebergLoadedTable {
 /// leak into a physical-table cache.
 pub(crate) enum IcebergLoadedTableMaterialization {
     Materialized(crate::iceberg::table::Table),
-    DeferredRest(crate::rest_protocol::deferred::FrozenLoadTable),
+    DeferredRest(Box<crate::rest_protocol::deferred::FrozenLoadTable>),
 }
 
 impl IcebergLoadedTable {
@@ -99,7 +99,9 @@ impl IcebergLoadedTable {
         access_delegation: IcebergAccessDelegation,
     ) -> Self {
         Self {
-            materialization: IcebergLoadedTableMaterialization::DeferredRest(materialization),
+            materialization: IcebergLoadedTableMaterialization::DeferredRest(Box::new(
+                materialization,
+            )),
             access_delegation,
         }
     }
@@ -309,14 +311,16 @@ impl IcebergVendedCredentialLeaseSeed {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn not_after_unix_ms(&self) -> u64 {
         self.credentials
             .iter()
-            .map(IcebergVendedS3Credential::not_after_unix_ms)
+            .map(|credential| credential.not_after_unix_ms)
             .min()
             .expect("vended credential seed is non-empty")
     }
 
+    #[cfg(test)]
     pub(crate) fn refresh_capable(&self) -> bool {
         self.refresh_endpoint.is_some()
     }
@@ -325,14 +329,9 @@ impl IcebergVendedCredentialLeaseSeed {
         self.refresh_endpoint.as_deref()
     }
 
-    pub(crate) fn prefixes(&self) -> impl Iterator<Item = &StorageCredentialScopePrefix> {
-        self.credentials
-            .iter()
-            .map(IcebergVendedS3Credential::prefix)
-    }
-
     /// Scope equality deliberately excludes material and expiration so a
     /// refresh can replace values without changing the query's access domain.
+    #[cfg(test)]
     pub(crate) fn has_same_scope(&self, other: &Self) -> bool {
         self.refresh_endpoint == other.refresh_endpoint
             && self.credentials.len() == other.credentials.len()
@@ -376,10 +375,6 @@ impl IcebergVendedCredentialLeaseSeed {
 }
 
 impl IcebergVendedS3RefreshScope {
-    pub(crate) fn shared_endpoint(&self) -> Arc<str> {
-        Arc::clone(&self.endpoint)
-    }
-
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
     }
@@ -658,20 +653,6 @@ pub(crate) struct IcebergVendedS3Credential {
     prefix: StorageCredentialScopePrefix,
     material: ObjectStoreSecretMaterial,
     not_after_unix_ms: u64,
-}
-
-impl IcebergVendedS3Credential {
-    pub(crate) fn prefix(&self) -> &StorageCredentialScopePrefix {
-        &self.prefix
-    }
-
-    pub(crate) fn not_after_unix_ms(&self) -> u64 {
-        self.not_after_unix_ms
-    }
-
-    pub(crate) fn secret_material(&self) -> &ObjectStoreSecretMaterial {
-        &self.material
-    }
 }
 
 /// Translate a NovaRocks-decoded delegation into the provider's closed S3
@@ -1789,7 +1770,7 @@ mod tests {
         let selected = seed
             .select_for_location("s3://warehouse/data/delete/part-0.parquet")
             .expect("longest prefix");
-        assert_eq!(selected.prefix().as_str(), "s3://warehouse/data/delete");
+        assert_eq!(selected.prefix.as_str(), "s3://warehouse/data/delete");
         assert_eq!(seed.not_after_unix_ms(), 600);
         assert!(seed.refresh_capable());
         // `IcebergVendedCredentialLeaseSeed` has no `Debug` implementation,

@@ -35,12 +35,6 @@ impl SeqField {
         }
         Ok(Self::Explicit(sequence))
     }
-    pub fn value(self) -> Option<i64> {
-        match self {
-            Self::Inherit => None,
-            Self::Explicit(value) => Some(value),
-        }
-    }
     /// The format writer's -1 sentinel means inheritance, never a predicted sequence.
     pub fn manifest_writer_value(self) -> i64 {
         match self {
@@ -90,6 +84,7 @@ impl AddedContent {
         self.data_sequence
     }
     /// Every newly added physical file inherits the sequence of its actual publication.
+    #[cfg(test)]
     pub const fn file_sequence(&self) -> SeqField {
         SeqField::Inherit
     }

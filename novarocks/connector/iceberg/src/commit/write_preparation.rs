@@ -880,7 +880,7 @@ fn bind_write_fields(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{

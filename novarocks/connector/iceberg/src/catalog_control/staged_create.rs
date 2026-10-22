@@ -51,7 +51,7 @@ use crate::iceberg::{TableCreation, TableUpdate};
 
 #[path = "staged_create/publication.rs"]
 mod publication;
-use crate::loaded_table::{IcebergPhysicalTable, IcebergRestVendedS3LeaseRefresher};
+use crate::loaded_table::IcebergRestVendedS3LeaseRefresher;
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
 
@@ -156,10 +156,6 @@ impl From<ConnectorError> for RestStagedPrepareFailure {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The REST stage-create boundary keeps every SQL-visible creation input explicit."
-)]
 pub(crate) fn prepare_rest_staged_table(
     runtime: &IcebergMetadataContext,
     request_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
@@ -358,109 +354,97 @@ pub(crate) fn prepare_rest_staged_table(
         .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
     novarocks_spi::connector::ConnectorOperationControl::check_active(&finalization)
         .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
-    let (table, initialization_updates) = match staged {
-        crate::catalog::StagedCreateMaterial {
-            table,
-            initialization_updates,
-            access_delegation,
-        } => {
-            if let Some(seed) = access_delegation.into_vended_lease_seed() {
-                let Some(request_context) = request_context else {
-                    // The stage request has already reached the REST catalog, so
-                    // this cannot be reported as an unsupported preflight.  T21
-                    // intentionally refuses the possibly-created staged target
-                    // without the query-attempt lease consumer; storing
-                    // this secret in the staged table/handle would violate the
-                    // confidential carrier boundary.
-                    return Err(RestStagedPrepareFailure::AppliedButUnusable(
+    let crate::catalog::StagedCreateMaterial {
+        table,
+        initialization_updates,
+        access_delegation,
+    } = staged;
+    let (table, initialization_updates) = if let Some(seed) =
+        access_delegation.into_vended_lease_seed()
+    {
+        let Some(request_context) = request_context else {
+            // The stage request has already reached the REST catalog, so
+            // this cannot be reported as an unsupported preflight.  T21
+            // intentionally refuses the possibly-created staged target
+            // without the query-attempt lease consumer; storing
+            // this secret in the staged table/handle would violate the
+            // confidential carrier boundary.
+            return Err(RestStagedPrepareFailure::AppliedButUnusable(
                     "REST staged create returned vended credentials but no query-attempt lease consumer is installed".to_string(),
                 ));
-                };
-                let collection = request_context
+        };
+        let collection = request_context
                 .vended_credential_lease_collection()
                 .ok_or_else(|| RestStagedPrepareFailure::AppliedButUnusable(
                     "REST staged create returned vended credentials but the request has no query-attempt lease consumer".to_string(),
                 ))?;
-                // A staged target is not yet addressable through load_table,
-                // so load-table-only delegation cannot renew its authority.
-                // The staging side effect may already exist at this point;
-                // report an unusable applied stage instead of returning a handle
-                // whose credentials can expire without a legal renewal path.
-                let refresh_scope = seed.staged_refresh_scope().map_err(|error| {
-                    RestStagedPrepareFailure::AppliedButUnusable(error.to_string())
-                })?;
-                let endpoints = runtime
+        // A staged target is not yet addressable through load_table,
+        // so load-table-only delegation cannot renew its authority.
+        // The staging side effect may already exist at this point;
+        // report an unusable applied stage instead of returning a handle
+        // whose credentials can expire without a legal renewal path.
+        let refresh_scope = seed
+            .staged_refresh_scope()
+            .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
+        let endpoints = runtime
+            .novarocks_catalog()
+            .vended_credential_refresh_catalog()
+            .ok_or_else(|| {
+                RestStagedPrepareFailure::AppliedButUnusable(
+                    "REST staged create vended refresh has no catalog owner".to_string(),
+                )
+            })?;
+        let binding = endpoints.established_binding().ok_or_else(|| {
+            RestStagedPrepareFailure::AppliedButUnusable(
+                "REST staged create has no established session".to_string(),
+            )
+        })?;
+        let announcement = crate::rest_protocol::routing::route_for_lease(
+            &binding,
+            &endpoints.route_admission(),
+            crate::rest_protocol::routing::RouteTarget::CredentialsEndpoint(
+                refresh_scope.endpoint(),
+            ),
+        )
+        .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
+        let contribution = seed
+            .into_vended_s3_credential_lease_contribution()
+            .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?
+            .with_renewal_path(
+                novarocks_spi::connector::CredentialRenewalPath::CredentialsEndpoint(announcement),
+            );
+        let contribution = contribution
+            .with_refresher(Arc::new(IcebergRestVendedS3LeaseRefresher::new(
+                runtime
                     .novarocks_catalog()
                     .vended_credential_refresh_catalog()
                     .ok_or_else(|| {
                         RestStagedPrepareFailure::AppliedButUnusable(
                             "REST staged create vended refresh has no catalog owner".to_string(),
                         )
-                    })?;
-                let binding = endpoints.established_binding().ok_or_else(|| {
-                    RestStagedPrepareFailure::AppliedButUnusable(
-                        "REST staged create has no established session".to_string(),
-                    )
-                })?;
-                let announcement = crate::rest_protocol::routing::route_for_lease(
-                    &binding,
-                    &endpoints.route_admission(),
-                    crate::rest_protocol::routing::RouteTarget::CredentialsEndpoint(
-                        refresh_scope.endpoint(),
-                    ),
-                )
-                .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
-                let contribution = seed
-                    .into_vended_s3_credential_lease_contribution()
-                    .map_err(|error| {
-                        RestStagedPrepareFailure::AppliedButUnusable(error.to_string())
-                    })?
-                    .with_renewal_path(
-                        novarocks_spi::connector::CredentialRenewalPath::CredentialsEndpoint(
-                            announcement,
-                        ),
-                    );
-                let contribution = contribution
-                    .with_refresher(Arc::new(IcebergRestVendedS3LeaseRefresher::new(
-                        runtime
-                            .novarocks_catalog()
-                            .vended_credential_refresh_catalog()
-                            .ok_or_else(|| {
-                                RestStagedPrepareFailure::AppliedButUnusable(
-                                    "REST staged create vended refresh has no catalog owner"
-                                        .to_string(),
-                                )
-                            })?,
-                        runtime.resources().catalog_runtime().clone(),
-                        refresh_scope,
-                    ))
-                        as Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>)
-                    .map_err(|error| {
-                        RestStagedPrepareFailure::AppliedButUnusable(error.to_string())
-                    })?;
-                collection
-                    .offer_vended_s3_credential_lease(contribution)
-                    .map_err(|error| {
-                        RestStagedPrepareFailure::AppliedButUnusable(error.to_string())
-                    })?;
-                let table = table
-                    .materialize_for_request(
-                        runtime
-                            .resources()
-                            .planning_binding()
-                            .for_request(finalization.clone()),
-                    )
-                    .map_err(|error| {
-                        RestStagedPrepareFailure::AppliedButUnusable(error.to_string())
-                    })?;
-                (table, initialization_updates)
-            } else {
-                let table = table.into_static_table().map_err(|error| {
-                    RestStagedPrepareFailure::AppliedButUnusable(error.to_string())
-                })?;
-                (table, initialization_updates)
-            }
-        }
+                    })?,
+                runtime.resources().catalog_runtime().clone(),
+                refresh_scope,
+            ))
+                as Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>)
+            .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
+        collection
+            .offer_vended_s3_credential_lease(contribution)
+            .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
+        let table = table
+            .materialize_for_request(
+                runtime
+                    .resources()
+                    .planning_binding()
+                    .for_request(finalization.clone()),
+            )
+            .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
+        (table, initialization_updates)
+    } else {
+        let table = table
+            .into_static_table()
+            .map_err(|error| RestStagedPrepareFailure::AppliedButUnusable(error.to_string()))?;
+        (table, initialization_updates)
     };
     if table.metadata().location() != location {
         return Err(RestStagedPrepareFailure::AppliedButUnusable(
@@ -600,14 +584,17 @@ pub struct IcebergStagedCreateAdapter {
 #[derive(Clone)]
 enum OperationState {
     Preparing,
-    StageAppliedUnusable(StagePublication),
-    StageUnknown(StagePublication),
+    StageAppliedUnusable {
+        _stage_publication: StagePublication,
+    },
+    StageUnknown {
+        _stage_publication: StagePublication,
+    },
     Prepared(PreparedOperation),
     /// Definite non-publication permits only another bounded cleanup attempt.
     CleanupPending(PreparedOperation),
     Published,
     Aborted,
-    Unknown,
     PublicationUnknown(PublicationUnknownOperation),
 }
 
@@ -752,10 +739,6 @@ impl IcebergStagedCreateAdapter {
             .insert(operation_id, state);
     }
 
-    fn set_unknown(&self, operation_id: ConnectorStagedCreateOperationId) {
-        self.record_terminal(operation_id, OperationState::Unknown);
-    }
-
     fn set_publication_unknown(
         &self,
         operation_id: ConnectorStagedCreateOperationId,
@@ -780,7 +763,9 @@ impl IcebergStagedCreateAdapter {
         let finalization = stage.fail_finalization(message);
         self.record_terminal(
             operation_id,
-            OperationState::StageAppliedUnusable(stage.clone()),
+            OperationState::StageAppliedUnusable {
+                _stage_publication: stage.clone(),
+            },
         );
         Ok(ConnectorStagedCreatePrepareOutcome::AppliedButUnusable {
             receipt: stage.receipt.clone(),
@@ -1176,7 +1161,9 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             Err(RestStagedPrepareFailure::CommitUnknown(message)) => {
                 self.record_terminal(
                     request.operation_id,
-                    OperationState::StageUnknown(stage_publication.clone()),
+                    OperationState::StageUnknown {
+                        _stage_publication: stage_publication.clone(),
+                    },
                 );
                 Ok(ConnectorStagedCreatePrepareOutcome::CommitUnknown {
                     failure: ConnectorMutationFailure::new(
@@ -2428,7 +2415,9 @@ mod tests {
         ));
         {
             let operations = adapter.operations.lock().unwrap();
-            let Some(OperationState::StageAppliedUnusable(stage)) = operations.get(&operation_id)
+            let Some(OperationState::StageAppliedUnusable {
+                _stage_publication: stage,
+            }) = operations.get(&operation_id)
             else {
                 panic!("unusable stage remains terminal")
             };
@@ -2489,7 +2478,9 @@ mod tests {
                 (500, ConnectorStagedCreatePrepareOutcome::CommitUnknown { .. }) => {
                     assert!(adapter.prepare(request).is_err());
                     let operations = adapter.operations.lock().unwrap();
-                    let Some(OperationState::StageUnknown(stage)) = operations.get(&operation_id)
+                    let Some(OperationState::StageUnknown {
+                        _stage_publication: stage,
+                    }) = operations.get(&operation_id)
                     else {
                         panic!("unknown stage retains its exact journal")
                     };
@@ -2959,7 +2950,6 @@ mod tests {
                 .unwrap(),
                 prepared: prepared_operation(&runtime),
             }),
-            OperationState::Unknown,
             OperationState::Published,
             OperationState::Aborted,
             OperationState::Preparing,

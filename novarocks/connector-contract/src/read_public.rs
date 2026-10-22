@@ -275,7 +275,7 @@ impl ConnectorReadPublicFacts {
                 && field.is_nullable() == ty.nullable()
                 && novarocks_type_contract::arrow_data_types_exact(
                     field.data_type(),
-                    &ty.data_type(),
+                    ty.data_type(),
                 )
         })
     }

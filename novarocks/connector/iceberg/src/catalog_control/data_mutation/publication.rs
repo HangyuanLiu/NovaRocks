@@ -18,9 +18,11 @@
 //! Data mutation owns registered-file facts, never registered-file deletion.
 
 use super::*;
+#[cfg(test)]
 use crate::catalog::error::{CatalogCommitEvidence, CatalogOutcome};
 use crate::catalog::publication::CatalogEvidencePolicy;
 use crate::catalog::publication_dispatch::{PreparationResult, PreparedPublication};
+#[cfg(test)]
 use crate::catalog::transaction::CommitProof;
 #[cfg(test)]
 use crate::commit::attempt::Publisher;
@@ -279,7 +281,9 @@ impl RegisteredIcebergDataMutationBackend {
             move |request: &FrozenRequest, operation: &IcebergCommitOperation| {
                 let facts = FrozenPublicationFacts::from_request(request, operation)?;
                 let evidence = template
-                    .evidence(RecoveryPublication::Dispatched { facts })
+                    .evidence(RecoveryPublication::Dispatched {
+                        facts: Box::new(facts),
+                    })
                     .map_err(format_error)?;
                 let snapshot = request
                     .ref_snapshot_after(&template.payload.target_ref)
@@ -573,7 +577,9 @@ mod tests {
             let facts = FrozenPublicationFacts::from_request(request, operation)?;
             let evidence = self
                 .template
-                .evidence(RecoveryPublication::Dispatched { facts })
+                .evidence(RecoveryPublication::Dispatched {
+                    facts: Box::new(facts),
+                })
                 .map_err(format_error)?;
             let receipt = self
                 .template

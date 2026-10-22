@@ -22,6 +22,10 @@ pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(
     "/iceberg_connector_descriptor.bin"
 ));
 
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Generated Protobuf enum names preserve the frozen wire vocabulary"
+)]
 pub(crate) mod dto {
     include!(concat!(env!("OUT_DIR"), "/novarocks.connector.iceberg.rs"));
 }

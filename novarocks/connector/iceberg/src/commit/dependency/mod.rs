@@ -18,11 +18,13 @@
 //! Dependency validation reads only the input class that the dependency requires.
 
 mod builtin;
+#[cfg(test)]
 mod history;
 mod inputs;
 
 pub(crate) use builtin::diagnose_ref_unchanged;
 pub use builtin::validate;
+#[cfg(test)]
 pub use history::{HistoryGap, HistoryWindow, history_window};
 pub use inputs::{LiveEntry, LiveSet, ValidationInputs};
 
@@ -44,6 +46,13 @@ pub enum Culprit {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Verdict<D = Dependency> {
     Holds,
-    Broken { dependency: D, culprit: Culprit },
-    Unprovable { dependency: D, reason: HistoryGap },
+    Broken {
+        dependency: D,
+        culprit: Culprit,
+    },
+    #[cfg(test)]
+    Unprovable {
+        dependency: D,
+        reason: HistoryGap,
+    },
 }

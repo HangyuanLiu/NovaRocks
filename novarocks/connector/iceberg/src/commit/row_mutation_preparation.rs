@@ -21,9 +21,6 @@
 //! provider owns the physical strategy, the signed match layout, and the
 //! base version; the application only persists what it is handed.
 
-#[cfg(test)]
-use std::sync::Arc;
-
 use arrow::datatypes::{DataType, Field};
 use bytes::Bytes;
 use novarocks_spi::connector::{
@@ -31,8 +28,8 @@ use novarocks_spi::connector::{
     ConnectorMutationMatchContract, ConnectorMutationSourceField, ConnectorMutationTargetField,
     ConnectorProviderBindingKey, ConnectorRowMutationEffect, ConnectorRowMutationPreparation,
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
-    ConnectorRowMutationStrategy, ConnectorTableHandle, ConnectorWriteBaseVersion,
-    ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
+    ConnectorTableHandle, ConnectorWriteBaseVersion, ConnectorWriteFieldRequest,
+    ConnectorWriteFieldToken,
 };
 use sha2::{Digest, Sha256};
 

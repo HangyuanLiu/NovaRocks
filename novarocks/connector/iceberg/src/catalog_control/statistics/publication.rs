@@ -352,6 +352,7 @@ mod tests {
         SortOrder, Summary, TableMetadata, TableMetadataBuilder,
     };
     use crate::resources::IcebergCatalogRuntime;
+    use novarocks_spi::connector::ConnectorMutationFailureKind;
     use novarocks_spi::connector::{
         ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMutationOperationId,
         ConnectorProviderId, ConnectorRequestContext, ConnectorStopOwner, ProviderBindingEpoch,

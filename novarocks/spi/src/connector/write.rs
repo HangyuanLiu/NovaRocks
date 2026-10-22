@@ -2423,8 +2423,6 @@ fn sha256(payload: &Bytes) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use arrow::datatypes::{DataType, Field};
 
     use super::*;

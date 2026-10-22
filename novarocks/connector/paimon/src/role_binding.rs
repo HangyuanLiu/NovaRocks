@@ -99,6 +99,9 @@ const PAIMON_FILESYSTEM_BINDING: &str = "filesystem";
 const MAX_PRIVATE_READ_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PRIVATE_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 
+type FrozenReadSlot = Arc<OnceLock<Result<Arc<PaimonFrozenRead>, ConnectorError>>>;
+type FrozenReadCache = HashMap<(CatalogHandle, SchemaTableName), FrozenReadSlot>;
+
 /// Server-owned authorization hook. Implementations resolve one exact role,
 /// catalog generation and admitted request into a warehouse-bounded FileIO.
 /// The provider has no environment, global credential or storage fallback.
@@ -146,12 +149,7 @@ impl PaimonAsyncRuntime {
 
 #[derive(Default)]
 struct PaimonRequestCache {
-    frozen: Mutex<
-        HashMap<
-            (CatalogHandle, SchemaTableName),
-            Arc<OnceLock<Result<Arc<PaimonFrozenRead>, ConnectorError>>>,
-        >,
-    >,
+    frozen: Mutex<FrozenReadCache>,
 }
 
 impl PaimonRequestCache {
@@ -366,7 +364,6 @@ impl ProviderReadMetadata for PaimonReadRuntime {
         Ok(recipe
             .columns()
             .iter()
-            .cloned()
             .map(|column| ProviderReadColumnBinding::new(column.name(), column.clone(), false))
             .collect())
     }

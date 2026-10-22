@@ -71,9 +71,10 @@ pub enum DeleteEvaluationMode {
 }
 
 type Flight<T> = Shared<BoxFuture<'static, Result<Arc<T>, ConnectorError>>>;
+type WeakFlight<T> = WeakShared<BoxFuture<'static, Result<Arc<T>, ConnectorError>>>;
 struct SharedLoad<T> {
     ready: tokio::sync::OnceCell<Result<Arc<T>, ConnectorError>>,
-    flight: Mutex<Option<WeakShared<BoxFuture<'static, Result<Arc<T>, ConnectorError>>>>>,
+    flight: Mutex<Option<WeakFlight<T>>>,
 }
 impl<T> Default for SharedLoad<T> {
     fn default() -> Self {

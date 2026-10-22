@@ -19,7 +19,9 @@
 
 use std::fmt;
 
-use novarocks_spi::connector::{ConnectorMutationOperationId, ConnectorWriteOperationId};
+use novarocks_spi::connector::ConnectorMutationOperationId;
+#[cfg(test)]
+use novarocks_spi::connector::ConnectorWriteOperationId;
 use uuid::Uuid;
 
 use crate::iceberg::Result;
@@ -135,6 +137,13 @@ impl ObjectIdentity {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum OperationAuthority {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Preserves the original write authority tag in frozen recovery facts."
+        )
+    )]
     Write,
     Mutation,
     WriteSession,
@@ -158,6 +167,7 @@ pub struct OperationToken {
 }
 
 impl OperationToken {
+    #[cfg(test)]
     pub fn from_write(id: ConnectorWriteOperationId) -> Self {
         Self {
             authority: OperationAuthority::Write,

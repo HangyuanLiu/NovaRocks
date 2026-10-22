@@ -28,6 +28,7 @@ pub(crate) struct RetentionPlan {
     pub format_version: crate::iceberg::spec::FormatVersion,
     pub removed_refs: BTreeSet<String>,
     pub removed_snapshots: Vec<Snapshot>,
+    #[cfg(test)]
     pub protected_snapshots: BTreeSet<i64>,
     pub requirements: Vec<TableRequirement>,
     pub statistics_removals: Vec<TableUpdate>,
@@ -189,6 +190,7 @@ impl RetentionPlan {
             removed_statistics_lengths,
             removed_refs,
             removed_snapshots,
+            #[cfg(test)]
             protected_snapshots: protected,
             requirements,
         })

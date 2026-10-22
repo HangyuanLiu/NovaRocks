@@ -42,7 +42,7 @@ type Planner =
 
 enum Phase {
     New,
-    Planned(Option<PlannedInput>),
+    Planned(Option<Box<PlannedInput>>),
     Reading,
     Ready,
     Failed,
@@ -82,20 +82,18 @@ impl Default for State {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreparationWatcherExitFailure {
-    JoinPanicked,
-    SpawnPanicked,
-    SpawnErrorProjectionPanicked,
-    SpawnErrorDropPanicked,
+    Join,
+    Spawn,
+    SpawnErrorProjection,
+    SpawnErrorDrop,
 }
 impl std::fmt::Display for PreparationWatcherExitFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::JoinPanicked => "preparation watcher join did not prove resource exit",
-            Self::SpawnPanicked => "preparation watcher spawn did not prove resource exit",
-            Self::SpawnErrorProjectionPanicked => "preparation spawn error projection panicked",
-            Self::SpawnErrorDropPanicked => {
-                "preparation spawn error destruction did not prove exit"
-            }
+            Self::Join => "preparation watcher join did not prove resource exit",
+            Self::Spawn => "preparation watcher spawn did not prove resource exit",
+            Self::SpawnErrorProjection => "preparation spawn error projection panicked",
+            Self::SpawnErrorDrop => "preparation spawn error destruction did not prove exit",
         })
     }
 }
@@ -104,10 +102,10 @@ impl novarocks_failure_contract::FailureProjection for PreparationWatcherExitFai
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
         use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
         let code = match self {
-            Self::JoinPanicked => 184,
-            Self::SpawnPanicked => 185,
-            Self::SpawnErrorProjectionPanicked => 186,
-            Self::SpawnErrorDropPanicked => 187,
+            Self::Join => 184,
+            Self::Spawn => 185,
+            Self::SpawnErrorProjection => 186,
+            Self::SpawnErrorDrop => 187,
         };
         FailureFact::new(
             FailureClass::Unexpected,
@@ -163,6 +161,11 @@ impl std::task::Wake for WatcherWake {
         self.0.notify_waiters();
     }
 }
+#[cfg(test)]
+type BooleanObservationHook = Arc<dyn Fn(bool) + Send + Sync>;
+#[cfg(test)]
+type PreparedInputDropHook = Arc<dyn Fn(&PreparedFileInput) + Send + Sync>;
+
 struct Shared {
     state: Mutex<State>,
     watcher: Mutex<WatcherSlot>,
@@ -174,11 +177,11 @@ struct Shared {
     #[cfg(test)]
     before_watcher_return: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
-    before_result_publication: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    before_result_publication: Mutex<Option<BooleanObservationHook>>,
     #[cfg(test)]
-    before_result_transaction: Mutex<Option<Arc<dyn Fn(bool) + Send + Sync>>>,
+    before_result_transaction: Mutex<Option<BooleanObservationHook>>,
     #[cfg(test)]
-    before_unused_input_drop: Mutex<Option<Arc<dyn Fn(&PreparedFileInput) + Send + Sync>>>,
+    before_unused_input_drop: Mutex<Option<PreparedInputDropHook>>,
     #[cfg(test)]
     after_unused_input_drop: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
@@ -234,6 +237,7 @@ impl Drop for WatcherTaskLoan<'_> {
 }
 
 impl Shared {
+    #[cfg(test)]
     fn new() -> Arc<Self> {
         Self::new_with_state(State::default())
     }
@@ -340,7 +344,7 @@ impl Shared {
         match spawned {
             Err(payload) => {
                 self.watcher_lock().payloads[0] = Some(std::mem::ManuallyDrop::new(payload));
-                self.watcher_unknown(PreparationWatcherExitFailure::SpawnPanicked);
+                self.watcher_unknown(PreparationWatcherExitFailure::Spawn);
             }
             Ok(Ok(task)) => {
                 let mut slot = self.watcher_lock();
@@ -368,9 +372,7 @@ impl Shared {
                         self.watcher_lock().payloads[0] =
                             Some(std::mem::ManuallyDrop::new(payload));
                         drop(loan);
-                        self.watcher_unknown(
-                            PreparationWatcherExitFailure::SpawnErrorProjectionPanicked,
-                        );
+                        self.watcher_unknown(PreparationWatcherExitFailure::SpawnErrorProjection);
                         return;
                     }
                 };
@@ -407,7 +409,7 @@ impl Shared {
                     Err(payload) => {
                         self.watcher_lock().payloads[1] =
                             Some(std::mem::ManuallyDrop::new(payload));
-                        self.watcher_unknown(PreparationWatcherExitFailure::SpawnErrorDropPanicked);
+                        self.watcher_unknown(PreparationWatcherExitFailure::SpawnErrorDrop);
                     }
                 }
             }
@@ -460,9 +462,7 @@ impl Shared {
             self.watcher_exited();
             std::task::Poll::Ready(ConnectorPreparationExit::Exited)
         } else {
-            std::task::Poll::Ready(
-                self.watcher_unknown(PreparationWatcherExitFailure::JoinPanicked),
-            )
+            std::task::Poll::Ready(self.watcher_unknown(PreparationWatcherExitFailure::Join))
         }
     }
     fn reap_finished_watcher(&self) {
@@ -940,8 +940,10 @@ impl PreparedRangeCandidate {
         present_input: Option<PreparedFileInput>,
         allow_partial: bool,
     ) -> Option<Self> {
-        let mut state = State::default();
-        state.present_input = present_input;
+        let state = State {
+            present_input,
+            ..State::default()
+        };
         Some(Self {
             range: context.range.clone()?,
             context,
@@ -981,7 +983,7 @@ impl PreparedRangeCandidate {
                     return Ok(ConnectorPreparationProgress::Deferred);
                 }
                 match planned {
-                    Ok(planned) => state.phase = Phase::Planned(planned),
+                    Ok(planned) => state.phase = Phase::Planned(planned.map(Box::new)),
                     Err(error) => {
                         state.failure = Some(error);
                         state.phase = Phase::Failed;
@@ -1012,10 +1014,10 @@ impl PreparedRangeCandidate {
                 if length == 0 {
                     return Ok(ConnectorPreparationProgress::Deferred);
                 }
-                let planned_snapshot = Some(PlannedInput {
+                let planned_snapshot = Some(Box::new(PlannedInput {
                     file: planned.file.clone(),
                     range: planned.range,
-                });
+                }));
                 let cancellation = self.context.cancellation.child();
                 let range = FileReadRange::bounded(offset, length).map_err(map_file_error)?;
                 let file = planned.file.clone();
@@ -1154,7 +1156,6 @@ impl Drop for PreparedRangeCandidate {
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
     use std::num::NonZeroUsize;
     use std::time::{Duration, Instant};
 
@@ -1537,7 +1538,7 @@ mod tests {
         };
         assert_eq!(
             cause.failure_fact(),
-            PreparationWatcherExitFailure::JoinPanicked.failure_fact()
+            PreparationWatcherExitFailure::Join.failure_fact()
         );
         assert_eq!(
             std::error::Error::source(&cause)
@@ -1545,7 +1546,7 @@ mod tests {
                 .source()
                 .unwrap()
                 .downcast_ref::<PreparationWatcherExitFailure>(),
-            Some(&PreparationWatcherExitFailure::JoinPanicked)
+            Some(&PreparationWatcherExitFailure::Join)
         );
         let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
         let std::task::Poll::Ready(Some(ConnectorSourceFailureEvent::CleanupUnresolved(event))) =
@@ -1723,13 +1724,11 @@ mod tests {
                     panic!("foreign panic is not NoJob proof");
                 };
                 let expected = match mode {
-                    RejectMode::SpawnPanic => PreparationWatcherExitFailure::SpawnPanicked,
+                    RejectMode::SpawnPanic => PreparationWatcherExitFailure::Spawn,
                     RejectMode::ProjectionPanic => {
-                        PreparationWatcherExitFailure::SpawnErrorProjectionPanicked
+                        PreparationWatcherExitFailure::SpawnErrorProjection
                     }
-                    RejectMode::SourceDropPanic => {
-                        PreparationWatcherExitFailure::SpawnErrorDropPanicked
-                    }
+                    RejectMode::SourceDropPanic => PreparationWatcherExitFailure::SpawnErrorDrop,
                     RejectMode::Normal => unreachable!(),
                 };
                 assert_eq!(cause.failure_fact(), expected.failure_fact());

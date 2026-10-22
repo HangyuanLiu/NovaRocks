@@ -24,8 +24,8 @@ use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
 use super::admission::{CatalogAdmissionTarget, CatalogOperation};
 use super::error::{CatalogOutcome, CatalogUnsupported};
 use super::{
-    CatalogNamespaceName, CatalogTableName, ConditionalCreateAttempt, ConditionalCreateEvidence,
-    ConditionalCreateReceipt, ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog,
+    CatalogNamespaceName, CatalogTableName, ConditionalCreateEvidence, ConditionalCreateVerdict,
+    NovaRocksCatalog,
 };
 
 type FrozenRecorder =
@@ -468,27 +468,6 @@ impl NovaRocksCatalog for AdmittedCatalog {
         self.inner
             .anchor_written_metadata(_table, _metadata_location)
             .await
-    }
-
-    async fn prepare_conditional_create(
-        &self,
-        _request: ConditionalCreateRequest,
-    ) -> CatalogOutcome<ConditionalCreateAttempt> {
-        self.inner.prepare_conditional_create(_request).await
-    }
-
-    async fn publish_conditional_create(
-        &self,
-        _attempt: ConditionalCreateAttempt,
-    ) -> CatalogOutcome<ConditionalCreateReceipt> {
-        self.inner.publish_conditional_create(_attempt).await
-    }
-
-    async fn adjudicate_conditional_create(
-        &self,
-        _evidence: ConditionalCreateEvidence,
-    ) -> Result<ConditionalCreateVerdict, ConnectorError> {
-        self.inner.adjudicate_conditional_create(_evidence).await
     }
 
     async fn adjudicate_conditional_create_for_read(

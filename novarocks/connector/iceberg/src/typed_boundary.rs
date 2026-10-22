@@ -179,6 +179,10 @@ impl IcebergSystemRelation {
     }
 }
 
+type RequestPinnedPhysicalTables = Arc<Mutex<HashMap<SchemaTableName, IcebergPhysicalTable>>>;
+type FrozenCowSource = Arc<crate::typed_read::frozen_source::IcebergCowPendingReadSource>;
+type FrozenCowSources = Arc<Mutex<BTreeMap<[u8; 32], FrozenCowSource>>>;
+
 /// The coordinator-side Iceberg adapter for one catalog instance generation.
 ///
 /// It is constructed per transaction, exactly like Trino's per-transaction
@@ -200,21 +204,11 @@ pub struct IcebergTypedBoundary {
     /// and the later lazy split source.  It keeps the request-bound FileIO
     /// capability process-local while ensuring split enumeration does not
     /// reopen REST metadata after the attempt's credential manifest is sealed.
-    request_pinned_physical_tables:
-        Option<Arc<Mutex<HashMap<SchemaTableName, IcebergPhysicalTable>>>>,
+    request_pinned_physical_tables: Option<RequestPinnedPhysicalTables>,
     split_source_options: IcebergSplitSourceOptions,
     /// Exact COW observations adopted by this request's actual generation.
     /// Keyed by original source identity, never a SQL name or projection set.
-    frozen_cow_sources: Option<
-        Arc<
-            Mutex<
-                BTreeMap<
-                    [u8; 32],
-                    Arc<crate::typed_read::frozen_source::IcebergCowPendingReadSource>,
-                >,
-            >,
-        >,
-    >,
+    frozen_cow_sources: Option<FrozenCowSources>,
 }
 
 impl IcebergTypedBoundary {
@@ -298,10 +292,7 @@ impl IcebergTypedBoundary {
     fn adopted_cow_source(
         &self,
         handle: &IcebergTableHandle,
-    ) -> Result<
-        Option<Arc<crate::typed_read::frozen_source::IcebergCowPendingReadSource>>,
-        ConnectorError,
-    > {
+    ) -> Result<Option<FrozenCowSource>, ConnectorError> {
         let Some(proof) = handle.frozen_cow_source() else {
             return Ok(None);
         };
@@ -1603,9 +1594,11 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
                         dynamic_filter_columns,
                     )?,
                 };
-                let initial_dynamic_filter_wait = (!dynamic_filter_columns.is_empty())
-                    .then_some(std::time::Duration::from_secs(1))
-                    .unwrap_or_default();
+                let initial_dynamic_filter_wait = if !dynamic_filter_columns.is_empty() {
+                    std::time::Duration::from_secs(1)
+                } else {
+                    std::time::Duration::default()
+                };
                 Ok(Box::new(
                     IcebergRuntimeSplitSource::new(IcebergSplitSource::try_new(
                         &enumeration_handle,
@@ -3711,7 +3704,6 @@ mod public_read_schema_tests {
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceId, ConnectorProviderId,
     };
-    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
     use super::*;
 
@@ -4084,7 +4076,7 @@ mod attempt_access_tests {
             context
                 .control_state()
                 .physical_table_cache()
-                .get(&"db", &"t")
+                .get("db", "t")
                 .unwrap()
                 .is_none()
         );
