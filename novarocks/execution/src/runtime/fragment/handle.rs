@@ -2133,7 +2133,7 @@ impl DormantFragmentHandle {
                 crate::exec::pipeline::global_driver_executor::FragmentStoppedFact,
             >,
         > = Some(Box::new(move |stopped| {
-            lifecycle_on_stop.finish_from_stopped(stopped.conclusion())
+            lifecycle_on_stop.settle_after_stop(stopped.conclusion())
         }));
         // The original lifecycle and its mandatory finisher exist before any
         // driver can finish, including a zero-driver execution.
@@ -2226,7 +2226,7 @@ impl RunningFragmentHandle {
     }
     pub fn join(&self) -> FragmentTerminalFact {
         let result = self.inner.pipeline.join();
-        self.inner.lifecycle.finish_from_stopped(result);
+        self.inner.lifecycle.settle_after_stop(result);
         let mut state = self
             .inner
             .lifecycle
@@ -2247,6 +2247,8 @@ impl RunningFragmentHandle {
                 .unwrap_or_else(|e| e.into_inner());
         }
     }
+    /// A hint from the current published state, which can lag handed-off
+    /// proposals. Only the settled lifecycle publishes a terminal outcome.
     pub fn conclusion(&self) -> Option<FragmentOutcome> {
         self.inner
             .pipeline
@@ -2300,6 +2302,21 @@ impl RunningFragmentLifecycle {
             }
         }
         self.advance();
+    }
+
+    // Design: ADR-0193 (docs/adr/ADR-0193-task-conclusion-proposals-and-settled-points.md)
+    fn settle_after_stop(self: &Arc<Self>, result: super::ExecutionResult<()>) -> bool {
+        let lifecycle = Arc::clone(self);
+        self.control.on_settled(Box::new(move |_snapshot| {
+            // Settlement is a barrier, not a frozen outcome. Retirement keeps
+            // reading the current owner snapshot at the actual decision point.
+            lifecycle.finish_from_stopped(result);
+        }));
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .terminal
+            .is_some()
     }
 
     fn finish_from_stopped(self: &Arc<Self>, result: super::ExecutionResult<()>) -> bool {

@@ -130,6 +130,8 @@ pub(crate) struct OnceRole<F> {
     state: Mutex<State<F>>,
     role: Role,
     quarantine: Mutex<Option<Arc<Self>>>,
+    #[cfg(test)]
+    after_call_published: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl<F: Send + 'static> OnceRole<F> {
@@ -148,6 +150,8 @@ impl<F: Send + 'static> OnceRole<F> {
             }),
             role,
             quarantine: Mutex::new(None),
+            #[cfg(test)]
+            after_call_published: Mutex::new(None),
         })
     }
 
@@ -231,13 +235,22 @@ impl<F: Send + 'static> OnceRole<F> {
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.callback = Some(callback_value);
+            // Establish deferred retention before completion can observe the
+            // returned call and dispose its capture.
+            if !call_completed {
+                self.retain();
+            }
             state.call_returned = true;
             if let Err(payload) = result {
                 state.call_payload = Some(ManuallyDrop::new(payload));
             }
         }
-        if !call_completed {
-            self.retain();
+        #[cfg(test)]
+        {
+            let hook = self.after_call_published.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
         if call_panicked {
             self.report(control, Phase::Call);
@@ -330,5 +343,56 @@ impl<F: Send + 'static> OnceRole<F> {
                 self.retain();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Capture(Arc<AtomicUsize>);
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // The original deferred owner can complete immediately after call_returned
+    // is published. It must release both the capture and the role's own pin.
+    // This owned, per-role hook fixes that real scheduling point; the helper
+    // thread is joined and the oracle is actual capture/allocation destruction.
+    #[test]
+    fn deferred_completion_between_call_publication_and_retention_releases_the_role() {
+        let role = OnceRole::<()>::new(Role::PipelineFinisher);
+        let control = Arc::new(RuntimeErrorState::default());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let capture = Capture(drops.clone());
+        let mut callback: Option<Callback<()>> = Some(Box::new(move |_| {
+            std::hint::black_box(&capture);
+            false
+        }));
+        role.bind(&mut callback).unwrap();
+        let weak = Arc::downgrade(&role);
+        let completion = weak.clone();
+        let completed_control = control.clone();
+        *role.after_call_published.lock().unwrap() = Some(Box::new(move || {
+            let role = completion.upgrade().unwrap();
+            std::thread::spawn(move || role.complete_deferred(&completed_control))
+                .join()
+                .expect("the original deferred owner actually exits");
+        }));
+        role.invoke(&(), &control);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(
+            role.quarantine.lock().unwrap().is_none(),
+            "a disposed role cannot be pinned again after deferred completion"
+        );
+        drop(role);
+        assert!(
+            weak.upgrade().is_none(),
+            "the role's allocation is reclaimed"
+        );
+        assert!(control.exit_health_reporter().failure().is_none());
     }
 }
