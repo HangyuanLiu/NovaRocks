@@ -19,6 +19,14 @@ use novarocks_coordination_contract::{
     AttemptActivationIdentity, LogicalExecutionActorId, MonotonicClock,
 };
 
+mod internal_ready;
+mod result_transport;
+pub(crate) use internal_ready::InternalReadyActorPort;
+use internal_ready::{
+    BindConsumer, ConsumerExit, EndInFlight, EndRequest, InternalRuntime, PendingEnd, ReadyProposal,
+};
+use result_transport::{ResultSlot, ResultTransport};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -41,8 +49,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::api::{
-    EndDelivery, ExecutionOutput, QueryExecutionError, QueryResultStream, QueryResultTransport,
-    ResultDelivery, ResultDeliveryDisposition, ResultDeliveryReceipt, ResultQueuePermit,
+    EndDelivery, ExecutionOutput, InternalConsumerActivation, InternalConsumerSeal,
+    QueryExecutionError, QueryResultStream, ResultDeliveryDisposition, ResultDeliveryReceipt,
     ResultSchema, RetainedRootReply, RootSegmentDelivery,
 };
 use novarocks_result_contract::{ClientRowProfile, ClientRowStreamCursor};
@@ -560,6 +568,44 @@ impl RunningAttemptPermit {
         })
     }
 
+    pub(crate) async fn bind_internal_consumer(
+        &self,
+        root: TaskIdentity,
+    ) -> Result<InternalConsumerActivation, LogicalExecutionActorError> {
+        request(self.mailbox(), |reply| {
+            ActorCommand::BindInternalConsumer(BindConsumer {
+                activation: self.identity(),
+                root,
+                lifetime: Arc::clone(
+                    self.lifetime
+                        .as_ref()
+                        .expect("running authority retains its lifetime"),
+                ),
+                mailbox: self.mailbox().clone(),
+                reply,
+            })
+        })
+        .await
+    }
+
+    /// End consumption borrows authority. A pre-ready failure must still be
+    /// able to return this exact permit to the recovery owner.
+    pub(crate) async fn deliver_internal_end(
+        &self,
+        root: TaskIdentity,
+        end: novarocks_execution_contract::root_result::RootResultEnd,
+    ) -> Result<(), LogicalExecutionActorError> {
+        request(self.mailbox(), |reply| {
+            ActorCommand::DeliverInternalEnd(EndRequest {
+                activation: self.identity(),
+                root,
+                end,
+                reply,
+            })
+        })
+        .await
+    }
+
     /// Serializes a pump-owned attempt failure against the result delivery
     /// boundary. A successful reply proves that no batch is visible or in a
     /// protocol-owned delivery, and freezes future delivery until the permit
@@ -764,6 +810,8 @@ pub struct LogicalExecutionActorConfig {
     result_schema: Option<ResultSchema>,
     result_delivery_capacity: Option<NonZeroUsize>,
     result_row_carrier: Option<crate::api::ResultRowCarrier>,
+    internal_budgets: crate::api::ComputationObservationBudgets,
+    internal_plan: Option<crate::api::PlanSeal>,
 }
 
 impl fmt::Debug for LogicalExecutionActorConfig {
@@ -848,6 +896,8 @@ impl LogicalExecutionActorConfig {
             result_schema: None,
             result_delivery_capacity: None,
             result_row_carrier: None,
+            internal_budgets: crate::api::ComputationObservationBudgets::default(),
+            internal_plan: None,
         })
     }
 
@@ -966,6 +1016,8 @@ impl LogicalExecutionActorConfig {
             result_schema: None,
             result_delivery_capacity: None,
             result_row_carrier: None,
+            internal_budgets: crate::api::ComputationObservationBudgets::default(),
+            internal_plan: None,
         })
     }
 
@@ -1027,6 +1079,38 @@ impl LogicalExecutionActorConfig {
         self
     }
 
+    pub(crate) fn with_internal_observation_budgets(
+        mut self,
+        budgets: crate::api::ComputationObservationBudgets,
+    ) -> Self {
+        self.internal_budgets = budgets;
+        self
+    }
+
+    pub(crate) fn with_internal_computation(
+        mut self,
+        description: &crate::preparation::FrozenExecutionDescription,
+        capacity: NonZeroUsize,
+    ) -> Result<Self, LogicalExecutionActorError> {
+        if description.finish_boundary()
+            != crate::preparation::ExecutionFinishBoundary::ComputationReady
+            || self.effect != description.effect()
+            || self.recovery_mode != description.recovery()
+        {
+            return Err(LogicalExecutionActorError::InvariantViolation);
+        }
+        self.result_row_carrier = Some(
+            description
+                .row_carrier()
+                .map_err(|_| LogicalExecutionActorError::InvariantViolation)?,
+        );
+        self.internal_plan = Some(description.plan_identity());
+        self.result_schema = None;
+        self.result_delivery_capacity = Some(capacity);
+        self.output_mode = LogicalOutputMode::InternalResultStream;
+        Ok(self)
+    }
+
     /// Connects the role-composed Abort effect port. The query application
     /// retains no Native operation carrier or codec dependency.
     pub fn with_abort_query_context_effect_port(
@@ -1039,7 +1123,6 @@ impl LogicalExecutionActorConfig {
         self
     }
 
-    #[cfg(test)]
     pub(crate) fn with_clock(mut self, clock: Arc<dyn MonotonicClock>) -> Self {
         self.clock = clock;
         self
@@ -1343,7 +1426,7 @@ struct PendingResultBatch {
     sequence: ResultPacketSequence,
     /// A decoded batch or a Backend-encoded root segment; both share the
     /// same ordered delivery, receipt and success gate.
-    delivery: ResultDelivery,
+    delivery: RootSegmentDelivery,
     receipt: ResultDeliveryReceipt,
     reply: ActorReply<()>,
 }
@@ -1386,6 +1469,7 @@ pub(crate) enum RootTerminalFailure {
 enum PendingResult {
     Batch(PendingResultBatch),
     End(PendingResultEnd),
+    InternalEnd(PendingEnd),
 }
 
 enum InFlightResult {
@@ -1401,6 +1485,36 @@ enum InFlightResult {
     End {
         receipt: ResultDeliveryReceipt,
     },
+    InternalEnd(EndInFlight),
+}
+
+// Transport disappearance cannot select a supervised consumer's domain cause.
+// Move the exact outstanding delivery here so no closed reservation or settled
+// receipt is polled again. Terminal control or retirement settles it once.
+enum DeferredInternalDelivery {
+    Pending(PendingResult),
+    InFlight(InFlightResult),
+    EndAckLost(ActorReply<()>),
+}
+
+impl DeferredInternalDelivery {
+    fn settle(self, state: &mut LogicalExecutionState, error: Option<QueryExecutionError>) {
+        match self {
+            Self::Pending(pending) => reject_pending_result(state, pending),
+            Self::InFlight(in_flight) => settle_failed_in_flight_result(state, in_flight, error),
+            Self::EndAckLost(reply) => reply_result_failure(state, reply),
+        }
+    }
+
+    fn retire(self) {
+        match self {
+            Self::Pending(pending) => reject_pending_result_for_retirement(pending),
+            Self::InFlight(in_flight) => retire_in_flight_result(in_flight),
+            Self::EndAckLost(reply) => {
+                let _ = reply.send(Err(LogicalExecutionActorError::StaleAuthority));
+            }
+        }
+    }
 }
 
 // An observed attempt failure is pending the logical recovery decision. It
@@ -1417,20 +1531,32 @@ struct ResultRuntime {
     failure_sender: Option<watch::Sender<Option<QueryExecutionError>>>,
     accepted_error: Option<QueryExecutionError>,
     attempt_error: Option<AttemptResultFailure>,
-    transport: QueryResultTransport,
+    transport: ResultTransport,
+    internal: Option<InternalRuntime>,
+    internal_outcome: Option<
+        watch::Sender<Option<Result<crate::api::ComputationReadyToken, QueryExecutionError>>>,
+    >,
     root_success: Option<RootSuccessGate>,
     attempt_decision_pending: Option<AttemptActivationIdentity>,
     finish_waiter: Option<PendingResultFinish>,
     pending: Option<PendingResult>,
     in_flight: Option<InFlightResult>,
+    deferred_internal: Option<DeferredInternalDelivery>,
 }
 
 enum ResultReceiptOutcome {
     Schema(Result<ResultDeliveryDisposition, ()>),
     Delivery(Result<ResultDeliveryDisposition, ()>),
+    SourceExited(ConsumerExit),
 }
 
 impl ResultRuntime {
+    fn internal_exit_supervised(&self) -> bool {
+        self.internal
+            .as_ref()
+            .is_some_and(InternalRuntime::exit_supervised)
+    }
+
     fn retire_attempt_failure(&mut self, activation: AttemptActivationIdentity) {
         if self
             .attempt_error
@@ -1442,11 +1568,28 @@ impl ResultRuntime {
     }
 
     fn idle(&self) -> bool {
-        self.finish_waiter.is_none() && self.pending.is_none() && self.in_flight.is_none()
+        self.finish_waiter.is_none()
+            && self.pending.is_none()
+            && self.in_flight.is_none()
+            && self.deferred_internal.is_none()
+            && self.internal.as_ref().is_none_or(InternalRuntime::idle)
     }
 }
 
 enum ActorCommand {
+    BindInternalConsumer(BindConsumer),
+    SuperviseInternalConsumer {
+        source: Arc<InternalConsumerSeal>,
+        receiver: oneshot::Receiver<Result<(), QueryExecutionError>>,
+        reply: ActorReply<()>,
+    },
+    DeliverInternalEnd(EndRequest),
+    AcceptComputationReady(ReadyProposal),
+    FailInternalComputation {
+        source: Arc<InternalConsumerSeal>,
+        error: QueryExecutionError,
+        reply: ActorReply<()>,
+    },
     TakeReplacementAdmissionEvidence {
         activation: AttemptActivationIdentity,
         reply: ActorReply<Option<Box<[ReplacementWorkerAdmissionEvidence]>>>,
@@ -1457,6 +1600,7 @@ enum ActorCommand {
     },
     InitializationFailed {
         permit: AttemptInstantiationPermit,
+        error: Option<QueryExecutionError>,
         reply: ActorReply<LogicalConclusion>,
     },
     InitializationCancelled {
@@ -1591,9 +1735,21 @@ pub struct LogicalExecutionActor {
     sender: mpsc::Sender<ActorCommand>,
     registry_close_requested: watch::Sender<Option<RegistryClose>>,
     registry_ingress_closed: watch::Receiver<bool>,
+    internal_outcome: Option<
+        watch::Receiver<Option<Result<crate::api::ComputationReadyToken, QueryExecutionError>>>,
+    >,
 }
 
 impl LogicalExecutionActor {
+    /// Observes the execution-wide internal result selected by this actor.
+    /// Attempt retirement leaves this observer open and undecided.
+    pub(crate) fn internal_outcome(
+        &self,
+    ) -> Option<
+        watch::Receiver<Option<Result<crate::api::ComputationReadyToken, QueryExecutionError>>>,
+    > {
+        self.internal_outcome.clone()
+    }
     pub const fn id(&self) -> LogicalExecutionActorId {
         self.id
     }
@@ -1672,6 +1828,20 @@ impl LogicalExecutionActor {
     ) -> Result<LogicalConclusion, LogicalExecutionActorError> {
         request(&self.sender, |reply| ActorCommand::InitializationFailed {
             permit,
+            error: None,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn initialization_failed_with_error(
+        &self,
+        permit: AttemptInstantiationPermit,
+        error: QueryExecutionError,
+    ) -> Result<LogicalConclusion, LogicalExecutionActorError> {
+        request(&self.sender, |reply| ActorCommand::InitializationFailed {
+            permit,
+            error: Some(error),
             reply,
         })
         .await
@@ -1922,7 +2092,7 @@ impl LogicalExecutionActorOwner {
 /// ```
 #[must_use = "the logical execution output must be handed to its application consumer"]
 pub(crate) struct LogicalExecutionOutputTransfer {
-    output: ExecutionOutput,
+    output: Option<ExecutionOutput>,
 }
 
 impl fmt::Debug for LogicalExecutionOutputTransfer {
@@ -1936,6 +2106,7 @@ impl fmt::Debug for LogicalExecutionOutputTransfer {
 impl LogicalExecutionOutputTransfer {
     pub(crate) fn into_output(self) -> ExecutionOutput {
         self.output
+            .expect("client output transfer requires a client execution")
     }
 }
 
@@ -2138,8 +2309,15 @@ pub(crate) fn spawn_logical_execution_actor(
         .execution_stage
         .take()
         .ok_or(LogicalExecutionActorError::InvariantViolation)?;
+    let (internal_outcome_sender, internal_outcome) =
+        if config.output_mode == LogicalOutputMode::InternalResultStream {
+            let (sender, receiver) = watch::channel(None);
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
     let (result_runtime, output) = match config.output_mode {
-        LogicalOutputMode::CompletionOnly => (None, ExecutionOutput::Completion),
+        LogicalOutputMode::CompletionOnly => (None, Some(ExecutionOutput::Completion)),
         LogicalOutputMode::ResultStream => {
             let schema = config
                 .result_schema
@@ -2167,14 +2345,52 @@ pub(crate) fn spawn_logical_execution_actor(
                     failure_sender: Some(failure_sender),
                     accepted_error: None,
                     attempt_error: None,
-                    transport,
+                    transport: ResultTransport::Client(transport),
+                    internal: None,
+                    internal_outcome: None,
                     root_success: None,
                     attempt_decision_pending: None,
                     finish_waiter: None,
                     pending: None,
                     in_flight: None,
+                    deferred_internal: None,
                 }),
-                ExecutionOutput::Rows(stream),
+                Some(ExecutionOutput::Rows(stream)),
+            )
+        }
+        LogicalOutputMode::InternalResultStream => {
+            let plan = config
+                .internal_plan
+                .ok_or(LogicalExecutionActorError::InvariantViolation)?;
+            let capacity = config
+                .result_delivery_capacity
+                .ok_or(LogicalExecutionActorError::InvariantViolation)?;
+            let carrier = config
+                .result_row_carrier
+                .ok_or(LogicalExecutionActorError::InvariantViolation)?;
+            (
+                Some(ResultRuntime {
+                    carrier,
+                    schema_receipt: None,
+                    schema_writer_completed: true,
+                    failure_sender: None,
+                    accepted_error: None,
+                    attempt_error: None,
+                    transport: ResultTransport::UnboundInternal,
+                    internal: Some(InternalRuntime::new(
+                        plan,
+                        capacity,
+                        config.internal_budgets,
+                    )),
+                    internal_outcome: internal_outcome_sender,
+                    root_success: None,
+                    attempt_decision_pending: None,
+                    finish_waiter: None,
+                    pending: None,
+                    in_flight: None,
+                    deferred_internal: None,
+                }),
+                None,
             )
         }
     };
@@ -2244,6 +2460,7 @@ pub(crate) fn spawn_logical_execution_actor(
                 sender: sender.clone(),
                 registry_close_requested,
                 registry_ingress_closed: registry_ingress_closed_rx,
+                internal_outcome,
             },
             join,
         },
@@ -2293,7 +2510,7 @@ async fn run_actor(
     let mut registry_close_requested = false;
     let mut registry_close_cancelled = false;
     let mut registry_close_signal_open = true;
-    let mut root_terminal_receiver = None;
+    let mut root_terminal_receiver: Option<mpsc::Receiver<RootTerminalObservation>> = None;
     loop {
         let now = clock.now();
         if state.conclusion().is_none()
@@ -2360,6 +2577,43 @@ async fn run_actor(
             clock.as_ref(),
             result_runtime.as_mut(),
         );
+        // A terminal observation already enqueued on the reserved ingress
+        // precedes this turn's computation cut, even when the proof arrived
+        // through the normal command mailbox.
+        if result_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.internal.is_some())
+            && let Some(receiver) = root_terminal_receiver.as_mut()
+        {
+            let queued = receiver.len();
+            for _ in 0..queued {
+                if let Ok(observation) = receiver.try_recv() {
+                    apply_root_terminal_observation(state, result_runtime.as_mut(), observation);
+                }
+            }
+        }
+        // Registry close can record cancellation in this same actor turn.
+        // Reduce it before taking the computation cut, rather than waiting
+        // for another mailbox wakeup.
+        if state.conclusion().is_none()
+            && let Some(reason) = work_cancellation.reason()
+        {
+            revoke_all_establish_authority(&mut attempts);
+            conclude_for_work_cancellation(
+                state,
+                replacement.as_ref(),
+                result_runtime.as_mut(),
+                &reason,
+            );
+            lifetime.settle();
+        }
+        if let Some(error) = accepted_replacement_error(state, replacement.as_ref())
+            && let Some(runtime) = result_runtime.as_mut()
+            && runtime.internal.is_some()
+        {
+            runtime.accepted_error = Some(error);
+        }
+        internal_ready::try_accept(state, &mut attempts, result_runtime.as_mut(), clock.now());
         release_concluded_actor_resources(state, &mut execution_stage, replacement.as_mut());
         let committed_end_awaiting_transport = state.conclusion()
             == Some(LogicalConclusion::Succeeded)
@@ -2384,6 +2638,7 @@ async fn run_actor(
             );
             fail_result_runtime(state, Some(runtime));
         }
+        internal_ready::publish_outcome(state, result_runtime.as_ref());
         if registry_close_requested
             && actor_cleanup_complete(state, &attempts, replacement.as_ref())
             && result_runtime.as_ref().is_none_or(ResultRuntime::idle)
@@ -2417,17 +2672,25 @@ async fn run_actor(
         let result_capacity_transport = result_runtime.as_ref().and_then(|runtime| {
             (runtime.pending.is_some()
                 && runtime.in_flight.is_none()
+                && runtime.deferred_internal.is_none()
                 && runtime.attempt_decision_pending.is_none())
             .then(|| runtime.transport.clone())
         });
-        let result_receipt_pending = result_runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.in_flight.is_some() || runtime.schema_receipt.is_some());
+        let result_receipt_pending = result_runtime.as_ref().is_some_and(|runtime| {
+            runtime.in_flight.is_some()
+                || runtime.schema_receipt.is_some()
+                || runtime
+                    .internal
+                    .as_ref()
+                    .is_some_and(InternalRuntime::source_pending)
+        });
         let result_consumer_transport = result_runtime.as_ref().and_then(|runtime| {
             state
                 .conclusion()
                 .is_none()
-                .then(|| runtime.transport.clone())
+                .then_some(())
+                .filter(|_| !runtime.internal_exit_supervised())
+                .map(|_| runtime.transport.clone())
         });
         let root_terminal_pending = root_terminal_receiver.is_some();
         tokio::select! {
@@ -2771,7 +3034,10 @@ fn synchronize_all_stand_down(
 ) {
     for attempt in attempts.values_mut() {
         if !attempt.stand_down.started()
-            && state.conclusion() == Some(LogicalConclusion::Succeeded)
+            && matches!(
+                state.conclusion(),
+                Some(LogicalConclusion::Succeeded | LogicalConclusion::ComputationReady)
+            )
             && let Err(error) = begin_or_refresh_successful_cleanup(attempt)
         {
             stand_down_error.get_or_insert(error);
@@ -2789,7 +3055,7 @@ fn synchronize_all_stand_down(
                     Some(ContextStandDownCause::LogicalExecutionCancelled)
                 }
                 LogicalConclusion::Failed => Some(ContextStandDownCause::LogicalExecutionFailed),
-                LogicalConclusion::Succeeded => None,
+                LogicalConclusion::Succeeded | LogicalConclusion::ComputationReady => None,
             })
         };
         if let Some(cause) = cause
@@ -3029,6 +3295,22 @@ fn conclude_replacement_failed(
     }
 }
 
+fn accepted_replacement_error(
+    state: &LogicalExecutionState,
+    replacement: Option<&ReplacementRuntime>,
+) -> Option<QueryExecutionError> {
+    if state.conclusion() != Some(LogicalConclusion::Failed) {
+        return None;
+    }
+    replacement
+        .and_then(|replacement| replacement.accepted_failure)
+        .map(|failure| {
+            result_actor_failure(LogicalExecutionActorError::ReplacementQualificationFailed(
+                failure,
+            ))
+        })
+}
+
 fn replacement_terminal_disposition(
     replacement: &ReplacementRuntime,
     conclusion: LogicalConclusion,
@@ -3238,8 +3520,13 @@ fn try_activate_qualified_replacement(
                 }
                 Err(error) => {
                     if let Ok(capability) = state.attempt_capability(active.identity.replacement())
+                        && state
+                            .conclude(&capability, LogicalConclusion::Failed)
+                            .is_ok()
+                        && let Some(runtime) = result_runtime
+                        && runtime.internal.is_some()
                     {
-                        let _ = state.conclude(&capability, LogicalConclusion::Failed);
+                        runtime.accepted_error = Some(result_actor_failure(error));
                     }
                     pending_activation.lifetime.abandon();
                     let _ = pending_activation.reply.send(Err(error));
@@ -3373,8 +3660,8 @@ fn start_schema_delivery(
 }
 
 async fn wait_for_result_capacity(
-    transport: Option<QueryResultTransport>,
-) -> Result<ResultQueuePermit, QueryExecutionError> {
+    transport: Option<ResultTransport>,
+) -> Result<ResultSlot, QueryExecutionError> {
     transport
         .expect("result capacity wait is gated by one pending delivery")
         .reserve_owned()
@@ -3383,21 +3670,40 @@ async fn wait_for_result_capacity(
 
 async fn wait_for_result_receipt(runtime: Option<&mut ResultRuntime>) -> ResultReceiptOutcome {
     let runtime = runtime.expect("result receipt wait is gated by a result runtime");
-    if let Some(in_flight) = runtime.in_flight.as_mut() {
+    if runtime
+        .internal
+        .as_ref()
+        .is_some_and(InternalRuntime::source_pending)
+    {
+        let receipt_pending = runtime.in_flight.is_some() || runtime.schema_receipt.is_some();
+        tokio::select! {
+            biased;
+            receipt = wait_for_regular_result_receipt(runtime.in_flight.as_mut(), runtime.schema_receipt.as_mut()), if receipt_pending => receipt,
+            source = internal_ready::wait_for_source_exit(runtime.internal.as_mut()) => ResultReceiptOutcome::SourceExited(source),
+        }
+    } else {
+        wait_for_regular_result_receipt(runtime.in_flight.as_mut(), runtime.schema_receipt.as_mut())
+            .await
+    }
+}
+
+async fn wait_for_regular_result_receipt(
+    in_flight: Option<&mut InFlightResult>,
+    schema: Option<&mut ResultDeliveryReceipt>,
+) -> ResultReceiptOutcome {
+    if let Some(in_flight) = in_flight {
         return ResultReceiptOutcome::Delivery(match in_flight {
             InFlightResult::Schema { receipt, .. }
             | InFlightResult::Batch { receipt, .. }
             | InFlightResult::End { receipt, .. } => receipt.await.map_err(|_| ()),
+            InFlightResult::InternalEnd(end) => (&mut end.receipt).await.map_err(|_| ()),
         });
     }
-    let receipt = runtime
-        .schema_receipt
-        .as_mut()
-        .expect("result receipt wait requires a schema or delivery receipt");
+    let receipt = schema.expect("result receipt wait requires a schema or delivery receipt");
     ResultReceiptOutcome::Schema(receipt.await.map_err(|_| ()))
 }
 
-async fn wait_for_result_consumer_closed(transport: Option<QueryResultTransport>) {
+async fn wait_for_result_consumer_closed(transport: Option<ResultTransport>) {
     transport
         .expect("result consumer wait is gated by a result runtime")
         .closed()
@@ -3547,7 +3853,7 @@ fn drive_root_success(
 fn apply_result_capacity(
     state: &mut LogicalExecutionState,
     runtime: Option<&mut ResultRuntime>,
-    reserved: Result<ResultQueuePermit, QueryExecutionError>,
+    reserved: Result<ResultSlot, QueryExecutionError>,
 ) {
     let Some(runtime) = runtime else {
         return;
@@ -3557,6 +3863,19 @@ fn apply_result_capacity(
     };
     let slot = match reserved {
         Ok(slot) => slot,
+        Err(_)
+            if state.conclusion().is_none()
+                && runtime.internal_exit_supervised()
+                && matches!(runtime.transport, ResultTransport::Internal(_))
+                && matches!(
+                    pending,
+                    PendingResult::Batch(_) | PendingResult::InternalEnd(_)
+                ) =>
+        {
+            debug_assert!(runtime.deferred_internal.is_none());
+            runtime.deferred_internal = Some(DeferredInternalDelivery::Pending(pending));
+            return;
+        }
         Err(error) => {
             conclude_result_failure(
                 state,
@@ -3600,7 +3919,12 @@ fn apply_result_capacity(
                     return;
                 }
             };
-            runtime.transport.enqueue(slot, pending.delivery);
+            if let Err(error) = runtime.transport.enqueue_segment(slot, pending.delivery) {
+                let _ = state.fail_result_delivery(permit);
+                runtime.accepted_error = Some(error);
+                reply_result_failure(state, pending.reply);
+                return;
+            }
             runtime.in_flight = Some(InFlightResult::Batch {
                 permit,
                 receipt: pending.receipt,
@@ -3608,6 +3932,14 @@ fn apply_result_capacity(
             });
         }
         PendingResult::End(pending) => {
+            if !matches!(
+                (&runtime.transport, &slot),
+                (ResultTransport::Client(_), ResultSlot::Client(_))
+            ) {
+                drop(slot);
+                conclude_consumed_handoff_as_failed(state, pending.permit, pending.reply);
+                return;
+            }
             let activation = pending.permit.identity();
             let capability = match state.attempt_capability(activation.execution()) {
                 Ok(capability) if identity_of(&capability) == activation => capability,
@@ -3656,12 +3988,16 @@ fn apply_result_capacity(
             );
             runtime
                 .transport
-                .enqueue(slot, ResultDelivery::End(delivery));
+                .enqueue_client_end(slot, delivery)
+                .expect("the frozen client channel was checked before success authorization");
             let (_capability, lifetime, mailbox_liveness) = pending.permit.into_parts();
             drop(mailbox_liveness);
             lifetime.settle();
             let _ = pending.reply.send(Ok(LogicalConclusion::Succeeded));
             runtime.in_flight = Some(InFlightResult::End { receipt });
+        }
+        PendingResult::InternalEnd(pending) => {
+            internal_ready::enqueue_end(state, runtime, slot, pending)
         }
     }
 }
@@ -3677,6 +4013,10 @@ fn apply_result_receipt(
     };
     let was_unconcluded = state.conclusion().is_none();
     let disposition = match outcome {
+        ResultReceiptOutcome::SourceExited(source) => {
+            internal_ready::source_exited(state, Some(runtime), source);
+            return;
+        }
         ResultReceiptOutcome::Schema(disposition) => {
             runtime.schema_receipt.take();
             if let Some(error) = result_receipt_failure(disposition) {
@@ -3691,14 +4031,38 @@ fn apply_result_receipt(
         }
         ResultReceiptOutcome::Delivery(disposition) => disposition,
     };
+    if state.conclusion().is_none()
+        && runtime.internal_exit_supervised()
+        && matches!(
+            disposition,
+            Ok(ResultDeliveryDisposition::Dropped) | Err(())
+        )
+        && matches!(
+            runtime.in_flight,
+            Some(InFlightResult::Batch { .. } | InFlightResult::InternalEnd(_))
+        )
+    {
+        // Unwinding can drop the input before the outer supervisor reports
+        // the actual typed Err/panic. Do not repoll this completed receipt.
+        debug_assert!(runtime.deferred_internal.is_none());
+        runtime.deferred_internal = runtime
+            .in_flight
+            .take()
+            .map(DeferredInternalDelivery::InFlight);
+        return;
+    }
     let Some(in_flight) = runtime.in_flight.take() else {
         return;
     };
-    let mut failure = result_receipt_failure(disposition);
+    let mut failure = result_receipt_failure(disposition.clone());
     let completed = failure.is_none();
     // Settle the original state transition before installing a failure or
     // replying. A prior cancellation/success still owns its exact conclusion.
     let reply = match in_flight {
+        InFlightResult::InternalEnd(end) => {
+            internal_ready::settle_end(state, runtime, end, disposition);
+            return;
+        }
         InFlightResult::Schema { permit, .. } => {
             if completed {
                 if let Err(error) = state.complete_schema_delivery(permit) {
@@ -3770,6 +4134,52 @@ fn reject_pending_result(state: &mut LogicalExecutionState, pending: PendingResu
                 reply_consumed_handoff_actual(state, pending.permit, pending.reply, true);
             }
         }
+        PendingResult::InternalEnd(pending) => {
+            let _ = pending.reply.send(Err(state.conclusion().map_or(
+                LogicalExecutionActorError::ResultDeliveryFailed,
+                LogicalExecutionActorError::ExecutionConcluded,
+            )));
+        }
+    }
+}
+
+fn reject_pending_result_for_retirement(pending: PendingResult) {
+    match pending {
+        PendingResult::Batch(pending) => {
+            let _ = pending
+                .reply
+                .send(Err(LogicalExecutionActorError::StaleAuthority));
+        }
+        PendingResult::InternalEnd(pending) => {
+            let _ = pending
+                .reply
+                .send(Err(LogicalExecutionActorError::StaleAuthority));
+        }
+        PendingResult::End(pending) => {
+            let (_, lifetime, mailbox) = pending.permit.into_parts();
+            drop(mailbox);
+            lifetime.settle();
+            let _ = pending
+                .reply
+                .send(Err(LogicalExecutionActorError::StaleAuthority));
+        }
+    }
+}
+
+fn retire_in_flight_result(in_flight: InFlightResult) {
+    match in_flight {
+        InFlightResult::Batch { reply, .. } => {
+            let _ = reply.send(Err(LogicalExecutionActorError::StaleAuthority));
+        }
+        InFlightResult::InternalEnd(end) => {
+            let _ = end.checked.send(Err(result_actor_failure(
+                LogicalExecutionActorError::StaleAuthority,
+            )));
+            let _ = end
+                .reply
+                .send(Err(LogicalExecutionActorError::StaleAuthority));
+        }
+        InFlightResult::Schema { .. } | InFlightResult::End { .. } => {}
     }
 }
 
@@ -3789,20 +4199,38 @@ fn fail_result_runtime(state: &mut LogicalExecutionState, runtime: Option<&mut R
     let Some(runtime) = runtime else {
         return;
     };
+    internal_ready::notify_terminal(state, runtime);
+    let internal_error = runtime.accepted_error.clone().or_else(|| {
+        runtime
+            .attempt_error
+            .as_ref()
+            .map(|failure| failure.error.clone())
+    });
     if let Some(sender) = runtime.failure_sender.take() {
-        if state.conclusion() == Some(LogicalConclusion::Succeeded) {
+        if matches!(
+            state.conclusion(),
+            Some(LogicalConclusion::Succeeded | LogicalConclusion::ComputationReady)
+        ) {
             runtime.accepted_error.take();
             runtime.attempt_error.take();
             drop(sender);
-        } else if let Some(error) = runtime.accepted_error.take().or_else(|| {
+        } else if let Some(error) = runtime.accepted_error.clone().or_else(|| {
             (state.conclusion() == Some(LogicalConclusion::Failed))
-                .then(|| runtime.attempt_error.take().map(|failure| failure.error))
+                .then(|| {
+                    runtime
+                        .attempt_error
+                        .as_ref()
+                        .map(|failure| failure.error.clone())
+                })
                 .flatten()
         }) {
+            runtime.accepted_error.get_or_insert_with(|| error.clone());
             sender.send_replace(Some(error));
         } else {
             match state.conclusion() {
-                Some(LogicalConclusion::Succeeded) => drop(sender),
+                Some(LogicalConclusion::Succeeded | LogicalConclusion::ComputationReady) => {
+                    drop(sender)
+                }
                 Some(LogicalConclusion::Cancelled) => {
                     sender.send_replace(Some(logical_owner_failure(
                         crate::execution_error::QueryFailureReason::LogicalOwnerStopped,
@@ -3821,6 +4249,9 @@ fn fail_result_runtime(state: &mut LogicalExecutionState, runtime: Option<&mut R
         }
     }
     runtime.root_success = None;
+    if let Some(deferred) = runtime.deferred_internal.take() {
+        deferred.settle(state, internal_error.clone());
+    }
     if let Some(finish) = runtime.finish_waiter.take() {
         if state.conclusion().is_none() {
             conclude_consumed_handoff_as_failed(state, finish.permit, finish.reply);
@@ -3831,15 +4262,35 @@ fn fail_result_runtime(state: &mut LogicalExecutionState, runtime: Option<&mut R
     if let Some(pending) = runtime.pending.take() {
         reject_pending_result(state, pending);
     }
-    let Some(in_flight) = runtime.in_flight.take() else {
-        return;
-    };
+    if let Some(in_flight) = runtime.in_flight.take() {
+        settle_failed_in_flight_result(state, in_flight, internal_error);
+    }
+}
+
+fn settle_failed_in_flight_result(
+    state: &LogicalExecutionState,
+    in_flight: InFlightResult,
+    internal_error: Option<QueryExecutionError>,
+) {
     match in_flight {
         InFlightResult::Schema { .. } => {}
         InFlightResult::Batch { reply, .. } => {
             reply_result_failure(state, reply);
         }
         InFlightResult::End { .. } => {}
+        InFlightResult::InternalEnd(end) => {
+            let error = internal_error.unwrap_or_else(|| {
+                result_actor_failure(state.conclusion().map_or(
+                    LogicalExecutionActorError::ResultDeliveryFailed,
+                    LogicalExecutionActorError::ExecutionConcluded,
+                ))
+            });
+            let _ = end.checked.send(Err(error));
+            let _ = end.reply.send(Err(state.conclusion().map_or(
+                LogicalExecutionActorError::ResultDeliveryFailed,
+                LogicalExecutionActorError::ExecutionConcluded,
+            )));
+        }
     }
 }
 
@@ -3933,6 +4384,53 @@ fn handle_command(
     command: ActorCommand,
 ) {
     match command {
+        ActorCommand::SuperviseInternalConsumer {
+            source,
+            receiver,
+            reply,
+        } => {
+            let Some(runtime) = result_runtime else {
+                let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
+                return;
+            };
+            internal_ready::supervise_exit(state, runtime, source, receiver, reply);
+        }
+        ActorCommand::BindInternalConsumer(binding) => {
+            let Some(runtime) = result_runtime else {
+                let _ = binding
+                    .reply
+                    .send(Err(LogicalExecutionActorError::WrongPhase));
+                return;
+            };
+            internal_ready::bind(state, runtime, binding);
+        }
+        ActorCommand::DeliverInternalEnd(end) => {
+            let Some(runtime) = result_runtime else {
+                let _ = end.reply.send(Err(LogicalExecutionActorError::WrongPhase));
+                return;
+            };
+            internal_ready::queue_end(state, runtime, end);
+        }
+        ActorCommand::AcceptComputationReady(proposal) => {
+            let Some(runtime) = result_runtime else {
+                let _ = proposal
+                    .reply
+                    .send(Err(LogicalExecutionActorError::WrongPhase));
+                return;
+            };
+            internal_ready::propose(state, runtime, proposal);
+        }
+        ActorCommand::FailInternalComputation {
+            source,
+            error,
+            reply,
+        } => {
+            let Some(runtime) = result_runtime else {
+                let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
+                return;
+            };
+            internal_ready::fail(state, runtime, source, error, reply);
+        }
         ActorCommand::TakeReplacementAdmissionEvidence { activation, reply } => {
             let result = (|| {
                 let current = state.attempt_capability(activation.execution())?;
@@ -3982,12 +4480,20 @@ fn handle_command(
                 }
             }
         }
-        ActorCommand::InitializationFailed { permit, reply } => {
+        ActorCommand::InitializationFailed {
+            permit,
+            error,
+            reply,
+        } => {
             settle_terminal(
                 state,
                 permit.into_parts(),
                 LogicalConclusion::Failed,
-                || {},
+                || {
+                    if let (Some(runtime), Some(error)) = (result_runtime, error) {
+                        runtime.accepted_error = Some(error);
+                    }
+                },
                 reply,
             );
         }
@@ -4091,6 +4597,7 @@ fn handle_command(
             let activation_error = verify_running_activation(state, activation).err();
             if activation_error.is_some()
                 || runtime.pending.is_some()
+                || runtime.deferred_internal.is_some()
                 || matches!(
                     runtime.in_flight,
                     Some(InFlightResult::Batch { .. } | InFlightResult::End { .. })
@@ -4164,7 +4671,7 @@ fn handle_command(
             runtime.pending = Some(PendingResult::Batch(PendingResultBatch {
                 activation,
                 sequence,
-                delivery: ResultDelivery::Segment(delivery),
+                delivery,
                 receipt,
                 reply,
             }));
@@ -4188,6 +4695,14 @@ fn handle_command(
             if verify_running_activation(state, activation).is_err()
                 || root.query_execution_id() != activation.execution()
             {
+                let _ = reply.send(Err(LogicalExecutionActorError::StaleAuthority));
+                return;
+            }
+            if runtime.internal.as_ref().is_some_and(|internal| {
+                !internal.consumer.as_ref().is_some_and(|record| {
+                    record.source.activation == activation && record.source.root == root
+                })
+            }) {
                 let _ = reply.send(Err(LogicalExecutionActorError::StaleAuthority));
                 return;
             }
@@ -4240,6 +4755,12 @@ fn handle_command(
                 return;
             }
             runtime.attempt_error = Some(AttemptResultFailure { activation, error });
+            if runtime.internal.is_some() {
+                runtime.attempt_decision_pending = Some(activation);
+                internal_ready::retire(runtime, activation);
+                let _ = reply.send(Ok(()));
+                return;
+            }
             let protocol_may_own_rows = matches!(
                 runtime.in_flight,
                 Some(InFlightResult::Batch { .. } | InFlightResult::End { .. })
@@ -4479,6 +5000,7 @@ fn handle_command(
                     }
                 };
             if let Some(runtime) = result_runtime.as_deref_mut() {
+                internal_ready::retire(runtime, activation);
                 if let Some(error) = terminal_error {
                     runtime.attempt_error = Some(AttemptResultFailure { activation, error });
                 }
@@ -5267,6 +5789,11 @@ fn reply_result_failure(state: &LogicalExecutionState, reply: ActorReply<()>) {
 
 #[cfg(test)]
 mod tests {
+    use crate::api::ResultDelivery;
+    mod internal_ready_tests {
+        include!("actor/internal_ready_tests.rs");
+    }
+
     use std::future::Future;
     use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicUsize, Ordering};

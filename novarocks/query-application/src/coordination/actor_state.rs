@@ -88,6 +88,7 @@ impl AttemptRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalConclusion {
     Succeeded,
+    ComputationReady,
     Failed,
     Cancelled,
 }
@@ -95,6 +96,7 @@ pub enum LogicalConclusion {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LogicalOutputMode {
     ResultStream,
+    InternalResultStream,
     CompletionOnly,
 }
 
@@ -509,7 +511,10 @@ impl LogicalExecutionState {
                 current.checked_add(1)
             })
             .map_err(|_| ActorStateError::StaleAttemptCapability)?;
-        let delivery = DeliveryGate::new(initial);
+        let delivery = match output_mode {
+            LogicalOutputMode::InternalResultStream => DeliveryGate::internal(initial),
+            _ => DeliveryGate::new(initial),
+        };
         let capability_generation = delivery.eligibility_generation();
         Ok(Self {
             actor_instance_id,
@@ -883,7 +888,10 @@ impl LogicalExecutionState {
         sequence: u64,
         packet: ResultPacket<P>,
     ) -> Result<DeliveryPermit<P>, DeliveryRejection<P>> {
-        if !matches!(self.output_mode, LogicalOutputMode::ResultStream) {
+        if !matches!(
+            self.output_mode,
+            LogicalOutputMode::ResultStream | LogicalOutputMode::InternalResultStream
+        ) {
             return Err(DeliveryRejection::new(
                 DeliveryGateError::WrongOutputMode,
                 packet,
@@ -910,6 +918,35 @@ impl LogicalExecutionState {
         permit: DeliveryPermit<P>,
     ) -> Result<CompletedDelivery<P>, DeliveryCompletionError<P>> {
         self.delivery.complete_delivery(permit)
+    }
+
+    pub(crate) fn begin_internal_end(
+        &mut self,
+        capability: &AttemptCapability,
+        sequence: u64,
+    ) -> Result<DeliveryPermit<()>, DeliveryRejection<()>> {
+        if self.output_mode != LogicalOutputMode::InternalResultStream
+            || self.require_running_capability(capability).is_err()
+        {
+            return Err(DeliveryRejection::new(
+                DeliveryGateError::WrongExecutionPhase,
+                ResultPacket::EndOfStream,
+            ));
+        }
+        self.delivery
+            .begin_delivery(capability.execution, sequence, ResultPacket::EndOfStream)
+    }
+
+    pub(crate) fn accept_computation_ready(
+        &mut self,
+        capability: &AttemptCapability,
+    ) -> Result<(), ActorStateError> {
+        self.require_running_capability(capability)?;
+        if self.output_mode != LogicalOutputMode::InternalResultStream {
+            return Err(ActorStateError::WrongPhase);
+        }
+        self.delivery.accept_internal_ready(capability.execution)?;
+        self.conclude_current_execution(capability.execution, LogicalConclusion::ComputationReady)
     }
 
     pub(crate) fn fail_result_delivery<P>(
@@ -1166,6 +1203,9 @@ impl LogicalExecutionState {
         current: &AttemptCapability,
         conclusion: LogicalConclusion,
     ) -> Result<(), ActorStateError> {
+        if conclusion == LogicalConclusion::ComputationReady {
+            return Err(ActorStateError::WrongPhase);
+        }
         if matches!(conclusion, LogicalConclusion::Succeeded) {
             self.require_running_capability(current)?;
         } else {
@@ -1199,7 +1239,10 @@ impl LogicalExecutionState {
         if !exact {
             return Err(ActorStateError::StaleReplacement);
         }
-        if matches!(conclusion, LogicalConclusion::Succeeded) {
+        if matches!(
+            conclusion,
+            LogicalConclusion::Succeeded | LogicalConclusion::ComputationReady
+        ) {
             return Err(ActorStateError::WrongPhase);
         }
         self.conclusion = Some(conclusion);
@@ -1220,7 +1263,10 @@ impl LogicalExecutionState {
             return Err(ActorStateError::SuccessAlreadyAuthorized);
         }
         if matches!(conclusion, LogicalConclusion::Succeeded)
-            && matches!(self.output_mode, LogicalOutputMode::ResultStream)
+            && matches!(
+                self.output_mode,
+                LogicalOutputMode::ResultStream | LogicalOutputMode::InternalResultStream
+            )
         {
             return Err(ActorStateError::SuccessRequiresEndOfStream);
         }

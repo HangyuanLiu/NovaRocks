@@ -1,0 +1,1432 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+// Included inside supervisor::tests to reuse its actual Native admission fixtures.
+mod internal_supervisor_tests {
+    use super::*;
+    use crate::api::{
+        ComputationReadyToken, InternalComputationConsumer, InternalConsumerActivation,
+        InternalConsumerFuture, InternalResultDelivery,
+    };
+    use novarocks_coordination_contract::{MonotonicClock, MonotonicInstant};
+    use novarocks_execution_contract::root_result::{
+        RootReadOutcome, RootReadResponse, RootResultEnd, RootResultRead, RootResultReply,
+    };
+    use novarocks_result_contract::{
+        FrozenRootOutput, RootOutputContract, RootOutputKind, RootProfileId,
+    };
+    use std::pin::Pin;
+
+    const INTERNAL_ROWS: u64 = 7;
+
+    #[derive(Debug)]
+    struct FixedComputationClock(MonotonicInstant);
+
+    impl MonotonicClock for FixedComputationClock {
+        fn now(&self) -> MonotonicInstant {
+            self.0
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct InternalAttemptSignals {
+        run_entered: AtomicBool,
+        run_returned: AtomicBool,
+        cleanup_entered: AtomicBool,
+        cleanup_completed: AtomicBool,
+        active_dropped: AtomicBool,
+        native_failure: std::sync::Mutex<Option<ExecutionFailureInput>>,
+        replacement_failure: std::sync::Mutex<Option<ExecutionFailureInput>>,
+        preparations: AtomicU64,
+        release_run: tokio::sync::Notify,
+        release_cleanup: tokio::sync::Notify,
+    }
+
+    #[derive(Debug, Default)]
+    struct CheckedCountConsumer {
+        decoded: AtomicBool,
+        accepted: std::sync::Mutex<Option<ComputationReadyToken>>,
+        ready_observation: std::sync::Mutex<
+            Option<watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>>,
+        >,
+    }
+
+    #[derive(Debug)]
+    struct ObservedCountConsumer(Arc<CheckedCountConsumer>);
+
+    impl InternalComputationConsumer for ObservedCountConsumer {
+        fn consume(&self, activation: InternalConsumerActivation) -> InternalConsumerFuture {
+            let record = Arc::clone(&self.0);
+            *record.ready_observation.lock().unwrap() = Some(activation.ready.clone());
+            let (mut stream, source) = activation.into_parts();
+            Box::pin(async move {
+                assert_eq!(
+                    stream.carrier(),
+                    crate::api::ResultRowCarrier::relayed(RootOutputKind::CountOnly, None).unwrap()
+                );
+                let delivery = stream
+                    .next()
+                    .await?
+                    .expect("internal root has its original End");
+                let InternalResultDelivery::End(end) = delivery else {
+                    panic!("count-only root cannot deliver a data segment")
+                };
+                assert_eq!(end.end().output_rows, INTERNAL_ROWS);
+                let decoded = end.complete().await?;
+                assert_eq!(decoded.activation(), source.activation());
+                assert_eq!(decoded.root(), source.root());
+                record.decoded.store(true, Ordering::SeqCst);
+                let accepted = source.accept(decoded).await?;
+                *record.accepted.lock().unwrap() = Some(accepted);
+                Ok(())
+            })
+        }
+    }
+
+    fn internal_count_request(
+        attempts: impl NativeAttemptPreparationPort,
+    ) -> QueryExecutionRequest {
+        internal_count_request_with_recovery(attempts, RecoveryMode::NoRecovery, None)
+    }
+
+    fn internal_count_request_with_recovery(
+        attempts: impl NativeAttemptPreparationPort,
+        recovery: RecoveryMode,
+        replacements: Option<Arc<dyn super::super::super::ReplacementQualificationEffectPort>>,
+    ) -> QueryExecutionRequest {
+        let plan = crate::completed_plan_fixture::completed_values_plan_blocking(fixture_version());
+        let candidate = crate::preparation::CompletedPhysicalPlanCandidate::for_program(
+            plan.candidate()
+                .plan()
+                .as_ref()
+                .clone()
+                .with_root_output(RootOutputContract::new(
+                    RootProfileId::V1,
+                    FrozenRootOutput::CountOnly,
+                ))
+                .unwrap(),
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let output = OutputContract::from_completed_candidate(
+            crate::api::QueryExecutionKind::Read,
+            &candidate,
+        )
+        .unwrap();
+        let description = FrozenExecutionDescription::for_completed_plan(
+            crate::api::QueryExecutionKind::Read,
+            candidate,
+            Vec::new(),
+            output,
+            novarocks_coordination_contract::ExecutionEffect::None,
+            recovery,
+            Vec::new(),
+            FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
+            ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
+        )
+        .unwrap()
+        .into_internal_computation()
+        .unwrap();
+        QueryExecutionRequest::bind_native(
+            description,
+            PermanentlyBackpressuredAbortEffectPort::shared(),
+            replacements,
+            attempts,
+        )
+    }
+
+    struct CountEndPort;
+
+    impl crate::api::BoundedRootReadPort for CountEndPort {
+        fn read(
+            &self,
+            request: RootResultRead,
+            guard: novarocks_workload_control::ResultWindowAlias,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            crate::api::RetainedRootReply,
+                            super::super::super::RootResultFetchFailure,
+                        >,
+                    > + Send,
+            >,
+        > {
+            Box::pin(async move {
+                assert_eq!(request.kind(), RootOutputKind::CountOnly);
+                let outcome = match request.wanted() {
+                    Some(sequence) => {
+                        assert_eq!(sequence, std::num::NonZeroU64::MIN);
+                        RootReadOutcome::End(RootResultEnd {
+                            sequence,
+                            output_rows: INTERNAL_ROWS,
+                        })
+                    }
+                    None => RootReadOutcome::AckOnly,
+                };
+                crate::api::RetainedRootReply::try_new(
+                    RootReadResponse::Reply(RootResultReply {
+                        root_task: request.root_task(),
+                        profile: request.profile(),
+                        kind: request.kind(),
+                        accepted_consumed: request.consumed(),
+                        outcome,
+                    }),
+                    guard,
+                    64 * 1024,
+                )
+                .map_err(|error| fixture_root_reply_failure(request.root_task(), error))
+            })
+        }
+
+        fn seal(
+            &self,
+            _: novarocks_execution_contract::root_lifetime::RootReadSealed,
+        ) -> Result<(), QueryExecutionError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct InternalCountPreparation {
+        backend: BackendProcessId,
+        window: TestWindow,
+        signals: Arc<InternalAttemptSignals>,
+    }
+
+    impl NativeAttemptPreparationPort for InternalCountPreparation {
+        fn prepare(
+            &mut self,
+            request: NativeAttemptPreparationRequest,
+        ) -> NativeAttemptPreparationFuture {
+            let ordinal = self.signals.preparations.fetch_add(1, Ordering::SeqCst) + 1;
+            let replacement_failure = if ordinal > 1 {
+                self.signals.replacement_failure.lock().unwrap().clone()
+            } else {
+                None
+            };
+            if let Some(input) = replacement_failure {
+                return Box::pin(async move {
+                    Err(NativeAttemptPreparationError::Runtime(
+                        NativeAttemptPreparationFailure::from_input(input),
+                    ))
+                });
+            }
+            let scheduling = no_scan_scheduling(&request);
+            let owner = InternalCountDormant {
+                backend: self.backend,
+                window: self.window.clone(),
+                signals: Arc::clone(&self.signals),
+            };
+            Box::pin(async move { request.bind(scheduling, owner).map_err(Into::into) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct InternalCountDormant {
+        backend: BackendProcessId,
+        window: TestWindow,
+        signals: Arc<InternalAttemptSignals>,
+    }
+
+    impl DormantNativeAttemptOwner for InternalCountDormant {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            std::slice::from_ref(&self.backend)
+        }
+
+        fn activate<'a>(
+            &'a mut self,
+            schedule: &'a AttemptSchedule,
+            _: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
+            _: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptActivationFuture<'a> {
+            let root = schedule.root();
+            let contexts = schedule.contexts().to_vec();
+            let window = self.window.clone();
+            let signals = Arc::clone(&self.signals);
+            Box::pin(async move {
+                let (statuses, source) =
+                    super::super::super::accepted_root_status_projection_with_control_port(
+                        root,
+                        Arc::new(ClosedSuccessSealPort),
+                    );
+                statuses
+                    .publish_attempt_observation(
+                        running_status(root),
+                        super::super::super::AcceptedAttemptFailure::None,
+                    )
+                    .unwrap();
+                let port: Arc<dyn crate::api::BoundedRootReadPort> =
+                    if signals.native_failure.lock().unwrap().is_some() {
+                        Arc::new(TestRootReadPort {
+                            sent: AtomicBool::new(false),
+                            payload: None,
+                        })
+                    } else {
+                        Arc::new(CountEndPort)
+                    };
+                let binding = super::super::super::RootRelayBinding {
+                    port,
+                    frontier: super::super::super::RootRelayFrontier::new(
+                        root,
+                        RootProfileId::V1,
+                        RootOutputKind::CountOnly,
+                        None,
+                    )
+                    .unwrap(),
+                    window: window.0,
+                    max_wait: Duration::from_millis(10),
+                };
+                Ok(ActivatedNativeAttempt::relayed_rows(
+                    InternalCountActive {
+                        root,
+                        contexts,
+                        statuses,
+                        signals,
+                    },
+                    binding,
+                    source,
+                ))
+            })
+        }
+
+        fn converge<'a>(
+            &'a mut self,
+            _: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptConvergenceFuture<'a> {
+            Box::pin(async {})
+        }
+    }
+
+    struct InternalCountActive {
+        root: novarocks_execution_contract::TaskIdentity,
+        contexts: Vec<QueryContextRef>,
+        statuses: super::super::super::AcceptedRootStatusSender,
+        signals: Arc<InternalAttemptSignals>,
+    }
+
+    impl fmt::Debug for InternalCountActive {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("InternalCountActive")
+                .field("root", &self.root)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl Drop for InternalCountActive {
+        fn drop(&mut self) {
+            self.signals.active_dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl ActiveNativeAttemptOwner for InternalCountActive {
+        fn run<'a>(
+            &'a mut self,
+            drive: &'a NativeAttemptDrive,
+            cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptRunFuture<'a> {
+            Box::pin(async move {
+                let mut admissions = SuccessfulCompletionActiveOwner {
+                    contexts: self.contexts.clone(),
+                };
+                assert!(matches!(
+                    admissions.run(drive, cancellation).await,
+                    NativeAttemptTerminal::Completed
+                ));
+                self.signals.run_entered.store(true, Ordering::SeqCst);
+                let failure = self.signals.native_failure.lock().unwrap().clone();
+                if let Some(input) = failure {
+                    self.signals.run_returned.store(true, Ordering::SeqCst);
+                    return NativeAttemptTerminal::Failed(
+                        NativeAttemptPreparationFailure::from_input(input),
+                    );
+                }
+                let finished = TaskStatus::try_new(
+                    self.root,
+                    TaskStatusVersion::new(2).unwrap(),
+                    TaskState::Finished,
+                    None,
+                    TaskOutputFacts::new(true),
+                )
+                .unwrap();
+                self.statuses
+                    .publish_attempt_observation(
+                        finished,
+                        super::super::super::AcceptedAttemptFailure::None,
+                    )
+                    .unwrap();
+                self.signals.release_run.notified().await;
+                self.signals.run_returned.store(true, Ordering::SeqCst);
+                NativeAttemptTerminal::Completed
+            })
+        }
+
+        fn converge<'a>(
+            &'a mut self,
+            _: NativeActiveConvergenceRequest,
+        ) -> NativeActiveAttemptConvergenceFuture<'a> {
+            Box::pin(async move {
+                self.signals.cleanup_entered.store(true, Ordering::SeqCst);
+                self.signals.release_cleanup.notified().await;
+                self.signals.cleanup_completed.store(true, Ordering::SeqCst);
+                Ok(NativeActiveConvergenceClosure::Evidence(
+                    NativeAttemptConvergence::all_workers_stopped_and_contexts_fenced(),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_internal_consumer_returns_ready_before_native_run_and_cleanup() {
+        let (control, root) = governance();
+        let scope = root.owner.scope();
+        let window = scope
+            .result_capacity()
+            .unwrap()
+            .try_acquire(
+                &scope,
+                novarocks_workload_control::ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let signals = Arc::new(InternalAttemptSignals::default());
+        let consumer = Arc::new(CheckedCountConsumer::default());
+        let request = internal_count_request(InternalCountPreparation {
+            backend: BackendProcessId::new_v7(),
+            window: TestWindow(window.retain_alias()),
+            signals: Arc::clone(&signals),
+        })
+        .with_internal_consumer(Arc::new(ObservedCountConsumer(Arc::clone(&consumer))))
+        .unwrap();
+        drop(window);
+        let cut = MonotonicInstant::from_origin(Duration::from_secs(91));
+        let config = supervisor_config();
+        let (mut supervisor, client) = LogicalExecutionSupervisor::with_clock(
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            QueryProcessNamespace::new(0x6e),
+            FrontendProcessId::new_v7(),
+            config,
+            Arc::new(FixedComputationClock(cut)),
+        );
+        let mut handle =
+            tokio::time::timeout(Duration::from_secs(5), client.start(request, root.owner))
+                .await
+                .expect("internal readiness must not wait for held Native work")
+                .unwrap();
+        let token = *handle
+            .ready_token()
+            .expect("internal execution returns its accepted cut");
+        assert!(handle.take_output().is_none());
+        assert_eq!(token.cut(), cut);
+        assert_eq!(
+            token.diagnostic_deadline(),
+            cut.saturating_add(config.diagnostic_timeout)
+        );
+        assert_eq!(
+            token.convergence_deadline(),
+            cut.saturating_add(config.remote_cleanup_timeout)
+        );
+        assert_eq!(token.end().output_rows, INTERNAL_ROWS);
+        assert!(consumer.decoded.load(Ordering::SeqCst));
+        assert!(signals.run_entered.load(Ordering::SeqCst));
+        assert!(!signals.run_returned.load(Ordering::SeqCst));
+        assert!(!signals.cleanup_completed.load(Ordering::SeqCst));
+        assert!(!signals.active_dropped.load(Ordering::SeqCst));
+        assert_eq!(supervisor.registry.active_native_custody_count(), 1);
+
+        handle.request_cancel().unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(handle.ready_token(), Some(&token));
+        assert_eq!(
+            consumer
+                .ready_observation
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("the registered consumer retains the actor's actual readiness observer")
+                .borrow()
+                .as_ref(),
+            Some(&Ok(token))
+        );
+        assert!(!signals.cleanup_completed.load(Ordering::SeqCst));
+        assert!(!signals.active_dropped.load(Ordering::SeqCst));
+        signals.release_run.notify_one();
+        signals.release_cleanup.notify_one();
+        drop(handle);
+        root.business.release();
+        supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        acknowledge_all_control(&control);
+        tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
+            .await
+            .unwrap();
+        assert_eq!(*consumer.accepted.lock().unwrap(), Some(token));
+        assert!(signals.cleanup_entered.load(Ordering::SeqCst));
+        assert!(signals.cleanup_completed.load(Ordering::SeqCst));
+        assert!(signals.active_dropped.load(Ordering::SeqCst));
+        assert_eq!(supervisor.registry.active_native_custody_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn no_recovery_native_failure_preserves_original_input_before_cleanup() {
+        let (control, root) = governance();
+        let scope = root.owner.scope();
+        let window = scope
+            .result_capacity()
+            .unwrap()
+            .try_acquire(
+                &scope,
+                novarocks_workload_control::ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let expected = fixture_execution_input("injected Native failure before internal End");
+        let signals = Arc::new(InternalAttemptSignals::default());
+        *signals.native_failure.lock().unwrap() = Some(expected.clone());
+        let consumer = Arc::new(CheckedCountConsumer::default());
+        let request = internal_count_request(InternalCountPreparation {
+            backend: BackendProcessId::new_v7(),
+            window: TestWindow(window.retain_alias()),
+            signals: Arc::clone(&signals),
+        })
+        .with_internal_consumer(Arc::new(ObservedCountConsumer(Arc::clone(&consumer))))
+        .unwrap();
+        drop(window);
+        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            QueryProcessNamespace::new(0x70),
+            FrontendProcessId::new_v7(),
+            supervisor_config(),
+        );
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), client.start(request, root.owner))
+                .await
+                .expect("the selected Native failure must be delivered while cleanup is held");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a failed NoRecovery computation cannot return a ready handle"),
+        };
+        assert_eq!(error.execution_failure(), Some(&expected));
+        assert!(signals.run_returned.load(Ordering::SeqCst));
+        assert!(!consumer.decoded.load(Ordering::SeqCst));
+        assert!(consumer.accepted.lock().unwrap().is_none());
+        assert!(!signals.cleanup_completed.load(Ordering::SeqCst));
+        assert!(!signals.active_dropped.load(Ordering::SeqCst));
+        assert_eq!(supervisor.registry.active_native_custody_count(), 1);
+
+        signals.release_cleanup.notify_one();
+        root.business.release();
+        supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        acknowledge_all_control(&control);
+        tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
+            .await
+            .unwrap();
+        assert!(signals.cleanup_completed.load(Ordering::SeqCst));
+        assert!(signals.active_dropped.load(Ordering::SeqCst));
+        assert_eq!(supervisor.registry.active_native_custody_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_replacement_preparation_failure_keeps_its_actual_source() {
+        use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureReason};
+
+        let (control, root) = governance();
+        let scope = root.owner.scope();
+        let window = scope
+            .result_capacity()
+            .unwrap()
+            .try_acquire(
+                &scope,
+                novarocks_workload_control::ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let backend = BackendProcessId::new_v7();
+        let original = ExecutionFailureInput::new(
+            QueryFailureReason::BackendLost.failure_fact(),
+            SafeDetail::truncating("injected first-attempt backend loss"),
+            ExecutionFailureSite::Backend { process: backend },
+        );
+        assert_eq!(
+            original.attempt_class(),
+            AttemptFailureClass::RecoverableInfrastructure
+        );
+        let replacement = ExecutionFailureInput::new(
+            FailureFact::new(
+                FailureClass::Unsupported,
+                FailureReason::new(
+                    std::num::NonZeroU16::MAX,
+                    std::num::NonZeroU16::new(2).unwrap(),
+                ),
+            ),
+            SafeDetail::truncating("injected Unsupported replacement preparation"),
+            ExecutionFailureSite::Coordinator,
+        );
+        let signals = Arc::new(InternalAttemptSignals::default());
+        *signals.native_failure.lock().unwrap() = Some(original.clone());
+        *signals.replacement_failure.lock().unwrap() = Some(replacement.clone());
+        let consumer = Arc::new(CheckedCountConsumer::default());
+        let request = internal_count_request_with_recovery(
+            InternalCountPreparation {
+                backend,
+                window: TestWindow(window.retain_alias()),
+                signals: Arc::clone(&signals),
+            },
+            RecoveryMode::RestartAttemptBeforeVisibility,
+            Some(Arc::new(ImmediateReplacementPort::default())),
+        )
+        .with_internal_consumer(Arc::new(ObservedCountConsumer(Arc::clone(&consumer))))
+        .unwrap();
+        drop(window);
+        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            QueryProcessNamespace::new(0x71),
+            FrontendProcessId::new_v7(),
+            supervisor_config(),
+        );
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), client.start(request, root.owner))
+                .await
+                .expect("replacement failure must be delivered while prior cleanup is held");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("failed replacement preparation cannot produce internal Ready"),
+        };
+        assert_eq!(signals.preparations.load(Ordering::SeqCst), 2);
+        assert_eq!(error.execution_failure(), Some(&replacement));
+        assert_ne!(error.execution_failure(), Some(&original));
+        assert!(!signals.cleanup_completed.load(Ordering::SeqCst));
+        assert!(!signals.active_dropped.load(Ordering::SeqCst));
+
+        signals.release_cleanup.notify_one();
+        root.business.release();
+        let shutdown = supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await;
+        let Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)) = shutdown else {
+            panic!("replacement preparation failure must retain its existing shutdown receipt");
+        };
+        assert_eq!(error.execution_failure(), Some(&replacement));
+        acknowledge_all_control(&control);
+        tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
+            .await
+            .unwrap();
+        assert!(signals.cleanup_completed.load(Ordering::SeqCst));
+        assert!(signals.active_dropped.load(Ordering::SeqCst));
+        assert!(consumer.accepted.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn internal_registration_errors_refuse_before_native_open() {
+        let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
+            Handle::current(),
+            Arc::new(RecordingRejectedOpen {
+                opened: Arc::clone(&opened),
+            }),
+            QueryProcessNamespace::new(0x6f),
+            FrontendProcessId::new_v7(),
+            supervisor_config(),
+        );
+        let consumer: Arc<dyn InternalComputationConsumer> = Arc::new(ObservedCountConsumer(
+            Arc::new(CheckedCountConsumer::default()),
+        ));
+        let wrong_boundary =
+            completion_request(UnreachablePreparationPort).with_internal_consumer(consumer);
+        assert!(matches!(wrong_boundary, Err(ref error)
+            if error.kind() == QueryExecutionErrorKind::InvalidRequest));
+        let (control, root) = governance();
+        let scope = root.owner.scope();
+        let missing_registration = client
+            .start(
+                internal_count_request(UnreachablePreparationPort),
+                root.owner,
+            )
+            .await;
+        assert!(matches!(missing_registration, Err(ref error)
+            if error.kind() == QueryExecutionErrorKind::InvalidRequest));
+        assert!(opened.lock().unwrap().is_empty());
+        root.business.release();
+        supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await
+            .unwrap();
+        acknowledge_all_control(&control);
+        scope.wait_released().await;
+    }
+
+    use super::super::super::{
+        LogicalExecutionActorError, ReplacementQualificationEffectAdmission,
+        ReplacementQualificationEffectPort, ReplacementQualificationEffectReservation,
+        ReplacementQualificationEffectSubmission, ReplacementQualificationFailure,
+        ReplacementQualificationRequest,
+    };
+
+    #[derive(Debug)]
+    struct QualificationReplacementPreparation {
+        inner: InternalCountPreparation,
+        replacement_backend: BackendProcessId,
+        prepared: usize,
+    }
+
+    impl NativeAttemptPreparationPort for QualificationReplacementPreparation {
+        fn prepare(
+            &mut self,
+            request: NativeAttemptPreparationRequest,
+        ) -> NativeAttemptPreparationFuture {
+            self.prepared += 1;
+            if self.prepared > 1 {
+                let crate::api::NativeAttemptTopologyRequirement::ExcludeProcess(excluded) =
+                    request.topology_requirement()
+                else {
+                    panic!("BackendLost replacement must exclude its failed process");
+                };
+                assert_eq!(excluded, self.inner.backend);
+                assert_ne!(self.replacement_backend, excluded);
+                self.inner.backend = self.replacement_backend;
+            }
+            self.inner.prepare(request)
+        }
+    }
+
+    #[derive(Debug)]
+    struct RefusingQualificationPort {
+        failure: ReplacementQualificationFailure,
+        capacity: watch::Sender<u64>,
+        submissions: Arc<AtomicU64>,
+    }
+
+    #[derive(Debug)]
+    struct RefusingQualificationReservation {
+        failure: ReplacementQualificationFailure,
+        submissions: Arc<AtomicU64>,
+    }
+
+    impl ReplacementQualificationEffectReservation for RefusingQualificationReservation {
+        fn submit(self: Box<Self>, submission: ReplacementQualificationEffectSubmission) {
+            assert!(!submission.request().failed_contexts().is_empty());
+            assert!(!submission.request().replacement_contexts().is_empty());
+            self.submissions.fetch_add(1, Ordering::SeqCst);
+            submission.refused(self.failure);
+        }
+    }
+
+    impl ReplacementQualificationEffectPort for RefusingQualificationPort {
+        fn subscribe_capacity(&self) -> watch::Receiver<u64> {
+            self.capacity.subscribe()
+        }
+
+        fn try_reserve(
+            &self,
+            _: &ReplacementQualificationRequest,
+        ) -> ReplacementQualificationEffectAdmission {
+            ReplacementQualificationEffectAdmission::Admitted(Box::new(
+                RefusingQualificationReservation {
+                    failure: self.failure,
+                    submissions: Arc::clone(&self.submissions),
+                },
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_qualification_failure_preserves_actor_fact_before_cleanup() {
+        for (namespace, qualification_failure) in [
+            (0x72, ReplacementQualificationFailure::Rejected),
+            (0x73, ReplacementQualificationFailure::Expired),
+        ] {
+            let (control, root) = governance();
+            let scope = root.owner.scope();
+            let window = scope
+                .result_capacity()
+                .unwrap()
+                .try_acquire(
+                    &scope,
+                    novarocks_workload_control::ResultWindowClass::Internal,
+                )
+                .unwrap();
+            // Freeze both process identities before the first failure. The
+            // replacement must never reuse the process excluded by BackendLost.
+            let first_backend = BackendProcessId::new_v7();
+            let replacement_backend = BackendProcessId::new_v7();
+            let original = ExecutionFailureInput::new(
+                QueryFailureReason::BackendLost.failure_fact(),
+                SafeDetail::truncating("injected Native failure before qualification"),
+                ExecutionFailureSite::Backend {
+                    process: first_backend,
+                },
+            );
+            assert_eq!(
+                original.attempt_class(),
+                AttemptFailureClass::RecoverableInfrastructure
+            );
+            let expected = actor_error(LogicalExecutionActorError::ReplacementQualificationFailed(
+                qualification_failure,
+            ));
+            assert_ne!(expected.execution_failure(), Some(&original));
+            let signals = Arc::new(InternalAttemptSignals::default());
+            *signals.native_failure.lock().unwrap() = Some(original.clone());
+            let consumer = Arc::new(CheckedCountConsumer::default());
+            let (capacity, _) = watch::channel(1);
+            let submissions = Arc::new(AtomicU64::new(0));
+            let request = internal_count_request_with_recovery(
+                QualificationReplacementPreparation {
+                    inner: InternalCountPreparation {
+                        backend: first_backend,
+                        window: TestWindow(window.retain_alias()),
+                        signals: Arc::clone(&signals),
+                    },
+                    replacement_backend,
+                    prepared: 0,
+                },
+                RecoveryMode::RestartAttemptBeforeVisibility,
+                Some(Arc::new(RefusingQualificationPort {
+                    failure: qualification_failure,
+                    capacity,
+                    submissions: Arc::clone(&submissions),
+                })),
+            )
+            .with_internal_consumer(Arc::new(ObservedCountConsumer(Arc::clone(&consumer))))
+            .unwrap();
+            drop(window);
+            let (mut supervisor, client) = LogicalExecutionSupervisor::new(
+                Handle::current(),
+                Arc::new(BindingNativePort),
+                QueryProcessNamespace::new(namespace),
+                FrontendProcessId::new_v7(),
+                supervisor_config(),
+            );
+            let result =
+                tokio::time::timeout(Duration::from_secs(2), client.start(request, root.owner))
+                    .await
+                    .expect("qualification failure must be delivered while prior cleanup is held");
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("refused qualification cannot produce internal Ready"),
+            };
+            assert_eq!(signals.preparations.load(Ordering::SeqCst), 2);
+            assert_eq!(submissions.load(Ordering::SeqCst), 1);
+            assert_eq!(error.execution_failure(), expected.execution_failure());
+            assert_ne!(error.execution_failure(), Some(&original));
+            assert!(signals.run_returned.load(Ordering::SeqCst));
+            assert!(!consumer.decoded.load(Ordering::SeqCst));
+            assert!(consumer.accepted.lock().unwrap().is_none());
+            assert!(!signals.cleanup_completed.load(Ordering::SeqCst));
+            assert!(!signals.active_dropped.load(Ordering::SeqCst));
+            assert_eq!(supervisor.registry.active_native_custody_count(), 1);
+
+            signals.release_cleanup.notify_one();
+            root.business.release();
+            let shutdown = supervisor
+                .shutdown_until(Instant::now() + Duration::from_secs(5))
+                .await;
+            let Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)) = shutdown
+            else {
+                panic!("qualification failure must retain its existing shutdown receipt");
+            };
+            assert_eq!(error.execution_failure(), expected.execution_failure());
+            acknowledge_all_control(&control);
+            tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
+                .await
+                .unwrap();
+            assert!(signals.cleanup_entered.load(Ordering::SeqCst));
+            assert!(signals.cleanup_completed.load(Ordering::SeqCst));
+            assert!(signals.active_dropped.load(Ordering::SeqCst));
+            assert_eq!(supervisor.registry.active_native_custody_count(), 0);
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum RegisteredConsumerOutcome {
+        Error(ExecutionFailureInput),
+        Panic,
+    }
+
+    #[derive(Debug)]
+    struct FailingRegisteredConsumer {
+        outcome: RegisteredConsumerOutcome,
+        end_seen: Arc<AtomicBool>,
+    }
+
+    impl InternalComputationConsumer for FailingRegisteredConsumer {
+        fn consume(&self, activation: InternalConsumerActivation) -> InternalConsumerFuture {
+            let (mut stream, source) = activation.into_parts();
+            let outcome = self.outcome.clone();
+            let end_seen = Arc::clone(&self.end_seen);
+            Box::pin(async move {
+                // Keep both source and original End owned until the actual
+                // future outcome unwinds them. No CPU receipt or Ready is sent.
+                let _source = source;
+                let delivery = stream
+                    .next()
+                    .await?
+                    .expect("healthy Native root must deliver its original End");
+                let InternalResultDelivery::End(end) = delivery else {
+                    panic!("count-only root cannot deliver a data segment");
+                };
+                assert_eq!(end.end().output_rows, INTERNAL_ROWS);
+                end_seen.store(true, Ordering::SeqCst);
+                match outcome {
+                    RegisteredConsumerOutcome::Error(input) => {
+                        Err(QueryExecutionError::from_execution(input))
+                    }
+                    RegisteredConsumerOutcome::Panic => {
+                        panic!("injected registered computation consumer panic")
+                    }
+                }
+            })
+        }
+    }
+
+    async fn assert_registered_consumer_failure_before_cleanup(
+        outcome: RegisteredConsumerOutcome,
+        expected: ExecutionFailureInput,
+        namespace: u64,
+    ) {
+        let (control, root) = governance();
+        let scope = root.owner.scope();
+        let window = scope
+            .result_capacity()
+            .unwrap()
+            .try_acquire(
+                &scope,
+                novarocks_workload_control::ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let signals = Arc::new(InternalAttemptSignals::default());
+        let end_seen = Arc::new(AtomicBool::new(false));
+        let request = internal_count_request(InternalCountPreparation {
+            backend: BackendProcessId::new_v7(),
+            window: TestWindow(window.retain_alias()),
+            signals: Arc::clone(&signals),
+        })
+        .with_internal_consumer(Arc::new(FailingRegisteredConsumer {
+            outcome,
+            end_seen: Arc::clone(&end_seen),
+        }))
+        .unwrap();
+        drop(window);
+        let (mut supervisor, client) = LogicalExecutionSupervisor::with_clock(
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            QueryProcessNamespace::new(namespace),
+            FrontendProcessId::new_v7(),
+            supervisor_config(),
+            Arc::new(FixedComputationClock(MonotonicInstant::from_origin(
+                Duration::from_secs(92),
+            ))),
+        );
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), client.start(request, root.owner))
+                .await
+                .expect("actual consumer failure must be delivered while Native cleanup is held");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("failed registered computation consumer cannot produce Ready"),
+        };
+        assert_eq!(error.execution_failure(), Some(&expected));
+        assert!(end_seen.load(Ordering::SeqCst));
+        assert_eq!(signals.preparations.load(Ordering::SeqCst), 1);
+        assert!(signals.run_entered.load(Ordering::SeqCst));
+        assert!(!signals.run_returned.load(Ordering::SeqCst));
+        assert!(!signals.cleanup_completed.load(Ordering::SeqCst));
+        assert!(!signals.active_dropped.load(Ordering::SeqCst));
+        assert_eq!(supervisor.registry.active_native_custody_count(), 1);
+
+        signals.release_cleanup.notify_one();
+        root.business.release();
+        supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        acknowledge_all_control(&control);
+        tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
+            .await
+            .unwrap();
+        assert!(signals.cleanup_entered.load(Ordering::SeqCst));
+        assert!(signals.cleanup_completed.load(Ordering::SeqCst));
+        assert!(signals.active_dropped.load(Ordering::SeqCst));
+        assert_eq!(supervisor.registry.active_native_custody_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn registered_consumer_error_preserves_original_input_before_cleanup() {
+        let expected = fixture_execution_input("injected registered computation consumer failure");
+        assert_registered_consumer_failure_before_cleanup(
+            RegisteredConsumerOutcome::Error(expected.clone()),
+            expected,
+            0x74,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn registered_consumer_panic_keeps_its_own_typed_author_before_cleanup() {
+        let expected = ExecutionFailureInput::new(
+            QueryFailureReason::InternalConsumerPanicked.failure_fact(),
+            SafeDetail::truncating("internal computation consumer panicked"),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_ne!(
+            expected.fact(),
+            QueryFailureReason::NativeFuturePanicked.failure_fact()
+        );
+        assert_registered_consumer_failure_before_cleanup(
+            RegisteredConsumerOutcome::Panic,
+            expected,
+            0x75,
+        )
+        .await;
+    }
+
+    #[derive(Debug, Default)]
+    struct HeldInternalActivationSignals {
+        entered: AtomicBool,
+        returned: AtomicBool,
+        dormant_dropped: AtomicBool,
+        release: tokio::sync::Notify,
+    }
+
+    #[derive(Debug)]
+    struct HeldInternalActivationPreparation {
+        backend: BackendProcessId,
+        window: TestWindow,
+        native: Arc<InternalAttemptSignals>,
+        activation: Arc<HeldInternalActivationSignals>,
+        failure: Option<ExecutionFailureInput>,
+    }
+
+    impl NativeAttemptPreparationPort for HeldInternalActivationPreparation {
+        fn prepare(
+            &mut self,
+            request: NativeAttemptPreparationRequest,
+        ) -> NativeAttemptPreparationFuture {
+            let scheduling = no_scan_scheduling(&request);
+            let dormant = HeldInternalActivationDormant {
+                inner: InternalCountDormant {
+                    backend: self.backend,
+                    window: self.window.clone(),
+                    signals: Arc::clone(&self.native),
+                },
+                activation: Arc::clone(&self.activation),
+                failure: self.failure.clone(),
+            };
+            Box::pin(async move { request.bind(scheduling, dormant).map_err(Into::into) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct HeldInternalActivationDormant {
+        inner: InternalCountDormant,
+        activation: Arc<HeldInternalActivationSignals>,
+        failure: Option<ExecutionFailureInput>,
+    }
+
+    impl Drop for HeldInternalActivationDormant {
+        fn drop(&mut self) {
+            self.activation
+                .dormant_dropped
+                .store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl DormantNativeAttemptOwner for HeldInternalActivationDormant {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            self.inner.eligible_backends()
+        }
+
+        fn activate<'a>(
+            &'a mut self,
+            schedule: &'a AttemptSchedule,
+            admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
+            cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptActivationFuture<'a> {
+            let signals = Arc::clone(&self.activation);
+            let failure = self.failure.clone();
+            let activation = self.inner.activate(schedule, admissions, cancellation);
+            Box::pin(async move {
+                signals.entered.store(true, Ordering::SeqCst);
+                signals.release.notified().await;
+                let result = if let Some(input) = failure {
+                    Err(NativeAttemptActivationFailure::new(
+                        NativeAttemptPreparationFailure::from_input(input),
+                    ))
+                } else {
+                    activation.await
+                };
+                signals.returned.store(true, Ordering::SeqCst);
+                result
+            })
+        }
+
+        fn converge<'a>(
+            &'a mut self,
+            cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptConvergenceFuture<'a> {
+            let native = Arc::clone(&self.inner.signals);
+            let convergence = self.inner.converge(cancellation);
+            Box::pin(async move {
+                native.cleanup_entered.store(true, Ordering::SeqCst);
+                native.release_cleanup.notified().await;
+                convergence.await;
+                native.cleanup_completed.store(true, Ordering::SeqCst);
+            })
+        }
+    }
+
+    async fn assert_internal_cancel_survives_held_initial_activation(
+        activation_failure: Option<ExecutionFailureInput>,
+        namespace: u64,
+    ) {
+        let (control, root) = governance();
+        let scope = root.owner.scope();
+        let requester = root.owner.cancellation_requester();
+        let window = scope
+            .result_capacity()
+            .unwrap()
+            .try_acquire(
+                &scope,
+                novarocks_workload_control::ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let native = Arc::new(InternalAttemptSignals::default());
+        let activation = Arc::new(HeldInternalActivationSignals::default());
+        let consumer = Arc::new(CheckedCountConsumer::default());
+        let request = internal_count_request(HeldInternalActivationPreparation {
+            backend: BackendProcessId::new_v7(),
+            window: TestWindow(window.retain_alias()),
+            native: Arc::clone(&native),
+            activation: Arc::clone(&activation),
+            failure: activation_failure.clone(),
+        })
+        .with_internal_consumer(Arc::new(ObservedCountConsumer(Arc::clone(&consumer))))
+        .unwrap();
+        drop(window);
+        let (mut supervisor, client) = LogicalExecutionSupervisor::with_clock(
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            QueryProcessNamespace::new(namespace),
+            FrontendProcessId::new_v7(),
+            supervisor_config(),
+            Arc::new(FixedComputationClock(MonotonicInstant::from_origin(
+                Duration::from_secs(93),
+            ))),
+        );
+        let start = client.start(request, root.owner);
+        wait_preparation_exit_fact(&activation.entered)
+            .await
+            .unwrap();
+        requester.request(CancellationReason::Requested).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), start)
+            .await
+            .expect("actor cancellation must not wait for the original Native activation future");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled internal initialization cannot return Ready"),
+        };
+        let expected = ExecutionFailureInput::new(
+            QueryFailureReason::Cancelled.failure_fact(),
+            SafeDetail::truncating("logical execution was cancelled before success EOF"),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_eq!(error.execution_failure(), Some(&expected));
+        if let Some(input) = activation_failure.as_ref() {
+            assert_ne!(error.execution_failure(), Some(input));
+        }
+        // A delivered terminal verdict cannot abandon the original future or
+        // turn an observation timeout into actual Native owner exit.
+        assert!(!activation.returned.load(Ordering::SeqCst));
+        assert!(!activation.dormant_dropped.load(Ordering::SeqCst));
+        assert!(!native.cleanup_entered.load(Ordering::SeqCst));
+        assert!(!native.cleanup_completed.load(Ordering::SeqCst));
+        assert!(consumer.accepted.lock().unwrap().is_none());
+        assert_ne!(control.snapshot().root_responsibilities, 0);
+
+        // This actual Native outcome occurs only after cancellation was
+        // accepted and delivered. Its typed Err must remain a later outcome.
+        activation.release.notify_one();
+        wait_preparation_exit_fact(&activation.returned)
+            .await
+            .unwrap();
+        wait_preparation_exit_fact(&native.cleanup_entered)
+            .await
+            .unwrap();
+        assert!(!native.cleanup_completed.load(Ordering::SeqCst));
+        assert!(!native.run_entered.load(Ordering::SeqCst));
+        assert_eq!(error.execution_failure(), Some(&expected));
+        native.release_cleanup.notify_one();
+        root.business.release();
+        supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        acknowledge_all_control(&control);
+        tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
+            .await
+            .unwrap();
+        assert!(activation.dormant_dropped.load(Ordering::SeqCst));
+        assert!(native.cleanup_completed.load(Ordering::SeqCst));
+        if activation_failure.is_none() {
+            assert!(native.active_dropped.load(Ordering::SeqCst));
+        }
+        assert!(consumer.accepted.lock().unwrap().is_none());
+        assert_eq!(supervisor.registry.active_native_custody_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn internal_actor_cancel_returns_before_held_initial_native_activation_exits() {
+        assert_internal_cancel_survives_held_initial_activation(None, 0x76).await;
+    }
+
+    #[tokio::test]
+    async fn internal_initial_activation_error_cannot_replace_accepted_actor_cancel() {
+        assert_internal_cancel_survives_held_initial_activation(
+            Some(fixture_execution_input(
+                "injected Native activation error after accepted cancellation",
+            )),
+            0x77,
+        )
+        .await;
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum NativeFactoryPanicPhase {
+        Activate,
+        Run,
+    }
+
+    #[derive(Debug)]
+    struct FactoryPanickingPreparation {
+        inner: HeldInternalActivationPreparation,
+        phase: NativeFactoryPanicPhase,
+        factory_called: Arc<AtomicBool>,
+    }
+
+    impl NativeAttemptPreparationPort for FactoryPanickingPreparation {
+        fn prepare(
+            &mut self,
+            request: NativeAttemptPreparationRequest,
+        ) -> NativeAttemptPreparationFuture {
+            let scheduling = no_scan_scheduling(&request);
+            let owner = FactoryPanickingDormant {
+                inner: HeldInternalActivationDormant {
+                    inner: InternalCountDormant {
+                        backend: self.inner.backend,
+                        window: self.inner.window.clone(),
+                        signals: Arc::clone(&self.inner.native),
+                    },
+                    activation: Arc::clone(&self.inner.activation),
+                    failure: None,
+                },
+                phase: self.phase,
+                factory_called: Arc::clone(&self.factory_called),
+            };
+            Box::pin(async move { request.bind(scheduling, owner).map_err(Into::into) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct FactoryPanickingDormant {
+        inner: HeldInternalActivationDormant,
+        phase: NativeFactoryPanicPhase,
+        factory_called: Arc<AtomicBool>,
+    }
+
+    impl DormantNativeAttemptOwner for FactoryPanickingDormant {
+        fn eligible_backends(&self) -> &[BackendProcessId] {
+            self.inner.eligible_backends()
+        }
+
+        fn activate<'a>(
+            &'a mut self,
+            schedule: &'a AttemptSchedule,
+            admissions: Option<Box<[ReplacementWorkerAdmissionEvidence]>>,
+            cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptActivationFuture<'a> {
+            if self.phase == NativeFactoryPanicPhase::Activate {
+                self.factory_called.store(true, Ordering::SeqCst);
+                // Deliberately before returning any future to the caller.
+                panic!("injected synchronous Native activation factory panic");
+            }
+            let activation = self.inner.activate(schedule, admissions, cancellation);
+            let factory_called = Arc::clone(&self.factory_called);
+            Box::pin(async move {
+                let (owner, rows) = activation.await?.into_parts();
+                let rows = rows.expect("healthy internal fixture retains its exact root runtime");
+                Ok(ActivatedNativeAttempt::relayed_rows(
+                    FactoryPanickingActive {
+                        inner: owner,
+                        factory_called,
+                    },
+                    rows.binding,
+                    rows.statuses,
+                ))
+            })
+        }
+
+        fn converge<'a>(
+            &'a mut self,
+            cancellation: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptConvergenceFuture<'a> {
+            self.inner.converge(cancellation)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FactoryPanickingActive {
+        inner: Box<dyn ActiveNativeAttemptOwner>,
+        factory_called: Arc<AtomicBool>,
+    }
+
+    impl ActiveNativeAttemptOwner for FactoryPanickingActive {
+        fn run<'a>(
+            &'a mut self,
+            _: &'a NativeAttemptDrive,
+            _: novarocks_workload_control::CancellationView,
+        ) -> NativeAttemptRunFuture<'a> {
+            self.factory_called.store(true, Ordering::SeqCst);
+            // Deliberately before returning any future to the caller.
+            panic!("injected synchronous Native run factory panic");
+        }
+
+        fn converge<'a>(
+            &'a mut self,
+            request: NativeActiveConvergenceRequest,
+        ) -> NativeActiveAttemptConvergenceFuture<'a> {
+            self.inner.converge(request)
+        }
+    }
+
+    async fn assert_native_factory_panic_retains_original_owner(
+        phase: NativeFactoryPanicPhase,
+        namespace: u64,
+    ) {
+        let (control, root) = governance();
+        let scope = root.owner.scope();
+        let window = scope
+            .result_capacity()
+            .unwrap()
+            .try_acquire(
+                &scope,
+                novarocks_workload_control::ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let native = Arc::new(InternalAttemptSignals::default());
+        let activation = Arc::new(HeldInternalActivationSignals::default());
+        // Run-factory failure needs successful activation, not an activation gate.
+        activation.release.notify_one();
+        let factory_called = Arc::new(AtomicBool::new(false));
+        let consumer = Arc::new(CheckedCountConsumer::default());
+        let request = internal_count_request(FactoryPanickingPreparation {
+            inner: HeldInternalActivationPreparation {
+                backend: BackendProcessId::new_v7(),
+                window: TestWindow(window.retain_alias()),
+                native: Arc::clone(&native),
+                activation: Arc::clone(&activation),
+                failure: None,
+            },
+            phase,
+            factory_called: Arc::clone(&factory_called),
+        })
+        .with_internal_consumer(Arc::new(ObservedCountConsumer(Arc::clone(&consumer))))
+        .unwrap();
+        drop(window);
+        let (mut supervisor, client) = LogicalExecutionSupervisor::with_clock(
+            Handle::current(),
+            Arc::new(BindingNativePort),
+            QueryProcessNamespace::new(namespace),
+            FrontendProcessId::new_v7(),
+            supervisor_config(),
+            Arc::new(FixedComputationClock(MonotonicInstant::from_origin(
+                Duration::from_secs(94),
+            ))),
+        );
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), client.start(request, root.owner))
+                .await
+                .expect("factory panic must become an actor verdict before held cleanup exits");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a Native factory panic cannot produce internal Ready"),
+        };
+        let expected = ExecutionFailureInput::new(
+            QueryFailureReason::NativeFuturePanicked.failure_fact(),
+            SafeDetail::truncating(match phase {
+                NativeFactoryPanicPhase::Activate => "Native attempt activation panicked",
+                NativeFactoryPanicPhase::Run => "Native row attempt run panicked",
+            }),
+            ExecutionFailureSite::Coordinator,
+        );
+        assert_eq!(error.execution_failure(), Some(&expected));
+        assert!(factory_called.load(Ordering::SeqCst));
+        wait_preparation_exit_fact(&native.cleanup_entered)
+            .await
+            .unwrap();
+        assert!(!native.cleanup_completed.load(Ordering::SeqCst));
+        assert!(!native.active_dropped.load(Ordering::SeqCst));
+        assert_ne!(control.snapshot().root_responsibilities, 0);
+        if phase == NativeFactoryPanicPhase::Activate {
+            assert!(!activation.dormant_dropped.load(Ordering::SeqCst));
+        } else {
+            assert_eq!(supervisor.registry.active_native_custody_count(), 1);
+        }
+        assert!(consumer.accepted.lock().unwrap().is_none());
+
+        native.release_cleanup.notify_one();
+        root.business.release();
+        let shutdown = supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(5))
+            .await;
+        if phase == NativeFactoryPanicPhase::Activate {
+            let Err(LogicalExecutionSupervisorShutdownError::SupervisorFailed(error)) = shutdown
+            else {
+                panic!("activation panic retains its existing process-health receipt");
+            };
+            assert_eq!(error.execution_failure(), Some(&expected));
+        } else {
+            shutdown.unwrap();
+        }
+        acknowledge_all_control(&control);
+        tokio::time::timeout(Duration::from_secs(2), scope.wait_released())
+            .await
+            .unwrap();
+        assert!(activation.dormant_dropped.load(Ordering::SeqCst));
+        assert!(native.cleanup_completed.load(Ordering::SeqCst));
+        if phase == NativeFactoryPanicPhase::Run {
+            assert!(native.active_dropped.load(Ordering::SeqCst));
+        }
+        assert_eq!(supervisor.registry.active_native_custody_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn synchronous_native_activation_factory_panic_retains_dormant_owner() {
+        assert_native_factory_panic_retains_original_owner(NativeFactoryPanicPhase::Activate, 0x78)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn synchronous_native_run_factory_panic_retains_active_owner() {
+        assert_native_factory_panic_retains_original_owner(NativeFactoryPanicPhase::Run, 0x79)
+            .await;
+    }
+}

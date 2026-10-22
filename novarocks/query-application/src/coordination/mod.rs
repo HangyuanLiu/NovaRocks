@@ -31,6 +31,7 @@ mod stand_down;
 mod statement_native_residual;
 mod supervisor;
 
+pub(crate) use actor::InternalReadyActorPort;
 pub use actor::*;
 pub use actor_state::*;
 pub use delivery::*;

@@ -248,10 +248,10 @@ pub enum QueryFailureReason {
     TaskLeaseExpired,
     TaskCancelled,
     NativeFuturePanicked,
+    InternalConsumerPanicked,
     PreparationFailed,
     RecoveryPreparationBudgetExceeded,
     LogicalFailureUnspecified,
-    BusinessDecisionUnspecified,
     LogicalOwnerStopped,
 }
 impl FailureProjection for QueryFailureReason {
@@ -272,10 +272,10 @@ impl FailureProjection for QueryFailureReason {
             Self::TaskLeaseExpired => (FailureClass::Control, 12),
             Self::TaskCancelled => (FailureClass::Control, 27),
             Self::NativeFuturePanicked => (FailureClass::Unexpected, 33),
+            Self::InternalConsumerPanicked => (FailureClass::Unexpected, 175),
             Self::PreparationFailed => (FailureClass::Unexpected, 34),
             Self::RecoveryPreparationBudgetExceeded => (FailureClass::Dependency, 151),
             Self::LogicalFailureUnspecified => (FailureClass::Unexpected, 172),
-            Self::BusinessDecisionUnspecified => (FailureClass::Unexpected, 173),
             Self::LogicalOwnerStopped => (FailureClass::Control, 174),
         };
         let reason = FailureReason::new(domain::QUERY, NonZeroU16::new(code).unwrap());

@@ -21,9 +21,12 @@ use novarocks_workload_control::{CancellationReason, WorkCancellationRequester, 
 
 #[cfg(test)]
 use super::NativeExecutionContractError;
-use super::{NativeAttemptPreparationPort, NativeLogicalExecutionSeed};
+use super::{
+    ComputationReadyToken, InternalComputationConsumer, NativeAttemptPreparationPort,
+    NativeLogicalExecutionSeed,
+};
 use crate::coordination::{AbortQueryContextEffectPort, ReplacementQualificationEffectPort};
-use crate::preparation::FrozenExecutionDescription;
+use crate::preparation::{ExecutionFinishBoundary, FrozenExecutionDescription};
 
 /// A product-independent query operation.
 ///
@@ -33,6 +36,7 @@ use crate::preparation::FrozenExecutionDescription;
 pub struct QueryExecutionRequest {
     description: FrozenExecutionDescription,
     native_seed: NativeLogicalExecutionSeed,
+    internal_consumer: Option<Arc<dyn InternalComputationConsumer>>,
 }
 
 impl QueryExecutionRequest {
@@ -63,7 +67,44 @@ impl QueryExecutionRequest {
         Self {
             description,
             native_seed,
+            internal_consumer: None,
         }
+    }
+
+    /// Registers the fixed application consumer for an internal computation.
+    /// The frozen finish boundary determines whether this capability is legal;
+    /// registering a consumer cannot change client EOF or Task completion.
+    pub fn with_internal_consumer(
+        mut self,
+        consumer: Arc<dyn InternalComputationConsumer>,
+    ) -> Result<Self, QueryExecutionError> {
+        if self.description.finish_boundary() != ExecutionFinishBoundary::ComputationReady {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "an internal consumer requires the frozen computation-ready finish boundary",
+            ));
+        }
+        if self.internal_consumer.is_some() {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "an internal computation consumer is already registered",
+            ));
+        }
+        self.internal_consumer = Some(consumer);
+        Ok(self)
+    }
+
+    /// Checks registration before the supervisor may open Native resources.
+    pub(crate) fn validate_internal_consumer(&self) -> Result<(), QueryExecutionError> {
+        let internal =
+            self.description.finish_boundary() == ExecutionFinishBoundary::ComputationReady;
+        if internal != self.internal_consumer.is_some() {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "the frozen finish boundary and internal consumer registration differ",
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -77,6 +118,7 @@ impl QueryExecutionRequest {
         Ok(Self {
             description,
             native_seed,
+            internal_consumer: None,
         })
     }
 
@@ -84,13 +126,19 @@ impl QueryExecutionRequest {
         &self.description
     }
 
-    pub(crate) fn into_parts(self) -> (FrozenExecutionDescription, NativeLogicalExecutionSeed) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        FrozenExecutionDescription,
+        NativeLogicalExecutionSeed,
+        Option<Arc<dyn InternalComputationConsumer>>,
+    ) {
         assert_eq!(
             self.description.plan_identity(),
             self.native_seed.plan(),
             "executable request must retain its atomically issued Native seed"
         );
-        (self.description, self.native_seed)
+        (self.description, self.native_seed, self.internal_consumer)
     }
 }
 
@@ -170,9 +218,61 @@ impl Error for QueryExecutionError {}
 pub type QueryExecutionFuture =
     Pin<Box<dyn Future<Output = Result<ExecutionHandle, QueryExecutionError>> + Send + 'static>>;
 
+/// A single initial execution reserved before statement preparation.
+///
+/// The identity is correlation data; starting still consumes the admitted
+/// Work owner. The private issuer binds this move-only reservation to the
+/// same supervisor that allocated it.
+#[must_use = "a reservation can be consumed by one start or deliberately abandoned"]
+pub struct ReservedExecutionIdentity {
+    execution: novarocks_types::identity::QueryExecutionId,
+    issuer: Arc<()>,
+}
+
+impl fmt::Debug for ReservedExecutionIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReservedExecutionIdentity")
+            .field("execution", &self.execution)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReservedExecutionIdentity {
+    pub const fn execution(&self) -> novarocks_types::identity::QueryExecutionId {
+        self.execution
+    }
+
+    pub(crate) fn issued(
+        execution: novarocks_types::identity::QueryExecutionId,
+        issuer: Arc<()>,
+    ) -> Self {
+        Self { execution, issuer }
+    }
+
+    pub(crate) fn consume(
+        self,
+        issuer: &Arc<()>,
+    ) -> Result<novarocks_types::identity::QueryExecutionId, QueryExecutionError> {
+        if !Arc::ptr_eq(&self.issuer, issuer) {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "execution reservation belongs to a different supervisor",
+            ));
+        }
+        Ok(self.execution)
+    }
+}
+
 /// Crate-private process driver behind the bounded client capability.
 pub(crate) trait QueryExecutionDriver: Send + Sync + 'static {
-    fn start(&self, request: QueryExecutionRequest, owner: WorkOwner) -> QueryExecutionFuture;
+    fn reserve_identity(&self) -> Result<ReservedExecutionIdentity, QueryExecutionError>;
+    fn start(
+        &self,
+        request: QueryExecutionRequest,
+        owner: WorkOwner,
+        reserved: Option<ReservedExecutionIdentity>,
+    ) -> QueryExecutionFuture;
 }
 
 /// Cloneable capability for starting logical executions.
@@ -202,7 +302,20 @@ impl QueryExecutionClient {
     }
 
     pub fn start(&self, request: QueryExecutionRequest, owner: WorkOwner) -> QueryExecutionFuture {
-        self.driver.start(request, owner)
+        self.driver.start(request, owner, None)
+    }
+
+    pub fn reserve_identity(&self) -> Result<ReservedExecutionIdentity, QueryExecutionError> {
+        self.driver.reserve_identity()
+    }
+
+    pub fn start_reserved(
+        &self,
+        request: QueryExecutionRequest,
+        owner: WorkOwner,
+        reserved: ReservedExecutionIdentity,
+    ) -> QueryExecutionFuture {
+        self.driver.start(request, owner, Some(reserved))
     }
 }
 
@@ -243,6 +356,7 @@ impl ExecutionControl for WorkCancellationRequester {
 pub struct ExecutionHandle {
     control: Box<dyn ExecutionControl>,
     output: Option<crate::api::ExecutionOutput>,
+    ready: Option<ComputationReadyToken>,
 }
 
 impl ExecutionHandle {
@@ -250,7 +364,24 @@ impl ExecutionHandle {
         Self {
             control: Box::new(control),
             output: Some(output),
+            ready: None,
         }
+    }
+
+    pub(crate) fn computation_ready(
+        control: impl ExecutionControl,
+        token: ComputationReadyToken,
+    ) -> Self {
+        Self {
+            control: Box::new(control),
+            output: None,
+            ready: Some(token),
+        }
+    }
+
+    /// Observes the accepted computation cut without granting publication rights.
+    pub const fn ready_token(&self) -> Option<&ComputationReadyToken> {
+        self.ready.as_ref()
     }
 
     pub fn request_cancel(&self) -> Result<(), QueryExecutionError> {

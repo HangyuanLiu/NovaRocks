@@ -312,6 +312,7 @@ impl std::error::Error for FrontendApplicationError {
 /// supervisor, Registry, workload control, or decode join handles.
 // Design: ADR-0147 (docs/adr/ADR-0147-process-local-work-governance-separates-responsibility-and-resources.md)
 struct FrontendExecutionRuntimeOwner {
+    clock: Arc<dyn novarocks_coordination_contract::MonotonicClock>,
     connector_blocking_io: ConnectorBlockingIoSupervisor,
     supervisor: LogicalExecutionSupervisor,
     logical_execution_client: QueryExecutionClient,
@@ -470,18 +471,22 @@ impl FrontendExecutionRuntimeOwner {
             "frontend logical execution runtime initialized"
         );
         let lifecycle_diagnostics = Arc::new(FrontendLifecycleDiagnostics::default());
-        let (supervisor, logical_execution_client) = LogicalExecutionSupervisor::new(
+        let clock: Arc<dyn novarocks_coordination_contract::MonotonicClock> =
+            Arc::new(novarocks_query_application::coordination::ProcessMonotonicClock::new());
+        let (supervisor, logical_execution_client) = LogicalExecutionSupervisor::with_clock(
             runtime.clone(),
             Arc::new(FrontendLogicalExecutionNativePort),
             namespace,
             frontend_process_id,
             supervisor_config,
+            Arc::clone(&clock),
         );
         let deadline_supervisor = FrontendWorkloadDeadlineSupervisor::start(
             &runtime,
             workload.owner.deadline_expiry_handle(),
         );
         Ok(Self {
+            clock,
             connector_blocking_io,
             supervisor,
             logical_execution_client,
@@ -1985,6 +1990,7 @@ impl FrontendApplicationHost {
             config.transport_budget.into_codec(),
             config.abort_capacity,
             self.execution_runtime_owner.lifecycle_diagnostics(),
+            Arc::clone(&self.execution_runtime_owner.clock),
         );
         #[cfg(novarocks_dev_controls)]
         let native_runtime = match &self.test_session {

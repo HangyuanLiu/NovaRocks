@@ -31,7 +31,7 @@ use novarocks_types::QueryExecutionId;
 use novarocks_workload_control::{CancellationReason, CancellationView, WorkError, WorkScope};
 use tokio::sync::{oneshot, watch};
 
-use crate::api::{BoundedRootReadPort, RetainedRootReply};
+use crate::api::{BoundedRootReadPort, ComputationReadyToken, RetainedRootReply};
 use crate::api::{NativeAttemptTerminal, NativeAttemptTopologyRequirement};
 use crate::api::{QueryExecutionError, QueryExecutionErrorKind};
 
@@ -495,10 +495,20 @@ impl ResultPumpDecision {
         self,
         actor: &LogicalExecutionActor,
     ) -> Result<LogicalConclusion, LogicalExecutionActorError> {
+        let error = self.failure.error().clone();
+        self.fail_logical_with_error(actor, error).await
+    }
+
+    /// A successor preparation failed before it produced a new running
+    /// permit. The supervisor retains this exact attempt authority and
+    /// submits that actual preparation verdict as the logical terminal cause.
+    pub(crate) async fn fail_logical_with_error(
+        self,
+        actor: &LogicalExecutionActor,
+        error: QueryExecutionError,
+    ) -> Result<LogicalConclusion, LogicalExecutionActorError> {
         let permit = self.permit;
-        let result = actor
-            .fail_attempt_with_error(permit, self.failure.error().clone())
-            .await;
+        let result = actor.fail_attempt_with_error(permit, error).await;
         drop(self.observer);
         result
     }
@@ -993,6 +1003,50 @@ pub(crate) async fn run_root_relay(
     statuses: AcceptedRootStatusSource,
     native_terminal: NativeAttemptTerminalSource,
 ) -> Result<LogicalConclusion, ResultPumpFailure> {
+    run_root_relay_core(
+        permit,
+        root,
+        scope,
+        binding,
+        statuses,
+        native_terminal,
+        None,
+    )
+    .await
+}
+
+/// Relays provisional internal output while retaining the original attempt
+/// authority until the registered domain proof establishes its computation cut.
+pub(crate) async fn run_internal_root_relay(
+    permit: RunningAttemptPermit,
+    root: TaskIdentity,
+    scope: WorkScope,
+    binding: RootRelayBinding,
+    statuses: AcceptedRootStatusSource,
+    native_terminal: NativeAttemptTerminalSource,
+    ready: watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>,
+) -> Result<LogicalConclusion, ResultPumpFailure> {
+    run_root_relay_core(
+        permit,
+        root,
+        scope,
+        binding,
+        statuses,
+        native_terminal,
+        Some(ready),
+    )
+    .await
+}
+
+async fn run_root_relay_core(
+    permit: RunningAttemptPermit,
+    root: TaskIdentity,
+    scope: WorkScope,
+    binding: RootRelayBinding,
+    statuses: AcceptedRootStatusSource,
+    native_terminal: NativeAttemptTerminalSource,
+    ready: Option<watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>>,
+) -> Result<LogicalConclusion, ResultPumpFailure> {
     let RootRelayBinding {
         port,
         mut frontier,
@@ -1004,11 +1058,15 @@ pub(crate) async fn run_root_relay(
         || permit.identity().execution() != root.query_execution_id()
         || !window.is_for_scope(&scope)
         || window.class()
-            != match frontier.kind() {
-                novarocks_result_contract::RootOutputKind::ClientRows => {
-                    novarocks_workload_control::ResultWindowClass::Client
+            != if ready.is_some() {
+                novarocks_workload_control::ResultWindowClass::Internal
+            } else {
+                match frontier.kind() {
+                    novarocks_result_contract::RootOutputKind::ClientRows => {
+                        novarocks_workload_control::ResultWindowClass::Client
+                    }
+                    _ => novarocks_workload_control::ResultWindowClass::Internal,
                 }
-                _ => novarocks_workload_control::ResultWindowClass::Internal,
             }
     {
         return Err(pump_failure(
@@ -1241,6 +1299,10 @@ pub(crate) async fn run_root_relay(
         )
         .await);
     }
+    if let Some(ready) = ready {
+        return finish_internal_relay(&mut runtime, &observer_owner, permit, root, end, ready)
+            .await;
+    }
     if !runtime.success_sealed {
         let seal_reply = match runtime.statuses.begin_success_seal_request() {
             Ok(reply) => reply,
@@ -1278,6 +1340,125 @@ pub(crate) async fn run_root_relay(
     }
 }
 
+fn internal_ready_accepted(
+    ready: &watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>,
+    activation: novarocks_coordination_contract::AttemptActivationIdentity,
+    root: TaskIdentity,
+    end: novarocks_execution_contract::root_result::RootResultEnd,
+) -> Result<bool, RootResultFetchFailure> {
+    let Some(result) = ready.borrow().clone() else {
+        return Ok(false);
+    };
+    let token = result.map_err(contract_failure)?;
+    if token.activation() != activation || token.root() != root || token.end() != end {
+        return Err(contract_failure(contract_error(
+            "internal readiness does not match the relay activation, root or consumed End",
+        )));
+    }
+    Ok(true)
+}
+
+async fn finish_internal_relay(
+    runtime: &mut PumpRuntime,
+    observer: &RootResultObserver,
+    permit: RunningAttemptPermit,
+    root: TaskIdentity,
+    end: novarocks_execution_contract::root_result::RootResultEnd,
+    mut ready: watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>,
+) -> Result<LogicalConclusion, ResultPumpFailure> {
+    // The End only borrows running authority. Its real CPU receipt may fail,
+    // and the same permit must remain available to the pre-ready recovery owner.
+    let delivery = runtime
+        .await_step(permit.deliver_internal_end(root, end))
+        .await;
+    let interruption = match delivery {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => {
+            let failure = actor_failure("deliver internal root End", error);
+            Some(match actor_error_conclusion(error) {
+                Some(conclusion) => PumpInterruption::Concluded(conclusion, failure),
+                None => PumpInterruption::Decision(failure),
+            })
+        }
+        Err(interruption) => Some(interruption),
+    };
+    if let Some(interruption) = interruption {
+        return settle_internal_interruption(observer, permit, &ready, root, end, interruption)
+            .await;
+    }
+
+    loop {
+        match internal_ready_accepted(&ready, permit.identity(), root, end) {
+            Ok(true) => return Ok(LogicalConclusion::ComputationReady),
+            Err(failure) => {
+                return Err(bound_pump_failure(observer, permit, failure).await);
+            }
+            Ok(false) => {}
+        }
+        // Ready is the actor's accepted cut, so it precedes observation of a
+        // simultaneous cancellation or a status that arrived after that cut.
+        let interruption = tokio::select! {
+            biased;
+            changed = ready.changed() => {
+                if changed.is_err() {
+                    Some(PumpInterruption::Decision(contract_failure(contract_error(
+                        "internal readiness owner closed without its accepted cut",
+                    ))))
+                } else {
+                    None
+                }
+            }
+            reason = runtime.cancellation.cancelled() => {
+                Some(PumpInterruption::Cancellation(cancellation_failure(reason)))
+            }
+            terminal = runtime.native_terminal.next(), if !runtime.native_completed => {
+                runtime.observe_native_terminal(terminal).err()
+            }
+            status = runtime.statuses.next() => {
+                match status {
+                    Ok(projection) => runtime.observe_projection(projection).await.err(),
+                    Err(error) => Some(PumpInterruption::Decision(contract_failure(error))),
+                }
+            }
+        };
+        if let Some(interruption) = interruption {
+            return settle_internal_interruption(observer, permit, &ready, root, end, interruption)
+                .await;
+        }
+    }
+}
+
+async fn settle_internal_interruption(
+    observer: &RootResultObserver,
+    permit: RunningAttemptPermit,
+    ready: &watch::Receiver<Option<Result<ComputationReadyToken, QueryExecutionError>>>,
+    root: TaskIdentity,
+    end: novarocks_execution_contract::root_result::RootResultEnd,
+    interruption: PumpInterruption,
+) -> Result<LogicalConclusion, ResultPumpFailure> {
+    let activation = permit.identity();
+    match internal_ready_accepted(ready, activation, root, end) {
+        Ok(true) => return Ok(LogicalConclusion::ComputationReady),
+        Err(failure) => return Err(bound_pump_failure(observer, permit, failure).await),
+        Ok(false) => {}
+    }
+    let failure = bound_pump_interruption(observer, permit, interruption).await;
+    // The actor can accept Ready while the pump is awaiting its failure or
+    // cancellation disposition. That exact accepted cut remains authoritative.
+    if matches!(
+        &failure,
+        ResultPumpFailure::Concluded(concluded)
+            if concluded.conclusion() == LogicalConclusion::ComputationReady
+    ) && matches!(
+        internal_ready_accepted(ready, activation, root, end),
+        Ok(true)
+    ) {
+        Ok(LogicalConclusion::ComputationReady)
+    } else {
+        Err(failure)
+    }
+}
+
 /// Preserve one read and its original window while an early normal deferral
 /// consumes the wait already requested from the backend. It grants no retry
 /// authority and never advances the cumulative delivery frontier.
@@ -1312,7 +1493,7 @@ fn pump_failure(
     })
 }
 
-fn pump_actor_failure(
+pub(super) fn pump_actor_failure(
     permit: RunningAttemptPermit,
     operation: &'static str,
     error: LogicalExecutionActorError,

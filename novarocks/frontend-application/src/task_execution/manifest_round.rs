@@ -39,7 +39,6 @@ use super::attempt_convergence::{
     NativeAttemptConvergenceMode, NativeAttemptConvergenceOwner, NativeAttemptConvergenceTarget,
     advance_task_round,
 };
-use super::clock::ProcessMonotonicClock;
 #[cfg(test)]
 use super::error::ParticipantObservationFailure;
 use super::error::TaskExecutionError;
@@ -67,6 +66,7 @@ const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Process-owned runtime policy used to instantiate one exact manifest.
 pub(crate) struct ManifestAttemptTransport {
+    pub(crate) clock: Arc<dyn MonotonicClock>,
     pub(crate) dispatch_budget: DispatchBudget,
     pub(crate) transport_budget: TransportBudget,
     pub(crate) status_subscription_error_budget: u32,
@@ -167,7 +167,7 @@ pub(crate) fn assemble_manifest_round(
     let sink = split_delivery.sink(Arc::new(actor_sink) as Arc<dyn TaskOperationSink>);
 
     let intake = StatusIntake::new(STATUS_INTAKE_CAPACITY, Arc::clone(&wake));
-    let clock = Arc::new(ProcessMonotonicClock::new()) as Arc<dyn MonotonicClock>;
+    let clock = Arc::clone(&transport.clock);
     let observation = Arc::new(
         ObservationIntake::for_task_attempt(Arc::clone(&wake), Arc::clone(&clock)).map_err(
             |error| {

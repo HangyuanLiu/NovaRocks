@@ -49,7 +49,8 @@ use crate::api::{
     NativeAttemptConvergence, NativeAttemptPreparationError, NativeAttemptPreparationFailure,
     NativeAttemptTerminal, NativeContextConvergenceKind, NativeRowsAttemptRuntime,
     QueryExecutionClient, QueryExecutionDriver, QueryExecutionError, QueryExecutionErrorKind,
-    QueryExecutionFuture, QueryExecutionRequest, ResultSchema, StatementNativeHealthFailure,
+    QueryExecutionFuture, QueryExecutionRequest, ReservedExecutionIdentity, ResultSchema,
+    StatementNativeHealthFailure,
 };
 use crate::execution_error::{ExecutionFailureInput, ExecutionFailureSite, QueryFailureReason};
 use crate::preparation::OutputContract;
@@ -62,7 +63,7 @@ use super::{
     ResultPumpFailure, SupervisedActiveNativeOwner, assert_shutdown_complete,
     build_attempt_schedule, evaluate_recovery,
 };
-use novarocks_coordination_contract::RecoveryMode;
+use novarocks_coordination_contract::{MonotonicClock, RecoveryMode};
 
 static NEXT_PROCESS_QUERY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const NATIVE_CONVERGENCE_PANIC_BACKOFF: Duration = Duration::from_millis(10);
@@ -76,6 +77,7 @@ pub struct LogicalExecutionSupervisorConfig {
     max_establish_authorizations_per_context: NonZeroUsize,
     rows: LogicalExecutionRowsConfig,
     remote_cleanup_timeout: Duration,
+    diagnostic_timeout: Duration,
 }
 
 /// Process-fixed bounds for every row-producing logical execution.
@@ -117,6 +119,7 @@ impl LogicalExecutionSupervisorConfig {
             max_establish_authorizations_per_context,
             rows,
             remote_cleanup_timeout: DEFAULT_REMOTE_CLEANUP_TIMEOUT,
+            diagnostic_timeout: DEFAULT_REMOTE_CLEANUP_TIMEOUT,
         }
     }
 
@@ -130,6 +133,12 @@ impl LogicalExecutionSupervisorConfig {
     pub const fn with_remote_cleanup_timeout(mut self, timeout: Duration) -> Self {
         assert!(!timeout.is_zero(), "remote cleanup timeout must be nonzero");
         self.remote_cleanup_timeout = timeout;
+        self
+    }
+
+    pub const fn with_diagnostic_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "diagnostic timeout must be nonzero");
+        self.diagnostic_timeout = timeout;
         self
     }
 
@@ -221,6 +230,25 @@ impl LogicalExecutionSupervisor {
         frontend_process_id: FrontendProcessId,
         config: LogicalExecutionSupervisorConfig,
     ) -> (Self, QueryExecutionClient) {
+        Self::with_clock(
+            runtime,
+            native,
+            namespace,
+            frontend_process_id,
+            config,
+            Arc::new(super::ProcessMonotonicClock::new()),
+        )
+    }
+
+    /// Uses the same role-local timeline as the Native attempt owner.
+    pub fn with_clock(
+        runtime: Handle,
+        native: Arc<dyn LogicalExecutionNativePort>,
+        namespace: QueryProcessNamespace,
+        frontend_process_id: FrontendProcessId,
+        config: LogicalExecutionSupervisorConfig,
+        clock: Arc<dyn MonotonicClock>,
+    ) -> (Self, QueryExecutionClient) {
         // Query admission is the sole warehouse scheduling queue. This
         // unbounded handoff only transfers already admitted work to the
         // supervisor; it must never reject a query with a second capacity.
@@ -230,16 +258,19 @@ impl LogicalExecutionSupervisor {
         let statement_native_residual_port =
             registry.statement_native_residual_port(config.remote_cleanup_timeout());
         let registry_handle = registry.handle();
+        let query_ids = Arc::new(ProcessQueryIdAllocator::new(namespace));
         let driver = QueryExecutionDriverHandle {
             starts,
             shutdown: shutdown_rx.clone(),
+            query_ids: Arc::clone(&query_ids),
         };
         let join = runtime.spawn(run_supervisor(
             registry_handle,
             native,
-            namespace,
+            query_ids,
             frontend_process_id,
             config,
+            clock,
             start_rx,
             shutdown_rx,
         ));
@@ -359,10 +390,26 @@ impl LogicalExecutionSupervisor {
 struct QueryExecutionDriverHandle {
     starts: mpsc::UnboundedSender<StartCommand>,
     shutdown: watch::Receiver<bool>,
+    query_ids: Arc<ProcessQueryIdAllocator>,
 }
 
 impl QueryExecutionDriver for QueryExecutionDriverHandle {
-    fn start(&self, request: QueryExecutionRequest, owner: WorkOwner) -> QueryExecutionFuture {
+    fn reserve_identity(&self) -> Result<ReservedExecutionIdentity, QueryExecutionError> {
+        if *self.shutdown.borrow() || self.starts.is_closed() {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::Rejected,
+                "logical execution supervisor is shutting down",
+            ));
+        }
+        self.query_ids.reserve()
+    }
+
+    fn start(
+        &self,
+        request: QueryExecutionRequest,
+        owner: WorkOwner,
+        reserved: Option<ReservedExecutionIdentity>,
+    ) -> QueryExecutionFuture {
         if *self.shutdown.borrow() {
             return rejected_start(owner, "logical execution supervisor is shutting down");
         }
@@ -375,13 +422,27 @@ impl QueryExecutionDriver for QueryExecutionDriverHandle {
             }
         };
         let (reply, response) = oneshot::channel();
+        let internal_cut = request.description().finish_boundary()
+            == crate::preparation::ExecutionFinishBoundary::ComputationReady;
         let command = StartCommand {
             request,
             owner,
             reply,
+            reserved,
         };
         match self.starts.send(command) {
             Ok(()) => Box::pin(async move {
+                // Internal start returns an actor-owned computation verdict.
+                // A caller-side cancellation race cannot replace a Ready cut
+                // that the actor has already accepted but not yet delivered.
+                if internal_cut {
+                    return response.await.unwrap_or_else(|_| {
+                        Err(QueryExecutionError::new(
+                            QueryExecutionErrorKind::Failed,
+                            "logical execution supervisor closed without an internal verdict",
+                        ))
+                    });
+                }
                 tokio::select! {
                     biased;
                     result = response => result.unwrap_or_else(|_| {
@@ -445,15 +506,38 @@ struct StartCommand {
     request: QueryExecutionRequest,
     owner: WorkOwner,
     reply: oneshot::Sender<Result<ExecutionHandle, QueryExecutionError>>,
+    reserved: Option<ReservedExecutionIdentity>,
 }
 
+#[derive(Debug)]
 struct ProcessQueryIdAllocator {
     namespace: QueryProcessNamespace,
+    issuer: Arc<()>,
 }
 
 impl ProcessQueryIdAllocator {
-    const fn new(namespace: QueryProcessNamespace) -> Self {
-        Self { namespace }
+    fn new(namespace: QueryProcessNamespace) -> Self {
+        Self {
+            namespace,
+            issuer: Arc::new(()),
+        }
+    }
+
+    fn reserve(&self) -> Result<ReservedExecutionIdentity, QueryExecutionError> {
+        Ok(ReservedExecutionIdentity::issued(
+            self.first_execution()?,
+            Arc::clone(&self.issuer),
+        ))
+    }
+
+    fn consume(
+        &self,
+        reserved: Option<ReservedExecutionIdentity>,
+    ) -> Result<QueryExecutionId, QueryExecutionError> {
+        match reserved {
+            Some(reserved) => reserved.consume(&self.issuer),
+            None => self.first_execution(),
+        }
     }
 
     fn first_execution(&self) -> Result<QueryExecutionId, QueryExecutionError> {
@@ -483,13 +567,13 @@ impl ProcessQueryIdAllocator {
 async fn run_supervisor(
     registry: LogicalExecutionRuntimeRegistryHandle,
     native: Arc<dyn LogicalExecutionNativePort>,
-    namespace: QueryProcessNamespace,
+    query_ids: Arc<ProcessQueryIdAllocator>,
     frontend_process_id: FrontendProcessId,
     config: LogicalExecutionSupervisorConfig,
+    clock: Arc<dyn MonotonicClock>,
     mut starts: mpsc::UnboundedReceiver<StartCommand>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), QueryExecutionError> {
-    let query_ids = Arc::new(ProcessQueryIdAllocator::new(namespace));
     let mut logical_tasks = JoinSet::new();
     let mut task_failure = None;
     loop {
@@ -518,6 +602,7 @@ async fn run_supervisor(
                     Arc::clone(&query_ids),
                     frontend_process_id,
                     config,
+                    Arc::clone(&clock),
                     registry.clone(),
                     shutdown.clone(),
                 ));
@@ -585,6 +670,7 @@ async fn run_logical_execution(
     query_ids: Arc<ProcessQueryIdAllocator>,
     frontend_process_id: FrontendProcessId,
     config: LogicalExecutionSupervisorConfig,
+    clock: Arc<dyn MonotonicClock>,
     registry: super::LogicalExecutionRuntimeRegistryHandle,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), QueryExecutionError> {
@@ -592,15 +678,20 @@ async fn run_logical_execution(
         request,
         owner,
         reply,
+        reserved,
     } = command;
     let mut pending_owner = PendingWorkOwner(Some(owner));
     let requester = pending_owner.owner().cancellation_requester();
     let scope = pending_owner.owner().scope();
-    let initial_execution = match query_ids.first_execution() {
+    let initial_execution = match query_ids.consume(reserved) {
         Ok(execution) => execution,
         Err(error) => return fail_uninstalled_start(pending_owner, reply, error),
     };
-    let (description, native_seed) = request.into_parts();
+    if let Err(error) = request.validate_internal_consumer() {
+        return fail_uninstalled_start(pending_owner, reply, error);
+    }
+    let (description, native_seed, internal_consumer) = request.into_parts();
+    let internal = internal_consumer.is_some();
     let description = Arc::new(description);
     // Activation is one-shot: the plan chosen by preparation and completion is
     // the one every attempt of this execution runs.
@@ -609,7 +700,7 @@ async fn run_logical_execution(
         OutputContract::Rows(fields) => Some(ResultSchema::new(Arc::clone(fields))),
         OutputContract::CompletionOnly => None,
     };
-    if result_schema.is_none() && description.recovery() != RecoveryMode::NoRecovery {
+    if !internal && result_schema.is_none() && description.recovery() != RecoveryMode::NoRecovery {
         return fail_uninstalled_start(
             pending_owner,
             reply,
@@ -717,7 +808,7 @@ async fn run_logical_execution(
             return fail_uninstalled_start(pending_owner, reply, registry_error(error));
         }
     };
-    let row_carrier = if result_schema.is_some() {
+    let row_carrier = if internal || result_schema.is_some() {
         match description.row_carrier() {
             Ok(carrier) => Some(carrier),
             Err(error) => {
@@ -733,38 +824,22 @@ async fn run_logical_execution(
         None
     };
     let max_establish_authorizations = config.max_establish_authorizations_per_context;
-    let actor_config = match (&result_schema, description.recovery()) {
-        (None, RecoveryMode::NoRecovery) => LogicalExecutionActorConfig::no_recovery_completion(
-            initial_execution,
-            description.effect(),
-            config.actor_mailbox_capacity,
-            contexts,
-            config.max_admission_issues_per_context,
-            max_establish_authorizations,
-            pending_owner.take(),
-            stage,
-        ),
-        (Some(schema), RecoveryMode::NoRecovery) => {
-            LogicalExecutionActorConfig::single_attempt_read_rows(
+    let actor_config = if internal {
+        let config_result = match description.recovery() {
+            RecoveryMode::NoRecovery => LogicalExecutionActorConfig::no_recovery_completion(
                 initial_execution,
+                description.effect(),
                 config.actor_mailbox_capacity,
                 contexts,
                 config.max_admission_issues_per_context,
                 max_establish_authorizations,
                 pending_owner.take(),
                 stage,
-                schema.clone(),
-                config.rows.delivery_capacity,
-                row_carrier.expect("row output carrier was validated"),
-            )
-        }
-        (Some(schema), RecoveryMode::RestartAttemptBeforeVisibility) => {
-            let replacement = session
-                .replacement_effect_port()
-                .ok_or(super::LogicalExecutionActorError::InvariantViolation);
-            match replacement {
-                Ok(replacement) => {
-                    LogicalExecutionActorConfig::read_only_pre_visibility_recovery_rows(
+            ),
+            RecoveryMode::RestartAttemptBeforeVisibility => match session.replacement_effect_port()
+            {
+                Some(replacement) => {
+                    LogicalExecutionActorConfig::read_only_pre_visibility_recovery(
                         initial_execution,
                         config.actor_mailbox_capacity,
                         contexts,
@@ -775,23 +850,88 @@ async fn run_logical_execution(
                         pending_owner.take(),
                         stage,
                         config.rows.replacement_reservation_valid_for,
-                        schema.clone(),
-                        config.rows.delivery_capacity,
-                        row_carrier.expect("row output carrier was validated"),
                     )
                 }
-                Err(error) => Err(error),
+                None => Err(super::LogicalExecutionActorError::InvariantViolation),
+            },
+        };
+        config_result
+            .and_then(|actor| {
+                actor.with_internal_computation(&description, config.rows.delivery_capacity)
+            })
+            .map(|actor| {
+                actor.with_internal_observation_budgets(
+                    crate::api::ComputationObservationBudgets::new(
+                        config.diagnostic_timeout,
+                        config.remote_cleanup_timeout,
+                    ),
+                )
+            })
+    } else {
+        match (&result_schema, description.recovery()) {
+            (None, RecoveryMode::NoRecovery) => {
+                LogicalExecutionActorConfig::no_recovery_completion(
+                    initial_execution,
+                    description.effect(),
+                    config.actor_mailbox_capacity,
+                    contexts,
+                    config.max_admission_issues_per_context,
+                    max_establish_authorizations,
+                    pending_owner.take(),
+                    stage,
+                )
             }
-        }
-        (None, RecoveryMode::RestartAttemptBeforeVisibility) => {
-            unreachable!("completion-only recovery was rejected before actor construction")
+            (Some(schema), RecoveryMode::NoRecovery) => {
+                LogicalExecutionActorConfig::single_attempt_read_rows(
+                    initial_execution,
+                    config.actor_mailbox_capacity,
+                    contexts,
+                    config.max_admission_issues_per_context,
+                    max_establish_authorizations,
+                    pending_owner.take(),
+                    stage,
+                    schema.clone(),
+                    config.rows.delivery_capacity,
+                    row_carrier.expect("row output carrier was validated"),
+                )
+            }
+            (Some(schema), RecoveryMode::RestartAttemptBeforeVisibility) => {
+                let replacement = session
+                    .replacement_effect_port()
+                    .ok_or_else(|| super::LogicalExecutionActorError::InvariantViolation);
+                match replacement {
+                    Ok(replacement) => {
+                        LogicalExecutionActorConfig::read_only_pre_visibility_recovery_rows(
+                            initial_execution,
+                            config.actor_mailbox_capacity,
+                            contexts,
+                            config.max_admission_issues_per_context,
+                            max_establish_authorizations,
+                            config.rows.max_attempts,
+                            replacement,
+                            pending_owner.take(),
+                            stage,
+                            config.rows.replacement_reservation_valid_for,
+                            schema.clone(),
+                            config.rows.delivery_capacity,
+                            row_carrier.expect("row output carrier was validated"),
+                        )
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            (None, RecoveryMode::RestartAttemptBeforeVisibility) => {
+                unreachable!("completion-only recovery was rejected before actor construction")
+            }
         }
     };
     let actor_config = match actor_config {
-        Ok(actor_config) => actor_config.with_abort_query_context_effect_port(
-            session.abort_effect_port(),
-            max_establish_authorizations,
-        ),
+        Ok(actor_config) => actor_config
+            .with_clock(Arc::clone(&clock))
+            .with_abort_query_context_effect_port(
+                session.abort_effect_port(),
+                max_establish_authorizations,
+            ),
         Err(error) => {
             let _ = reply.send(Err(actor_error(error)));
             return Ok(());
@@ -814,354 +954,448 @@ async fn run_logical_execution(
             return Err(error);
         }
     };
-    let mut dormant = prepared.owner;
-    let mut active_custody = match registry.reserve_active_native_owner(
-        &registration,
-        schedule.execution(),
-        schedule.contexts(),
-    ) {
-        Ok(reservation) => Some(reservation),
-        Err(error) => {
-            let error = registry_error(error);
-            let _ = reply.send(Err(error.clone()));
-            let actor_result = actor
-                .initialization_failed(initial)
-                .await
-                .map(|_| ())
-                .or_else(actor_terminal_refusal);
-            converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
-            drop(dormant);
-            let retire_result = retire_logical(&registry, registration).await;
-            return first_supervision_error(
-                Err(error),
-                first_supervision_error(actor_result, retire_result),
-            );
-        }
+    let outcome = actor.internal_outcome();
+    let (reply, internal_reply) = if internal {
+        let (local_reply, local_result) = oneshot::channel();
+        (local_reply, Some((reply, local_result)))
+    } else {
+        (reply, None)
     };
-    let activation = await_with_shutdown(
-        catch_future_panic(dormant.activate(&schedule, None, cancellation.clone())),
-        &mut shutdown,
-        &requester,
-    )
-    .await;
-    let active = match activation {
-        Ok(Ok(active)) => {
-            drop(dormant);
-            active
-        }
-        Ok(Err(failure)) => {
-            drop(active_custody.take());
-            session.retire_preparation();
-            let error = failure.into_failure().error().clone();
-            // Initialization failure may cancel the root while the actor starts
-            // converging. Publish the native verdict first so that derived
-            // cancellation cannot replace the direct start failure.
-            let _ = reply.send(Err(error));
-            let actor_result = actor
-                .initialization_failed(initial)
-                .await
-                .map(|_| ())
-                .or_else(actor_terminal_refusal);
-            converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
-            drop(dormant);
-            let retire_result = retire_logical(&registry, registration).await;
-            return first_supervision_error(actor_result, retire_result);
-        }
-        Err(()) => {
-            drop(active_custody.take());
-            session.retire_preparation();
-            let error = native_future_panicked("Native attempt activation panicked");
-            // As above, the direct activation verdict precedes any derived
-            // cancellation emitted while the installed actor converges.
-            let _ = reply.send(Err(error.clone()));
-            let actor_result = actor
-                .initialization_failed(initial)
-                .await
-                .map(|_| ())
-                .or_else(actor_terminal_refusal);
-            converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
-            drop(dormant);
-            let retire_result = retire_logical(&registry, registration).await;
-            return first_supervision_error(
-                Err(error),
-                first_supervision_error(actor_result, retire_result),
-            );
-        }
-    };
-    let (original_active, rows_runtime) = active.into_parts();
-    let mut active = active_custody
-        .take()
-        .expect("reserved before activation")
-        .bind(original_active);
-    match (&result_schema, rows_runtime) {
-        (Some(_), Some(rows_runtime)) => {
-            let running = match actor.activate(initial.ready()).await {
-                Ok(running) => running,
-                Err(error) => {
-                    session.retire_preparation();
-                    let supervision = actor_terminal_refusal(error);
-                    if supervision.is_err() {
-                        let _ = requester.request(CancellationReason::Requested);
-                    }
-                    let error = actor_error(error);
-                    let convergence = converge_supervised_active(
-                        &mut active,
-                        cancellation,
-                        &mut shutdown,
-                        &requester,
-                        config.remote_cleanup_timeout(),
-                    )
-                    .await;
-                    drop(active);
-                    let convergence_result = record_reported_active_convergence(
-                        &registry,
-                        &registration,
-                        schedule.contexts(),
-                        convergence,
-                    )
-                    .await;
-                    let _ = reply.send(Err(error.clone()));
-                    let retire_result = retire_logical(&registry, registration).await;
-                    return first_supervision_error(
-                        supervision,
-                        first_supervision_error(convergence_result, retire_result),
-                    );
-                }
-            };
-            let handle = ExecutionHandle::new(requester.clone(), output.into_output());
-            let _ = reply.send(Ok(handle));
-            let actor_result = supervise_rows(
-                &actor,
-                &mut session,
-                Arc::clone(&description),
-                scope,
-                frontend_process_id,
-                config,
-                &registry,
-                &registration,
-                &mut shutdown,
-                &requester,
-                active_plan,
-                RowsAttempt {
-                    schedule,
-                    active,
-                    running,
-                    runtime: rows_runtime,
-                },
-            )
-            .await;
-            let retire_result = retire_logical(&registry, registration).await;
-            return first_supervision_error(actor_result, retire_result);
-        }
-        (Some(_), None) => {
-            session.retire_preparation();
-            let error = result_protocol_error(
-                "Native activated a row execution without its root result runtime",
-            );
-            let actor_result = actor
-                .initialization_failed(initial)
-                .await
-                .map(|_| ())
-                .or_else(actor_terminal_refusal);
-            let _ = requester.request(CancellationReason::Requested);
-            let convergence = converge_supervised_active(
-                &mut active,
-                cancellation,
-                &mut shutdown,
-                &requester,
-                config.remote_cleanup_timeout(),
-            )
-            .await;
-            drop(active);
-            let convergence_result = record_reported_active_convergence(
-                &registry,
-                &registration,
-                schedule.contexts(),
-                convergence,
-            )
-            .await;
-            let _ = reply.send(Err(error.clone()));
-            let retire_result = retire_logical(&registry, registration).await;
-            return first_supervision_error(
-                Err(error),
-                first_supervision_error(
-                    actor_result,
-                    first_supervision_error(convergence_result, retire_result),
-                ),
-            );
-        }
-        (None, Some(_)) => {
-            session.retire_preparation();
-            let error = result_protocol_error(
-                "Native attached a root result runtime to a completion-only execution",
-            );
-            let actor_result = actor
-                .initialization_failed(initial)
-                .await
-                .map(|_| ())
-                .or_else(actor_terminal_refusal);
-            let _ = requester.request(CancellationReason::Requested);
-            let convergence = converge_supervised_active(
-                &mut active,
-                cancellation,
-                &mut shutdown,
-                &requester,
-                config.remote_cleanup_timeout(),
-            )
-            .await;
-            drop(active);
-            let convergence_result = record_reported_active_convergence(
-                &registry,
-                &registration,
-                schedule.contexts(),
-                convergence,
-            )
-            .await;
-            let _ = reply.send(Err(error.clone()));
-            let retire_result = retire_logical(&registry, registration).await;
-            return first_supervision_error(
-                Err(error),
-                first_supervision_error(
-                    actor_result,
-                    first_supervision_error(convergence_result, retire_result),
-                ),
-            );
-        }
-        (None, None) => {}
-    }
-    let running = match actor.activate(initial.ready()).await {
-        Ok(running) => running,
-        Err(error) => {
-            session.retire_preparation();
-            let supervision = actor_terminal_refusal(error);
-            if supervision.is_err() {
-                let _ = requester.request(CancellationReason::Requested);
+    let outcome_requester = requester.clone();
+    let supervision = async move {
+        let mut dormant = prepared.owner;
+        let mut active_custody = match registry.reserve_active_native_owner(
+            &registration,
+            schedule.execution(),
+            schedule.contexts(),
+        ) {
+            Ok(reservation) => Some(reservation),
+            Err(error) => {
+                let error = registry_error(error);
+                let _ = reply.send(Err(error.clone()));
+                let actor_result = actor
+                    .initialization_failed_with_error(initial, error.clone())
+                    .await
+                    .map(|_| ())
+                    .or_else(actor_terminal_refusal);
+                converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
+                drop(dormant);
+                let retire_result = retire_logical(&registry, registration).await;
+                return first_supervision_error(
+                    Err(error),
+                    first_supervision_error(actor_result, retire_result),
+                );
             }
-            let error = actor_error(error);
-            let convergence = converge_supervised_active(
-                &mut active,
-                cancellation,
-                &mut shutdown,
-                &requester,
-                config.remote_cleanup_timeout(),
-            )
-            .await;
-            drop(active);
-            let convergence_result = record_reported_active_convergence(
-                &registry,
-                &registration,
-                schedule.contexts(),
-                convergence,
-            )
-            .await;
-            let _ = reply.send(Err(error.clone()));
-            let retire_result = retire_logical(&registry, registration).await;
-            return first_supervision_error(
-                supervision,
-                first_supervision_error(convergence_result, retire_result),
+        };
+        let activation = await_with_shutdown(
+            catch_future_panic(async {
+                dormant
+                    .activate(&schedule, None, cancellation.clone())
+                    .await
+            }),
+            &mut shutdown,
+            &requester,
+        )
+        .await;
+        let active = match activation {
+            Ok(Ok(active)) => {
+                drop(dormant);
+                active
+            }
+            Ok(Err(failure)) => {
+                drop(active_custody.take());
+                session.retire_preparation();
+                let error = failure.into_failure().error().clone();
+                let _ = reply.send(Err(error.clone()));
+                let actor_result = actor
+                    .initialization_failed_with_error(initial, error.clone())
+                    .await
+                    .map(|_| ())
+                    .or_else(actor_terminal_refusal);
+                converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
+                drop(dormant);
+                let retire_result = retire_logical(&registry, registration).await;
+                return first_supervision_error(actor_result, retire_result);
+            }
+            Err(()) => {
+                drop(active_custody.take());
+                session.retire_preparation();
+                let error = native_future_panicked("Native attempt activation panicked");
+                let _ = reply.send(Err(error.clone()));
+                let actor_result = actor
+                    .initialization_failed_with_error(initial, error.clone())
+                    .await
+                    .map(|_| ())
+                    .or_else(actor_terminal_refusal);
+                converge_dormant(dormant.as_mut(), cancellation, &mut shutdown, &requester).await;
+                drop(dormant);
+                let retire_result = retire_logical(&registry, registration).await;
+                return first_supervision_error(
+                    Err(error),
+                    first_supervision_error(actor_result, retire_result),
+                );
+            }
+        };
+        let (original_active, rows_runtime) = active.into_parts();
+        let mut active = active_custody
+            .take()
+            .expect("reserved before activation")
+            .bind(original_active);
+        match (internal || result_schema.is_some(), rows_runtime) {
+            (true, Some(rows_runtime)) => {
+                let running = match actor.activate(initial.ready()).await {
+                    Ok(running) => running,
+                    Err(error) => {
+                        session.retire_preparation();
+                        let supervision = actor_terminal_refusal(error);
+                        if supervision.is_err() {
+                            let _ = requester.request(CancellationReason::Requested);
+                        }
+                        let error = actor_error(error);
+                        let convergence = converge_supervised_active(
+                            &mut active,
+                            cancellation,
+                            &mut shutdown,
+                            &requester,
+                            config.remote_cleanup_timeout(),
+                        )
+                        .await;
+                        drop(active);
+                        let convergence_result = record_reported_active_convergence(
+                            &registry,
+                            &registration,
+                            schedule.contexts(),
+                            convergence,
+                        )
+                        .await;
+                        let _ = reply.send(Err(error.clone()));
+                        let retire_result = retire_logical(&registry, registration).await;
+                        return first_supervision_error(
+                            supervision,
+                            first_supervision_error(convergence_result, retire_result),
+                        );
+                    }
+                };
+                let internal_output = match internal_consumer {
+                    Some(consumer) => {
+                        drop(reply);
+                        Some(InternalExecutionConsumer {
+                            consumer,
+                            accepted: None,
+                        })
+                    }
+                    None => {
+                        let handle = ExecutionHandle::new(requester.clone(), output.into_output());
+                        let _ = reply.send(Ok(handle));
+                        None
+                    }
+                };
+                let actor_result = supervise_rows(
+                    &actor,
+                    &mut session,
+                    Arc::clone(&description),
+                    scope,
+                    frontend_process_id,
+                    config,
+                    &registry,
+                    &registration,
+                    &mut shutdown,
+                    &requester,
+                    active_plan,
+                    internal_output,
+                    Arc::clone(&clock),
+                    RowsAttempt {
+                        schedule,
+                        active,
+                        running,
+                        runtime: rows_runtime,
+                    },
+                )
+                .await;
+                let retire_result = retire_logical(&registry, registration).await;
+                return first_supervision_error(actor_result, retire_result);
+            }
+            (true, None) => {
+                session.retire_preparation();
+                let error = result_protocol_error(
+                    "Native activated a row execution without its root result runtime",
+                );
+                let actor_result = actor
+                    .initialization_failed_with_error(initial, error.clone())
+                    .await
+                    .map(|_| ())
+                    .or_else(actor_terminal_refusal);
+                let _ = requester.request(CancellationReason::Requested);
+                let convergence = converge_supervised_active(
+                    &mut active,
+                    cancellation,
+                    &mut shutdown,
+                    &requester,
+                    config.remote_cleanup_timeout(),
+                )
+                .await;
+                drop(active);
+                let convergence_result = record_reported_active_convergence(
+                    &registry,
+                    &registration,
+                    schedule.contexts(),
+                    convergence,
+                )
+                .await;
+                let _ = reply.send(Err(error.clone()));
+                let retire_result = retire_logical(&registry, registration).await;
+                return first_supervision_error(
+                    Err(error),
+                    first_supervision_error(
+                        actor_result,
+                        first_supervision_error(convergence_result, retire_result),
+                    ),
+                );
+            }
+            (false, Some(_)) => {
+                session.retire_preparation();
+                let error = result_protocol_error(
+                    "Native attached a root result runtime to a completion-only execution",
+                );
+                let actor_result = actor
+                    .initialization_failed_with_error(initial, error.clone())
+                    .await
+                    .map(|_| ())
+                    .or_else(actor_terminal_refusal);
+                let _ = requester.request(CancellationReason::Requested);
+                let convergence = converge_supervised_active(
+                    &mut active,
+                    cancellation,
+                    &mut shutdown,
+                    &requester,
+                    config.remote_cleanup_timeout(),
+                )
+                .await;
+                drop(active);
+                let convergence_result = record_reported_active_convergence(
+                    &registry,
+                    &registration,
+                    schedule.contexts(),
+                    convergence,
+                )
+                .await;
+                let _ = reply.send(Err(error.clone()));
+                let retire_result = retire_logical(&registry, registration).await;
+                return first_supervision_error(
+                    Err(error),
+                    first_supervision_error(
+                        actor_result,
+                        first_supervision_error(convergence_result, retire_result),
+                    ),
+                );
+            }
+            (false, None) => {}
+        }
+        let running = match actor.activate(initial.ready()).await {
+            Ok(running) => running,
+            Err(error) => {
+                session.retire_preparation();
+                let supervision = actor_terminal_refusal(error);
+                if supervision.is_err() {
+                    let _ = requester.request(CancellationReason::Requested);
+                }
+                let error = actor_error(error);
+                let convergence = converge_supervised_active(
+                    &mut active,
+                    cancellation,
+                    &mut shutdown,
+                    &requester,
+                    config.remote_cleanup_timeout(),
+                )
+                .await;
+                drop(active);
+                let convergence_result = record_reported_active_convergence(
+                    &registry,
+                    &registration,
+                    schedule.contexts(),
+                    convergence,
+                )
+                .await;
+                let _ = reply.send(Err(error.clone()));
+                let retire_result = retire_logical(&registry, registration).await;
+                return first_supervision_error(
+                    supervision,
+                    first_supervision_error(convergence_result, retire_result),
+                );
+            }
+        };
+        let drive = NativeAttemptDrive::new(&running);
+        let terminal = await_with_shutdown(
+            catch_future_panic(async { active.as_mut().run(&drive, cancellation.clone()).await }),
+            &mut shutdown,
+            &requester,
+        )
+        .await;
+        active.begin_terminal_cut(Instant::now());
+        session.retire_preparation();
+        let (actor_result, convergence) = match terminal {
+            Ok(NativeAttemptTerminal::Completed) => {
+                // The logical conclusion is the client-visible terminal boundary.
+                // It must precede bounded remote observation so the statement
+                // owner can release its warehouse query permit while FE cleanup
+                // continues independently.
+                let actor_result = match actor.complete_attempt(running).await {
+                    Ok(super::LogicalConclusion::Succeeded) => {
+                        let handle = ExecutionHandle::new(requester.clone(), output.into_output());
+                        let _ = reply.send(Ok(handle));
+                        Ok(())
+                    }
+                    Ok(conclusion) => {
+                        let error = QueryExecutionError::new(
+                            QueryExecutionErrorKind::Failed,
+                            format!("completion execution concluded as {conclusion:?}"),
+                        );
+                        let _ = reply.send(Err(error.clone()));
+                        Err(error)
+                    }
+                    Err(error) => {
+                        let supervision = actor_terminal_refusal(error);
+                        let _ = reply.send(Err(actor_error(error)));
+                        supervision
+                    }
+                };
+                let convergence = converge_supervised_active(
+                    &mut active,
+                    cancellation,
+                    &mut shutdown,
+                    &requester,
+                    config.remote_cleanup_timeout(),
+                )
+                .await;
+                drop(active);
+                (actor_result, convergence)
+            }
+            Ok(NativeAttemptTerminal::Failed(failure)) => {
+                let client_error = failure.error().clone();
+                let actor_result = actor
+                    .fail_attempt_with_error(running, client_error.clone())
+                    .await
+                    .map(|_| ())
+                    .or_else(actor_terminal_refusal);
+                let _ = reply.send(Err(client_error));
+                let convergence = converge_supervised_active(
+                    &mut active,
+                    cancellation,
+                    &mut shutdown,
+                    &requester,
+                    config.remote_cleanup_timeout(),
+                )
+                .await;
+                drop(active);
+                (actor_result, convergence)
+            }
+            Err(()) => {
+                let error = native_future_panicked("Native attempt run panicked");
+                let actor_result = actor
+                    .fail_attempt_with_error(running, error.clone())
+                    .await
+                    .map(|_| ())
+                    .or_else(actor_terminal_refusal);
+                let _ = reply.send(Err(error.clone()));
+                let convergence = converge_supervised_active(
+                    &mut active,
+                    cancellation,
+                    &mut shutdown,
+                    &requester,
+                    config.remote_cleanup_timeout(),
+                )
+                .await;
+                drop(active);
+                (
+                    first_supervision_error(Err(error), actor_result),
+                    convergence,
+                )
+            }
+        };
+        let convergence_result = record_reported_active_convergence(
+            &registry,
+            &registration,
+            schedule.contexts(),
+            convergence,
+        )
+        .await;
+        let retire_result = retire_logical(&registry, registration).await;
+        first_supervision_error(
+            actor_result,
+            first_supervision_error(convergence_result, retire_result),
+        )
+    };
+    match internal_reply {
+        Some((reply, local_result)) => {
+            supervise_internal_outcome(supervision, outcome, outcome_requester, reply, local_result)
+                .await
+        }
+        None => supervision.await,
+    }
+}
+
+/// Relay the actor's logical verdict while retaining the original supervisor
+/// future through its actual exit. A local branch reply is not a competing
+/// terminal authority while the actor's outcome owner is still alive.
+async fn supervise_internal_outcome(
+    supervision: impl Future<Output = Result<(), QueryExecutionError>>,
+    mut outcome: Option<
+        watch::Receiver<Option<Result<crate::api::ComputationReadyToken, QueryExecutionError>>>,
+    >,
+    requester: novarocks_workload_control::WorkCancellationRequester,
+    reply: oneshot::Sender<Result<ExecutionHandle, QueryExecutionError>>,
+    mut local_result: oneshot::Receiver<Result<ExecutionHandle, QueryExecutionError>>,
+) -> Result<(), QueryExecutionError> {
+    tokio::pin!(supervision);
+    let mut reply = Some(reply);
+    loop {
+        if let Some(verdict) = outcome
+            .as_ref()
+            .and_then(|outcome| outcome.borrow().clone())
+            && let Some(reply) = reply.take()
+        {
+            let _ = reply.send(
+                verdict.map(|token| ExecutionHandle::computation_ready(requester.clone(), token)),
             );
         }
-    };
-    let drive = NativeAttemptDrive::new(&running);
-    let terminal = await_with_shutdown(
-        catch_future_panic(active.as_mut().run(&drive, cancellation.clone())),
-        &mut shutdown,
-        &requester,
-    )
-    .await;
-    active.begin_terminal_cut(Instant::now());
-    session.retire_preparation();
-    let (actor_result, convergence) = match terminal {
-        Ok(NativeAttemptTerminal::Completed) => {
-            // The logical conclusion is the client-visible terminal boundary.
-            // It must precede bounded remote observation so the statement
-            // owner can release its warehouse query permit while FE cleanup
-            // continues independently.
-            let actor_result = match actor.complete_attempt(running).await {
-                Ok(super::LogicalConclusion::Succeeded) => {
-                    let handle = ExecutionHandle::new(requester.clone(), output.into_output());
-                    let _ = reply.send(Ok(handle));
-                    Ok(())
+        tokio::select! {
+            biased;
+            changed = wait_for_internal_ready(outcome.as_mut()), if outcome.is_some() && reply.is_some() => {
+                if changed.is_err() {
+                    // Read the final retained value before treating owner loss
+                    // as unknown. A last send may precede sender destruction.
+                    if let Some(verdict) = outcome.as_ref().and_then(|outcome| outcome.borrow().clone()) {
+                        if let Some(reply) = reply.take() {
+                            let _ = reply.send(verdict.map(|token| ExecutionHandle::computation_ready(requester.clone(), token)));
+                        }
+                    }
+                    outcome = None;
                 }
-                Ok(conclusion) => {
-                    let error = QueryExecutionError::new(
-                        QueryExecutionErrorKind::Failed,
-                        format!("completion execution concluded as {conclusion:?}"),
-                    );
-                    let _ = reply.send(Err(error.clone()));
-                    Err(error)
+            }
+            candidate = &mut local_result, if outcome.is_none() && reply.is_some() => {
+                if let Some(reply) = reply.take() {
+                    let _ = reply.send(candidate.unwrap_or_else(|_| Err(result_protocol_error(
+                        "internal computation lost its logical outcome owner before readiness",
+                    ))));
                 }
-                Err(error) => {
-                    let supervision = actor_terminal_refusal(error);
-                    let _ = reply.send(Err(actor_error(error)));
-                    supervision
+            }
+            result = &mut supervision => {
+                if let Some(reply) = reply.take() {
+                    let verdict = outcome.as_ref().and_then(|outcome| outcome.borrow().clone());
+                    let candidate = match verdict {
+                        Some(verdict) => verdict.map(|token| ExecutionHandle::computation_ready(requester.clone(), token)),
+                        None => local_result.try_recv().unwrap_or_else(|_| {
+                            Err(result.as_ref().err().cloned().unwrap_or_else(|| result_protocol_error(
+                                "internal computation lost its logical outcome owner before readiness",
+                            )))
+                        }),
+                    };
+                    let _ = reply.send(candidate);
                 }
-            };
-            let convergence = converge_supervised_active(
-                &mut active,
-                cancellation,
-                &mut shutdown,
-                &requester,
-                config.remote_cleanup_timeout(),
-            )
-            .await;
-            drop(active);
-            (actor_result, convergence)
+                return result;
+            }
         }
-        Ok(NativeAttemptTerminal::Failed(failure)) => {
-            let client_error = failure.error().clone();
-            let actor_result = actor
-                .fail_attempt_with_error(running, client_error.clone())
-                .await
-                .map(|_| ())
-                .or_else(actor_terminal_refusal);
-            let _ = reply.send(Err(client_error));
-            let convergence = converge_supervised_active(
-                &mut active,
-                cancellation,
-                &mut shutdown,
-                &requester,
-                config.remote_cleanup_timeout(),
-            )
-            .await;
-            drop(active);
-            (actor_result, convergence)
-        }
-        Err(()) => {
-            let error = native_future_panicked("Native attempt run panicked");
-            let actor_result = actor
-                .fail_attempt_with_error(running, error.clone())
-                .await
-                .map(|_| ())
-                .or_else(actor_terminal_refusal);
-            let _ = reply.send(Err(error.clone()));
-            let convergence = converge_supervised_active(
-                &mut active,
-                cancellation,
-                &mut shutdown,
-                &requester,
-                config.remote_cleanup_timeout(),
-            )
-            .await;
-            drop(active);
-            (
-                first_supervision_error(Err(error), actor_result),
-                convergence,
-            )
-        }
-    };
-    let convergence_result = record_reported_active_convergence(
-        &registry,
-        &registration,
-        schedule.contexts(),
-        convergence,
-    )
-    .await;
-    let retire_result = retire_logical(&registry, registration).await;
-    first_supervision_error(
-        actor_result,
-        first_supervision_error(convergence_result, retire_result),
-    )
+    }
 }
 
 struct RowsAttempt {
@@ -1274,18 +1508,76 @@ async fn drive_rows_attempt_until_pump_decision(
     runtime: NativeRowsAttemptRuntime,
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
+    internal: &mut Option<InternalExecutionConsumer>,
+    consumers: &mut JoinSet<Result<(), QueryExecutionError>>,
 ) -> (Result<super::LogicalConclusion, ResultPumpFailure>,) {
+    let mut ready = if let Some(internal) = internal.as_ref() {
+        let activation = match running.bind_internal_consumer(root).await {
+            Ok(activation) => activation,
+            Err(error) => {
+                return (Err(super::result_pump::pump_actor_failure(
+                    running,
+                    "bind internal consumer",
+                    error,
+                )),);
+            }
+        };
+        let ready = activation.ready.clone();
+        let exit = match activation.supervise_exit().await {
+            Ok(exit) => exit,
+            Err(error) => {
+                drop(activation);
+                return (Err(super::result_pump::pump_actor_failure(
+                    running,
+                    "register internal consumer supervision",
+                    error,
+                )),);
+            }
+        };
+        let consumer = Arc::clone(&internal.consumer);
+        consumers.spawn(async move {
+            let outcome = catch_future_panic(async move { consumer.consume(activation).await })
+                .await
+                .unwrap_or_else(|()| {
+                    Err(internal_consumer_panicked(
+                        "internal computation consumer panicked",
+                    ))
+                });
+            exit.complete(outcome.clone());
+            outcome
+        });
+        Some(ready)
+    } else {
+        None
+    };
     let (terminal_sender, terminal_source) = super::native_attempt_terminal_channel();
     let mut terminal_sender = Some(terminal_sender);
-    let native_run = catch_future_panic(active.run(drive, cancellation));
-    let pump = super::run_root_relay(
-        running,
-        root,
-        scope,
-        runtime.binding,
-        runtime.statuses,
-        terminal_source,
-    );
+    let native_run = catch_future_panic(async { active.run(drive, cancellation).await });
+    let pump_ready = ready.clone();
+    let pump = async move {
+        if let Some(ready) = pump_ready {
+            super::result_pump::run_internal_root_relay(
+                running,
+                root,
+                scope,
+                runtime.binding,
+                runtime.statuses,
+                terminal_source,
+                ready,
+            )
+            .await
+        } else {
+            super::run_root_relay(
+                running,
+                root,
+                scope,
+                runtime.binding,
+                runtime.statuses,
+                terminal_source,
+            )
+            .await
+        }
+    };
     tokio::pin!(native_run);
     tokio::pin!(pump);
     let pump_result = loop {
@@ -1307,10 +1599,49 @@ async fn drive_rows_attempt_until_pump_decision(
                     .expect("Native terminal sender is present while run is polled")
                     .publish(terminal);
             }
+            changed = wait_for_internal_ready(ready.as_mut()), if ready.is_some() => {
+                if changed.is_ok() {
+                    observe_internal_ready(internal, ready.as_ref());
+                }
+                ready = None;
+            }
             outcome = &mut pump => break outcome,
         }
     };
+    observe_internal_ready(internal, ready.as_ref());
     (pump_result,)
+}
+
+struct InternalExecutionConsumer {
+    consumer: Arc<dyn crate::api::InternalComputationConsumer>,
+    accepted: Option<crate::api::ComputationReadyToken>,
+}
+
+async fn wait_for_internal_ready(
+    ready: Option<
+        &mut watch::Receiver<
+            Option<Result<crate::api::ComputationReadyToken, QueryExecutionError>>,
+        >,
+    >,
+) -> Result<(), watch::error::RecvError> {
+    let ready = ready.expect("ready wait is gated by its observer");
+    if ready.borrow().is_some() {
+        return Ok(());
+    }
+    ready.changed().await
+}
+
+fn observe_internal_ready(
+    internal: &mut Option<InternalExecutionConsumer>,
+    ready: Option<
+        &watch::Receiver<Option<Result<crate::api::ComputationReadyToken, QueryExecutionError>>>,
+    >,
+) {
+    if let Some(Ok(token)) = ready.and_then(|ready| ready.borrow().clone())
+        && let Some(internal) = internal.as_mut()
+    {
+        internal.accepted = Some(token);
+    }
 }
 
 #[expect(
@@ -1329,6 +1660,67 @@ async fn supervise_rows(
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
     active_plan: super::ActiveLogicalPlan,
+    mut internal: Option<InternalExecutionConsumer>,
+    clock: Arc<dyn MonotonicClock>,
+    attempt: RowsAttempt,
+) -> Result<(), QueryExecutionError> {
+    let mut consumers = JoinSet::new();
+    let result = supervise_rows_inner(
+        actor,
+        session,
+        description,
+        scope,
+        frontend_process_id,
+        config,
+        registry,
+        registration,
+        shutdown,
+        requester,
+        active_plan,
+        &mut internal,
+        &mut consumers,
+        clock.as_ref(),
+        attempt,
+    )
+    .await;
+    // Join handles remain owned across replacement and cancellation. Actual
+    // consumer exit is separate from revoking its eligibility or accepting Ready.
+    while let Some(joined) = consumers.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "internal consumer exited with its domain verdict")
+            }
+            Err(error) => {
+                registry.record_native_supervision_join_failure(error);
+                return first_supervision_error(
+                    result,
+                    Err(native_future_panicked(
+                        "internal consumer supervision failed",
+                    )),
+                );
+            }
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_rows_inner(
+    actor: &super::LogicalExecutionActor,
+    session: &mut LogicalNativeSession,
+    description: Arc<crate::preparation::FrozenExecutionDescription>,
+    scope: novarocks_workload_control::WorkScope,
+    frontend_process_id: FrontendProcessId,
+    config: LogicalExecutionSupervisorConfig,
+    registry: &LogicalExecutionRuntimeRegistryHandle,
+    registration: &super::LogicalExecutionRegistration,
+    shutdown: &mut watch::Receiver<bool>,
+    requester: &novarocks_workload_control::WorkCancellationRequester,
+    active_plan: super::ActiveLogicalPlan,
+    internal: &mut Option<InternalExecutionConsumer>,
+    consumers: &mut JoinSet<Result<(), QueryExecutionError>>,
+    clock: &dyn MonotonicClock,
     mut attempt: RowsAttempt,
 ) -> Result<(), QueryExecutionError> {
     let mut residuals = JoinSet::new();
@@ -1358,13 +1750,27 @@ async fn supervise_rows(
             attempt.runtime,
             shutdown,
             requester,
+            internal,
+            consumers,
         )
         .await;
         attempt.active.begin_terminal_cut(Instant::now());
+        if let Some(token) = internal.as_ref().and_then(|internal| internal.accepted) {
+            // Consume the budget established at the actor cut. Time spent
+            // handing off the ready result cannot renew remote observation.
+            let remaining = token
+                .convergence_deadline()
+                .saturating_duration_since(clock.now());
+            attempt
+                .active
+                .shorten_remote_deadline(Instant::now() + remaining);
+        }
         drop(drive);
 
         match pump_result {
-            Ok(super::LogicalConclusion::Succeeded) => {
+            Ok(
+                super::LogicalConclusion::Succeeded | super::LogicalConclusion::ComputationReady,
+            ) => {
                 session.retire_preparation();
                 return converge_rows_attempts(
                     &mut attempt.active,
@@ -1403,6 +1809,7 @@ async fn supervise_rows(
             }
             Err(ResultPumpFailure::Concluded(failure)) => {
                 session.retire_preparation();
+
                 let convergence = converge_rows_attempts(
                     &mut attempt.active,
                     attempt.schedule.contexts(),
@@ -1426,6 +1833,7 @@ async fn supervise_rows(
             }
             Err(ResultPumpFailure::ActorOutcomeUnknown(failure)) => {
                 session.retire_preparation();
+
                 let convergence = converge_rows_attempts(
                     &mut attempt.active,
                     attempt.schedule.contexts(),
@@ -1464,6 +1872,7 @@ async fn supervise_rows(
                         .await
                         .map(|_| ())
                         .or_else(actor_terminal_refusal);
+
                     let convergence = converge_rows_attempts(
                         &mut attempt.active,
                         attempt.schedule.contexts(),
@@ -1525,7 +1934,15 @@ async fn supervise_rows(
                     Ok(prepared) => prepared,
                     Err(error) => {
                         session.retire_preparation();
-                        let actor_outcome = decision.fail_logical(actor).await;
+                        let actor_outcome = if internal.is_some() {
+                            decision.fail_logical_with_error(actor, error.clone()).await
+                        } else {
+                            // An already handed-off client stream retains its
+                            // originating attempt failure. The separate
+                            // preparation verdict remains supervisor health.
+                            decision.fail_logical(actor).await
+                        };
+
                         let supervision = preparation_supervision_result(error, actor_outcome);
                         let convergence = converge_rows_attempts(
                             &mut attempt.active,
@@ -1594,6 +2011,7 @@ async fn supervise_rows(
                     Ok(instantiation) => instantiation,
                     Err(error) => {
                         session.retire_preparation();
+
                         converge_dormant(dormant.as_mut(), cancellation, shutdown, requester).await;
                         let replacement_convergence = record_active_convergence(
                             registry,
@@ -1644,8 +2062,9 @@ async fn supervise_rows(
                     Ok(reservation) => Some(reservation),
                     Err(error) => {
                         session.retire_preparation();
+                        let error = registry_error(error);
                         let actor_result = actor
-                            .initialization_failed(instantiation)
+                            .initialization_failed_with_error(instantiation, error.clone())
                             .await
                             .map(|_| ())
                             .or_else(actor_terminal_refusal);
@@ -1660,7 +2079,7 @@ async fn supervise_rows(
                             converge_residual_rows_attempts(&mut residuals, registry, registration)
                                 .await;
                         return first_supervision_error(
-                            Err(registry_error(error)),
+                            Err(error),
                             first_supervision_error(
                                 actor_result,
                                 first_supervision_error(replacement_convergence, old_convergence),
@@ -1669,11 +2088,15 @@ async fn supervise_rows(
                     }
                 };
                 let activated = await_with_shutdown(
-                    catch_future_panic(dormant.activate(
-                        &replacement_schedule,
-                        replacement_admissions,
-                        cancellation.clone(),
-                    )),
+                    catch_future_panic(async {
+                        dormant
+                            .activate(
+                                &replacement_schedule,
+                                replacement_admissions,
+                                cancellation.clone(),
+                            )
+                            .await
+                    }),
                     shutdown,
                     requester,
                 )
@@ -1684,7 +2107,10 @@ async fn supervise_rows(
                         drop(replacement_custody.take());
                         session.retire_preparation();
                         let error = failure.into_failure().error().clone();
-                        let actor_outcome = actor.initialization_failed(instantiation).await;
+                        let actor_outcome = actor
+                            .initialization_failed_with_error(instantiation, error.clone())
+                            .await;
+
                         let supervision = preparation_supervision_result(error, actor_outcome);
                         converge_dormant(dormant.as_mut(), cancellation, shutdown, requester).await;
                         let replacement_convergence = record_active_convergence(
@@ -1708,7 +2134,7 @@ async fn supervise_rows(
                             "Native replacement attempt activation panicked",
                         );
                         let actor_result = actor
-                            .initialization_failed(instantiation)
+                            .initialization_failed_with_error(instantiation, error.clone())
                             .await
                             .map(|_| ())
                             .or_else(actor_terminal_refusal);
@@ -1742,7 +2168,7 @@ async fn supervise_rows(
                     let error =
                         result_protocol_error("Native replacement omitted its root result runtime");
                     let actor_result = actor
-                        .initialization_failed(instantiation)
+                        .initialization_failed_with_error(instantiation, error.clone())
                         .await
                         .map(|_| ())
                         .or_else(actor_terminal_refusal);
@@ -2372,12 +2798,21 @@ fn native_future_panic_input(message: &'static str) -> ExecutionFailureInput {
     )
 }
 
+fn internal_consumer_panicked(message: &'static str) -> QueryExecutionError {
+    QueryExecutionError::from_execution(ExecutionFailureInput::new(
+        QueryFailureReason::InternalConsumerPanicked.failure_fact(),
+        SafeDetail::truncating(message),
+        ExecutionFailureSite::Coordinator,
+    ))
+}
+
 fn native_future_panicked(message: &'static str) -> QueryExecutionError {
     QueryExecutionError::from_execution(native_future_panic_input(message))
 }
 
 #[cfg(test)]
 mod tests {
+    include!("supervisor_internal_tests.rs");
     #[test]
     fn terminal_actor_disposition_does_not_hide_invalid_phase_or_service_invariants() {
         use super::super::{LogicalConclusion, LogicalExecutionActorError};
@@ -2704,7 +3139,13 @@ mod tests {
     async fn accepted_start_returns_on_cancellation_before_supervisor_verdict() {
         let (starts, mut start_rx) = mpsc::unbounded_channel();
         let (_shutdown, shutdown) = watch::channel(false);
-        let client = QueryExecutionClient::new(QueryExecutionDriverHandle { starts, shutdown });
+        let client = QueryExecutionClient::new(QueryExecutionDriverHandle {
+            starts,
+            shutdown,
+            query_ids: Arc::new(ProcessQueryIdAllocator::new(QueryProcessNamespace::new(
+                0x50,
+            ))),
+        });
         let (_control, root) = governance();
         let requester = root.owner.cancellation_requester();
         let start = client.start(completion_request(UnreachablePreparationPort), root.owner);
@@ -6222,7 +6663,13 @@ mod tests {
         let seed_drops = Arc::new(AtomicU64::new(0));
         let (starts, mut start_rx) = mpsc::unbounded_channel();
         let (_shutdown_sender, shutdown) = watch::channel(false);
-        let client = QueryExecutionClient::new(QueryExecutionDriverHandle { starts, shutdown });
+        let client = QueryExecutionClient::new(QueryExecutionDriverHandle {
+            starts,
+            shutdown,
+            query_ids: Arc::new(ProcessQueryIdAllocator::new(QueryProcessNamespace::new(
+                0x50,
+            ))),
+        });
 
         let (first_control, first) = governance();
         let first_scope = first.owner.scope();
@@ -6254,12 +6701,15 @@ mod tests {
             request: first_request,
             owner: first_owner,
             reply: first_reply,
+            reserved: first_reserved,
         } = first_command;
         let StartCommand {
             request: second_request,
             owner: second_owner,
             reply: second_reply,
+            reserved: second_reserved,
         } = second_command;
+        assert!(first_reserved.is_none() && second_reserved.is_none());
         first_owner.complete();
         second_owner.complete();
         let start_error = || {
@@ -6611,6 +7061,99 @@ mod tests {
             .unwrap();
 
         assert_ne!(first, rebuilt);
+    }
+
+    #[derive(Debug)]
+    struct RecordingRejectedOpen {
+        opened: Arc<std::sync::Mutex<Vec<QueryExecutionId>>>,
+    }
+
+    impl LogicalExecutionNativePort for RecordingRejectedOpen {
+        fn open(&self, request: LogicalNativeOpenRequest) -> LogicalNativeOpenFuture {
+            self.opened
+                .lock()
+                .unwrap()
+                .push(request.initial_execution());
+            Box::pin(async {
+                Err(crate::api::LogicalNativeOpenFailure::rejected(
+                    "injected Native open rejection after identity observation",
+                )
+                .into())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn reserved_identity_reaches_native_open_without_reallocation() {
+        let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
+            Handle::current(),
+            Arc::new(RecordingRejectedOpen {
+                opened: Arc::clone(&opened),
+            }),
+            QueryProcessNamespace::new(0x51),
+            FrontendProcessId::new_v7(),
+            supervisor_config(),
+        );
+        let reserved = client.reserve_identity().unwrap();
+        let expected = reserved.execution();
+        let (control, root) = governance();
+        let scope = root.owner.scope();
+        let result = client
+            .start_reserved(
+                completion_request(UnreachablePreparationPort),
+                root.owner,
+                reserved,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ref error) if error.kind() == QueryExecutionErrorKind::Rejected)
+        );
+        assert_eq!(*opened.lock().unwrap(), vec![expected]);
+        root.business.release();
+        supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        acknowledge_all_control(&control);
+        scope.wait_released().await;
+    }
+
+    #[tokio::test]
+    async fn foreign_reservation_is_refused_before_native_side_effects() {
+        let opened = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let namespace = QueryProcessNamespace::new(0x52);
+        let donor = ProcessQueryIdAllocator::new(namespace);
+        let reserved = donor.reserve().unwrap();
+        let (mut supervisor, client) = LogicalExecutionSupervisor::new(
+            Handle::current(),
+            Arc::new(RecordingRejectedOpen {
+                opened: Arc::clone(&opened),
+            }),
+            namespace,
+            FrontendProcessId::new_v7(),
+            supervisor_config(),
+        );
+        let (control, root) = governance();
+        let scope = root.owner.scope();
+        let result = client
+            .start_reserved(
+                completion_request(UnreachablePreparationPort),
+                root.owner,
+                reserved,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ref error) if error.kind() == QueryExecutionErrorKind::InvalidRequest)
+        );
+        assert!(opened.lock().unwrap().is_empty());
+        root.business.release();
+        supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        acknowledge_all_control(&control);
+        scope.wait_released().await;
     }
 
     #[tokio::test]

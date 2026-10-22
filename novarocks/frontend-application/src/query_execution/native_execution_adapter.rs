@@ -819,6 +819,7 @@ impl LogicalExecutionNativePort for FrontendLogicalExecutionNativePort {
 /// manifest through these handles and cannot reacquire policy from globals.
 #[derive(Clone)]
 pub(crate) struct FrontendNativeLogicalExecutionRuntime {
+    clock: Arc<dyn novarocks_coordination_contract::MonotonicClock>,
     #[cfg(novarocks_dev_controls)]
     test_controls: Option<Arc<novarocks_native_adapter::test_controls::NativeTestControls>>,
     #[cfg(novarocks_dev_controls)]
@@ -886,8 +887,10 @@ impl FrontendNativeLogicalExecutionRuntime {
         lifecycle_diagnostics: Arc<
             crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
         >,
+        clock: Arc<dyn novarocks_coordination_contract::MonotonicClock>,
     ) -> Self {
         Self {
+            clock,
             #[cfg(novarocks_dev_controls)]
             test_controls: None,
             #[cfg(novarocks_dev_controls)]
@@ -1454,6 +1457,7 @@ impl ProductionManifestAttemptProjection {
             establish,
             replacement_admissions,
             crate::task_execution::manifest_round::ManifestAttemptTransport {
+                clock: Arc::clone(&self.runtime.clock),
                 dispatch_budget: self.runtime.coordination_budgets.dispatch,
                 transport_budget: self.runtime.transport_budget,
                 status_subscription_error_budget: self
