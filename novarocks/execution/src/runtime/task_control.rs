@@ -22,7 +22,7 @@ use crate::runtime::{
     observable::Observable,
 };
 use novarocks_execution_contract::{
-    AcceptedTaskConclusion, ConclusionAcceptance, TaskConclusion, TaskConclusionPort,
+    AcceptedTaskConclusion, SettledContinuation, TaskConclusion, TaskConclusionPort,
     TaskConclusionProposal, TaskFailurePhase, TaskIdentity, TerminationDetail,
 };
 use novarocks_failure_contract::{FailureClass, FailureFact, FailureProjection};
@@ -170,14 +170,14 @@ impl TaskExecutionControl {
     pub(crate) fn exit_health_reporter(&self) -> ExecutionExitReporter {
         self.exit_reporter.clone()
     }
-    pub fn report_failure(
-        &self,
-        cause: ExecutionFailure,
-    ) -> ConclusionAcceptance<ExecutionFailure> {
+    pub fn report_failure(&self, cause: ExecutionFailure) {
         self.owner.submit(TaskConclusionProposal::Failed {
             cause,
             phase: self.phase,
         })
+    }
+    pub fn on_settled(&self, continuation: SettledContinuation<ExecutionFailure>) {
+        self.owner.on_settled(continuation);
     }
     pub fn report_cleanup(&self, cause: &ExecutionFailure) {
         self.owner.report_cleanup(cause, self.phase);
@@ -244,7 +244,7 @@ impl crate::runtime::fragment::ExecutionFailureReporter for TaskExecutionControl
         TaskExecutionControl::report_unresolved_exit(self, cause);
     }
     fn report_failure(&self, error: ExecutionFailure) {
-        let _ = TaskExecutionControl::report_failure(self, error);
+        TaskExecutionControl::report_failure(self, error);
     }
 }
 
@@ -354,10 +354,7 @@ pub(crate) mod test_support {
         fn accepted(&self) -> Option<Snapshot> {
             self.accepted.lock().unwrap().clone()
         }
-        fn submit(
-            &self,
-            proposed: TaskConclusionProposal<ExecutionFailure>,
-        ) -> ConclusionAcceptance<ExecutionFailure> {
+        fn submit(&self, proposed: TaskConclusionProposal<ExecutionFailure>) {
             // This fixture owns one Task domain. The real Worker owner, its
             // status publication and terminal seal are integrated separately.
             let mut reported_evidence = None;
@@ -424,7 +421,6 @@ pub(crate) mod test_support {
                 ));
                 self.stopped.store(current.is_some(), Ordering::Release);
             }
-            let accepted = current.as_ref().unwrap().clone();
             drop(current);
             if decision != ConclusionDecision::Keep {
                 let gap = self.before_notify.lock().unwrap().take();
@@ -435,7 +431,10 @@ pub(crate) mod test_support {
                 self.cv.notify_all();
                 self.observable.notify_observers();
             }
-            ConclusionAcceptance { decision, accepted }
+        }
+        fn on_settled(&self, continuation: SettledContinuation<ExecutionFailure>) {
+            let snapshot = self.accepted();
+            continuation(snapshot);
         }
     }
     impl TaskExecutionPort for Owner {
@@ -475,11 +474,12 @@ pub(crate) mod test_support {
     }
     #[test]
     fn cleanup_and_unknown_exit_leave_the_exact_accepted_task_receipt_unchanged() {
-        use novarocks_execution_contract::{AbortCause, ConclusionDecision};
+        use novarocks_execution_contract::AbortCause;
         let owner = Owner::new();
         let control = owner.view(TaskFailurePhase::Execution);
-        let accepted = owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
-        let original = accepted.accepted;
+        owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let accepted = owner.accepted().unwrap();
+        let original = accepted;
         let cleanup = ExecutionFailure::from(novarocks_functions::KernelFailure::ResourceExhausted);
         control.report_cleanup(&cleanup);
         control.report_unresolved_exit(&cleanup);
@@ -501,8 +501,13 @@ pub(crate) mod test_support {
         );
         // An independently authored original failure still has its own legal
         // acceptance path; cleanup did not consume or refine that opportunity.
-        let refined = control.report_failure(cleanup);
-        assert_eq!(refined.decision, ConclusionDecision::RefineDerived);
+        let before_refined = control.accepted();
+        control.report_failure(cleanup);
+        let refined = control.accepted().unwrap();
+        assert_eq!(
+            refined.neutral().generation().get(),
+            before_refined.unwrap().neutral().generation().get() + 1
+        );
     }
 
     pub(crate) fn owner_for(identity: TaskIdentity) -> Arc<Owner> {
@@ -545,9 +550,19 @@ pub(crate) mod test_support {
         }));
         owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
         let observation = state.error_state().error().unwrap();
-        assert!(!fragment.set_final_status(observation));
+        let before_observation = owner.accepted().unwrap();
+        fragment.set_final_status(observation);
+        assert!(Arc::ptr_eq(&before_observation, &owner.accepted().unwrap()));
         let original = cause();
-        assert!(fragment.set_final_status(original.clone()));
+        fragment.set_final_status(original.clone());
+        assert!(
+            owner
+                .accepted()
+                .unwrap()
+                .originating_failure()
+                .unwrap()
+                .same_occurrence(&original)
+        );
         assert!(completion.should_abort());
         assert_eq!(
             reentered.load(Ordering::Acquire),
@@ -579,8 +594,13 @@ pub(crate) mod test_support {
             "zero drivers do not prove root/finalization work finished"
         );
         let original = cause();
+        completion.fail(original.clone());
         assert!(
-            completion.fail(original.clone()),
+            completion
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&original),
             "physical driver exit cannot suppress another work owner's failure"
         );
         assert!(
@@ -673,9 +693,19 @@ pub(crate) mod test_support {
             observed.failure_fact().evidence(),
             novarocks_failure_contract::FailureEvidence::StopObservation
         );
-        assert!(!runtime.accept_error(observed));
+        let before_observation = owner.accepted().unwrap();
+        runtime.set_error(observed);
+        assert!(Arc::ptr_eq(&before_observation, &owner.accepted().unwrap()));
         let original = cause();
-        assert!(runtime.accept_error(original.clone()));
+        runtime.set_error(original.clone());
+        assert!(
+            owner
+                .accepted()
+                .unwrap()
+                .originating_failure()
+                .unwrap()
+                .same_occurrence(&original)
+        );
         assert!(runtime.error().unwrap().same_occurrence(&original));
         assert!(
             runtime
@@ -694,14 +724,12 @@ pub(crate) mod test_support {
         let canceled = Owner::new();
         let runtime =
             RuntimeErrorState::for_task(Arc::new(canceled.view(TaskFailurePhase::Execution)));
-        let receipt = canceled.submit(TaskConclusionProposal::Canceled(
+        canceled.submit(TaskConclusionProposal::Canceled(
             CancelReason::UpstreamNoLongerNeeded,
         ));
-        assert!(!runtime.accept_error(cause()));
-        assert!(Arc::ptr_eq(
-            &receipt.accepted,
-            &canceled.accepted().unwrap()
-        ));
+        let receipt = canceled.accepted().unwrap();
+        runtime.set_error(cause());
+        assert!(Arc::ptr_eq(&receipt, &canceled.accepted().unwrap()));
         assert_eq!(
             runtime.error().unwrap().failure_fact().evidence(),
             novarocks_failure_contract::FailureEvidence::StopObservation
@@ -721,45 +749,58 @@ pub(crate) mod test_support {
         let reader = owner.view(TaskFailurePhase::Execution);
         let original = cause();
         let source = original.clone();
-        let job = std::thread::spawn(move || publisher.report_failure(source));
+        let job = std::thread::spawn(move || {
+            publisher.report_failure(source);
+            publisher.accepted().unwrap()
+        });
         entered.wait();
         assert!(reader.is_stopped());
         assert!(reader.wait_until_stopped(Duration::ZERO));
         assert!(reader.error().unwrap().same_occurrence(&original));
-        let later = reader.report_failure(cause());
-        assert_eq!(later.decision, ConclusionDecision::Keep);
+        let before_later = reader.accepted();
+        reader.report_failure(cause());
+        let later = reader.accepted().unwrap();
+        assert!(Arc::ptr_eq(&before_later.unwrap(), &later));
         assert!(
             later
-                .accepted
                 .originating_failure()
                 .unwrap()
                 .same_occurrence(&original)
         );
         release.wait();
         let first = job.join().unwrap();
-        assert!(Arc::ptr_eq(&first.accepted, &later.accepted));
+        assert!(Arc::ptr_eq(&first, &later));
     }
     #[test]
     fn accepted_control_has_no_fabricated_origin_and_refinement_reads_the_actual_failure() {
         let owner = Owner::new();
         let view = owner.view(TaskFailurePhase::Execution);
-        let first = owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let first = owner.accepted().unwrap();
         let observation = view.error().unwrap();
         assert_eq!(observation.failure_fact().class(), FailureClass::Control);
-        assert!(first.accepted.originating_failure().is_none());
+        assert!(first.originating_failure().is_none());
         let original = cause();
-        let refined = view.report_failure(original.clone());
-        assert_eq!(refined.decision, ConclusionDecision::RefineDerived);
-        assert_eq!(refined.accepted.neutral().generation().get(), 2);
+        let before_refined = view.accepted();
+        view.report_failure(original.clone());
+        let refined = view.accepted().unwrap();
+        assert_eq!(
+            refined.neutral().generation().get(),
+            before_refined.unwrap().neutral().generation().get() + 1
+        );
+        assert_eq!(refined.neutral().generation().get(), 2);
         assert!(view.error().unwrap().same_occurrence(&original));
         let owner = Owner::new();
         let view = owner.view(TaskFailurePhase::Execution);
-        let canceled = owner.submit(TaskConclusionProposal::Canceled(
+        owner.submit(TaskConclusionProposal::Canceled(
             CancelReason::UpstreamNoLongerNeeded,
         ));
-        let later = view.report_failure(cause());
-        assert_eq!(later.decision, ConclusionDecision::Keep);
-        assert!(Arc::ptr_eq(&canceled.accepted, &later.accepted));
+        let canceled = owner.accepted().unwrap();
+        let before_later = view.accepted();
+        view.report_failure(cause());
+        let later = view.accepted().unwrap();
+        assert!(Arc::ptr_eq(&before_later.unwrap(), &later));
+        assert!(Arc::ptr_eq(&canceled, &later));
         assert!(view.accepted().unwrap().originating_failure().is_none());
     }
     #[test]
@@ -768,11 +809,13 @@ pub(crate) mod test_support {
         let prep = owner.view(TaskFailurePhase::Preparation);
         let execution = prep.in_phase(TaskFailurePhase::Execution);
         let original = cause();
-        let accepted = prep.report_failure(original.clone());
-        let later = execution.report_failure(cause());
-        assert!(Arc::ptr_eq(&accepted.accepted, &later.accepted));
+        prep.report_failure(original.clone());
+        let accepted = prep.accepted().unwrap();
+        execution.report_failure(cause());
+        let later = execution.accepted().unwrap();
+        assert!(Arc::ptr_eq(&accepted, &later));
         let TaskConclusion::Terminated(TerminationDetail::Failed(failure)) =
-            accepted.accepted.neutral().conclusion()
+            accepted.neutral().conclusion()
         else {
             panic!("accepted original failure");
         };
@@ -780,20 +823,23 @@ pub(crate) mod test_support {
         assert!(execution.error().unwrap().same_occurrence(&original));
         let owner = Owner::new();
         let view = owner.view(TaskFailurePhase::Execution);
-        let successful = owner.submit(TaskConclusionProposal::Succeeded);
+        owner.submit(TaskConclusionProposal::Succeeded);
+        let successful = owner.accepted().unwrap();
         assert!(
             view.is_stopped(),
             "any accepted Task conclusion closes ordinary production"
         );
-        let later = view.report_failure(cause());
-        assert!(Arc::ptr_eq(&successful.accepted, &later.accepted));
+        view.report_failure(cause());
+        let later = view.accepted().unwrap();
+        assert!(Arc::ptr_eq(&successful, &later));
         assert!(view.error().is_none());
     }
     #[test]
     fn observed_stop_cannot_refine_peer_placeholder_but_a_genuine_control_failure_can() {
         let owner = Owner::new();
         let view = owner.view(TaskFailurePhase::Execution);
-        let first = owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let first = owner.accepted().unwrap();
         let observed = view.error().unwrap();
         assert_eq!(
             observed.failure_fact().evidence(),
@@ -804,10 +850,12 @@ pub(crate) mod test_support {
             novarocks_functions::KernelFailure::Cancelled.into(),
             novarocks_functions::KernelFailure::DeadlineExceeded.into(),
         ] {
-            let later = view.report_failure(observation);
-            assert_eq!(later.decision, ConclusionDecision::Keep);
-            assert!(Arc::ptr_eq(&first.accepted, &later.accepted));
-            assert!(later.accepted.originating_failure().is_none());
+            let before_later = view.accepted();
+            view.report_failure(observation);
+            let later = view.accepted().unwrap();
+            assert!(Arc::ptr_eq(&before_later.unwrap(), &later));
+            assert!(Arc::ptr_eq(&first, &later));
+            assert!(later.originating_failure().is_none());
         }
         #[derive(Debug)]
         struct LocalTimeout;
@@ -829,8 +877,13 @@ pub(crate) mod test_support {
             }
         }
         let original = ExecutionFailure::from_domain(LocalTimeout);
-        let refined = view.report_failure(original.clone());
-        assert_eq!(refined.decision, ConclusionDecision::RefineDerived);
+        let before_refined = view.accepted();
+        view.report_failure(original.clone());
+        let refined = view.accepted().unwrap();
+        assert_eq!(
+            refined.neutral().generation().get(),
+            before_refined.unwrap().neutral().generation().get() + 1
+        );
         assert!(view.error().unwrap().same_occurrence(&original));
     }
     #[test]
@@ -838,9 +891,12 @@ pub(crate) mod test_support {
         let owner = Owner::new();
         let view = owner.view(TaskFailurePhase::Execution);
         let observation: ExecutionFailure = novarocks_functions::KernelFailure::Cancelled.into();
-        let accepted = view.report_failure(observation.clone());
-        assert_eq!(accepted.decision, ConclusionDecision::Accept);
-        let primary = accepted.accepted.originating_failure().unwrap();
+        let before_accepted = view.accepted();
+        view.report_failure(observation.clone());
+        let accepted = view.accepted().unwrap();
+        assert!(before_accepted.is_none());
+        assert_eq!(accepted.neutral().generation().get(), 1);
+        let primary = accepted.originating_failure().unwrap();
         assert_eq!(primary.failure_fact().class(), FailureClass::Unexpected);
         let mut source = primary.source();
         let mut seen = false;

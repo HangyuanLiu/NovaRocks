@@ -40,8 +40,8 @@ use crate::runtime::{
     task_control::{TaskExecutionControl, TaskExecutionPort, test_support::Owner as TaskOwner},
 };
 use novarocks_execution_contract::{
-    AbortCause, AcceptedTaskConclusion, ConclusionAcceptance, TaskConclusionPort,
-    TaskConclusionProposal, TaskFailurePhase, TaskIdentity,
+    AbortCause, AcceptedTaskConclusion, TaskConclusionPort, TaskConclusionProposal,
+    TaskFailurePhase, TaskIdentity,
 };
 use novarocks_failure_contract::FailureFact;
 use std::{
@@ -92,10 +92,16 @@ impl TaskConclusionPort<ExecutionFailure> for Port {
     fn accepted(&self) -> Option<Arc<AcceptedTaskConclusion<ExecutionFailure>>> {
         self.task.accepted()
     }
-    fn submit(
+    fn on_settled(
         &self,
-        proposal: TaskConclusionProposal<ExecutionFailure>,
-    ) -> ConclusionAcceptance<ExecutionFailure> {
+        continuation: novarocks_execution_contract::SettledContinuation<ExecutionFailure>,
+    ) {
+        novarocks_execution_contract::TaskConclusionPort::on_settled(
+            self.task.as_ref(),
+            continuation,
+        );
+    }
+    fn submit(&self, proposal: TaskConclusionProposal<ExecutionFailure>) {
         self.task.submit(proposal)
     }
 }
@@ -431,10 +437,9 @@ fn fanout_cleanup_error_or_opaque_panic_keeps_peer_and_closes_safe_actual_join_o
         HookFault::CloseOpaque,
     ] {
         let mut f = fixture(&runtime, mode, None);
-        let peer = f
-            .port
-            .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
-            .accepted;
+        f.port
+            .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let peer = f.port.accepted().unwrap();
         assert_eq!(
             f.driver.finish_with_state(DriverState::Canceled),
             DriverState::PendingFinish
@@ -516,10 +521,9 @@ fn fanout_required_event_refines_peer_once_before_independent_actual_sibling_joi
         .unwrap();
     let original: ExecutionFailure = novarocks_functions::KernelFailure::ResourceExhausted.into();
     let mut f = fixture(&runtime, HookFault::None, Some(original.clone()));
-    let peer = f
-        .port
-        .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
-        .accepted;
+    f.port
+        .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+    let peer = f.port.accepted().unwrap();
     assert_eq!(
         f.driver.finish_with_state(DriverState::Finished),
         DriverState::PendingFinish

@@ -180,10 +180,15 @@ fn an_aborted_compiled_scan_reaches_its_parked_reader() {
     let running = prepare(&program, bound(&op), &output)
         .expect("compiled scan prepares")
         .start();
+    let cancellation: crate::runtime::fragment::ExecutionFailure =
+        crate::runtime::fragment::FragmentCancelReason::new("aborted by the test").into();
+    running.cancel(cancellation.clone());
     assert!(
-        running.cancel(crate::runtime::fragment::FragmentCancelReason::new(
-            "aborted by the test"
-        ))
+        running
+            .conclusion()
+            .unwrap()
+            .unwrap_err()
+            .same_occurrence(&cancellation)
     );
     let error = running
         .join()

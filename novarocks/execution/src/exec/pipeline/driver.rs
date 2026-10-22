@@ -3741,7 +3741,7 @@ mod terminal_signal_tests {
     struct PeerCleanupObservation {
         before: Option<ExecutionResult<()>>,
         peer: DriverState,
-        peer_accepted: Option<bool>,
+        peer_conclusion: Option<ExecutionResult<()>>,
         after: Option<ExecutionResult<()>>,
     }
 
@@ -3763,8 +3763,11 @@ mod terminal_signal_tests {
             // here could be swallowed without failing the test thread.
             let before = self.completion.conclusion();
             let peer = self.peer.lock().unwrap().process(Duration::ZERO);
-            let peer_accepted = match &peer {
-                DriverState::Failed(error) => Some(self.completion.fail(error.clone())),
+            let peer_conclusion = match &peer {
+                DriverState::Failed(error) => {
+                    self.completion.fail(error.clone());
+                    self.completion.conclusion()
+                }
                 _ => None,
             };
             self.observations
@@ -3773,7 +3776,7 @@ mod terminal_signal_tests {
                 .push(PeerCleanupObservation {
                     before,
                     peer,
-                    peer_accepted,
+                    peer_conclusion,
                     after: self.completion.conclusion(),
                 });
         }
@@ -3848,7 +3851,7 @@ mod terminal_signal_tests {
                 .unwrap_err()
                 .same_occurrence(&original)
         );
-        assert_eq!(observed.peer_accepted, Some(false));
+        assert_eq!(observed.peer_conclusion, Some(Err(original.clone())));
         assert_eq!(observed.after, Some(Err(original.clone())));
         assert!(
             observed
@@ -3861,7 +3864,15 @@ mod terminal_signal_tests {
         );
         // The peer already reached completion, just as an executor worker can
         // while the originating worker remains in an operator callback.
-        assert!(!completion.fail(original.clone()));
+        let previous = completion.conclusion().unwrap().unwrap_err();
+        completion.fail(original.clone());
+        assert!(
+            completion
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&previous)
+        );
         assert_eq!(completion.conclusion(), Some(Err(original.clone())));
         assert_eq!(runtime.error(), Some(original));
         assert!(completion.stopped_fact().is_none());

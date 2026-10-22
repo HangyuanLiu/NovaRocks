@@ -561,7 +561,7 @@ mod owner_tests {
             std::thread::yield_now();
         }
         assert!(root.finishing.load(Ordering::Acquire));
-        let _ = novarocks_execution_contract::TaskConclusionPort::submit(
+        novarocks_execution_contract::TaskConclusionPort::submit(
             task.as_ref(),
             novarocks_execution_contract::TaskConclusionProposal::Canceled(
                 novarocks_execution_contract::CancelReason::UpstreamNoLongerNeeded,
@@ -2221,7 +2221,7 @@ impl RunningFragmentHandle {
         if self.stopped_fact().is_some() {
             return;
         }
-        let _ = self.inner.pipeline.cancel(reason.clone());
+        self.inner.pipeline.cancel(reason.clone());
         self.inner.lifecycle.interrupt(reason.detail());
     }
     pub fn join(&self) -> FragmentTerminalFact {
@@ -2451,7 +2451,7 @@ impl Drop for RunningFragmentInner {
             .is_none()
         {
             let reason = FragmentCancelReason::new("running fragment handle dropped");
-            let _ = self.pipeline.cancel(reason.clone());
+            self.pipeline.cancel(reason.clone());
             self.lifecycle.interrupt(reason.detail());
         }
     }

@@ -4711,7 +4711,7 @@ impl CreationTransaction<'_> {
         let failure = CreationFailure::domain(domain_outcome, rejection.operation_failure());
         self.failure = Some(failure.clone());
         if let Some(status) = self.cell.accepted_status() {
-            let _ = status
+            status
                 .execution_control(novarocks_execution_contract::TaskFailurePhase::Preparation)
                 .report_failure(rejection.into_failure());
         }

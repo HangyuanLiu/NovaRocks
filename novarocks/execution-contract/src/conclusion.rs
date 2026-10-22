@@ -33,7 +33,7 @@ pub enum ConclusionDecision {
     RefineDerived,
 }
 
-/// Called by the Task owner under its acceptance lock before terminal
+/// Called by the Task owner within its adjudication step before terminal
 /// publication. An already published terminal retains its receipt; late facts
 /// are diagnostics. No timestamp ordering,
 /// lifecycle observer, or physical-stop escalation can replace this decision.
@@ -56,7 +56,7 @@ pub fn decide_conclusion(
     }
 }
 
-/// A reporting owner calls this under the same acceptance lock. Stop
+/// A reporting owner calls this within the same adjudication step. Stop
 /// observations keep every existing receipt, including a derived peer cause.
 /// With no accepted cause the owner reports its own unexpected unowned-stop
 /// failure, retaining the actual observation as its source. Class alone never
@@ -187,39 +187,58 @@ impl<C> AcceptedTaskConclusion<C> {
         self.originating_failure.as_ref()
     }
 }
-#[derive(Debug)]
-pub struct ConclusionAcceptance<C> {
-    pub decision: ConclusionDecision,
-    pub accepted: Arc<AcceptedTaskConclusion<C>>,
-}
-impl<C> Clone for ConclusionAcceptance<C> {
-    fn clone(&self) -> Self {
-        Self {
-            decision: self.decision,
-            accepted: Arc::clone(&self.accepted),
-        }
-    }
-}
+/// A barrier continuation, called exactly once after every Task input ordered
+/// before its registration has been adjudicated and published. `None` means
+/// no conclusion was accepted before that point. The snapshot is not frozen:
+/// later inputs may still change it through the shared refinement rule.
+pub type SettledContinuation<C> =
+    Box<dyn FnOnce(Option<Arc<AcceptedTaskConclusion<C>>>) + Send + 'static>;
 
 /// Bound to one exact Task from Accepted through preparation and execution.
-/// The Task owner projects a failure once and accepts it under the same lock
-/// as control and success. Readers receive the original accepted snapshot,
-/// including when a later proposal loses. Notifications happen after that
-/// lock is released and do not choose, replace or reconstruct a cause.
-/// Reports project their author's causal evidence through
-/// `decide_reported_failure`: an observed stop cannot refine a derived peer
-/// placeholder. An unowned observation is an unexpected owner failure with
-/// its actual observation preserved as source, not an invented cancellation.
+///
+/// `submit` hands off an owned proposal without returning a verdict or waiting
+/// for another thread to advance. Each handed-off proposal is adjudicated once,
+/// eventually when its owner keeps running. All Task inputs share an order
+/// consistent with happens-before, including physical exit and settlement.
+/// A handoff may run short nonblocking observers inline; callers must not hold
+/// locks needed by observers or rely on notification having run on return.
+///
+/// Failures are projected before handoff. The shared adjudication rules retain
+/// the first cause, allowing only an originating failure to refine a live peer
+/// placeholder. Success requires actual stop and completed output obligations;
+/// terminal conclusions cannot be refined. Stop observations cannot refine an
+/// existing conclusion; an unowned stop is an unexpected owner failure with
+/// the actual observation as its source.
+///
+/// Publication installs the immutable snapshot before setting the monotonic
+/// stop signal, then notifies outside owner locks and publication fences.
+/// Handoff does not promise immediate visibility. Reads may lag proposals;
+/// irreversible decisions read only inside an owner adjudication step or after
+/// a settled continuation begins. Settlement is a barrier, not a result freeze.
+/// Owner-driven actions complete termination and wake stopped work.
+///
+/// Rich sources belong to the owner; losing sources are destroyed outside its
+/// locks and publication fences. Unwind before handoff means no transfer;
+/// unwind after it cannot revoke transfer. A caller unable to distinguish these
+/// retains its original work and reports unresolved local exit.
+///
+/// If an owner fails, published conclusions remain. Tasks without one first
+/// publish an explicit owner failure, then stop. Unadjudicated proposals are
+/// discarded and each registered continuation runs once with the published
+/// snapshot, including during shutdown or after Task termination.
 ///
 /// `C` is a local domain-projected cause, never a generated DTO or a String.
-/// This generic contract keeps Execution's rich source out of wire contracts.
+// Design: ADR-0193 (docs/adr/ADR-0193-task-conclusion-proposals-and-settled-points.md)
 pub trait TaskConclusionPort<C>: Send + Sync
 where
     C: std::error::Error + crate::failure::FailureProjection + Send + Sync + 'static,
 {
     fn identity(&self) -> TaskIdentity;
-    fn submit(&self, proposed: TaskConclusionProposal<C>) -> ConclusionAcceptance<C>;
+    /// Transfers one proposal; its published effect may become visible later.
+    fn submit(&self, proposed: TaskConclusionProposal<C>);
     fn accepted(&self) -> Option<Arc<AcceptedTaskConclusion<C>>>;
+    /// Registers a nonblocking barrier continuation without waiting for it.
+    fn on_settled(&self, continuation: SettledContinuation<C>);
 }
 
 #[cfg(test)]
@@ -378,19 +397,13 @@ mod source_ownership_tests {
         let original =
             AcceptedTaskConclusion::new(receipt(failed()), Some(Origin(Arc::clone(&drops))))
                 .unwrap();
-        let accepted = ConclusionAcceptance {
-            decision: ConclusionDecision::Accept,
-            accepted: Arc::new(original),
-        };
+        let accepted = Arc::new(original);
         let alias = accepted.clone();
         assert!(std::ptr::eq(
-            accepted.accepted.originating_failure().unwrap(),
-            alias.accepted.originating_failure().unwrap()
+            accepted.originating_failure().unwrap(),
+            alias.originating_failure().unwrap()
         ));
-        assert!(std::ptr::eq(
-            accepted.accepted.neutral(),
-            alias.accepted.neutral()
-        ));
+        assert!(std::ptr::eq(accepted.neutral(), alias.neutral()));
         drop(accepted);
         assert_eq!(drops.load(Ordering::Acquire), 0);
         drop(alias);

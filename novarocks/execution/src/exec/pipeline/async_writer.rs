@@ -4101,9 +4101,8 @@ pub(crate) mod tests {
         for required in [true, false] {
             let runtime = runtime();
             let task = Owner::new();
-            let accepted = task
-                .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
-                .accepted;
+            task.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+            let accepted = task.accepted().unwrap();
             let signal = Arc::new(RuntimeErrorState::for_task(Arc::new(
                 task.view(TaskFailurePhase::Execution),
             )));

@@ -198,13 +198,12 @@ impl RunningPipelineExecution {
     }
 
     /// Locally cancel this fragment and wake any blocked drivers so join can drain them.
-    pub fn cancel(&self, err: impl Into<ExecutionFailure>) -> bool {
+    pub fn cancel(&self, err: impl Into<ExecutionFailure>) {
         let err = err.into();
-        let accepted = self.fragment_ctx.set_final_status(err);
-        accepted
+        self.fragment_ctx.set_final_status(err);
     }
 
-    pub fn fail(&self, err: impl Into<ExecutionFailure>) -> bool {
+    pub fn fail(&self, err: impl Into<ExecutionFailure>) {
         self.cancel(err)
     }
 
@@ -836,11 +835,19 @@ mod tests {
             runtime_state.error().expect("same runtime latch").cause(),
             error.cause()
         );
-        assert!(!running.fail(novarocks_functions::KernelFailure::Internal(
+        let previous = running.conclusion().unwrap().unwrap_err();
+        running.fail(novarocks_functions::KernelFailure::Internal(
             novarocks_functions::KernelDiagnostic::new(
-                &("later identical-looking failure".to_owned())
-            )
-        )));
+                &("later identical-looking failure".to_owned()),
+            ),
+        ));
+        assert!(
+            running
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&previous)
+        );
         assert_eq!(running.join(), Err(original.clone()));
         assert_eq!(failure_signals.load(Ordering::SeqCst), 1);
         original
@@ -1318,7 +1325,8 @@ mod tests {
             crate::runtime::fragment::prepare_compiled_fragment(submission, context).unwrap();
         let original: ExecutionFailure =
             novarocks_functions::KernelFailure::ResourceExhausted.into();
-        let _ = control.report_failure(original.clone());
+        control.report_failure(original.clone());
+        let _ = control.accepted().unwrap();
         state.armed.store(true, Ordering::Release);
         let mut slot = Some(dormant);
         let running = DormantFragmentHandle::try_drain_stopped(&mut slot).unwrap();
@@ -1501,11 +1509,11 @@ mod tests {
             std::thread::yield_now();
         }
         let entered_wait = state.error_state().waiting_count() == 1;
-        assert!(
-            running.cancel(crate::runtime::fragment::FragmentCancelReason::new(
-                "cancel actual SLEEP".to_string()
-            ))
-        );
+        let original_cancel: ExecutionFailure =
+            crate::runtime::fragment::FragmentCancelReason::new("cancel actual SLEEP".to_string())
+                .into();
+        running.cancel(original_cancel.clone());
+        assert!(state.error().unwrap().same_occurrence(&original_cancel));
         let cancellation = state.error().expect("cancel installed its actual cause");
         let (tx, rx) = mpsc::channel();
         let join = std::thread::spawn(move || {

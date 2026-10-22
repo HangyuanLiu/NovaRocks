@@ -1572,16 +1572,12 @@ fn a_task_failure_can_win_the_context_latch() {
     let original = novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
         FixtureRefusal::Operator,
     );
-    let accepted = reporter.report_failure(
-        original.clone(),
-        novarocks_execution_contract::TaskFailurePhase::Execution,
-    );
-    assert_eq!(
-        accepted.decision,
-        novarocks_execution_contract::ConclusionDecision::Accept
-    );
+    let control = fixture.task_host.control(reporter.identity());
+    control.report_failure(original.clone());
+    let accepted = control.accepted().unwrap();
+    assert_eq!(accepted.neutral().generation().get(), 1);
     assert!(std::ptr::eq(
-        accepted.accepted.originating_failure().unwrap().cause(),
+        accepted.originating_failure().unwrap().cause(),
         original.cause()
     ));
     assert_eq!(reporter.current().state(), TaskState::Failing);
@@ -1605,7 +1601,7 @@ fn a_task_failure_can_win_the_context_latch() {
         60015,
         "operator error",
     );
-    assert!(Arc::ptr_eq(&source, &accepted.accepted));
+    assert!(Arc::ptr_eq(&source, &accepted));
     reporter.release_output();
     reporter.note_actual_stopped();
     reporter.note_resources_converged();
@@ -4280,16 +4276,12 @@ fn task_failed_revocation_is_not_a_missing_active_result_refusal() {
     let original = novarocks_execution::runtime::fragment::ExecutionFailure::from_domain(
         FixtureRefusal::ArrayLengths,
     );
-    let accepted = child_reporter.report_failure(
-        original.clone(),
-        novarocks_execution_contract::TaskFailurePhase::Execution,
-    );
-    assert_eq!(
-        accepted.decision,
-        novarocks_execution_contract::ConclusionDecision::Accept
-    );
+    let control = fixture.task_host.control(child_reporter.identity());
+    control.report_failure(original.clone());
+    let accepted = control.accepted().unwrap();
+    assert_eq!(accepted.neutral().generation().get(), 1);
     assert!(std::ptr::eq(
-        accepted.accepted.originating_failure().unwrap().cause(),
+        accepted.originating_failure().unwrap().cause(),
         original.cause()
     ));
     let failure = match child_reporter.current().termination().cloned().unwrap() {
@@ -4315,7 +4307,7 @@ fn task_failed_revocation_is_not_a_missing_active_result_refusal() {
         60016,
         "upstream array lengths differ",
     );
-    assert!(Arc::ptr_eq(&original_accepted, &accepted.accepted));
+    assert!(Arc::ptr_eq(&original_accepted, &accepted));
     fixture.registry.advance_deadlines();
     assert_eq!(
         fixture.registry.context_state(context),

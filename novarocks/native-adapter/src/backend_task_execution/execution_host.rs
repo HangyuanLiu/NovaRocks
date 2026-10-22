@@ -2234,15 +2234,10 @@ pub(super) fn failure_category(
 /// requires, and keeps an abort that already won: a failure cannot rewrite a
 /// stand-down the Worker published before this runnable heard of it.
 fn report_failure(reporter: &TaskStatusReporter, failure: ExecutionFailure) {
-    let accepted = reporter.report_failure(
+    reporter.conclude_failure(
         failure,
         novarocks_execution_contract::TaskFailurePhase::Execution,
     );
-    if let novarocks_execution_contract::TaskConclusion::Terminated(detail) =
-        accepted.accepted.neutral().conclusion()
-    {
-        reporter.conclude_termination(detail.clone(), TaskOutputFacts::default());
-    }
     reporter.release_output();
 }
 
@@ -6025,23 +6020,20 @@ pub(crate) mod tests {
     #[test]
     fn receiver_construction_abort_does_not_refine_the_accepted_peer_failure() {
         use novarocks_execution_contract::failure::{FailureEvidence, FailureProjection};
-        use novarocks_execution_contract::{
-            ConclusionDecision, TaskConclusionPort, TaskFailurePhase,
-        };
+        use novarocks_execution_contract::{TaskConclusionPort, TaskFailurePhase};
         let (owner, reporter) = reporter_for(identity(91_211, 1, 1));
         reporter.aborting(AbortCause::PeerTaskFailed);
         let before = owner.accepted().unwrap();
         let observed =
             ExecutionFailure::from_domain(ReceiverConstructionAborted(AbortCause::PeerTaskFailed));
-        let receipt = owner
+        owner
             .execution_control(TaskFailurePhase::Execution)
             .report_failure(observed.clone());
-        assert_eq!(
-            receipt.decision,
-            ConclusionDecision::Keep,
+        let receipt = owner.accepted().unwrap();
+        assert!(
+            Arc::ptr_eq(&before, &receipt),
             "observing an accepted abort must not masquerade as its origin"
         );
-        assert!(Arc::ptr_eq(&before, &receipt.accepted));
         assert_eq!(
             observed.failure_fact().evidence(),
             FailureEvidence::StopObservation
@@ -7511,10 +7503,10 @@ pub(crate) mod tests {
         assert!(
             matches!(source.downcast_ref::<novarocks_worker::CompletionReservationError>(), Some(novarocks_worker::CompletionReservationError::Duplicate(id)) if *id == root)
         );
-        let accepted = status
+        status
             .execution_control(TaskFailurePhase::Preparation)
-            .report_failure(refusal.into_failure())
-            .accepted;
+            .report_failure(refusal.into_failure());
+        let accepted = status.accepted().unwrap();
         preparation.rollback_host(
             || host.remove_inbound_capability(&descriptor),
             || host.remove_receiver(&descriptor),
@@ -7623,9 +7615,8 @@ pub(crate) mod tests {
             )
             .unwrap();
         host.execution_runtime.driver_executor().shutdown().unwrap();
-        let accepted = status
-            .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
-            .accepted;
+        status.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let accepted = status.accepted().unwrap();
         preparation.rollback_host(
             || host.remove_inbound_capability(&descriptor),
             || host.remove_receiver(&descriptor),
@@ -7763,9 +7754,8 @@ pub(crate) mod tests {
             let _ = receive.await;
             drop(resource);
         }));
-        let accepted = status
-            .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
-            .accepted;
+        status.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let accepted = status.accepted().unwrap();
         preparation.rollback_host(
             || host.remove_inbound_capability(&descriptor),
             || host.remove_receiver(&descriptor),

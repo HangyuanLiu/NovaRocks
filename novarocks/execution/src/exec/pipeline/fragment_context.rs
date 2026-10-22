@@ -173,11 +173,10 @@ impl FragmentContext {
         Arc::clone(&self.event_scheduler)
     }
 
-    pub(crate) fn set_final_status(&self, err: impl Into<ExecutionFailure>) -> bool {
-        let accepted = self.runtime_state.error_state().accept_error(err.into());
+    pub(crate) fn set_final_status(&self, err: impl Into<ExecutionFailure>) {
+        self.runtime_state.error_state().set_error(err.into());
         // Driver control subscriptions already cover the owner's generation.
         // Explicit fanout also advances any currently parked scheduler slots.
         self.event_scheduler.enqueue_all_blocked();
-        accepted
     }
 }

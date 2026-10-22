@@ -179,10 +179,10 @@ impl FragmentCompletion {
         self.control.is_stopped()
     }
 
-    pub fn fail(&self, err: impl Into<ExecutionFailure>) -> bool {
+    pub fn fail(&self, err: impl Into<ExecutionFailure>) {
         // The shared owner publishes outside the physical completion lock.
         // A parked driver's notification may reenter completion inspection.
-        self.control.accept_error(err.into())
+        self.control.set_error(err.into())
     }
 
     pub fn driver_finished(&self) -> bool {
@@ -291,7 +291,7 @@ impl FragmentCompletion {
                 // Time does not prove exit. Submit the real deadline cause,
                 // request local stand-down even if an earlier cause won, and
                 // still join the exact submitted driver group.
-                let _ = self.fail(err);
+                self.fail(err);
                 on_timeout();
                 return self.wait();
             }
@@ -1405,7 +1405,16 @@ mod tests {
         );
 
         let failure = ExecutionFailure::from(novarocks_functions::KernelFailure::DeadlineExceeded);
-        assert!(completion.fail(failure.clone()));
+        let submitted_failure: crate::runtime::fragment::ExecutionFailure =
+            (failure.clone()).into();
+        completion.fail(submitted_failure.clone());
+        assert!(
+            completion
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&submitted_failure)
+        );
         assert_eq!(completion.conclusion(), Some(Err(failure.clone())));
         assert_eq!(completion.remaining_drivers(), 2);
         assert_eq!(completion.stopped_fact(), None);
@@ -1437,7 +1446,16 @@ mod tests {
         });
         let original: ExecutionFailure =
             novarocks_functions::KernelFailure::DeadlineExceeded.into();
-        assert!(completion.fail(original.clone()));
+        let submitted_failure: crate::runtime::fragment::ExecutionFailure =
+            (original.clone()).into();
+        completion.fail(submitted_failure.clone());
+        assert!(
+            completion
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&submitted_failure)
+        );
         assert!(
             seen.lock().unwrap().is_none(),
             "binding a dormant no-job scope is not activation"
@@ -1865,7 +1883,17 @@ mod tests {
         // The fragment fails elsewhere: the parked driver gets one turn to
         // deliver cancellation, then waits for its owner again.
         let failure = ExecutionFailure::from(novarocks_functions::KernelFailure::DeadlineExceeded);
-        assert!(harness.completion.fail(failure.clone()));
+        let submitted_failure: crate::runtime::fragment::ExecutionFailure =
+            (failure.clone()).into();
+        harness.completion.fail(submitted_failure.clone());
+        assert!(
+            harness
+                .completion
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&submitted_failure)
+        );
         harness.fragment_ctx.set_final_status(failure.clone());
         assert!(wait_until(Duration::from_secs(1), || {
             harness.cancelled.load(Ordering::Acquire)
@@ -1976,9 +2004,8 @@ mod tests {
         let executor = GlobalDriverExecutor::new(1);
         executor.shutdown().unwrap();
         let owner = crate::runtime::task_control::test_support::Owner::new();
-        let receipt = owner
-            .submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed))
-            .accepted;
+        owner.submit(TaskConclusionProposal::Aborted(AbortCause::PeerTaskFailed));
+        let receipt = owner.accepted().unwrap();
         let control = Arc::new(RuntimeErrorState::for_task(Arc::new(
             owner.view(TaskFailurePhase::Execution),
         )));
@@ -2374,8 +2401,24 @@ mod tests {
             Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
         );
         let first: ExecutionFailure = novarocks_functions::KernelFailure::ResourceExhausted.into();
-        assert!(completion.fail(first.clone()));
-        assert!(!completion.fail(novarocks_functions::KernelFailure::Cancelled));
+        let submitted_failure: crate::runtime::fragment::ExecutionFailure = (first.clone()).into();
+        completion.fail(submitted_failure.clone());
+        assert!(
+            completion
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&submitted_failure)
+        );
+        let previous = completion.conclusion().unwrap().unwrap_err();
+        completion.fail(novarocks_functions::KernelFailure::Cancelled);
+        assert!(
+            completion
+                .conclusion()
+                .unwrap()
+                .unwrap_err()
+                .same_occurrence(&previous)
+        );
         assert_eq!(completion.conclusion(), Some(Err(first.clone())));
         assert_eq!(completion.remaining_drivers(), 2);
         assert!(completion.stopped_fact().is_none());

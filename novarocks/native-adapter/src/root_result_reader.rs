@@ -177,7 +177,6 @@ impl NativeRootResultReader {
         request: &RootResultRead,
         admitted: &novarocks_worker::root_result_channel::RootChannelRead,
     ) -> bool {
-        use novarocks_execution_contract::ConclusionDecision;
         if request.wanted().map(|sequence| sequence.get()) != Some(2) {
             return false;
         }
@@ -233,35 +232,29 @@ impl NativeRootResultReader {
             return false;
         }
         let original = crate::task_protocol_fault::injected_task_execution_failure();
-        let receipt = control.report_failure(original.clone());
-        if !matches!(
-            receipt.decision,
-            ConclusionDecision::Accept | ConclusionDecision::RefineDerived
-        ) || !receipt
-            .accepted
-            .originating_failure()
-            .is_some_and(|accepted| std::ptr::eq(accepted.cause(), original.cause()))
-        {
-            return false;
-        }
-        if let Err(error) =
-            crate::task_protocol_fault::record_task_execution_failure(identity, &claim)
-        {
-            control.report_cleanup(&error);
-            return true;
-        }
-        let execution = identity.query_execution_id();
-        eprintln!(
-            "NOVAROCKS_TASK_EXECUTION_FAILURE_AFTER_VISIBLE_PREFIX_ACCEPTED execution_id={}:{}:{} stage={} task={} backend={} token={} accepted_consumed={}",
-            execution.query_id().high(),
-            execution.query_id().low(),
-            execution.attempt_id().get(),
-            identity.stage_id().get(),
-            identity.task_id().get(),
-            identity.backend_process_id(),
-            claim.token,
-            admitted.accepted_consumed()
-        );
+        control.report_failure(original.clone());
+        let consumed = admitted.accepted_consumed();
+        let control = Arc::clone(&control);
+        control.clone().on_settled(Box::new(move |snapshot| {
+            if !snapshot.as_ref().and_then(|snapshot| snapshot.originating_failure())
+                .is_some_and(|accepted| std::ptr::eq(accepted.cause(), original.cause())) {
+                return;
+            }
+            if let Err(error) =
+                crate::task_protocol_fault::record_task_execution_failure(identity, &claim)
+            {
+                control.report_cleanup(&error);
+                return;
+            }
+            let execution = identity.query_execution_id();
+            eprintln!(
+                "NOVAROCKS_TASK_EXECUTION_FAILURE_AFTER_VISIBLE_PREFIX_ACCEPTED execution_id={}:{}:{} stage={} task={} backend={} token={} accepted_consumed={}",
+                execution.query_id().high(), execution.query_id().low(),
+                execution.attempt_id().get(), identity.stage_id().get(),
+                identity.task_id().get(), identity.backend_process_id(),
+                claim.token, consumed
+            );
+        }));
         true
     }
 
