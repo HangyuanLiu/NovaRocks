@@ -175,7 +175,6 @@ fn frozen() -> FrozenConnectorRead {
         vec![],
         NonZeroU64::new(100).unwrap(),
         NonZeroU64::new(4096).unwrap(),
-        ConnectorReadWorkSource::RuntimeSplits,
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(
@@ -214,7 +213,6 @@ fn legacy() -> StaticConnectorScan {
         vec![],
         NonZeroU64::new(100).unwrap(),
         NonZeroU64::new(4096).unwrap(),
-        ConnectorReadWorkSource::RuntimeSplits,
     )
     .unwrap()
 }
@@ -449,10 +447,7 @@ fn complete_read_seal_preserves_explicit_json_without_duplicating_root_field_tag
             .as_ref(),
         b"canonical-private"
     );
-    assert_eq!(
-        retained.frozen().scan().work_source(),
-        ConnectorReadWorkSource::RuntimeSplits
-    );
+
     assert_eq!(retained.frozen().scan().max_batch_rows().get(), 100);
     assert_eq!(
         retained.frozen().public_facts().source().selection_digest(),

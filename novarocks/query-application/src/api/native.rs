@@ -884,6 +884,13 @@ impl LogicalNativeSession {
 #[derive(Debug)]
 struct AttemptTicket;
 
+/// Placement preference for runtime work; it does not constrain correctness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeSplitPlacement {
+    SingleUnit,
+    Spread,
+}
+
 /// Native-owned work cardinality for one exact sealed scan occurrence.
 ///
 /// This is an input to Query Application scheduling, not a placement result.
@@ -893,8 +900,9 @@ pub enum NativeScanWork {
     /// retains one Task so its non-scan operators and exchange obligations
     /// have an execution owner.
     Empty,
-    RuntimeSplits,
-    WholeRelation,
+    RuntimeSplits {
+        placement: RuntimeSplitPlacement,
+    },
     FrozenUnits {
         count: NonZeroUsize,
     },
@@ -1814,7 +1822,12 @@ mod tests {
             Err(NativeExecutionContractError::MissingScanWorkFact)
         ));
 
-        let fact = (expected_scan, NativeScanWork::RuntimeSplits);
+        let fact = (
+            expected_scan,
+            NativeScanWork::RuntimeSplits {
+                placement: RuntimeSplitPlacement::Spread,
+            },
+        );
         let (duplicate, _) = session.issue_attempt(exact).unwrap();
         assert!(matches!(
             duplicate.bind(
@@ -1827,7 +1840,9 @@ mod tests {
         let foreign_description = scan_description();
         let foreign = (
             foreign_description.scan_identities()[0],
-            NativeScanWork::WholeRelation,
+            NativeScanWork::RuntimeSplits {
+                placement: RuntimeSplitPlacement::SingleUnit,
+            },
         );
         let (foreign_request, _) = session.issue_attempt(exact).unwrap();
         assert!(matches!(

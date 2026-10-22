@@ -32,7 +32,6 @@ pub enum MetadataTableType {
     Snapshots,
     History,
     Refs,
-    Partitions,
 }
 
 #[derive(Clone, Debug)]
@@ -121,7 +120,7 @@ pub fn metadata_table_output_columns(
             novarocks_spi::connector::ConnectorError,
         >,
     > {
-        Ok(vec![
+        let mut columns = vec![
             column("content", DataType::Int32, false)?,
             column("file_path", DataType::Utf8, false)?,
             column("file_format", DataType::Utf8, false)?,
@@ -139,17 +138,17 @@ pub fn metadata_table_output_columns(
             column("sort_order_id", DataType::Int32, true)?,
             column("key_metadata", DataType::Binary, true)?,
             column("first_row_id", DataType::Int64, true)?,
-            column(
-                "partition",
-                partition_struct_type(metadata).map_err(|error| {
-                    novarocks_spi::connector::ConnectorError::new(
-                        novarocks_spi::connector::ConnectorErrorKind::CorruptData,
-                        error,
-                    )
-                })?,
-                true,
-            )?,
-        ])
+        ];
+        let partition = partition_struct_type(metadata).map_err(|error| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                error,
+            )
+        })?;
+        if matches!(&partition, DataType::Struct(fields) if !fields.is_empty()) {
+            columns.push(column("partition", partition, true)?);
+        }
+        Ok(columns)
     };
     match metadata_table_type {
         MetadataTableType::Snapshots => Ok(vec![
@@ -176,12 +175,6 @@ pub fn metadata_table_output_columns(
             column("max_reference_age_in_ms", DataType::Int64, true)?,
             column("min_snapshots_to_keep", DataType::Int32, true)?,
             column("max_snapshot_age_in_ms", DataType::Int64, true)?,
-        ]),
-        MetadataTableType::Partitions => Ok(vec![
-            column("record_count", DataType::Int64, false)?,
-            column("file_count", DataType::Int64, false)?,
-            column("position_delete_file_count", DataType::Int64, true)?,
-            column("equality_delete_file_count", DataType::Int64, true)?,
         ]),
         MetadataTableType::Files => files(&mut column),
         MetadataTableType::Manifests => Ok(vec![
@@ -232,44 +225,15 @@ pub(crate) fn partition_source_type(
 }
 
 pub(crate) fn partition_struct_type(metadata: &TableMetadata) -> Result<DataType, String> {
-    let mut specs = metadata.partition_specs_iter().cloned().collect::<Vec<_>>();
-    specs.sort_by_key(|spec| spec.spec_id());
-    let mut fields: Vec<Arc<Field>> = Vec::new();
-    for spec in specs {
-        for partition_field in spec.fields() {
-            let source_type = partition_source_type(metadata, partition_field.source_id)?;
-            let result_type = partition_field
-                .transform
-                .result_type(&source_type)
-                .map_err(|error| {
-                    format!(
-                        "infer iceberg partition field {} type: {error}",
-                        partition_field.name
-                    )
-                })?;
-            let arrow_type = iceberg_type_to_arrow_type(&result_type)?;
-            if let Some(existing) = fields
-                .iter()
-                .find(|field| field.name().eq_ignore_ascii_case(&partition_field.name))
-            {
-                if existing.data_type() != &arrow_type {
-                    return Err(format!(
-                        "iceberg partition field {} has incompatible types across specs: {:?} vs {:?}",
-                        partition_field.name,
-                        existing.data_type(),
-                        arrow_type
-                    ));
-                }
-                continue;
-            }
-            fields.push(Arc::new(Field::new(
-                partition_field.name.clone(),
-                arrow_type,
-                true,
-            )));
-        }
-    }
-    Ok(DataType::Struct(Fields::from(fields)))
+    let specs = metadata
+        .partition_specs_iter()
+        .map(|spec| spec.as_ref().clone())
+        .collect::<Vec<_>>();
+    let row = crate::partition_row::UnifiedPartitionRow::of(metadata.current_schema(), &specs)
+        .map_err(|error| error.to_string())?;
+    Ok(row
+        .arrow_type()
+        .unwrap_or_else(|| DataType::Struct(Fields::empty())))
 }
 
 pub(crate) fn iceberg_type_to_arrow_type(
@@ -476,11 +440,11 @@ mod tests {
         let files = metadata_table_output_columns(MetadataTableType::Files, &metadata)
             .expect("files columns");
         assert_eq!(files.first().map(|column| column.name()), Some("content"));
-        assert_eq!(files.last().map(|column| column.name()), Some("partition"));
-        assert!(matches!(
-            files.last().map(|column| column.data_type()),
-            Some(DataType::Struct(fields)) if fields.is_empty()
-        ));
+        assert_eq!(
+            files.last().map(|column| column.name()),
+            Some("first_row_id")
+        );
+        assert!(!files.iter().any(|column| column.name() == "partition"));
         let snapshots = metadata_table_output_columns(MetadataTableType::Snapshots, &metadata)
             .expect("snapshots columns");
         assert_eq!(

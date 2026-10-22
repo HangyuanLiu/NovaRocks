@@ -161,12 +161,6 @@ fn author_read(
             )));
         }
     }
-    if relation.work_source() != encoding.work_source {
-        return Err(refused(
-            "relation work source differs from the one its freeze decided".to_string(),
-        ));
-    }
-
     // The recipe draft is exactly what the plan addresses: the package
     // validator compares it field by field with the relation.
     let read = relation.read();
@@ -214,7 +208,6 @@ fn author_read(
         dynamic_filters,
         max_batch_rows,
         max_batch_bytes,
-        encoding.work_source,
     )
     .map_err(|error| refused(error.to_string()))?;
 

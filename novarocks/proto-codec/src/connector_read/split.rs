@@ -41,7 +41,8 @@ pub enum SplitCategory {
     Data,
     TableChanges,
     ChangeWindow,
-    SystemFiles,
+    SystemManifest,
+    SystemRelation,
     RewritePositionDeleteFiles,
 }
 
@@ -208,10 +209,15 @@ fn decode_category(
             value.provider_payload.as_ref(),
             path.field("change_window").field("provider_payload"),
         ),
-        dto::connector_split::Category::SystemFiles(value) => (
-            SplitCategory::SystemFiles,
+        dto::connector_split::Category::SystemRelation(value) => (
+            SplitCategory::SystemRelation,
             value.provider_payload.as_ref(),
-            path.field("system_files").field("provider_payload"),
+            path.field("system_relation").field("provider_payload"),
+        ),
+        dto::connector_split::Category::SystemManifest(value) => (
+            SplitCategory::SystemManifest,
+            value.provider_payload.as_ref(),
+            path.field("system_manifest").field("provider_payload"),
         ),
         dto::connector_split::Category::RewritePositionDeleteFiles(value) => (
             SplitCategory::RewritePositionDeleteFiles,

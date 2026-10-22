@@ -1055,3 +1055,81 @@ fn source_invoice_and_original_control_loans_remain_explicit() {
         work.finish().unwrap();
     });
 }
+
+// The original statistics seed has 1024 fields. Check both one wide writer
+// and cumulative fields from two writers, with independent token identities.
+#[test]
+fn production_writer_policy_round_trips_wide_and_cumulative_field_tokens() {
+    use crate::physical_package_v2::{PackageDecodeLimits, PackageEncodeLimits};
+    for widths in [&[1024usize][..], &[512usize, 512][..]] {
+        let mut ordinal = 0u32;
+        let mut ids = Vec::new();
+        let recipes = widths
+            .iter()
+            .map(|&width| {
+                let mut source_ids = Vec::new();
+                let fields = (0..width)
+                    .map(|_| {
+                        let id = ordinal;
+                        ordinal += 1;
+                        source_ids.push(id);
+                        let mut token = [0; 32];
+                        token[..4].copy_from_slice(&id.to_le_bytes());
+                        c::ConnectorWriteFieldBinding::try_new_typed(
+                            c::ConnectorWriteFieldToken::from_bytes(token),
+                            Field::new(format!("v{id}"), DataType::Int64, false),
+                            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                ids.push(source_ids);
+                draft(c::ConnectorWriteInputShape::Data { fields })
+            })
+            .collect::<Vec<_>>();
+        let encode = PackageEncodeLimits::FROZEN.writers;
+        let decode = PackageDecodeLimits::FROZEN.writers;
+        let (encoded, _) = encode_run(&recipes, &ids, None, encode);
+        let (encoded, facts) = encoded.unwrap();
+        assert_eq!(facts.recipe_count, widths.len());
+        assert_eq!(facts.input_field_count, 1024);
+        assert_eq!(facts.token_bytes, 32768);
+        let raw = raw(&recipes, &ids);
+        assert_eq!(encoded, raw.package.writes);
+        let (decoded, _) = decode_run(&raw, None, decode, false);
+        let (decoded, decoded_facts) = decoded.unwrap();
+        assert_eq!(decoded.len(), widths.len());
+        assert_eq!(decoded_facts.recipe_count, widths.len());
+        assert_eq!(decoded_facts.input_field_count, 1024);
+        assert_eq!(decoded_facts.token_bytes, 32768);
+        for (index, ((node, actual), expected)) in decoded.iter().zip(&recipes).enumerate() {
+            assert_eq!(
+                node.get(),
+                if index == 0 {
+                    u32::MAX
+                } else {
+                    index as u32 - 1
+                }
+            );
+            assert_eq!(actual.input(), expected.input());
+            assert_eq!(actual.binding(), expected.binding());
+            assert_eq!(actual.payload(), expected.payload());
+        }
+        let finite_encode = WriterRecipeProjectionLimits {
+            max_token_bytes: 32000,
+            ..encode
+        };
+        let finite_decode = WriterRecipeProjectionLimits {
+            max_token_bytes: 32000,
+            ..decode
+        };
+        assert!(matches!(
+            encode_run(&recipes, &ids, None, finite_encode).0,
+            Err(E::Control(CompileControlError::ResourceExhausted))
+        ));
+        assert!(matches!(
+            decode_run(&raw, None, finite_decode, false).0,
+            Err(E::Control(CompileControlError::ResourceExhausted))
+        ));
+    }
+}

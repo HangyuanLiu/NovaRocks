@@ -1440,22 +1440,6 @@ fn decode_public_source(
     };
     Ok((source, metadata_kind))
 }
-fn source_work(source: c::ConnectorReadWorkSource) -> i32 {
-    match source {
-        c::ConnectorReadWorkSource::RuntimeSplits => 1,
-        c::ConnectorReadWorkSource::WholeRelation => 2,
-    }
-}
-fn raw_work(v: i32, work: &mut CompileCheckpoints<'_>) -> Result<c::ConnectorReadWorkSource, E> {
-    observed(
-        match v {
-            1 => Ok(c::ConnectorReadWorkSource::RuntimeSplits),
-            2 => Ok(c::ConnectorReadWorkSource::WholeRelation),
-            _ => Err(E::InvalidShape("unknown scan work source")),
-        },
-        work,
-    )
-}
 fn same_control(
     actual: &dyn novarocks_type_contract::PureCompileControl,
     work: &mut CompileCheckpoints<'_>,
@@ -1733,7 +1717,6 @@ pub fn encode_read_scans_observed(
                 dynamic_filters,
                 max_batch_rows: scan.max_batch_rows().get(),
                 max_batch_bytes: scan.max_batch_bytes().get(),
-                work_source: source_work(scan.work_source()),
             }),
             public_facts: Some(encode_public(
                 source.read.public_facts(),
@@ -2117,7 +2100,6 @@ fn decode_read_scans_core<H>(
             "scan max batch bytes must be nonzero",
             work,
         )?;
-        let work_source = raw_work(facts.work_source, work)?;
         let mut last = c::WriterOwnedResourceFacts::default();
         let scan = {
             let mut child_admit = |f: &c::WriterOwnedResourceFacts| {
@@ -2136,7 +2118,6 @@ fn decode_read_scans_core<H>(
                     dynamic_filters: filters,
                     max_batch_rows: rows,
                     max_batch_bytes: bytes,
-                    work_source,
                 },
                 source_retained_bytes,
                 &mut child_admit,

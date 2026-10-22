@@ -31,9 +31,8 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use crate::{
-    ConnectorExpression, ConnectorReadRelationKind, ConnectorReadRelationRecipe,
-    ConnectorReadRelationRecipeDraft, ConnectorReadWorkSource, ConnectorValueType,
-    MAX_CONNECTOR_RECIPE_COLUMNS, TupleDomain,
+    ConnectorExpression, ConnectorReadRelationRecipe, ConnectorReadRelationRecipeDraft,
+    ConnectorValueType, MAX_CONNECTOR_RECIPE_COLUMNS, TupleDomain,
 };
 
 const MAX_SCAN_NAME_BYTES: usize = 256;
@@ -122,7 +121,6 @@ struct ConnectorScanFacts {
     dynamic_filters: Arc<[StaticScanDynamicFilter]>,
     max_batch_rows: NonZeroU64,
     max_batch_bytes: NonZeroU64,
-    work_source: ConnectorReadWorkSource,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,7 +137,6 @@ pub enum StaticConnectorScanError {
     ExpressionTypeMismatch,
     DuplicateDynamicFilter,
     UnknownDynamicFilterVariable,
-    WholeRelationRequiresSystemTable,
     TooManyRetainedBytes,
 }
 
@@ -170,7 +167,6 @@ impl<R: AsRef<ConnectorReadRelationRecipeDraft>> ConnectorScan<R> {
         dynamic_filters: Vec<StaticScanDynamicFilter>,
         max_batch_rows: NonZeroU64,
         max_batch_bytes: NonZeroU64,
-        work_source: ConnectorReadWorkSource,
     ) -> Result<Self, StaticConnectorScanError> {
         let input = ScanConstructionInput {
             recipe,
@@ -181,7 +177,6 @@ impl<R: AsRef<ConnectorReadRelationRecipeDraft>> ConnectorScan<R> {
             dynamic_filters,
             max_batch_rows,
             max_batch_bytes,
-            work_source,
         };
         let retained = match validate_scan(&input, &mut PlainScan) {
             Ok(bytes) => bytes,
@@ -199,7 +194,6 @@ impl<R: AsRef<ConnectorReadRelationRecipeDraft>> ConnectorScan<R> {
                 dynamic_filters: input.dynamic_filters.into_boxed_slice().into(),
                 max_batch_rows: input.max_batch_rows,
                 max_batch_bytes: input.max_batch_bytes,
-                work_source: input.work_source,
             }),
             retained_bytes: retained,
         })
@@ -257,7 +251,6 @@ impl<R: AsRef<ConnectorReadRelationRecipeDraft>> ConnectorScan<R> {
             dynamic_filters,
             max_batch_rows: input.max_batch_rows,
             max_batch_bytes: input.max_batch_bytes,
-            work_source: input.work_source,
         });
         context.step().map_err(lift_scan_resources)?;
         context.flush().map_err(lift_scan_resources)?;
@@ -300,10 +293,6 @@ impl<R: AsRef<ConnectorReadRelationRecipeDraft>> ConnectorScan<R> {
         self.facts.max_batch_bytes
     }
 
-    pub fn work_source(&self) -> ConnectorReadWorkSource {
-        self.facts.work_source
-    }
-
     /// The checked conservative charge computed from these frozen facts.
     /// A containing package must still enforce its cumulative budget.
     pub fn retained_bytes(&self) -> usize {
@@ -344,7 +333,6 @@ pub struct ScanConstructionInput<R> {
     pub dynamic_filters: Vec<StaticScanDynamicFilter>,
     pub max_batch_rows: NonZeroU64,
     pub max_batch_bytes: NonZeroU64,
-    pub work_source: ConnectorReadWorkSource,
 }
 
 #[derive(Debug)]
@@ -642,11 +630,6 @@ fn validate_scan<R: AsRef<ConnectorReadRelationRecipeDraft>, S: ScanOperations>(
             return Err(E::UnknownDynamicFilterVariable.into());
         }
     }
-    if input.work_source == ConnectorReadWorkSource::WholeRelation
-        && input.recipe.as_ref().relation().kind() != ConnectorReadRelationKind::SystemTable
-    {
-        return Err(E::WholeRelationRequiresSystemTable.into());
-    }
     let mut retained = input
         .recipe
         .as_ref()
@@ -866,6 +849,7 @@ fn owned_expression_core<O: OwnedCopy>(
 
 #[cfg(test)]
 mod tests {
+    use crate::ConnectorReadRelationKind;
     use std::collections::BTreeMap;
 
     use crate::{
@@ -954,7 +938,6 @@ mod tests {
             vec![],
             NonZeroU64::new(1).unwrap(),
             NonZeroU64::new(1).unwrap(),
-            ConnectorReadWorkSource::RuntimeSplits,
         )
         .unwrap();
         let Some(ConnectorExpression::Call { arguments, .. }) = scan.remaining_expression() else {
@@ -996,7 +979,6 @@ mod tests {
                 vec![],
                 NonZeroU64::new(1).unwrap(),
                 NonZeroU64::new(1).unwrap(),
-                ConnectorReadWorkSource::RuntimeSplits,
             ),
             Err(StaticConnectorScanError::TooManyRetainedBytes)
         ));
@@ -1022,7 +1004,6 @@ mod tests {
                 vec![],
                 NonZeroU64::new(1).unwrap(),
                 NonZeroU64::new(1).unwrap(),
-                ConnectorReadWorkSource::RuntimeSplits,
             ),
             Err(StaticConnectorScanError::PredicateTypeMismatch)
         ));
@@ -1044,7 +1025,6 @@ mod tests {
             vec![StaticScanDynamicFilter::new(7, Arc::from("v"))],
             NonZeroU64::new(17).unwrap(),
             NonZeroU64::new(8192).unwrap(),
-            ConnectorReadWorkSource::RuntimeSplits,
         )
         .unwrap();
         let compiled = StaticConnectorScan::try_new(
@@ -1056,7 +1036,6 @@ mod tests {
             frozen.dynamic_filters().to_vec(),
             frozen.max_batch_rows(),
             frozen.max_batch_bytes(),
-            frozen.work_source(),
         )
         .unwrap();
         assert_eq!(frozen.recipe(), compiled.recipe().draft());
@@ -1074,7 +1053,6 @@ mod tests {
                 vec![StaticScanDynamicFilter::new(7, Arc::from("unknown"))],
                 frozen.max_batch_rows(),
                 frozen.max_batch_bytes(),
-                frozen.work_source(),
             ),
             Err(StaticConnectorScanError::UnknownDynamicFilterVariable)
         ));

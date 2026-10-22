@@ -396,10 +396,18 @@ impl<'a> CatalogNeedCollector<'a> {
                 }
                 let relation = self.resolve_name(name)?;
                 let target = match metadata {
-                    Some(metadata) => CatalogLookupTarget::IcebergMetadata {
-                        kind: SqlMetadataTableKind::parse(&metadata.value)
-                            .map_err(SqlCompileError::Compilation)?,
-                    },
+                    Some(metadata) => {
+                        let kind = SqlMetadataTableKind::parse(&metadata.value)
+                            .map_err(SqlCompileError::Compilation)?;
+                        // The analyzer expands the partitions view over this exact
+                        // Files fact; it must not request a provider Partitions read.
+                        CatalogLookupTarget::IcebergMetadata {
+                            kind: match kind {
+                                SqlMetadataTableKind::Partitions => SqlMetadataTableKind::Files,
+                                kind => kind,
+                            },
+                        }
+                    }
                     None => CatalogLookupTarget::Table {
                         mode: self.lookup_mode,
                     },
@@ -981,6 +989,52 @@ mod tests {
                 mode: TableLookupMode::SchemaOnly,
             },
         )));
+    }
+
+    #[test]
+    fn partitions_view_and_files_share_one_exact_frozen_catalog_fact() {
+        let state = state(
+            "WITH orders AS (SELECT 1 AS content) \
+             SELECT * FROM orders$partitions p \
+             JOIN session_catalog.session_db.orders$files f ON 1 = 1",
+        );
+        assert_eq!(state.needs().len(), 1);
+        let need = &state.needs()[0];
+        assert_eq!(
+            need.relation(),
+            &TableIdentity::new("session_catalog", "session_db", "orders")
+        );
+        assert!(matches!(
+            need.target(),
+            CatalogLookupTarget::IcebergMetadata {
+                kind: SqlMetadataTableKind::Files
+            }
+        ));
+        let table = resolved_table(
+            need.relation(),
+            SqlScanKind::Metadata {
+                kind: SqlMetadataTableKind::Files,
+                version: SqlTableVersionSelector::Current,
+            },
+        );
+        let ScanSource::Sql(original_binding) = table.planner.source.clone();
+        let fact = CatalogRelationFact::resolved(need, table).expect("exact Files fact");
+        let catalog = state.fact_catalog(&[fact]).expect("frozen catalog");
+        let resolved = catalog
+            .get_iceberg_metadata_table(None, "session_db", "orders", SqlMetadataTableKind::Files)
+            .expect("the view consumes its frozen Files fact");
+        let ScanSource::Sql(resolved_source) = resolved.planner.source;
+        assert_eq!(resolved_source, original_binding);
+        assert!(
+            catalog
+                .get_iceberg_metadata_table(
+                    None,
+                    "session_db",
+                    "orders",
+                    SqlMetadataTableKind::Partitions,
+                )
+                .is_err()
+        );
     }
 
     #[test]

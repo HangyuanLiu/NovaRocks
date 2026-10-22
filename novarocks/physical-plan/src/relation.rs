@@ -17,7 +17,6 @@
 
 use novarocks_connector_contract::{
     ConnectorEncodedPayload, ConnectorReadBinding, ConnectorReadRelationPayload,
-    ConnectorReadWorkSource,
 };
 
 use crate::{ExprId, IdentityError, PhysicalProperties, ValueType, stable_identity};
@@ -66,8 +65,7 @@ pub struct PredicateGuarantee {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DataRelation {
     pub read: ProviderReadReference,
-    /// Whether execution receives provider splits or opens the whole relation.
-    pub work_source: ConnectorReadWorkSource,
+
     /// Digest of the exact frozen row/split selection represented by this scan.
     pub selection_digest: [u8; 32],
     pub schema: Box<[RelationField]>,
@@ -99,8 +97,7 @@ impl MetadataRelationKind {
 pub struct MetadataRelation {
     pub kind: MetadataRelationKind,
     pub read: ProviderReadReference,
-    /// Whether execution receives provider splits or opens the whole relation.
-    pub work_source: ConnectorReadWorkSource,
+
     /// Digest of the exact frozen metadata selection represented by this scan.
     pub selection_digest: [u8; 32],
     pub schema: Box<[RelationField]>,
@@ -136,17 +133,6 @@ impl Relation {
         match self {
             Self::Data(relation) => &relation.predicate_guarantees,
             Self::Metadata(relation) => &relation.predicate_guarantees,
-        }
-    }
-
-    /// How execution obtains work for this exact frozen relation.
-    ///
-    /// `WholeRelation` means one executor opens the provider relation directly;
-    /// it is not an implicit one-split fallback.
-    pub const fn work_source(&self) -> ConnectorReadWorkSource {
-        match self {
-            Self::Data(relation) => relation.work_source,
-            Self::Metadata(relation) => relation.work_source,
         }
     }
 

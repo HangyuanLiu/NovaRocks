@@ -49,6 +49,7 @@ pub enum SqlMetadataTableKind {
     Refs,
     Files,
     Manifests,
+    /// SQL aggregation view over the same frozen Files binding; never a provider relation.
     Partitions,
     /// Trino `$entries`: the manifest entries of the pinned snapshot.
     ///

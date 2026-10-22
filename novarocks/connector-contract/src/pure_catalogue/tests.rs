@@ -127,7 +127,6 @@ fn frozen_read(name: &str, count: usize) -> FrozenConnectorRead {
         vec![],
         NonZeroU64::new(100).unwrap(),
         NonZeroU64::new(4096).unwrap(),
-        ConnectorReadWorkSource::RuntimeSplits,
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(

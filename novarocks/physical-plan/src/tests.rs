@@ -20,7 +20,7 @@ use novarocks_connector_contract::{
     CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
     ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorProviderId, ConnectorReadBinding, ConnectorReadRelationKind,
-    ConnectorReadRelationPayload, ConnectorReadWorkSource,
+    ConnectorReadRelationPayload,
 };
 
 use super::*;
@@ -232,7 +232,7 @@ fn metadata_relation(binding: &ConnectorReadBinding, column: ProviderColumnRefer
                 encoded(binding, ConnectorCodecCategory::ReadView, 2),
             ),
         },
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
+
         selection_digest: [8; 32],
         schema: Box::from([RelationField {
             column,

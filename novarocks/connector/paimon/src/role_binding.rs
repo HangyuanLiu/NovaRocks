@@ -29,8 +29,7 @@ use novarocks_spi::connector::read_stack::adapter::{
     ProviderAdmittedReadFactory, ProviderReadColumnBinding, ProviderReadFactoryAdapter,
     ProviderReadFilterResult, ProviderReadLimitApplication, ProviderReadMetadata,
     ProviderReadPageSourceProvider, ProviderReadRuntime, ProviderReadSplitManager,
-    ProviderReadSplitSource, ProviderReadSystemTablePlan, ProviderReadSystemTableProvider,
-    ReadRuntimeAdapter,
+    ProviderReadSplitSource, ProviderReadSystemTablePlan, ReadRuntimeAdapter,
 };
 use novarocks_spi::connector::read_stack::{
     Assignment, ConnectorPageSourceProviderOptions, ConnectorPollBudget,
@@ -1048,14 +1047,6 @@ impl ProviderAdmittedReadFactory<PaimonReadRuntime> for PaimonExecutionReadFacto
             ),
             host_io,
         }))
-    }
-
-    fn create_system_table_provider(
-        &self,
-        _request: &ConnectorRequestContext,
-        _resources: ConnectorExecutionResources,
-    ) -> Result<Arc<dyn ProviderReadSystemTableProvider<PaimonReadRuntime>>, ConnectorError> {
-        Err(unsupported("Paimon system tables are unsupported in PAI-1"))
     }
 }
 

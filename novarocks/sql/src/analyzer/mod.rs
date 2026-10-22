@@ -59,6 +59,7 @@ mod subquery_rewrite;
 
 pub mod alter_iceberg_ref;
 pub mod iceberg_metadata;
+mod iceberg_partitions;
 pub mod iceberg_ref;
 pub(crate) mod mv_lineage;
 
@@ -6386,7 +6387,7 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_uses_metadata_provider_for_partitions_table() {
+    fn analyzer_uses_files_metadata_provider_for_partitions_view() {
         struct MetadataModeCatalog(std::cell::Cell<bool>);
         impl crate::catalog::PlannerTableProvider for MetadataModeCatalog {
             fn resolve_table_for_analysis(
@@ -6412,7 +6413,7 @@ mod tests {
                 metadata_table_type: SqlMetadataTableKind,
             ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
                 self.0
-                    .set(metadata_table_type == SqlMetadataTableKind::Partitions);
+                    .set(metadata_table_type == SqlMetadataTableKind::Files);
                 CatalogAwareTestCatalog.get_iceberg_metadata_table(
                     catalog,
                     database,
@@ -6429,7 +6430,7 @@ mod tests {
         let _ = analyze(&query, &catalog, "default").expect("analyze");
         assert!(
             catalog.0.get(),
-            "partitions metadata provider was not requested"
+            "Files metadata provider was not requested by the partitions view"
         );
     }
 
@@ -6463,7 +6464,7 @@ mod tests {
                 assert_eq!(database, "db");
                 assert_eq!(table, "orders");
                 self.0
-                    .set(metadata_table_type == SqlMetadataTableKind::Partitions);
+                    .set(metadata_table_type == SqlMetadataTableKind::Files);
                 CatalogAwareTestCatalog.get_iceberg_metadata_table(
                     catalog,
                     database,
@@ -6480,7 +6481,7 @@ mod tests {
         let _ = analyze(&query, &catalog, "default").expect("analyze");
         assert!(
             catalog.0.get(),
-            "partitions metadata provider was not requested"
+            "Files metadata provider was not requested by the partitions view"
         );
     }
 

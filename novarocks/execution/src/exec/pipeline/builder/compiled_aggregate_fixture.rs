@@ -71,8 +71,8 @@ use super::family_fixture::{FixtureControl, constant_policy};
 use crate::exec::chunk::Chunk;
 use crate::exec::fragment::program::FragmentNodeId;
 use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
-use crate::exec::pipeline::binding::ExchangeBindings;
-use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
+use crate::exec::pipeline::binding::{ExchangeBindings, ScanBindings};
+use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution_with_profiler;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use crate::runtime::exchange::decode_chunks;
@@ -969,7 +969,15 @@ pub(super) fn try_run(
     bindings: ExchangeBindings,
     instance: UniqueId,
 ) -> Result<(), String> {
-    try_run_in(program, sink, bindings, instance, runtime_state(), false)
+    try_run_in(
+        program,
+        sink,
+        bindings,
+        ScanBindings::default(),
+        instance,
+        runtime_state(),
+        false,
+    )
 }
 
 /// The same original local execution lane with an explicit declared query
@@ -990,23 +998,54 @@ pub(super) fn try_run_with_tracker(
         Some(tracker),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ));
-    try_run_in(program, sink, bindings, instance, state, true)
+    try_run_in(
+        program,
+        sink,
+        bindings,
+        ScanBindings::default(),
+        instance,
+        state,
+        true,
+    )
 }
+/// Run the original compiled pipeline with this instance's exact scan operations.
+pub(super) fn try_run_with_scans(
+    program: &Arc<LocalProgram>,
+    sink: Box<dyn OperatorFactory>,
+    bindings: ExchangeBindings,
+    scans: ScanBindings,
+    instance: UniqueId,
+) -> Result<(), String> {
+    try_run_in(
+        program,
+        sink,
+        bindings,
+        scans,
+        instance,
+        runtime_state(),
+        true,
+    )
+}
+
 fn try_run_in(
     program: &Arc<LocalProgram>,
     sink: Box<dyn OperatorFactory>,
     bindings: ExchangeBindings,
+    scans: ScanBindings,
     instance: UniqueId,
     state: Arc<RuntimeState>,
     tracked: bool,
 ) -> Result<(), String> {
     let dop = i32::try_from(program.graph().profile().pipeline_dop().get()).unwrap();
-    let running = prepare_compiled_program_pipeline_execution(
+    let running = prepare_compiled_program_pipeline_execution_with_profiler(
         Arc::clone(program),
         Duration::from_millis(10),
         sink,
         bindings,
+        scans,
+        crate::runtime::fragment::CompiledWriterBindings::default(),
         Some((instance.high(), instance.low())),
+        None,
         dop,
         state,
         Arc::new(NoopFragmentEventSink),

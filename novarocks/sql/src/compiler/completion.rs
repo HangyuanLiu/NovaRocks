@@ -32,7 +32,7 @@ use novarocks_physical_plan::{
 };
 use novarocks_spi::connector::read_stack::{
     ConnectorExpression, ConnectorFunctionName, ConnectorReadBinding, ConnectorReadRelationKind,
-    ConnectorReadWorkSource, ConnectorValueType, Constraint, TupleDomain,
+    ConnectorValueType, Constraint, TupleDomain,
 };
 use novarocks_spi::connector::{ConnectorCodecCategory, ConnectorEncodedPayload, StatisticsMetric};
 use novarocks_type_contract::{BucketLayoutAlgorithm, PartitionHashAlgorithm};
@@ -1376,7 +1376,6 @@ pub struct ProviderReadStaticContract {
     pub read: ProviderReadReference,
     /// Exact provider metadata kind accepted while opening this frozen read.
     pub metadata_kind: Option<novarocks_spi::connector::read_stack::ConnectorReadMetadataKind>,
-    pub work_source: ConnectorReadWorkSource,
     pub selection_digest: [u8; 32],
     pub schema: Box<[ProviderReadColumnFact]>,
     pub predicates: Box<[ProviderReadPredicateFact]>,
@@ -1393,7 +1392,6 @@ impl fmt::Debug for ProviderReadStaticContract {
             .field("request", &self.request)
             .field("relation_kind", &self.read.relation.kind())
             .field("metadata_kind", &self.metadata_kind)
-            .field("work_source", &self.work_source)
             .field("schema_columns", &self.schema.len())
             .field("predicate_guarantees", &self.predicates.len())
             .field("limit", &self.limit)
@@ -3821,7 +3819,6 @@ mod tests {
                     )
                     .expect("fixture metadata kind")
                 }),
-            work_source: ConnectorReadWorkSource::RuntimeSplits,
             selection_digest: [8; 32],
             schema: Box::from([ProviderReadColumnFact::new(
                 0,

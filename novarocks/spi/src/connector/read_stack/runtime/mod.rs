@@ -35,16 +35,14 @@ use crate::connector::read_stack::page_source::ConnectorPreparationStart;
 use crate::connector::read_stack::{
     Assignment, ColumnHandle, ConnectorExpression, ConnectorPollBudget, ConnectorSession,
     ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot, HostAddress,
-    OwnedConnectorPageStream, SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
+    OwnedConnectorPageStream, SchemaTableName, SplitWeight, SystemTableUnitHint, TupleDomain,
 };
 use crate::connector::{
     ConnectorAttemptContext, ConnectorError, ConnectorExecutionResources, ConnectorPinnedFileSet,
     ConnectorPlanningContext, ConnectorRequestContext,
 };
 
-pub use novarocks_connector_contract::{
-    ConnectorReadBinding, ConnectorReadRelationKind, ConnectorReadWorkSource,
-};
+pub use novarocks_connector_contract::{ConnectorReadBinding, ConnectorReadRelationKind};
 
 #[derive(Clone)]
 struct OpaquePayload(Arc<dyn Any + Send + Sync>);
@@ -395,18 +393,12 @@ impl ConnectorReadLimitApplication {
 #[derive(Clone, Debug)]
 pub struct ConnectorReadSystemTablePlan {
     handle: ConnectorReadTableHandle,
-    distribution: SystemTableDistribution,
+    unit_hint: SystemTableUnitHint,
 }
 
 impl ConnectorReadSystemTablePlan {
-    pub const fn new(
-        handle: ConnectorReadTableHandle,
-        distribution: SystemTableDistribution,
-    ) -> Self {
-        Self {
-            handle,
-            distribution,
-        }
+    pub const fn new(handle: ConnectorReadTableHandle, unit_hint: SystemTableUnitHint) -> Self {
+        Self { handle, unit_hint }
     }
 
     pub const fn handle(&self) -> &ConnectorReadTableHandle {
@@ -417,8 +409,8 @@ impl ConnectorReadSystemTablePlan {
         self.handle
     }
 
-    pub const fn distribution(&self) -> SystemTableDistribution {
-        self.distribution
+    pub const fn unit_hint(&self) -> SystemTableUnitHint {
+        self.unit_hint
     }
 }
 
@@ -1091,19 +1083,7 @@ pub trait ConnectorReadPageSourceProvider: Send + Sync {
     }
 }
 
-pub trait ConnectorReadSystemTableProvider: Send + Sync {
-    /// Opens the system table as a page stream; see
-    /// [`ConnectorReadPageSourceProvider::create_page_stream`].
-    fn create_system_page_stream(
-        &self,
-        session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        columns: &[ConnectorReadAssignment],
-        budget: &ConnectorPollBudget,
-    ) -> Result<OwnedConnectorPageStream, ConnectorError>;
-}
-
-/// The backend factory contract after task admission. Both execution lanes
+/// The backend factory contract after task admission. All reads
 /// require the exact task's resource capability as an independent argument;
 /// metadata callers cannot obtain one from a request context.
 ///
@@ -1112,7 +1092,7 @@ pub trait ConnectorReadSystemTableProvider: Send + Sync {
 /// use novarocks_spi::connector::ConnectorRequestContext;
 /// let factory: &dyn ConnectorAdmittedReadProviderFactory = todo!();
 /// let request: &ConnectorRequestContext = todo!();
-/// let _ = factory.create_system_table_provider(request);
+/// let _ = factory.create_page_source_provider(request);
 /// ```
 ///
 /// ```compile_fail
@@ -1120,7 +1100,8 @@ pub trait ConnectorReadSystemTableProvider: Send + Sync {
 /// use novarocks_spi::connector::ConnectorRequestContext;
 /// let factory: &dyn ConnectorAdmittedReadProviderFactory = todo!();
 /// let request: &ConnectorRequestContext = todo!();
-/// let _ = factory.create_system_table_provider(request, request.clone());
+/// let options: novarocks_spi::connector::read_stack::ConnectorPageSourceProviderOptions = todo!();
+/// let _ = factory.create_page_source_provider(request, request.clone(), options);
 /// ```
 pub trait ConnectorAdmittedReadProviderFactory: Send + Sync {
     /// Exact catalog generation whose task-owned provider this factory opens.
@@ -1132,12 +1113,6 @@ pub trait ConnectorAdmittedReadProviderFactory: Send + Sync {
         resources: ConnectorExecutionResources,
         options: super::ConnectorPageSourceProviderOptions,
     ) -> Result<Arc<dyn ConnectorReadPageSourceProvider>, ConnectorError>;
-
-    fn create_system_table_provider(
-        &self,
-        request: &ConnectorRequestContext,
-        resources: ConnectorExecutionResources,
-    ) -> Result<Arc<dyn ConnectorReadSystemTableProvider>, ConnectorError>;
 }
 
 // These helpers are intentionally crate-private.  Concrete connectors use the

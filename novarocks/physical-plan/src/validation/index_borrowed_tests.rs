@@ -22,7 +22,7 @@ use novarocks_connector_contract::{
     CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
     ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorProviderId, ConnectorReadBinding, ConnectorReadRelationKind,
-    ConnectorReadRelationPayload, ConnectorReadWorkSource,
+    ConnectorReadRelationPayload,
 };
 use novarocks_type_contract::{
     CompilePhase, PureCompileControl, owned_resources::copy::copy_string,
@@ -249,7 +249,7 @@ fn scan_fixture(count: usize) -> Fragment {
                 encoded(ConnectorCodecCategory::ReadView),
             ),
         },
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
+
         selection_digest: [8; 32],
         schema: Box::from([RelationField {
             column: column.clone(),

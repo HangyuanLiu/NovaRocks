@@ -427,7 +427,8 @@ fn typed_connector_read_handles_use_provider_owned_payloads() {
         "novarocks.connector_read.DataSplit",
         "novarocks.connector_read.TableChangesSplitCategory",
         "novarocks.connector_read.ChangeWindowSplitCategory",
-        "novarocks.connector_read.SystemFilesSplitCategory",
+        "novarocks.connector_read.SystemManifestSplitCategory",
+        "novarocks.connector_read.SystemRelationSplitCategory",
         "novarocks.connector_read.RewritePositionDeleteFilesSplitCategory",
     ] {
         let message = pool
@@ -455,8 +456,9 @@ fn typed_connector_read_handles_use_provider_owned_payloads() {
                 "data",
                 "table_changes",
                 "change_window",
-                "system_files",
+                "system_manifest",
                 "rewrite_position_delete_files",
+                "system_relation",
             ][..],
         ),
         (
@@ -515,7 +517,8 @@ fn typed_connector_read_handles_use_provider_owned_payloads() {
         "IcebergDeletedDataFileRows",
         "IcebergChangeSplit",
         "TrinoManifestFile",
-        "FilesTableSplit",
+        "SystemManifestSplit",
+        "SystemRelationSplit",
         "IcebergRewritePositionDeleteFilesSplit",
     ] {
         let full_name = format!("novarocks.connector_read.{private_message}");
@@ -563,13 +566,32 @@ fn the_typed_connector_scan_source_carries_no_split_list_or_private_payload() {
             (6, "dynamic_filters".to_owned()),
             (7, "max_batch_rows".to_owned()),
             (8, "max_batch_bytes".to_owned()),
-            (9, "work_source".to_owned()),
         ]
     );
 
+    for (message, tag) in [
+        ("novarocks.connector_read.ConnectorTableScanSource", 9),
+        ("novarocks.physical_package_v2.DataRelation", 2),
+        ("novarocks.physical_package_v2.MetadataRelation", 3),
+        ("novarocks.physical_package_v2.ConnectorScanFacts", 8),
+    ] {
+        let descriptor = pool
+            .get_message_by_name(message)
+            .expect("scan contract descriptor");
+        assert!(
+            descriptor
+                .reserved_ranges()
+                .any(|range| range.contains(&tag))
+        );
+        assert!(
+            descriptor
+                .reserved_names()
+                .any(|name| name == "work_source")
+        );
+    }
+
     // The whole point of the typed source: no eager split list, no provider
-    // payload, and no Arrow IPC schema crossing the boundary. `work_source`
-    // is a neutral scheduling fact, not provider-private scan content.
+    // payload, or Arrow IPC schema crossing the boundary. All reads use runtime splits.
     for forbidden in [
         "splits",
         "scan_payload",

@@ -30,7 +30,7 @@ use novarocks_connector_contract::{
     CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
     ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorProviderId, ConnectorReadBinding, ConnectorReadRelationKind,
-    ConnectorReadRelationPayload, ConnectorReadWorkSource,
+    ConnectorReadRelationPayload,
 };
 use novarocks_physical_plan::{
     Distribution, ExactInputVersion, FragmentBuilder, FragmentId, FragmentSink,
@@ -168,7 +168,6 @@ pub(crate) fn completed_scan_candidate(version: [u8; 16]) -> CompletedPhysicalPl
                 encoded(ConnectorCodecCategory::ReadView, 2),
             ),
         },
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
         selection_digest: [8; 32],
         schema: Box::from([RelationField {
             column: field.clone(),

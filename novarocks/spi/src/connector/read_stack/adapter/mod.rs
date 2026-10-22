@@ -44,17 +44,16 @@ use super::runtime::{
     ConnectorReadLimitApplication, ConnectorReadMetadata, ConnectorReadPageSourceProvider,
     ConnectorReadRelationKind, ConnectorReadRelationVersion, ConnectorReadSplit,
     ConnectorReadSplitFacts, ConnectorReadSplitManager, ConnectorReadSplitSource,
-    ConnectorReadSystemTablePlan, ConnectorReadSystemTableProvider, ConnectorReadTableHandle,
-    ConnectorReadTransactionHandle, binding_error, column_handle, column_value, map_constraint,
-    map_tuple_domain, split_handle, split_value, table_handle, table_value, transaction_handle,
-    transaction_value, type_error,
+    ConnectorReadSystemTablePlan, ConnectorReadTableHandle, ConnectorReadTransactionHandle,
+    binding_error, column_handle, column_value, map_constraint, map_tuple_domain, split_handle,
+    split_value, table_handle, table_value, transaction_handle, transaction_value, type_error,
 };
 use super::{
     Assignment, BoundsMatch, ColumnHandle, ColumnValueBounds, ConnectorExpression,
     ConnectorMvTargetPartitionSelection, ConnectorReadDistribution, ConnectorReadOrderingKey,
     ConnectorReadProperties, ConnectorReadPublicSchema, ConnectorReadStaticFacts, ConnectorSession,
     ConnectorSplit, ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot,
-    PageSourceMetrics, SchemaTableName, SourcePage, SystemTableDistribution, TupleDomain,
+    PageSourceMetrics, SchemaTableName, SourcePage, SystemTableUnitHint, TupleDomain,
 };
 use crate::connector::{
     CatalogHandle, ConnectorError, ConnectorExecutionResources, ConnectorInstanceDescriptor,
@@ -176,15 +175,12 @@ impl<T> ProviderReadLimitApplication<T> {
 #[derive(Clone, Debug)]
 pub struct ProviderReadSystemTablePlan<T> {
     handle: T,
-    distribution: SystemTableDistribution,
+    unit_hint: SystemTableUnitHint,
 }
 
 impl<T> ProviderReadSystemTablePlan<T> {
-    pub const fn new(handle: T, distribution: SystemTableDistribution) -> Self {
-        Self {
-            handle,
-            distribution,
-        }
+    pub const fn new(handle: T, unit_hint: SystemTableUnitHint) -> Self {
+        Self { handle, unit_hint }
     }
 
     pub const fn handle(&self) -> &T {
@@ -195,8 +191,8 @@ impl<T> ProviderReadSystemTablePlan<T> {
         self.handle
     }
 
-    pub const fn distribution(&self) -> SystemTableDistribution {
-        self.distribution
+    pub const fn unit_hint(&self) -> SystemTableUnitHint {
+        self.unit_hint
     }
 }
 
@@ -441,18 +437,6 @@ pub trait ProviderPreparedPageSource<P: ProviderReadRuntime>: Send {
     ) -> Result<OwnedConnectorPageStream, ConnectorError>;
 }
 
-pub trait ProviderReadSystemTableProvider<P: ProviderReadRuntime>: Send + Sync {
-    /// Opens the system table as a page stream; see
-    /// [`ProviderReadPageSourceProvider::create_page_stream`].
-    fn create_system_page_stream(
-        &self,
-        session: &ConnectorSession,
-        table: &P::Table,
-        columns: &[Assignment<P::Column>],
-        budget: &ConnectorPollBudget,
-    ) -> Result<OwnedConnectorPageStream, ConnectorError>;
-}
-
 /// Concrete backend factory contract. The provider receives an admitted
 /// resource capability separately from operation control and authorized I/O.
 pub trait ProviderAdmittedReadFactory<P: ProviderReadRuntime>: Send + Sync {
@@ -462,12 +446,6 @@ pub trait ProviderAdmittedReadFactory<P: ProviderReadRuntime>: Send + Sync {
         resources: ConnectorExecutionResources,
         options: super::ConnectorPageSourceProviderOptions,
     ) -> Result<Arc<dyn ProviderReadPageSourceProvider<P>>, ConnectorError>;
-
-    fn create_system_table_provider(
-        &self,
-        request: &ConnectorRequestContext,
-        resources: ConnectorExecutionResources,
-    ) -> Result<Arc<dyn ProviderReadSystemTableProvider<P>>, ConnectorError>;
 }
 
 /// The single generic bridge from provider-owned types to role-visible SPI.
@@ -1036,9 +1014,9 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
             .get_system_table_plan(session, name)
             .map(|result| {
                 result.map(|result| {
-                    let distribution = result.distribution();
+                    let unit_hint = result.unit_hint();
                     let handle = result.into_handle();
-                    ConnectorReadSystemTablePlan::new(self.wrap_table(handle), distribution)
+                    ConnectorReadSystemTablePlan::new(self.wrap_table(handle), unit_hint)
                 })
             })
     }
@@ -1053,9 +1031,9 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
             .get_system_table_plan_for_request(session, name, request)
             .map(|result| {
                 result.map(|result| {
-                    let distribution = result.distribution();
+                    let unit_hint = result.unit_hint();
                     let handle = result.into_handle();
-                    ConnectorReadSystemTablePlan::new(self.wrap_table(handle), distribution)
+                    ConnectorReadSystemTablePlan::new(self.wrap_table(handle), unit_hint)
                 })
             })
     }
@@ -1559,26 +1537,6 @@ impl<P: ProviderReadRuntime> ConnectorReadPageSourceProvider for AdapterPageSour
     }
 }
 
-struct AdapterSystemTableProvider<P: ProviderReadRuntime> {
-    provider: Arc<dyn ProviderReadSystemTableProvider<P>>,
-    adapter: ReadRuntimeAdapter<P>,
-}
-
-impl<P: ProviderReadRuntime> ConnectorReadSystemTableProvider for AdapterSystemTableProvider<P> {
-    fn create_system_page_stream(
-        &self,
-        session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        columns: &[Assignment<ConnectorReadColumnHandle>],
-        budget: &ConnectorPollBudget,
-    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
-        let table = self.adapter.table(table)?;
-        let columns = self.adapter.typed_assignments(columns)?;
-        self.provider
-            .create_system_page_stream(session, table, &columns, budget)
-    }
-}
-
 /// Combines a provider-owned execution factory with the separately-owned
 /// metadata type adapter. It is constructed by the concrete connector's
 /// exact-key bundle factory and never exposed as a typed accessor to a role.
@@ -1614,21 +1572,6 @@ where
                 request,
                 resources,
                 options,
-            )?,
-            adapter: ReadRuntimeAdapter::clone(&self.adapter),
-        }))
-    }
-
-    fn create_system_table_provider(
-        &self,
-        request: &ConnectorRequestContext,
-        resources: ConnectorExecutionResources,
-    ) -> Result<Arc<dyn ConnectorReadSystemTableProvider>, ConnectorError> {
-        Ok(Arc::new(AdapterSystemTableProvider {
-            provider: ProviderAdmittedReadFactory::create_system_table_provider(
-                self.factory.as_ref(),
-                request,
-                resources,
             )?,
             adapter: ReadRuntimeAdapter::clone(&self.adapter),
         }))

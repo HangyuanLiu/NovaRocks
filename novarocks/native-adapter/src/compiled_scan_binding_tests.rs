@@ -53,6 +53,10 @@ use crate::typed_connector_test_support::test_support;
 /// The physical scan node every fixture scan is addressed by.
 pub(crate) const SCAN_NODE: i32 = 10;
 
+// The fixture provider owns one complete metadata generation. This exact
+// opaque coverage statement belongs to that fixture, not a product provider.
+const FIXTURE_METADATA_COVERAGE: &[u8] = b"fixture.metadata/complete-generation-1";
+
 struct Unbounded;
 impl PureCompileControl for Unbounded {
     fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
@@ -198,10 +202,28 @@ fn frozen_read(
     unenforced: TupleDomain<ScanColumnId>,
     dynamic_filters: Vec<StaticScanDynamicFilter>,
 ) -> FrozenConnectorRead {
+    frozen_read_kind(
+        provider,
+        unenforced,
+        dynamic_filters,
+        ConnectorReadRelationKind::Table,
+    )
+}
+
+fn frozen_read_kind(
+    provider: &str,
+    unenforced: TupleDomain<ScanColumnId>,
+    dynamic_filters: Vec<StaticScanDynamicFilter>,
+    kind: ConnectorReadRelationKind,
+) -> FrozenConnectorRead {
     let binding = binding(provider);
     let draft = ConnectorReadRelationRecipeDraft::try_new(
         binding.clone(),
-        relation_payload(&binding),
+        ConnectorReadRelationPayload::new(
+            kind,
+            payload(&binding, ConnectorCodecCategory::ReadTable, b"table"),
+            payload(&binding, ConnectorCodecCategory::ReadView, b"transaction"),
+        ),
         column_payloads(&binding),
     )
     .unwrap();
@@ -217,7 +239,6 @@ fn frozen_read(
         dynamic_filters,
         NonZeroU64::new(1024).unwrap(),
         NonZeroU64::new(1 << 20).unwrap(),
-        ConnectorReadWorkSource::RuntimeSplits,
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(
@@ -225,7 +246,11 @@ fn frozen_read(
         [7; 32],
         ConnectorReadProperties::try_new(ConnectorReadDistribution::Unconstrained, vec![]).unwrap(),
         ConnectorReadArtifactCoverage::NoArtifactInputs,
-        vec![],
+        if kind == ConnectorReadRelationKind::SystemTable {
+            FIXTURE_METADATA_COVERAGE.to_vec()
+        } else {
+            vec![]
+        },
     )
     .unwrap();
     // Complete execution semantics and original provider attributes have
@@ -302,7 +327,10 @@ fn frozen_read(
     work.finish().unwrap();
     let public = ConnectorReadPublicFacts::try_new_typed_with_control(
         source,
-        None,
+        (kind == ConnectorReadRelationKind::SystemTable).then(|| {
+            novarocks_connector_contract::ConnectorReadMetadataKind::try_new("fixture.metadata")
+                .unwrap()
+        }),
         &execution,
         &source_facts,
         &Unbounded,
@@ -497,6 +525,42 @@ fn a_compiled_read_binds_the_installed_execution_of_its_binding() {
 }
 
 #[test]
+fn system_table_and_table_execute_reads_register_the_split_execution() {
+    for kind in [
+        ConnectorReadRelationKind::SystemTable,
+        ConnectorReadRelationKind::TableExecute,
+    ] {
+        let runtime = test_support::typed_scan_runtime();
+        let read = frozen_read_kind("fixture", TupleDomain::all(), vec![], kind);
+        let source = bind(&runtime, &recipe(&read), &layout()).expect("supported relation binds");
+        assert_eq!(source.profile_name().as_deref(), Some("TypedConnectorScan"));
+        assert!(
+            runtime
+                .register_read_execution(SCAN_NODE, test_support::installed_read_execution())
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn unsupported_relation_kinds_keep_their_binding_refusal() {
+    use novarocks_execution_contract::failure::FailureProjection;
+    for kind in [
+        ConnectorReadRelationKind::TableFunction,
+        ConnectorReadRelationKind::MergeTable,
+    ] {
+        let runtime = test_support::typed_scan_runtime();
+        let read = frozen_read_kind("fixture", TupleDomain::all(), vec![], kind);
+        let error = refusal(&runtime, &recipe(&read), &layout());
+        assert_eq!(
+            error.failure_fact(),
+            ScanBindingContractFailure::UnsupportedRelation(kind).failure_fact()
+        );
+        assert_unregistered(&runtime);
+    }
+}
+
+#[test]
 fn a_compiled_read_of_another_binding_is_refused_before_registration() {
     // Same catalog generation, another provider: the installed execution of
     // that catalog is not the one this read was frozen and sealed for.
@@ -658,6 +722,14 @@ fn reads_a_compiled_scan_cannot_run_are_refused_before_registration() {
 /// over the fixture provider, streaming to a Gather receiver. Returns the
 /// bytes and the receiver node.
 pub(crate) fn scan_producer_package() -> (Vec<u8>, u32) {
+    scan_producer_package_kind(ConnectorReadRelationKind::Table)
+}
+
+pub(crate) fn system_scan_producer_package() -> (Vec<u8>, u32) {
+    scan_producer_package_kind(ConnectorReadRelationKind::SystemTable)
+}
+
+fn scan_producer_package_kind(kind: ConnectorReadRelationKind) -> (Vec<u8>, u32) {
     use novarocks_physical_plan::*;
     use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
     use novarocks_plan_codec::physical_package_v2::test_support::encode_limits;
@@ -676,7 +748,11 @@ pub(crate) fn scan_producer_package() -> (Vec<u8>, u32) {
     let int64 = || ValueType::new(DataType::Int64, false);
 
     let binding = binding("fixture");
-    let relation_payload = relation_payload(&binding);
+    let relation_payload = ConnectorReadRelationPayload::new(
+        kind,
+        payload(&binding, ConnectorCodecCategory::ReadTable, b"table"),
+        payload(&binding, ConnectorCodecCategory::ReadView, b"transaction"),
+    );
     let columns = column_payloads(&binding)
         .into_iter()
         .map(|column_payload| ProviderColumnReference { column_payload })
@@ -727,31 +803,61 @@ pub(crate) fn scan_producer_package() -> (Vec<u8>, u32) {
             SCAN,
             NodeKind::Scan {
                 occurrence: ProviderReadOccurrenceId::new(0),
-                relation: Box::new(Relation::Data(DataRelation {
-                    read: ProviderReadReference {
-                        binding: binding.clone(),
-                        input_version: ExactInputVersion::try_new([9]).unwrap(),
-                        relation: relation_payload,
-                    },
-                    work_source: ConnectorReadWorkSource::RuntimeSplits,
-                    selection_digest: [7; 32],
-                    schema: columns
-                        .iter()
-                        .map(|column| RelationField {
-                            column: column.clone(),
-                            ty: int64(),
-                        })
-                        .collect(),
-                    predicate_guarantees: Box::from([PredicateGuarantee {
-                        predicate: residual,
-                        kind: PredicateGuaranteeKind::PruningOnly,
-                    }]),
-                    provided_properties: PhysicalProperties {
-                        distribution: Distribution::Unconstrained,
-                        row_multiplicity: RowMultiplicity::SingleCopy,
-                        ordering: Box::default(),
-                    },
-                })),
+                relation: Box::new(if kind == ConnectorReadRelationKind::SystemTable {
+                    Relation::Metadata(MetadataRelation {
+                        read: ProviderReadReference {
+                            binding: binding.clone(),
+                            input_version: ExactInputVersion::try_new([9]).unwrap(),
+                            relation: relation_payload,
+                        },
+
+                        selection_digest: [7; 32],
+                        schema: columns
+                            .iter()
+                            .map(|column| RelationField {
+                                column: column.clone(),
+                                ty: int64(),
+                            })
+                            .collect(),
+                        predicate_guarantees: Box::from([PredicateGuarantee {
+                            predicate: residual,
+                            kind: PredicateGuaranteeKind::PruningOnly,
+                        }]),
+                        provided_properties: PhysicalProperties {
+                            distribution: Distribution::Unconstrained,
+                            row_multiplicity: RowMultiplicity::SingleCopy,
+                            ordering: Box::default(),
+                        },
+                        kind: MetadataRelationKind::try_new("fixture.metadata").unwrap(),
+                        coverage_evidence: FIXTURE_METADATA_COVERAGE.into(),
+                    })
+                } else {
+                    Relation::Data(DataRelation {
+                        read: ProviderReadReference {
+                            binding: binding.clone(),
+                            input_version: ExactInputVersion::try_new([9]).unwrap(),
+                            relation: relation_payload,
+                        },
+
+                        selection_digest: [7; 32],
+                        schema: columns
+                            .iter()
+                            .map(|column| RelationField {
+                                column: column.clone(),
+                                ty: int64(),
+                            })
+                            .collect(),
+                        predicate_guarantees: Box::from([PredicateGuarantee {
+                            predicate: residual,
+                            kind: PredicateGuaranteeKind::PruningOnly,
+                        }]),
+                        provided_properties: PhysicalProperties {
+                            distribution: Distribution::Unconstrained,
+                            row_multiplicity: RowMultiplicity::SingleCopy,
+                            ordering: Box::default(),
+                        },
+                    })
+                }),
                 read_budget: ScanReadBudget {
                     max_batch_rows: 1024,
                     max_batch_bytes: 1 << 20,
@@ -985,7 +1091,7 @@ pub(crate) fn scan_producer_package() -> (Vec<u8>, u32) {
     }
     let scans = BTreeMap::from([(
         ProviderReadOccurrenceId::new(0),
-        frozen_read("fixture", TupleDomain::all(), vec![]),
+        frozen_read_kind("fixture", TupleDomain::all(), vec![], kind),
     )]);
     let mut packages = extract_fragment_packages(
         &plan,

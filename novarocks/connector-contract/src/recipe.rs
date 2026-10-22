@@ -169,7 +169,8 @@ pub enum ConnectorReadRecipeSplitKind {
     Data,
     TableChanges,
     ChangeWindow,
-    SystemFiles,
+    SystemManifest,
+    SystemRelation,
     RewritePositionDeleteFiles,
 }
 

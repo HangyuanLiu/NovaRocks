@@ -603,7 +603,6 @@ mod tests {
                 }],
             },
             serialized_metadata: None,
-            serialized_metadata_rows: None,
         };
         let mut file = IcebergDataFileInfo::for_test("data.parquet", 10, 1);
         file.delete_files.push(IcebergDeleteFileInfo {

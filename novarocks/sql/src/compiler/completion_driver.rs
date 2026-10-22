@@ -1290,7 +1290,7 @@ mod tests {
         ExactInputVersion, NodeKind, PredicateGuaranteeKind, ProviderColumnReference,
         ProviderReadReference,
     };
-    use novarocks_spi::connector::read_stack::{ConnectorReadBinding, ConnectorReadWorkSource};
+    use novarocks_spi::connector::read_stack::ConnectorReadBinding;
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
         ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
@@ -1791,8 +1791,16 @@ mod tests {
                         relation.table.clone(),
                     )
                     .expect("table identity"),
-                    SqlScanKind::Data {
-                        version: SqlTableVersionSelector::Current,
+                    match need.target() {
+                        crate::compiler::CatalogLookupTarget::Table { .. } => SqlScanKind::Data {
+                            version: SqlTableVersionSelector::Current,
+                        },
+                        crate::compiler::CatalogLookupTarget::IcebergMetadata { kind } => {
+                            SqlScanKind::Metadata {
+                                kind,
+                                version: SqlTableVersionSelector::Current,
+                            }
+                        }
                     },
                 )),
             },
@@ -1850,7 +1858,6 @@ mod tests {
                 )
                 .expect("fixture metadata kind")
             }),
-            work_source: ConnectorReadWorkSource::RuntimeSplits,
             selection_digest: [8; 32],
             schema: need
                 .columns()
@@ -1882,7 +1889,14 @@ mod tests {
                 ProviderReadLimitFact::Exact,
             ),
             provided_properties: ProviderReadProperties::unconstrained(),
-            coverage_evidence: Box::default(),
+            coverage_evidence: if matches!(
+                need.relation(),
+                crate::compiler::ProviderReadRelationNeed::Metadata { .. }
+            ) {
+                Box::from(*b"fixture-metadata-coverage")
+            } else {
+                Box::default()
+            },
         }
     }
 
@@ -1953,6 +1967,86 @@ mod tests {
             &SqlCompileControl::unbounded(),
         )
         .expect("provider round")
+    }
+
+    #[test]
+    fn metadata_count_uses_unconstrained_scan_and_plan_dop_with_global_gather() {
+        use novarocks_physical_plan::{AggregatePhase, Distribution, NodeKind, Relation};
+        let intent = SqlCompileIntent::Explain {
+            level: crate::explain::ExplainLevel::Verbose,
+            analyze: false,
+        };
+        let seed = request("select count(*) from orders$snapshots", intent)
+            .try_into_completion()
+            .unwrap();
+        let mut progress = SqlCompiler::start(seed, &SqlCompileControl::unbounded()).unwrap();
+        let completed = loop {
+            match progress {
+                SqlCompileProgress::Complete(completed) => break completed,
+                SqlCompileProgress::Incomplete(compilation) => {
+                    progress = match compilation.needs() {
+                        SqlNeedBatch::CatalogRelations(_) => answer_catalog(compilation),
+                        SqlNeedBatch::Statistics(_) => answer_statistics(compilation),
+                        SqlNeedBatch::ProviderReads(_) => answer_provider(compilation),
+                        other => panic!("unexpected metadata count need {other:?}"),
+                    };
+                }
+            }
+        };
+        let plan = completed.plan();
+        let (scan_fragment, scan) = plan
+            .fragments()
+            .values()
+            .find_map(|fragment| {
+                fragment.nodes().values().find_map(|node| {
+                    matches!(node.kind, NodeKind::Scan { .. }).then_some((fragment, node))
+                })
+            })
+            .expect("metadata scan");
+        let NodeKind::Scan { relation, .. } = &scan.kind else {
+            unreachable!()
+        };
+        let Relation::Metadata(metadata) = relation.as_ref() else {
+            panic!("metadata relation must remain explicit")
+        };
+        assert_eq!(
+            metadata.read.relation.kind(),
+            novarocks_spi::connector::read_stack::ConnectorReadRelationKind::SystemTable
+        );
+        assert!(matches!(
+            metadata.provided_properties.distribution,
+            Distribution::Unconstrained
+        ));
+        assert_eq!(scan_fragment.dop_domain().max, 8);
+        assert!(scan_fragment.nodes().values().any(|node| {
+            match &node.kind {
+                NodeKind::Aggregate { calls, .. } => calls
+                    .iter()
+                    .any(|call| matches!(call.binding.phase, AggregatePhase::Partial { .. })),
+                _ => false,
+            }
+        }));
+        let gather = plan
+            .edges()
+            .values()
+            .find(|edge| {
+                edge.source.fragment == scan_fragment.id()
+                    && matches!(edge.partitioning.destination, Distribution::Singleton)
+            })
+            .expect("metadata partial states must cross a gather boundary");
+        let final_fragment = &plan.fragments()[&gather.destination.fragment];
+        assert!(final_fragment.nodes().values().any(|node| {
+            match &node.kind {
+                NodeKind::Aggregate { calls, .. } => calls
+                    .iter()
+                    .any(|call| matches!(call.binding.phase, AggregatePhase::Final { .. })),
+                _ => false,
+            }
+        }));
+        let verbose = completed.render_explain_lines().unwrap().join("\n");
+        assert!(verbose.contains("HASH AGGREGATE"));
+        assert!(verbose.contains("EXCHANGE"));
+        assert!(!verbose.contains("work-source="));
     }
 
     #[test]

@@ -187,7 +187,6 @@ fn typed_frozen_read_with_distribution(
         dynamic_filters,
         NonZeroU64::new(100).unwrap(),
         NonZeroU64::new(4096).unwrap(),
-        ConnectorReadWorkSource::RuntimeSplits,
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(
@@ -311,7 +310,7 @@ pub(crate) fn add_typed_scan_with_residual(
                         input_version: ExactInputVersion::try_new([9]).unwrap(),
                         relation: recipe.relation().clone(),
                     },
-                    work_source: ConnectorReadWorkSource::RuntimeSplits,
+
                     selection_digest: [7; 32],
                     schema: columns
                         .iter()
@@ -406,7 +405,7 @@ pub(crate) fn scan_program(dop: usize, residual: bool) -> Arc<LocalProgram> {
     };
     let relation = Relation::Data(DataRelation {
         read,
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
+
         selection_digest: [7; 32],
         schema: columns
             .iter()
@@ -749,6 +748,7 @@ impl FixtureScanOp {
                 chunks: Mutex::new(Some(chunks.into())),
                 endless,
                 claims: AtomicUsize::new(0),
+                closes: Arc::new(AtomicUsize::new(0)),
             }),
             terminations: AtomicUsize::new(0),
         })
@@ -756,6 +756,10 @@ impl FixtureScanOp {
 
     pub(crate) fn terminations(&self) -> usize {
         self.terminations.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn closes(&self) -> usize {
+        self.source.closes.load(Ordering::Acquire)
     }
 
     pub(crate) fn claims(&self) -> usize {
@@ -782,6 +786,7 @@ struct FixtureStreamSource {
     chunks: Mutex<Option<VecDeque<Chunk>>>,
     endless: bool,
     claims: AtomicUsize,
+    closes: Arc<AtomicUsize>,
 }
 
 impl ScanStreamSource for FixtureStreamSource {
@@ -807,6 +812,7 @@ impl ScanStreamSource for FixtureStreamSource {
         Ok(Box::pin(FixtureStream {
             chunks,
             endless: self.endless,
+            closes: Arc::clone(&self.closes),
         }))
     }
 }
@@ -814,6 +820,7 @@ impl ScanStreamSource for FixtureStreamSource {
 struct FixtureStream {
     chunks: VecDeque<Chunk>,
     endless: bool,
+    closes: Arc<AtomicUsize>,
 }
 
 impl Stream for FixtureStream {
@@ -848,6 +855,7 @@ impl ScanChunkStream for FixtureStream {
         self: Pin<Box<Self>>,
         _failures: Arc<dyn crate::runtime::fragment::ExecutionFailureReporter>,
     ) -> BoxFuture<'static, crate::runtime::fragment::ExecutionResult<()>> {
+        self.closes.fetch_add(1, Ordering::AcqRel);
         Box::pin(async { Ok(()) })
     }
 }

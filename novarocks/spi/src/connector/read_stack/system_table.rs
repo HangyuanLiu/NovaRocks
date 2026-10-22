@@ -19,14 +19,14 @@
 
 use crate::connector::{ConnectorError, ConnectorErrorKind};
 
-/// Where a system relation must run.
+/// Provider work-unit hint used only for frontend placement; never an execution constraint.
+// Design: ADR-0192 (docs/adr/ADR-0192-provider-work-units-share-one-runtime-split-path.md)
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum SystemTableDistribution {
+pub enum SystemTableUnitHint {
     /// Distributed over the admitted workers through a typed split source.
-    AllNodes,
-    /// Executed exactly once. Native selects one backend rather than running
-    /// the relation on the coordinator.
-    SingleCoordinator,
+    ManyUnits,
+    /// Expected to enumerate one work unit; correctness does not depend on placement.
+    SingleUnit,
 }
 
 /// One system relation's exact output column.
@@ -57,10 +57,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn distribution_is_a_closed_set() {
+    fn unit_hints_are_a_closed_set() {
         assert_ne!(
-            SystemTableDistribution::AllNodes,
-            SystemTableDistribution::SingleCoordinator
+            SystemTableUnitHint::ManyUnits,
+            SystemTableUnitHint::SingleUnit
         );
     }
 

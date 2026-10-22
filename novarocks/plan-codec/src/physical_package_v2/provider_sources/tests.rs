@@ -161,7 +161,7 @@ pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::Fragmen
         p::Relation::Metadata(p::MetadataRelation {
             kind: p::MetadataRelationKind::try_new("iceberg.manifest.entries").unwrap(),
             read,
-            work_source: c::ConnectorReadWorkSource::RuntimeSplits,
+
             selection_digest: [8; 32],
             schema: Box::from([field]),
             predicate_guarantees: Box::default(),
@@ -171,7 +171,7 @@ pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::Fragmen
     } else {
         p::Relation::Data(p::DataRelation {
             read,
-            work_source: c::ConnectorReadWorkSource::RuntimeSplits,
+
             selection_digest: [8; 32],
             schema: Box::from([field]),
             predicate_guarantees: Box::default(),
@@ -279,7 +279,6 @@ pub(in crate::physical_package_v2) fn checked_read(metadata: bool) -> p::Fragmen
         vec![],
         NonZeroU64::new(4096).unwrap(),
         NonZeroU64::new(4 * 1024 * 1024).unwrap(),
-        c::ConnectorReadWorkSource::RuntimeSplits,
     )
     .unwrap();
     let facts = c::ConnectorReadStaticFacts::try_new(

@@ -30,9 +30,10 @@ use novarocks_spi::connector::read_stack::{
 use novarocks_spi::connector::{CatalogHandle, ConnectorInstanceDescriptor};
 
 use super::{
-    FilesTableSplit, IcebergChangeSplit, IcebergChangeWindowHandle, IcebergMergeTableHandle,
+    IcebergChangeSplit, IcebergChangeWindowHandle, IcebergMergeTableHandle,
     IcebergRewritePositionDeleteFilesSplit, IcebergSystemTableReference, IcebergTableExecuteHandle,
-    IcebergTableHandle, TableChangesFunctionHandle, TableChangesSplit,
+    IcebergTableHandle, SystemManifestSplit, SystemRelationSplit, TableChangesFunctionHandle,
+    TableChangesSplit,
 };
 
 #[derive(Clone, Debug)]
@@ -74,7 +75,8 @@ pub enum IcebergReadSplit {
     Data(IcebergTableHandleSplit),
     TableChanges(TableChangesSplit),
     ChangeWindow(IcebergChangeSplit),
-    SystemFiles(FilesTableSplit),
+    SystemManifest(SystemManifestSplit),
+    SystemRelation(SystemRelationSplit),
     RewritePositionDeleteFiles(IcebergRewritePositionDeleteFilesSplit),
 }
 
@@ -142,7 +144,8 @@ impl ConnectorSplit for IcebergReadSplit {
             Self::Data(split) => split.is_remotely_accessible(),
             Self::TableChanges(split) => split.is_remotely_accessible(),
             Self::ChangeWindow(split) => split.is_remotely_accessible(),
-            Self::SystemFiles(split) => split.is_remotely_accessible(),
+            Self::SystemManifest(split) => split.is_remotely_accessible(),
+            Self::SystemRelation(split) => split.is_remotely_accessible(),
             Self::RewritePositionDeleteFiles(split) => split.is_remotely_accessible(),
         }
     }
@@ -152,7 +155,8 @@ impl ConnectorSplit for IcebergReadSplit {
             Self::Data(split) => split.addresses(),
             Self::TableChanges(split) => split.addresses(),
             Self::ChangeWindow(split) => split.addresses(),
-            Self::SystemFiles(split) => split.addresses(),
+            Self::SystemManifest(split) => split.addresses(),
+            Self::SystemRelation(split) => split.addresses(),
             Self::RewritePositionDeleteFiles(split) => split.addresses(),
         }
     }
@@ -162,7 +166,8 @@ impl ConnectorSplit for IcebergReadSplit {
             Self::Data(split) => split.affinity_key(),
             Self::TableChanges(split) => split.affinity_key(),
             Self::ChangeWindow(split) => split.affinity_key(),
-            Self::SystemFiles(split) => split.affinity_key(),
+            Self::SystemManifest(split) => split.affinity_key(),
+            Self::SystemRelation(split) => split.affinity_key(),
             Self::RewritePositionDeleteFiles(split) => split.affinity_key(),
         }
     }
@@ -172,7 +177,8 @@ impl ConnectorSplit for IcebergReadSplit {
             Self::Data(split) => split.split_weight(),
             Self::TableChanges(split) => split.split_weight(),
             Self::ChangeWindow(split) => split.split_weight(),
-            Self::SystemFiles(split) => split.split_weight(),
+            Self::SystemManifest(split) => split.split_weight(),
+            Self::SystemRelation(split) => split.split_weight(),
             Self::RewritePositionDeleteFiles(split) => split.split_weight(),
         }
     }
@@ -182,7 +188,8 @@ impl ConnectorSplit for IcebergReadSplit {
             Self::Data(split) => split.retained_size_in_bytes(),
             Self::TableChanges(split) => split.retained_size_in_bytes(),
             Self::ChangeWindow(split) => split.retained_size_in_bytes(),
-            Self::SystemFiles(split) => split.retained_size_in_bytes(),
+            Self::SystemManifest(split) => split.retained_size_in_bytes(),
+            Self::SystemRelation(split) => split.retained_size_in_bytes(),
             Self::RewritePositionDeleteFiles(split) => split.retained_size_in_bytes(),
         }
     }

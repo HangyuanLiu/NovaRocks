@@ -2256,7 +2256,7 @@ fn split_queue_rejection(error: SplitQueueError) -> HostRejection {
 
 /// The instance scan assignments of a compiled program: an empty range
 /// binding for each compiled scan's physical node, because a compiled scan
-/// takes all of its work as runtime splits.
+/// takes every provider relation's work units as runtime splits.
 ///
 /// The descriptor must name exactly those nodes as split-driven: a scan it
 /// omits would never be told that no more splits come, and a node it adds
@@ -10334,7 +10334,7 @@ pub(crate) mod tests {
         /// A query context that leases the fixture catalog with its installed
         /// read execution; every other fact is the stub's.
         #[derive(Default)]
-        struct ScanContextFacts(StubContextFacts);
+        struct ScanContextFacts(StubContextFacts, Option<ConnectorExecutionReadBinding>);
 
         impl TaskQueryContextFacts for ScanContextFacts {
             fn query_options(
@@ -10409,8 +10409,9 @@ pub(crate) mod tests {
                 handle: &CatalogHandle,
             ) -> Result<ConnectorExecutionReadBinding, novarocks_worker::CatalogExecutionAccessError>
             {
-                let installed =
-                    crate::typed_connector_test_support::test_support::installed_read_execution();
+                let installed = self.1.clone().unwrap_or_else(
+                    crate::typed_connector_test_support::test_support::installed_read_execution,
+                );
                 if installed.binding().catalog_handle() == handle {
                     Ok(installed)
                 } else {
@@ -10624,6 +10625,82 @@ pub(crate) mod tests {
             assert!(!provider.retryable_before_progress());
             await_runtime_convergence(&owner);
 
+            host.remove_inbound_capability(&descriptor);
+            host.remove_receiver(&descriptor);
+            assert!(host.task_runtime(identity).is_none());
+        }
+
+        #[test]
+        fn a_compiled_system_scan_opens_its_delivered_unit_and_closes_on_abort() {
+            use crate::compiled_scan_binding::tests::{SCAN_NODE, system_scan_producer_package};
+            use crate::typed_connector_test_support::test_support::{
+                PendingReadProbe, installed_pending_read_execution,
+            };
+            use std::sync::atomic::Ordering;
+            let probe = Arc::new(PendingReadProbe::default());
+            let facts = Arc::new(ScanContextFacts(
+                StubContextFacts::default(),
+                Some(installed_pending_read_execution(probe.clone())),
+            ));
+            let host = scan_host(facts);
+            let identity = super::identity(74, 1, 1);
+            let (package, receiver) = system_scan_producer_package();
+            let descriptor = producer_descriptor(identity, receiver, &[SCAN_NODE]);
+            establish_fixture_context(&host, descriptor.identity());
+            let (owner, reporter) = reporter_for(identity);
+            let preparation = novarocks_worker::TestPreparationControl::from_status(
+                owner.clone(),
+                Duration::from_millis(1),
+            );
+            host.install_receiver(
+                &descriptor,
+                scan_input(
+                    &descriptor,
+                    package_carrier(&package),
+                    vec![empty_scan_ranges(SCAN_NODE)],
+                ),
+                preparation.scope(),
+            )
+            .expect("system package installs through split scan binding");
+            host.install_inbound_capability(&descriptor)
+                .expect("installs");
+            let runnable = submit_committed(&host, &descriptor, reporter);
+            host.apply_task_domain(
+                &descriptor,
+                &split_intent(
+                    PlanNodeId::new(SCAN_NODE).unwrap(),
+                    SCAN_NODE,
+                    vec![
+                        crate::typed_connector_test_support::test_support::split_proto(
+                            SCAN_NODE, 1,
+                        ),
+                    ],
+                    SplitOffer::batch(SplitSequence::FIRST, SplitSequence::FIRST, true).unwrap(),
+                ),
+                TaskOperationId::new_v7(),
+            )
+            .expect("installed execution decodes the system work unit");
+            for _ in 0..600 {
+                if probe.opens.load(Ordering::Acquire) == 1 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                probe.opens.load(Ordering::Acquire),
+                1,
+                "provider reader opens before abort"
+            );
+            assert!(!owner.is_terminal(), "the pending reader retains the task");
+            owner.force_conclusion(AbortCause::QueryFailed);
+            runnable.abort(AbortCause::QueryFailed);
+            assert_eq!(await_terminal(&owner), TaskState::Aborted);
+            await_runtime_convergence(&owner);
+            assert_eq!(
+                probe.closes.load(Ordering::Acquire),
+                1,
+                "the opened stream closes exactly once"
+            );
             host.remove_inbound_capability(&descriptor);
             host.remove_receiver(&descriptor);
             assert!(host.task_runtime(identity).is_none());

@@ -283,7 +283,6 @@ mod tests {
             vec![],
             NonZeroU64::new(100).unwrap(),
             NonZeroU64::new(4096).unwrap(),
-            ConnectorReadWorkSource::RuntimeSplits,
         )
         .unwrap()
     }
@@ -353,7 +352,6 @@ mod tests {
             vec![],
             NonZeroU64::new(100).unwrap(),
             NonZeroU64::new(4096).unwrap(),
-            ConnectorReadWorkSource::RuntimeSplits,
         )
         .unwrap();
         let public = ConnectorReadPublicFacts::try_new(

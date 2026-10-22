@@ -55,7 +55,7 @@ pub struct CompiledExchangeInput {
 
 /// Compiled-only physical address of one actual provider `Scan` node. A
 /// compiled node has no legacy native identity, so the program names the
-/// physical node that keys the task's runtime split queue, range scope and
+/// physical node that keys every relation's task-local work-unit queue, range scope and
 /// scan assignment instead of deriving it from a node ID.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompiledScanInput {

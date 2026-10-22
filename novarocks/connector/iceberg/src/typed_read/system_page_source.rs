@@ -17,8 +17,8 @@
 
 //! The worker-side reader for Iceberg system relations.
 //!
-//! Five relations -- `$entries`, `$snapshots`, `$history`, `$refs` and
-//! `$manifests` -- run on exactly one selected backend with no split at all.
+//! Files and entries read one manifest per work unit. Snapshots, history,
+//! refs and manifests each read one indivisible relation work unit.
 //! The reader opens the frozen metadata file, proves it is the file planning
 //! froze through [`IcebergSystemTableReference::verify_loaded_metadata`], and
 //! produces pages straight from it. It never re-resolves the table through the
@@ -29,15 +29,6 @@
 //! twenty-two flat entry columns match the catalog-owned metadata schema.
 //! Bounds remain field-ID keyed binary maps, including historical field IDs.
 //!
-//! `$partitions` is the aggregation Trino calls `PartitionsView`, computed over
-//! the same pinned snapshot's `$files` rows. It carries its own reference kind
-//! because a `$files` reference reaching a backend reads as the un-aggregated
-//! relation -- one row per data file where the query asked for one row per
-//! partition -- but both kinds are minted by one resolution, so they can never
-//! describe different snapshots. It is read on a single backend: an aggregate
-//! over one manifest would report a partition that only part of the snapshot
-//! describes.
-//!
 //! Three rules shape every schema here:
 //!
 //! * the column list, its order and its types are frozen by the design spec, not
@@ -47,7 +38,7 @@
 //! * anything this stack cannot prove fails closed. There is no guessed count,
 //!   no substituted zero, and no encrypted manifest read with its key ignored.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -62,7 +53,7 @@ use bytes::Bytes;
 use novarocks_connector_contract::PureProviderCompileError;
 use novarocks_fs::{FileReadContext, FileReadRange};
 use novarocks_spi::connector::read_stack::{
-    ConnectorPollBudget, ConnectorSession, OwnedConnectorPageStream, PageSourceMetrics, SourcePage,
+    ConnectorPollBudget, OwnedConnectorPageStream, PageSourceMetrics, SourcePage,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 use novarocks_type_contract::{
@@ -80,8 +71,8 @@ use crate::iceberg::spec::{
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, type_to_json, unsupported};
 use super::page_source::{MaterializedPageStream, MaterializedPages, SplitOperations};
 use super::system_table::{
-    FilesTableSplit, IcebergSystemTableExecution, IcebergSystemTableReference,
-    IcebergSystemTableType, TrinoManifestFile,
+    IcebergSystemTableReference, IcebergSystemTableType, SystemManifestSplit, SystemRelationSplit,
+    TrinoManifestFile,
 };
 
 /// The Arrow rendering of `TIMESTAMP WITH TIME ZONE`.
@@ -439,10 +430,6 @@ pub(crate) fn system_column_field_for_compile(
             IcebergSystemTableType::History => history_fields(),
             IcebergSystemTableType::Refs => refs_fields(),
             IcebergSystemTableType::Manifests => manifests_fields(),
-            IcebergSystemTableType::Partitions => partitions_fields(
-                (field.name() == "partition").then_some(field.data_type()),
-                (field.name() == "data").then_some(field.data_type()),
-            ),
         };
         work.flush()?;
         let mut expected = None;
@@ -590,7 +577,6 @@ pub fn system_relation_schema_with_metadata(
         IcebergSystemTableType::Entries => {
             entries_fields(partition_row_type_with_metadata(metadata)?.as_ref())
         }
-        IcebergSystemTableType::Partitions => partitions_fields(None, None),
         _ => return system_relation_schema(relation, metadata.current_schema(), &[]),
     };
     Ok(Arc::new(ArrowSchema::new(fields)))
@@ -599,8 +585,15 @@ pub fn system_relation_schema_with_metadata(
 pub fn files_relation_schema_json_with_metadata(
     metadata: &TableMetadata,
 ) -> Result<String, ConnectorError> {
+    system_relation_schema_json_with_metadata(IcebergSystemTableType::Files, metadata)
+}
+
+pub fn system_relation_schema_json_with_metadata(
+    kind: IcebergSystemTableType,
+    metadata: &TableMetadata,
+) -> Result<String, ConnectorError> {
     type_to_json(&metadata_relation_row(
-        &system_relation_schema_with_metadata(IcebergSystemTableType::Files, metadata)?,
+        &system_relation_schema_with_metadata(kind, metadata)?,
     )?)
 }
 
@@ -637,59 +630,7 @@ pub fn partition_row_type(
     schema: &Schema,
     specs: &[PartitionSpec],
 ) -> Result<Option<DataType>, ConnectorError> {
-    let mut ordered: Vec<&PartitionSpec> = specs.iter().collect();
-    ordered.sort_by_key(|spec| spec.spec_id());
-
-    let mut fields: Vec<Arc<Field>> = Vec::new();
-    for spec in ordered {
-        for partition_field in spec.fields() {
-            let source = schema
-                .field_by_id(partition_field.source_id)
-                .ok_or_else(|| {
-                    corrupt(format!(
-                        "iceberg partition field {} references missing source field id {}",
-                        partition_field.name, partition_field.source_id
-                    ))
-                })?;
-            let result_type = partition_field
-                .transform
-                .result_type(source.field_type.as_ref())
-                .map_err(|error| {
-                    corrupt(format!(
-                        "iceberg partition field {} has no result type: {error}",
-                        partition_field.name
-                    ))
-                })?;
-            let Type::Primitive(primitive) = &result_type else {
-                return Err(corrupt(format!(
-                    "iceberg partition field {} does not transform to a primitive",
-                    partition_field.name
-                )));
-            };
-            let arrow_type = crate::metadata_batch_reader::iceberg_type_to_arrow_type(
-                &Type::Primitive(primitive.clone()),
-            )
-            .map_err(corrupt)?;
-            if let Some(existing) = fields
-                .iter()
-                .find(|field| field.name().eq_ignore_ascii_case(&partition_field.name))
-            {
-                if existing.data_type() != &arrow_type {
-                    return Err(corrupt(format!(
-                        "iceberg partition field {} has incompatible types across specs: {:?} vs {arrow_type:?}",
-                        partition_field.name,
-                        existing.data_type()
-                    )));
-                }
-                continue;
-            }
-            fields.push(Arc::new(nullable(&partition_field.name, arrow_type)));
-        }
-    }
-    if fields.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(DataType::Struct(Fields::from(fields))))
+    Ok(crate::partition_row::UnifiedPartitionRow::of(schema, specs)?.arrow_type())
 }
 
 /// Every primitive field of a schema, in field-id order, with its Arrow type.
@@ -721,32 +662,6 @@ pub fn bounds_row_type(_schema: &Schema) -> Result<Option<DataType>, ConnectorEr
     Ok(Some(map_type(DataType::Int32, DataType::Binary)))
 }
 
-/// The `$partitions.data` ROW type: one field per top-level primitive column,
-/// each a `ROW(min, max, null_count, nan_count)` over that column's own type.
-///
-/// Only top-level columns take part: a nested field's name is not unique in the
-/// table, and a ROW cannot carry two fields with one name.
-fn partitions_metrics_row_type(schema: &Schema) -> Result<Option<DataType>, ConnectorError> {
-    let mut fields: Vec<Arc<Field>> = Vec::new();
-    for field in schema.as_struct().fields() {
-        let Type::Primitive(primitive) = field.field_type.as_ref() else {
-            continue;
-        };
-        let value_type = iceberg_primitive_to_arrow(primitive)?;
-        let metrics = DataType::Struct(Fields::from(vec![
-            Arc::new(nullable("min", value_type.clone())),
-            Arc::new(nullable("max", value_type)),
-            Arc::new(nullable("null_count", DataType::Int64)),
-            Arc::new(nullable("nan_count", DataType::Int64)),
-        ]));
-        fields.push(Arc::new(nullable(&field.name, metrics)));
-    }
-    if fields.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(DataType::Struct(Fields::from(fields))))
-}
-
 // ---------------------------------------------------------------------------
 // Frozen relation schemas
 // ---------------------------------------------------------------------------
@@ -754,7 +669,7 @@ fn partitions_metrics_row_type(schema: &Schema) -> Result<Option<DataType>, Conn
 /// The eighteen public file columns, in the catalog's accepted order.
 /// Bounds preserve field-ID binary maps; partition is always a nullable ROW.
 fn files_fields(partition_row: Option<&DataType>, _bounds_row: Option<&DataType>) -> Vec<Field> {
-    vec![
+    let mut fields = vec![
         required("content", DataType::Int32),
         required("file_path", DataType::Utf8),
         required("file_format", DataType::Utf8),
@@ -778,13 +693,11 @@ fn files_fields(partition_row: Option<&DataType>, _bounds_row: Option<&DataType>
         nullable("sort_order_id", DataType::Int32),
         nullable("key_metadata", DataType::Binary),
         nullable("first_row_id", DataType::Int64),
-        nullable(
-            "partition",
-            partition_row
-                .cloned()
-                .unwrap_or_else(|| DataType::Struct(Fields::empty())),
-        ),
-    ]
+    ];
+    if let Some(partition) = partition_row {
+        fields.push(nullable("partition", partition.clone()));
+    }
+    fields
 }
 
 /// The `$entries.data_file` ROW: the file's own facts, nested rather than
@@ -900,18 +813,6 @@ fn manifests_fields() -> Vec<Field> {
     ]
 }
 
-fn partitions_fields(
-    _partition_row: Option<&DataType>,
-    _metrics_row: Option<&DataType>,
-) -> Vec<Field> {
-    vec![
-        required("record_count", DataType::Int64),
-        required("file_count", DataType::Int64),
-        nullable("position_delete_file_count", DataType::Int64),
-        nullable("equality_delete_file_count", DataType::Int64),
-    ]
-}
-
 /// The frozen output schema of one worker system relation.
 ///
 /// Every schema is derived from the table schema and partition specs the
@@ -934,20 +835,8 @@ pub fn system_relation_schema(
         IcebergSystemTableType::History => history_fields(),
         IcebergSystemTableType::Refs => refs_fields(),
         IcebergSystemTableType::Manifests => manifests_fields(),
-        IcebergSystemTableType::Partitions => partitions_fields(None, None),
     };
     Ok(Arc::new(ArrowSchema::new(fields)))
-}
-
-/// The frozen output schema of the `$partitions` view.
-///
-/// It is a separate entry point because `$partitions` is not a worker relation:
-/// it aggregates the `$files` rows of the same pinned snapshot.
-pub fn partitions_view_schema(
-    _schema: &Schema,
-    _specs: &[PartitionSpec],
-) -> Result<SchemaRef, ConnectorError> {
-    Ok(Arc::new(ArrowSchema::new(partitions_fields(None, None))))
 }
 
 mod schema_author;
@@ -1164,9 +1053,9 @@ struct FileRow {
     file_path: String,
     file_format: &'static str,
     spec_id: i32,
-    /// The entry's partition tuple, already resolved to `name -> value` through
-    /// the spec the manifest names.
-    partition: BTreeMap<String, Option<Literal>>,
+    /// The entry's partition tuple in canonical field-ID slots, resolved
+    /// through the exact spec the manifest names.
+    partition: Vec<Option<Literal>>,
     record_count: i64,
     file_size_in_bytes: i64,
     column_sizes: BTreeMap<i32, i64>,
@@ -1236,31 +1125,35 @@ fn counts_to_map(
 fn partition_values(
     data_file: &DataFile,
     spec: &PartitionSpec,
-) -> Result<BTreeMap<String, Option<Literal>>, ConnectorError> {
+    unified: &crate::partition_row::UnifiedPartitionRow,
+) -> Result<Vec<Option<Literal>>, ConnectorError> {
     let values = data_file.partition().fields();
-    if values.len() != spec.fields().len() {
+    let mapping = unified
+        .slots_by_spec
+        .get(&spec.spec_id())
+        .ok_or_else(|| corrupt("iceberg partition spec has no canonical slot mapping"))?;
+    if values.len() != spec.fields().len() || mapping.len() != values.len() {
         return Err(corrupt(format!(
-            "iceberg data file {} carries {} partition values for spec {} with {} fields",
+            "iceberg data file {} partition value count differs from spec {}",
             data_file.file_path(),
-            values.len(),
-            spec.spec_id(),
-            spec.fields().len()
+            spec.spec_id()
         )));
     }
-    Ok(spec
-        .fields()
-        .iter()
-        .zip(values)
-        .map(|(field, value)| (field.name.clone(), value.clone()))
-        .collect())
+    let mut output = vec![None; unified.fields.len()];
+    for (slot, value) in mapping.iter().zip(values) {
+        if let Some(slot) = slot {
+            output[*slot] = value.clone();
+        }
+    }
+    Ok(output)
 }
 
-/// Turn the entries of one manifest into `$files`-shaped rows.
 fn manifest_rows(
     manifest_file: &TrinoManifestFile,
     manifest: &Manifest,
     spec: &PartitionSpec,
     status_rule: EntryStatusRule,
+    unified: &crate::partition_row::UnifiedPartitionRow,
 ) -> Result<Vec<FileRow>, ConnectorError> {
     let mut rows = Vec::with_capacity(manifest.entries().len());
     for (ordinal, entry) in manifest.entries().iter().enumerate() {
@@ -1297,7 +1190,7 @@ fn manifest_rows(
             // not apply here, and an ORC or Avro file is reported happily.
             file_format: file_format_name(data_file.file_format()),
             spec_id: manifest_file.partition_spec_id(),
-            partition: partition_values(data_file, spec)?,
+            partition: partition_values(data_file, spec, unified)?,
             record_count,
             file_size_in_bytes,
             column_sizes: counts_to_map(data_file.column_sizes(), "column size")?,
@@ -1598,13 +1491,13 @@ fn primitive_array(
 /// Build the schema-derived `partition` ROW column.
 fn partition_struct_array(
     row_type: &DataType,
-    rows: &[&BTreeMap<String, Option<Literal>>],
+    rows: &[&Vec<Option<Literal>>],
 ) -> Result<ArrayRef, ConnectorError> {
     let DataType::Struct(fields) = row_type else {
         return Err(internal("iceberg partition row type must be a struct"));
     };
     let mut children = Vec::with_capacity(fields.len());
-    for field in fields {
+    for (ordinal, field) in fields.iter().enumerate() {
         let target =
             metadata_relation_type(field.data_type(), &mut MetadataRelationFieldIds::new())?;
         let Type::Primitive(target) = target else {
@@ -1612,7 +1505,7 @@ fn partition_struct_array(
         };
         let promoted = rows
             .iter()
-            .map(|row| match row.get(field.name()) {
+            .map(|row| match row.get(ordinal) {
                 // A spec that does not define this field leaves it null.
                 None | Some(None) => Ok(None),
                 Some(Some(Literal::Primitive(literal))) => Ok(Some(
@@ -2381,289 +2274,6 @@ fn partition_summaries_array(
 }
 
 // ---------------------------------------------------------------------------
-// The `$partitions` view
-// ---------------------------------------------------------------------------
-
-/// One aggregated partition of the `$partitions` view.
-#[derive(Debug)]
-struct PartitionAggregate {
-    record_count: i64,
-    file_count: i64,
-    position_delete_files: BTreeSet<String>,
-    equality_delete_files: BTreeSet<String>,
-}
-
-fn check_partition_read(context: &FileReadContext) -> Result<(), ConnectorError> {
-    context
-        .check_active()
-        .map_err(crate::file_reader::map_file_error)
-}
-
-fn partition_construction_failure(
-    cause: crate::delete_semantics::ConstructionFailure<ConnectorError>,
-) -> ConnectorError {
-    match cause {
-        crate::delete_semantics::ConstructionFailure::Semantic(cause) => corrupt(cause.to_string()),
-        crate::delete_semantics::ConstructionFailure::Original(cause) => cause,
-    }
-}
-
-/// Count the same per-data-file load views as the public metadata owner.
-/// Group identity includes spec ID; delete counts deduplicate physical paths
-/// inside each group, rather than counting manifest rows or applications.
-fn aggregate_partition_facts(
-    files: Vec<(crate::delete_semantics::DataFileFact, (i32, String))>,
-    index: &crate::delete_semantics::DeleteCandidateIndex,
-    context: &FileReadContext,
-) -> Result<Vec<PartitionAggregate>, ConnectorError> {
-    use crate::delete_semantics::DeleteKind;
-    let mut groups = BTreeMap::<(i32, String), PartitionAggregate>::new();
-    for (file, key) in files {
-        check_partition_read(context)?;
-        let group = groups.entry(key).or_insert_with(|| PartitionAggregate {
-            record_count: 0,
-            file_count: 0,
-            position_delete_files: BTreeSet::new(),
-            equality_delete_files: BTreeSet::new(),
-        });
-        let rows = i64::try_from(file.record_count)
-            .map_err(|_| corrupt("Iceberg partition record count exceeds Int64"))?;
-        group.record_count = group
-            .record_count
-            .checked_add(rows)
-            .ok_or_else(|| corrupt("Iceberg partition record count exceeds Int64"))?;
-        group.file_count = group
-            .file_count
-            .checked_add(1)
-            .ok_or_else(|| corrupt("Iceberg partition file count exceeds Int64"))?;
-        let logical = index
-            .for_data(&file)
-            .map_err(|cause| corrupt(cause.to_string()))?;
-        let deletes = crate::read_snapshot::metadata_delete_load_view(&logical);
-        for delete in deletes.members() {
-            check_partition_read(context)?;
-            let paths = match delete.kind() {
-                DeleteKind::Equality(_) => &mut group.equality_delete_files,
-                DeleteKind::Position { .. } | DeleteKind::DeletionVector { .. } => {
-                    &mut group.position_delete_files
-                }
-            };
-            paths.insert(delete.address().path().to_owned());
-        }
-    }
-    Ok(groups.into_values().collect())
-}
-
-/// Observe the original pinned manifests and reuse the provider's existing
-/// delete normalization/index/load-view owners. No catalogue, later snapshot,
-/// guessed sequence, or hand-written applicability rule enters this path.
-async fn read_snapshot_partitions(
-    reader: &mut FrozenMetadataReader<'_>,
-    reference: &IcebergSystemTableReference,
-    metadata: &TableMetadata,
-    budget: &ConnectorPollBudget,
-) -> Result<Vec<PartitionAggregate>, ConnectorError> {
-    use crate::delete_semantics::*;
-    let context = reader.context;
-    check_partition_read(context)?;
-    let Some(snapshot_id) = reference.snapshot_id() else {
-        return Ok(Vec::new());
-    };
-    let schema = metadata
-        .snapshot_by_id(snapshot_id)
-        .ok_or_else(|| corrupt("pinned partition snapshot is absent"))?
-        .schema(metadata)
-        .map_err(|cause| corrupt(cause.to_string()))?;
-    let domain =
-        crate::read_snapshot::mint_read_domain(metadata, snapshot_id, &schema).map_err(corrupt)?;
-    check_partition_read(context)?;
-    let manifests = read_snapshot_manifests(reader, reference, metadata, budget).await?;
-    let mut seen = HashSet::new();
-    let mut data = Vec::new();
-    let mut observations = Vec::new();
-    for file in &manifests.files {
-        check_partition_read(context)?;
-        if !seen.insert(file.path().to_owned()) {
-            continue;
-        }
-        let spec = manifest_spec(metadata, file)?;
-        let partition_type = domain
-            .endpoint()
-            .partition_type(spec.spec_id())
-            .map_err(|cause| corrupt(cause.to_string()))?;
-        let manifest = reader.load_manifest(file).await.map_err(|cause| {
-            cause.map_message(|message| {
-                crate::manifest::with_variant_statistics_hint(message, metadata)
-            })
-        })?;
-        budget.consume(1).await;
-        check_partition_read(context)?;
-        if manifest.metadata().partition_spec != spec {
-            return Err(corrupt(
-                "manifest partition spec differs from the frozen metadata",
-            ));
-        }
-        let mut deletes = Vec::new();
-        for entry in manifest.entries() {
-            budget.consume(1).await;
-            check_partition_read(context)?;
-            if entry.status() == ManifestStatus::Deleted {
-                continue;
-            }
-            let sequence = EntrySequence {
-                format_version: manifest.metadata().format_version,
-                status: entry.status(),
-                data_sequence: entry.sequence_number(),
-                manifest_sequence: file.sequence_number(),
-            };
-            let original = entry.data_file();
-            let partition = TypedPartition::bind_type_checked(
-                &spec,
-                &partition_type,
-                original.partition(),
-                |_, _| check_partition_read(context),
-                || check_partition_read(context),
-            )
-            .map_err(|cause| match cause {
-                PartitionBindFailure::Semantic(cause) => corrupt(cause.to_string()),
-                PartitionBindFailure::Original(cause) => cause,
-            })?;
-            let metrics =
-                crate::read_snapshot::manifest_metrics_for_metadata(original, &schema, || {
-                    check_partition_read(context)
-                })?;
-            if original.content_type() == DataContentType::Data {
-                let fact = DataFileFact::try_new(
-                    original.file_path(),
-                    sequence
-                        .required_sequence()
-                        .map_err(|cause| corrupt(cause.to_string()))?,
-                    partition,
-                    original.record_count(),
-                    metrics,
-                )
-                .map_err(|cause| corrupt(cause.to_string()))?;
-                let values = crate::read_snapshot::resolved_partition_values(
-                    original.partition(),
-                    &partition_type,
-                );
-                let key = crate::read_model::iceberg_partition_key(&values)
-                    .unwrap_or_else(|| "Struct([])".to_owned());
-                data.push((fact, (spec.spec_id(), key)));
-                continue;
-            }
-            let (address, kind) = match (original.content_type(), original.file_format()) {
-                (DataContentType::PositionDeletes, DataFileFormat::Puffin) => {
-                    let offset = original
-                        .content_offset()
-                        .ok_or_else(|| corrupt("Puffin deletion vector has no content offset"))?;
-                    let length = original
-                        .content_size_in_bytes()
-                        .ok_or_else(|| corrupt("Puffin deletion vector has no content size"))?;
-                    let target = original
-                        .referenced_data_file()
-                        .ok_or_else(|| corrupt("Puffin deletion vector has no target"))?;
-                    (
-                        DeleteContentAddress::puffin(
-                            original.file_path(),
-                            offset,
-                            length,
-                            original.file_size_in_bytes(),
-                        ),
-                        DeleteKind::DeletionVector {
-                            exact_target: target.into(),
-                        },
-                    )
-                }
-                (DataContentType::PositionDeletes, DataFileFormat::Parquet) => (
-                    DeleteContentAddress::file(original.file_path()),
-                    DeleteKind::Position {
-                        exact_target: original.referenced_data_file().map(Arc::from),
-                    },
-                ),
-                (DataContentType::EqualityDeletes, DataFileFormat::Parquet) => {
-                    let ids = original
-                        .equality_ids()
-                        .ok_or_else(|| corrupt("equality delete file has no equality field IDs"))?;
-                    let fields = EqualityFieldGroup::bind(&ids, &schema)
-                        .map_err(|cause| corrupt(cause.to_string()))?;
-                    (
-                        DeleteContentAddress::file(original.file_path()),
-                        DeleteKind::Equality(fields),
-                    )
-                }
-                _ => return Err(unsupported("unsupported Iceberg metadata delete format")),
-            };
-            if original.key_metadata().is_some_and(|key| !key.is_empty()) {
-                return Err(unsupported(
-                    "encrypted Iceberg delete metadata is unsupported",
-                ));
-            }
-            deletes.push(RawDeleteEntry {
-                sequence,
-                file: RawDeleteFile {
-                    address: address.map_err(|cause| corrupt(cause.to_string()))?,
-                    kind,
-                    partition,
-                    read: DeleteReadFacts {
-                        format: original.file_format().into(),
-                        file_size: original.file_size_in_bytes(),
-                        record_count: original.record_count(),
-                        key_metadata: Arc::from(original.key_metadata().unwrap_or_default()),
-                    },
-                    metrics,
-                },
-            });
-        }
-        observations.push(ManifestDeleteObservation {
-            manifest_path: Arc::from(file.path()),
-            entries: deletes,
-        });
-    }
-    let observation =
-        DeleteObservation::from_manifests_checked(observations, || check_partition_read(context))
-            .map_err(partition_construction_failure)?;
-    let index = DeleteCandidateIndex::try_new_checked(domain, observation, || {
-        check_partition_read(context)
-    })
-    .map_err(partition_construction_failure)?;
-    aggregate_partition_facts(data, &index, context)
-}
-
-fn partitions_columns(
-    schema: &SchemaRef,
-    aggregates: &[PartitionAggregate],
-    _table_schema: &Schema,
-) -> Result<Vec<ArrayRef>, ConnectorError> {
-    let mut columns = Vec::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        let values: Vec<i64> = match field.name().as_str() {
-            "record_count" => aggregates.iter().map(|group| group.record_count).collect(),
-            "file_count" => aggregates.iter().map(|group| group.file_count).collect(),
-            name @ ("position_delete_file_count" | "equality_delete_file_count") => aggregates
-                .iter()
-                .map(|group| {
-                    let count = if name == "position_delete_file_count" {
-                        group.position_delete_files.len()
-                    } else {
-                        group.equality_delete_files.len()
-                    };
-                    i64::try_from(count)
-                        .map_err(|_| corrupt("Iceberg partition delete count exceeds Int64"))
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            other => {
-                return Err(internal(format!(
-                    "Iceberg partitions has no column named {other}"
-                )));
-            }
-        };
-        columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
-    }
-    Ok(columns)
-}
-
-// ---------------------------------------------------------------------------
 // Projection
 // ---------------------------------------------------------------------------
 
@@ -2852,16 +2462,36 @@ impl IcebergSystemTableProvider {
         }
     }
 
+    /// Dispatch one metadata work unit after matching its exact frozen scan reference.
+    pub fn create_page_stream(
+        &self,
+        reference: &IcebergSystemTableReference,
+        split: &super::IcebergReadSplit,
+        columns: &[IcebergColumnHandle],
+        budget: &ConnectorPollBudget,
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        match split {
+            super::IcebergReadSplit::SystemManifest(split) if split.reference() == reference => {
+                self.create_manifest_page_stream(split, columns, budget)
+            }
+            super::IcebergReadSplit::SystemRelation(split) if split.reference() == reference => {
+                self.create_relation_page_stream(split, columns, budget)
+            }
+            _ => Err(invalid(
+                "iceberg system work unit differs from its frozen scan reference or relation kind",
+            )),
+        }
+    }
+
     /// The `$files` page stream for one manifest of the pinned snapshot,
     /// polled with `budget`. Creating it reads nothing; its first poll reads
     /// the manifest through the stream's own operations.
     ///
-    /// `$files` is the one distributed system relation, so it arrives as a
-    /// split rather than through the direct whole-relation provider path,
-    /// whose contract has no split at all.
-    pub fn create_files_page_stream(
+    /// Files and entries share this manifest-unit read. Their frozen relation
+    /// kind chooses whether deleted entries are retained and how rows render.
+    fn create_manifest_page_stream(
         &self,
-        split: &FilesTableSplit,
+        split: &SystemManifestSplit,
         columns: &[IcebergColumnHandle],
         budget: &ConnectorPollBudget,
     ) -> Result<OwnedConnectorPageStream, ConnectorError> {
@@ -2899,12 +2529,13 @@ impl IcebergSystemTableProvider {
     /// frozen metadata file, as a page stream polled with `budget`. Creating
     /// it reads nothing; its first poll reads the relation through the
     /// stream's own operations.
-    fn create_single_backend_page_stream(
+    fn create_relation_page_stream(
         &self,
-        reference: &IcebergSystemTableReference,
+        split: &SystemRelationSplit,
         columns: &[IcebergColumnHandle],
         budget: &ConnectorPollBudget,
     ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        let reference = split.reference();
         let StreamRead {
             binding,
             context,
@@ -2954,6 +2585,8 @@ struct StreamRead {
 
 /// One `$files` split's frozen shape; deciding it reads nothing.
 struct FilesSplitRelation {
+    unified: crate::partition_row::UnifiedPartitionRow,
+    kind: IcebergSystemTableType,
     table_has_variant_history: bool,
     manifest: TrinoManifestFile,
     spec: PartitionSpec,
@@ -2964,7 +2597,7 @@ struct FilesSplitRelation {
 
 impl FilesSplitRelation {
     fn of(
-        split: &FilesTableSplit,
+        split: &SystemManifestSplit,
         columns: &[IcebergColumnHandle],
     ) -> Result<Self, ConnectorError> {
         let table_schema: Schema = serde_json::from_str(split.table_schema_json())
@@ -2975,64 +2608,34 @@ impl FilesSplitRelation {
             .keys()
             .map(|spec_id| split.parse_partition_spec(*spec_id))
             .collect::<Result<Vec<_>, _>>()?;
-        let partition = split
+        let unified = crate::partition_row::UnifiedPartitionRow::of(&table_schema, &specs)?;
+        let partition = unified.arrow_type();
+        let frozen_partition = split
             .partition_column_type_json()
             .map(|json| super::column_handle::parse_type(json, "partition_column_type_json"))
             .transpose()?;
-        let partition = match partition {
-            None => None,
-            Some(Type::Struct(row)) => {
-                for field in row.fields() {
-                    if field.required || !matches!(field.field_type.as_ref(), Type::Primitive(_)) {
-                        return Err(invalid(
-                            "frozen files partition fields must be nullable primitives",
-                        ));
-                    }
-                }
-                let fields = row
-                    .fields()
-                    .iter()
-                    .map(|field| {
-                        Ok(Arc::new(Field::new(
-                            field.name.clone(),
-                            crate::metadata_batch_reader::iceberg_type_to_arrow_type(
-                                field.field_type.as_ref(),
-                            )
-                            .map_err(invalid)?,
-                            !field.required,
-                        )))
-                    })
-                    .collect::<Result<Vec<_>, ConnectorError>>()?;
-                Some(DataType::Struct(Fields::from(fields)))
-            }
-            Some(_) => return Err(invalid("frozen files partition declaration is not a ROW")),
-        };
-        let mut ordered_specs: Vec<_> = specs.iter().collect();
-        ordered_specs.sort_unstable_by_key(|spec| spec.spec_id());
-        let mut names: Vec<&str> = Vec::new();
-        for spec in ordered_specs {
-            for field in spec.fields() {
-                if !names
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(&field.name))
-                {
-                    names.push(&field.name);
-                }
-            }
-        }
-        let actual_names: Vec<_> = match &partition {
-            Some(DataType::Struct(fields)) => {
-                fields.iter().map(|field| field.name().as_str()).collect()
-            }
-            None => Vec::new(),
-            Some(_) => return Err(invalid("frozen files partition carrier is not a ROW")),
-        };
-        if names != actual_names {
+        let expected_partition = partition
+            .as_ref()
+            .map(|row| metadata_relation_type(row, &mut MetadataRelationFieldIds::new()))
+            .transpose()?;
+        if frozen_partition != expected_partition
+            || split.partition_slot_field_ids() != unified.field_ids()
+        {
             return Err(invalid(
-                "frozen files partition declaration differs from its spec fields",
+                "frozen files partition declaration or field IDs differ from canonical metadata",
             ));
         }
-        let schema = Arc::new(ArrowSchema::new(files_fields(partition.as_ref(), None)));
+        let kind = split.reference().system_table_type();
+        let fields = match kind {
+            IcebergSystemTableType::Files => files_fields(partition.as_ref(), None),
+            IcebergSystemTableType::Entries => entries_fields(partition.as_ref()),
+            _ => {
+                return Err(invalid(
+                    "iceberg manifest work unit requires files or entries",
+                ));
+            }
+        };
+        let schema = Arc::new(ArrowSchema::new(fields));
         let declared = super::column_handle::parse_type(
             split.metadata_table_schema_json(),
             "metadata_table_schema_json",
@@ -3044,6 +2647,8 @@ impl FilesSplitRelation {
         }
         let projection = project_system_relation_columns(&schema, columns)?;
         Ok(Self {
+            unified,
+            kind,
             table_has_variant_history: split.table_has_variant_history(),
             manifest: split.manifest().clone(),
             spec,
@@ -3063,9 +2668,30 @@ impl FilesSplitRelation {
             &self.manifest,
             manifest,
             &self.spec,
-            EntryStatusRule::SkipDeleted,
+            match self.kind {
+                IcebergSystemTableType::Files => EntryStatusRule::SkipDeleted,
+                IcebergSystemTableType::Entries => EntryStatusRule::KeepDeleted,
+                _ => {
+                    return Err(invalid(
+                        "iceberg manifest work unit requires files or entries",
+                    ));
+                }
+            },
+            &self.unified,
         )?;
-        let relation_columns = files_columns(&self.schema, &rows, &self.table_schema)?;
+        let relation_columns = match self.kind {
+            IcebergSystemTableType::Files => {
+                files_columns(&self.schema, &rows, &self.table_schema)?
+            }
+            IcebergSystemTableType::Entries => {
+                entries_columns(&self.schema, &rows, &self.table_schema)?
+            }
+            _ => {
+                return Err(invalid(
+                    "iceberg manifest work unit requires files or entries",
+                ));
+            }
+        };
         IcebergSystemPageSource::new(
             &self.schema,
             relation_columns,
@@ -3077,13 +2703,11 @@ impl FilesSplitRelation {
     }
 }
 
-/// A single-backend relation's frozen shape: its schema, the scan's
-/// projection onto it, and the table schema its values are rendered with.
+/// A single-backend relation's frozen shape and the scan's projection onto it.
 struct SingleBackendRelation {
     kind: SingleBackendKind,
     schema: SchemaRef,
     projection: Vec<usize>,
-    table_schema: Schema,
 }
 
 /// What a single-backend relation is rendered from.
@@ -3093,8 +2717,6 @@ enum SingleBackendKind {
     Metadata(MetadataRelation),
     /// The pinned snapshot's manifest list.
     Manifests,
-    /// The rows of every manifest of the pinned snapshot.
-    FileRows(FileRowsRelation),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3102,12 +2724,6 @@ enum MetadataRelation {
     Snapshots,
     History,
     Refs,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum FileRowsRelation {
-    Entries,
-    Partitions,
 }
 
 /// A relation's columns before the scan's projection.
@@ -3122,20 +2738,13 @@ impl SingleBackendRelation {
         metadata: &TableMetadata,
         columns: &[IcebergColumnHandle],
     ) -> Result<Self, ConnectorError> {
-        let table_schema = metadata.current_schema().as_ref().clone();
         let schema = system_relation_schema_with_metadata(reference.system_table_type(), metadata)?;
         let projection = project_system_relation_columns(&schema, columns)?;
         let kind = match reference.system_table_type() {
-            IcebergSystemTableType::Files => {
+            IcebergSystemTableType::Files | IcebergSystemTableType::Entries => {
                 return Err(invalid(
                     "iceberg $files is a distributed relation and arrives as a split",
                 ));
-            }
-            IcebergSystemTableType::Entries => {
-                SingleBackendKind::FileRows(FileRowsRelation::Entries)
-            }
-            IcebergSystemTableType::Partitions => {
-                SingleBackendKind::FileRows(FileRowsRelation::Partitions)
             }
             IcebergSystemTableType::Snapshots => {
                 SingleBackendKind::Metadata(MetadataRelation::Snapshots)
@@ -3150,7 +2759,6 @@ impl SingleBackendRelation {
             kind,
             schema,
             projection,
-            table_schema,
         })
     }
 
@@ -3194,13 +2802,6 @@ impl SingleBackendRelation {
         })
     }
 
-    fn render_entries(&self, rows: &[FileRow]) -> Result<RenderedRelation, ConnectorError> {
-        Ok(RenderedRelation {
-            columns: entries_columns(&self.schema, rows, &self.table_schema)?,
-            row_count: rows.len(),
-        })
-    }
-
     fn into_page_source(
         self,
         rendered: RenderedRelation,
@@ -3235,24 +2836,6 @@ async fn read_single_backend(
         SingleBackendKind::Manifests => {
             let manifests = read_snapshot_manifests(reader, reference, &metadata, budget).await?;
             relation.render_manifests(&metadata, &manifests)?
-        }
-        SingleBackendKind::FileRows(FileRowsRelation::Entries) => {
-            let rows = read_snapshot_file_rows(
-                reader,
-                &metadata,
-                reference,
-                EntryStatusRule::KeepDeleted,
-                budget,
-            )
-            .await?;
-            relation.render_entries(&rows)?
-        }
-        SingleBackendKind::FileRows(FileRowsRelation::Partitions) => {
-            let aggregates = read_snapshot_partitions(reader, reference, &metadata, budget).await?;
-            RenderedRelation {
-                columns: partitions_columns(&relation.schema, &aggregates, &relation.table_schema)?,
-                row_count: aggregates.len(),
-            }
         }
     };
     let bytes_read = reader.bytes_read;
@@ -3375,7 +2958,19 @@ async fn read_snapshot_file_rows(
             })
         })?;
         budget.consume(1).await;
-        rows.extend(manifest_rows(manifest_file, &manifest, &spec, status_rule)?);
+        let specs = metadata
+            .partition_specs_iter()
+            .map(|spec| spec.as_ref().clone())
+            .collect::<Vec<_>>();
+        let unified =
+            crate::partition_row::UnifiedPartitionRow::of(metadata.current_schema(), &specs)?;
+        rows.extend(manifest_rows(
+            manifest_file,
+            &manifest,
+            &spec,
+            status_rule,
+            &unified,
+        )?);
     }
     Ok(rows)
 }
@@ -3398,55 +2993,6 @@ fn manifest_spec(
         .clone())
 }
 
-impl<P> novarocks_spi::connector::read_stack::adapter::ProviderReadSystemTableProvider<P>
-    for IcebergSystemTableProvider
-where
-    P: novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime<
-            Table = crate::typed_read::IcebergRuntimeRelation,
-            Column = IcebergColumnHandle,
-            Transaction = crate::typed_read::HiveTransactionHandle,
-            Split = crate::typed_read::IcebergReadSplit,
-        >,
-{
-    fn create_system_page_stream(
-        &self,
-        _session: &ConnectorSession,
-        table: &crate::typed_read::IcebergRuntimeRelation,
-        columns: &[novarocks_spi::connector::read_stack::Assignment<IcebergColumnHandle>],
-        budget: &ConnectorPollBudget,
-    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
-        let reference = direct_system_reference(table)?;
-        self.create_single_backend_page_stream(reference, &assigned_columns(columns), budget)
-    }
-}
-
-/// The single-backend reference a direct system read names.
-fn direct_system_reference(
-    table: &crate::typed_read::IcebergRuntimeRelation,
-) -> Result<&IcebergSystemTableReference, ConnectorError> {
-    let crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) = table else {
-        return Err(invalid(
-            "an iceberg system page source reads a system relation, not another relation",
-        ));
-    };
-    match reference.system_table_type().execution() {
-        IcebergSystemTableExecution::SingleBackendDirectPageSource => Ok(reference),
-        IcebergSystemTableExecution::DistributedSplits => Err(invalid(format!(
-            "iceberg {} is scheduled through a split source, not the direct system page source",
-            reference.system_table_type().suffix()
-        ))),
-    }
-}
-
-fn assigned_columns(
-    columns: &[novarocks_spi::connector::read_stack::Assignment<IcebergColumnHandle>],
-) -> Vec<IcebergColumnHandle> {
-    columns
-        .iter()
-        .map(|assignment| assignment.column().clone())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -3467,7 +3013,7 @@ mod tests {
         Summary, TableMetadataBuilder, Transform,
     };
     use crate::typed_read::system_table::{
-        FilesTableSplitParams, IcebergSystemTableReferenceParams, TrinoManifestFileParams,
+        IcebergSystemTableReferenceParams, SystemManifestSplitParams, TrinoManifestFileParams,
     };
     use crate::typed_read::test_spawners::{GatedTaskSpawner, route_reads_through};
     use crate::typed_read::test_streams::DrivenStream;
@@ -3638,14 +3184,8 @@ mod tests {
         assert!(relation.field_with_name("readable_metrics").is_err());
         let unpartitioned =
             system_relation_schema(IcebergSystemTableType::Files, &schema, &[]).unwrap();
-        assert_eq!(unpartitioned.fields().len(), 18);
-        assert_eq!(
-            unpartitioned
-                .field_with_name("partition")
-                .unwrap()
-                .data_type(),
-            &DataType::Struct(Fields::empty())
-        );
+        assert_eq!(unpartitioned.fields().len(), 17);
+        assert!(unpartitioned.field_with_name("partition").is_err());
     }
 
     #[test]
@@ -3838,83 +3378,159 @@ mod tests {
     }
 
     #[test]
-    fn partitions_freezes_the_four_public_count_columns() {
+    fn partition_value_slots_preserve_same_name_case_and_generated_name_collisions() {
         let schema = test_schema();
-        let specs = vec![identity_spec(&schema, 7, "region")];
-        let relation = partitions_view_schema(&schema, &specs).unwrap();
-        assert_eq!(
-            column_names(&relation),
-            vec![
-                "record_count",
-                "file_count",
-                "position_delete_file_count",
-                "equality_delete_file_count",
-            ]
-        );
-        for (ordinal, field) in relation.fields().iter().enumerate() {
-            assert_eq!(field.data_type(), &DataType::Int64);
-            assert_eq!(field.is_nullable(), ordinal >= 2);
+        let specs = [(0,1000,"p"),(1,1001,"P"),(2,1002,"p_1000"),(3,1003,"p_1000_1")]
+            .into_iter().map(|(spec_id,field_id,name)| serde_json::from_value::<PartitionSpec>(serde_json::json!({
+                "spec-id":spec_id,"fields":[{"field-id":field_id,"source-id":2,"name":name,"transform":"identity"}]
+            })).unwrap()).collect::<Vec<_>>();
+        let unified = crate::partition_row::UnifiedPartitionRow::of(&schema, &specs).unwrap();
+        let mut rows = Vec::new();
+        for (slot, spec) in specs.iter().enumerate() {
+            let file = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(format!("data/{slot}.parquet"))
+                .file_format(DataFileFormat::Parquet)
+                .partition(Struct::from_iter([Some(Literal::string(format!(
+                    "value-{slot}"
+                )))]))
+                .partition_spec_id(spec.spec_id())
+                .record_count(1)
+                .file_size_in_bytes(100)
+                .build()
+                .unwrap();
+            let manifest = Manifest::new(
+                crate::iceberg::spec::ManifestMetadata {
+                    schema: Arc::new(schema.clone()),
+                    schema_id: schema.schema_id(),
+                    partition_spec: spec.clone(),
+                    format_version: FormatVersion::V2,
+                    content: crate::iceberg::spec::ManifestContentType::Data,
+                },
+                vec![crate::iceberg::spec::ManifestEntry {
+                    status: ManifestStatus::Added,
+                    snapshot_id: Some(SNAPSHOT_ID),
+                    sequence_number: Some(1),
+                    file_sequence_number: Some(1),
+                    data_file: file,
+                }],
+            );
+            let descriptor = TrinoManifestFile::try_new(TrinoManifestFileParams {
+                path: format!("metadata/{slot}.avro"),
+                length: 100,
+                partition_spec_id: spec.spec_id(),
+                content: crate::typed_read::TrinoManifestContent::Data,
+                sequence_number: 1,
+                min_sequence_number: 1,
+                added_snapshot_id: SNAPSHOT_ID,
+                added_files_count: Some(1),
+                existing_files_count: Some(0),
+                deleted_files_count: Some(0),
+                added_rows_count: Some(1),
+                existing_rows_count: Some(0),
+                deleted_rows_count: Some(0),
+                first_row_id: None,
+                key_metadata: Vec::new(),
+            })
+            .unwrap();
+            rows.extend(
+                manifest_rows(
+                    &descriptor,
+                    &manifest,
+                    spec,
+                    EntryStatusRule::SkipDeleted,
+                    &unified,
+                )
+                .unwrap(),
+            );
         }
-        assert!(relation.field_with_name("partition").is_err());
-        assert!(relation.field_with_name("data").is_err());
-        assert!(relation.field_with_name("total_size").is_err());
+        for kind in [
+            IcebergSystemTableType::Files,
+            IcebergSystemTableType::Entries,
+        ] {
+            let output_schema = system_relation_schema(kind, &schema, &specs).unwrap();
+            let columns = match kind {
+                IcebergSystemTableType::Files => {
+                    files_columns(&output_schema, &rows, &schema).unwrap()
+                }
+                IcebergSystemTableType::Entries => {
+                    entries_columns(&output_schema, &rows, &schema).unwrap()
+                }
+                _ => unreachable!(),
+            };
+            let partition = columns[output_schema.index_of("partition").unwrap()]
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            assert_eq!(
+                partition.column_names(),
+                vec!["p_1000_2", "P", "p_1000", "p_1000_1"]
+            );
+            for slot in 0..4 {
+                let column = partition
+                    .column(slot)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let expected = (0..4)
+                    .map(|row| (row == slot).then(|| format!("value-{slot}")))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    column
+                        .iter()
+                        .map(|value| value.map(str::to_owned))
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "{kind:?} slot {slot}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn the_partition_row_is_the_union_of_every_spec_and_a_conflict_is_an_error() {
+    fn partition_field_ids_keep_renamed_values_in_one_canonical_slot() {
         let schema = test_schema();
-        let by_region = identity_spec(&schema, 1, "region");
-        let by_id = identity_spec(&schema, 2, "id");
-        let row = partition_row_type(&schema, &[by_id.clone(), by_region.clone()])
-            .expect("partition row")
-            .expect("partitioned");
-        let DataType::Struct(fields) = row else {
-            panic!("partition row must be a struct");
+        let spec = |id, name: &str| {
+            serde_json::from_value::<PartitionSpec>(serde_json::json!({
+            "spec-id": id, "fields": [{"field-id":1000,"source-id":2,"name":name,"transform":"identity"}]
+        })).unwrap()
         };
-        // Ordered by spec id, so the spec-1 field comes first even though the
-        // caller listed spec 2 first.
+        let old = spec(0, "old_region");
+        let new = spec(1, "region");
+        let unified =
+            crate::partition_row::UnifiedPartitionRow::of(&schema, &[new.clone(), old.clone()])
+                .unwrap();
+        assert_eq!(unified.field_ids(), vec![1000]);
+        let row_type = unified.arrow_type().unwrap();
         assert_eq!(
-            fields
-                .iter()
-                .map(|field| (field.name().clone(), field.data_type().clone()))
-                .collect::<Vec<_>>(),
-            vec![
-                ("region".to_string(), DataType::Utf8),
-                ("id".to_string(), DataType::Int64),
-            ]
+            row_type,
+            DataType::Struct(vec![Arc::new(Field::new("region", DataType::Utf8, true))].into())
         );
-
-        // The same partition-field name may be repeated across specs, but not
-        // with two types: one Arrow column cannot carry both.
-        let text_part = named_identity_spec(&schema, 3, "region", "part");
-        let long_part = named_identity_spec(&schema, 4, "id", "part");
-        assert!(
-            partition_row_type(&schema, &[text_part.clone(), text_part.clone()])
-                .expect("repeated but agreeing")
-                .is_some()
+        let data = |id| {
+            DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(format!("data/{id}.parquet"))
+                .file_format(DataFileFormat::Parquet)
+                .partition(Struct::from_iter([Some(Literal::string("east"))]))
+                .partition_spec_id(id)
+                .record_count(1)
+                .file_size_in_bytes(100)
+                .build()
+                .unwrap()
+        };
+        let old_values = partition_values(&data(0), &old, &unified).unwrap();
+        let new_values = partition_values(&data(1), &new, &unified).unwrap();
+        let rows = partition_struct_array(&row_type, &[&old_values, &new_values]).unwrap();
+        let rows = rows.as_any().downcast_ref::<StructArray>().unwrap();
+        let values = rows
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            values.iter().collect::<Vec<_>>(),
+            vec![Some("east"), Some("east")]
         );
-        let error = partition_row_type(&schema, &[text_part, long_part])
-            .expect_err("conflicting partition field types");
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-
-        // An unpartitioned table simply has no partition column.
-        assert!(
-            partition_row_type(&schema, &[PartitionSpec::unpartition_spec()])
-                .expect("unpartitioned")
-                .is_none()
-        );
-        let unpartitioned = system_relation_schema(
-            IcebergSystemTableType::Files,
-            &schema,
-            &[PartitionSpec::unpartition_spec()],
-        )
-        .expect("schema");
-        assert_eq!(unpartitioned.fields().len(), 18);
-        let partition = unpartitioned
-            .field_with_name("partition")
-            .expect("public empty ROW");
-        assert_eq!(partition.data_type(), &DataType::Struct(Fields::empty()));
-        assert!(partition.is_nullable());
     }
 
     // -- real metadata on disk --------------------------------------------
@@ -4199,7 +3815,7 @@ mod tests {
         Ok(pages)
     }
 
-    /// A single-backend relation read to its end through its page stream.
+    /// Read singleton work units, or each independent entries manifest unit.
     fn single_backend_pages(
         runtime: &tokio::runtime::Runtime,
         provider: &IcebergSystemTableProvider,
@@ -4207,19 +3823,123 @@ mod tests {
         columns: &[IcebergColumnHandle],
     ) -> Result<Vec<Vec<ArrayRef>>, ConnectorError> {
         let budget = ConnectorPollBudget::new();
-        let stream = provider.create_single_backend_page_stream(reference, columns, &budget)?;
+        if reference.system_table_type() == IcebergSystemTableType::Entries {
+            let mut pages = Vec::new();
+            for split in manifest_splits(runtime, provider, reference)? {
+                let stream = provider.create_page_stream(
+                    reference,
+                    &super::super::IcebergReadSplit::SystemManifest(split),
+                    columns,
+                    &budget,
+                )?;
+                pages.extend(drain_driven(DrivenStream::new(
+                    runtime,
+                    stream,
+                    budget.clone(),
+                ))?);
+            }
+            // Preserve the pre-existing relation-wide value assertions after
+            // independently reading every manifest through the unit channel.
+            if pages.len() > 1 {
+                let columns = (0..pages[0].len())
+                    .map(|ordinal| {
+                        let arrays = pages
+                            .iter()
+                            .map(|page| page[ordinal].as_ref())
+                            .collect::<Vec<_>>();
+                        arrow::compute::concat(&arrays).map_err(|error| invalid(error.to_string()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(vec![columns]);
+            }
+            return Ok(pages);
+        }
+        let split = super::super::IcebergReadSplit::SystemRelation(SystemRelationSplit::try_new(
+            reference.clone(),
+        )?);
+        let stream = provider.create_page_stream(reference, &split, columns, &budget)?;
         drain_driven(DrivenStream::new(runtime, stream, budget))
+    }
+
+    fn manifest_splits(
+        runtime: &tokio::runtime::Runtime,
+        provider: &IcebergSystemTableProvider,
+        reference: &IcebergSystemTableReference,
+    ) -> Result<Vec<SystemManifestSplit>, ConnectorError> {
+        if reference.snapshot_id().is_none() {
+            return Ok(Vec::new());
+        }
+        let mut reader = FrozenMetadataReader::new(&provider.binding, &provider.context);
+        let metadata = runtime.block_on(reader.load_metadata(reference))?;
+        let manifests = runtime
+            .block_on(read_snapshot_manifests(
+                &mut reader,
+                reference,
+                &metadata,
+                &unbounded_budget(),
+            ))?
+            .files;
+        let schema = metadata.current_schema();
+        let specs = metadata
+            .partition_specs_iter()
+            .map(|spec| {
+                Ok((
+                    spec.spec_id(),
+                    serde_json::to_string(spec.as_ref())
+                        .map_err(|error| invalid(error.to_string()))?,
+                ))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, ConnectorError>>()?;
+        let partition = partition_row_type_with_metadata(&metadata)?
+            .as_ref()
+            .map(derived_row_type_json)
+            .transpose()?;
+        manifests
+            .into_iter()
+            .map(|manifest| {
+                SystemManifestSplit::try_new(SystemManifestSplitParams {
+                    reference: reference.clone(),
+                    table_has_variant_history: crate::manifest::table_has_variant_history(
+                        &metadata,
+                    ),
+                    manifest,
+                    table_schema_json: serde_json::to_string(schema.as_ref())
+                        .map_err(|error| invalid(error.to_string()))?,
+                    metadata_table_schema_json: system_relation_schema_json_with_metadata(
+                        reference.system_table_type(),
+                        &metadata,
+                    )?,
+                    partition_spec_jsons: specs.clone(),
+                    partition_slot_field_ids: crate::partition_row::UnifiedPartitionRow::of(
+                        schema.as_ref(),
+                        &metadata
+                            .partition_specs_iter()
+                            .map(|spec| spec.as_ref().clone())
+                            .collect::<Vec<_>>(),
+                    )?
+                    .field_ids(),
+                    partition_column_type_json: partition.clone(),
+                    bounds_column_type_json: None,
+                    encryption_key_id: None,
+                })
+            })
+            .collect()
     }
 
     /// A `$files` split read to its end through its page stream.
     fn files_pages(
         runtime: &tokio::runtime::Runtime,
         provider: &IcebergSystemTableProvider,
-        split: &FilesTableSplit,
+        split: &SystemManifestSplit,
         columns: &[IcebergColumnHandle],
     ) -> Result<Vec<Vec<ArrayRef>>, ConnectorError> {
         let budget = ConnectorPollBudget::new();
-        let stream = provider.create_files_page_stream(split, columns, &budget)?;
+        let stream = provider.create_page_stream(
+            split.reference(),
+            &super::super::IcebergReadSplit::SystemManifest(split.clone()),
+            columns,
+            &budget,
+        )?;
         drain_driven(DrivenStream::new(runtime, stream, budget))
     }
 
@@ -4427,6 +4147,83 @@ mod tests {
     }
 
     #[test]
+    fn entries_reads_each_manifest_once_and_keeps_deleted_rows() {
+        let (runtime, binding, context) = runtime_and_binding();
+        let dir = tempfile::tempdir().unwrap();
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
+        let provider = provider(&binding, &context);
+        let reference = reference(
+            &warehouse,
+            IcebergSystemTableType::Entries,
+            Some(SNAPSHOT_ID),
+        );
+        let splits = manifest_splits(&runtime, &provider, &reference).unwrap();
+        assert_eq!(splits.len(), 2);
+        let schema = system_relation_schema_with_metadata(
+            IcebergSystemTableType::Entries,
+            &warehouse.metadata,
+        )
+        .unwrap();
+        let columns = all_columns(&schema);
+        let mut statuses = Vec::new();
+        let mut paths = Vec::new();
+        for split in splits {
+            assert_eq!(split.reference(), &reference);
+            let pages = files_pages(&runtime, &provider, &split, &columns).unwrap();
+            for page in pages {
+                statuses.extend(int_column(&page, 0));
+                let values = page[5].as_any().downcast_ref::<StringArray>().unwrap();
+                paths.extend((0..values.len()).map(|i| values.value(i).to_owned()));
+            }
+        }
+        assert_eq!(statuses, vec![Some(1), Some(1), Some(2)]);
+        assert_eq!(
+            paths,
+            vec!["data/a.parquet", "data/b.parquet", "data/c.parquet"]
+        );
+    }
+
+    #[test]
+    fn system_work_units_refuse_foreign_scan_references_before_reading() {
+        let (runtime, binding, context) = runtime_and_binding();
+        let dir = tempfile::tempdir().unwrap();
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
+        let provider = provider(&binding, &context);
+        let original = reference(
+            &warehouse,
+            IcebergSystemTableType::Snapshots,
+            Some(SNAPSHOT_ID),
+        );
+        let foreign = reference(
+            &warehouse,
+            IcebergSystemTableType::History,
+            Some(SNAPSHOT_ID),
+        );
+        let split = super::super::IcebergReadSplit::SystemRelation(
+            SystemRelationSplit::try_new(original.clone()).unwrap(),
+        );
+        let error = provider
+            .create_page_stream(&foreign, &split, &[], &ConnectorPollBudget::new())
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        let manifest_reference = reference(
+            &warehouse,
+            IcebergSystemTableType::Entries,
+            Some(SNAPSHOT_ID),
+        );
+        let manifest = manifest_splits(&runtime, &provider, &manifest_reference)
+            .unwrap()
+            .remove(0);
+        let split = super::super::IcebergReadSplit::SystemManifest(manifest);
+        let error = provider
+            .create_page_stream(&original, &split, &[], &ConnectorPollBudget::new())
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
     fn files_skips_deleted_entries_while_entries_keeps_them() {
         let (runtime, binding, context) = runtime_and_binding();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4532,7 +4329,8 @@ mod tests {
             .partition_specs_iter()
             .map(|spec| spec.as_ref().clone())
             .collect();
-        let split = FilesTableSplit::try_new(FilesTableSplitParams {
+        let split = SystemManifestSplit::try_new(SystemManifestSplitParams {
+            reference: files_reference.clone(),
             table_has_variant_history: false,
             manifest: manifests[0].clone(),
             table_schema_json: serde_json::to_string(&schema).expect("schema json"),
@@ -4549,6 +4347,11 @@ mod tests {
                     )
                 })
                 .collect(),
+            partition_slot_field_ids: crate::partition_row::UnifiedPartitionRow::of(
+                &schema, &specs,
+            )
+            .unwrap()
+            .field_ids(),
             partition_column_type_json: partition_row_type_with_metadata(&warehouse.metadata)
                 .expect("partition declaration")
                 .as_ref()
@@ -4659,6 +4462,14 @@ mod tests {
             &manifest,
             &spec,
             EntryStatusRule::SkipDeleted,
+            &crate::partition_row::UnifiedPartitionRow::of(
+                metadata.current_schema(),
+                &metadata
+                    .partition_specs_iter()
+                    .map(|spec| spec.as_ref().clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -4678,89 +4489,6 @@ mod tests {
             vec![Some(SNAPSHOT_ID), Some(SNAPSHOT_ID)],
             "added snapshot id is inherited from the manifest list entry"
         );
-    }
-
-    #[test]
-    fn partitions_aggregates_the_same_pinned_files() {
-        let (runtime, binding, context) = runtime_and_binding();
-        let dir = tempfile::tempdir().unwrap();
-        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
-        let provider = provider(&binding, &context);
-        let reference = reference(
-            &warehouse,
-            IcebergSystemTableType::Partitions,
-            Some(SNAPSHOT_ID),
-        );
-        let specs = warehouse
-            .metadata
-            .partition_specs_iter()
-            .map(|spec| spec.as_ref().clone())
-            .collect::<Vec<_>>();
-        let schema = system_relation_schema(
-            IcebergSystemTableType::Partitions,
-            warehouse.metadata.current_schema(),
-            &specs,
-        )
-        .unwrap();
-        let pages =
-            single_backend_pages(&runtime, &provider, &reference, &all_columns(&schema)).unwrap();
-        let columns = &pages[0];
-        assert_eq!(columns.len(), 4);
-        assert_eq!(columns[0].len(), 2);
-        assert_eq!(long_column(columns, 0), vec![Some(10), Some(20)]);
-        assert_eq!(long_column(columns, 1), vec![Some(1), Some(1)]);
-        assert_eq!(long_column(columns, 2), vec![Some(0), Some(0)]);
-        assert_eq!(long_column(columns, 3), vec![Some(0), Some(0)]);
-    }
-
-    #[test]
-    fn partitions_counts_real_delete_applications_once_per_public_partition() {
-        let (runtime, binding, context) = runtime_and_binding();
-        let dir = tempfile::tempdir().unwrap();
-        let warehouse = runtime.block_on(build_warehouse_with_deletes(
-            dir.path(),
-            binding.clone(),
-            true,
-        ));
-        let provider = provider(&binding, &context);
-        let reference = reference(
-            &warehouse,
-            IcebergSystemTableType::Partitions,
-            Some(SNAPSHOT_ID),
-        );
-        let schema = system_relation_schema(
-            IcebergSystemTableType::Partitions,
-            warehouse.metadata.current_schema(),
-            &[],
-        )
-        .unwrap();
-        let pages =
-            single_backend_pages(&runtime, &provider, &reference, &all_columns(&schema)).unwrap();
-        let columns = &pages[0];
-        assert_eq!(columns.len(), 4);
-        assert_eq!(columns[0].len(), 2);
-        assert_eq!(long_column(columns, 0), vec![Some(25), Some(20)]);
-        assert_eq!(long_column(columns, 1), vec![Some(2), Some(1)]);
-        assert_eq!(long_column(columns, 2), vec![Some(1), Some(0)]);
-        assert_eq!(
-            long_column(columns, 3),
-            vec![Some(1), Some(0)],
-            "one equality file applies to both east data files but counts once"
-        );
-        // Changing only the runtime context preserves its actual cancellation
-        // and deadline identities before any metadata fact can be fabricated.
-        let cancelled = context.clone();
-        cancelled.cancellation.cancel();
-        let mut reader = FrozenMetadataReader::new(&binding, &cancelled);
-        let cause = runtime
-            .block_on(read_snapshot_partitions(
-                &mut reader,
-                &reference,
-                &warehouse.metadata,
-                &unbounded_budget(),
-            ))
-            .unwrap_err();
-        assert_eq!(cause.kind(), ConnectorErrorKind::Cancelled);
     }
 
     #[test]
@@ -4894,7 +4622,7 @@ mod tests {
         binding: &IcebergReadBinding,
         context: &FileReadContext,
         warehouse: &Warehouse,
-    ) -> (FilesTableSplit, Vec<IcebergColumnHandle>) {
+    ) -> (SystemManifestSplit, Vec<IcebergColumnHandle>) {
         let mut reader = FrozenMetadataReader::new(binding, context);
         let files_reference =
             reference(warehouse, IcebergSystemTableType::Files, Some(SNAPSHOT_ID));
@@ -4916,7 +4644,8 @@ mod tests {
             .partition_specs_iter()
             .map(|spec| spec.as_ref().clone())
             .collect();
-        let split = FilesTableSplit::try_new(FilesTableSplitParams {
+        let split = SystemManifestSplit::try_new(SystemManifestSplitParams {
+            reference: files_reference.clone(),
             table_has_variant_history: false,
             manifest: manifests[0].clone(),
             table_schema_json: serde_json::to_string(&schema).expect("schema json"),
@@ -4933,6 +4662,11 @@ mod tests {
                     )
                 })
                 .collect(),
+            partition_slot_field_ids: crate::partition_row::UnifiedPartitionRow::of(
+                &schema, &specs,
+            )
+            .unwrap()
+            .field_ids(),
             partition_column_type_json: partition_row_type_with_metadata(&warehouse.metadata)
                 .expect("partition declaration")
                 .as_ref()
@@ -4992,34 +4726,176 @@ mod tests {
     }
 
     #[test]
-    fn dropped_partition_source_keeps_public_compile_and_runtime_metadata_declarations() {
+    fn renamed_partition_has_one_type_across_alias_provider_frozen_split_and_be() {
         use novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation;
-        use novarocks_type_contract::{CompilePhase, PureCompileControl, ValueTypeStorageLifetime};
+        use novarocks_type_contract::ValueTypeStorageLifetime;
+        let (runtime, binding, context) = runtime_and_binding();
+        let dir = tempfile::tempdir().unwrap();
+        let mut warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
+        let mut frozen = serde_json::to_value(&warehouse.metadata).unwrap();
+        let old = warehouse
+            .metadata
+            .partition_specs_iter()
+            .find(|spec| !spec.fields().is_empty())
+            .unwrap();
+        let mut renamed = serde_json::to_value(old.as_ref()).unwrap();
+        renamed["spec-id"] = serde_json::json!(1);
+        renamed["fields"][0]["name"] = serde_json::json!("renamed_region");
+        frozen["partition-specs"]
+            .as_array_mut()
+            .unwrap()
+            .push(renamed);
+        frozen["default-spec-id"] = serde_json::json!(1);
+        warehouse.metadata = serde_json::from_value(frozen).unwrap();
+        std::fs::write(
+            warehouse.metadata_location.strip_prefix("file://").unwrap(),
+            serde_json::to_vec(&warehouse.metadata).unwrap(),
+        )
+        .unwrap();
+        let expected = DataType::Struct(
+            vec![Arc::new(Field::new("renamed_region", DataType::Utf8, true))].into(),
+        );
+        assert_eq!(
+            partition_row_type_with_metadata(&warehouse.metadata).unwrap(),
+            Some(expected.clone())
+        );
+        let mut request = |_| Ok(());
+        let mut work = |_| Ok(());
+        let mut creation = ConnectorReadSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
+        let alias = crate::metadata_batch_reader::metadata_table_output_columns(
+            crate::metadata_batch_reader::MetadataTableType::Files,
+            &warehouse.metadata,
+            &mut creation,
+        )
+        .unwrap();
+        let alias = crate::metadata_batch_reader::metadata_output_schema(&alias).unwrap();
+        let provider_schema = system_relation_schema_with_metadata(
+            IcebergSystemTableType::Files,
+            &warehouse.metadata,
+        )
+        .unwrap();
+        assert_eq!(alias.fields(), provider_schema.fields());
+        assert_eq!(
+            provider_schema
+                .field_with_name("partition")
+                .unwrap()
+                .data_type(),
+            &expected
+        );
+        let (split, columns) = first_manifest_split(&runtime, &binding, &context, &warehouse);
+        assert_eq!(split.partition_slot_field_ids(), &[1000]);
+        let frozen_type = super::super::column_handle::parse_type(
+            split.partition_column_type_json().unwrap(),
+            "partition",
+        )
+        .unwrap();
+        assert_eq!(
+            frozen_type,
+            metadata_relation_type(&expected, &mut MetadataRelationFieldIds::new()).unwrap()
+        );
+        let be = FilesSplitRelation::of(&split, &columns).unwrap();
+        assert_eq!(be.schema.fields(), provider_schema.fields());
+        let pages = files_pages(&runtime, &provider(&binding, &context), &split, &columns).unwrap();
+        let partition = pages[0][17].as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(
+            partition
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "east"
+        );
+    }
+
+    fn assert_metadata_columns_compile(
+        kind: IcebergSystemTableType,
+        columns: &[IcebergColumnHandle],
+        schema: &SchemaRef,
+    ) {
+        use novarocks_type_contract::{CompilePhase, PureCompileControl};
         struct Active;
         impl PureCompileControl for Active {
             fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
                 Ok(())
             }
         }
+        let mut checkpoints =
+            CompileCheckpoints::try_new(&Active, CompilePhase::LowerProgram).unwrap();
+        for (column, field) in columns.iter().zip(schema.fields()) {
+            system_column_field_for_compile(
+                kind,
+                column,
+                field,
+                ValueLogicalType::Physical,
+                &mut checkpoints,
+            )
+            .unwrap();
+        }
+        checkpoints.finish().unwrap();
+    }
+
+    fn assert_historical_manifest_summary(
+        runtime: &tokio::runtime::Runtime,
+        provider: &IcebergSystemTableProvider,
+        warehouse: &Warehouse,
+        expected: &str,
+        count: usize,
+    ) {
+        let reference = reference(
+            warehouse,
+            IcebergSystemTableType::Manifests,
+            Some(SNAPSHOT_ID),
+        );
+        let schema = system_relation_schema_with_metadata(
+            IcebergSystemTableType::Manifests,
+            &warehouse.metadata,
+        )
+        .unwrap();
+        let pages =
+            single_backend_pages(runtime, provider, &reference, &all_columns(&schema)).unwrap();
+        let summaries = pages[0][11].as_any().downcast_ref::<ListArray>().unwrap();
+        for ordinal in 0..count {
+            let value = summaries.value(ordinal);
+            let fields = value.as_any().downcast_ref::<StructArray>().unwrap();
+            assert_eq!(
+                fields
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn dropped_partition_source_is_absent_from_all_metadata_authors_and_runtime() {
         let (runtime, binding, context) = runtime_and_binding();
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir().unwrap();
         let mut warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
         drop_partition_source(&mut warehouse);
-        let expected_partition =
-            DataType::Struct(vec![Arc::new(Field::new("region", DataType::Utf8, true))].into());
-        assert_eq!(
-            partition_row_type_with_metadata(&warehouse.metadata).unwrap(),
-            Some(expected_partition.clone())
-        );
-        // Current-only declarations must still fail rather than guessing the
-        // dropped source's type. Production deliberately uses complete metadata.
-        let specs: Vec<_> = warehouse
+        use novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation;
+        use novarocks_type_contract::ValueTypeStorageLifetime;
+        let specs = warehouse
             .metadata
             .partition_specs_iter()
             .map(|spec| spec.as_ref().clone())
-            .collect();
-        assert!(partition_row_type(warehouse.metadata.current_schema(), &specs).is_err());
-        for (kind, catalog_kind, partition_ordinal) in [
+            .collect::<Vec<_>>();
+        assert_eq!(
+            partition_row_type_with_metadata(&warehouse.metadata).unwrap(),
+            None
+        );
+        assert_eq!(
+            partition_row_type(warehouse.metadata.current_schema(), &specs).unwrap(),
+            None
+        );
+        for (kind, catalog_kind, count) in [
             (
                 IcebergSystemTableType::Files,
                 crate::metadata_batch_reader::MetadataTableType::Files,
@@ -5032,12 +4908,9 @@ mod tests {
             ),
         ] {
             let schema = system_relation_schema_with_metadata(kind, &warehouse.metadata).unwrap();
+            assert_eq!(schema.fields().len(), count);
+            assert!(schema.field_with_name("partition").is_err());
             let columns = system_relation_columns_with_metadata(kind, &warehouse.metadata).unwrap();
-            assert_eq!(
-                schema.fields()[partition_ordinal].data_type(),
-                &expected_partition
-            );
-            assert!(schema.fields()[partition_ordinal].is_nullable());
             let mut request = |_| Ok(());
             let mut work = |_| Ok(());
             let mut creation = ConnectorReadSchemaCreation::new(
@@ -5045,15 +4918,14 @@ mod tests {
                 &mut request,
                 &mut work,
             );
-            let public_columns = crate::metadata_batch_reader::metadata_table_output_columns(
+            let alias = crate::metadata_batch_reader::metadata_table_output_columns(
                 catalog_kind,
                 &warehouse.metadata,
                 &mut creation,
             )
             .unwrap();
-            let catalog =
-                crate::metadata_batch_reader::metadata_output_schema(&public_columns).unwrap();
-            let borrowed: Vec<_> = columns.iter().collect();
+            let alias = crate::metadata_batch_reader::metadata_output_schema(&alias).unwrap();
+            let borrowed = columns.iter().collect::<Vec<_>>();
             let public = publish_read_schema_with_metadata(
                 kind,
                 &borrowed,
@@ -5061,23 +4933,9 @@ mod tests {
                 &mut creation,
             )
             .unwrap();
-            assert_eq!(schema.fields(), catalog.fields());
+            assert_eq!(alias.fields(), schema.fields());
             assert_eq!(public.schema().fields(), schema.fields());
-            // Exercise the independent BE mirror admission for flat entries
-            // and files partition declarations, including private identities.
-            let mut checkpoints =
-                CompileCheckpoints::try_new(&Active, CompilePhase::LowerProgram).unwrap();
-            for (column, field) in columns.iter().zip(schema.fields()) {
-                system_column_field_for_compile(
-                    kind,
-                    column,
-                    field,
-                    ValueLogicalType::Physical,
-                    &mut checkpoints,
-                )
-                .unwrap();
-            }
-            checkpoints.finish().unwrap();
+            assert_metadata_columns_compile(kind, &columns, &schema);
         }
         let provider = provider(&binding, &context);
         let entries = reference(
@@ -5092,55 +4950,14 @@ mod tests {
         .unwrap();
         let pages =
             single_backend_pages(&runtime, &provider, &entries, &all_columns(&schema)).unwrap();
+        assert_eq!(pages[0].len(), 21);
         assert_eq!(pages[0][0].len(), 3);
-        let partition = pages[0][21].as_any().downcast_ref::<StructArray>().unwrap();
-        let regions = partition
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(
-            regions.iter().collect::<Vec<_>>(),
-            vec![Some("east"), Some("west"), Some("east")]
-        );
         let (split, columns) = first_manifest_split(&runtime, &binding, &context, &warehouse);
-        let files = files_pages(&runtime, &provider, &split, &columns).unwrap();
-        let partition = files[0][17].as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(partition.data_type(), &expected_partition);
-        assert_eq!(
-            partition
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .iter()
-                .collect::<Vec<_>>(),
-            vec![Some("east"), Some("west")]
-        );
-        // Old summary bound bytes still use their historical source type.
-        let manifests = reference(
-            &warehouse,
-            IcebergSystemTableType::Manifests,
-            Some(SNAPSHOT_ID),
-        );
-        let schema = system_relation_schema_with_metadata(
-            IcebergSystemTableType::Manifests,
-            &warehouse.metadata,
-        )
-        .unwrap();
-        let pages =
-            single_backend_pages(&runtime, &provider, &manifests, &all_columns(&schema)).unwrap();
-        let summaries = pages[0][11].as_any().downcast_ref::<ListArray>().unwrap();
-        let row = summaries.value(0);
-        let row = row.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(
-            row.column(2)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .value(0),
-            "east"
-        );
+        assert!(split.partition_slot_field_ids().is_empty());
+        assert!(split.partition_column_type_json().is_none());
+        let pages = files_pages(&runtime, &provider, &split, &columns).unwrap();
+        assert_eq!(pages[0].len(), 17);
+        assert_historical_manifest_summary(&runtime, &provider, &warehouse, "east", 1);
     }
 
     /// Real Avro facts retain the same source through Int -> Long -> removal.
@@ -5282,90 +5099,72 @@ mod tests {
     }
 
     #[test]
-    fn dropped_promoted_partition_source_has_stable_authors_and_actual_metadata_values() {
-        use novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation;
-        use novarocks_type_contract::ValueTypeStorageLifetime;
+    fn dropped_promoted_partition_source_has_no_canonical_slot_or_output_column() {
         let (runtime, binding, context) = runtime_and_binding();
         let dir = tempfile::tempdir().unwrap();
         let warehouse = runtime.block_on(build_promoted_partition_warehouse(
             dir.path(),
             binding.clone(),
         ));
-        assert!(warehouse.metadata.current_schema().field_by_id(2).is_none());
-        let expected =
-            DataType::Struct(vec![Arc::new(Field::new("region", DataType::Int64, true))].into());
-        let encoded = serde_json::to_vec(&warehouse.metadata).unwrap();
-        for _ in 0..16 {
-            let metadata: TableMetadata = serde_json::from_slice(&encoded).unwrap();
-            assert_eq!(
-                partition_row_type_with_metadata(&metadata).unwrap(),
-                Some(expected.clone())
-            );
-            for (kind, public_kind, ordinal) in [
-                (
-                    IcebergSystemTableType::Files,
-                    crate::metadata_batch_reader::MetadataTableType::Files,
-                    17,
-                ),
-                (
-                    IcebergSystemTableType::Entries,
-                    crate::metadata_batch_reader::MetadataTableType::LogicalIcebergMetadata,
-                    21,
-                ),
-            ] {
-                let runtime_schema = system_relation_schema_with_metadata(kind, &metadata).unwrap();
-                assert_eq!(runtime_schema.fields()[ordinal].data_type(), &expected);
-                let columns = system_relation_columns_with_metadata(kind, &metadata).unwrap();
-                let mut request = |_| Ok(());
-                let mut work = |_| Ok(());
-                let mut creation = ConnectorReadSchemaCreation::new(
-                    ValueTypeStorageLifetime::pure(),
-                    &mut request,
-                    &mut work,
-                );
-                let catalog = crate::metadata_batch_reader::metadata_table_output_columns(
-                    public_kind,
-                    &metadata,
-                    &mut creation,
-                )
-                .unwrap();
-                let catalog_schema =
-                    crate::metadata_batch_reader::metadata_output_schema(&catalog).unwrap();
-                let borrowed = columns.iter().collect::<Vec<_>>();
-                let public =
-                    publish_read_schema_with_metadata(kind, &borrowed, &metadata, &mut creation)
-                        .unwrap();
-                assert_eq!(catalog_schema.fields(), runtime_schema.fields());
-                assert_eq!(public.schema().fields(), runtime_schema.fields());
-            }
-        }
-        for expected in [
-            CompileControlError::Cancelled,
-            CompileControlError::DeadlineExceeded,
-            CompileControlError::ResourceExhausted,
+        use novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation;
+        use novarocks_type_contract::ValueTypeStorageLifetime;
+        let specs = warehouse
+            .metadata
+            .partition_specs_iter()
+            .map(|spec| spec.as_ref().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            partition_row_type_with_metadata(&warehouse.metadata).unwrap(),
+            None
+        );
+        assert_eq!(
+            partition_row_type(warehouse.metadata.current_schema(), &specs).unwrap(),
+            None
+        );
+        for (kind, catalog_kind, count) in [
+            (
+                IcebergSystemTableType::Files,
+                crate::metadata_batch_reader::MetadataTableType::Files,
+                17,
+            ),
+            (
+                IcebergSystemTableType::Entries,
+                crate::metadata_batch_reader::MetadataTableType::LogicalIcebergMetadata,
+                21,
+            ),
         ] {
+            let schema = system_relation_schema_with_metadata(kind, &warehouse.metadata).unwrap();
+            assert_eq!(schema.fields().len(), count);
+            assert!(schema.field_with_name("partition").is_err());
+            let columns = system_relation_columns_with_metadata(kind, &warehouse.metadata).unwrap();
             let mut request = |_| Ok(());
-            let mut work = |_| Err(expected.clone());
+            let mut work = |_| Ok(());
             let mut creation = ConnectorReadSchemaCreation::new(
                 ValueTypeStorageLifetime::pure(),
                 &mut request,
                 &mut work,
             );
-            let cause = crate::read_snapshot::partition_source_types_checked(
+            let alias = crate::metadata_batch_reader::metadata_table_output_columns(
+                catalog_kind,
                 &warehouse.metadata,
-                warehouse.metadata.current_schema(),
-                2,
-                || creation.work(1),
+                &mut creation,
             )
-            .unwrap_err();
-            assert!(
-                matches!(cause, crate::read_snapshot::PartitionSourceTypeFailure::Original(
-                PureProviderCompileError::Control(actual)
-            ) if actual == expected)
-            );
+            .unwrap();
+            let alias = crate::metadata_batch_reader::metadata_output_schema(&alias).unwrap();
+            let borrowed = columns.iter().collect::<Vec<_>>();
+            let public = publish_read_schema_with_metadata(
+                kind,
+                &borrowed,
+                &warehouse.metadata,
+                &mut creation,
+            )
+            .unwrap();
+            assert_eq!(alias.fields(), schema.fields());
+            assert_eq!(public.schema().fields(), schema.fields());
+            assert_metadata_columns_compile(kind, &columns, &schema);
         }
         let provider = provider(&binding, &context);
-        let entries_reference = reference(
+        let entries = reference(
             &warehouse,
             IcebergSystemTableType::Entries,
             Some(SNAPSHOT_ID),
@@ -5375,103 +5174,23 @@ mod tests {
             &warehouse.metadata,
         )
         .unwrap();
-        let pages = single_backend_pages(
-            &runtime,
-            &provider,
-            &entries_reference,
-            &all_columns(&schema),
-        )
-        .unwrap();
-        let partitions = pages[0][21].as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(partitions.data_type(), &expected);
-        let values = partitions
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(
-            values.iter().collect::<Vec<_>>(),
-            vec![Some(-7), Some(-7), Some(3_000_000_000)]
-        );
+        let pages =
+            single_backend_pages(&runtime, &provider, &entries, &all_columns(&schema)).unwrap();
+        assert_eq!(pages[0].len(), 21);
+        assert_eq!(pages[0][0].len(), 3);
         let (split, columns) = first_manifest_split(&runtime, &binding, &context, &warehouse);
+        assert!(split.partition_slot_field_ids().is_empty());
+        assert!(split.partition_column_type_json().is_none());
         let pages = files_pages(&runtime, &provider, &split, &columns).unwrap();
-        let partitions = pages[0][17].as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(partitions.data_type(), &expected);
-        assert_eq!(
-            partitions
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .iter()
-                .collect::<Vec<_>>(),
-            vec![Some(-7)]
-        );
-        let partitions_reference = reference(
-            &warehouse,
-            IcebergSystemTableType::Partitions,
-            Some(SNAPSHOT_ID),
-        );
-        let schema = system_relation_schema_with_metadata(
-            IcebergSystemTableType::Partitions,
-            &warehouse.metadata,
-        )
-        .unwrap();
-        let pages = single_backend_pages(
-            &runtime,
-            &provider,
-            &partitions_reference,
-            &all_columns(&schema),
-        )
-        .unwrap();
-        let mut counts = long_column(&pages[0], 0)
-            .into_iter()
-            .zip(long_column(&pages[0], 1))
-            .collect::<Vec<_>>();
-        counts.sort();
-        assert_eq!(
-            counts,
-            vec![(Some(1), Some(1)), (Some(2), Some(2))],
-            "Int(-7) and Long(-7) are the same partition, not two public groups"
-        );
-        let manifests_reference = reference(
-            &warehouse,
-            IcebergSystemTableType::Manifests,
-            Some(SNAPSHOT_ID),
-        );
-        let schema = system_relation_schema_with_metadata(
-            IcebergSystemTableType::Manifests,
-            &warehouse.metadata,
-        )
-        .unwrap();
-        let pages = single_backend_pages(
-            &runtime,
-            &provider,
-            &manifests_reference,
-            &all_columns(&schema),
-        )
-        .unwrap();
-        let summaries = pages[0][11].as_any().downcast_ref::<ListArray>().unwrap();
-        for ordinal in 0..2 {
-            let value = summaries.value(ordinal);
-            let fields = value.as_any().downcast_ref::<StructArray>().unwrap();
-            assert_eq!(
-                fields
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap()
-                    .value(0),
-                "-7"
-            );
-        }
+        assert_eq!(pages[0].len(), 17);
+        assert_historical_manifest_summary(&runtime, &provider, &warehouse, "-7", 2);
     }
 
     #[test]
     fn historical_partition_normalization_preserves_unrelated_literal_rejection() {
         let field = Arc::new(Field::new("region", DataType::Int64, true));
         let declaration = DataType::Struct(vec![field].into());
-        let bad = BTreeMap::from([("region".to_owned(), Some(Literal::string("-7")))]);
+        let bad = vec![Some(Literal::string("-7"))];
         assert_eq!(
             partition_struct_array(&declaration, &[&bad])
                 .unwrap_err()
@@ -5480,7 +5199,7 @@ mod tests {
         );
         let declaration =
             DataType::Struct(vec![Arc::new(Field::new("region", DataType::Float64, true))].into());
-        let old = BTreeMap::from([("region".to_owned(), Some(Literal::float(1.5_f32)))]);
+        let old = vec![Some(Literal::float(1.5_f32))];
         let values = partition_struct_array(&declaration, &[&old]).unwrap();
         let values = values.as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(
@@ -5495,7 +5214,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_files_split_rejects_missing_or_foreign_partition_declarations() {
+    fn frozen_files_split_rejects_foreign_partition_types_and_slot_field_ids() {
         let (runtime, binding, context) = runtime_and_binding();
         let dir = tempfile::tempdir().expect("tempdir");
         let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
@@ -5509,13 +5228,15 @@ mod tests {
                 .unwrap(),
             ),
         ] {
-            let changed = FilesTableSplit::try_new(FilesTableSplitParams {
+            let changed = SystemManifestSplit::try_new(SystemManifestSplitParams {
+                reference: split.reference().clone(),
                 table_has_variant_history: split.table_has_variant_history(),
                 manifest: split.manifest().clone(),
                 table_schema_json: split.table_schema_json().to_owned(),
                 metadata_table_schema_json: split.metadata_table_schema_json().to_owned(),
                 partition_spec_jsons: split.partition_spec_jsons().clone(),
                 partition_column_type_json: partition,
+                partition_slot_field_ids: split.partition_slot_field_ids().to_vec(),
                 bounds_column_type_json: split.bounds_column_type_json().map(str::to_owned),
                 encryption_key_id: None,
             })
@@ -5524,6 +5245,18 @@ mod tests {
                 .err()
                 .expect("missing/foreign declaration rejected");
             assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        }
+        for ids in [Vec::new(), vec![9999]] {
+            let mut raw = split.to_proto();
+            raw.partition_slot_field_ids = ids;
+            let changed = SystemManifestSplit::from_proto(&raw).unwrap();
+            assert_eq!(
+                FilesSplitRelation::of(&changed, &columns)
+                    .err()
+                    .unwrap()
+                    .kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
         }
     }
 
@@ -5549,14 +5282,19 @@ mod tests {
         }
     }
 
-    fn split_with_variant_history(split: &FilesTableSplit, history: bool) -> FilesTableSplit {
-        FilesTableSplit::try_new(FilesTableSplitParams {
+    fn split_with_variant_history(
+        split: &SystemManifestSplit,
+        history: bool,
+    ) -> SystemManifestSplit {
+        SystemManifestSplit::try_new(SystemManifestSplitParams {
+            reference: split.reference().clone(),
             table_has_variant_history: history,
             manifest: split.manifest().clone(),
             table_schema_json: split.table_schema_json().to_owned(),
             metadata_table_schema_json: split.metadata_table_schema_json().to_owned(),
             partition_spec_jsons: split.partition_spec_jsons().clone(),
             partition_column_type_json: split.partition_column_type_json().map(str::to_owned),
+            partition_slot_field_ids: split.partition_slot_field_ids().to_vec(),
             bounds_column_type_json: split.bounds_column_type_json().map(str::to_owned),
             encryption_key_id: None,
         })
@@ -5567,7 +5305,7 @@ mod tests {
         runtime: &tokio::runtime::Runtime,
         binding: &IcebergReadBinding,
         context: &FileReadContext,
-        split: &FilesTableSplit,
+        split: &SystemManifestSplit,
         columns: &[IcebergColumnHandle],
         original: &ConnectorError,
     ) {
@@ -5577,7 +5315,7 @@ mod tests {
             let split = split_with_variant_history(split, history);
             let budget = ConnectorPollBudget::new();
             let stream = provider(binding, context)
-                .create_files_page_stream(&split, columns, &budget)
+                .create_manifest_page_stream(&split, columns, &budget)
                 .expect("manifest page stream");
             let mut stream = DrivenStream::new(runtime, stream, budget);
             let actual = match stream.next_page() {
@@ -5715,8 +5453,6 @@ mod tests {
             .map(|spec| spec.as_ref().clone())
             .collect::<Vec<_>>();
         for relation in [
-            IcebergSystemTableType::Entries,
-            IcebergSystemTableType::Partitions,
             IcebergSystemTableType::Snapshots,
             IcebergSystemTableType::History,
             IcebergSystemTableType::Refs,
@@ -5732,7 +5468,14 @@ mod tests {
             let budget = ConnectorPollBudget::new();
             budget.refill(1);
             let mut stream = provider
-                .create_single_backend_page_stream(&reference, &columns, &budget)
+                .create_page_stream(
+                    &reference,
+                    &super::super::IcebergReadSplit::SystemRelation(
+                        SystemRelationSplit::try_new(reference.clone()).unwrap(),
+                    ),
+                    &columns,
+                    &budget,
+                )
                 .expect("page stream");
             let streamed = drain_stream(&runtime, &mut stream);
             runtime
@@ -5740,15 +5483,7 @@ mod tests {
                 .expect("closing a drained stream");
 
             assert!(!streamed.is_empty(), "{relation:?} has rows");
-            // Both relations walk the two actual manifests. Partitions also
-            // validates the three original entries under the host poll budget;
-            // page delivery spends its own independent units.
-            let walked = match relation {
-                IcebergSystemTableType::Entries => 2,
-                IcebergSystemTableType::Partitions => 2 + 3,
-                _ => 0,
-            };
-            let spent = walked + streamed.len() as u64;
+            let spent = streamed.len() as u64;
             assert_eq!(budget.exhaustions(), spent - 1, "{relation:?}");
         }
     }
@@ -5767,7 +5502,7 @@ mod tests {
             route_reads_through(&mut context, spawner.clone(), runtime.handle().clone());
         let budget = ConnectorPollBudget::new();
         let mut stream = provider(&binding, &context)
-            .create_files_page_stream(&split, &columns, &budget)
+            .create_manifest_page_stream(&split, &columns, &budget)
             .expect("page stream");
         assert_eq!(spawner.started(), 0, "creating the stream reads nothing");
         spawner.release(64);

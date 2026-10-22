@@ -616,9 +616,12 @@ where
             .map(|assignment| assignment.column().clone())
             .collect::<Vec<_>>();
         match (table, split) {
-            (_, IcebergReadSplit::SystemFiles(files_split)) => self
+            (
+                IcebergRuntimeRelation::SystemTable(reference),
+                IcebergReadSplit::SystemManifest(_) | IcebergReadSplit::SystemRelation(_),
+            ) => self
                 .system_tables
-                .create_files_page_stream(files_split, &columns, budget),
+                .create_page_stream(reference, split, &columns, budget),
             (
                 IcebergRuntimeRelation::ChangeWindow(handle),
                 IcebergReadSplit::ChangeWindow(split),

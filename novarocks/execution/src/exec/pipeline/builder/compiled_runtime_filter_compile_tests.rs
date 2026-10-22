@@ -183,7 +183,7 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
                         input_version: ExactInputVersion::try_new([9]).unwrap(),
                         relation: relation_payload(),
                     },
-                    work_source: ConnectorReadWorkSource::RuntimeSplits,
+
                     selection_digest: [7; 32],
                     schema: columns
                         .iter()
@@ -380,7 +380,6 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
         vec![StaticScanDynamicFilter::new(FILTER.get(), Arc::from("v0"))],
         NonZeroU64::new(100).unwrap(),
         NonZeroU64::new(4096).unwrap(),
-        ConnectorReadWorkSource::RuntimeSplits,
     )
     .unwrap();
     let source = ConnectorReadStaticFacts::try_new(

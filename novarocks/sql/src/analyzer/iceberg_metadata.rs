@@ -178,14 +178,13 @@ fn field(name: &str, data_type: DataType, nullable: bool) -> Field {
 pub struct IcebergMetadataDerivedTypes {
     partition: Option<DataType>,
     bounds: Option<DataType>,
-    partition_metrics: Option<DataType>,
 }
 
 impl IcebergMetadataDerivedTypes {
     /// The derivation for a table with no partition field, no boundable
     /// column, and no metric column. Every optional column is omitted.
     pub fn none() -> Self {
-        Self::try_new(None, None, None).expect("an empty derivation is always valid")
+        Self::try_new(None, None).expect("an empty derivation is always valid")
     }
 
     /// Build the derivation from the caller's already-resolved Iceberg facts.
@@ -197,21 +196,11 @@ impl IcebergMetadataDerivedTypes {
     ///   field types are the target column types. Drives `$files.lower_bounds`
     ///   and `$files.upper_bounds`. `$entries` deliberately does not use it:
     ///   its nested bounds stay `MAP(INTEGER, VARCHAR)`, matching Trino.
-    /// * `partition_metrics` — ROW of per-column metric ROWs. Drives
-    ///   `$partitions.data`.
     ///
     /// Every supplied type must be a ROW; anything else is a caller bug and is
     /// rejected rather than coerced.
-    pub fn try_new(
-        partition: Option<DataType>,
-        bounds: Option<DataType>,
-        partition_metrics: Option<DataType>,
-    ) -> Result<Self, String> {
-        for (label, candidate) in [
-            ("partition", &partition),
-            ("bounds", &bounds),
-            ("partition_metrics", &partition_metrics),
-        ] {
+    pub fn try_new(partition: Option<DataType>, bounds: Option<DataType>) -> Result<Self, String> {
+        for (label, candidate) in [("partition", &partition), ("bounds", &bounds)] {
             if let Some(data_type) = candidate
                 && !matches!(data_type, DataType::Struct(_))
             {
@@ -220,11 +209,7 @@ impl IcebergMetadataDerivedTypes {
                 ));
             }
         }
-        Ok(Self {
-            partition,
-            bounds,
-            partition_metrics,
-        })
+        Ok(Self { partition, bounds })
     }
 
     pub fn partition(&self) -> Option<&DataType> {
@@ -233,10 +218,6 @@ impl IcebergMetadataDerivedTypes {
 
     pub fn bounds(&self) -> Option<&DataType> {
         self.bounds.as_ref()
-    }
-
-    pub fn partition_metrics(&self) -> Option<&DataType> {
-        self.partition_metrics.as_ref()
     }
 }
 
@@ -248,9 +229,8 @@ impl IcebergMetadataDerivedTypes {
 /// contributes no schema-derived column.
 ///
 /// Use [`metadata_table_schema_with`] whenever the caller has already resolved
-/// the table's partition struct, bounds ROW, or partition metrics ROW: this
-/// entry point cannot know them and therefore omits `partition`,
-/// `lower_bounds`, `upper_bounds`, and `$partitions.data`.
+/// the table's partition struct or bounds ROW: this entry point cannot know
+/// them and therefore omits `partition`, `lower_bounds`, and `upper_bounds`.
 pub fn metadata_table_schema(kind: SqlMetadataTableKind) -> Vec<MetadataColumn> {
     metadata_table_schema_with(kind, &IcebergMetadataDerivedTypes::none())
 }
@@ -449,7 +429,7 @@ fn manifests_columns() -> Vec<MetadataColumn> {
     ]
 }
 
-/// Trino `PartitionsView`, exactly.
+/// SQL partition aggregation over data-file rows; per-column metrics are not exposed.
 ///
 /// SQL COMPATIBILITY CHANGE: the previous NovaRocks shape carried
 /// `position_delete_file_count` and `equality_delete_file_count`. Both are
@@ -467,13 +447,10 @@ fn partitions_columns(derived: &IcebergMetadataDerivedTypes) -> Vec<MetadataColu
         columns.push(MetadataColumn::new("partition", partition.clone(), true));
     }
     columns.extend([
-        MetadataColumn::new("record_count", bigint(), false),
+        MetadataColumn::new("record_count", bigint(), true),
         MetadataColumn::new("file_count", bigint(), false),
-        MetadataColumn::new("total_size", bigint(), false),
+        MetadataColumn::new("total_size", bigint(), true),
     ]);
-    if let Some(metrics) = derived.partition_metrics() {
-        columns.push(MetadataColumn::new("data", metrics.clone(), true));
-    }
     columns
 }
 
@@ -525,26 +502,9 @@ mod tests {
         ])
     }
 
-    fn partition_metrics_row() -> DataType {
-        row_of(vec![field(
-            "amount",
-            row_of(vec![
-                field("min", DataType::Float64, true),
-                field("max", DataType::Float64, true),
-                field("null_count", bigint(), true),
-                field("nan_count", bigint(), true),
-            ]),
-            true,
-        )])
-    }
-
     fn full_derivation() -> IcebergMetadataDerivedTypes {
-        IcebergMetadataDerivedTypes::try_new(
-            Some(partition_row()),
-            Some(bounds_row()),
-            Some(partition_metrics_row()),
-        )
-        .expect("ROW derivations")
+        IcebergMetadataDerivedTypes::try_new(Some(partition_row()), Some(bounds_row()))
+            .expect("ROW derivations")
     }
 
     const ALL_RELATIONS: [SqlMetadataTableKind; 7] = [
@@ -966,19 +926,16 @@ mod tests {
             metadata_table_schema_with(SqlMetadataTableKind::Partitions, &full_derivation());
         assert_eq!(
             names(&columns),
-            vec![
-                "partition",
-                "record_count",
-                "file_count",
-                "total_size",
-                "data"
-            ]
+            vec!["partition", "record_count", "file_count", "total_size"]
         );
         assert_eq!(column(&columns, "partition").data_type, partition_row());
         assert_eq!(column(&columns, "record_count").data_type, bigint());
         assert_eq!(column(&columns, "file_count").data_type, bigint());
         assert_eq!(column(&columns, "total_size").data_type, bigint());
-        assert_eq!(column(&columns, "data").data_type, partition_metrics_row());
+        assert!(column(&columns, "record_count").nullable);
+        assert!(!column(&columns, "file_count").nullable);
+        assert!(column(&columns, "total_size").nullable);
+        assert!(!names(&columns).contains(&"data"));
     }
 
     #[test]
@@ -1147,13 +1104,7 @@ mod tests {
             ),
             (
                 "$partitions",
-                vec![
-                    "partition",
-                    "record_count",
-                    "file_count",
-                    "total_size",
-                    "data",
-                ],
+                vec!["partition", "record_count", "file_count", "total_size"],
             ),
         ];
         let expected: Vec<(&str, Vec<String>)> = expected
@@ -1183,7 +1134,6 @@ mod tests {
             (SqlMetadataTableKind::Snapshots, "summary"),
             (SqlMetadataTableKind::Manifests, "partition_summaries"),
             (SqlMetadataTableKind::Partitions, "partition"),
-            (SqlMetadataTableKind::Partitions, "data"),
         ];
         for (kind, name) in complex {
             let columns = metadata_table_schema_with(kind, &derived);
@@ -1205,14 +1155,13 @@ mod tests {
 
     #[test]
     fn derived_types_reject_a_non_row_derivation() {
-        let error = IcebergMetadataDerivedTypes::try_new(Some(varchar()), None, None)
+        let error = IcebergMetadataDerivedTypes::try_new(Some(varchar()), None)
             .expect_err("a VARCHAR partition is a caller bug");
         assert!(error.contains("partition"), "{error}");
         assert!(error.contains("must be a ROW"), "{error}");
 
-        let error =
-            IcebergMetadataDerivedTypes::try_new(None, Some(map_of(integer(), varchar())), None)
-                .expect_err("a MAP bounds derivation is a caller bug");
+        let error = IcebergMetadataDerivedTypes::try_new(None, Some(map_of(integer(), varchar())))
+            .expect_err("a MAP bounds derivation is a caller bug");
         assert!(error.contains("bounds"), "{error}");
     }
 }

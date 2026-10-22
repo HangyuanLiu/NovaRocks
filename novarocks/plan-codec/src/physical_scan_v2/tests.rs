@@ -45,7 +45,7 @@ use novarocks_connector_contract::{
     CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
     ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorProviderId, ConnectorReadBinding, ConnectorReadInputVersion,
-    ConnectorReadRelationKind, ConnectorReadRelationPayload, ConnectorReadWorkSource,
+    ConnectorReadRelationKind, ConnectorReadRelationPayload,
 };
 use novarocks_proto_models::physical_control_v2::Empty;
 use novarocks_type_contract::{
@@ -252,7 +252,7 @@ fn source() -> p::PhysicalNode {
     let ty = FunctionValueType::new(DataType::Int64, true);
     let relation = p::Relation::Data(p::DataRelation {
         read: read(),
-        work_source: ConnectorReadWorkSource::RuntimeSplits,
+
         selection_digest: [255; 32],
         schema: Box::from([p::RelationField {
             column: p::ProviderColumnReference {
@@ -598,7 +598,7 @@ fn scan_metadata_relation_preserves_kind_coverage_read_purpose_and_complete_head
     let metadata = p::Relation::Metadata(p::MetadataRelation {
         kind: p::MetadataRelationKind::try_new("files / ✓").unwrap(),
         read: reference,
-        work_source: ConnectorReadWorkSource::WholeRelation,
+
         selection_digest: data.selection_digest,
         schema: data.schema,
         predicate_guarantees: data.predicate_guarantees,
@@ -642,7 +642,6 @@ fn scan_metadata_relation_preserves_kind_coverage_read_purpose_and_complete_head
                 metadata.read.relation.kind(),
                 ConnectorReadRelationKind::SystemTable
             );
-            assert_eq!(metadata.work_source, ConnectorReadWorkSource::WholeRelation);
         },
     );
 }

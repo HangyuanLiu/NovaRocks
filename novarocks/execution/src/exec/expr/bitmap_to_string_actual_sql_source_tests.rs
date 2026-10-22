@@ -20,7 +20,7 @@ use arrow::datatypes::{Field, Schema};
 use novarocks_physical_plan::{
     ExactInputVersion, PredicateGuaranteeKind, ProviderColumnReference, ProviderReadReference,
 };
-use novarocks_spi::connector::read_stack::{ConnectorReadBinding, ConnectorReadWorkSource};
+use novarocks_spi::connector::read_stack::ConnectorReadBinding;
 use novarocks_spi::connector::{
     CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
     ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,

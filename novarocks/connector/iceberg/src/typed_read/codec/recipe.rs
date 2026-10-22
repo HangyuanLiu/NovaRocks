@@ -238,7 +238,8 @@ fn recipe_kind(
         Category::Data => ConnectorReadRecipeSplitKind::Data,
         Category::TableChanges => ConnectorReadRecipeSplitKind::TableChanges,
         Category::ChangeWindow => ConnectorReadRecipeSplitKind::ChangeWindow,
-        Category::SystemFiles => ConnectorReadRecipeSplitKind::SystemFiles,
+        Category::SystemManifest => ConnectorReadRecipeSplitKind::SystemManifest,
+        Category::SystemRelation => ConnectorReadRecipeSplitKind::SystemRelation,
         Category::RewritePositionDeleteFiles => {
             ConnectorReadRecipeSplitKind::RewritePositionDeleteFiles
         }

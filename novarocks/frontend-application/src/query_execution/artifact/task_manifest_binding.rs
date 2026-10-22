@@ -128,7 +128,6 @@ impl BoundManifestFrozenUnits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BoundManifestScanAssignment {
     RuntimeSplits,
-    WholeRelation,
     FrozenUnits(BoundManifestFrozenUnits),
 }
 
@@ -647,7 +646,6 @@ impl TaskManifestBinding {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProjectedScanAssignment {
     RuntimeSplits,
-    WholeRelation,
     FrozenUnits(BoundManifestFrozenUnits),
 }
 
@@ -655,7 +653,6 @@ impl ProjectedScanAssignment {
     fn into_bound(self) -> BoundManifestScanAssignment {
         match self {
             Self::RuntimeSplits => BoundManifestScanAssignment::RuntimeSplits,
-            Self::WholeRelation => BoundManifestScanAssignment::WholeRelation,
             Self::FrozenUnits(units) => BoundManifestScanAssignment::FrozenUnits(units),
         }
     }
@@ -707,7 +704,6 @@ type PreparedEdgeKey = (FragmentId, FragmentId, i32);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreparedScanSource {
     RuntimeSplits,
-    WholeRelation,
     FrozenUnits { unit_count: usize },
 }
 
@@ -751,8 +747,7 @@ impl PreparedManifestFacts {
         for fragment in &scheduling.fragments {
             for scan in &fragment.scans {
                 let source = match scan.work {
-                    NativeScanWork::RuntimeSplits => PreparedScanSource::RuntimeSplits,
-                    NativeScanWork::WholeRelation => PreparedScanSource::WholeRelation,
+                    NativeScanWork::RuntimeSplits { .. } => PreparedScanSource::RuntimeSplits,
                     NativeScanWork::Empty => PreparedScanSource::FrozenUnits { unit_count: 0 },
                     NativeScanWork::FrozenUnits { count } => PreparedScanSource::FrozenUnits {
                         unit_count: count.get(),
@@ -827,9 +822,6 @@ impl ScheduleFacts {
                                     assignment: match work.assignment() {
                                         ScheduledScanAssignment::RuntimeSplits => {
                                             ProjectedScanAssignment::RuntimeSplits
-                                        }
-                                        ScheduledScanAssignment::WholeRelation => {
-                                            ProjectedScanAssignment::WholeRelation
                                         }
                                         ScheduledScanAssignment::FrozenUnits { units } => {
                                             ProjectedScanAssignment::FrozenUnits(
@@ -984,17 +976,6 @@ fn validate_scan_assignments(
                 {
                     return Err(contract_error(format!(
                         "attempt manifest runtime-split scan node {} must be assigned to every task",
-                        scan.node_id()
-                    )));
-                }
-            }
-            PreparedScanSource::WholeRelation => {
-                if tasks.len() != 1
-                    || assignments.len() != 1
-                    || assignments.get(&0) != Some(&ProjectedScanAssignment::WholeRelation)
-                {
-                    return Err(contract_error(format!(
-                        "attempt manifest whole-relation scan node {} must have exactly one task assignment",
                         scan.node_id()
                     )));
                 }
