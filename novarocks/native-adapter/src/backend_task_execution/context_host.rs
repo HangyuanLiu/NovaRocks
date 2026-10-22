@@ -87,6 +87,7 @@ use crate::{
         sealed_runtime_filter_evidence,
     },
 };
+use novarocks_worker::RuntimeFilterContractError;
 use novarocks_worker::runtime_filter::domain::BackendFrontendFeedbackSink;
 use novarocks_worker::runtime_filter::domain::BackendParticipantIdentity;
 use novarocks_worker::{
@@ -94,7 +95,6 @@ use novarocks_worker::{
     ConnectorExecutionRoleBindingFactorySet, HostRejection, QueryContextCredentialSlot,
     QueryContextHost, ReleasedContextEvidence, SharedFactsRequest, TaskStatusReporter,
 };
-use novarocks_worker::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 
 type RuntimeFilterParticipantInstaller = dyn Fn(
         QueryExecutionId,

@@ -15,7 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_failpoint::scope::{ActionClaim, ControlCancellation, GrantHandle, ProcessBinding};
+#[cfg(any(
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
+use novarocks_failpoint::scope::{ActionClaim, ControlCancellation};
+use novarocks_failpoint::scope::{GrantHandle, ProcessBinding};
+#[cfg(any(
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
 use novarocks_types::FrontendProcessId;
 use serde::Deserialize;
 use std::{io, path::PathBuf};
@@ -23,8 +32,20 @@ use std::{io, path::PathBuf};
 /// MySQL owns mutual exclusion before either fixture creates transport resources.
 pub struct MysqlFixtureAuthorization {
     action: String,
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
     path: PathBuf,
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
     nonce: [u8; 16],
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
     grant: GrantHandle,
 }
 #[derive(Deserialize)]
@@ -53,10 +74,27 @@ impl MysqlFixtureAuthorization {
         if !matches!(grant.cancellation().process(), ProcessBinding::Frontend(_)) {
             return Err(invalid("MySQL fixture requires an FE process"));
         }
+        #[cfg(not(any(
+            feature = "mem-1-m07-exact-mysql-write",
+            feature = "mem-1-m07-closing-pressure"
+        )))]
+        let _ = (path, nonce);
         Ok(Some(Self {
             action,
+            #[cfg(any(
+                feature = "mem-1-m07-exact-mysql-write",
+                feature = "mem-1-m07-closing-pressure"
+            ))]
             path,
+            #[cfg(any(
+                feature = "mem-1-m07-exact-mysql-write",
+                feature = "mem-1-m07-closing-pressure"
+            ))]
             nonce,
+            #[cfg(any(
+                feature = "mem-1-m07-exact-mysql-write",
+                feature = "mem-1-m07-closing-pressure"
+            ))]
             grant,
         }))
     }
@@ -66,6 +104,10 @@ impl MysqlFixtureAuthorization {
     pub fn is_closing_pressure(&self) -> bool {
         self.action == "closing-pressure"
     }
+    #[cfg(any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    ))]
     pub(crate) fn claim(
         self,
         action: &str,
@@ -108,7 +150,7 @@ fn parse_parameters(parameters: &serde_json::Value) -> io::Result<(String, PathB
         ));
     }
     let mut nonce = [0; 16];
-    for (out, pair) in nonce.iter_mut().zip(text.chunks_exact(2)) {
+    for (out, pair) in nonce.iter_mut().zip(text.as_chunks::<2>().0) {
         let digit = |b: u8| {
             if b.is_ascii_digit() {
                 b - b'0'
@@ -176,7 +218,14 @@ mod tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(
+    test,
+    unix,
+    any(
+        feature = "mem-1-m07-exact-mysql-write",
+        feature = "mem-1-m07-closing-pressure"
+    )
+))]
 mod session_tests {
     use super::*;
     use novarocks_failpoint::liveness::{PreparedRoleSession, RunnerSession};
@@ -249,7 +298,15 @@ mod session_tests {
 }
 
 /// Shared only by the original fixture and its exact kernel, not a registry.
+#[cfg(any(
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
 pub(crate) struct FixtureActionObservation(std::sync::Mutex<(ActionClaim, bool)>);
+#[cfg(any(
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
 impl FixtureActionObservation {
     pub(crate) fn new(claim: ActionClaim) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self(std::sync::Mutex::new((claim, false))))

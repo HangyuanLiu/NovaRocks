@@ -2772,6 +2772,10 @@ pub fn decode_status_event(
 }
 
 /// One observed status event.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "This public codec result carries the frozen TaskStatus by value; boxing it changes consumer ownership and is queued for coordinated P10 contract review."
+)]
 #[derive(Clone, Debug)]
 pub enum StatusStreamEvent {
     Status(novarocks_execution_contract::task_execution::status::TaskStatus),
@@ -2779,6 +2783,10 @@ pub enum StatusStreamEvent {
 }
 
 /// One event from a convergence-aware task-status subscription.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "This public codec result carries the frozen TaskStatus by value; boxing it changes consumer ownership and is queued for coordinated P10 contract review."
+)]
 #[derive(Clone, Debug)]
 pub enum ContextAwareStatusStreamEvent {
     Status(novarocks_execution_contract::task_execution::status::TaskStatus),
@@ -3178,6 +3186,10 @@ pub struct CoveredObservationBookmark {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "This public codec result carries the frozen TaskStatus by value; boxing it changes consumer ownership and is queued for coordinated P10 contract review."
+)]
 pub enum CoveredStatusStreamFact {
     Status(TaskStatus),
     Gone(TaskIdentity),

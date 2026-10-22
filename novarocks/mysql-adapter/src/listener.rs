@@ -30,7 +30,6 @@ use tracing::warn;
 ))]
 mod fixture_join_observation;
 #[cfg(any(
-    test,
     feature = "mem-1-m07-exact-mysql-write",
     feature = "mem-1-m07-closing-pressure"
 ))]
@@ -46,7 +45,12 @@ pub(crate) use fixture_join_observation::MysqlFixtureSessionJoins;
     feature = "mem-1-m07-exact-mysql-write",
     feature = "mem-1-m07-closing-pressure"
 ))]
-pub(crate) use fixture_join_observation::{WatcherAbortGuard, WatcherFacts, WatcherPermit};
+pub(crate) use fixture_join_observation::WatcherAbortGuard;
+#[cfg(any(
+    feature = "mem-1-m07-exact-mysql-write",
+    feature = "mem-1-m07-closing-pressure"
+))]
+pub(crate) use fixture_join_observation::{WatcherFacts, WatcherPermit};
 
 /// Bind a TCP listener and retain accepted protocol tasks until `shutdown`.
 ///

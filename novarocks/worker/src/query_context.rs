@@ -149,7 +149,6 @@ impl novarocks_execution_contract::failure::FailureProjection for QueryContextRe
 }
 impl novarocks_execution_contract::failure::FailureProjection for QueryMemoryAccountError {
     fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
-        use novarocks_execution_contract::failure::*;
         match self {
             Self::MissingContext => {
                 QueryContextRegistrationError::MissingRequiredContext.failure_fact()
@@ -788,10 +787,6 @@ impl QueryContextManager {
         )
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "This internal constructor accepts the complete query registration contract before atomically installing context state."
-    )]
     fn get_or_register_internal_with_generation(
         &self,
         query_id: QueryId,

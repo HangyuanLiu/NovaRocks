@@ -243,7 +243,7 @@ pub(crate) mod streaming_result_tests {
     };
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
     use novarocks_workload_control::{
-        CancellationReason, ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+        CancellationReason, ResourceConfig, WorkloadConfig, WorkloadControl,
     };
 
     use super::*;

@@ -2167,7 +2167,6 @@ mod tests {
         };
         let carrier = protocol::FrozenFragment {
             package: vec![0; 65].into(),
-            ..Default::default()
         };
         let error = services
             .task_execution_ingress

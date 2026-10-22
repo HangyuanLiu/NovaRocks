@@ -16,6 +16,8 @@
 // under the License.
 
 //! Original Int64 shipping GLOBAL witnesses, sharing the lawful Native fixture.
+#[path = "support/shift_runtime_funding_helpers.rs"]
+mod shift_helpers;
 #[path = "support/shift_runtime_funding.rs"]
 mod shift_support;
 use arrow::array::{Array, Int64Array};
@@ -25,6 +27,7 @@ use novarocks_execution::runtime::scalar_memory::{
 };
 use novarocks_functions::{EvaluatedArgument, Selection};
 use novarocks_memory::lane::global_store;
+use shift_helpers::*;
 use shift_support::*;
 
 fn program(

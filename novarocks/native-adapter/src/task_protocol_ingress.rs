@@ -3140,7 +3140,6 @@ mod tests {
             let mut carriers = CreateCarriers::root(context, identity);
             carriers.frozen = proto::FrozenFragment {
                 package: bytes::Bytes::from(vec![0; len]),
-                ..Default::default()
             };
             carriers
         }

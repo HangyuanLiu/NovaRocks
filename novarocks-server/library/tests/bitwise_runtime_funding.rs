@@ -17,8 +17,10 @@
 
 //! Original bitwise wrappers and Frames under the sole shipping GLOBAL.
 //! Explicit fixture retirement does not establish production Work teardown.
+#[path = "support/shift_runtime_funding_helpers.rs"]
+mod shift_helpers;
 #[path = "support/shift_runtime_funding.rs"]
-mod support;
+mod shift_support;
 use arrow::{
     array::{Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array},
     buffer::Buffer,
@@ -35,7 +37,8 @@ use novarocks_memory::lane::global_store;
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
 };
-use support::*;
+use shift_helpers::*;
+use shift_support::*;
 
 const BITWISE: [&str; 4] = ["bitand", "bitor", "bitxor", "bitnot"];
 fn widths() -> [DataType; 4] {

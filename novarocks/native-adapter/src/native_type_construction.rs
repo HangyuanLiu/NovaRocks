@@ -27,6 +27,7 @@ use std::{
 };
 
 use novarocks_execution::runtime::mem_tracker::MemTracker;
+#[cfg(test)]
 use novarocks_plan_codec::host_projection_v2::AdmissionRefusal;
 use novarocks_spi::connector::ConnectorStopView;
 use novarocks_type_contract::{
@@ -358,6 +359,7 @@ impl<'control> NativeTypeConstruction<'control> {
         self.checkpoint(CompilePhase::LowerProgram, 0)?;
         self.reservation.request_bytes(bytes)
     }
+    #[cfg(test)]
     pub(crate) fn request(
         &self,
         layout: Layout,
@@ -394,6 +396,7 @@ impl NativeTypeScope<'_> {
         self.checkpoint(CompilePhase::LowerProgram, 0)?;
         self.reservation.request_bytes(bytes)
     }
+    #[cfg(test)]
     pub(crate) fn request(
         &self,
         layout: Layout,
@@ -441,6 +444,7 @@ impl<'borrow, 'control> NativeTypeFactory<'borrow, 'control> {
             request_upper: std::cell::Cell::new(0),
         }
     }
+    #[cfg(test)]
     pub(crate) fn construction_request_bytes_upper_bound(&self) -> usize {
         self.request_upper.get()
     }

@@ -421,8 +421,10 @@ mod tests {
 
     #[test]
     fn excess_compute_is_refused_but_lower_actual_config_is_not_a_profile_drift() {
-        let mut workload = WorkloadConfig::default();
-        workload.query_concurrency_limit = 257;
+        let mut workload = WorkloadConfig {
+            query_concurrency_limit: 257,
+            ..WorkloadConfig::default()
+        };
         assert!(validate_current(&workload).is_err());
         workload.query_concurrency_limit = 16;
         let report = validate_current(&workload).expect("smaller workload remains covered");
@@ -454,8 +456,10 @@ mod tests {
 
     #[test]
     fn original_workload_result_and_transport_error_sources_survive_context() {
-        let mut workload = WorkloadConfig::default();
-        workload.waiting_limit = 0;
+        let workload = WorkloadConfig {
+            waiting_limit: 0,
+            ..WorkloadConfig::default()
+        };
         let error = validate_current(&workload).expect_err("invalid original workload");
         assert!(
             error

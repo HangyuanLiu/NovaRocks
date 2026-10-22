@@ -85,12 +85,14 @@ pub(crate) enum RootProducerExitStatus {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RootExitRole {
+    #[cfg(test)]
     Preparation,
     Runtime,
 }
 impl RootExitRole {
     fn index(self) -> usize {
         match self {
+            #[cfg(test)]
             Self::Preparation => 0,
             Self::Runtime => 1,
         }
@@ -107,9 +109,11 @@ const EXIT_ROLES: usize = 2;
 const META_FAULTS: usize = EXIT_ROLES * 3; // clone, wake, holder destruction
 
 enum RootExitMetadata {
-    Root(Arc<novarocks_worker::root_result_channel::RootMetadataReservation>),
+    Root {
+        _reservation: Arc<novarocks_worker::root_result_channel::RootMetadataReservation>,
+    },
     #[cfg(test)]
-    Test(ResultWriteCredit),
+    Test { _credit: ResultWriteCredit },
 }
 struct ExitState {
     status: RootProducerExitStatus,
@@ -503,7 +507,6 @@ pub(crate) enum RootProducerControlFailure {
     RegistrationExpired,
     JobExited,
     Positions { limit: usize },
-    GenerationOverflow,
     Unavailable,
 }
 impl std::fmt::Display for RootProducerControlFailure {
@@ -514,7 +517,6 @@ impl std::fmt::Display for RootProducerControlFailure {
             Self::RegistrationExpired => "root producer registration has expired",
             Self::JobExited => "root producer job has exited",
             Self::Positions { .. } => "root producer pool positions are exhausted",
-            Self::GenerationOverflow => "root producer generation overflow",
             Self::Unavailable => "root producer pool is unhealthy",
         })
     }
@@ -529,7 +531,6 @@ impl novarocks_execution_contract::failure::FailureProjection for RootProducerCo
             Self::RegistrationExpired => (FailureClass::Control, 602),
             Self::JobExited => (FailureClass::Control, 603),
             Self::Positions { .. } => (FailureClass::Resource, 604),
-            Self::GenerationOverflow => (FailureClass::Invariant, 605),
             Self::Unavailable => (FailureClass::Unexpected, 606),
         };
         let fact = FailureFact::new(
@@ -831,7 +832,12 @@ impl RootProducerPool {
         plan: RootCleanupPlan,
         metadata: Arc<novarocks_worker::root_result_channel::RootMetadataReservation>,
     ) -> Result<RootProducerReservation, RootProducerReserveFailure> {
-        self.reserve_inner(plan, RootExitMetadata::Root(metadata))
+        self.reserve_inner(
+            plan,
+            RootExitMetadata::Root {
+                _reservation: metadata,
+            },
+        )
     }
     fn reserve_inner(
         &self,
@@ -950,7 +956,7 @@ impl RootProducerPool {
         else {
             panic!("fixture metadata must be actually funded");
         };
-        self.reserve_inner(plan, RootExitMetadata::Test(credit))
+        self.reserve_inner(plan, RootExitMetadata::Test { _credit: credit })
     }
     pub(crate) fn execution_health(&self) -> Arc<ExecutionHealth> {
         Arc::clone(&self.core.health)
@@ -1075,6 +1081,7 @@ impl Drop for RootProducerReservation {
     }
 }
 impl RootProducerRegistration {
+    #[cfg(test)]
     pub(crate) fn exit_observation(&self) -> RootProducerExitObservation {
         self.exit.clone()
     }
@@ -1085,6 +1092,7 @@ impl RootProducerRegistration {
             _exit: self.exit.clone(),
         }
     }
+    #[cfg(test)]
     pub(crate) fn wake(&self) -> Result<(), RootProducerControlFailure> {
         self.wake_handle().wake()
     }
@@ -1518,7 +1526,7 @@ mod tests {
         else {
             panic!("test metadata must be actually reserved");
         };
-        pool.reserve_inner(plan, RootExitMetadata::Test(credit))
+        pool.reserve_inner(plan, RootExitMetadata::Test { _credit: credit })
     }
     fn install(
         pool: &RootProducerPool,

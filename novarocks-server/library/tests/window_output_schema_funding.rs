@@ -32,7 +32,7 @@ use novarocks_memory::{
     lane::{RecordRef, global_store},
 };
 use novarocks_native_adapter::backend_task_execution::{
-    CompiledPackageCompiler, CompiledPackageInterpreter, CompiledTaskOptions, CompiledTaskProgram,
+    CompiledPackageInterpreter, CompiledTaskOptions, CompiledTaskProgram,
     PreparedWindowMetadataForTest, ProjectMetadataHost, ProjectMetadataJournal,
     TypeMaterializationHost, TypeMaterializationJournal, prepare_window_metadata_for_test,
     prepare_window_metadata_graph_for_test,
@@ -52,12 +52,7 @@ use novarocks_types::{
 };
 use novarocks_worker::TestPreparationControl;
 use prost::Message;
-use std::{
-    collections::{BTreeMap, HashMap},
-    num::NonZeroUsize,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc, time::Duration};
 
 struct Control;
 impl PureCompileControl for Control {

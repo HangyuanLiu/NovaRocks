@@ -41,7 +41,7 @@ struct HubState {
 
 /// One listener-owned slot. Per-connection aliases never allocate another scope.
 pub(crate) struct MysqlWriteGateHub {
-    #[cfg(novarocks_dev_controls)]
+    #[cfg(all(novarocks_dev_controls, feature = "mem-1-m07-exact-mysql-write"))]
     action_observation:
         Mutex<Option<Arc<crate::test_fixture_authorization::FixtureActionObservation>>>,
     frontend: FrontendProcessId,
@@ -80,7 +80,7 @@ fn hub_fail(state: &mut HubState, reason: GateFailure) -> io::Error {
     error(*state.failure.get_or_insert(earlier))
 }
 impl MysqlWriteGateHub {
-    #[cfg(novarocks_dev_controls)]
+    #[cfg(all(novarocks_dev_controls, feature = "mem-1-m07-exact-mysql-write"))]
     pub(crate) fn install_action_observation(
         &self,
         observation: Arc<crate::test_fixture_authorization::FixtureActionObservation>,
@@ -92,22 +92,25 @@ impl MysqlWriteGateHub {
     }
     #[cfg(novarocks_dev_controls)]
     fn observe_reached_cut(&self) {
-        let reached = self
-            .state
-            .lock()
-            .expect("original hub lock")
-            .scope
-            .as_ref()
-            .is_some_and(|scope| scope.snapshot().blocked_after_acceptance);
-        if reached
-            && let Some(observation) = self
-                .action_observation
-                .lock()
-                .expect("original observation lock")
-                .as_ref()
-            && observation.record_hit().is_err()
+        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
         {
-            self.fail(GateFailure::Transition);
+            let reached = self
+                .state
+                .lock()
+                .expect("original hub lock")
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.snapshot().blocked_after_acceptance);
+            if reached
+                && let Some(observation) = self
+                    .action_observation
+                    .lock()
+                    .expect("original observation lock")
+                    .as_ref()
+                && observation.record_hit().is_err()
+            {
+                self.fail(GateFailure::Transition);
+            }
         }
     }
 
@@ -123,7 +126,7 @@ impl MysqlWriteGateHub {
             return Err(error(GateFailure::Deadline));
         }
         let hub = Arc::new(Self {
-            #[cfg(novarocks_dev_controls)]
+            #[cfg(all(novarocks_dev_controls, feature = "mem-1-m07-exact-mysql-write"))]
             action_observation: Mutex::new(None),
             frontend: actual_frontend,
             nonce,

@@ -214,10 +214,6 @@ pub struct FrontendTaskTransportBudget(TransportBudget);
 impl FrontendTaskTransportBudget {
     pub const DEFAULT: Self = Self(TransportBudget::DEFAULT);
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "each deployment limit is independently configurable"
-    )]
     pub fn try_new(
         max_batch_items: usize,
         max_batch_encoded_bytes: usize,

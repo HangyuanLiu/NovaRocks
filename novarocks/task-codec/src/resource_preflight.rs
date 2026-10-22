@@ -153,6 +153,7 @@ struct RenderSchemaScan {
     columns: usize,
     nodes: usize,
     wire_bytes: usize,
+    #[cfg(test)]
     root_wire_bytes: usize,
     scalar_initialized: bool,
     scalar_nodes: usize,
@@ -164,6 +165,7 @@ impl RenderSchemaScan {
             columns: 0,
             nodes: 0,
             wire_bytes: 0,
+            #[cfg(test)]
             root_wire_bytes: 0,
             scalar_initialized: false,
             scalar_nodes: 0,
@@ -266,6 +268,7 @@ impl RenderSchemaScan {
             Ok(())
         })
     }
+    #[cfg(test)]
     fn scan_root(&mut self, raw: &[u8]) -> ScanResult {
         use novarocks_result_contract::RootProfileV1;
         self.root_wire_bytes = self

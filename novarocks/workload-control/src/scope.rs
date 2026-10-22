@@ -406,10 +406,6 @@ impl Inner {
         result
     }
 
-    pub(crate) fn notify_capacity_available(&self) {
-        self.changed.notify_waiters();
-    }
-
     pub(crate) fn update<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         let (result, wakers) = {
             let mut state = self.state.lock().unwrap();

@@ -95,7 +95,7 @@ use crate::{
     FinalTaskInfoOutcome, OperationReceipt, QueryContextHost, QueryContextOutcome,
     QuiesceQueryContextOutcome, ReleaseAcknowledgement, ReleaseQueryContextOutcome,
     ReleasedContextEvidence, RootResultBinding, RootResultRoute, RunnableTask, SharedFactsRequest,
-    StatusAdvance, TaskDomains, TaskExecutionHost, TaskExecutionRegistryConfig, TaskStatusOwner,
+    TaskDomains, TaskExecutionHost, TaskExecutionRegistryConfig, TaskStatusOwner,
     TaskStatusReporter, TaskStatusSource, UpdateTaskOutcome, WorkerAdmissionEpochAuthority,
     apply_planned_task_domain_updates, apply_task_domain_updates,
     commit_task_domain_execution_updates, plan_task_domain_execution_updates,

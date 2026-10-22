@@ -205,6 +205,10 @@ pub struct TypedConnectorScanSource {
 }
 
 impl TypedConnectorScanSource {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The public BE scan constructor takes each frozen provider, task queue, output layout, filter and stream capability separately; regrouping them changes the cross-crate Worker API and is queued for P10 review."
+    )]
     pub fn new(
         descriptor: TypedConnectorReadDescriptor,
         provider: Arc<dyn ConnectorReadPageSourceProvider>,
@@ -238,7 +242,10 @@ impl TypedConnectorScanSource {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The private shared constructor preserves exactly the independent frozen facts accepted by both ready and deferred public constructors; a second aggregate carrier adds no distinct contract."
+    )]
     fn from_provider(
         descriptor: TypedConnectorReadDescriptor,
         provider: ReadProvider<dyn ConnectorReadPageSourceProvider>,
@@ -277,7 +284,10 @@ impl TypedConnectorScanSource {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The public BE scan constructor takes each frozen provider, task queue, output layout, filter and stream capability separately; regrouping them changes the cross-crate Worker API and is queued for P10 review."
+    )]
     pub fn new_deferred(
         descriptor: TypedConnectorReadDescriptor,
         provider_factory: PageProviderFactory,
@@ -340,24 +350,6 @@ impl TypedConnectorScanSource {
             .expect("typed connector scan source is not shared before it is bound");
         shared.dynamic_filter = dynamic_filter;
         self
-    }
-
-    /// Rebuild this source around one live dynamic filter.
-    ///
-    /// Every field but the filter is carried over: the scan carrier, the
-    /// installed provider, the session, and the request all belong to this
-    /// fragment instance and are unaffected by which filter the page streams
-    /// consult.
-    /// Carry this fragment's consumer contracts without subscribing yet.
-    fn with_recorded_contracts(
-        &self,
-        contracts: BTreeMap<u32, RuntimeFilterConsumerContract>,
-    ) -> Self {
-        let mut rebuilt = self.with_substituted_filter(Arc::clone(&self.shared.dynamic_filter));
-        Arc::get_mut(&mut rebuilt.shared)
-            .expect("a freshly rebuilt typed scan source is not shared")
-            .runtime_filter_contracts = contracts;
-        rebuilt
     }
 
     /// Subscribe to the live filter, now that the attempt will hand out its

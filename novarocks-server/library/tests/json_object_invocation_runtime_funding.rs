@@ -231,7 +231,9 @@ fn json_object_actual_runtime_whole_groups_keep_query_facts_until_cross_thread_l
             Alias::Buffers(buffers)
         };
         let records = new_body_records(&before, &binding);
-        drop(receipt);
+        {
+            let _receipt = receipt;
+        }
         drop(args);
         drop(arrays);
         drop(wrapper);

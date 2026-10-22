@@ -17,6 +17,8 @@
 
 //! Shipping GLOBAL: original narrow Frame and complete wrapper allocations.
 //! Explicit account retirement is a test protocol, not production exit evidence.
+#[path = "support/shift_runtime_funding_helpers.rs"]
+mod shift_helpers;
 #[path = "support/shift_runtime_funding.rs"]
 mod shift_support;
 use arrow::{
@@ -30,6 +32,7 @@ use novarocks_execution::runtime::scalar_memory::{
 };
 use novarocks_functions::{EvaluatedArgument, Selection};
 use novarocks_memory::lane::global_store;
+use shift_helpers::*;
 use shift_support::*;
 
 fn expected(name: &str) -> Option<i64> {

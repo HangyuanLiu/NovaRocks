@@ -135,11 +135,11 @@ pub(crate) fn find_source<'a, T: std::error::Error + 'static>(
 
 /// Pure decoder fixtures borrow their declared connector stop control. They
 /// do not manufacture a Task just to satisfy an unrelated runtime API.
-#[cfg(any(test, novarocks_dev_controls))]
+#[cfg(test)]
 pub(crate) struct PureConnectorCompileControl(
     pub(crate) novarocks_spi::connector::ConnectorStopView,
 );
-#[cfg(any(test, novarocks_dev_controls))]
+#[cfg(test)]
 impl novarocks_type_contract::PureCompileControl for PureConnectorCompileControl {
     fn checkpoint(
         &self,

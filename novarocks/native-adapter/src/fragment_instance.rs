@@ -63,12 +63,6 @@ fn assignment_path() -> FieldPath {
     FieldPath::root("creation_metadata").field("assignment")
 }
 
-/// The wire path of a task's initial scan ranges, for refusals raised while
-/// the kernel validates them against the static plan.
-pub(crate) fn task_scan_ranges_path() -> FieldPath {
-    assignment_path().field("initial_scan_ranges")
-}
-
 /// The wire path of a task's sink edge bindings, for refusals raised while the
 /// kernel binds them to the static sink.
 pub(crate) fn task_sink_edge_ids_path() -> FieldPath {

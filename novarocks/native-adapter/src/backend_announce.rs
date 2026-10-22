@@ -45,10 +45,6 @@ pub struct BackendAnnounceSupervisor {
 }
 
 impl BackendAnnounceSupervisor {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The immutable descriptor, Worker drain fact, and retry policy are separate Native boundary facts."
-    )]
     pub fn start(
         data_runtime: BackendDataRuntime,
         frontend_endpoint: NativeEndpoint,

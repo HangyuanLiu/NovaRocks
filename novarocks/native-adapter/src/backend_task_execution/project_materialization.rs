@@ -19,7 +19,11 @@
 
 use super::compiled_package::NativeCompiledMetadataLoan;
 use super::preparation_memory_control::WorkerPreparationMemoryControl;
-use novarocks_execution::exec::chunk::{ChunkSchemaRef, original_compiled_schema_metadata_request};
+#[cfg(test)]
+use novarocks_execution::exec::chunk::ChunkSchemaRef;
+use novarocks_execution::exec::chunk::original_compiled_schema_metadata_request;
+#[cfg(test)]
+use novarocks_execution::runtime::preparation_metadata::CompiledSchemaMetadataScope;
 use novarocks_execution::runtime::{
     fragment::ExecutionResult,
     kernel_memory::KernelMemoryJournal,
@@ -27,9 +31,7 @@ use novarocks_execution::runtime::{
         PreparationMemoryJournalLoan, PreparationMemoryRefusal, SynchronousPreparationFailure,
         SynchronousPreparationMemory,
     },
-    preparation_metadata::{
-        CompiledSchemaMetadataScope, CompiledSchemaSite, PreparationMetadataFailure,
-    },
+    preparation_metadata::{CompiledSchemaSite, PreparationMetadataFailure},
     query_memory::QueryMemoryBinding,
 };
 use novarocks_local_compiler::{
@@ -39,9 +41,10 @@ use novarocks_local_compiler::{
 use novarocks_local_program::{LocalProgram, ProgramNodeId, ProgramNodeKind, StaticLayout};
 use novarocks_memory::{CapacityError, CoverageReceipt, ShortageReceipt};
 use novarocks_physical_plan::NodeId;
+#[cfg(test)]
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 use novarocks_type_contract::{
-    CompileCheckpoints, CompilePhase, CompleteMetadataRequestFacts, MetadataRequestError,
-    PureCompileControl,
+    CompleteMetadataRequestFacts, MetadataRequestError, PureCompileControl,
 };
 use novarocks_worker::PreparationControlLoan;
 use std::sync::Arc;

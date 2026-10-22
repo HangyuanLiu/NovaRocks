@@ -22,12 +22,13 @@ use novarocks_types::BackendProcessId;
 use std::sync::Arc;
 
 pub type ProviderCloseHook = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+pub type ProviderBindHook =
+    Arc<dyn Fn(&SessionScope) -> Result<Option<ProviderCloseHook>, String> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct BackendTestSessionConfig {
     prepared: PreparedRoleSession,
-    provider_bind: Option<
-        Arc<dyn Fn(&SessionScope) -> Result<Option<ProviderCloseHook>, String> + Send + Sync>,
-    >,
+    provider_bind: Option<ProviderBindHook>,
 }
 impl BackendTestSessionConfig {
     pub fn new(prepared: PreparedRoleSession) -> Self {
@@ -36,10 +37,7 @@ impl BackendTestSessionConfig {
             provider_bind: None,
         }
     }
-    pub fn with_provider_bind(
-        mut self,
-        bind: Arc<dyn Fn(&SessionScope) -> Result<Option<ProviderCloseHook>, String> + Send + Sync>,
-    ) -> Self {
+    pub fn with_provider_bind(mut self, bind: ProviderBindHook) -> Self {
         self.provider_bind = Some(bind);
         self
     }

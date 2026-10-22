@@ -38,7 +38,6 @@ fn type_to_proto(t: &InternalType, table: &mut plan::ExecutionTypeTable) -> comm
             nullable: false,
             logical_type_id: Some(id),
             r#type: Some(Box::new(layout)),
-            ..Default::default()
         }
     }
     fn node(t: &InternalType, table: &mut plan::ExecutionTypeTable) -> (u32, a::ArrowPhysicalType) {
@@ -134,7 +133,6 @@ fn type_to_proto(t: &InternalType, table: &mut plan::ExecutionTypeTable) -> comm
                             ],
                         })),
                     })),
-                    ..Default::default()
                 };
                 (
                     L::MapValue(v::MapValue {
@@ -273,26 +271,6 @@ pub(super) fn scalar_table() -> plan::ExecutionTypeTable {
     }
     table
 }
-pub(super) fn scalar_from_ref(
-    p: &common::TypeDesc,
-    table: &plan::ExecutionTypeTable,
-    nullable: bool,
-) -> Result<i32, String> {
-    let binding = binding_from_ref(p, table)?;
-    let root = table
-        .logical_types
-        .iter()
-        .find(|n| n.id == binding.logical_type_id)
-        .ok_or("binding logical type missing")?;
-    if root.nullable != nullable {
-        return Err("Expr.nullable differs from its binding".into());
-    }
-    match type_from_proto(p, table)? {
-        InternalType::Scalar { prim, .. } => Ok(prim),
-        _ => Err("expr test analogue only accepts scalar binding".into()),
-    }
-}
-
 fn roundtrip_message<M>(value: &M) -> M
 where
     M: Message + Default,

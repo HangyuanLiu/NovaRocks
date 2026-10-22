@@ -187,6 +187,10 @@ pub struct RoleConfig {
     process: ProcessCompatibilityProjection,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "ResolvedServerLaunch is constructed once during startup and immediately moved into its role runner; boxing the 6 KiB AllInOne pair adds an allocation and changes this public launch type without reducing repeated or hot-path storage."
+)]
 #[derive(Clone)]
 pub enum ResolvedServerLaunch {
     Fe(RoleConfig),

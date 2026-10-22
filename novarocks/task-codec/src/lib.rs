@@ -2970,7 +2970,12 @@ mod tests {
     fn canonical_failure_wire_rejects_missing_unknown_and_out_of_range_facts() {
         let status = canonical_status(complete_canonical_fact());
         // Each corruption goes through the real status ingress, independently.
-        let mutations: &[(fn(&mut novarocks::TaskFailure), ProtocolErrorKind, &str)] = &[
+        type FailureMutation = (
+            fn(&mut novarocks::TaskFailure),
+            ProtocolErrorKind,
+            &'static str,
+        );
+        let mutations: &[FailureMutation] = &[
             (
                 |f| f.fact = None,
                 ProtocolErrorKind::MissingField,

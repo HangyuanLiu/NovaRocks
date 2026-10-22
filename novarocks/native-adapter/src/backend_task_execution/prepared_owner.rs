@@ -83,7 +83,6 @@ pub(crate) enum NativePreparedOwnerFailure {
     OfferWithoutPrepared,
     AdoptWithoutOffer,
     StartWithoutAdoption,
-    Identity,
     LateInstall,
     Panicked(Phase),
 }
@@ -102,9 +101,6 @@ impl std::fmt::Display for NativePreparedOwnerFailure {
             }
             Self::StartWithoutAdoption => {
                 f.write_str("Native kernel start requires its explicit adoption")
-            }
-            Self::Identity => {
-                f.write_str("Native preparation owner identity differs from its Task")
             }
             Self::LateInstall => f.write_str("Native preparation cannot install after rollback"),
             Self::Panicked(phase) => write!(f, "Native preparation exit phase {phase:?} panicked"),
@@ -125,7 +121,6 @@ impl FailureProjection for NativePreparedOwnerFailure {
             Self::OfferWithoutPrepared => (FailureClass::Invariant, 9642),
             Self::AdoptWithoutOffer => (FailureClass::Invariant, 9643),
             Self::StartWithoutAdoption => (FailureClass::Invariant, 9644),
-            Self::Identity => (FailureClass::Invariant, 9645),
             Self::LateInstall => (FailureClass::Invariant, 9646),
             Self::Panicked(phase) => (FailureClass::Unexpected, 9650 + *phase as u16),
         };
@@ -347,13 +342,7 @@ impl NativePreparationChild {
         if !self.claim(phase) {
             return self.state.lock().unwrap().phases[phase as usize] == Action::Exited;
         }
-        let root = self
-            .state
-            .lock()
-            .unwrap()
-            .root
-            .as_ref()
-            .map(|root| Arc::clone(root));
+        let root = self.state.lock().unwrap().root.as_deref().cloned();
         let result = catch_unwind(AssertUnwindSafe(|| {
             if let Some(root) = &root {
                 action(root.as_ref());
@@ -394,13 +383,7 @@ impl NativePreparationChild {
                 Action::NotStarted => state.phases[Phase::RootPoll as usize] = Action::Started,
             }
         }
-        let root = self
-            .state
-            .lock()
-            .unwrap()
-            .root
-            .as_ref()
-            .map(|root| Arc::clone(root));
+        let root = self.state.lock().unwrap().root.as_deref().cloned();
         let result = catch_unwind(AssertUnwindSafe(|| {
             root.as_ref()
                 .map_or(TaskPreparationChildExit::Exited, |root| root.poll_exit())

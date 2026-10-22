@@ -342,6 +342,10 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
 /// This is intentionally the only Server-to-Backend projection: Backend
 /// receives no root configuration and therefore cannot observe unrelated
 /// Frontend, StateStore, or connector wire sections.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This public role-composition entry point names each frozen BE startup owner explicitly; grouping them changes the Server library API and is queued for coordinated P10 review."
+)]
 pub fn compose_backend_server_config(
     config: &NovaRocksConfig,
     build: &crate::build_information::BuildInformation,
@@ -534,7 +538,17 @@ fn frontend_process_memory_observation()
     }
 }
 
+type MvManagementContinuation = (
+    novarocks_mv_application::management::RemoteEffectPolicy,
+    Option<std::sync::Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
+    Option<novarocks_frontend_application::StartupIsolationSource>,
+);
+
 /// Resolve every Frontend startup input from the application wire configuration.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "This public role-composition entry point names each frozen FE startup owner explicitly; grouping them changes the Server library API and is queued for coordinated P10 review."
+)]
 pub fn compose_frontend_role_config(
     config: &NovaRocksConfig,
     build: &crate::build_information::BuildInformation,
@@ -1390,11 +1404,7 @@ mod tests {
 /// error, not a reason to act unrecorded.
 fn mv_management_continuation(
     config: &NovaRocksConfig,
-) -> anyhow::Result<(
-    novarocks_mv_application::management::RemoteEffectPolicy,
-    Option<std::sync::Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
-    Option<novarocks_frontend_application::StartupIsolationSource>,
-)> {
+) -> anyhow::Result<MvManagementContinuation> {
     let policy = novarocks_mv_application::management::RemoteEffectPolicy::try_new(
         remote_effect_guarantee(
             config.mv_management.catalog_commit_guarantee.as_ref(),

@@ -91,7 +91,9 @@ pub fn prepare_project_metadata_for_test<'a>(
         .prepared_schema_for_test()
         .expect("actual Project schema prepared");
     drop(operator);
-    drop(host);
+    {
+        let _host = host;
+    }
     Ok(PreparedProjectMetadataForTest {
         program: Arc::clone(prepared.program()),
         factory,

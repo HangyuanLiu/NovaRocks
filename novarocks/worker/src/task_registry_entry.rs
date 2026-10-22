@@ -36,8 +36,10 @@ use novarocks_execution_contract::task_execution::operation::{
     CreateTaskReceipt, EstablishQueryContext, EstablishSemanticIdentity, OperationOutcome,
     QueryContextReceipt, QuiesceQueryContextReceipt,
 };
+#[cfg(test)]
+use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
 use novarocks_execution_contract::task_execution::status::{
-    AbortCause, CancelReason, FinalTaskInfo, TaskFailureCategory, TaskStatus, TerminationDetail,
+    AbortCause, CancelReason, FinalTaskInfo, TaskStatus, TerminationDetail,
 };
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_types::identity::{StageId, TaskId};

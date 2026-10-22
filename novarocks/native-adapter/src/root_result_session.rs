@@ -19,12 +19,14 @@
 
 use novarocks_execution::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use std::alloc::Layout;
+#[cfg(test)]
+use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use novarocks_execution::exec::chunk::{
-    Chunk, RootArrayStorageLimits, borrowed_root_chunk_storage,
-};
+#[cfg(test)]
+use novarocks_execution::exec::chunk::Chunk;
+use novarocks_execution::exec::chunk::{RootArrayStorageLimits, borrowed_root_chunk_storage};
 use novarocks_execution::runtime::fragment::io::{
     FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, ResultAbort, ResultWriteAdmission,
     ResultWriteCredit, RootInputAdmission, RootInputAuthority, RootInputPermit,
@@ -72,14 +74,11 @@ enum RootSessionFailure {
     ScalarBytesWithoutRow,
     ScalarRowWithoutRecord,
     NoRowsIncomplete,
-    RegisteredTwice,
-    ReadinessRegisteredTwice,
     InputClosed,
     ForeignPermit,
     InputNotAccepting,
     ProducerClosed,
     ObservedStop,
-    CleanupPanic(novarocks_execution_contract::failure::BoundedDetail),
     RowCountWidth {
         requested: usize,
         source: std::num::TryFromIntError,
@@ -106,8 +105,6 @@ impl std::fmt::Display for RootSessionFailure {
             Self::NoRowsIncomplete => {
                 f.write_str("scalar NoRows record did not complete in its admitted output")
             }
-            Self::RegisteredTwice => f.write_str("root producer registered twice"),
-            Self::ReadinessRegisteredTwice => f.write_str("root readiness registered twice"),
             Self::InputClosed => f.write_str("root input is closed"),
             Self::ForeignPermit => {
                 f.write_str("root input permit belongs to a different issuer or generation")
@@ -115,7 +112,6 @@ impl std::fmt::Display for RootSessionFailure {
             Self::InputNotAccepting => f.write_str("root input position is not accepting"),
             Self::ProducerClosed => f.write_str("root producer is closed"),
             Self::ObservedStop => f.write_str("root producer was stopped by its host"),
-            Self::CleanupPanic(detail) => write!(f, "root cleanup action panicked: {detail}"),
             Self::RowCountWidth { requested, .. } => {
                 write!(f, "root row count exceeds its u64 carrier: {requested}")
             }
@@ -144,14 +140,11 @@ impl novarocks_execution_contract::failure::FailureProjection for RootSessionFai
             Self::ScalarBytesWithoutRow => (FailureClass::Invariant, 507),
             Self::ScalarRowWithoutRecord => (FailureClass::Invariant, 508),
             Self::NoRowsIncomplete => (FailureClass::Invariant, 509),
-            Self::RegisteredTwice => (FailureClass::Invariant, 510),
-            Self::ReadinessRegisteredTwice => (FailureClass::Invariant, 511),
             Self::InputClosed => (FailureClass::Control, 512),
             Self::ForeignPermit => (FailureClass::Invariant, 513),
             Self::InputNotAccepting => (FailureClass::Invariant, 514),
             Self::ProducerClosed => (FailureClass::Control, 515),
             Self::ObservedStop => (FailureClass::Control, 516),
-            Self::CleanupPanic(_) => (FailureClass::Unexpected, 521),
             Self::RowCountWidth { .. } => (FailureClass::Representation, 522),
         };
         let fact = FailureFact::new(
@@ -185,18 +178,6 @@ impl From<RootSessionFailure> for ExecutionFailure {
         Self::from_domain(cause)
     }
 }
-fn panic_detail(
-    payload: &(dyn std::any::Any + Send),
-) -> novarocks_execution_contract::failure::BoundedDetail {
-    novarocks_execution_contract::failure::BoundedDetail::truncating(
-        payload
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| payload.downcast_ref::<&'static str>().copied())
-            .unwrap_or("non-text panic payload"),
-    )
-}
-
 enum InputEncoder {
     Client(Box<ArrowMysqlTextEncoder>),
     Statistics(Box<StatisticsArtifactEncoder>),
@@ -297,7 +278,7 @@ struct Input {
     encoder: Option<std::mem::ManuallyDrop<InputEncoder>>,
     scratch: Option<std::mem::ManuallyDrop<ResultWriteCredit>>,
     chunk: Option<std::mem::ManuallyDrop<novarocks_execution::exec::chunk::Chunk>>,
-    permit:
+    _permit:
         Option<std::mem::ManuallyDrop<novarocks_execution::runtime::fragment::io::RootInputPermit>>,
     retiring: bool,
     execution: InputExecution,
@@ -310,7 +291,7 @@ impl Input {
             encoder: None,
             scratch: None,
             chunk: Some(std::mem::ManuallyDrop::new(chunk)),
-            permit: Some(std::mem::ManuallyDrop::new(permit)),
+            _permit: Some(std::mem::ManuallyDrop::new(permit)),
             retiring: false,
             execution: InputExecution::Idle,
             exits: [InputOwnerExit::NotStarted; 4],
@@ -320,11 +301,6 @@ impl Input {
         self.chunk
             .as_ref()
             .expect("live input retains original backing")
-    }
-    fn permit(&self) -> &novarocks_execution::runtime::fragment::io::RootInputPermit {
-        self.permit
-            .as_ref()
-            .expect("live input retains original permit")
     }
     fn data_exited(&self) -> bool {
         self.execution == InputExecution::Idle
@@ -355,7 +331,7 @@ impl Input {
             InputExitPhase::Encoder => InputExitAction::Encoder(self.encoder.take()),
             InputExitPhase::Chunk => InputExitAction::Chunk(self.chunk.take()),
             InputExitPhase::Scratch => InputExitAction::Scratch(self.scratch.take()),
-            InputExitPhase::Permit => InputExitAction::Permit(self.permit.take()),
+            InputExitPhase::Permit => InputExitAction::Permit(self._permit.take()),
         })
     }
     fn note_exit(&mut self, phase: InputExitPhase) {
@@ -1428,7 +1404,7 @@ impl RootSessionState {
                     .input
                     .as_mut()
                     .expect("original input remains during retirement");
-                input.permit = Some(permit);
+                input._permit = Some(permit);
                 input.exits[phase.index()] = InputOwnerExit::Unresolved;
                 RootCleanupProgress::Unresolved
             }
@@ -1447,7 +1423,9 @@ impl RootSessionState {
                     }
                 };
                 if removed.is_some() {
-                    drop(removed);
+                    {
+                        let _removed = removed;
+                    }
                     // The permit receipt precedes reopening this Native slot.
                     self.authority.notify_readiness();
                 }

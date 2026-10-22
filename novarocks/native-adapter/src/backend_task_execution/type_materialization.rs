@@ -70,7 +70,6 @@ impl std::error::Error for TypeMaterializationRefusal {
 }
 impl novarocks_execution_contract::failure::FailureProjection for TypeMaterializationRefusal {
     fn failure_fact(&self) -> novarocks_execution_contract::failure::FailureFact {
-        use novarocks_execution_contract::failure::FailureProjection;
         match self {
             Self::Interrupted(source) => source.failure_fact(),
             Self::MissingQueryMemory => PreparationMemoryRefusal::MissingQueryMemory.failure_fact(),

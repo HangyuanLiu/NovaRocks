@@ -41,7 +41,7 @@ pub(crate) const CLOSING_DEADLINE: Duration = Duration::from_secs(5);
 pub(crate) const CLOSING_OBJECT_BYTES: u64 = 8 * 1024 * 1024;
 
 enum WriteInterruption {
-    Query(QueryExecutionError),
+    Query(Box<QueryExecutionError>),
     Io(io::Error),
 }
 
@@ -112,7 +112,7 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
     let cancellation = result.cancellation();
     let started = tokio::select! {
         biased;
-        error = wait_terminal_result_failure(&mut failure, &cancellation) => Err(WriteInterruption::Query(error)),
+        error = wait_terminal_result_failure(&mut failure, &cancellation) => Err(WriteInterruption::Query(Box::new(error))),
         outcome = budget.run(async {
             lease.writer().start_metadata(metadata)?;
             lease.writer().finish_metadata().await
@@ -125,6 +125,7 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
         }
         return match error {
             WriteInterruption::Query(error) => {
+                let error = *error;
                 schema.fail(error.clone());
                 close_relay(
                     result,
@@ -232,12 +233,13 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
                 let cancellation = result.cancellation();
                 let written = tokio::select! {
                     biased;
-                    error = wait_terminal_result_failure(&mut failure, &cancellation) => Err(WriteInterruption::Query(error)),
+                    error = wait_terminal_result_failure(&mut failure, &cancellation) => Err(WriteInterruption::Query(Box::new(error))),
                     outcome = budget.run(write_body(lease.writer(), &body)) => outcome.map_err(WriteInterruption::Io),
                 };
                 if let Err(error) = written {
                     return match error {
                         WriteInterruption::Query(error) => {
+                            let error = *error;
                             #[cfg(feature = "mem-1-m07-closing-pressure")]
                             if let Some(pressure) = &pressure_hook {
                                 // Actual borrowed write_body future has dropped when select! returns.
@@ -732,7 +734,7 @@ pub(crate) fn success_payload(capabilities: CapabilityFlags, more: bool) -> Vec<
     }
 }
 pub(crate) fn error_payload(error: &QueryExecutionError, limit: usize) -> Vec<u8> {
-    let kind = crate::error_mapping::execution_error_kind(&error);
+    let kind = crate::error_mapping::execution_error_kind(error);
     let message = crate::error_mapping::execution_error_message(error);
     let mut payload = Vec::with_capacity(message.len().min(limit) + 9);
     payload.push(0xff);
@@ -859,7 +861,7 @@ mod tests {
     async fn validated_spans_cross_segments_without_rebuilding_a_row() {
         let profile = ClientRowProfile::try_new(16, 64).unwrap();
         let first = [4, 0, 0, 0, b'a'];
-        let second = [b'b', b'c'];
+        let second = b"bc";
         let third = [b'd', 1, 0, 0, 0, b'e'];
         let mut cursor = ClientRowStreamCursor::new();
         let mut writer =
