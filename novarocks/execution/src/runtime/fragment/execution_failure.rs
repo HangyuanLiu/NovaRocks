@@ -696,6 +696,58 @@ mod tests {
         assert_eq!(call.cause().message(), secret);
     }
     #[test]
+    fn connector_domain_reasons_preserve_the_source_and_only_render_safe_facts() {
+        use super::super::connector_failure::{ConnectorCallFailure, ConnectorOperation};
+        use novarocks_failure_contract::{
+            FailureClass, FailureFact, FailureProjection, FailureReason, domain,
+        };
+        use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+        use std::num::NonZeroU16;
+
+        #[derive(Debug)]
+        struct ProducerCause(u16);
+        impl std::fmt::Display for ProducerCause {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("private-provider-url-principal-credential-marker")
+            }
+        }
+        impl std::error::Error for ProducerCause {}
+        impl FailureProjection for ProducerCause {
+            fn failure_fact(&self) -> FailureFact {
+                FailureFact::new(
+                    FailureClass::Dependency,
+                    FailureReason::new(domain::STORAGE_AUTHORITY, NonZeroU16::new(self.0).unwrap()),
+                )
+            }
+        }
+
+        for (code, kind) in [
+            (1, ConnectorErrorKind::Unavailable),
+            (2, ConnectorErrorKind::PermissionDenied),
+            (3, ConnectorErrorKind::Unavailable),
+            (4, ConnectorErrorKind::PermissionDenied),
+        ] {
+            let source = ConnectorError::from_domain(kind, ProducerCause(code));
+            let expected = source.failure_fact();
+            let failure: ExecutionFailure =
+                ConnectorCallFailure::new(ConnectorOperation::ReadPage, source.clone()).into();
+            let failure = failure.at_operator(7, PipelineOperation::Pull);
+            assert_eq!(failure.failure_fact(), expected);
+            let safe = failure.safe_detail();
+            assert_eq!(
+                safe.as_str(),
+                format!("Dependency failure (reason 23:{code}) at operator 7 during Pull")
+            );
+            assert!(!safe.as_str().contains("private-provider"));
+            let ExecutionFailureCause::Connector(call) = failure.cause() else {
+                panic!("connector must retain its original source");
+            };
+            assert_eq!(call.cause(), &source);
+            assert!(call.cause().message().contains("private-provider"));
+        }
+    }
+
+    #[test]
     fn typed_failure_launch_cleanup_keeps_original_kernel_payload_and_source_chain() {
         use crate::runtime::fragment::{
             FragmentLaunchError, FragmentLaunchErrorKind, FragmentLaunchStage,

@@ -18,7 +18,10 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+use novarocks_failure_contract::SharedFailureCause;
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+
+use crate::storage_authority::failure::{AuthorityFailure, AuthorityFailureReason};
 
 pub type FileResult<T> = Result<T, FileError>;
 
@@ -42,6 +45,7 @@ pub struct FileError {
     kind: FileErrorKind,
     message: String,
     source: Option<Box<dyn Error + Send + Sync>>,
+    authority_cause: Option<SharedFailureCause>,
 }
 
 impl FileError {
@@ -50,6 +54,7 @@ impl FileError {
             kind,
             message: message.into(),
             source: None,
+            authority_cause: None,
         }
     }
 
@@ -62,7 +67,27 @@ impl FileError {
             kind,
             message: message.into(),
             source: Some(Box::new(source)),
+            authority_cause: None,
         }
+    }
+
+    pub(crate) fn authority(
+        kind: FileErrorKind,
+        reason: AuthorityFailureReason,
+        message: impl Into<String>,
+    ) -> Self {
+        let message = message.into();
+        let cause = SharedFailureCause::new(AuthorityFailure::new(reason, message.clone()));
+        Self::new(kind, message).with_authority_cause(cause)
+    }
+
+    pub(crate) fn with_authority_cause(mut self, cause: SharedFailureCause) -> Self {
+        self.authority_cause = Some(cause);
+        self
+    }
+
+    pub(crate) fn authority_cause(&self) -> Option<&SharedFailureCause> {
+        self.authority_cause.as_ref()
     }
 
     pub fn kind(&self) -> FileErrorKind {
@@ -107,6 +132,11 @@ impl Error for FileError {
         self.source
             .as_deref()
             .map(|source| source as &(dyn Error + 'static))
+            .or_else(|| {
+                self.authority_cause
+                    .as_ref()
+                    .map(|cause| cause as &(dyn Error + 'static))
+            })
     }
 }
 
@@ -126,7 +156,10 @@ impl From<&FileError> for ConnectorError {
             FileErrorKind::Cancelled => ConnectorErrorKind::Cancelled,
             FileErrorKind::AlreadyExists | FileErrorKind::Internal => ConnectorErrorKind::Internal,
         };
-        ConnectorError::new(kind, error.to_string())
+        match error.authority_cause() {
+            Some(cause) => ConnectorError::from_domain(kind, cause.clone()),
+            None => ConnectorError::new(kind, error.to_string()),
+        }
     }
 }
 

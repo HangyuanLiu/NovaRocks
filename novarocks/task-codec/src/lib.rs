@@ -2915,7 +2915,17 @@ mod tests {
             FailureFact::new(FailureClass::Control, reason),
             FailureFact::new(FailureClass::Unsupported, reason),
             FailureFact::stop_observation(reason),
-        ] {
+        ]
+        .into_iter()
+        .chain((1..=4).map(|code| {
+            FailureFact::new(
+                FailureClass::Dependency,
+                FailureReason::new(
+                    domain::STORAGE_AUTHORITY,
+                    std::num::NonZeroU16::new(code).unwrap(),
+                ),
+            )
+        })) {
             let status = canonical_status(fact);
             let wire = encode_task_status(&status);
             let bytes = wire.encode_to_vec();

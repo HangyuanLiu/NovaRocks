@@ -401,6 +401,161 @@ pub(super) fn outcome<T: mysql::prelude::FromRow>(
     }
     Ok(result)
 }
+/// The original SQL result and its exact owner-authored terminal, observed
+/// before the same observation is drained. This value grants no control.
+pub(super) struct ObservedStorageOutcome<T> {
+    pub result: mysql::Result<Vec<T>>,
+    pub snapshot: novarocks_cluster_harness::QueryLifecycleStructuredSnapshot,
+}
+
+/// A SQL error consumed by a case remains diagnostic input when its new
+/// observation or semantic assertion fails. Expected SQL failure alone does
+/// not turn an otherwise successful case into failure.
+fn with_original_sql_failure<T>(
+    original_sql_failure: &mysql::Error,
+    outcome: Result<T>,
+) -> Result<T> {
+    outcome.with_context(|| format!("original Storage SQL failed: {original_sql_failure}"))
+}
+
+fn finish_observed_outcome<T>(
+    result: mysql::Result<Vec<T>>,
+    snapshot: Result<novarocks_cluster_harness::QueryLifecycleStructuredSnapshot>,
+    drained: Result<()>,
+) -> Result<ObservedStorageOutcome<T>> {
+    let snapshot = with_cleanup(snapshot, drained);
+    let snapshot = match &result {
+        Ok(_) => snapshot.context("original Storage SQL succeeded"),
+        Err(error) => with_original_sql_failure(error, snapshot),
+    }?;
+    Ok(ObservedStorageOutcome { result, snapshot })
+}
+
+pub(super) fn observed_outcome<T: mysql::prelude::FromRow>(
+    context: &mut ScenarioContext,
+    inputs: &Inputs,
+    conn: &mut mysql::Conn,
+    token: &str,
+    sql: &str,
+) -> Result<ObservedStorageOutcome<T>> {
+    exact_sql(inputs, token, sql)?;
+    let deadline = context.deadline();
+    let observation = context.handle().arm_selected_statement_observation(
+        token,
+        conn.connection_id(),
+        sql,
+        deadline,
+    )?;
+    let result = conn.query(sql);
+    let snapshot = context
+        .handle()
+        .await_query_lifecycle_statement_observation(&observation, false, deadline);
+    let drained = context
+        .handle()
+        .drain_query_lifecycle_statement_observation(&observation);
+    finish_observed_outcome(result, snapshot, drained)
+}
+
+pub(super) fn assert_acquisition_failure(
+    context: &mut ScenarioContext,
+    snapshot: &novarocks_cluster_harness::QueryLifecycleStructuredSnapshot,
+    code: u16,
+    original_sql_failure: &mysql::Error,
+) -> Result<()> {
+    let asserted = (|| {
+        check_acquisition_failure(context, snapshot, code)?;
+        let detail = snapshot
+            .failure_detail
+            .as_deref()
+            .context("Storage acquisition failure omitted its original safe detail")?;
+        let server = check_acquisition_mysql_error(original_sql_failure, detail)?;
+        context.action(format!(
+            "observed original acquisition MySQL error code={} state={} descriptor=query.execution.dependency",
+            server.code, server.state
+        ));
+        Ok(())
+    })();
+    with_original_sql_failure(original_sql_failure, asserted)
+}
+
+/// Cross-check the original server packet against the same statement's
+/// owner-authored safe detail. A client transport failure proves no server
+/// failure descriptor, even if an independent Native terminal was observed.
+fn check_acquisition_mysql_error<'a>(
+    error: &'a mysql::Error,
+    safe_detail: &str,
+) -> Result<&'a mysql::MySqlError> {
+    let mysql::Error::MySqlError(server) = error else {
+        bail!("Storage acquisition failure did not return an original MySQL server error: {error}");
+    };
+    ensure!(
+        server.code == 1105 && server.state == "HY000",
+        "Storage acquisition failure changed its MySQL code/state: code={} state={}",
+        server.code,
+        server.state
+    );
+    let expected = format!("[query.execution.dependency] {safe_detail}");
+    ensure!(
+        server.message == expected,
+        "Storage acquisition MySQL message differs from its original safe projection: expected={expected:?} observed={:?}",
+        server.message
+    );
+    Ok(server)
+}
+
+fn check_acquisition_failure(
+    context: &mut ScenarioContext,
+    snapshot: &novarocks_cluster_harness::QueryLifecycleStructuredSnapshot,
+    code: u16,
+) -> Result<()> {
+    use novarocks_cluster_harness::QueryLifecycleFailureSite;
+    use novarocks_execution_contract::{
+        TaskFailurePhase,
+        failure::{FailureClass, FailureFact, FailureReason, domain},
+    };
+    use std::num::NonZeroU16;
+    let expected = FailureFact::new(
+        FailureClass::Dependency,
+        FailureReason::new(
+            domain::STORAGE_AUTHORITY,
+            NonZeroU16::new(code).context("acquisition reason must be nonzero")?,
+        ),
+    );
+    ensure!(
+        snapshot.failure_fact == Some(expected),
+        "Storage statement lost its acquisition cause: {snapshot:?}"
+    );
+    ensure!(
+        snapshot.error_source.is_none() && snapshot.worker_contexts_converged,
+        "Storage failure was not an original converged attempt: {snapshot:?}"
+    );
+    let Some(QueryLifecycleFailureSite::Task { identity, phase }) = &snapshot.failure_site else {
+        bail!("Storage acquisition failure has no original Task site: {snapshot:?}");
+    };
+    ensure!(
+        *phase == TaskFailurePhase::Execution,
+        "Storage failure came from another Task phase: {snapshot:?}"
+    );
+    ensure!(
+        identity.backend_process_id() == context.handle().backend_process_id(0)?,
+        "Storage failure did not originate on the targeted BE[0]: {snapshot:?}"
+    );
+    let execution = identity.query_execution_id();
+    let expected_execution = format!(
+        "{}:{}:{}",
+        execution.query_id().high(),
+        execution.query_id().low(),
+        execution.attempt_id().get()
+    );
+    ensure!(
+        snapshot.execution_id.as_deref() == Some(expected_execution.as_str())
+            && snapshot.attempt_id == execution.attempt_id().get(),
+        "Storage failure belongs to another execution/attempt: {snapshot:?}"
+    );
+    context.action(format!("observed original acquisition failure reason=23:{code} execution={expected_execution} site={:?}", snapshot.failure_site));
+    Ok(())
+}
+
 pub(super) fn query<T: mysql::prelude::FromRow>(
     context: &mut ScenarioContext,
     inputs: &Inputs,
@@ -489,6 +644,24 @@ impl SimpleRead {
             connection_id,
         })
     }
+    pub fn terminal_snapshot(
+        &self,
+        context: &mut ScenarioContext,
+        original_sql_failure: &mysql::Error,
+    ) -> Result<novarocks_cluster_harness::QueryLifecycleStructuredSnapshot> {
+        let snapshot = self
+            .observation
+            .as_ref()
+            .context("ordinary Storage read has no statement observation")
+            .and_then(|observation| {
+                let deadline = context.deadline();
+                context
+                    .handle()
+                    .await_query_lifecycle_statement_observation(observation, false, deadline)
+            });
+        with_original_sql_failure(original_sql_failure, snapshot)
+    }
+
     pub fn finish_after<T>(
         self,
         context: &mut ScenarioContext,
@@ -680,6 +853,120 @@ mod tests {
         assert!(text.contains("actual probe failure"));
         // A caller-consumed probe must not produce a second cleanup failure.
         pending_probe_error(&result).unwrap();
+    }
+
+    #[test]
+    fn observation_and_drain_failures_preserve_the_original_sql_failure() {
+        let result: mysql::Result<Vec<i64>> =
+            Err(std::io::Error::other("original SQL failure").into());
+        let error = finish_observed_outcome(
+            result,
+            Err(anyhow::anyhow!("exact observation failure")),
+            Err(anyhow::anyhow!("original drain failure")),
+        )
+        .err()
+        .expect("all three failures must remain visible");
+        let text = format!("{error:#}");
+        assert!(text.contains("original SQL failure"));
+        assert!(text.contains("exact observation failure"));
+        assert!(text.contains("original drain failure"));
+    }
+
+    #[test]
+    fn consumed_sql_failure_survives_observation_or_assertion_and_actor_cleanup_errors() {
+        for failure in [
+            "exact terminal observation failure",
+            "exact fact/site assertion failure",
+        ] {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let actor = thread::spawn(move || -> Result<()> {
+                let sql_result: mysql::Result<Vec<i64>> =
+                    Err(std::io::Error::other("consumed original SQL failure").into());
+                sender
+                    .send(sql_result)
+                    .map_err(|_| anyhow::anyhow!("publish original SQL result"))?;
+                Err(anyhow::anyhow!("original actor exit failure"))
+            });
+            let received = receiver.recv();
+            // Observe the real actor's exit before an expectation can panic.
+            let joined = actor
+                .join()
+                .map_err(|_| anyhow::anyhow!("original actor panicked"))
+                .and_then(|result| result);
+            let sql_error = received
+                .expect("receive original SQL result")
+                .expect_err("the original SQL failed");
+            let phase: Result<()> =
+                with_original_sql_failure(&sql_error, Err(anyhow::anyhow!(failure)));
+            let error = with_cleanup(
+                with_cleanup(phase, joined),
+                Err(anyhow::anyhow!("original observation drain failure")),
+            )
+            .unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains("consumed original SQL failure"));
+            assert!(text.contains(failure));
+            assert!(text.contains("original actor exit failure"));
+            assert!(text.contains("original observation drain failure"));
+        }
+    }
+
+    #[test]
+    fn expected_sql_failure_does_not_replace_a_successful_observation() {
+        let sql_error: mysql::Error = std::io::Error::other("expected SQL failure").into();
+        assert_eq!(with_original_sql_failure(&sql_error, Ok(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn acquisition_mysql_error_matches_the_exact_original_safe_projection() {
+        let detail = "Dependency failure (reason 23:3) at operator 7 during Pull";
+        let error = mysql::Error::MySqlError(mysql::MySqlError {
+            code: 1105,
+            state: "HY000".into(),
+            message: "[query.execution.dependency] Dependency failure (reason 23:3) at operator 7 during Pull".into(),
+        });
+        let server = check_acquisition_mysql_error(&error, detail).unwrap();
+        assert_eq!(server.code, 1105);
+        assert_eq!(server.state, "HY000");
+    }
+
+    #[test]
+    fn acquisition_mysql_error_rejects_client_io_and_other_server_projections() {
+        let detail = "Dependency failure (reason 23:3) at operator 7 during Pull";
+        let io: mysql::Error = std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "client disconnected before receiving the server error",
+        )
+        .into();
+        let rejected =
+            with_original_sql_failure(&io, check_acquisition_mysql_error(&io, detail)).unwrap_err();
+        let text = format!("{rejected:#}");
+        assert!(text.contains("original MySQL server error"));
+        assert!(text.contains("client disconnected before receiving the server error"));
+        for (code, state, message) in [
+            (
+                1105,
+                "HY000",
+                "[query.execution.dependency] Dependency failure (reason 23:3) at operator 8 during Pull",
+            ),
+            (
+                1045,
+                "HY000",
+                "[query.execution.dependency] Dependency failure (reason 23:3) at operator 7 during Pull",
+            ),
+            (
+                1105,
+                "28000",
+                "[query.execution.dependency] Dependency failure (reason 23:3) at operator 7 during Pull",
+            ),
+        ] {
+            let error = mysql::Error::MySqlError(mysql::MySqlError {
+                code,
+                state: state.into(),
+                message: message.into(),
+            });
+            assert!(check_acquisition_mysql_error(&error, detail).is_err());
+        }
     }
 
     fn authority(close: bool) -> AuthorityIntent {

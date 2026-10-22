@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use novarocks_failure_contract::SharedFailureCause;
 use novarocks_spi::connector::{StaticCredentialReference, StorageAccessDomainId};
 use opendal::layers::{ConcurrentLimitLayer, HttpClientLayer, RetryLayer, TimeoutLayer};
 use opendal::raw::{
@@ -2426,7 +2427,15 @@ impl reqsign::AwsCredentialLoad for AuthorityCredentialLoad {
 /// operation can still ask the open authority for material.
 #[derive(Debug, Default)]
 struct CredentialDenialLatch {
-    denial: Mutex<Option<String>>,
+    denial: Mutex<Option<RecordedCredentialDenial>>,
+}
+
+/// Keep the original local denial, including its producer-owned fact when
+/// present. Unclassified Permission errors retain the existing generic path.
+#[derive(Clone, Debug)]
+enum RecordedCredentialDenial {
+    Authority(SharedFailureCause),
+    Generic(String),
 }
 
 impl CredentialDenialLatch {
@@ -2436,11 +2445,14 @@ impl CredentialDenialLatch {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if denial.is_none() {
-            *denial = Some(error.to_string());
+            *denial = Some(match error.authority_cause() {
+                Some(cause) => RecordedCredentialDenial::Authority(cause.clone()),
+                None => RecordedCredentialDenial::Generic(error.to_string()),
+            });
         }
     }
 
-    fn observed(&self) -> Option<String> {
+    fn observed(&self) -> Option<RecordedCredentialDenial> {
         self.denial
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2479,9 +2491,23 @@ impl CredentialDenialLatch {
             cause = current.source();
         }
         match self.observed() {
-            Some(detail) => opendal::Error::new(opendal::ErrorKind::PermissionDenied, detail)
-                .set_permanent()
-                .set_source(error),
+            Some(RecordedCredentialDenial::Authority(cause)) => {
+                let detail = cause.detail().to_owned();
+                let source = FileError::with_source(
+                    FileErrorKind::Permission,
+                    "retained storage authority credential denial",
+                    error,
+                )
+                .with_authority_cause(cause);
+                opendal::Error::new(opendal::ErrorKind::PermissionDenied, detail)
+                    .set_permanent()
+                    .set_source(source)
+            }
+            Some(RecordedCredentialDenial::Generic(detail)) => {
+                opendal::Error::new(opendal::ErrorKind::PermissionDenied, detail)
+                    .set_permanent()
+                    .set_source(error)
+            }
             None => error,
         }
     }
@@ -2836,9 +2862,45 @@ fn build_hdfs_operator(name_node: &str, user: Option<&str>) -> FileResult<Operat
     Ok(operator)
 }
 
+/// Recover only an already projected FS acquisition cause through the actual
+/// file/signing/stream wrappers. This bound does not change ordinary error
+/// classification or OpenDAL's retry predicate.
+fn authority_cause_in(error: &(dyn std::error::Error + 'static)) -> Option<SharedFailureCause> {
+    const MAX_SOURCE_DEPTH: usize = 16;
+    let mut current = error;
+    for _ in 0..MAX_SOURCE_DEPTH {
+        if let Some(file) = current.downcast_ref::<FileError>() {
+            if let Some(cause) = file.authority_cause() {
+                return Some(cause.clone());
+            }
+        } else if let Some(cause) = current.downcast_ref::<SharedFailureCause>() {
+            return cause
+                .downcast_ref::<crate::storage_authority::failure::AuthorityFailure>()
+                .map(|_| cause.clone());
+        } else if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            // io::Error owns the OpenDAL error as its custom payload. Use that
+            // payload explicitly rather than depending on its source shortcut.
+            current = io.get_ref()?;
+            continue;
+        } else if !current.is::<opendal::Error>() {
+            return None;
+        }
+        current = current.source()?;
+    }
+    None
+}
+
+fn carry_authority_cause(error: FileError, cause: Option<SharedFailureCause>) -> FileError {
+    match cause {
+        Some(cause) => error.with_authority_cause(cause),
+        None => error,
+    }
+}
+
 fn map_opendal_error(operation: &str, error: opendal::Error) -> FileError {
     let kind = classify_opendal_error(&error);
-    FileError::with_source(kind, operation, error)
+    let cause = authority_cause_in(&error);
+    carry_authority_cause(FileError::with_source(kind, operation, error), cause)
 }
 
 /// Bound the diagnostic we create at the catalog listing boundary. OpenDAL
@@ -2851,7 +2913,11 @@ pub fn map_object_store_listing_error(error: opendal::Error) -> FileError {
 }
 
 fn map_bounded_listing_opendal_error(operation: &str, error: opendal::Error) -> FileError {
-    bounded_listing_failure(classify_opendal_error(&error), operation)
+    let cause = authority_cause_in(&error);
+    carry_authority_cause(
+        bounded_listing_failure(classify_opendal_error(&error), operation),
+        cause,
+    )
 }
 
 fn bounded_listing_failure(kind: FileErrorKind, message: &str) -> FileError {
@@ -2874,7 +2940,8 @@ fn map_stream_error(operation: &str, error: std::io::Error) -> FileError {
             std::io::ErrorKind::PermissionDenied => FileErrorKind::Permission,
             _ => FileErrorKind::Transient,
         });
-    FileError::with_source(kind, operation, error)
+    let cause = authority_cause_in(&error);
+    carry_authority_cause(FileError::with_source(kind, operation, error), cause)
 }
 
 fn classify_opendal_error(error: &opendal::Error) -> FileErrorKind {
@@ -4533,8 +4600,8 @@ mod tests {
             .enable_time()
             .build()
             .unwrap();
-        // No material and no renewal capability: every credential load is a
-        // confirmed denial, decided locally and without any remote request.
+        // No material and no renewal capability: this local permission
+        // failure is distinct from a provider-confirmed denial.
         let authority = seeded_authority("s3://warehouse/sales/orders/", None);
         let endpoint = ObjectStoreEndpointIdentity::try_new(
             "warehouse",
@@ -4550,10 +4617,9 @@ mod tests {
         let error = runtime
             .block_on(operator.stat("sales/orders/part-0.parquet"))
             .expect_err("a denied authority cannot sign a request");
-        assert_eq!(
-            map_opendal_error("stat file", error).kind(),
-            FileErrorKind::Permission
-        );
+        let mapped = map_opendal_error("stat file", error);
+        assert_eq!(mapped.kind(), FileErrorKind::Permission);
+        assert_authority_fact(&mapped, 4);
         // The retry layer swallows anything opendal marked temporary. One
         // credential load means the denial reached the caller as itself
         // instead of being retried as jitter (CAD-1 D4).
@@ -4585,5 +4651,362 @@ mod tests {
             opendal::Error::new(opendal::ErrorKind::Unexpected, "S3 response unavailable")
                 .set_temporary();
         assert!(latch.classify(unrelated_s3_failure).is_temporary());
+    }
+
+    fn assert_authority_fact(error: &FileError, code: u16) {
+        use novarocks_failure_contract::{FailureClass, FailureEvidence, FailureProjection};
+        let fact = novarocks_spi::connector::ConnectorError::from(error).failure_fact();
+        assert_eq!(fact.class(), FailureClass::Dependency);
+        assert_eq!(fact.evidence(), FailureEvidence::Originating);
+        assert_eq!((fact.reason().domain(), fact.reason().code()), (23, code));
+    }
+
+    struct FixedAuthorityFailure {
+        failure: AcquisitionFailure,
+        calls: AtomicUsize,
+        refreshes: Mutex<Vec<JoinHandle<()>>>,
+    }
+
+    impl FixedAuthorityFailure {
+        /// The test thread observes actual refresh exit before asserting the
+        /// operation result. Do not join from Drop: a refresh owns the source.
+        fn join_refreshes(&self) -> std::thread::Result<()> {
+            let handles = std::mem::take(
+                &mut *self
+                    .refreshes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            let mut first_panic = None;
+            for handle in handles {
+                if let Err(panic) = handle.join()
+                    && first_panic.is_none()
+                {
+                    first_panic = Some(panic);
+                }
+            }
+            match first_panic {
+                Some(panic) => Err(panic),
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl AuthorityMaterialSource for FixedAuthorityFailure {
+        fn acquire(&self, _deadline: Instant) -> Result<AuthorityMaterial, AcquisitionFailure> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(self.failure.clone())
+        }
+    }
+
+    impl RefreshExecutor for FixedAuthorityFailure {
+        fn execute(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+            let handle = std::thread::spawn(job);
+            self.refreshes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(handle);
+        }
+    }
+
+    fn failing_authority_operator(
+        failure: AcquisitionFailure,
+    ) -> (Operator, Arc<StorageAuthority>, Arc<FixedAuthorityFailure>) {
+        let capability = if matches!(&failure, AcquisitionFailure::NoRenewalCapability) {
+            AuthorityCapabilityPath::SeededWithoutRenewal
+        } else {
+            AuthorityCapabilityPath::CredentialsEndpoint {
+                principal: StaticCredentialReference::try_new("executor", "v1").unwrap(),
+                routing: novarocks_spi::connector::CredentialRoutingContext::try_new(
+                    "http://127.0.0.1:1/v1/credentials",
+                    [],
+                )
+                .unwrap(),
+            }
+        };
+        let source = Arc::new(FixedAuthorityFailure {
+            failure,
+            calls: AtomicUsize::new(0),
+            refreshes: Mutex::new(Vec::new()),
+        });
+        let authority = Arc::new(StorageAuthority::new(
+            StorageAuthorityId::new(
+                CatalogHandle::new(
+                    ConnectorInstanceId::parse("lake").unwrap(),
+                    CatalogVersion::from_bytes([0x11; 32]),
+                ),
+                StorageCredentialScopePrefix::try_from_normalized("s3://warehouse/sales/orders/")
+                    .unwrap(),
+                capability,
+            ),
+            source.clone(),
+            source.clone(),
+            RefreshPolicy::default(),
+        ));
+        let endpoint = ObjectStoreEndpointIdentity::try_new(
+            "warehouse",
+            &endpoint_config("http://127.0.0.1:1"),
+        )
+        .unwrap();
+        let operator = build_object_store_operator(
+            &endpoint,
+            &ObjectStoreCredentialSource::Authority(authority.clone()),
+        )
+        .unwrap();
+        (operator, authority, source)
+    }
+
+    #[test]
+    fn four_acquisition_causes_cross_the_signer_and_each_file_error_bridge() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // These are independent producer inputs. The FS does not own the
+        // provider's HTTP-to-AcquisitionFailure classification. Each input
+        // crosses the real authority, reqsign loader and OpenDAL operation.
+        for bridge in 0..3 {
+            for (failure, code, kind) in [
+                (
+                    AcquisitionFailure::Transient("provider timeout PRIVATE".into()),
+                    1,
+                    FileErrorKind::Transient,
+                ),
+                (
+                    AcquisitionFailure::Denied("provider confirmed denial PRIVATE".into()),
+                    2,
+                    FileErrorKind::Permission,
+                ),
+                (
+                    AcquisitionFailure::CatalogUnreachable(
+                        "catalog connect refused PRIVATE".into(),
+                    ),
+                    3,
+                    FileErrorKind::Transient,
+                ),
+                (
+                    AcquisitionFailure::NoRenewalCapability,
+                    4,
+                    FileErrorKind::Permission,
+                ),
+            ] {
+                let (operator, authority, source) = failing_authority_operator(failure);
+                let result = runtime.block_on(operator.stat("sales/orders/part-0.parquet"));
+                source
+                    .join_refreshes()
+                    .expect("join acquisition refresh owner");
+                let error = result.expect_err("the producer refused signing material");
+                assert!(!error.is_temporary());
+                let original = authority_cause_in(&error).expect("original acquisition cause");
+                let mapped = match bridge {
+                    0 => map_opendal_error("stat file", error),
+                    1 => map_stream_error("stream file", std::io::Error::from(error)),
+                    2 => map_bounded_listing_opendal_error("list files", error),
+                    _ => unreachable!(),
+                };
+                assert_eq!(mapped.kind(), kind);
+                assert_eq!(mapped.authority_cause(), Some(&original));
+                assert_authority_fact(&mapped, code);
+                assert_eq!(authority.metrics().blocking_waits, 1);
+                assert_eq!(source.calls.load(Ordering::Relaxed), usize::from(code != 4));
+            }
+        }
+    }
+
+    #[test]
+    fn denial_latch_shares_the_original_cause_and_preserves_generic_permission() {
+        use crate::storage_authority::failure::AuthorityFailureReason;
+        for (reason, code) in [
+            (AuthorityFailureReason::AcquisitionDenied, 2),
+            (AuthorityFailureReason::NoRenewalCapability, 4),
+        ] {
+            let latch = CredentialDenialLatch::default();
+            let denial = FileError::authority(FileErrorKind::Permission, reason, "original denial");
+            let original = denial.authority_cause().unwrap().clone();
+            latch.record(&denial);
+            latch.record(&FileError::new(
+                FileErrorKind::Permission,
+                "later unrelated denial",
+            ));
+            let restored = latch.classify(
+                opendal::Error::new(opendal::ErrorKind::Unexpected, "loader lost its source")
+                    .set_temporary(),
+            );
+            assert!(!restored.is_temporary());
+            let mapped = map_opendal_error("stat file", restored);
+            assert_eq!(mapped.kind(), FileErrorKind::Permission);
+            assert_eq!(mapped.authority_cause(), Some(&original));
+            assert_authority_fact(&mapped, code);
+        }
+
+        let latch = CredentialDenialLatch::default();
+        latch.record(&FileError::new(
+            FileErrorKind::Permission,
+            "ordinary permission",
+        ));
+        let restored = latch.classify(
+            opendal::Error::new(opendal::ErrorKind::Unexpected, "ordinary loader failure")
+                .set_temporary(),
+        );
+        assert!(!restored.is_temporary());
+        let mapped = map_opendal_error("stat file", restored);
+        assert_eq!(mapped.kind(), FileErrorKind::Permission);
+        assert!(mapped.authority_cause().is_none());
+        assert!(mapped.to_string().contains("ordinary permission"));
+    }
+
+    #[test]
+    fn bounded_listing_retains_the_cause_without_displaying_opaque_sources() {
+        use crate::storage_authority::failure::AuthorityFailureReason;
+        let original = FileError::authority(
+            FileErrorKind::Permission,
+            AuthorityFailureReason::AcquisitionDenied,
+            "known local denial",
+        )
+        .authority_cause()
+        .unwrap()
+        .clone();
+        let opaque = FileError::with_source(
+            FileErrorKind::Permission,
+            "x".repeat(8192),
+            ListingPanicDisplay,
+        )
+        .with_authority_cause(original.clone());
+        let error = opendal::Error::new(opendal::ErrorKind::PermissionDenied, "x".repeat(8192))
+            .with_context("path", "y".repeat(8192))
+            .set_source(opaque);
+        let mapped = map_bounded_listing_opendal_error("list files", error);
+        assert_eq!(mapped.authority_cause(), Some(&original));
+        assert_authority_fact(&mapped, 2);
+        assert!(mapped.to_string().len() < 128);
+    }
+
+    #[test]
+    fn authority_extraction_is_bounded_and_does_not_reclassify_waiter_deadlines() {
+        use crate::storage_authority::failure::AuthorityFailureReason;
+        let source = FileError::authority(
+            FileErrorKind::Transient,
+            AuthorityFailureReason::CatalogUnreachable,
+            "catalog refused",
+        );
+        let mut error =
+            opendal::Error::new(opendal::ErrorKind::Unexpected, "signing").set_source(source);
+        // Fifteen OpenDAL nodes and the FileError fit the sixteen-node bound.
+        for _ in 1..15 {
+            error =
+                opendal::Error::new(opendal::ErrorKind::Unexpected, "wrapped").set_source(error);
+        }
+        assert!(authority_cause_in(&error).is_some());
+        let over_bound =
+            opendal::Error::new(opendal::ErrorKind::Unexpected, "wrapped").set_source(error);
+        assert!(authority_cause_in(&over_bound).is_none());
+        let mapped = map_opendal_error("stat file", over_bound);
+        assert_eq!(mapped.kind(), FileErrorKind::Transient);
+        assert!(mapped.authority_cause().is_none());
+
+        let deadline = FileError::deadline("only this waiter ran out of time");
+        let error = CredentialDenialLatch::default().classify(
+            opendal::Error::new(opendal::ErrorKind::Unexpected, "signing")
+                .set_temporary()
+                .set_source(deadline),
+        );
+        assert!(!error.is_temporary());
+        let mapped = map_opendal_error("stat file", error);
+        assert!(mapped.authority_cause().is_none());
+    }
+
+    #[test]
+    fn unknown_source_wrappers_do_not_invent_an_authority_fact() {
+        use crate::storage_authority::failure::AuthorityFailureReason;
+        #[derive(Debug)]
+        struct UnknownWrapper(FileError);
+        impl std::fmt::Display for UnknownWrapper {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("unknown wrapper")
+            }
+        }
+        impl std::error::Error for UnknownWrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let error = opendal::Error::new(opendal::ErrorKind::PermissionDenied, "opaque").set_source(
+            UnknownWrapper(FileError::authority(
+                FileErrorKind::Permission,
+                AuthorityFailureReason::AcquisitionDenied,
+                "known only behind an unsupported wrapper",
+            )),
+        );
+        let mapped = map_bounded_listing_opendal_error("list files", error);
+        assert_eq!(mapped.kind(), FileErrorKind::Permission);
+        assert!(mapped.authority_cause().is_none());
+    }
+
+    #[test]
+    fn real_s3_http_failures_keep_their_generic_connector_facts() {
+        use novarocks_failure_contract::FailureProjection;
+        use std::io::{Read, Write};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (status, kind, code) in [
+            ("403 Forbidden", FileErrorKind::Permission, 3),
+            ("503 Service Unavailable", FileErrorKind::Transient, 8),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(accepted) => break accepted,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "S3 request did not arrive");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept S3 request: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = [0; 8192];
+                let bytes = stream.read(&mut request).unwrap();
+                assert!(request[..bytes].starts_with(b"HEAD "));
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+            });
+            let authority = seeded_authority(
+                "s3://warehouse/sales/orders/",
+                Some(vended_material(
+                    "live",
+                    Instant::now() + Duration::from_secs(900),
+                )),
+            );
+            let mut config = endpoint_config(&format!("http://{address}"));
+            config.retry_max_times = Some(0);
+            config.timeout_ms = Some(5_000);
+            config.io_timeout_ms = Some(5_000);
+            let endpoint = ObjectStoreEndpointIdentity::try_new("warehouse", &config).unwrap();
+            let operator = build_object_store_operator(
+                &endpoint,
+                &ObjectStoreCredentialSource::Authority(authority.clone()),
+            )
+            .unwrap();
+            let result = runtime.block_on(operator.stat("sales/orders/part-0.parquet"));
+            server.join().expect("join S3 response owner");
+            let mapped =
+                map_opendal_error("stat file", result.expect_err("S3 refused the request"));
+            assert_eq!(mapped.kind(), kind);
+            assert!(mapped.authority_cause().is_none());
+            let fact = novarocks_spi::connector::ConnectorError::from(&mapped).failure_fact();
+            assert_eq!((fact.reason().domain(), fact.reason().code()), (4, code));
+            assert_eq!(authority.metrics().blocking_waits, 0);
+        }
     }
 }

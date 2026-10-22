@@ -590,6 +590,16 @@ mod tests {
             failure,
             SafeDetail::new("x".repeat(512)).unwrap(),
         ))];
+        for code in 1..=4 {
+            results.push(RootReadResponse::Refused(RootReadRefusal::for_request(
+                &request,
+                FailureFact::new(
+                    FailureClass::Dependency,
+                    FailureReason::new(domain::STORAGE_AUTHORITY, NonZeroU16::new(code).unwrap()),
+                ),
+                SafeDetail::new(format!("Dependency failure (reason 23:{code})")).unwrap(),
+            )));
+        }
         for reason in [
             RootReadDeferral::Preparing,
             RootReadDeferral::ReadHoldersBusy(facts),

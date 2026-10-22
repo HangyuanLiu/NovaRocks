@@ -135,6 +135,7 @@ pub mod domain {
     pub const LOCAL_COMPILER: NonZeroU16 = NonZeroU16::new(19).unwrap();
     pub const QUERY: NonZeroU16 = NonZeroU16::new(20).unwrap();
     pub const WORKLOAD: NonZeroU16 = NonZeroU16::new(21).unwrap();
+    pub const STORAGE_AUTHORITY: NonZeroU16 = NonZeroU16::new(23).unwrap();
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

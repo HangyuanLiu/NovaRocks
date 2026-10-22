@@ -52,6 +52,7 @@ mod debug_close;
 #[cfg(novarocks_dev_controls)]
 pub use debug_close::StorageAuthorityCloseControls;
 mod executor;
+pub(crate) mod failure;
 mod registry;
 
 #[cfg(test)]
@@ -318,22 +319,28 @@ impl AcquisitionFailure {
     }
 
     fn into_file_error(self, id: &StorageAuthorityId) -> FileError {
+        use failure::AuthorityFailureReason;
+
         let scope = id.scope().as_str();
         match self {
-            Self::Transient(detail) => FileError::new(
+            Self::Transient(detail) => FileError::authority(
                 FileErrorKind::Transient,
+                AuthorityFailureReason::TransientAcquisition,
                 format!("storage authority refresh for {scope} failed transiently: {detail}"),
             ),
-            Self::Denied(detail) => FileError::new(
+            Self::Denied(detail) => FileError::authority(
                 FileErrorKind::Permission,
+                AuthorityFailureReason::AcquisitionDenied,
                 format!("storage authority for {scope} was denied: {detail}"),
             ),
-            Self::CatalogUnreachable(detail) => FileError::new(
+            Self::CatalogUnreachable(detail) => FileError::authority(
                 FileErrorKind::Transient,
+                AuthorityFailureReason::CatalogUnreachable,
                 format!("storage authority for {scope} could not reach its catalog: {detail}"),
             ),
-            Self::NoRenewalCapability => FileError::new(
+            Self::NoRenewalCapability => FileError::authority(
                 FileErrorKind::Permission,
+                AuthorityFailureReason::NoRenewalCapability,
                 format!(
                     "storage authority for {scope} holds no renewal capability and its material expired"
                 ),
