@@ -21,9 +21,7 @@
 //! cancellation stops both active and queued roots; single-query KILL QUERY
 //! protocol conformance is covered by its dedicated scenarios.
 
-use super::query_lifecycle::native_sql_controls::{
-    SelectedStatement, SqlIntentOwner, StatementSpec,
-};
+use super::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec};
 use crate::actors::mysql as mysql_actor;
 use crate::actors::mysql_stream::{AsyncMysqlStream, MysqlStream};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};

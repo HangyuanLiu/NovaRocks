@@ -842,6 +842,7 @@ impl UnixControlClient {
     pub fn last_prefixes(&self) -> (PrefixSummary, PrefixSummary) {
         (self.last_request, self.last_response)
     }
+    #[cfg(test)]
     pub fn command_count(&self) -> u8 {
         self.commands
     }

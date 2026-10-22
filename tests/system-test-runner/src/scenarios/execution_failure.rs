@@ -21,10 +21,9 @@ use crate::actors::mysql_stream::{
     AsyncMysqlStream, BoundedErrorPrefix, BoundedNegativeTextObservation, TextResultObservation,
 };
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
-use crate::scenarios::query_lifecycle::{
-    await_resource_convergence,
+use crate::scenarios::{
     native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec},
-    resource_snapshot,
+    query_lifecycle::{await_resource_convergence, resource_snapshot},
 };
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::{

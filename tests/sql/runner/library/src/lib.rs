@@ -1467,7 +1467,7 @@ fn verify_runtime_filter_structured_assertion(
         return Ok(());
     }
 
-    if assertion.runtime_filter_availability.is_some()
+    if let Some(expected_availability) = assertion.runtime_filter_availability.as_ref()
         && !matches!(
             after.runtime_filter,
             novarocks_cluster_harness::RuntimeFilterTerminalRollup::Available { .. }
@@ -1475,10 +1475,7 @@ fn verify_runtime_filter_structured_assertion(
     {
         bail!(
             "runtime-filter availability mismatch: expected {}, actual {:?}, execution_id={:?}",
-            assertion
-                .runtime_filter_availability
-                .expect("checked")
-                .as_str(),
+            expected_availability.as_str(),
             after.runtime_filter,
             after.execution_id
         );
@@ -6744,7 +6741,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             }
 
             let mut slowest_case_timings = all_case_timings.clone();
-            slowest_case_timings.sort_by(|a, b| b.elapsed.cmp(&a.elapsed));
+            slowest_case_timings.sort_by_key(|timing| std::cmp::Reverse(timing.elapsed));
             println!("\nslowest cases (top 5):");
             for timing in slowest_case_timings.iter().take(5) {
                 println!(

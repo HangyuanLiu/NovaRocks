@@ -51,11 +51,9 @@ use super::connector::{
     await_resource_convergence, connector_reader_environment, require_three_backends,
     resource_baseline,
 };
+use super::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec};
 use super::paimon::scan_statement_actor::{ScanActor, combine};
 use super::paimon::{Fixture as PaimonFixture, create_paimon_catalog, load_shared_fixture};
-use super::query_lifecycle::native_sql_controls::{
-    SelectedStatement, SqlIntentOwner, StatementSpec,
-};
 use super::uea4_catalog_planning::await_frontend_local_exit;
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};

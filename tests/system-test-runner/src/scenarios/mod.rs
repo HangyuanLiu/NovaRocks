@@ -38,6 +38,7 @@ mod native_compatibility;
 mod native_creation;
 mod native_direct_controls;
 mod native_ingress;
+mod native_sql_controls;
 mod native_trust;
 mod paimon;
 mod preparation_capacity;

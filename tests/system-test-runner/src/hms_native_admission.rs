@@ -258,12 +258,14 @@ fn canonical(value: Value) -> Value {
     }
 }
 
+pub(crate) type HmsNativeAdmission = (HmsBinding, Vec<u8>, Vec<u8>, Vec<u8>, Admission);
+
 pub(crate) fn admit(
     path: &Path,
     server: &Path,
     config: &Path,
     build: &crate::build_information::BuildInformation,
-) -> Result<(HmsBinding, Vec<u8>, Vec<u8>, Vec<u8>, Admission)> {
+) -> Result<HmsNativeAdmission> {
     let preparation = Instant::now() + Duration::from_millis(PREP_MS);
     let mut binding_owner = InputOwner::open(path, BINDING_BYTES, preparation)?;
     let binding_raw = binding_owner.read_small(BINDING_BYTES, preparation)?;

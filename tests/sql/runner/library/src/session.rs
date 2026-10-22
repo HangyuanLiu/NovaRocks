@@ -73,9 +73,6 @@ pub struct MysqlSession {
 }
 
 impl MysqlSession {
-    pub fn new(conn: &ConnectionConfig) -> Result<Self> {
-        Self::create(conn, None)
-    }
     pub(crate) fn new_with_deadline(
         conn: &ConnectionConfig,
         deadline: Option<Instant>,
@@ -658,10 +655,6 @@ fn normalize_statement_fragment(fragment: &str) -> Option<String> {
     }
 }
 
-pub fn run_mysql_sql(conn: &ConnectionConfig, query_timeout: u64, sql: &str) -> Result<String> {
-    run_mysql_sql_until(conn, query_timeout, sql, None)
-}
-
 pub(crate) fn run_mysql_sql_until(
     conn: &ConnectionConfig,
     query_timeout: u64,
@@ -692,26 +685,6 @@ pub(crate) fn run_mysql_sql_scoped_until(
         (true, Ok(())) => {}
     }
     Ok(execution.map_or_else(String::new, |execution| execution.text_output))
-}
-
-pub fn execute_suite_hook(
-    conn: &ConnectionConfig,
-    query_timeout: u64,
-    hook: &SuiteHook,
-    label: &str,
-) -> Result<()> {
-    execute_suite_hook_until(conn, query_timeout, hook, label, None)
-}
-pub(crate) fn execute_suite_hook_until(
-    conn: &ConnectionConfig,
-    query_timeout: u64,
-    hook: &SuiteHook,
-    label: &str,
-    deadline: Option<Instant>,
-) -> Result<()> {
-    run_mysql_sql_until(conn, query_timeout, &hook.sql, deadline)
-        .with_context(|| format!("{} suite hook failed: {}", label, hook.path.display()))?;
-    Ok(())
 }
 
 /// Names of the tables a case database currently holds.
@@ -752,23 +725,6 @@ fn case_table_names(
         .collect())
 }
 
-pub fn reset_case_database(
-    conn: &ConnectionConfig,
-    query_timeout: u64,
-    db_name: &str,
-    label: &str,
-) -> Result<()> {
-    reset_case_database_until(conn, query_timeout, db_name, label, None)
-}
-pub(crate) fn reset_case_database_until(
-    conn: &ConnectionConfig,
-    query_timeout: u64,
-    db_name: &str,
-    label: &str,
-    deadline: Option<Instant>,
-) -> Result<()> {
-    reset_case_database_scoped_until(conn, query_timeout, db_name, label, deadline, None)
-}
 pub(crate) fn reset_case_database_scoped_until(
     conn: &ConnectionConfig,
     query_timeout: u64,
@@ -789,14 +745,6 @@ pub(crate) fn reset_case_database_scoped_until(
     Ok(())
 }
 
-pub fn drop_case_database(
-    conn: &ConnectionConfig,
-    query_timeout: u64,
-    db_name: &str,
-    label: &str,
-) -> Result<()> {
-    drop_case_database_until(conn, query_timeout, db_name, label, None)
-}
 pub(crate) fn drop_case_database_until(
     conn: &ConnectionConfig,
     query_timeout: u64,

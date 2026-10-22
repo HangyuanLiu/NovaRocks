@@ -688,7 +688,16 @@ impl fmt::Display for Failure {
 // Raw causes are retained in fixed, bounded slots and deliberately not exposed
 // to generic anyhow chain formatting. In-crate tests can inspect the objects.
 impl std::error::Error for Failure {}
-struct Panic(std::sync::Mutex<Box<dyn std::any::Any + Send>>);
+struct Panic(
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retain the original panic payload without invoking its formatter."
+        )
+    )]
+    std::sync::Mutex<Box<dyn std::any::Any + Send>>,
+);
 impl fmt::Debug for Panic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("OriginalHmsClientPanic")
@@ -1697,25 +1706,27 @@ mod tests {
             "59f40e575db0ff0d1d60a6355e1e0594db0705af1a298a79b0772c7f99915b35"
         );
         assert_eq!(bytes, 622592);
-        let mut observed = TextResultObservation::default();
-        observed.rows = ROWS;
-        observed.columns = 3;
-        observed.row_sha256 = digest;
-        observed.row_payload_bytes = bytes;
-        observed.packets = ROWS + 6;
-        observed.schema = vec![
-            ("table_schema", 253),
-            ("table_name", 253),
-            ("table_type", 253),
-        ]
-        .into_iter()
-        .map(
-            |(name, mysql_type)| crate::actors::mysql_stream::TextColumnObservation {
-                name: name.into(),
-                mysql_type,
-            },
-        )
-        .collect();
+        let mut observed = TextResultObservation {
+            rows: ROWS,
+            columns: 3,
+            row_sha256: digest,
+            row_payload_bytes: bytes,
+            packets: ROWS + 6,
+            schema: vec![
+                ("table_schema", 253),
+                ("table_name", 253),
+                ("table_type", 253),
+            ]
+            .into_iter()
+            .map(
+                |(name, mysql_type)| crate::actors::mysql_stream::TextColumnObservation {
+                    name: name.into(),
+                    mysql_type,
+                },
+            )
+            .collect(),
+            ..TextResultObservation::default()
+        };
         assert!(validate_rows(&observed).is_ok());
         observed.rows -= 1;
         assert!(validate_rows(&observed).is_err());
@@ -1726,12 +1737,14 @@ mod tests {
     #[test]
     fn schema_type_and_server_err_cannot_pass_row_hash() {
         let (digest, bytes) = row_oracle();
-        let mut value = TextResultObservation::default();
-        value.rows = ROWS;
-        value.columns = 3;
-        value.row_sha256 = digest;
-        value.row_payload_bytes = bytes;
-        value.packets = ROWS + 6;
+        let mut value = TextResultObservation {
+            rows: ROWS,
+            columns: 3,
+            row_sha256: digest,
+            row_payload_bytes: bytes,
+            packets: ROWS + 6,
+            ..TextResultObservation::default()
+        };
         assert!(validate_rows(&value).is_err());
         value.error = Some("actual failure retained".into());
         assert!(validate_rows(&value).is_err());

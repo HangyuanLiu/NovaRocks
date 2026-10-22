@@ -16,7 +16,7 @@
 // under the License.
 
 //! Exact compatibility-artifact role declarations for finite SQL observations.
-use super::super::query_lifecycle::native_sql_controls::SelectedStatement;
+use super::super::native_sql_controls::SelectedStatement;
 use crate::{actors::mysql as mysql_actor, scenario::ScenarioContext};
 use anyhow::{Context, Result, ensure};
 use mysql::prelude::Queryable;

@@ -955,8 +955,10 @@ mod tests {
         let mut bytes = Vec::new();
         control.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes.len(), 3 * 16);
-        let operations = bytes
-            .chunks_exact(16)
+        let (frames, remainder) = bytes.as_chunks::<16>();
+        assert!(remainder.is_empty());
+        let operations = frames
+            .iter()
             .map(|frame| unix::decode_control(frame).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(

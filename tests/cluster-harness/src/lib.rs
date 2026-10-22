@@ -79,6 +79,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml::Value;
 
+type PrelaunchConfigCheck<'a> = &'a dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>;
+type ProcessLogOwnerCheck<'a> = &'a dyn Fn(&str, &ManagedProcessLogSource) -> Result<()>;
+
 const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
 const SYSTEM_NATIVE_TRUST_SECRET_ENV: &str = "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET";
 const MAX_FAILURE_LOG_REDACTION_VALUE_BYTES: usize = 64 * 1024;
@@ -3367,10 +3370,6 @@ impl QueryLifecycleFaultFiles {
         })
     }
 
-    fn root(&self) -> &Path {
-        &self.root
-    }
-
     fn terminal_ack_drop_path(&self, index: usize) -> Result<PathBuf> {
         self.be_path(index, QueryLifecycleFaultKind::TerminalAckDrop)
     }
@@ -3862,6 +3861,10 @@ impl CrossProcessServerHandle {
     }
 
     /// Preserve existing source/config checks for explicitly selected fixture consumers.
+    #[expect(
+        clippy::type_complexity,
+        reason = "Keep the existing public callback signature stable until P10 can update cross-crate callers together."
+    )]
     pub fn launch_with_test_sessions_and_checks(
         options: CrossProcessClusterOptions,
         plan: ClusterTestSessionPlan,
@@ -3882,6 +3885,10 @@ impl CrossProcessServerHandle {
     }
 
     /// Same role owners and capabilities, bounded by a fixture's original clock.
+    #[expect(
+        clippy::type_complexity,
+        reason = "Keep the existing public callback signature stable until P10 can update cross-crate callers together."
+    )]
     pub fn launch_with_fixture_budget(
         options: CrossProcessClusterOptions,
         test_sessions: Option<ClusterTestSessionPlan>,
@@ -3906,8 +3913,8 @@ impl CrossProcessServerHandle {
         options: CrossProcessClusterOptions,
         proxy_config: CrossProcessNativeFaultProxyConfig,
         root_reply_fault_config: Option<CrossProcessRootReplyFaultConfig>,
-        prelaunch_check: Option<&dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>>,
-        log_owner_check: Option<&dyn Fn(&str, &ManagedProcessLogSource) -> Result<()>>,
+        prelaunch_check: Option<PrelaunchConfigCheck<'_>>,
+        log_owner_check: Option<ProcessLogOwnerCheck<'_>>,
         mut test_sessions: Option<ClusterTestSessionPlan>,
         fixture_budget: Option<fixture_run::RunBudget>,
     ) -> Result<Self> {

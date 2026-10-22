@@ -24,7 +24,7 @@
 
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
-use crate::scenarios::query_lifecycle::native_sql_controls::SqlIntentOwner;
+use crate::scenarios::native_sql_controls::SqlIntentOwner;
 use crate::scenarios::task_evidence;
 
 #[path = "native_trust_controls.rs"]

@@ -338,7 +338,6 @@ impl InputOwner {
 
 struct Capture {
     bytes: Vec<u8>,
-    hash: Sha256,
     total: u64,
     cap: usize,
     eof: bool,
@@ -347,7 +346,6 @@ impl Capture {
     fn new(cap: usize) -> Self {
         Self {
             bytes: Vec::new(),
-            hash: Sha256::new(),
             total: 0,
             cap,
             eof: false,
@@ -367,7 +365,6 @@ impl Capture {
                         .total
                         .checked_add(n as u64)
                         .ok_or_else(|| std::io::Error::other("capture count overflow"))?;
-                    self.hash.update(&scratch[..n]);
                     if n > self.cap - self.bytes.len() {
                         return Ok(true);
                     }
@@ -399,36 +396,9 @@ pub(crate) struct CommandFailure {
     status: Option<ExitStatus>,
     stdout_bytes: u64,
     stderr_bytes: u64,
-    stdout_sha256: [u8; 32],
-    stderr_sha256: [u8; 32],
     // Exactly the original unreaped Child. Error ownership is retained, never a guessed PID.
     retained_child: Option<Mutex<Child>>,
-    panic_payload: Option<Mutex<Box<dyn std::any::Any + Send>>>,
-}
-impl CommandFailure {
-    /// This cannot change the failed admission verdict or start a new clock.
-    pub(crate) fn retained_original_child(&self) -> bool {
-        self.retained_child.is_some()
-    }
-    /// Caller may observe actual reap of this exact original handle after failure.
-    /// No guessed PID, wait wrapper, replacement child or successful admission is minted.
-    pub(crate) fn poll_retained_original(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        let Some(owner) = self.retained_child.as_mut() else {
-            return Ok(self.status);
-        };
-        let child = match owner.get_mut() {
-            Ok(child) => child,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        match child.try_wait()? {
-            Some(status) => {
-                self.status = Some(status);
-                drop(self.retained_child.take());
-                Ok(Some(status))
-            }
-            None => Ok(None),
-        }
-    }
+    _panic_payload: Option<Mutex<Box<dyn std::any::Any + Send>>>,
 }
 impl std::fmt::Debug for CommandFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -527,10 +497,8 @@ fn bounded_command(
                 status: None,
                 stdout_bytes: 0,
                 stderr_bytes: 0,
-                stdout_sha256: Sha256::digest([]).into(),
-                stderr_sha256: Sha256::digest([]).into(),
                 retained_child: None,
-                panic_payload: None,
+                _panic_payload: None,
             }
             .into());
         }
@@ -596,10 +564,8 @@ fn bounded_command(
         status: owner.status,
         stdout_bytes: out.total,
         stderr_bytes: err.total,
-        stdout_sha256: out.hash.finalize().into(),
-        stderr_sha256: err.hash.finalize().into(),
         retained_child: owner.child.take().map(Mutex::new),
-        panic_payload,
+        _panic_payload: panic_payload,
     }
     .into())
 }

@@ -74,6 +74,7 @@ struct FixtureError {
 
 /// Read an already prepared input once. No supply mode is exposed by this consumer.
 // Design: ADR-0173 (docs/adr/ADR-0173-prepared-dataset-consumption-is-check-only.md)
+#[cfg(test)]
 pub fn bind_prepared_dataset(
     requirement: &PreparedDatasetRequirement,
     runner_config: &RunnerConfig,

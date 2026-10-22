@@ -18,7 +18,7 @@
 //! Process-boundary backend self-registration acceptance.
 
 use super::distributed_writer::{assert_commit_never_invoked, publication_terminals};
-use super::query_lifecycle::native_sql_controls::{SqlIntentOwner, StatementSpec};
+use super::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
@@ -32,7 +32,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 const REQUIRED_BACKENDS: usize = 3;
 

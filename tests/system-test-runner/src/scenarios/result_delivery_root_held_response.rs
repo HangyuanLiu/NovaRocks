@@ -64,7 +64,6 @@ pub(crate) enum Phase {
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub(crate) enum FailureClass {
-    Preparation,
     Transition,
     Clock,
     Transport,
@@ -444,9 +443,6 @@ impl HeldRootResponse {
             abort_requested: self.abort_requested,
             driver_exit: self.driver_exit,
         }
-    }
-    pub(crate) fn root_task(&self) -> TaskIdentity {
-        self.proof.root_task()
     }
     pub(crate) fn require_closed_ack(
         &self,

@@ -18,7 +18,7 @@
 //! P09 real FE semantic refusal after a bounded authenticated native reply fault.
 //! Requires the separately reviewed actor v2 and runner launch opt-in integration.
 
-use super::query_lifecycle::native_sql_controls::{SqlIntentOwner, StatementSpec};
+use super::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use super::result_delivery::root_census;
 use super::result_delivery_root_protocol::parse_created_task_candidates;
 use super::result_delivery_support::await_idle;
@@ -266,17 +266,19 @@ impl Scenario for NativeRootReplyRefusal {
     }
 
     fn launch_config(&self, _: &Path) -> Result<ScenarioLaunchConfig> {
-        let mut config = ScenarioLaunchConfig::default();
         // Select the bounded RootReply actor explicitly for these scenarios.
         // Ordinary scenarios keep the existing TCP forwarding path.
-        config.native_root_reply_fault = Some(CrossProcessRootReplyFaultConfig {
-            backend_indices: (0..3).collect(),
-            bounds: RootReplyFaultBounds::default(),
-        });
-        // Existing Control TCP path remains in Forward state with its usual cap.
-        config.native_fault_proxies.backend_retained_byte_limits =
-            (0..3).map(|i| (i, 1024 * 1024)).collect();
-        Ok(config)
+        Ok(ScenarioLaunchConfig {
+            native_root_reply_fault: Some(CrossProcessRootReplyFaultConfig {
+                backend_indices: (0..3).collect(),
+                bounds: RootReplyFaultBounds::default(),
+            }),
+            // Existing Control TCP path remains in Forward state with its usual cap.
+            native_fault_proxies: novarocks_cluster_harness::CrossProcessNativeFaultProxyConfig {
+                backend_retained_byte_limits: (0..3).map(|i| (i, 1024 * 1024)).collect(),
+            },
+            ..ScenarioLaunchConfig::default()
+        })
     }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         ensure!(

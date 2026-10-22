@@ -1,7 +1,8 @@
 use crate::cli::Cli;
 use crate::config::RunnerConfig;
 use crate::scenario::{
-    Scenario, ScenarioContext, ScenarioEvidenceOutcome, resolve_backend_binaries, resolve_binary,
+    Scenario, ScenarioContext, ScenarioContextParams, ScenarioEvidenceOutcome,
+    resolve_backend_binaries, resolve_binary,
 };
 use crate::scenario_settlement::ScenarioSettlement;
 use crate::scenarios;
@@ -602,21 +603,21 @@ fn run_one_inner(
         }
     };
     settlement.cluster_launched();
-    let mut context = ScenarioContext::new(
-        scenario.name(),
+    let mut context = ScenarioContext::new(ScenarioContextParams {
+        name: scenario.name(),
         handle,
         scenario_root,
-        config.timeout,
+        timeout: config.timeout,
         original_deadline,
-        config.binary.clone(),
-        config.compatible_binary.clone(),
-        config.other_island_binary.clone(),
-        config.base_config_path.clone(),
-        config.cluster_size,
-        config.launch_profile,
-        config.build,
+        binary: config.binary.clone(),
+        compatible_binary: config.compatible_binary.clone(),
+        other_island_binary: config.other_island_binary.clone(),
+        base_config_path: config.base_config_path.clone(),
+        cluster_size: config.cluster_size,
+        launch_profile: config.launch_profile,
+        build: config.build,
         exact_mysql_clock,
-    );
+    });
     context.action("cluster launched and topology barrier passed");
     let result = scenario.run(&mut context).and_then(|()| {
         if std::time::Instant::now() >= original_deadline {
@@ -1182,11 +1183,14 @@ mod exact_mysql_prelaunch_teardown_tests {
                 "NOVAROCKS_MEM_1_M07_MYSQL_WRITE_NONCE_HEX".into(),
                 "synthetic-only".into(),
             );
-            let mut config = ScenarioLaunchConfig::default();
-            config.child_environment = environment;
-            config.binary_layout.frontend = self.frontend;
-            config.binary_layout.backends = self.backends.clone();
-            Ok(config)
+            Ok(ScenarioLaunchConfig {
+                child_environment: environment,
+                binary_layout: crate::scenario::ScenarioBinaryLayout {
+                    frontend: self.frontend,
+                    backends: self.backends.clone(),
+                },
+                ..ScenarioLaunchConfig::default()
+            })
         }
         fn run(&self, _: &mut ScenarioContext) -> Result<()> {
             panic!("prelaunch refusal must never launch a role")

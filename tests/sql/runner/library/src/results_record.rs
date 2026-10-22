@@ -1707,8 +1707,10 @@ mod lifecycle_tests {
             ResultsWriter::create(dir.path(), dir.path().join("results.jsonl").to_str()).unwrap();
         let source = dir.path().join("runner.conf");
         fs::write(&source, "password=secret").unwrap();
-        let mut config = crate::types::RunnerConfig::default();
-        config.path = Some(source.clone());
+        let mut config = crate::types::RunnerConfig {
+            path: Some(source.clone()),
+            ..crate::types::RunnerConfig::default()
+        };
         config.values.insert("password".into(), "secret".into());
         let cli = crate::Cli::try_parse_from(["sql-test", "--suite", "optimizer"]).unwrap();
         let path = writer

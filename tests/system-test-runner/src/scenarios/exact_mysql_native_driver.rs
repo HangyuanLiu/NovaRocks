@@ -339,12 +339,6 @@ impl PrivateControlOwner {
         self.identity = Some((metadata.dev(), metadata.ino()));
         Ok(())
     }
-    #[cfg(test)]
-    fn create() -> Result<Self> {
-        let mut owner = Self::reserve()?;
-        owner.initialize()?;
-        Ok(owner)
-    }
     fn environment(&self) -> CrossProcessChildEnvironment {
         let mut environment = CrossProcessChildEnvironment::default();
         environment.fe.insert(
@@ -1255,6 +1249,13 @@ async fn health(reader: &mut ExactResultReader) -> Result<()> {
 /// Retain both actual errors without formatting either source into a new string.
 struct SecondaryFailure {
     primary: anyhow::Error,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Retain the original secondary cleanup failure without formatting it."
+        )
+    )]
     secondary: anyhow::Error,
 }
 impl std::fmt::Debug for SecondaryFailure {

@@ -156,9 +156,6 @@ impl std::fmt::Debug for AdmittedHeldNativeRun {
     }
 }
 impl AdmittedHeldNativeRun {
-    pub(crate) fn original(&self) -> &AdmittedExactNativeRun {
-        &self.original
-    }
     /// Current scene receipt must name its current execution binding, not the
     /// immutable original ten-case binding. Both original hashes remain retained.
     pub(crate) fn for_scene(&self) -> AdmittedExactNativeRun {

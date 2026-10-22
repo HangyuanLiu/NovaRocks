@@ -144,7 +144,7 @@ fn parse_bound(line: &[u8]) -> Result<RawBound> {
         "original target marker digest width or extra fields are invalid"
     );
     let mut sql_sha256 = [0; 32];
-    for (output, pair) in sql_sha256.iter_mut().zip(digest.chunks_exact(2)) {
+    for (output, pair) in sql_sha256.iter_mut().zip(digest.as_chunks::<2>().0) {
         *output = hex(pair[0])? * 16 + hex(pair[1])?;
     }
     ensure!(

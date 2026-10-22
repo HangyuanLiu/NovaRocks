@@ -23,7 +23,6 @@ use novarocks_types::FrontendProcessId;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::io;
-use std::path::Path;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -516,43 +515,6 @@ pub struct UnixControlClient {
     used_arm: bool,
 }
 impl UnixControlClient {
-    /// Only this explicit fixture entry connects. No path/nonce input is formatted on failure.
-    pub async fn connect(
-        path: &Path,
-        actual_frontend: FrontendProcessId,
-        nonce: [u8; 16],
-        original_absolute_deadline: Instant,
-    ) -> Result<Self, ClientFailure> {
-        let empty = |class, cause: Option<io::Error>| ClientFailure {
-            class,
-            stage: ClientStage::Connect,
-            request: PrefixSummary::empty(),
-            response: PrefixSummary::empty(),
-            io_kind: cause.as_ref().map(io::Error::kind),
-            raw_os_error: cause.as_ref().and_then(io::Error::raw_os_error),
-        };
-        if nonce == [0; 16] {
-            return Err(empty(ClientClass::Decode(DecodeError::Identity), None));
-        }
-        if Instant::now() >= original_absolute_deadline {
-            return Err(empty(ClientClass::Deadline, None));
-        }
-        let stream = match tokio::time::timeout_at(
-            tokio::time::Instant::from_std(original_absolute_deadline),
-            UnixStream::connect(path),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(cause)) => return Err(empty(ClientClass::Io, Some(cause))),
-            Err(_) => return Err(empty(ClientClass::Deadline, None)),
-        };
-        if Instant::now() >= original_absolute_deadline {
-            drop(stream);
-            return Err(empty(ClientClass::Deadline, None));
-        }
-        Self::from_stream(stream, actual_frontend, nonce, original_absolute_deadline)
-    }
     /// Move one original already-connected stream into its sole owner; no handle clone.
     pub fn from_stream(
         stream: UnixStream,

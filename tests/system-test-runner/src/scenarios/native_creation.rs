@@ -49,9 +49,7 @@ use super::native_compatibility::{
     raw_acquire_admission_ticket, raw_apply_task_operations_until, raw_establish,
     raw_operation_envelope, raw_unary, raw_unary_response, raw_unary_until,
 };
-use super::query_lifecycle::native_sql_controls::{
-    SelectedStatement, SqlIntentOwner, StatementSpec,
-};
+use super::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec};
 use super::query_lifecycle::{
     NID2_FENCE_QUERY, arm_on_every_backend, assert_two_sleep_rows, await_backend_exit,
     await_fresh_task_create, await_resource_convergence, await_token_scoped_marker,

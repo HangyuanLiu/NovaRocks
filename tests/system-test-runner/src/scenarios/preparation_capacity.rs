@@ -363,7 +363,7 @@ fn same_batch(
             "same ApplyBatch did not promptly accept the exact ordered item: {receipt:?}"
         );
         let Some(proto::task_operation_verdict::Ack::CreateTask(ack)) =
-            &receipt_verdict(&receipt)?.ack
+            &receipt_verdict(receipt)?.ack
         else {
             bail!("same ApplyBatch omitted the Create acknowledgement");
         };

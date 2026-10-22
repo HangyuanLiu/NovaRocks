@@ -18,7 +18,6 @@
 //! Real process-boundary compatibility-island admission scenarios.
 
 use super::native_creation::receipt_verdict;
-use crate::actors::mysql as mysql_actor;
 #[path = "compatibility_sql_intent.rs"]
 mod compatibility_sql_intent;
 use crate::scenario::{
@@ -29,7 +28,6 @@ use bytes::Bytes;
 use compatibility_sql_intent::{CompatibilityIntent, CompatibilitySql};
 use h2::client;
 use http::{Request, header};
-use mysql::prelude::Queryable;
 use novarocks_cluster_harness::ServerHandle;
 use novarocks_native_trust::{NativeEndpointConnector, NativeTrust};
 use novarocks_proto_models::{common, novarocks as proto};
@@ -1633,32 +1631,6 @@ fn wait_for_eligible_count(context: &mut ScenarioContext, expected: usize) -> Re
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-}
-
-fn run_distributed_queries(
-    context: &mut ScenarioContext,
-    expected_backends: &[usize],
-) -> Result<()> {
-    let mut connection = mysql_actor::connect(
-        context.mysql_user(),
-        context.mysql_port(),
-        context.remaining("connect compatibility-island MySQL client")?,
-    )?;
-    for ordinal in 1..=3 {
-        let rows: Vec<i64> = connection
-            .query(BASELINE_QUERY)
-            .with_context(|| format!("run compatibility-island query {ordinal}"))?;
-        ensure!(
-            rows == vec![1, 2],
-            "compatibility-island query {ordinal} returned {rows:?}"
-        );
-    }
-    for &backend in expected_backends {
-        context
-            .handle()
-            .assert_be_log(backend, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

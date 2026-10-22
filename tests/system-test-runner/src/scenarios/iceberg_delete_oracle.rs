@@ -566,7 +566,7 @@ async fn observe_manifests(
         .snapshot_by_id(snapshot_id)
         .context("snapshot missing")?;
     let list = novarocks_connector_iceberg::manifest::load_manifest_list(
-        &snapshot,
+        snapshot,
         table.file_io(),
         metadata,
     )
@@ -578,7 +578,7 @@ async fn observe_manifests(
             continue;
         }
         let manifest =
-            novarocks_connector_iceberg::manifest::load_manifest(&manifest_file, table.file_io())
+            novarocks_connector_iceberg::manifest::load_manifest(manifest_file, table.file_io())
                 .await?;
         let spec = metadata
             .partition_spec_by_id(manifest_file.partition_spec_id)
@@ -895,7 +895,7 @@ fn decode_base64(text: &str) -> Result<Vec<u8>> {
             _ => bail!("invalid base64 digit"),
         })
     };
-    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+    for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let last = index + 1 == bytes.len() / 4;
         ensure!(
             last || !chunk.contains(&b'='),

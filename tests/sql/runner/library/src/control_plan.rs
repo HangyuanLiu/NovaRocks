@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 pub(crate) struct StepControl {
     pub submissions: Vec<PlannedSubmission>,
     pub needs_nomination: bool,
+    #[cfg(test)]
     pub native_faults: Vec<(usize, &'static str)>,
 }
 #[derive(Debug)]
@@ -718,6 +719,7 @@ pub(crate) fn build(
                         StepControl {
                             submissions,
                             needs_nomination,
+                            #[cfg(test)]
                             native_faults: faults,
                         },
                     );

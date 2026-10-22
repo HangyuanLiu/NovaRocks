@@ -26,7 +26,6 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 pub fn env_or_default(key: &str, default: &str) -> String {
@@ -408,12 +407,6 @@ fn substitute_known_variable_values(variables: &mut HashMap<String, String>) {
     }
 }
 
-pub fn stable_hash_hex(input: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    input.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
 pub fn case_auto_db_name(run: &str, ordinal: usize) -> Result<String> {
     crate::fixture_context::resource(run, 'd', ordinal, 0)
 }
@@ -781,11 +774,13 @@ oss_endpoint = "http://127.0.0.1:9000"
 
     #[test]
     fn mutable_extra_warehouse_uses_run_scope_without_rebinding_ready_datasets() {
-        let mut config = RunnerConfig::default();
-        config.fixture_names = Some(std::sync::Arc::new(crate::fixture_context::test_names(
-            "iceberg",
-            &["case"],
-        )));
+        let mut config = RunnerConfig {
+            fixture_names: Some(std::sync::Arc::new(crate::fixture_context::test_names(
+                "iceberg",
+                &["case"],
+            ))),
+            ..RunnerConfig::default()
+        };
         for (key, value) in [
             ("iceberg_test_warehouse", "s3://novarocks/legacy-extra"),
             (
@@ -826,11 +821,13 @@ oss_endpoint = "http://127.0.0.1:9000"
     }
     #[test]
     fn shared_rest_ctas_warehouses_use_run_root_without_changing_ready_or_private_bindings() {
-        let mut config = RunnerConfig::default();
-        config.fixture_names = Some(std::sync::Arc::new(crate::fixture_context::test_names(
-            "iceberg",
-            &["case"],
-        )));
+        let mut config = RunnerConfig {
+            fixture_names: Some(std::sync::Arc::new(crate::fixture_context::test_names(
+                "iceberg",
+                &["case"],
+            ))),
+            ..RunnerConfig::default()
+        };
         config.values.insert(
             "iceberg_rest_warehouse".into(),
             "s3://warehouse/private/actual".into(),

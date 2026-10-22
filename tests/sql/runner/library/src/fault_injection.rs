@@ -341,6 +341,7 @@ pub(crate) fn configured_query_lifecycle_faults(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -> Result<()> {
     apply_pre_query_with_token(meta, server, None, None)
 }

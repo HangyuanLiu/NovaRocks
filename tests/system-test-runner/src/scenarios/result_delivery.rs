@@ -18,7 +18,7 @@
 use super::result_delivery_support::await_idle;
 use crate::actors::mysql_stream::{AsyncMysqlStream, TextColumnObservation, TextResultObservation};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
-use crate::scenarios::query_lifecycle::native_sql_controls::{SqlIntentOwner, StatementSpec};
+use crate::scenarios::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use anyhow::{Context, Result, ensure};
 use novarocks_cluster_harness::{QueryLifecycleStatementObservation, ServerHandle};
 use novarocks_execution_contract::failure::{FailureClass, FailureFact, FailureReason, domain};

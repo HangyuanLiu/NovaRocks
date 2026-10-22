@@ -1,5 +1,5 @@
 use super::mv_uea7::ManagedMvRestFixture;
-use super::query_lifecycle::native_sql_controls::SelectedStatement;
+use super::native_sql_controls::SelectedStatement;
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use ::mysql::prelude::{FromRow, Queryable};

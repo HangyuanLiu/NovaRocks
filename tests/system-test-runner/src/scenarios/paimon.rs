@@ -26,9 +26,7 @@ use super::connector::{
     await_resource_convergence, connector_launch_config, create_catalog, create_warehouse,
     require_three_backends, resource_baseline,
 };
-use super::query_lifecycle::native_sql_controls::{
-    SelectedStatement, SqlIntentOwner, StatementSpec,
-};
+use super::native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec};
 use super::task_evidence::assert_query_completed_across_boundary;
 #[path = "scan_statement_actor.rs"]
 pub(super) mod scan_statement_actor;
@@ -193,6 +191,8 @@ impl Scenario for PaimonReadData {
             "partitioned Paimon rows differ from the external oracle: {partitioned:?}"
         );
 
+        type TypedPaimonRow = (i64, Option<String>, Option<String>, Option<String>);
+
         let selected = self.intent.take(2)?;
         selected.arm(context, control.connection_id(), &selected.sql)?;
         let empty: Vec<i64> = control
@@ -202,7 +202,7 @@ impl Scenario for PaimonReadData {
 
         let selected = self.intent.take(3)?;
         selected.arm(context, control.connection_id(), &selected.sql)?;
-        let typed: Vec<(i64, Option<String>, Option<String>, Option<String>)> = control
+        let typed: Vec<TypedPaimonRow> = control
             .query(&selected.sql)
             .context("read Paimon scalar type matrix")?;
         ensure!(

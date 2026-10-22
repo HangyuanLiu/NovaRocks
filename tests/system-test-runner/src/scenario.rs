@@ -274,22 +274,39 @@ pub struct ScenarioPhaseObservation {
     counters: BTreeMap<&'static str, u64>,
 }
 
+pub(crate) struct ScenarioContextParams {
+    pub name: &'static str,
+    pub handle: CrossProcessServerHandle,
+    pub scenario_root: PathBuf,
+    pub timeout: Duration,
+    pub original_deadline: Instant,
+    pub binary: PathBuf,
+    pub compatible_binary: Option<PathBuf>,
+    pub other_island_binary: Option<PathBuf>,
+    pub base_config_path: PathBuf,
+    pub cluster_size: usize,
+    pub launch_profile: LaunchProfile,
+    pub build: crate::build_information::BuildInformation,
+    pub exact_mysql_clock: Option<ExactMysqlPrelaunchClock>,
+}
+
 impl ScenarioContext {
-    pub(crate) fn new(
-        name: &'static str,
-        handle: CrossProcessServerHandle,
-        scenario_root: PathBuf,
-        timeout: Duration,
-        original_deadline: Instant,
-        binary: PathBuf,
-        compatible_binary: Option<PathBuf>,
-        other_island_binary: Option<PathBuf>,
-        base_config_path: PathBuf,
-        cluster_size: usize,
-        launch_profile: LaunchProfile,
-        build: crate::build_information::BuildInformation,
-        exact_mysql_clock: Option<ExactMysqlPrelaunchClock>,
-    ) -> Self {
+    pub(crate) fn new(params: ScenarioContextParams) -> Self {
+        let ScenarioContextParams {
+            name,
+            handle,
+            scenario_root,
+            timeout,
+            original_deadline,
+            binary,
+            compatible_binary,
+            other_island_binary,
+            base_config_path,
+            cluster_size,
+            launch_profile,
+            build,
+            exact_mysql_clock,
+        } = params;
         Self {
             build,
             name,

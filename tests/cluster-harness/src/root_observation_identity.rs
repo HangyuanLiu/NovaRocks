@@ -23,6 +23,7 @@ use std::time::Instant;
 
 pub(crate) const SCAN_BYTES: u64 = 2 * 1024 * 1024;
 const STEM: &[u8] = b"NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_FE";
+#[cfg(test)]
 const BASE: &[u8] = b"NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_FE ";
 const PREFIX: &[u8] = b"NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_FE frontend_process_id=";
 const LINE_BYTES: usize = 384;
