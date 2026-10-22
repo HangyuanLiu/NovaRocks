@@ -669,7 +669,14 @@ class MachineDocker(runtime.Docker):
             runtime.atomic_json(path, fact)
 
     def remove_rest_state(self, record):
-        self.compose(record, ["rm", "-f", "rest", "rest-mv"])
+        # Revalidate the exact saved activation on every retry. Compose service
+        # selectors would also select an externally replaced container.
+        containers = [info["Id"] for service in ("rest", "rest-mv")
+                      if (info := self.container(record, service))]
+        if containers:
+            # Writers must already have exited; do not force-remove a running
+            # process if it was restarted outside this maintenance intent.
+            self.command(["rm", *containers])
         for service in ("rest", "rest-mv"):
             name = PROJECT + "_" + service + "-catalog"
             volume = self.inspect("volume", name, absent_ok=True)
@@ -950,11 +957,12 @@ class MachineOwner:
                     fence["offline_catalog_barrier"] = barrier
                     steps["rest_removed"] = True
                     self._save(record)
-                # A durable observation does not replace a fresh native absence
-                # check when resuming an interrupted purge under the same intent.
-                fence["offline_catalog_barrier"] = self.backend.rest_state_barrier(fence)
-                self._save(record)
                 if not steps.get("purged"):
+                    # A durable observation does not replace a fresh native
+                    # check before retrying purge. Once purge is committed,
+                    # target activation may already have created new catalogs.
+                    fence["offline_catalog_barrier"] = self.backend.rest_state_barrier(fence)
+                    self._save(record)
                     sweeper = self._sweeper(fence)
                     sweeper.revoke_users()
                     report = sweeper.sweep(expired_only=False, deadline=time.monotonic() + self.timeout)

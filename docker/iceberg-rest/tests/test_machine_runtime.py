@@ -850,6 +850,39 @@ class MachineTests(unittest.TestCase):
         self.owner.sweeper_factory = factory
         self.owner.activate(self.changed(), upgrade=True)
 
+    def test_upgrade_health_failure_resumes_target_catalogs_without_repurging(self):
+        self.start()
+        self.backend.failure = "health"
+        self.assert_code("ReadinessTimeout", lambda: self.owner.activate(self.changed(), upgrade=True))
+        failed = self.owner.read_saved_state()
+        self.assertTrue(failed["steps"]["purged"])
+        self.assertTrue(failed["steps"]["activation_started"])
+        self.assertTrue(self.backend.catalog_present)
+        self.backend.events.clear()
+        self.backend.failure = None
+        final = self.owner.activate(self.changed(), upgrade=True)
+        self.assertEqual(final["generation"], failed["generation"])
+        self.assertEqual(final["phase"], "ready")
+        self.assertEqual(self.backend.events, ["ensure"])
+
+    def test_cancelled_target_activation_resumes_without_deleting_new_catalogs(self):
+        self.start()
+        original = self.backend.ensure_machine
+        def interrupted(record, previous=None):
+            original(record, previous)
+            raise KeyboardInterrupt
+        with mock.patch.object(self.backend, "ensure_machine", side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.owner.activate(self.changed(), upgrade=True)
+        failed = self.owner.read_saved_state()
+        self.assertTrue(failed["steps"]["purged"])
+        self.assertTrue(self.backend.catalog_present)
+        self.backend.events.clear()
+        final = self.owner.activate(self.changed(), upgrade=True)
+        self.assertEqual(final["phase"], "ready")
+        self.assertEqual(final["generation"], failed["generation"])
+        self.assertEqual(self.backend.events, ["ensure"])
+
     def test_unconfirmed_fence_never_purges_and_retries_without_another_rotation(self):
         self.start()
         self.backend.failure = "fence"
@@ -1007,6 +1040,29 @@ class DockerActivationTests(unittest.TestCase):
         barrier = self.docker.rest_state_barrier(self.source)
         self.assertTrue(barrier["complete"])
         self.assertEqual(barrier["generation"], self.source["generation"])
+
+    def test_catalog_removal_rejects_replacement_before_deleting_any_container(self):
+        self.install(self.source, "rest-mv", identity="external-replacement")
+        with mock.patch.object(self.docker, "command", wraps=self.docker.command) as command:
+            with self.assertRaisesRegex(runtime.RuntimeFailure, "replaced outside maintenance"):
+                self.docker.remove_rest_state(self.source)
+        self.assertFalse(any(call.args[0][0] in {"rm", "compose"} for call in command.call_args_list))
+
+    def test_catalog_removal_targets_verified_ids_and_confirms_native_absence(self):
+        identifiers = [self.source["containers"][s] for s in ("rest", "rest-mv")]
+        original = self.docker.command
+        mutations = []
+        def command(args, **kwargs):
+            if args[0] == "rm":
+                mutations.append(args)
+                for service in ("rest", "rest-mv"):
+                    self.infos.pop(service, None)
+                return ""
+            return original(args, **kwargs)
+        with mock.patch.object(self.docker, "command", side_effect=command):
+            barrier = self.docker.remove_rest_state(self.source)
+        self.assertEqual(mutations, [["rm", *identifiers]])
+        self.assertTrue(barrier["complete"])
 
 
 if __name__ == "__main__":
