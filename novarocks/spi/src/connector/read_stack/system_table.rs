@@ -20,6 +20,7 @@
 use crate::connector::{ConnectorError, ConnectorErrorKind};
 
 /// Provider work-unit hint used only for frontend placement; never an execution constraint.
+// Design: ADR-0192 (docs/adr/ADR-0192-provider-work-units-share-one-runtime-split-path.md)
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SystemTableUnitHint {
     /// Distributed over the admitted workers through a typed split source.

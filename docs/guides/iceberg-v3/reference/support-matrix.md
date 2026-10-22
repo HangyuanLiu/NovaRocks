@@ -202,16 +202,19 @@ under the License.
 
 ## 9. Metadata Tables
 
+列与空输入行为详见 [Metadata Tables](../metadata-tables.md)。
+
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| `$snapshots` | ✅ | BE PR #81 + SQL 路由 PR #85 |
-| `$history` | ✅ | BE PR #81 + SQL 路由 PR #85 |
-| `$refs`（branches + tags） | ✅ | BE PR #81 + SQL 路由 PR #85 |
-| `$partitions` | ✅ | BE PR #81 + SQL 路由 PR #85 |
-| `$manifests` | ❌ | |
-| `$files` / `$all_data_files` | ❌ | |
-| `$delete_files` / `$all_delete_files` | ❌ | |
-| `$entries`（manifest entries） | ❌ | |
+| `$snapshots` | ✅ | 冻结 metadata 上的 snapshot 元信息 |
+| `$history` | ✅ | snapshot 历史 |
+| `$refs`（branches + tags） | ✅ | 引用及保留策略 |
+| `$manifests` | ✅ | 所选 snapshot 的 manifest 列表 |
+| `$files` | ✅ | 有效文件；按 `content` 区分 data/delete 文件 |
+| `$entries`（manifest entries） | ✅ | 所选 snapshot 的 entry 及状态 |
+| `$partitions` | ✅ | `$files` 的数据文件聚合视图；可选 `partition` ROW、可空 `record_count`/`total_size`、非空 `file_count`；无数据文件返回零行 |
+| `$all_data_files` | ❌ | |
+| `$delete_files` / `$all_delete_files` | ❌ | 当前删除文件可筛选 `$files.content` |
 | `$metadata_log_entries` | ❌ | |
 | `$position_deletes` | ❌ | |
 | `$all_files`（V3 统一视图） | ❌ | |

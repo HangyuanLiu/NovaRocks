@@ -18,7 +18,7 @@ code-anchors:
   - "novarocks/execution/src/exec/pipeline/operator.rs (Operator::pending_finish, FinishWatch)"
   - "novarocks/execution/src/exec/pipeline/schedule/event_scheduler.rs (add_pending_finish)"
   - "novarocks/execution/src/exec/operators/runtime_filter/mod.rs (poll_gate)"
-  - "novarocks/worker/src/typed_connector_runtime/stream.rs (TypedConnectorScanStream, TypedSystemTableStream)"
+  - "novarocks/worker/src/typed_connector_runtime/stream.rs (TypedConnectorScanStream)"
   - "novarocks/worker/src/query_context.rs (QueryExecutionKey)"
 ---
 
