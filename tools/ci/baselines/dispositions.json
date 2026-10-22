@@ -772,16 +772,6 @@
       "expires": "2026-12-15"
     },
     {
-      "unit": "sql-case:function/function_cast",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Unsupported compiled cast from: Utf8, to: Binary; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
       "unit": "sql-case:function/function_conditional",
       "failure": {
         "class": "error_code",
@@ -809,26 +799,6 @@
       },
       "reason": "Missing installed pure implementation for builtin.scalar/aes_encrypt/(any...)->utf8;strict;legacy; owner B8, I1, I5; remove after capability repair and native verification",
       "owner": "B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:function/function_field",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Unsupported compiled cast from: Timestamp(Microsecond, None), to: Float64; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
-      "expires": "2026-12-15"
-    },
-    {
-      "unit": "sql-case:function/function_field_common_type",
-      "failure": {
-        "class": "error_code",
-        "code": "UnsupportedCompiledShape"
-      },
-      "reason": "Unsupported compiled cast from: Utf8, to: Float64; owner B7, B8, I1, I5; remove after capability repair and native verification",
-      "owner": "B7, B8, I1, I5",
       "expires": "2026-12-15"
     },
     {
