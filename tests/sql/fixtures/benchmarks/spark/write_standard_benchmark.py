@@ -18,6 +18,7 @@
 
 import argparse
 import json
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -240,13 +241,16 @@ def parse_args():
     parser.add_argument("--warehouse", required=True)
     parser.add_argument("--manifest-output", required=True)
     parser.add_argument("--s3-endpoint", required=True)
-    parser.add_argument("--s3-access-key", required=True)
-    parser.add_argument("--s3-secret-key", required=True)
+    parser.add_argument("--s3-access-key", default=os.environ.get("AWS_ACCESS_KEY_ID"))
+    parser.add_argument("--s3-secret-key", default=os.environ.get("AWS_SECRET_ACCESS_KEY"))
     parser.add_argument("--generator", required=True)
     parser.add_argument("--generator-version", required=True)
     parser.add_argument("--schema-ddl")
     parser.add_argument("--fixture-contract-json")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.s3_access_key or not args.s3_secret_key:
+        parser.error("S3 credentials require the explicit arguments or the producer environment")
+    return args
 
 
 def load_fixture_contract(args):

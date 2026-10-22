@@ -73,6 +73,7 @@ AWS_S3_ACCESS_KEY_ID=test-key
 AWS_S3_SECRET_ACCESS_KEY=test-secret
 EOF
 : > "$TMP/compose.env"; : > "$TMP/compose.yml"
+cp "$TMP/binding/r2-publication/manifest.json" "$TMP/manifest.json"
 resolved="$TMP/resolved.json"
 python3 "$ROOT/tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py" --workspace-root "$ROOT" --suite ssb --scale 1 --shared-root s3://fixture/shared/benchmarks > "$resolved"
 python3 - "$resolved" "$BENCHMARK_FIXTURE_STORAGE_DIR" <<'PY'

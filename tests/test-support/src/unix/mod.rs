@@ -27,6 +27,10 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::Child;
 use std::time::{Duration, Instant};
+mod process_group;
+pub fn process_group_running(child: &Child) -> io::Result<bool> {
+    process_group::running(child)
+}
 
 #[cfg(not(all(
     target_pointer_width = "64",

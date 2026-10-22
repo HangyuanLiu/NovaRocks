@@ -26,4 +26,4 @@ docker/iceberg-rest/up.sh --prepare-only
 """
 
 [cleanup]
-script = "docker/iceberg-rest/down.sh --runtime-only --purge"
+script = "docker/iceberg-rest/down.sh --runtime-only"

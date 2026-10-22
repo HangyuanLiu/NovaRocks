@@ -27,7 +27,11 @@ fi
 # shellcheck disable=SC1090
 source "$env_file"
 
-compose=(docker compose --env-file "$NOVA_ENV_COMPOSE_ENV" \
+NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" context --env-file "$env_file")"
+export NOVA_FIXTURE_RUN_CONTEXT
+NOVA_FIXTURE_RUN_STORAGE="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" storage --env-file "$env_file")"
+export NOVA_FIXTURE_RUN_STORAGE
+compose=(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" compose --env-file "$env_file" -- --env-file "$NOVA_ENV_COMPOSE_ENV" \
   -p "$NOVA_ENV_COMPOSE_PROJECT" -f "$NOVA_ENV_COMPOSE_FILE")
 "${compose[@]}" ps --status running spark | grep -q spark || {
   echo "Spark fixture is not running; run docker/iceberg-rest/up.sh first" >&2
@@ -39,10 +43,14 @@ runtime_digest=$("${compose[@]}" exec -T spark sha256sum "$runtime_jar" | awk '{
 test "$runtime_digest" = "94b8e36fc329f0293d44ba9e01b784a56e9501affec1842d898144c51f6e486a"
 
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/novarocks-spark-theta-interop.XXXXXX")
-container_dir="/tmp/novarocks-spark-theta-interop-$$"
+container_dir="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" temp-dir --env-file "$env_file")"
 cleanup() {
-  "${compose[@]}" exec -T spark rm -rf "$container_dir" >/dev/null 2>&1 || true
-  rm -rf "$work_dir"
+  local primary=$? cleanup=0
+  trap - EXIT
+  python3 "$repo_root/docker/iceberg-rest/fixture_run.py" cleanup-dir --env-file "$env_file" --path "$container_dir" || cleanup=$?
+  rm -rf "$work_dir" || cleanup=$?
+  (( primary == 0 )) || exit "$primary"
+  exit "$cleanup"
 }
 trap cleanup EXIT
 
@@ -65,7 +73,7 @@ trap cleanup EXIT
     -i '$container_dir/VerifyThetaInterop.scala'"
 
 "${compose[@]}" cp "spark:$container_dir/spark_disjoint_n1000.sk" "$work_dir/"
-cargo run --quiet --locked -p novarocks-datasketches-tck \
+python3 "$repo_root/docker/iceberg-rest/fixture_run.py" command --env-file "$env_file" -- cargo run --quiet --locked -p novarocks-datasketches-tck \
   --bin verify_theta_interop -- \
   "$work_dir/spark_disjoint_n1000.sk" 1000 \
   "$repo_root/tests/datasketches-tck/fixtures/theta/rust_quickselect_n1000_ordered_v3.sk" 2000

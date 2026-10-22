@@ -582,9 +582,9 @@ the CI fixture for the `iceberg`, `iceberg-compatibility`, and `iceberg-rest`
 SQL suites. The Codex workspace manifest at
 `.codex/environments/environment.toml` points setup at this directory.
 
-共享 Docker fixture 由版本化 runtime owner 管理：一个对象存储实例可以供多个 catalog 实例使用，相同输入附着同一实例，输入变化创建并存版本。控制目录默认是 `${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/fixture-runtime`，可由 `NOVA_FIXTURE_RUNTIME_DIR` 指定；资源身份同时包含控制目录与本机 Docker daemon。服务端口由 owner 预留，默认范围 `28000..28999`，不能假设 `9000/8181/4040` 或固定 Compose 项目。
+共享 Docker fixture 由机器 owner 管理：每个 daemon 使用固定 `nr-fixture-machine` 项目和 `nr-fixture-machine_iceberg_net` 网络，运行一组 MinIO、REST、rest-mv、Spark 与 mc。控制目录默认 `${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/fixture-machine`，管理命令可显式 `--root`；换目录不能在同 daemon 创建第二套。固定服务端口来自机器配置（默认28000..28005），FE/BE端口仍按worktree/harness分配。普通 `up.sh` 只核验并附着ready同版本机器；显式 `fixture-runtime.sh start/upgrade` 才维护服务。完整版本含验证后的BOM/derived定义、实际image ID、模板和配置；输入变化不自动启动并存栈。见 [ADR-0191](docs/adr/ADR-0191-machine-shared-fixture-and-bounded-scratch.md)。
 
-Codex setup 的 `docker/iceberg-rest/up.sh --prepare-only` 不调用 Docker。它按入口已保存的 owner locator 和记录发布配置；`ready=true` 只表示保存的记录为 ready，不证明当前健康。首次、记录缺失或 deleting 时发布 unbound，清除端点和镜像变量；正常 `up.sh` 先验证本机 BOM，再恢复或附着实例。
+Codex setup 的 `docker/iceberg-rest/up.sh --prepare-only` 不调用 Docker，只发布unbound入口并清除端点/镜像变量。真正消费者必须先运行正常 `up.sh`，核验本机BOM、机器version/generation、实际资源和健康后附着。离线prepare不证明健康，也不启动或修复机器。
 
 `runtime/current` 定位本 worktree 的稳定入口，入口的 `published` 是唯一绑定提交点。消费者在启动时解析一次 publication，再 source 其中的 `env.sh`；所有配置路径指向同一不可变 publication。`NOVA_ENV_RUNTIME_DIR` 保存 SQLite 等稳定运行数据，不能拼接成 `NOVA_ENV_RUNTIME_DIR/env.sh`。推荐：
 
@@ -720,9 +720,11 @@ and `http://minio:9000` for object storage. NovaRocks should use the host
 endpoints from `env.sh`. Do not mix container endpoints into NovaRocks catalog
 SQL.
 
-`docker/iceberg-rest/down.sh --runtime-only` 显式解绑，发布 unbound 并回收旧输出，保留全部历史 `data_locations`。加 `--purge` 才清理全部已记录对象存储位置的私有前缀；只有全部成功才释放数据引用，失败保留原发布供重试。共享 SSB/TPC 正确性 READY 数据不属于 worktree 清理范围；首次新对象存储需由输入 owner 显式准备并校验。
+`docker/iceberg-rest/down.sh --runtime-only` 发布unbound，保留固定锁、SQLite及旧不可变publication。共享 `--purge` 不删除整个worktree的S3前缀；正常运行按原身份精确清理，崩溃遗留由显式 `fixture-runtime.sh sweep` 按TTL回收。benchmark根及全部对象（包括staging）受保护，不能按旧owner/data_locations删除。共享模式拒绝 `down.sh --docker/--volumes`。
 
-共享服务的停止与删除使用 `docker/iceberg-rest/fixture-runtime.sh stop/delete <exact-runtime-id>`，全局 `--root/--daemon` 放在子命令前并取自 manifest 的 owner locator。catalog 普通删除在有绑定时拒绝；force 只条件解绑仍指向目标的 worktree，保留数据引用。对象存储默认停止和任何删除都受 catalog/数据引用保护；force-stop 可以中断消费者但保留记录、卷和端口。HMS 或其他外部 endpoint 未退出时普通/force catalog 删除均在破坏操作前拒绝；先按 HMS 自身入口退出。共享模式拒绝 `down.sh --docker/--volumes`。旧 `nr-iceberg-rest`、`nr-iceberg-hive` 项目和卷不自动接管或删除，退出由用户另行安排。
+机器维护使用 `docker/iceberg-rest/fixture-runtime.sh [--root <control-root>] start/status/upgrade/sweep`，不再提供多版本stop/delete或owner locator协议。升级保存maintenance，停止共享writers、轮换旧root并撤销原IAM/STS后，先移除准确旧REST实例/状态卷，确认absence并持久记录catalog屏障，再保持MinIO在线清理准确scratch，切换并核实健康才提交ready。失败保持maintenance，真实unknown不猜成功；历史项目/网络/卷不自动接管或删除。HMS拥有自己的项目与Derby卷，只接入机器的外部网络；私有stock/publication-hook保留原生命周期，vended只共享准确MinIO。
+
+SQL/System/Spark/直接producer在首次scratch副作用前准入整次预算，默认3600秒、不得超过机器max-run（默认86400），原完整期限内预留300秒清理；嵌套继承同一run ID与期限。到期由原进程owner停止真实writer、确认退出并保留清理失败，不能只杀Docker客户端。scratch资源保留完整时间/run ID，`NOVA_FIXTURE_RUN_STORAGE`在开始前固定原run root与两个REST warehouse的run名称前缀；JDBC默认表/view位置、rename、显式位置与CTAS统一检查属于这三个范围，不依赖namespace location继承。正常/TTL递归删除文件前须完成跨两个共享REST的整运行catalog屏障及IAM撤销；未知命名不自动删除，共享Spark凭证不受运行IAM全面约束。只读READY warehouse保持原绑定。TTL默认604800秒，不替代正常teardown。
 
 真实验收基准仍为 1FE+3BE；all-in-one 只作 smoke。fixture verify 和测试不自行下载或构建缺失输入，BOM 前置条件失败为 BLOCKED（75），端口/身份/生命周期失败为 VERIFY FAILED。
 

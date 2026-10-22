@@ -43,6 +43,8 @@ sql_runner="$(ci_bound_binary novarocks-sql-test)"
   --cluster-mode cross-process --cluster-size 3 -j 1
 ```
 
+共享fixture由机器owner显式start/upgrade，普通up只附着ready同版本机器。SQL在首次scratch或私有fixture副作用前准入 `--fixture-budget-secs`（默认3600），继承原run ID与完整期限，工作期只能收窄，原完整期限内预留清理；超上限BLOCKED，准入后到期FAIL。namespace使用完整run身份与有限ordinal，保留原CREATE/golden；不写namespace location，JDBC默认表/view、rename、显式位置和CTAS统一验证属于固定三范围。独立原生运行确认角色及producer退出后按整运行catalog→IAM→文件顺序清理；嵌套/外部server保留原owner责任与deferred事实。嵌套shell/retry/role restart不续期；只读READY继续原warehouse与check-only。见 [ADR-0191](../../docs/adr/ADR-0191-machine-shared-fixture-and-bounded-scratch.md)。
+
 `--list-suites` 列出所有注册套件，包括 explicit-only；`--list-declarations` 输出 schema 1 的 suite impact、环境输入、reuse 初始状态/范围、重项依据与 case 清单，不启动集群。`--suite all` 按 suite manifest 排除 explicit-only 和 DISABLED，构成常规 SQL 集合的原生来源。`--list-extensions` 不启动集群。默认配置不提供完整 fixture 端点，不能用旧环境补造缺项。隔离 REST 套件由 runner 启停私有 fixture，准备和测试分离，见 [fixture 操作](../../docker/iceberg-rest/README.md)。
 
 能力需求来自 merge/过滤后真正选中的有限步骤、已有指令与原生 capability tag；普通 SQL 仍使用同一主产物，内部断言不能因缺测试产物而跳过。feature 编入、profile、suite 名或旧环境不授予控制，裸测试 CALL 也没有自动权限。`test-capability:mv-document-observation` 只声明非破坏观察，不授予 wipe；未知 `test-capability:` 值明确拒绝。`mv_storage_contract_shared_document_revisions.sql` query 5/6 已就近声明此 tag，并保留原六个普通标签；两步只请求非破坏观察，SQL/expected/oracle 不变。G2 的完整 storage-contract 十个 case 已通过，验证范围与未运行项见 [G2 验证记录](../../docs/guides/development/tst-g2-validation-status.md)。
@@ -65,7 +67,7 @@ cluster-harness 继续拥有 FE/BE 的应用生命周期、原生 1FE+NBE 拓扑
 
 角色的输出定位文件指向 run-owned `stdout.log`、`stderr.log` 和监护记录，不能把 locator 当 combined log。runner/harness 通过原始 source handle 读取，失败材料关联真实位置；实时完整 UTF-8 行诊断上限为 1 MiB，超限明确失败并保留原始字节，不截断完整 SQL golden 输出。snapshot 拒绝替换/截短的日志文件。完整 capture 消费原期限，timeout/复制失败后的原始双流保留在 `diagnostic_root`。
 
-受原查询期限约束的 shell 走 `ManagedCommand`/capture；普通无期限 shell 仍由其原 owner 直接运行。Docker/fixture owner、stdin 协议 helper、listing observer 和专用 fencing helper 也不被这份共享接线自动接管。嵌在 nextest 中首次启动 runner 前，外层测试必须先 `ensure_run_retention(deadline)` 并保留继承上下文；直接运行 SQL CLI 无需伪造 nextest 身份。普通保留默认最近三次已收束调用；活动和未完成材料不淘汰，正式材料不受该窗口影响。
+受原查询期限约束的 shell 走 `ManagedCommand`/capture；共享运行中未单独指定query期限的shell仍受原fixture预算；没有fixture预算的私有路径由原owner运行。Docker/fixture owner、stdin 协议 helper、listing observer 和专用 fencing helper 也不被这份共享接线自动接管。嵌在 nextest 中首次启动 runner 前，外层测试必须先 `ensure_run_retention(deadline)` 并保留继承上下文；直接运行 SQL CLI 无需伪造 nextest 身份。普通保留默认最近三次已收束调用；活动和未完成材料不淘汰，正式材料不受该窗口影响。
 
 容器运行状态根及正式证据根需 bind-mount 支持的本地文件系统；overlay 不作锁语义 fallback。详细 API、保留/释放责任、macOS 排查与 native Linux x86_64 尚未补齐的验证见 [test-support README](../test-support/README.md)。规范 Rust 的 nextest 与正式原始结果接口见 [CI README](../../tools/ci/README.md)；这些机械验证不替代本 suite 的真实 fixture 和 native 1FE+3BE 验收。
 

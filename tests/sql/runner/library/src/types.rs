@@ -577,6 +577,9 @@ pub struct SqlStep {
 
 #[derive(Debug, Clone)]
 pub struct SqlCase {
+    pub expected_variables: HashMap<String, String>,
+    pub namespace_rewrites: std::collections::BTreeMap<String, String>,
+    pub auto_db: String,
     pub source_file: PathBuf,
     pub case_id: String,
     pub steps: Vec<SqlStep>,
@@ -624,6 +627,7 @@ pub struct SuiteHook {
 
 #[derive(Debug, Default, Clone)]
 pub struct RunnerConfig {
+    pub(crate) fixture_names: Option<std::sync::Arc<crate::fixture_context::RunNames>>,
     pub path: Option<PathBuf>,
     pub values: HashMap<String, String>,
     pub cluster: HashMap<String, String>,

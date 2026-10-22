@@ -16,6 +16,7 @@ from pyiceberg.manifest import DataFile
 from pyiceberg.table import TableProperties, _parquet_files_to_data_files
 
 from fixture import MANIFEST_FILE, PROBE_FILE, READY_FILE, sha256, verify
+import publish as governed_publish
 from publish import DEFAULT_NAMESPACE, TABLES, catalog_from_environment
 
 TABLE_NAME = "probe_whole_v1"
@@ -156,9 +157,19 @@ def publish(directory: Path, receipt_path: Path, namespace: str) -> None:
     require(catalog.namespace_exists(namespace), "RF fixture namespace is absent")
     require(not catalog.table_exists((namespace, TABLE_NAME)), f"refusing to mutate existing {namespace}.{TABLE_NAME}")
     source = source_record(catalog, namespace, local_file)
+    run = governed_publish.RUN
+    location = run.identity.scope_root + "/rest/" + namespace + "/" + TABLE_NAME if run else None
+    if run:
+        source_table = catalog.load_table((namespace, SOURCE_TABLE_NAME))
+        require(source_table.location() == run.identity.scope_root + "/rest/" + namespace + "/" + SOURCE_TABLE_NAME,
+                "source RF table does not belong to the persisted original scratch run")
+        governed_publish.fixture_run.startup_sweep(
+            Path(os.environ["NOVA_ENV_REST_ENV_FILE"]), budget=run)
     table = catalog.create_table(
-        (namespace, TABLE_NAME), schema=TABLES[SOURCE_TABLE_NAME][1], properties={"format-version": "2"}
+        (namespace, TABLE_NAME), schema=TABLES[SOURCE_TABLE_NAME][1], location=location,
+        properties={"format-version": "2"}
     )
+    require(not run or table.location() == location, "whole-file table escaped its original scratch location")
     object_uri = table.location().rstrip("/") + "/data/" + PROBE_FILE
     with local_file.open("rb") as source_file, table.io.new_output(object_uri).create(overwrite=False) as destination:
         shutil.copyfileobj(source_file, destination, length=1024 * 1024)
@@ -168,6 +179,8 @@ def publish(directory: Path, receipt_path: Path, namespace: str) -> None:
     receipt = {
         "schema_version": 1,
         "namespace": namespace,
+        "run_context": run.as_dict() if run else None,
+        "run_storage": json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]) if run else None,
         "rest_uri": os.environ["NOVAROCKS_ICEBERG_REST_URI"],
         "warehouse": os.environ["NOVAROCKS_ICEBERG_REST_WAREHOUSE"],
         "local_manifest_sha256": sha256(directory / MANIFEST_FILE),
@@ -200,11 +213,26 @@ def main() -> None:
     parser.add_argument("mode", choices=("publish", "verify-published"))
     parser.add_argument("--directory", type=Path, default=Path(__file__).parent)
     parser.add_argument("--receipt", type=Path, default=Path(__file__).parent / "whole_published.json")
-    parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
+    parser.add_argument("--namespace")
+    parser.add_argument("--source-receipt", type=Path, default=Path(__file__).parent / "published.json")
+    parser.add_argument("--fixture-budget-secs", type=int, default=3600)
     arguments = parser.parse_args()
     if arguments.mode == "publish":
-        publish(arguments.directory, arguments.receipt, arguments.namespace)
+        source_receipt = json.loads(arguments.source_receipt.read_text()) if arguments.source_receipt.exists() else None
+        restored = bool(source_receipt and source_receipt.get("run_context") is not None and
+                        governed_publish.fixture_run.restore_context(arguments.source_receipt))
+        run = governed_publish.admit_run(arguments.fixture_budget_secs)
+        if run:
+            require(restored, "shared whole-file publication needs the source receipt's original run context")
+            namespace = governed_publish.writer_namespace(arguments.namespace or source_receipt["namespace"])
+            require(source_receipt.get("namespace") == namespace, "source receipt namespace differs")
+            require(source_receipt.get("rest_uri") == os.environ["NOVAROCKS_ICEBERG_REST_URI"], "source REST endpoint differs")
+            require(source_receipt.get("warehouse") == os.environ["NOVAROCKS_ICEBERG_REST_WAREHOUSE"], "source REST warehouse differs")
+        else:
+            namespace = arguments.namespace or DEFAULT_NAMESPACE
+        publish(arguments.directory, arguments.receipt, namespace)
     else:
+        governed_publish.admit_run(arguments.fixture_budget_secs)
         verify_published(arguments.directory, arguments.receipt)
 
 

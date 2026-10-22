@@ -36,7 +36,18 @@ pub struct ManagedCommand {
     command: Command,
     program: OsString,
     arguments: Vec<OsString>,
+    lifetime: Option<(Instant, Instant)>,
 }
+
+/// The admitted payload's work clock expired, independently of its native exit.
+#[derive(Debug)]
+pub struct PayloadLifetimeExpired;
+impl std::fmt::Display for PayloadLifetimeExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("managed payload original work deadline expired")
+    }
+}
+impl std::error::Error for PayloadLifetimeExpired {}
 
 impl std::fmt::Debug for ManagedCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -53,7 +64,20 @@ impl ManagedCommand {
             command: Command::new(env!("NOVAROCKS_TEST_MONITOR")),
             program: program.as_ref().to_owned(),
             arguments: vec![],
+            lifetime: None,
         }
+    }
+    /// Stop the actual payload group at the original work clock, preserving
+    /// the complete clock for escalation and actual exit. Repeated calls only
+    /// narrow these clocks; ordinary commands retain startup-only semantics.
+    pub fn terminate_at(&mut self, work: Instant, complete: Instant) -> &mut Self {
+        self.lifetime = Some(
+            self.lifetime
+                .map_or((work, complete), |(old_work, old_end)| {
+                    (work.min(old_work), complete.min(old_end))
+                }),
+        );
+        self
     }
     pub fn arg(&mut self, argument: impl AsRef<OsStr>) -> &mut Self {
         self.arguments.push(argument.as_ref().to_owned());
@@ -155,6 +179,7 @@ pub(crate) struct Final {
     pub owner_lost: bool,
     pub cleanup_complete: bool,
     pub errors: Vec<String>,
+    pub lifetime_expired: bool,
 }
 
 fn hex(value: &OsStr) -> String {
@@ -221,6 +246,19 @@ impl Drop for PendingRecord {
 impl OwnedMonitor {
     pub fn spawn(label: &str, mut request: ManagedCommand, deadline: Instant) -> Result<Self> {
         let absolute = unix::absolute_deadline(deadline)?;
+        let lifetime = request
+            .lifetime
+            .map(|(work, complete)| -> Result<_> {
+                ensure!(
+                    work < complete,
+                    "payload work deadline must precede complete deadline"
+                );
+                Ok((
+                    unix::absolute_deadline(work)?,
+                    unix::absolute_deadline(complete)?,
+                ))
+            })
+            .transpose()?;
         let run = run_retention::ensure_run_retention(deadline)?;
         let gate = run.gate(deadline)?;
         let path = run.root.join("monitor").join(run_retention::unique());
@@ -258,7 +296,7 @@ impl OwnedMonitor {
         .collect::<std::collections::BTreeMap<_, _>>();
         serde_json::to_writer(
             &mut record,
-            &serde_json::json!({"schema":1,"event":"Pending","label":label,"payload_os_hex":payload_hex,"native":native,"stdout":"stdout.log","stderr":"stderr.log","deadline_ns":absolute}),
+            &serde_json::json!({"schema":1,"event":"Pending","label":label,"payload_os_hex":payload_hex,"native":native,"stdout":"stdout.log","stderr":"stderr.log","deadline_ns":absolute,"lifetime_ns":lifetime}),
         )?;
         record.write_all(b"\n")?;
         record.flush()?;
@@ -316,6 +354,8 @@ impl OwnedMonitor {
             .command
             .arg("payload-monitor")
             .arg(absolute.to_string())
+            .arg(lifetime.map_or(0, |value| value.0).to_string())
+            .arg(lifetime.map_or(0, |value| value.1).to_string())
             .arg(&material.run.root)
             .arg("--")
             .arg(&request.program)
@@ -618,6 +658,14 @@ impl OwnedMonitor {
                         .as_bool()
                         .context("monitor Final lacks cleanup fact")?,
                     errors,
+                    lifetime_expired: value
+                        .get("lifetime_expired")
+                        .map(|v| {
+                            v.as_bool()
+                                .context("monitor Final has invalid lifetime expiry fact")
+                        })
+                        .transpose()?
+                        .unwrap_or(false),
                 }));
             }
         }
@@ -688,6 +736,9 @@ impl OwnedMonitor {
                     "managed process cleanup violation: {final_record:?}; diagnostics={}",
                     self.material.path.display()
                 );
+                if final_record.lifetime_expired {
+                    return Err(PayloadLifetimeExpired.into());
+                }
                 ensure!(
                     Instant::now() < deadline,
                     "managed process completion exceeded original deadline"

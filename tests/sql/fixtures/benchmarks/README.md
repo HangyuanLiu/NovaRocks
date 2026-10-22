@@ -36,6 +36,8 @@ The bootstrap path supports these standard benchmark data sets:
 - TPC-H SF1 through `tpch-dbgen`
 - TPC-DS 1GB through `dsdgen`
 
+Spark producer 从固定机器容器的 AWS 环境读取访问材料，bootstrap 不把凭证拼入 Spark 命令行。`NOVAROCKS_BENCHMARK_SPARK_MEMORY` 可显式设置当前环境所需的 driver/executor heap；它不改变数据规模、p4布局、fixture key判据或结果oracle。
+
 Benchmark data must come from standard generators. Spark is only used to
 convert generated pipe-delimited raw files into Iceberg tables. TPC-H and
 TPC-DS schemas are parsed from the generator-provided DDL files so table
@@ -179,3 +181,15 @@ For TPC-DS, dry-run output also shows the normalized generator scale:
 ```text
 DRY_RUN suite=tpc-ds scale=1GB generator_scale=1
 ```
+
+### 共享机器运行预算
+
+共享消费者通过本次不可变 publication 读取机器事实，继承
+`NOVA_FIXTURE_RUN_CONTEXT` 的 run 身份与原截止时间。嵌套 Spark 调用不会重置
+预算；容器内 owner 负责准确进程组的终止与实际 wait。正常清理失败会返回失败，
+不能以未来 TTL 清扫代替本次清理。私有 publication 保留其原有资源 owner。
+
+benchmark root 内全部对象（包括 READY 引用的 warehouse 和未引用 staging）均为
+保留输入；TTL 与机器升级不删除它们。bootstrap 只向本次新 staging 条件上传 raw
+对象，不先递归删除 prefix。迁移前后使用 resolver、bootstrap `--check` 和完整
+对象清单/内容核验确认输入；临时容器目录与本地构建文件不属于这些持久数据。

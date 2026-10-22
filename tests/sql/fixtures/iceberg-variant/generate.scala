@@ -30,17 +30,28 @@ object VariantFixture {
   var spark: org.apache.spark.sql.SparkSession = _
   var namespace = ""
   var tableName = ""
-  def initialize(session: org.apache.spark.sql.SparkSession, ns: String, name: String): Unit = {
+  def initialize(session: org.apache.spark.sql.SparkSession, ns: String, name: String, readOnly: Boolean = false): Unit = {
     require(ns.matches("[a-zA-Z0-9_]+") && name.matches("[a-zA-Z0-9_]+"))
     require(IcebergBuild.version() == "1.11.0", "IRU-9 fixture requires pinned Iceberg 1.11.0")
     spark = session; namespace = ns; tableName = name
-    spark.sql(s"CREATE NAMESPACE IF NOT EXISTS ice_rest.$ns")
+    if (!readOnly) {
+      val scope = spark.conf.getOption("spark.novarocks.fixture.scopeRoot")
+      val run = spark.conf.getOption("spark.novarocks.fixture.runId")
+      require(run.forall(id => ns.startsWith(id + "_") && ns.length <= 63 && ns.substring(id.length + 1).matches("[a-z][a-z0-9]*")), "namespace is outside the original scratch run")
+      spark.sql(s"CREATE NAMESPACE IF NOT EXISTS ice_rest.$ns")
+    }
   }
   def load(): Table = Spark3Util.loadIcebergCatalog(spark,"ice_rest").loadTable(TableIdentifier.of(namespace,tableName))
-  def create(schema: Schema, spec: PartitionSpec = PartitionSpec.unpartitioned(), properties: Map[String,String] = Map.empty): Table =
-    Spark3Util.loadIcebergCatalog(spark,"ice_rest").createTable(
-      TableIdentifier.of(namespace,tableName),schema,spec,
+  def create(schema: Schema, spec: PartitionSpec = PartitionSpec.unpartitioned(), properties: Map[String,String] = Map.empty): Table = {
+    val location = spark.conf.getOption("spark.novarocks.fixture.scopeRoot")
+      .map(root => s"$root/rest/$namespace/$tableName")
+    val table = Spark3Util.loadIcebergCatalog(spark,"ice_rest").createTable(
+      TableIdentifier.of(namespace,tableName),schema,spec,location.orNull,
       (Map("format-version"->"3","write.metadata.metrics.default"->"full") ++ properties).asJava)
+    require(location.forall(expected => table.location() == expected),
+      "actual REST table location differs from the original run namespace table location")
+    table
+  }
   def row(schema: Schema, values: Seq[Any]): Record = {
     val record = GenericRecord.create(schema)
     values.zipWithIndex.foreach{case (value,index) => record.set(index,value.asInstanceOf[AnyRef])};record

@@ -361,8 +361,15 @@ fn run_one_inner(
     }
     let bounded_binding = config.exact_mysql_execution_binding.is_some()
         || config.held_native_execution_binding.is_some();
-    let mut launch_config = match scenario.launch_config(&scenario_root) {
-        Ok(config) => config,
+    let preparation_budget = (|| -> Result<_> {
+        config.fixture_budget.check_work()?;
+        Ok(std::time::Instant::now()
+            .checked_add(config.timeout)
+            .context("system original scenario deadline overflow")?
+            .min(config.fixture_budget.work_deadline()))
+    })();
+    let scenario_deadline = match preparation_budget {
+        Ok(deadline) => deadline,
         Err(error) => {
             return finish_prelaunch_scenario(
                 bounded_binding,
@@ -372,6 +379,22 @@ fn run_one_inner(
             );
         }
     };
+    let scenario_budget = config
+        .fixture_budget
+        .clone()
+        .with_work_deadline_limit(scenario_deadline);
+    let mut launch_config =
+        match scenario.launch_config_with_fixture_run(&scenario_root, &scenario_budget) {
+            Ok(config) => config,
+            Err(error) => {
+                return finish_prelaunch_scenario(
+                    bounded_binding,
+                    Some(error),
+                    Ok(()),
+                    settlement.teardown(scenario),
+                );
+            }
+        };
     settlement.launch_config_succeeded();
     // The explicit FE-child fixture pair is the existing activation contract.
     // Capture only once before launch; serial startup consumes this original budget.
@@ -409,19 +432,6 @@ fn run_one_inner(
         );
     }
     let bounded_original = exact_mysql_clock.is_some() || root_observation_clock.is_some();
-    let scenario_deadline = match std::time::Instant::now().checked_add(config.timeout) {
-        Some(deadline) => deadline,
-        None => {
-            return finish_prelaunch_scenario(
-                bounded_original,
-                Some(anyhow::anyhow!(
-                    "system original scenario deadline overflow"
-                )),
-                Ok(()),
-                settlement.teardown(scenario),
-            );
-        }
-    };
     let original_deadline = exact_mysql_clock
         .map(|clock| clock.deadline())
         .or(root_observation_clock)
@@ -510,6 +520,7 @@ fn run_one_inner(
         native_trust_fixture: launch_config.native_trust_fixture,
     };
     if bounded_original
+        && test_sessions.is_none()
         && (launch_config.native_root_reply_fault.is_some()
             || !launch_config
                 .native_fault_proxies
@@ -518,152 +529,58 @@ fn run_one_inner(
     {
         return finish_exact_mysql_scenario(
             Some(anyhow::anyhow!(
-                "original exact/neutral config freeze requires direct original roles"
+                "original source requires direct original roles"
             )),
             Ok(()),
             settlement.teardown(scenario),
         );
     }
     settlement.cluster_launch_attempted();
-    let handle = if let Some(plan) = test_sessions {
-        let prepared_check =
-            |artifact: &novarocks_cluster_harness::EffectiveLaunchConfigEvidence| -> Result<()> {
-                anyhow::ensure!(
-                    std::time::Instant::now() < original_deadline,
-                    "original system preparation deadline expired"
-                );
-                if bounded_original {
-                    scenario.freeze_prepared_exact_config(
-                        artifact,
-                        &scenario_root,
-                        original_deadline,
-                    )?;
-                }
-                Ok(())
-            };
-        let log_check = |role: &str,
-                         source: &novarocks_cluster_harness::ManagedProcessLogSource|
-         -> Result<()> {
+    let prepared_check =
+        |artifact: &novarocks_cluster_harness::EffectiveLaunchConfigEvidence| -> Result<()> {
+            anyhow::ensure!(
+                std::time::Instant::now() < original_deadline,
+                "original system preparation deadline expired"
+            );
+            if bounded_original {
+                scenario.freeze_prepared_exact_config(
+                    artifact,
+                    &scenario_root,
+                    original_deadline,
+                )?;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < original_deadline,
+                "original system preparation completion was late"
+            );
+            Ok(())
+        };
+    let log_check =
+        |role: &str, source: &novarocks_cluster_harness::ManagedProcessLogSource| -> Result<()> {
             anyhow::ensure!(
                 std::time::Instant::now() < original_deadline,
                 "original system log source deadline expired"
             );
             let (device, inode) = source.original_durable_log_identity()?;
-            scenario.observe_original_durable_log_owner(role, device, inode)
-        };
-        CrossProcessServerHandle::launch_with_test_sessions_and_checks(
-            cluster_options,
-            plan,
-            launch_config.native_fault_proxies,
-            launch_config.native_root_reply_fault,
-            bounded_original.then_some(
-                &prepared_check
-                    as &dyn Fn(
-                        &novarocks_cluster_harness::EffectiveLaunchConfigEvidence,
-                    ) -> Result<()>,
-            ),
-            config.held_live_collector_fences.then_some(
-                &log_check
-                    as &dyn Fn(
-                        &str,
-                        &novarocks_cluster_harness::ManagedProcessLogSource,
-                    ) -> Result<()>,
-            ),
-        )
-    } else if let Some(clock) = exact_mysql_clock {
-        if launch_config.native_root_reply_fault.is_some()
-            || !launch_config
-                .native_fault_proxies
-                .backend_retained_byte_limits
-                .is_empty()
-        {
-            finish_exact_mysql_scenario(
-                Some(anyhow::anyhow!(
-                    "exact MySQL prelaunch config freeze requires direct original roles"
-                )),
-                Ok(()),
-                settlement.teardown(scenario),
-            )?;
-            unreachable!();
-        }
-        CrossProcessServerHandle::launch_with_exact_mysql_prelaunch_check(
-            cluster_options,
-            &|artifact| {
-                clock.remaining("original prepared config freeze")?;
-                scenario.freeze_prepared_exact_config(
-                    artifact,
-                    &scenario_root,
-                    clock.deadline(),
-                )?;
-                clock.remaining("original prepared config freeze completion")?;
-                Ok(())
-            },
-        )
-    } else if let Some(deadline) = root_observation_clock {
-        if launch_config.native_root_reply_fault.is_some()
-            || !launch_config
-                .native_fault_proxies
-                .backend_retained_byte_limits
-                .is_empty()
-        {
-            return finish_exact_mysql_scenario(
-                Some(anyhow::anyhow!(
-                    "neutral original source requires direct original roles"
-                )),
-                Ok(()),
-                settlement.teardown(scenario),
+            scenario.observe_original_durable_log_owner(role, device, inode)?;
+            anyhow::ensure!(
+                std::time::Instant::now() < original_deadline,
+                "original log owner source completion was late"
             );
-        }
-        let prepared_check =
-            |artifact: &novarocks_cluster_harness::EffectiveLaunchConfigEvidence| {
-                anyhow::ensure!(
-                    std::time::Instant::now() < deadline,
-                    "neutral original prelaunch clock expired"
-                );
-                scenario.freeze_prepared_exact_config(artifact, &scenario_root, deadline)?;
-                anyhow::ensure!(
-                    std::time::Instant::now() < deadline,
-                    "neutral original prepared freeze was late"
-                );
-                Ok(())
-            };
-        if config.held_live_collector_fences {
-            CrossProcessServerHandle::launch_with_held_live_source_checks(
-                cluster_options,
-                &prepared_check,
-                &|role, source| {
-                    anyhow::ensure!(
-                        std::time::Instant::now() < deadline,
-                        "original log owner observation was late"
-                    );
-                    let (device, inode) = source.original_durable_log_identity()?;
-                    scenario.observe_original_durable_log_owner(role, device, inode)?;
-                    anyhow::ensure!(
-                        std::time::Instant::now() < deadline,
-                        "original log owner source completion was late"
-                    );
-                    Ok(())
-                },
-            )
-        } else {
-            CrossProcessServerHandle::launch_with_exact_mysql_prelaunch_check(
-                cluster_options,
-                &prepared_check,
-            )
-        }
-    } else {
-        match launch_config.native_root_reply_fault {
-            Some(root_fault) => CrossProcessServerHandle::launch_with_native_root_reply_fault(
-                cluster_options,
-                launch_config.native_fault_proxies,
-                root_fault,
-            ),
-            None => CrossProcessServerHandle::launch_with_native_fault_proxies(
-                cluster_options,
-                launch_config.native_fault_proxies,
-            ),
-        }
-    }
+            Ok(())
+        };
+    let handle = CrossProcessServerHandle::launch_with_fixture_budget(
+        cluster_options,
+        test_sessions,
+        launch_config.native_fault_proxies,
+        launch_config.native_root_reply_fault,
+        Some(&prepared_check),
+        config.held_live_collector_fences.then_some(
+            &log_check
+                as &dyn Fn(&str, &novarocks_cluster_harness::ManagedProcessLogSource) -> Result<()>,
+        ),
+        scenario_budget.with_work_deadline_limit(original_deadline),
+    )
     .with_context(|| format!("launch system scenario {}", scenario.name()));
     let handle = match handle {
         Ok(handle) => handle,
@@ -701,7 +618,12 @@ fn run_one_inner(
         exact_mysql_clock,
     );
     context.action("cluster launched and topology barrier passed");
-    let result = scenario.run(&mut context);
+    let result = scenario.run(&mut context).and_then(|()| {
+        if std::time::Instant::now() >= original_deadline {
+            return Err(novarocks_cluster_harness::fixture_run::FixtureBudgetExpired.into());
+        }
+        Ok(())
+    });
     if let Err(error) = &result {
         context.retain_artifacts();
         let evidence_path = match context.write_evidence(ScenarioEvidenceOutcome::Failed) {
@@ -1027,6 +949,28 @@ impl std::error::Error for PrelaunchScenarioFailure {
             .map(|error| error.as_ref())
     }
 }
+pub(crate) fn fixture_admission_rejected(error: &anyhow::Error) -> bool {
+    if let Some(failure) = error.downcast_ref::<PrelaunchScenarioFailure>() {
+        return failure.settlement.is_none()
+            && failure.fixture.is_none()
+            && failure
+                .primary
+                .as_ref()
+                .is_some_and(fixture_admission_rejected);
+    }
+    if let Some(failure) = error.downcast_ref::<ExactMysqlScenarioFailure>() {
+        return failure.cluster.is_none()
+            && failure.fixture.is_none()
+            && failure
+                .primary
+                .as_ref()
+                .is_some_and(fixture_admission_rejected);
+    }
+    error
+        .chain()
+        .any(|source| source.is::<novarocks_cluster_harness::fixture_run::FixtureBudgetRejected>())
+}
+
 fn finish_prelaunch_scenario(
     bounded: bool,
     primary: Option<anyhow::Error>,
@@ -1264,6 +1208,10 @@ mod exact_mysql_prelaunch_teardown_tests {
             artifact_root: root.clone(),
             cluster_size: 3,
             timeout: Duration::from_secs(20),
+            fixture_budget: novarocks_cluster_harness::fixture_run::RunBudget::from_environment(
+                3600,
+            )
+            .unwrap(),
             launch_profile: LaunchProfile::FaultScenario,
             exact_mysql_execution_binding: None,
             held_native_execution_binding: None,
@@ -1421,6 +1369,10 @@ mod neutral_root_prelaunch_tests {
             artifact_root: root.into(),
             cluster_size: 3,
             timeout: Duration::from_secs(20),
+            fixture_budget: novarocks_cluster_harness::fixture_run::RunBudget::from_environment(
+                3600,
+            )
+            .unwrap(),
             launch_profile: LaunchProfile::FaultScenario,
             exact_mysql_execution_binding: None,
             held_native_execution_binding: None,
@@ -1436,6 +1388,52 @@ mod neutral_root_prelaunch_tests {
             .unwrap();
         assert!(Arc::ptr_eq(&source.0, expected));
     }
+    #[test]
+    fn exhausted_original_budget_refuses_before_launch_config_side_effect() {
+        use novarocks_cluster_harness::fixture_run::{FixturePolicy, RunBudget, ScratchIdentity};
+        let root = tempfile::tempdir().unwrap();
+        let fixture = Fixture::new(Mode::Neutral);
+        let mut config = configuration(root.path());
+        let created = 1_792_540_800_000;
+        let identity = ScratchIdentity::create_at(
+            "s3://novarocks/tests",
+            created,
+            "0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        // A valid admitted run with an already elapsed monotonic work clock.
+        config.fixture_budget = RunBudget::admit_at(
+            FixturePolicy::default(),
+            identity,
+            301,
+            None,
+            created,
+            Instant::now() - Duration::from_secs(2),
+        )
+        .unwrap();
+        let error = run_one(&fixture, &config).unwrap_err();
+        assert!(error.is::<novarocks_cluster_harness::fixture_run::FixtureBudgetExpired>());
+        assert!(fixture.clock.lock().unwrap().is_none());
+        assert_eq!(fixture.teardowns.load(Ordering::SeqCst), 1);
+        assert!(!fixture_admission_rejected(&error));
+    }
+
+    #[test]
+    fn admission_is_blocked_only_when_cleanup_also_succeeds() {
+        let rejection =
+            || novarocks_cluster_harness::fixture_run::rejected(anyhow::anyhow!("invalid input"));
+        assert!(fixture_admission_rejected(&rejection()));
+        let clean = finish_exact_mysql_scenario(Some(rejection()), Ok(()), Ok(())).unwrap_err();
+        assert!(fixture_admission_rejected(&clean));
+        let cleanup_failure = finish_exact_mysql_scenario(
+            Some(rejection()),
+            Ok(()),
+            Err(anyhow::anyhow!("cleanup failed")),
+        )
+        .unwrap_err();
+        assert!(!fixture_admission_rejected(&cleanup_failure));
+    }
+
     #[test]
     fn actual_launch_and_clock_errors_retain_both_original_sources_and_teardown_once() {
         let root =
@@ -1616,6 +1614,10 @@ mod settlement_integration_tests {
             artifact_root: root.to_owned(),
             cluster_size: 3,
             timeout: Duration::from_millis(100),
+            fixture_budget: novarocks_cluster_harness::fixture_run::RunBudget::from_environment(
+                3600,
+            )
+            .unwrap(),
             launch_profile: novarocks_cluster_harness::LaunchProfile::FaultScenario,
             exact_mysql_execution_binding: None,
             held_native_execution_binding: None,

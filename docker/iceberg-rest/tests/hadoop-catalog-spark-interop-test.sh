@@ -26,9 +26,17 @@ repo_root=$(cd "$fixture_dir/../.." && pwd)
 publication="$("$fixture_dir/up.sh" | python3 -c 'import json, sys; print(json.load(sys.stdin)["published_dir"])')"
 source "$publication/env.sh"
 
+NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$fixture_dir/fixture_run.py" context --env-file "$publication/env.sh")"
+export NOVA_FIXTURE_RUN_CONTEXT
+NOVA_FIXTURE_RUN_STORAGE="$(python3 "$fixture_dir/fixture_run.py" storage --env-file "$publication/env.sh")"
+export NOVA_FIXTURE_RUN_STORAGE
+python3 "$fixture_dir/fixture_run.py" sweep-start --env-file "$publication/env.sh" >&2
 run_token="$(date +%s)_$$"
 warehouse_base="${NOVAROCKS_ICEBERG_TEST_WAREHOUSE%/}"
 warehouse="${warehouse_base}/hadoop-spark-interop-${run_token}"
+if [[ "$NOVA_FIXTURE_RUN_CONTEXT" != null ]]; then
+    warehouse="$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["identity"]["scope_root"]+"/hadoop")' "$NOVA_FIXTURE_RUN_CONTEXT")"
+fi
 warehouse="${warehouse/s3:\/\//s3a:\/\/}"
 catalog="nr_hadoop_interop_${run_token}"
 namespace="interop_${run_token}"
@@ -49,7 +57,7 @@ cleanup() {
 trap cleanup EXIT
 
 compose=(
-    docker compose
+    python3 "$fixture_dir/fixture_run.py" compose --env-file "$publication/env.sh" --
     --env-file "$NOVA_ENV_COMPOSE_ENV"
     -p "$NOVA_ENV_COMPOSE_PROJECT"
     -f "$NOVA_ENV_COMPOSE_FILE"

@@ -1,0 +1,113 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Native observation while the original group leader remains unreaped.
+use std::{io, process::Child};
+
+#[cfg(target_os = "linux")]
+pub fn running(child: &Child) -> io::Result<bool> {
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let text = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let (_, fields) = text
+            .rsplit_once(')')
+            .ok_or_else(|| super::error("invalid native process stat"))?;
+        let fields: Vec<_> = fields.split_whitespace().collect();
+        let group: u32 = fields
+            .get(2)
+            .ok_or_else(|| super::error("missing native process group"))?
+            .parse()
+            .map_err(super::error)?;
+        if group == child.id() && !matches!(fields.first(), Some(&"Z" | &"X")) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+pub fn running(child: &Child) -> io::Result<bool> {
+    use std::ffi::c_void;
+    unsafe extern "C" {
+        fn proc_listpids(kind: u32, group: u32, buffer: *mut c_void, size: i32) -> i32;
+        fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut c_void, size: i32) -> i32;
+    }
+    // Darwin proc_bsdshortinfo from sys/proc_info.h. All fields have native
+    // uint32_t/uid_t/gid_t layout; PROC_PIDT_SHORTBSDINFO=13, SZOMB=5.
+    #[repr(C)]
+    struct ShortInfo {
+        pid: u32,
+        parent: u32,
+        group: u32,
+        status: u32,
+        command: [u8; 16],
+        remaining: [u32; 8],
+    }
+    let mut capacity = 64;
+    loop {
+        let mut pids = vec![0i32; capacity];
+        let size = (pids.len() * size_of::<i32>()) as i32;
+        // SAFETY: writable aligned PID array of the exact declared size;
+        // PROC_PGRP_ONLY=2 limits observation to the unreaped leader's group.
+        let bytes = unsafe { proc_listpids(2, child.id(), pids.as_mut_ptr().cast(), size) };
+        if bytes < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if bytes == size {
+            if capacity >= 65536 {
+                return Err(super::error("process group enumeration limit exceeded"));
+            }
+            capacity *= 2;
+            continue;
+        }
+        if bytes % size_of::<i32>() as i32 != 0 {
+            return Err(super::error("invalid native process group enumeration"));
+        }
+        for pid in pids
+            .into_iter()
+            .take(bytes as usize / size_of::<i32>())
+            .filter(|pid| *pid > 0)
+        {
+            // SAFETY: every field is an integer/byte; zero initializes valid output storage.
+            let mut info: ShortInfo = unsafe { std::mem::zeroed() };
+            let size = size_of::<ShortInfo>() as i32;
+            // SAFETY: writable aligned storage matches the native declared ABI.
+            let length =
+                unsafe { proc_pidinfo(pid, 13, 0, (&mut info as *mut ShortInfo).cast(), size) };
+            if length != size {
+                let error = io::Error::last_os_error();
+                if matches!(error.raw_os_error(), Some(3)) {
+                    continue;
+                }
+                return Err(super::error(format!(
+                    "observe native process group member: {error}"
+                )));
+            }
+            if info.group == child.id() && info.status != 5 {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+}

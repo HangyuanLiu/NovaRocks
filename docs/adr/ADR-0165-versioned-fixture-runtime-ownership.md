@@ -2,9 +2,9 @@
 id: ADR-0165
 title: "Versioned fixture runtimes have one owner and one published worktree binding"
 domain: [test-fixtures]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0191
 partially-superseded-by: [ADR-0173]
 date: 2026-09-29
 provenance:
@@ -17,6 +17,8 @@ code-anchors:
   - "tests/cluster-harness/src/isolated_iceberg_rest.rs"
   - "tools/ci/local-full-ci.sh (load_fixture_publication, prepare_runtime)"
 ---
+
+> 2026-10-21：运行层由 [ADR-0191](ADR-0191-machine-shared-fixture-and-bounded-scratch.md) 替代。本文保留历史裁决；已有READY消费继续遵循ADR-0173。
 
 ## 问题
 

@@ -43,12 +43,33 @@ pub(crate) fn execute_shell_step_until(
     sql: &str,
     deadline: Option<Instant>,
 ) -> (bool, Option<QueryExecution>, String) {
+    execute_shell_step_in_context(sql, deadline, None, false)
+}
+
+pub(crate) fn execute_shell_step_in_context(
+    sql: &str,
+    deadline: Option<Instant>,
+    context: Option<&str>,
+    cleanup: bool,
+) -> (bool, Option<QueryExecution>, String) {
+    let storage = std::env::var(novarocks_cluster_harness::fixture_run::RUN_STORAGE_ENV).ok();
+    execute_shell_step_observed(sql, deadline, context, storage.as_deref(), cleanup, None)
+}
+
+pub(crate) fn execute_shell_step_observed(
+    sql: &str,
+    deadline: Option<Instant>,
+    context: Option<&str>,
+    storage: Option<&str>,
+    cleanup: bool,
+    writer_exit: Option<&std::sync::atomic::AtomicBool>,
+) -> (bool, Option<QueryExecution>, String) {
     let Some(deadline) = deadline else {
         return execute_shell_step(sql);
     };
     #[cfg(not(unix))]
     {
-        let _ = deadline;
+        let _ = (deadline, writer_exit);
         return (
             false,
             None,
@@ -72,6 +93,23 @@ pub(crate) fn execute_shell_step_until(
                 .expect("shell step")
                 .trim(),
         );
+        if let Some(context) = context {
+            command
+                .env(
+                    novarocks_cluster_harness::fixture_run::RUN_CONTEXT_ENV,
+                    context,
+                )
+                .env(
+                    "NOVA_FIXTURE_CLEANUP_MODE",
+                    if cleanup { "true" } else { "false" },
+                );
+        }
+        if let Some(storage) = storage {
+            command.env(
+                novarocks_cluster_harness::fixture_run::RUN_STORAGE_ENV,
+                storage,
+            );
+        }
         let capture = (|| -> anyhow::Result<_> {
             use std::os::unix::fs::OpenOptionsExt;
             let stdout = std::fs::OpenOptions::new()
@@ -92,6 +130,14 @@ pub(crate) fn execute_shell_step_until(
             Ok(outcome) => {
                 let timed_out = outcome.timed_out || Instant::now() >= deadline;
                 let failures = &outcome.failures;
+                // A failed producer may have reported an unknown remote writer
+                // outcome even after its host CLI exited. Keep files until its
+                // original owner can supply a successful completion fact.
+                if (!failures.is_empty() || !outcome.output.status.success())
+                    && let Some(observed) = writer_exit
+                {
+                    observed.store(false, std::sync::atomic::Ordering::Release);
+                }
                 let result = render_command_output(&outcome.output, started.elapsed());
                 if timed_out || Instant::now() >= deadline || !failures.is_empty() {
                     let path = directory.keep();
@@ -126,6 +172,9 @@ pub(crate) fn execute_shell_step_until(
                 result
             }
             Err(error) => {
+                if let Some(observed) = writer_exit {
+                    observed.store(false, std::sync::atomic::Ordering::Release);
+                }
                 let path = directory.keep();
                 (
                     false,
@@ -188,7 +237,34 @@ fn execute_command(command: &mut Command) -> (bool, Option<QueryExecution>, Stri
 
 #[cfg(test)]
 mod tests {
-    use super::execute_shell_step;
+    use super::{execute_shell_step, execute_shell_step_observed};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn unsuccessful_producer_keeps_outer_cleanup_unconfirmed_even_when_host_cli_exits() {
+        let exited = std::sync::atomic::AtomicBool::new(true);
+        let result = execute_shell_step_observed(
+            "shell: exit 17",
+            Some(Instant::now() + Duration::from_secs(5)),
+            None,
+            None,
+            false,
+            Some(&exited),
+        );
+        assert!(!result.0);
+        assert!(!exited.load(std::sync::atomic::Ordering::Acquire));
+        let success = std::sync::atomic::AtomicBool::new(true);
+        let result = execute_shell_step_observed(
+            "shell: printf done",
+            Some(Instant::now() + Duration::from_secs(5)),
+            None,
+            None,
+            false,
+            Some(&success),
+        );
+        assert!(result.0, "{}", result.2);
+        assert!(success.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     #[test]
     fn successful_shell_step_preserves_stdout_as_result_text() {
@@ -260,6 +336,39 @@ mod bounded_tests {
         );
         assert!(!signal.0);
         assert_eq!(signal.1.unwrap().text_output, "-1");
+    }
+    #[test]
+    fn nested_shell_receives_the_original_context_and_explicit_cleanup_mode() {
+        let original =
+            r#"{"schema":1,"deadline_unix_ms":1792541400000,"identity":{"run_id":"original"}}"#;
+        let sql =
+            "shell: printf '%s\\n%s' \"$NOVA_FIXTURE_RUN_CONTEXT\" \"$NOVA_FIXTURE_CLEANUP_MODE\"";
+        let (ok, result, error) = execute_shell_step_in_context(
+            sql,
+            Some(Instant::now() + Duration::from_secs(2)),
+            Some(original),
+            true,
+        );
+        assert!(ok, "{error}");
+        assert_eq!(result.unwrap().text_output, format!("0\n{original}\ntrue"));
+    }
+    #[test]
+    fn nested_shell_receives_original_storage_without_renewing_budget() {
+        let context = "original-budget";
+        let storage = "original-fixed-storage";
+        let (ok, result, error) = execute_shell_step_observed(
+            "shell: printf '%s\n%s' \"$NOVA_FIXTURE_RUN_CONTEXT\" \"$NOVA_FIXTURE_RUN_STORAGE\"",
+            Some(Instant::now() + Duration::from_secs(2)),
+            Some(context),
+            Some(storage),
+            false,
+            None,
+        );
+        assert!(ok, "{error}");
+        assert_eq!(
+            result.unwrap().text_output,
+            format!("0\n{context}\n{storage}")
+        );
     }
     #[test]
     fn expired_clock_never_spawns_and_timeout_stops_the_owned_group() {

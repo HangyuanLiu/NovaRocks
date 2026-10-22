@@ -1,0 +1,114 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+x-resource-labels: &resource-labels
+  novarocks.fixture.owner: ${NOVA_FIXTURE_OWNER}
+  novarocks.fixture.key: machine
+  novarocks.fixture.kind: machine
+  novarocks.fixture.control-root: ${NOVA_FIXTURE_CONTROL_ROOT}
+x-service-labels: &service-labels
+  <<: *resource-labels
+  novarocks.fixture.version: ${NOVA_FIXTURE_VERSION}
+  novarocks.fixture.activation: ${NOVA_FIXTURE_GENERATION}
+x-credentials: &credentials
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+  AWS_REGION: us-east-1
+x-mc: &mc
+  image: ${MC_IMAGE:?verified image required}
+  pull_policy: never
+  labels: *service-labels
+  environment:
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+  networks: [iceberg_net]
+services:
+  minio:
+    image: ${MINIO_IMAGE:?verified image required}
+    pull_policy: never
+    labels: *service-labels
+    command: [server, /data, --console-address, ':9001']
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports: ['${NOVA_ENV_MINIO_PORT}:9000', '${NOVA_ENV_MINIO_CONSOLE_PORT}:9001']
+    volumes: [minio-data:/data]
+    networks:
+      iceberg_net:
+        aliases: [minio, warehouse.minio, novarocks.minio]
+  mc-init:
+    <<: *mc
+    entrypoint: [/bin/sh, -c]
+    command:
+      - >-
+        until mc alias set store http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do sleep 1; done;
+        mc mb --ignore-existing store/warehouse && mc mb --ignore-existing store/novarocks
+  mc:
+    <<: *mc
+    entrypoint: [/bin/sh]
+    command: [-c, 'exit 0']
+  rest:
+    image: ${REST_IMAGE:?verified image required}
+    pull_policy: never
+    labels: *service-labels
+    environment:
+      <<: *credentials
+      CATALOG_WAREHOUSE: ${NOVA_ENV_REST_SERVER_WAREHOUSE_URI}
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: 'true'
+      CATALOG_URI: jdbc:sqlite:/tmp/iceberg-rest-catalog.db
+    ports: ['${NOVA_ENV_REST_PORT}:8181']
+    volumes: [rest-catalog:/tmp]
+    networks: [iceberg_net]
+  rest-mv:
+    image: ${REST_MV_IMAGE:?verified image required}
+    pull_policy: never
+    labels: *service-labels
+    environment:
+      <<: *credentials
+      CATALOG_WAREHOUSE: ${NOVA_ENV_REST_MV_SERVER_WAREHOUSE_URI}
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: 'true'
+      CATALOG_URI: jdbc:sqlite:/tmp/iceberg-rest-catalog.db
+    ports: ['${NOVA_ENV_REST_MV_PORT}:8181']
+    volumes: [rest-mv-catalog:/tmp]
+    networks: [iceberg_net]
+  spark:
+    image: ${SPARK_IMAGE:?verified image required}
+    pull_policy: never
+    labels: *service-labels
+    environment:
+      <<: *credentials
+      SPARK_LOCAL_HOSTNAME: localhost
+    ports: ['${NOVA_ENV_SPARK_PORT}:4040']
+    entrypoint: [/bin/bash, -lc]
+    command: ["trap 'exit 0' TERM INT; sleep infinity & wait"]
+    networks: [iceberg_net]
+volumes:
+  minio-data:
+    external: true
+    name: ${NOVA_FIXTURE_MINIO_VOLUME}
+  rest-catalog:
+    labels: *resource-labels
+  rest-mv-catalog:
+    labels: *resource-labels
+networks:
+  iceberg_net:
+    name: nr-fixture-machine_iceberg_net
+    labels: *resource-labels

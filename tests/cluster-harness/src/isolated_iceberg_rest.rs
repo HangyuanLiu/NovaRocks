@@ -27,7 +27,8 @@
 //! every other worktree's views too.  This module is therefore test-only and
 //! deliberately drives the existing fixture scripts with
 //! `NOVA_ENV_SHARED_DOCKER=false`; it never starts or falls back to the shared
-//! project.
+//! project. The vended scenarios retain these private catalogs and may attach
+//! only the machine MinIO, with one original run scope and complete deadline.
 
 use anyhow::{Context, Result, bail, ensure};
 use hmac::{Hmac, Mac};
@@ -47,7 +48,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::fixture_run::{RunBudget, RunStorageScope};
 use crate::resource_registration::{Registration, register};
+use std::sync::Mutex;
 
 const FIXTURE_PREFIX: &str = "isolated-rest";
 /// Every Docker project this fixture creates.  Creation always uses this
@@ -118,6 +121,30 @@ pub struct IsolatedIcebergRestEndpoints {
     pub rest_mv_warehouse: String,
     pub minio_endpoint: String,
     pub compose_project: String,
+}
+
+/// The physical object-store owner of an already constructed REST fixture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RestObjectStoreOwner {
+    PrivateObjectStore,
+    MachineScratch,
+}
+
+/// Credential-free owner facts captured from an actual fixture handle.
+/// Fields are private so consumers cannot mint private ownership from a URI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestStorageBinding {
+    owner: RestObjectStoreOwner,
+    rest_uri: String,
+    rest_mv_uri: String,
+}
+impl RestStorageBinding {
+    pub fn owner(&self) -> RestObjectStoreOwner {
+        self.owner
+    }
+    pub fn rest_uris(&self) -> [&str; 2] {
+        [&self.rest_uri, &self.rest_mv_uri]
+    }
 }
 
 /// Safe, immutable identity of one image actually running in the fixture.
@@ -234,6 +261,12 @@ pub struct IsolatedIcebergRestFixture {
     profile: FixtureProfile,
     registration: Registration,
     active: bool,
+    fixture_budget: Option<RunBudget>,
+    private_budget: Option<RunBudget>,
+    shared_iam: Mutex<Vec<(String, String, Registration)>>,
+    shared_scope_registration: Option<Registration>,
+    shared_machine: Option<serde_json::Value>,
+    run_storage: Option<RunStorageScope>,
 }
 
 /// The identity of one generated `docker/iceberg-rest/runtime/<id>` entry.
@@ -285,6 +318,54 @@ impl IsolatedIcebergRestFixture {
         )
     }
 
+    /// Keep a private REST namespace owner while using the machine's scoped S3.
+    pub fn start_with_shared_minio(
+        scenario_root: impl AsRef<Path>,
+        budget: &RunBudget,
+    ) -> Result<Self> {
+        budget.check_work()?;
+        Self::start_profile_with_budget(
+            repository_root()?,
+            scenario_root.as_ref(),
+            FixtureProfile::Stock,
+            Some(budget.clone()),
+            None,
+        )
+    }
+
+    pub fn start_private_with_budget(
+        scenario_root: impl AsRef<Path>,
+        budget: &RunBudget,
+        publication_hook: bool,
+    ) -> Result<(Self, Option<String>)> {
+        budget.check_work()?;
+        let profile = if publication_hook {
+            let reservation = TcpListener::bind("127.0.0.1:0")?;
+            let control_port = reservation.local_addr()?.port();
+            drop(reservation);
+            FixtureProfile::PublicationHook {
+                image: String::new(),
+                control_port,
+            }
+        } else {
+            FixtureProfile::Stock
+        };
+        let mut fixture = Self::start_profile_with_budget(
+            repository_root()?,
+            scenario_root.as_ref(),
+            profile,
+            None,
+            Some(budget.clone()),
+        )?;
+        let control = if publication_hook {
+            Some(fixture.observe_publication_hook()?)
+        } else {
+            None
+        };
+        fixture.publication_control_uri = control.clone();
+        Ok((fixture, control))
+    }
+
     /// Creates the REST service with its publication hook already installed.
     /// The returned control URI belongs to this fixture's initial REST container.
     pub fn start_with_publication_hook(scenario_root: impl AsRef<Path>) -> Result<(Self, String)> {
@@ -315,11 +396,49 @@ impl IsolatedIcebergRestFixture {
         scenario_root: &Path,
         profile: FixtureProfile,
     ) -> Result<Self> {
+        Self::start_profile_with_budget(repo_root, scenario_root, profile, None, None)
+    }
+
+    fn start_profile_with_budget(
+        repo_root: PathBuf,
+        scenario_root: &Path,
+        profile: FixtureProfile,
+        fixture_budget: Option<RunBudget>,
+        private_budget: Option<RunBudget>,
+    ) -> Result<Self> {
+        if let Some(budget) = fixture_budget.as_ref().or(private_budget.as_ref()) {
+            budget.check_work()?;
+        }
+        let shared_env = fixture_budget
+            .as_ref()
+            .map(|_| shared_env_file(&repo_root))
+            .transpose()
+            .map_err(crate::fixture_run::rejected)?;
+        let shared_machine = shared_env
+            .as_ref()
+            .map(|env| load_shared_machine(env))
+            .transpose()
+            .map_err(crate::fixture_run::rejected)?;
         // A previous run that crashed, timed out, or was interrupted leaves its
         // Docker project and generated runtime entry behind with nothing left to
         // reclaim them.  Sweep those before adding another one, so one bad run
         // cannot accumulate into an unusable machine.
-        sweep_stale_fixtures(&repo_root);
+        if fixture_budget.is_none() && private_budget.is_none() {
+            sweep_stale_fixtures(&repo_root);
+        }
+        let run_storage = match (&fixture_budget, &shared_machine) {
+            (Some(budget), Some(snapshot)) => {
+                budget.validate_machine(snapshot)?;
+                Some(RunStorageScope::from_environment(
+                    budget.identity(),
+                    snapshot,
+                )?)
+            }
+            _ => None,
+        };
+        if let (Some(budget), Some(_snapshot)) = (&fixture_budget, &shared_machine) {
+            crate::fixture_run::startup_sweep(&repo_root, shared_env.as_ref().unwrap(), budget)?;
+        }
         let scenario_root = ensure_absolute_directory(scenario_root)?;
         let fixture_id = unique_fixture_id();
         let workspace_root = scenario_root.join(&fixture_id);
@@ -343,6 +462,17 @@ impl IsolatedIcebergRestFixture {
             &compose_project,
         )?;
 
+        let shared_scope_registration = fixture_budget
+            .as_ref()
+            .map(|budget| {
+                register(
+                    &scenario_root,
+                    "shared-minio-prefix",
+                    &budget.identity().run_id,
+                    &budget.identity().scope_root,
+                )
+            })
+            .transpose()?;
         let mut fixture = Self {
             repo_root,
             scenario_root,
@@ -367,11 +497,23 @@ impl IsolatedIcebergRestFixture {
             profile,
             registration,
             active: true,
+            fixture_budget,
+            private_budget,
+            shared_iam: Mutex::new(Vec::new()),
+            shared_scope_registration,
+            shared_machine,
+            run_storage,
         };
 
         let started = (|| {
             if let FixtureProfile::PublicationHook { image, .. } = &mut fixture.profile {
-                *image = build_publication_hook_image(&fixture.repo_root)?;
+                *image = build_publication_hook_image_until(
+                    &fixture.repo_root,
+                    fixture
+                        .private_budget
+                        .as_ref()
+                        .map(RunBudget::work_deadline),
+                )?;
             }
             fixture.run_script("up.sh", &[])
         })();
@@ -416,6 +558,25 @@ impl IsolatedIcebergRestFixture {
     pub fn endpoints(&self) -> &IsolatedIcebergRestEndpoints {
         &self.endpoints
     }
+    /// Capture storage ownership without exporting credentials or mutable state.
+    pub fn rest_storage_binding(&self) -> RestStorageBinding {
+        RestStorageBinding {
+            owner: if self.shared_machine.is_some() {
+                RestObjectStoreOwner::MachineScratch
+            } else {
+                RestObjectStoreOwner::PrivateObjectStore
+            },
+            rest_uri: self.endpoints.rest_uri.clone(),
+            rest_mv_uri: self.endpoints.rest_mv_uri.clone(),
+        }
+    }
+
+    fn work_limit(&self) -> Option<Instant> {
+        self.fixture_budget
+            .as_ref()
+            .or(self.private_budget.as_ref())
+            .map(RunBudget::work_deadline)
+    }
 
     fn observe_publication_hook(&self) -> Result<String> {
         let FixtureProfile::PublicationHook { control_port, .. } = &self.profile else {
@@ -423,8 +584,17 @@ impl IsolatedIcebergRestFixture {
         };
         let manifest = read_manifest(&self.find_manifest()?)?;
         self.assert_isolated_manifest(&manifest)?;
-        let container = live_service_container(&self.repo_root, &self.compose_project, "rest")?;
-        let port_output = run_docker(&self.repo_root, &["port", &container, "8182/tcp"])?;
+        let container = live_service_container_until(
+            &self.repo_root,
+            &self.compose_project,
+            "rest",
+            self.work_limit(),
+        )?;
+        let port_output = run_docker_until(
+            &self.repo_root,
+            &["port", &container, "8182/tcp"],
+            self.work_limit(),
+        )?;
         ensure!(
             port_output.status.success(),
             "publication hook control port is not published"
@@ -447,14 +617,20 @@ impl IsolatedIcebergRestFixture {
             "publication hook manifest control URI differs from its live binding"
         );
         let client = fixture_http_client()?;
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = self
+            .work_limit()
+            .map_or(Instant::now() + Duration::from_secs(60), |end| {
+                end.min(Instant::now() + Duration::from_secs(60))
+            });
         loop {
             if client
                 .get(format!("{control_uri}/health"))
+                .timeout(self.http_timeout()?)
                 .send()
                 .is_ok_and(|response| response.status().is_success())
                 && client
                     .get(format!("{}/v1/config", self.endpoints.rest_uri))
+                    .timeout(self.http_timeout()?)
                     .send()
                     .is_ok_and(|response| response.status().is_success())
             {
@@ -493,32 +669,71 @@ impl IsolatedIcebergRestFixture {
     pub fn runtime_identity(&self) -> Result<IsolatedIcebergRestRuntimeIdentity> {
         self.assert_owned_paths()?;
         ensure!(self.active, "isolated provider runtime is no longer active");
-        let mut images = ["minio", "rest", "rest-mv", "spark"]
+        let services = if self.shared_machine.is_some() {
+            vec!["rest", "rest-mv", "spark"]
+        } else {
+            vec!["minio", "rest", "rest-mv", "spark"]
+        };
+        let mut images = services
             .into_iter()
             .map(|service| {
                 Ok((
                     service.to_string(),
-                    live_service_image(&self.repo_root, &self.compose_project, service)?,
+                    live_service_image_until(
+                        &self.repo_root,
+                        &self.compose_project,
+                        service,
+                        self.work_limit(),
+                    )?,
                 ))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        let mc_container =
-            completed_service_container(&self.repo_root, &self.compose_project, "mc")?;
+        let mc_container = completed_service_container_until(
+            &self.repo_root,
+            &self.compose_project,
+            "mc",
+            self.work_limit(),
+        )?;
         images.insert(
             "mc".to_string(),
-            container_image(&self.repo_root, &mc_container, "mc")?,
+            container_image_until(&self.repo_root, &mc_container, "mc", self.work_limit())?,
         );
 
-        let minio_container =
-            live_service_container(&self.repo_root, &self.compose_project, "minio")?;
-        let minio_version = minio_runtime_version(&self.repo_root, &minio_container)?;
-        let rest_container =
-            live_service_container(&self.repo_root, &self.compose_project, "rest")?;
-        let rest_environment = container_string_array(
+        let minio_container = if let Some(machine) = &self.shared_machine {
+            let container = machine["containers"]["minio"]
+                .as_str()
+                .context("shared MinIO snapshot omitted exact container")?
+                .to_string();
+            let image =
+                container_image_until(&self.repo_root, &container, "minio", self.work_limit())?;
+            ensure!(
+                Some(image.image_id.as_str()) == machine["images"]["minio"]["image_id"].as_str(),
+                "shared MinIO image differs from original machine snapshot"
+            );
+            images.insert("minio".into(), image);
+            container
+        } else {
+            live_service_container_until(
+                &self.repo_root,
+                &self.compose_project,
+                "minio",
+                self.work_limit(),
+            )?
+        };
+        let minio_version =
+            minio_runtime_version_until(&self.repo_root, &minio_container, self.work_limit())?;
+        let rest_container = live_service_container_until(
+            &self.repo_root,
+            &self.compose_project,
+            "rest",
+            self.work_limit(),
+        )?;
+        let rest_environment = container_string_array_until(
             &self.repo_root,
             &rest_container,
             "{{json .Config.Env}}",
             "REST environment",
+            self.work_limit(),
         )?;
         let expected_io = if self.publication_control_uri.is_some() {
             "CATALOG_IO__IMPL=org.apache.iceberg.rest.fixture.TracingFileIO"
@@ -596,7 +811,28 @@ impl IsolatedIcebergRestFixture {
 
     /// Independent object-existence oracle, restricted to this fixture's buckets.
     /// It uses the fixture identity directly, outside provider caches and cleanup logic.
+    fn http_timeout(&self) -> Result<Duration> {
+        if let Some(budget) = self
+            .fixture_budget
+            .as_ref()
+            .or(self.private_budget.as_ref())
+        {
+            budget.check_work()?;
+            Ok(FIXTURE_HTTP_TIMEOUT.min(budget.work_remaining()))
+        } else {
+            Ok(FIXTURE_HTTP_TIMEOUT)
+        }
+    }
+
     pub fn object_exists(&self, location: &str) -> Result<bool> {
+        if let Some(budget) = &self.fixture_budget {
+            let location = crate::fixture_run::canonical_s3(location)?;
+            let root = &budget.identity().scope_root;
+            ensure!(
+                location.starts_with(&format!("{root}/")),
+                "object oracle refuses a key outside the original run scope"
+            );
+        }
         let path = location
             .strip_prefix("s3://")
             .context("fixture object oracle requires s3 URI")?;
@@ -657,6 +893,7 @@ impl IsolatedIcebergRestFixture {
         );
         let status = fixture_http_client()?
             .head(endpoint)
+            .timeout(self.http_timeout()?)
             .header("host", host)
             .header("x-amz-date", timestamp)
             .header("x-amz-content-sha256", payload_hash)
@@ -717,9 +954,9 @@ impl IsolatedIcebergRestFixture {
         validate_catalog_identifier("table", table)?;
 
         let catalog = self.rest_catalog_base()?;
-        create_rest_namespace(&catalog, namespace)
+        create_rest_namespace_until(&catalog, namespace, self.http_timeout()?)
             .with_context(|| format!("provision isolated Iceberg namespace {namespace}"))?;
-        create_rest_empty_table(&catalog, namespace, table)
+        create_rest_empty_table_until(&catalog, namespace, table, self.http_timeout()?)
             .with_context(|| format!("provision empty isolated Iceberg table {namespace}.{table}"))
     }
 
@@ -767,14 +1004,24 @@ impl IsolatedIcebergRestFixture {
         // is what actually guarantees removal.
         self.active = false;
         let ordered = self.run_script("down.sh", &["--docker", "--purge"]);
-        let reclaimed = reclaim_fixture(
+        if self.fixture_budget.is_some() {
+            // A failed private teardown may still have a root-authorized writer.
+            // Preserve IAM/prefix registrations until its actual exit is known.
+            // The container's independent original-deadline guard remains active.
+            ordered.context(
+                "private writer exit was not confirmed; shared cleanup was not attempted",
+            )?;
+            return self.cleanup_shared_s3();
+        }
+        let reclaimed = reclaim_fixture_until(
             &self.repo_root,
             &self.compose_project,
             self.runtime_entry
                 .as_ref()
                 .map(|entry| entry.directory.as_path()),
+            self.private_budget.as_ref().map(RunBudget::deadline),
         );
-        match (ordered, reclaimed) {
+        let local_cleanup = match (ordered, reclaimed) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(script), Ok(())) => {
                 // Nothing leaked, so this is a diagnostic rather than a
@@ -791,6 +1038,15 @@ impl IsolatedIcebergRestFixture {
             (Err(script), Err(reclaim)) => Err(reclaim.context(format!(
                 "isolated fixture teardown script also failed: {script:#}"
             ))),
+        };
+        // The private catalog may own an in-flight metadata write. Settle its
+        // actual containers before removing the shared prefix they could write.
+        let shared_cleanup = self.cleanup_shared_s3();
+        match (shared_cleanup, local_cleanup) {
+            (Ok(()), value) | (value, Ok(())) => value,
+            (Err(shared), Err(local)) => {
+                Err(shared.context(format!("private teardown also failed: {local:#}")))
+            }
         }
     }
 
@@ -837,6 +1093,46 @@ impl IsolatedIcebergRestFixture {
                 && !manifest.minio.secret_access_key.trim().is_empty(),
             "isolated fixture manifest is missing REST or MinIO endpoint facts"
         );
+        if let Some(budget) = &self.fixture_budget {
+            let storage = self
+                .run_storage
+                .as_ref()
+                .context("shared private fixture omitted storage projection")?;
+            let snapshot = self
+                .shared_machine
+                .as_ref()
+                .context("shared private fixture omitted machine snapshot")?;
+            let published = manifest
+                .runtime
+                .machine
+                .as_ref()
+                .context("private publication omitted shared storage machine")?;
+            storage.validate_against(budget.identity(), published)?;
+            let projection = serde_json::to_value(storage)?;
+            ensure!(
+                manifest.storage_owner.as_ref() == Some(&projection["storage_owner"])
+                    && manifest.minio.volume.as_deref()
+                        == projection["storage_owner"]["minio_volume"].as_str(),
+                "private publication object-store owner differs from original machine"
+            );
+            let port = snapshot["ports"]["minio"]
+                .as_u64()
+                .context("original machine omitted MinIO port")?;
+            ensure!(
+                manifest.minio.endpoint == format!("http://127.0.0.1:{port}"),
+                "private publication MinIO endpoint differs from original machine"
+            );
+            for warehouse in [
+                &manifest.iceberg_rest.warehouse,
+                &manifest.iceberg_rest_mv.warehouse,
+            ] {
+                let warehouse = crate::fixture_run::canonical_s3(warehouse)?;
+                ensure!(
+                    warehouse.starts_with(&format!("{}/", budget.identity().scope_root)),
+                    "private publication warehouse leaves its original run root"
+                );
+            }
+        }
         let endpoints = IsolatedIcebergRestEndpoints {
             rest_uri: manifest.iceberg_rest.uri,
             rest_warehouse: manifest.iceberg_rest.warehouse,
@@ -897,13 +1193,187 @@ impl IsolatedIcebergRestFixture {
         }
     }
 
+    fn run_shared_mc(&self, script: &str, cleanup: bool) -> Result<Output> {
+        self.run_shared_request(script, false, cleanup)
+    }
+
+    fn run_shared_request(
+        &self,
+        payload: &str,
+        cleanup_run: bool,
+        cleanup: bool,
+    ) -> Result<Output> {
+        let budget = self
+            .fixture_budget
+            .as_ref()
+            .context("shared mc requires original run budget")?;
+        let machine = self
+            .shared_machine
+            .as_ref()
+            .context("shared S3 has no original machine snapshot")?;
+        let field = |key: &str| {
+            machine[key]
+                .as_str()
+                .with_context(|| format!("shared S3 manifest omitted {key}"))
+        };
+        let mut request = tempfile::NamedTempFile::new_in(&self.scenario_root)
+            .context("create private mc request")?;
+        std::io::Write::write_all(&mut request, payload.as_bytes())?;
+        request.as_file().sync_all()?;
+        let mut command = novarocks_test_support::ManagedCommand::new("python3");
+        command
+            .env_clear()
+            .envs(controlled_environment_values(std::env::vars_os()))
+            .current_dir(&self.repo_root)
+            .arg(self.repo_root.join("docker/iceberg-rest/machine_mc.py"))
+            .arg("--root")
+            .arg(field("control_root")?)
+            .arg("--daemon")
+            .arg(field("daemon_id")?)
+            .arg("--expected-version")
+            .arg(field("version")?)
+            .arg("--expected-generation")
+            .arg(field("generation")?)
+            .arg("--script-file")
+            .arg(request.path())
+            .env(
+                "NOVA_FIXTURE_MACHINE_DAEMON",
+                machine["daemon_id"].as_str().context("machine daemon")?,
+            )
+            .env(crate::fixture_run::RUN_CONTEXT_ENV, budget.to_json()?)
+            .env(
+                crate::fixture_run::RUN_STORAGE_ENV,
+                self.run_storage
+                    .as_ref()
+                    .context("shared command omitted original storage projection")?
+                    .to_json()?,
+            )
+            .env(
+                "NOVA_FIXTURE_MACHINE_GENERATION",
+                machine["generation"]
+                    .as_str()
+                    .context("machine generation")?,
+            );
+        if cleanup {
+            command.arg("--cleanup");
+        }
+        if cleanup_run {
+            command.arg("--cleanup-run");
+        }
+        let deadline = if cleanup {
+            budget.deadline()
+        } else {
+            budget.work_deadline()
+        };
+        let outcome = novarocks_test_support::capture_command_until(
+            command,
+            tempfile::tempfile()?,
+            tempfile::tempfile()?,
+            deadline,
+        )?;
+        ensure!(
+            !outcome.timed_out && outcome.failures.is_empty() && outcome.output.status.success(),
+            "shared mc failed with {}; diagnostics retained at {}",
+            outcome.output.status,
+            outcome.diagnostic_root().display()
+        );
+        outcome.release_diagnostics()?;
+        Ok(outcome.output)
+    }
+
+    fn cleanup_shared_s3(&mut self) -> Result<()> {
+        let Some(budget) = &self.fixture_budget else {
+            return Ok(());
+        };
+        let pairs = self
+            .shared_iam
+            .lock()
+            .map_err(|_| anyhow::anyhow!("shared IAM registration lock poisoned"))?
+            .iter()
+            .map(|(user, policy, _)| serde_json::json!({"user":user,"policy":policy}))
+            .collect::<Vec<_>>();
+        let storage = self
+            .run_storage
+            .as_ref()
+            .context("shared cleanup omitted original storage projection")?;
+        let request =
+            serde_json::json!({"identity":budget.identity(),"storage":storage,"users":pairs})
+                .to_string();
+        let result = self.run_shared_request(&request, true, true).map(|_| ());
+        let mut settlements = Vec::new();
+        for (_, _, registration) in self
+            .shared_iam
+            .lock()
+            .map_err(|_| anyhow::anyhow!("shared IAM registration lock poisoned"))?
+            .iter_mut()
+        {
+            if let Err(error) = registration.settle(&result) {
+                settlements.push(format!("{error:#}"));
+            }
+        }
+        if let Some(registration) = &mut self.shared_scope_registration
+            && let Err(error) = registration.settle(&result)
+        {
+            settlements.push(format!("{error:#}"));
+        }
+        match (result, settlements.is_empty()) {
+            (value, true) => value,
+            (Ok(()), false) => anyhow::bail!(
+                "shared cleanup settlement failed: {}",
+                settlements.join("; ")
+            ),
+            (Err(error), false) => Err(error.context(format!(
+                "shared cleanup settlement also failed: {}",
+                settlements.join("; ")
+            ))),
+        }
+    }
+
     fn new_sts_identity(&self, prefix: &str) -> Result<IsolatedStsS3Identity> {
         let user = self.new_builtin_user_identity(prefix)?;
-        mint_minio_sts_identity(&self.endpoints.minio_endpoint, &user)
+        if let Some(budget) = &self.fixture_budget {
+            budget.check_work()?;
+        }
+        mint_minio_sts_identity_until(&self.endpoints.minio_endpoint, &user, self.http_timeout()?)
             .context("mint isolated MinIO STS credential")
     }
 
     fn new_builtin_user_identity(&self, prefix: &str) -> Result<IsolatedS3Identity> {
+        if let Some(budget) = &self.fixture_budget {
+            budget.check_work()?;
+            let purpose = if prefix == "ccai" { "init" } else { "rot" };
+            let identity = IsolatedS3Identity {
+                access_key_id: budget.identity().iam_name(purpose)?,
+                secret_access_key: secret_key(prefix, &self.compose_project),
+            };
+            let policy_name = budget.identity().resource_name(purpose)?;
+            let registration = register(
+                &self.scenario_root,
+                "shared-minio-user",
+                &identity.access_key_id,
+                &policy_name,
+            )?;
+            self.shared_iam
+                .lock()
+                .map_err(|_| anyhow::anyhow!("shared IAM registration lock poisoned"))?
+                .push((
+                    identity.access_key_id.clone(),
+                    policy_name.clone(),
+                    registration,
+                ));
+            let document = scoped_s3_policy(&budget.identity().scope_root)?;
+            let script = format!(
+                "set -eu; mc alias set store http://minio:9000 \"$MINIO_ROOT_USER\" \"$MINIO_ROOT_PASSWORD\" >/dev/null; printf '%s' {} >/tmp/policy.json; mc admin policy create store {} /tmp/policy.json >/dev/null; mc admin user add store {} {} >/dev/null; mc admin policy attach store {} --user {} >/dev/null",
+                shell_literal(&document),
+                shell_literal(&policy_name),
+                shell_literal(&identity.access_key_id),
+                shell_literal(&identity.secret_access_key),
+                shell_literal(&policy_name),
+                shell_literal(&identity.access_key_id)
+            );
+            self.run_shared_mc(&script, false)?;
+            return Ok(identity);
+        }
         let identity = IsolatedS3Identity {
             access_key_id: access_key(prefix, &self.compose_project),
             // MinIO built-in-user secrets are bounded to 8..=40 bytes.
@@ -941,7 +1411,7 @@ impl IsolatedIcebergRestFixture {
             .env("VENDED_SECRET_KEY", &identity.secret_access_key);
         let output = run_bounded_command(
             command,
-            FIXTURE_DOCKER_TIMEOUT,
+            remaining_command_timeout(FIXTURE_DOCKER_TIMEOUT, self.work_limit())?,
             "provision isolated MinIO built-in user",
             &[
                 &self.minio_root_identity.secret_access_key,
@@ -1005,7 +1475,90 @@ impl IsolatedIcebergRestFixture {
         Ok(())
     }
 
+    fn run_shared_script(&self, script: &str, args: &[&str]) -> Result<()> {
+        let budget = self
+            .fixture_budget
+            .as_ref()
+            .context("shared fixture requires original budget")?;
+        let snapshot = self
+            .shared_machine
+            .as_ref()
+            .context("shared fixture omitted its original machine")?;
+        let mut command = novarocks_test_support::ManagedCommand::new(
+            self.repo_root.join("docker/iceberg-rest").join(script),
+        );
+        command
+            .env_clear()
+            .envs(controlled_environment_values(std::env::vars_os()))
+            .current_dir(&self.repo_root)
+            .args(args)
+            .env("NOVAROCKS_WORKSPACE_ROOT", &self.workspace_root)
+            .env("NOVA_ENV_CONFIG_FILE", &self.config_file)
+            .env("NOVA_ENV_SHARED_DOCKER", "false")
+            .env("NOVA_ENV_COMPOSE_PROJECT", &self.compose_project)
+            .env("NOVA_ENV_UPDATE_CURRENT", "false")
+            .env("NOVA_ENV_ALLOW_VOLUME_DELETE", "true")
+            .env("NOVA_ENV_EXPECTED_COMPOSE_PROJECT", &self.compose_project)
+            .env(
+                "NOVA_ENV_EXPECTED_MINIO_VOLUME",
+                format!("{}_minio-data", self.compose_project),
+            )
+            .env("NOVA_ENV_PRIVATE_SHARED_MINIO", "true")
+            .env(
+                "NOVA_FIXTURE_MACHINE_ROOT",
+                snapshot["control_root"]
+                    .as_str()
+                    .context("machine control root")?,
+            )
+            .env(
+                "NOVA_FIXTURE_MACHINE_DAEMON",
+                snapshot["daemon_id"].as_str().context("machine daemon")?,
+            )
+            .env(crate::fixture_run::RUN_CONTEXT_ENV, budget.to_json()?)
+            .env(
+                crate::fixture_run::RUN_STORAGE_ENV,
+                self.run_storage
+                    .as_ref()
+                    .context("shared command omitted original storage projection")?
+                    .to_json()?,
+            )
+            .env(
+                "NOVA_FIXTURE_MACHINE_GENERATION",
+                snapshot["generation"]
+                    .as_str()
+                    .context("machine generation")?,
+            );
+        if script == "up.sh" {
+            command.args(["--profile", "stock"]);
+        }
+        if let Some(entry) = &self.runtime_entry {
+            command.env("NOVA_ENV_ID", &entry.id);
+        }
+        let deadline = if script == "up.sh" {
+            budget.work_deadline()
+        } else {
+            budget.deadline()
+        };
+        let outcome = novarocks_test_support::capture_command_until(
+            command,
+            tempfile::tempfile()?,
+            tempfile::tempfile()?,
+            deadline,
+        )?;
+        ensure!(
+            !outcome.timed_out && outcome.failures.is_empty() && outcome.output.status.success(),
+            "shared S3 private REST script {script} failed with {}; diagnostics retained at {}",
+            outcome.output.status,
+            outcome.diagnostic_root().display()
+        );
+        outcome.release_diagnostics()?;
+        Ok(())
+    }
+
     fn run_script(&self, script: &str, args: &[&str]) -> Result<()> {
+        if self.fixture_budget.is_some() {
+            return self.run_shared_script(script, args);
+        }
         let script_path = self.repo_root.join("docker/iceberg-rest").join(script);
         let mut command = fixture_command(
             &script_path,
@@ -1024,15 +1577,36 @@ impl IsolatedIcebergRestFixture {
         if let Some(entry) = &self.runtime_entry {
             command.env("NOVA_ENV_ID", &entry.id);
         }
-        let output = run_bounded_command(
-            command,
-            FIXTURE_SCRIPT_TIMEOUT,
-            &format!(
-                "isolated Iceberg REST fixture script {}",
-                script_path.display()
-            ),
-            &[&self.minio_root_identity.secret_access_key],
-        )?;
+        let output = if let Some(budget) = &self.private_budget {
+            command.env(crate::fixture_run::RUN_CONTEXT_ENV, budget.to_json()?);
+            run_managed_command_until(
+                command,
+                if script == "up.sh" {
+                    budget.work_deadline()
+                } else {
+                    budget.deadline()
+                },
+            )?
+        } else {
+            run_bounded_command(
+                command,
+                self.private_budget
+                    .as_ref()
+                    .map_or(FIXTURE_SCRIPT_TIMEOUT, |budget| {
+                        if script == "up.sh" {
+                            budget.work_remaining()
+                        } else {
+                            budget.remaining()
+                        }
+                    })
+                    .min(FIXTURE_SCRIPT_TIMEOUT),
+                &format!(
+                    "isolated Iceberg REST fixture script {}",
+                    script_path.display()
+                ),
+                &[&self.minio_root_identity.secret_access_key],
+            )?
+        };
         if output.status.success() {
             return Ok(());
         }
@@ -1078,10 +1652,19 @@ impl Drop for IsolatedIcebergRestFixture {
 /// so this addresses containers, volumes, and networks through the
 /// `com.docker.compose.project` label that Compose itself writes.  That makes
 /// the reclaim safe to repeat and immune to a partially created environment.
+#[cfg(test)]
 fn reclaim_fixture(
     repo_root: &Path,
     compose_project: &str,
     runtime_dir: Option<&Path>,
+) -> Result<()> {
+    reclaim_fixture_until(repo_root, compose_project, runtime_dir, None)
+}
+fn reclaim_fixture_until(
+    repo_root: &Path,
+    compose_project: &str,
+    runtime_dir: Option<&Path>,
+    deadline: Option<Instant>,
 ) -> Result<()> {
     ensure!(
         is_fixture_project(compose_project),
@@ -1089,7 +1672,7 @@ fn reclaim_fixture(
     );
     let mut failures = Vec::new();
 
-    if let Err(error) = remove_project_docker_state(repo_root, compose_project) {
+    if let Err(error) = remove_project_docker_state_until(repo_root, compose_project, deadline) {
         failures.push(format!("{error:#}"));
     }
     if let Some(runtime_dir) = runtime_dir
@@ -1111,26 +1694,43 @@ fn reclaim_fixture(
 /// Force-removes every container, volume, and network Compose labelled with
 /// this project. Success requires verified empty final resource listings.
 fn remove_project_docker_state(repo_root: &Path, compose_project: &str) -> Result<()> {
+    remove_project_docker_state_until(repo_root, compose_project, None)
+}
+fn remove_project_docker_state_until(
+    repo_root: &Path,
+    compose_project: &str,
+    deadline: Option<Instant>,
+) -> Result<()> {
     let label = format!("label=com.docker.compose.project={compose_project}");
 
-    let containers = docker_ids(repo_root, &["ps", "-aq", "--filter", &label])?;
+    let containers = docker_ids_until(repo_root, &["ps", "-aq", "--filter", &label], deadline)?;
     if !containers.is_empty() {
         let mut args = vec!["rm", "-f", "-v"];
         args.extend(containers.iter().map(String::as_str));
-        let _ = run_docker(repo_root, &args);
+        let _ = run_docker_until(repo_root, &args, deadline);
     }
-    let networks = docker_ids(repo_root, &["network", "ls", "-q", "--filter", &label])?;
+    let networks = docker_ids_until(
+        repo_root,
+        &["network", "ls", "-q", "--filter", &label],
+        deadline,
+    )?;
     for network in &networks {
-        let _ = run_docker(repo_root, &["network", "rm", network]);
+        let _ = run_docker_until(repo_root, &["network", "rm", network], deadline);
     }
     // Volumes must go last: Docker refuses to remove one that a container still
     // references.
-    let volumes = docker_ids(repo_root, &["volume", "ls", "-q", "--filter", &label])?;
+    let volumes = docker_ids_until(
+        repo_root,
+        &["volume", "ls", "-q", "--filter", &label],
+        deadline,
+    )?;
     for volume in &volumes {
-        let _ = run_docker(repo_root, &["volume", "rm", volume]);
+        let _ = run_docker_until(repo_root, &["volume", "rm", volume], deadline);
     }
 
-    confirm_fixture_project_cleanup(compose_project, |args| docker_ids(repo_root, args))
+    confirm_fixture_project_cleanup(compose_project, |args| {
+        docker_ids_until(repo_root, args, deadline)
+    })
 }
 
 /// A successful removal requires a successful final listing of every resource
@@ -1373,14 +1973,20 @@ fn fixture_owner_pid(name: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-fn live_service_container(
+#[cfg(test)]
+fn live_service_container(repo: &Path, project: &str, service: &str) -> Result<String> {
+    live_service_container_until(repo, project, service, None)
+}
+
+fn live_service_container_until(
     repo_root: &Path,
     compose_project: &str,
     service: &str,
+    deadline: Option<Instant>,
 ) -> Result<String> {
     let project_label = format!("label=com.docker.compose.project={compose_project}");
     let service_label = format!("label=com.docker.compose.service={service}");
-    let containers = docker_ids(
+    let containers = docker_ids_until(
         repo_root,
         &[
             "ps",
@@ -1390,6 +1996,7 @@ fn live_service_container(
             "--filter",
             &service_label,
         ],
+        deadline,
     )?;
     ensure!(
         containers.len() == 1,
@@ -1399,14 +2006,15 @@ fn live_service_container(
     Ok(containers[0].clone())
 }
 
-fn completed_service_container(
+fn completed_service_container_until(
     repo_root: &Path,
     compose_project: &str,
     service: &str,
+    deadline: Option<Instant>,
 ) -> Result<String> {
     let project_label = format!("label=com.docker.compose.project={compose_project}");
     let service_label = format!("label=com.docker.compose.service={service}");
-    let containers = docker_ids(
+    let containers = docker_ids_until(
         repo_root,
         &[
             "ps",
@@ -1416,6 +2024,7 @@ fn completed_service_container(
             "--filter",
             &service_label,
         ],
+        deadline,
     )?;
     ensure!(
         containers.len() == 1,
@@ -1424,46 +2033,56 @@ fn completed_service_container(
     );
     let container = containers[0].clone();
     ensure!(
-        docker_inspect_scalar(
+        docker_inspect_scalar_until(
             repo_root,
             &container,
             "{{.State.Status}}",
-            "completed service state"
+            "completed service state",
+            deadline
         )? == "exited"
-            && docker_inspect_scalar(
+            && docker_inspect_scalar_until(
                 repo_root,
                 &container,
                 "{{.State.ExitCode}}",
-                "completed service exit code"
+                "completed service exit code",
+                deadline
             )? == "0",
         "isolated fixture service {service} did not complete successfully"
     );
     Ok(container)
 }
 
-fn live_service_image(
+fn live_service_image_until(
     repo_root: &Path,
     compose_project: &str,
     service: &str,
+    deadline: Option<Instant>,
 ) -> Result<IsolatedIcebergRestImageIdentity> {
-    let container = live_service_container(repo_root, compose_project, service)?;
-    container_image(repo_root, &container, service)
+    let container = live_service_container_until(repo_root, compose_project, service, deadline)?;
+    container_image_until(repo_root, &container, service, deadline)
 }
 
-fn container_image(
+fn container_image_until(
     repo_root: &Path,
     container: &str,
     service: &str,
+    deadline: Option<Instant>,
 ) -> Result<IsolatedIcebergRestImageIdentity> {
-    let image_id = docker_inspect_scalar(repo_root, container, "{{.Image}}", "image id")?;
+    let image_id =
+        docker_inspect_scalar_until(repo_root, container, "{{.Image}}", "image id", deadline)?;
     ensure!(
         image_id.strip_prefix("sha256:").is_some_and(
             |digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
         ),
         "isolated fixture service {service} did not report an immutable image id"
     );
-    let image_reference =
-        docker_inspect_scalar(repo_root, container, "{{.Config.Image}}", "image reference")?;
+    let image_reference = docker_inspect_scalar_until(
+        repo_root,
+        container,
+        "{{.Config.Image}}",
+        "image reference",
+        deadline,
+    )?;
     ensure!(
         !image_reference.trim().is_empty(),
         "isolated fixture service {service} has an empty image reference"
@@ -1474,13 +2093,18 @@ fn container_image(
     })
 }
 
-fn docker_inspect_scalar(
+fn docker_inspect_scalar_until(
     repo_root: &Path,
     object: &str,
     format: &str,
     fact: &str,
+    deadline: Option<Instant>,
 ) -> Result<String> {
-    let output = run_docker(repo_root, &["inspect", "--format", format, object])?;
+    let output = run_docker_until(
+        repo_root,
+        &["inspect", "--format", format, object],
+        deadline,
+    )?;
     ensure!(
         output.status.success(),
         "docker inspect for {fact} exited with {}",
@@ -1494,18 +2118,27 @@ fn docker_inspect_scalar(
     Ok(value)
 }
 
-fn container_string_array(
+fn container_string_array_until(
     repo_root: &Path,
     container: &str,
     format: &str,
     fact: &str,
+    deadline: Option<Instant>,
 ) -> Result<Vec<String>> {
-    let json = docker_inspect_scalar(repo_root, container, format, fact)?;
+    let json = docker_inspect_scalar_until(repo_root, container, format, fact, deadline)?;
     serde_json::from_str(&json).with_context(|| format!("decode Docker {fact}"))
 }
 
-fn minio_runtime_version(repo_root: &Path, container: &str) -> Result<String> {
-    let output = run_docker(repo_root, &["exec", container, "minio", "--version"])?;
+fn minio_runtime_version_until(
+    repo_root: &Path,
+    container: &str,
+    deadline: Option<Instant>,
+) -> Result<String> {
+    let output = run_docker_until(
+        repo_root,
+        &["exec", container, "minio", "--version"],
+        deadline,
+    )?;
     ensure!(
         output.status.success(),
         "read isolated MinIO version exited with {}",
@@ -1545,7 +2178,10 @@ fn fixture_template_model_hash(repo_root: &Path) -> Result<String> {
     hash_named_files(repo_root, &paths)
 }
 
-fn build_publication_hook_image(repo_root: &Path) -> Result<String> {
+fn build_publication_hook_image_until(
+    repo_root: &Path,
+    deadline: Option<Instant>,
+) -> Result<String> {
     // --pull=false alone still permits Docker to fetch a missing FROM image.
     // Verify the local inputs before invoking the hook-only compilation.
     let mut inspect = controlled_command("docker");
@@ -1557,7 +2193,7 @@ fn build_publication_hook_image(repo_root: &Path) -> Result<String> {
     ]);
     let inputs = run_bounded_command(
         inspect,
-        FIXTURE_DOCKER_TIMEOUT,
+        remaining_command_timeout(FIXTURE_DOCKER_TIMEOUT, deadline)?,
         "inspect local publication hook base images",
         &[],
     )?;
@@ -1590,7 +2226,7 @@ fn build_publication_hook_image(repo_root: &Path) -> Result<String> {
         .arg(&hook_root);
     let output = run_bounded_command(
         command,
-        FIXTURE_SCRIPT_TIMEOUT,
+        remaining_command_timeout(FIXTURE_SCRIPT_TIMEOUT, deadline)?,
         "build publication hook image before fixture creation",
         &[],
     )?;
@@ -1673,6 +2309,86 @@ fn run_docker(repo_root: &Path, args: &[&str]) -> Result<Output> {
 /// pipe EOF from another process before the fixture can inspect its output.
 /// Whatever the script left running is addressed by the caller's failure path,
 /// which reclaims the compose project by label.
+fn remaining_command_timeout(cap: Duration, deadline: Option<Instant>) -> Result<Duration> {
+    let timeout = deadline.map_or(cap, |end| {
+        cap.min(end.saturating_duration_since(Instant::now()))
+    });
+    ensure!(
+        !timeout.is_zero(),
+        "original private fixture deadline expired"
+    );
+    Ok(timeout)
+}
+fn run_docker_until(repo_root: &Path, args: &[&str], deadline: Option<Instant>) -> Result<Output> {
+    let mut command = controlled_command("docker");
+    command.current_dir(repo_root).args(args);
+    let end = Instant::now() + remaining_command_timeout(FIXTURE_DOCKER_TIMEOUT, deadline)?;
+    if deadline.is_some() {
+        run_managed_command_until(command, end)
+    } else {
+        run_bounded_command(
+            command,
+            FIXTURE_DOCKER_TIMEOUT,
+            "private fixture Docker operation",
+            &[],
+        )
+    }
+}
+fn docker_ids_until(
+    repo_root: &Path,
+    args: &[&str],
+    deadline: Option<Instant>,
+) -> Result<Vec<String>> {
+    let output = run_docker_until(repo_root, args, deadline)?;
+    ensure!(
+        output.status.success(),
+        "private Docker listing failed with {}",
+        output.status
+    );
+    Ok(String::from_utf8(output.stdout)?
+        .lines()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn run_managed_command_until(command: Command, deadline: Instant) -> Result<Output> {
+    ensure!(
+        Instant::now() < deadline,
+        "original private fixture deadline expired"
+    );
+    let mut request = novarocks_test_support::ManagedCommand::new(command.get_program());
+    request.env_clear().args(command.get_args());
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => {
+                request.env(key, value);
+            }
+            None => {
+                request.env_remove(key);
+            }
+        }
+    }
+    if let Some(directory) = command.get_current_dir() {
+        request.current_dir(directory);
+    }
+    let outcome = novarocks_test_support::capture_command_until(
+        request,
+        tempfile::tempfile()?,
+        tempfile::tempfile()?,
+        deadline,
+    )?;
+    ensure!(
+        !outcome.timed_out && outcome.failures.is_empty(),
+        "private fixture command failed to settle before its original deadline; diagnostics: {}",
+        outcome.diagnostic_root().display()
+    );
+    let output = outcome.output.clone();
+    outcome.release_diagnostics()?;
+    Ok(output)
+}
+
 fn run_bounded_command(
     mut command: Command,
     timeout: Duration,
@@ -1761,9 +2477,14 @@ fn fixture_http_client() -> Result<reqwest::blocking::Client> {
 
 /// Creates one namespace in the fixture's own REST Catalog, tolerating a
 /// namespace that already exists.
-fn create_rest_namespace(catalog_base: &str, namespace: &str) -> Result<()> {
+fn create_rest_namespace_until(
+    catalog_base: &str,
+    namespace: &str,
+    timeout: Duration,
+) -> Result<()> {
     let response = fixture_http_client()?
         .post(format!("{catalog_base}/v1/namespaces"))
+        .timeout(timeout)
         .header("content-type", "application/json")
         .body(rest_create_namespace_body(namespace))
         .send()
@@ -1788,9 +2509,15 @@ fn create_rest_namespace(catalog_base: &str, namespace: &str) -> Result<()> {
 /// An existing table is a failure rather than a no-op: the previous Spark
 /// `CREATE TABLE` carried no `IF NOT EXISTS`, and a scenario that provisions
 /// the same table twice has lost track of its own fixture.
-fn create_rest_empty_table(catalog_base: &str, namespace: &str, table: &str) -> Result<()> {
+fn create_rest_empty_table_until(
+    catalog_base: &str,
+    namespace: &str,
+    table: &str,
+    timeout: Duration,
+) -> Result<()> {
     let response = fixture_http_client()?
         .post(format!("{catalog_base}/v1/namespaces/{namespace}/tables"))
+        .timeout(timeout)
         .header("content-type", "application/json")
         .body(rest_create_table_body(table))
         .send()
@@ -1802,6 +2529,50 @@ fn create_rest_empty_table(catalog_base: &str, namespace: &str, table: &str) -> 
         rest_failure_body(response)
     );
     Ok(())
+}
+
+fn load_shared_machine(env: &Path) -> Result<serde_json::Value> {
+    let manifest: serde_json::Value = serde_json::from_str(&fs::read_to_string(
+        env.parent()
+            .context("shared publication directory")?
+            .join("manifest.json"),
+    )?)?;
+    ensure!(
+        manifest["ready"] == true && manifest["shared_docker"] == true,
+        "BLOCKED: shared S3 requires a ready machine publication"
+    );
+    let snapshot = manifest["runtime"]["machine"].clone();
+    ensure!(
+        snapshot.is_object() && snapshot["phase"] == "ready",
+        "BLOCKED: fixture publication has no machine snapshot"
+    );
+    Ok(snapshot)
+}
+
+fn shared_env_file(repo: &Path) -> Result<PathBuf> {
+    let env = std::env::var_os("NOVA_ENV_REST_ENV_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo.join("docker/iceberg-rest/runtime/current/env.sh"));
+    env.canonicalize()
+        .context("BLOCKED: attach the machine fixture before shared S3 scenarios")
+}
+
+fn scoped_s3_policy(scope_root: &str) -> Result<String> {
+    let root = crate::fixture_run::canonical_s3(scope_root)?;
+    let (bucket, prefix) = root
+        .strip_prefix("s3://")
+        .unwrap()
+        .split_once('/')
+        .context("S3 policy requires an exact object prefix")?;
+    ensure!(
+        prefix.contains("/scratch/"),
+        "S3 policy requires a scratch run scope"
+    );
+    Ok(serde_json::json!({"Version":"2012-10-17","Statement":[
+        {"Effect":"Allow","Action":["s3:GetBucketLocation"],"Resource":[format!("arn:aws:s3:::{bucket}")]},
+        {"Effect":"Allow","Action":["s3:ListBucket"],"Resource":[format!("arn:aws:s3:::{bucket}")],"Condition":{"StringLike":{"s3:prefix":[format!("{prefix}/"),format!("{prefix}/*")]}}},
+        {"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:AbortMultipartUpload","s3:ListMultipartUploadParts"],"Resource":[format!("arn:aws:s3:::{bucket}/{prefix}/*")]}
+    ]}).to_string())
 }
 
 fn rest_create_namespace_body(namespace: &str) -> String {
@@ -1837,9 +2608,10 @@ fn rest_failure_body(response: reqwest::blocking::Response) -> String {
 /// endpoint. This fixture uses a deliberately small SigV4 implementation so
 /// the test harness does not need to introduce an AWS SDK only to issue two
 /// local credentials.
-fn mint_minio_sts_identity(
+fn mint_minio_sts_identity_until(
     endpoint: &str,
     user: &IsolatedS3Identity,
+    timeout: Duration,
 ) -> Result<IsolatedStsS3Identity> {
     let endpoint = endpoint
         .parse::<reqwest::Url>()
@@ -1885,6 +2657,7 @@ fn mint_minio_sts_identity(
 
     let response = fixture_http_client()?
         .post(endpoint)
+        .timeout(timeout)
         .header("content-type", "application/x-www-form-urlencoded")
         .header("host", canonical_host)
         .header("x-amz-content-sha256", payload_hash)
@@ -1917,34 +2690,16 @@ fn mint_minio_sts_identity(
 }
 
 fn aws_amz_timestamp() -> Result<String> {
-    let mut command = Command::new("date");
-    command.args(["-u", "+%Y%m%dT%H%M%SZ"]);
-    let output = run_bounded_command(
-        command,
-        FIXTURE_PROBE_TIMEOUT,
-        "read UTC time for isolated MinIO STS request",
-        &[],
-    )?;
-    ensure!(
-        output.status.success(),
-        "read UTC time for isolated MinIO STS request exited with {}",
-        output.status
-    );
-    let value = String::from_utf8(output.stdout)
-        .context("decode UTC time for isolated MinIO STS request")?
-        .trim()
-        .to_owned();
-    ensure!(
-        value.len() == 16
-            && value.as_bytes()[8] == b'T'
-            && value.as_bytes()[15] == b'Z'
-            && value
-                .bytes()
-                .enumerate()
-                .all(|(index, byte)| { index == 8 || index == 15 || byte.is_ascii_digit() }),
-        "UTC time for isolated MinIO STS request has an unexpected format"
-    );
-    Ok(value)
+    let now = OffsetDateTime::now_utc();
+    Ok(format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    ))
 }
 
 fn aws_v4_signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
@@ -1990,6 +2745,8 @@ fn sts_xml_value(xml: &str, element: &str) -> Result<String> {
 struct Manifest {
     env_id: String,
     runtime: ManifestRuntime,
+    #[serde(default)]
+    storage_owner: Option<serde_json::Value>,
     workspace_root: String,
     shared_docker: bool,
     compose_project: String,
@@ -2003,6 +2760,8 @@ struct Manifest {
 
 #[derive(Deserialize)]
 struct ManifestRuntime {
+    #[serde(default)]
+    machine: Option<serde_json::Value>,
     profile: String,
     control_uri: Option<String>,
     template_model_sha256: String,
@@ -2062,6 +2821,8 @@ fn read_manifest(manifest_path: &Path) -> Result<Manifest> {
 
 #[derive(Deserialize)]
 struct ManifestMinio {
+    #[serde(default)]
+    volume: Option<String>,
     endpoint: String,
     access_key_id: String,
     secret_access_key: String,
@@ -2160,10 +2921,9 @@ fn shell_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
 }
 
-fn apply_controlled_environment(
-    command: &mut Command,
+pub(crate) fn controlled_environment_values(
     source: impl IntoIterator<Item = (OsString, OsString)>,
-) {
+) -> Vec<(OsString, OsString)> {
     // Keep this transport/tooling allowlist aligned with fixture_runtime.py.
     // Generated endpoints, credentials and Compose overrides are never inputs.
     const PRESERVED: &[&str] = &[
@@ -2182,14 +2942,20 @@ fn apply_controlled_environment(
         "XDG_CACHE_HOME",
         "XDG_STATE_HOME",
         "NOVA_FIXTURE_STORE",
-        "NOVA_FIXTURE_RUNTIME_DIR",
     ];
-    command.env_clear();
-    command.envs(
-        source
-            .into_iter()
-            .filter(|(key, _)| key.to_str().is_some_and(|key| PRESERVED.contains(&key))),
-    );
+    source
+        .into_iter()
+        .filter(|(key, _)| key.to_str().is_some_and(|key| PRESERVED.contains(&key)))
+        .collect()
+}
+
+fn apply_controlled_environment(
+    command: &mut Command,
+    source: impl IntoIterator<Item = (OsString, OsString)>,
+) {
+    command
+        .env_clear()
+        .envs(controlled_environment_values(source));
 }
 
 fn controlled_command(program: impl AsRef<OsStr>) -> Command {
@@ -2276,7 +3042,7 @@ mod tests {
             ("DOCKER_HOST", "unix:///tmp/fixture.sock"),
             ("XDG_CACHE_HOME", "/tmp/fixture-cache"),
             ("NOVA_FIXTURE_STORE", "/tmp/private-bom"),
-            ("NOVA_FIXTURE_RUNTIME_DIR", "/tmp/private-owner"),
+            ("XDG_STATE_HOME", "/tmp/fixture-state"),
             ("NOVA_ENV_REST_PORT", "8181"),
             ("NOVA_ENV_UNKNOWN_FUTURE_OVERRIDE", "foreign"),
             ("NOVAROCKS_WORKSPACE_ROOT", "/foreign/worktree"),
@@ -2300,7 +3066,7 @@ mod tests {
             "DOCKER_HOST=unix:///tmp/fixture.sock",
             "XDG_CACHE_HOME=/tmp/fixture-cache",
             "NOVA_FIXTURE_STORE=/tmp/private-bom",
-            "NOVA_FIXTURE_RUNTIME_DIR=/tmp/private-owner",
+            "XDG_STATE_HOME=/tmp/fixture-state",
         ] {
             assert!(actual.lines().any(|line| line == expected), "{actual}");
         }
@@ -2419,8 +3185,147 @@ mod tests {
             profile: FixtureProfile::Stock,
             // These tests own files only. Drop must never contact Docker.
             active: false,
+            fixture_budget: None,
+            private_budget: None,
+            shared_iam: Mutex::new(Vec::new()),
+            shared_scope_registration: None,
+            shared_machine: None,
+            run_storage: None,
         };
         (temp, fixture, manifest)
+    }
+
+    #[test]
+    fn rest_storage_binding_snapshots_the_actual_owner_without_credentials() {
+        let (_root, mut fixture, _) = manifest_fixture();
+        fixture.endpoints.rest_uri = "http://127.0.0.1:38001".into();
+        fixture.endpoints.rest_mv_uri = "http://127.0.0.1:38002".into();
+        let private = fixture.rest_storage_binding();
+        assert_eq!(private.owner(), RestObjectStoreOwner::PrivateObjectStore);
+        assert_eq!(
+            private.rest_uris(),
+            ["http://127.0.0.1:38001", "http://127.0.0.1:38002"]
+        );
+        let debug = format!("{private:?}");
+        assert!(!debug.contains(&fixture.minio_root_identity.access_key_id));
+        assert!(!debug.contains(&fixture.minio_root_identity.secret_access_key));
+        fixture.shared_machine = Some(serde_json::json!({}));
+        fixture.endpoints.rest_uri = "http://127.0.0.1:48001".into();
+        let shared = fixture.rest_storage_binding();
+        assert_eq!(shared.owner(), RestObjectStoreOwner::MachineScratch);
+        assert_eq!(shared.rest_uris()[0], "http://127.0.0.1:48001");
+        assert_eq!(private.owner(), RestObjectStoreOwner::PrivateObjectStore);
+        assert_eq!(private.rest_uris()[0], "http://127.0.0.1:38001");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_fixture_rejects_expired_original_work_clock_before_creating_resources() {
+        use crate::fixture_run::{FixturePolicy, RunBudget, ScratchIdentity};
+        let original = RunBudget::admit(
+            FixturePolicy::default(),
+            ScratchIdentity::create("s3://novarocks/private-budget").unwrap(),
+            600,
+            None,
+        )
+        .unwrap();
+        let budget = original.clone().with_work_deadline_limit(Instant::now());
+        let root = tempfile::tempdir().unwrap();
+        assert!(
+            IsolatedIcebergRestFixture::start_private_with_budget(root.path(), &budget, false)
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        assert_eq!(budget.to_json().unwrap(), original.to_json().unwrap());
+    }
+    #[test]
+    fn shared_prefix_cleanup_waits_for_confirmed_private_exit() {
+        use crate::fixture_run::{FixturePolicy, RunBudget, ScratchIdentity};
+        use std::os::unix::fs::PermissionsExt;
+        for private_succeeds in [false, true] {
+            let (_temp, mut fixture, _) = manifest_fixture();
+            let budget = RunBudget::admit(
+                FixturePolicy::default(),
+                ScratchIdentity::create("s3://novarocks/order-test").unwrap(),
+                600,
+                None,
+            )
+            .unwrap();
+            let before = crate::resource_registration::list(&fixture.scenario_root).unwrap();
+            fixture.shared_scope_registration = Some(
+                register(
+                    &fixture.scenario_root,
+                    "shared-minio-prefix",
+                    &budget.identity().run_id,
+                    &budget.identity().scope_root,
+                )
+                .unwrap(),
+            );
+            fixture.fixture_budget = Some(budget);
+            let vectors: serde_json::Value = serde_json::from_str(include_str!(
+                "../../../docker/iceberg-rest/tests/run_storage_scope_vectors.json"
+            ))
+            .unwrap();
+            let mut snapshot = vectors["record"].clone();
+            snapshot["control_root"] = serde_json::json!("/unused");
+            fixture.run_storage = Some(
+                RunStorageScope::from_record(
+                    fixture.fixture_budget.as_ref().unwrap().identity(),
+                    &snapshot,
+                )
+                .unwrap(),
+            );
+            fixture.shared_machine = Some(snapshot);
+            let script_root = fixture.repo_root.join("docker/iceberg-rest");
+            let down = script_root.join("down.sh");
+            fs::write(
+                &down,
+                if private_succeeds {
+                    "#!/bin/sh\nexit 0\n"
+                } else {
+                    "#!/bin/sh\nexit 17\n"
+                },
+            )
+            .unwrap();
+            fs::set_permissions(&down, fs::Permissions::from_mode(0o700)).unwrap();
+            let marker = fixture.scenario_root.join("shared-cleanup-called");
+            fs::write(
+                script_root.join("machine_mc.py"),
+                format!(
+                    "import json,os,sys\nfrom pathlib import Path\nrequest=json.loads(Path(sys.argv[sys.argv.index('--script-file')+1]).read_text())\nassert request['storage']==json.loads(os.environ['NOVA_FIXTURE_RUN_STORAGE'])\nassert request['identity']==json.loads(os.environ['NOVA_FIXTURE_RUN_CONTEXT'])['identity']\nPath({:?}).write_text(json.dumps(request))\n",
+                    marker.to_str().unwrap()
+                ),
+            )
+            .unwrap();
+            fixture.active = true;
+            let result = fixture.shutdown();
+            assert_eq!(result.is_ok(), private_succeeds);
+            assert_eq!(marker.exists(), private_succeeds);
+            if private_succeeds {
+                let request: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
+                assert_eq!(
+                    request["storage"],
+                    serde_json::to_value(fixture.run_storage.as_ref().unwrap()).unwrap()
+                );
+                assert!(request["users"].as_array().unwrap().is_empty());
+            }
+            let observed = crate::resource_registration::collect(
+                &fixture.scenario_root,
+                &before,
+                std::process::id(),
+            )
+            .unwrap();
+            assert_eq!(observed.len(), 1);
+            assert_eq!(
+                observed[0].state,
+                if private_succeeds {
+                    crate::resource_registration::ObservedResourceState::Released
+                } else {
+                    crate::resource_registration::ObservedResourceState::Unsettled
+                }
+            );
+        }
     }
 
     #[test]
@@ -2445,6 +3350,79 @@ mod tests {
                 let error = fixture.read_endpoints().unwrap_err();
                 assert!(error.to_string().contains("endpoint facts"), "{error}");
             }
+        }
+    }
+
+    #[test]
+    fn shared_private_manifest_requires_original_storage_owner_endpoint_and_child_roots() {
+        let (_temp, mut fixture, mut value) = manifest_fixture();
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docker/iceberg-rest/tests/run_storage_scope_vectors.json"
+        ))
+        .unwrap();
+        let mut snapshot = vectors["record"].clone();
+        snapshot["ports"]["minio"] = serde_json::json!(38000);
+        let budget = RunBudget::admit(
+            crate::fixture_run::FixturePolicy::default(),
+            crate::fixture_run::ScratchIdentity::create("s3://novarocks/private-fixture").unwrap(),
+            600,
+            None,
+        )
+        .unwrap();
+        fixture.run_storage =
+            Some(RunStorageScope::from_record(budget.identity(), &snapshot).unwrap());
+        value["runtime"]["machine"] = snapshot.clone();
+        value["storage_owner"] =
+            serde_json::json!({"daemon_id":"daemon-test","minio_volume":"minio-test"});
+        value["minio"]["volume"] = serde_json::json!("minio-test");
+        value["minio"]["endpoint"] = serde_json::json!("http://127.0.0.1:38000");
+        for (catalog, suffix) in [("iceberg_rest", "rest"), ("iceberg_rest_mv", "rest-mv")] {
+            value[catalog]["warehouse"] =
+                serde_json::json!(format!("{}/{suffix}", budget.identity().scope_root));
+        }
+        fixture.fixture_budget = Some(budget);
+        fixture.shared_machine = Some(snapshot);
+        let manifest_path = Path::new(value["runtime_dir"].as_str().unwrap()).join("manifest.json");
+        fs::write(&manifest_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        fixture
+            .read_endpoints()
+            .expect("exact shared owner and private children");
+        for change in [
+            "owner",
+            "volume",
+            "endpoint",
+            "machine",
+            "warehouse",
+            "lookalike",
+        ] {
+            let mut changed = value.clone();
+            match change {
+                "owner" => changed["storage_owner"]["daemon_id"] = serde_json::json!("other"),
+                "volume" => changed["minio"]["volume"] = serde_json::json!("other"),
+                "endpoint" => {
+                    changed["minio"]["endpoint"] = serde_json::json!("http://127.0.0.1:38009")
+                }
+                "machine" => {
+                    changed["runtime"]["machine"]["generation"] = serde_json::json!("other")
+                }
+                "warehouse" => {
+                    changed["iceberg_rest"]["warehouse"] =
+                        serde_json::json!("s3://warehouse/service")
+                }
+                _ => {
+                    changed["iceberg_rest_mv"]["warehouse"] = serde_json::json!(format!(
+                        "{}lookalike/rest",
+                        fixture
+                            .fixture_budget
+                            .as_ref()
+                            .unwrap()
+                            .identity()
+                            .scope_root
+                    ))
+                }
+            }
+            fs::write(&manifest_path, serde_json::to_vec(&changed).unwrap()).unwrap();
+            assert!(fixture.read_endpoints().is_err(), "{change}");
         }
     }
 
@@ -2879,6 +3857,29 @@ mod tests {
             fs::write(path, "original").expect("restore model input");
         }
         assert_eq!(forward.len(), 64);
+    }
+
+    #[test]
+    fn shared_policy_authorizes_only_exact_run_descendants() {
+        let root = "s3://novarocks/worktree/scratch/nr_scratch_1792540800000_0123456789abcdef0123456789abcdef";
+        let policy: serde_json::Value =
+            serde_json::from_str(&scoped_s3_policy(root).unwrap()).unwrap();
+        let statements = policy["Statement"].as_array().unwrap();
+        assert_eq!(statements.len(), 3);
+        assert_eq!(
+            statements[1]["Condition"]["StringLike"]["s3:prefix"],
+            serde_json::json!([
+                "worktree/scratch/nr_scratch_1792540800000_0123456789abcdef0123456789abcdef/",
+                "worktree/scratch/nr_scratch_1792540800000_0123456789abcdef0123456789abcdef/*"
+            ])
+        );
+        assert_eq!(
+            statements[2]["Resource"],
+            serde_json::json!([
+                "arn:aws:s3:::novarocks/worktree/scratch/nr_scratch_1792540800000_0123456789abcdef0123456789abcdef/*"
+            ])
+        );
+        assert!(scoped_s3_policy("s3://novarocks/benchmarks").is_err());
     }
 
     #[test]

@@ -21,6 +21,14 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../../.." && pwd)"
+if [[ "${UEA7_USE_SHARED_MINIO:-0}" == "1" && "${NOVA_FIXTURE_PUBLICATION_COMMAND_OWNER:-false}" != true ]]; then
+  runtime_env="${NOVA_ENV_REST_ENV_FILE:-$repo_root/docker/iceberg-rest/runtime/current/env.sh}"
+  NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" context --env-file "$runtime_env")"
+  export NOVA_FIXTURE_RUN_CONTEXT NOVA_FIXTURE_PUBLICATION_COMMAND_OWNER=true
+  NOVA_FIXTURE_RUN_STORAGE="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" storage --env-file "$runtime_env")"
+  export NOVA_FIXTURE_RUN_STORAGE
+  exec python3 "$repo_root/docker/iceberg-rest/fixture_run.py" command --env-file "$runtime_env" -- bash "$0" "$@"
+fi
 image_name="${UEA7_FIXTURE_IMAGE:-novarocks/iceberg-rest-publication-fixture:test}"
 artifact_dir="${UEA7_ARTIFACT_DIR:-}"
 storage_mode="local-hadoop"
@@ -32,15 +40,17 @@ container_name="novarocks-uea7-publication-$name_suffix"
 work_dir=""
 shared_bucket=""
 shared_bucket_created=0
+shared_prefix=""
 minio_container=""
 minio_host=""
 
 cleanup_shared_bucket() {
   if [[ "$shared_bucket_created" == "1" ]]; then
-    docker exec \
-      --env "MC_HOST_uea7=$minio_host" \
-      "$minio_container" \
-      mc rb --force "uea7/$shared_bucket" >/dev/null 2>&1 || true
+    NOVA_FIXTURE_CLEANUP_MODE=true python3 "$repo_root/docker/iceberg-rest/fixture_run.py" compose --env-file "$runtime_env" -- \
+      --env-file "$NOVA_ENV_COMPOSE_ENV" -p "$NOVA_ENV_COMPOSE_PROJECT" -f "$NOVA_ENV_COMPOSE_FILE" \
+      run --rm --no-deps --entrypoint /bin/sh mc -c \
+      'mc alias set store http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null && mc rm --recursive --force "$1"' _ \
+      "store/$shared_bucket/$shared_prefix/" || return
     shared_bucket_created=0
   fi
 }
@@ -72,6 +82,11 @@ retain_failed_attempt() {
   fi
   # Copy before deleting the private work directory or container. Failure to
   # retain one item must not prevent retaining the others or hide the cause.
+  # Credential material is private operational state, never evidence.
+  if ! rm -f "$work_dir/shared-minio.env"; then
+    echo "private credential file could not be removed; raw work directory retained without evidence copy" >&2
+    return 1
+  fi
   if cp -R "$work_dir/." "$artifact_dir/"; then
     retention_complete=1
   else
@@ -91,11 +106,17 @@ cleanup() {
   local retention_complete=0
   trap - EXIT INT TERM
   if [[ "$original_status" -ne 0 ]]; then
-    retain_failed_attempt "$original_status"
+    if ! retain_failed_attempt "$original_status"; then
+      echo "failed attempt evidence could not be fully retained" >&2
+    fi
   fi
   local container_cleanup=0
-  docker rm -f "$container_name" >/dev/null 2>&1 || container_cleanup="$?"
-  cleanup_shared_bucket
+  docker rm -f "${started_container_id:-$container_name}" >/dev/null 2>&1 || container_cleanup="$?"
+  local shared_cleanup=0
+  cleanup_shared_bucket || shared_cleanup="$?"
+  if (( container_cleanup != 0 || shared_cleanup != 0 )); then
+    echo "fixture cleanup failed: container=$container_cleanup shared_scope=$shared_cleanup" >&2
+  fi
   if [[ -n "$artifact_dir" && "$original_status" -ne 0 ]]; then
     printf '%s\n' "$container_cleanup" >"$artifact_dir/container-cleanup-status.txt" || true
   fi
@@ -106,6 +127,7 @@ cleanup() {
   else
     echo "unarchived Java fixture work directory retained: $work_dir" >&2
   fi
+  (( original_status != 0 )) || original_status=$((container_cleanup != 0 ? container_cleanup : shared_cleanup))
   exit "$original_status"
 }
 trap cleanup EXIT
@@ -129,6 +151,9 @@ docker image inspect apache/iceberg-rest-fixture:1.10.1 >/dev/null 2>&1 \
 docker image inspect apache/spark:3.5.5-java17 >/dev/null 2>&1 \
   || fail "missing local image apache/spark:3.5.5-java17"
 
+if [[ "${UEA7_USE_SHARED_MINIO:-0}" == "1" && "${UEA7_SKIP_BUILD:-0}" != "1" ]]; then
+  fail "shared MinIO publication requires an already provisioned fixture image and UEA7_SKIP_BUILD=1"
+fi
 if [[ "${UEA7_SKIP_BUILD:-0}" != "1" ]]; then
   docker build --pull=false -t "$image_name" "$script_dir"
 fi
@@ -159,36 +184,58 @@ if [[ "${UEA7_USE_SHARED_MINIO:-0}" == "1" ]]; then
       || fail "UEA7_USE_SHARED_MINIO=1 requires $required_variable"
   done
   storage_mode="shared-minio"
-  shared_network="${NOVA_ENV_COMPOSE_PROJECT}_iceberg_net"
+  NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" context --env-file "$runtime_env")"
+  export NOVA_FIXTURE_RUN_CONTEXT
+  NOVA_FIXTURE_RUN_STORAGE="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" storage --env-file "$runtime_env")"
+  export NOVA_FIXTURE_RUN_STORAGE
+python3 "$repo_root/docker/iceberg-rest/fixture_run.py" sweep-start --env-file "$runtime_env" >&2
+  shared_network="${NOVAROCKS_PAIMON_DOCKER_NETWORK:?machine network required}"
   minio_container="${NOVA_ENV_OBJECT_STORE_CONTAINER}"
   docker network inspect "$shared_network" >/dev/null 2>&1 \
     || fail "shared MinIO network does not exist: $shared_network"
   [[ "$(docker inspect "$minio_container" --format '{{.State.Running}}' 2>/dev/null)" == "true" ]] \
     || fail "shared MinIO container is not running: $minio_container"
-  bucket_suffix="$(printf '%s' "$name_suffix" | tr '[:upper:]' '[:lower:]' | cut -c1-38)"
-  shared_bucket="novarocks-uea7-$bucket_suffix"
-  [[ "$shared_bucket" =~ ^novarocks-uea7-[a-z0-9-]+$ ]] \
-    || fail "generated unsafe shared MinIO bucket: $shared_bucket"
-  minio_host="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@localhost:9000"
-  docker exec \
-    --env "MC_HOST_uea7=$minio_host" \
-    "$minio_container" \
-    mc mb "uea7/$shared_bucket" >/dev/null \
-    || fail "create isolated shared MinIO bucket $shared_bucket"
+  shared_root="$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["identity"]["scope_root"]+"/publication")' "$NOVA_FIXTURE_RUN_CONTEXT")"
+  shared_bucket="${shared_root#s3://}"; shared_bucket="${shared_bucket%%/*}"
+  shared_prefix="${shared_root#s3://$shared_bucket/}"
   shared_bucket_created=1
+  shared_environment="$work_dir/shared-minio.env"
+  (umask 077; printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n' "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" > "$shared_environment")
   docker_arguments+=(
     --network "$shared_network"
     --env UEA7_DELEGATE_FILE_IO=s3
-    --env AWS_ACCESS_KEY_ID="$MINIO_ROOT_USER"
-    --env AWS_SECRET_ACCESS_KEY="$MINIO_ROOT_PASSWORD"
+    --env-file "$shared_environment"
     --env AWS_REGION=us-east-1
     --env CATALOG_S3_ENDPOINT=http://minio:9000
     --env CATALOG_S3_PATH__STYLE__ACCESS=true
-    --env CATALOG_WAREHOUSE="s3://$shared_bucket/warehouse"
+    --env CATALOG_WAREHOUSE="$shared_root/warehouse"
   )
 fi
 
-docker run "${docker_arguments[@]}" "$image_name" >/dev/null
+if [[ "${UEA7_USE_SHARED_MINIO:-0}" == "1" ]]; then
+  started_container_id="$(python3 - "$repo_root/docker/iceberg-rest" "$runtime_env" "$image_name" "${docker_arguments[@]}" <<'PYGUARD'
+import sys
+sys.path.insert(0,sys.argv[1])
+import fixture_run,fixture_runtime
+from private_deadline import command_guard
+_,_,budget=fixture_run.admit(sys.argv[2])
+if budget is None:
+    raise SystemExit("RunBudgetRejected: shared publication requires its original machine context")
+backend=fixture_runtime.Docker(timeout=max(0.001,budget.remaining_seconds(work=True)))
+backend.operation_deadline=budget.deadline-budget.cleanup_grace_seconds
+image=backend.inspect("image",sys.argv[3])
+config=image.get("Config") or {}
+parts=[config.get("Entrypoint") or [],config.get("Cmd") or []]
+if not all(isinstance(part,list) for part in parts):
+    raise SystemExit("RuntimeIdentityMismatch: fixture image command is not an argv array")
+argv=command_guard(parts[0]+parts[1],budget.as_dict())
+print(backend.command(["run",*sys.argv[4:],"--entrypoint",argv[0],image["Id"],*argv[1:]]))
+PYGUARD
+)"
+  rm -f "$shared_environment"
+else
+  docker run "${docker_arguments[@]}" "$image_name" >/dev/null
+fi
 
 rest_port="$(docker port "$container_name" 8181/tcp | awk -F: 'NR == 1 {print $NF}')"
 control_port="$(docker port "$container_name" 8182/tcp | awk -F: 'NR == 1 {print $NF}')"
@@ -901,6 +948,7 @@ PY
 
 container_id="$(docker inspect "$container_name" --format '{{.Id}}')"
 [[ -n "$container_id" ]] || fail "fixture container identity is empty"
+[[ -z "${started_container_id:-}" || "$container_id" == "$started_container_id" ]] || fail "fixture container differs from its exact started identity"
 
 if [[ -n "$artifact_dir" ]]; then
   [[ "$artifact_dir" == /* ]] || fail "UEA7_ARTIFACT_DIR must be an absolute path"
@@ -910,7 +958,7 @@ if [[ -n "$artifact_dir" ]]; then
   fi
   cp -R "$work_dir/." "$artifact_dir/"
   docker logs "$container_name" >"$artifact_dir/container.log" 2>&1
-  image_id="$(docker image inspect "$image_name" --format '{{.Id}}')"
+  image_id="$(docker inspect "$container_id" --format '{{.Image}}')"
   base_image_id="$(docker image inspect apache/iceberg-rest-fixture:1.10.1 --format '{{.Id}}')"
   git_head="$(git -C "$repo_root" rev-parse HEAD)"
   python3 - "$artifact_dir/manifest.json" \
@@ -918,6 +966,7 @@ if [[ -n "$artifact_dir" ]]; then
     "$script_dir" "$storage_mode" "$shared_bucket" "$v11_enabled" <<'PY'
 import hashlib
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -957,6 +1006,11 @@ with open(path, "w", encoding="utf-8") as handle:
             "container_id": container_id,
             "storage_mode": storage_mode,
             "shared_minio_bucket": shared_bucket,
+            "shared_minio_scope": os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") and json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"])["identity"]["scope_root"] if storage_mode == "shared-minio" else None,
+            "run_context": json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"]) if storage_mode == "shared-minio" else None,
+            "run_storage": json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]) if storage_mode == "shared-minio" else None,
+            "machine_version": os.environ.get("NOVA_FIXTURE_MACHINE_VERSION") if storage_mode == "shared-minio" else None,
+            "machine_generation": os.environ.get("NOVA_FIXTURE_MACHINE_GENERATION") if storage_mode == "shared-minio" else None,
             "scenarios": ["new-first", "old-first", "client-exit"] + (
                 ["snapshot-new-first", "snapshot-old-first",
                  "snapshot-existing-new-first", "snapshot-existing-old-first"]
@@ -977,18 +1031,12 @@ if docker inspect "$container_name" >/dev/null 2>&1; then
 fi
 cleanup_shared_bucket
 if [[ -n "$shared_bucket" ]]; then
-  remaining_buckets="$(
-    docker exec --env "MC_HOST_uea7=$minio_host" "$minio_container" \
-      mc ls --json uea7
-  )" || fail "list shared MinIO buckets after fixture cleanup"
-  bucket_presence="$(
-    printf '%s\n' "$remaining_buckets" \
-      | python3 -c 'import json, sys; target = sys.argv[1]; print("present" if any(json.loads(line).get("key", "").rstrip("/") == target for line in sys.stdin if line.strip()) else "absent")' \
-        "$shared_bucket"
-  )" || fail "decode shared MinIO bucket listing after fixture cleanup"
-  if [[ "$bucket_presence" == "present" ]]; then
-    fail "shared MinIO bucket still exists after cleanup: $shared_bucket"
-  fi
+  remaining_objects="$(NOVA_FIXTURE_CLEANUP_MODE=true python3 "$repo_root/docker/iceberg-rest/fixture_run.py" compose --env-file "$runtime_env" -- \
+    --env-file "$NOVA_ENV_COMPOSE_ENV" -p "$NOVA_ENV_COMPOSE_PROJECT" -f "$NOVA_ENV_COMPOSE_FILE" \
+    run --rm --no-deps --entrypoint /bin/sh mc -c \
+    'mc alias set store http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null && mc ls --recursive --json "$1"' _ \
+    "store/$shared_bucket/$shared_prefix/")" || fail "list shared scratch after cleanup"
+  [[ -z "$remaining_objects" ]] || fail "shared scratch remains after cleanup"
 fi
 trap - EXIT INT TERM
 rm -rf -- "$work_dir"

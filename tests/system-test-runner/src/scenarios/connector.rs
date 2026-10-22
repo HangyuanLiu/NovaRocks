@@ -1373,8 +1373,12 @@ impl Scenario for VendedRestReadWritePem {
         CrossProcessChildEnvironment::default()
     }
 
-    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
+    fn launch_config_with_fixture_run(
+        &self,
+        scenario_root: &std::path::Path,
+        budget: &novarocks_cluster_harness::fixture_run::RunBudget,
+    ) -> Result<ScenarioLaunchConfig> {
+        let mut rest = IsolatedIcebergRestFixture::start_with_shared_minio(scenario_root, budget)
             .context("start isolated REST and MinIO fixture for vended credentials")?;
         // Bootstrap the namespace and target table with the fixture's private
         // catalog authority before the vended proxy exists. NovaRocks must
@@ -1629,8 +1633,12 @@ impl Scenario for VendedRestWriteOutcomePem {
         CrossProcessChildEnvironment::default()
     }
 
-    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
+    fn launch_config_with_fixture_run(
+        &self,
+        scenario_root: &std::path::Path,
+        budget: &novarocks_cluster_harness::fixture_run::RunBudget,
+    ) -> Result<ScenarioLaunchConfig> {
+        let mut rest = IsolatedIcebergRestFixture::start_with_shared_minio(scenario_root, budget)
             .context("start isolated REST fixture for vended write outcome")?;
         rest.provision_empty_table("vended_write_outcome_db", "vended_write_outcome_data")
             .context("provision isolated vended write-outcome table")?;
@@ -1889,8 +1897,12 @@ impl Scenario for VendedRestPostPublishAnswerPem {
         connector_reader_environment()
     }
 
-    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
+    fn launch_config_with_fixture_run(
+        &self,
+        scenario_root: &std::path::Path,
+        budget: &novarocks_cluster_harness::fixture_run::RunBudget,
+    ) -> Result<ScenarioLaunchConfig> {
+        let mut rest = IsolatedIcebergRestFixture::start_with_shared_minio(scenario_root, budget)
             .context("start isolated REST fixture for a post-publish answer")?;
         rest.provision_empty_table(POST_PUBLISH_DATABASE, POST_PUBLISH_TABLE)
             .context("provision isolated post-publish answer table")?;
@@ -2229,9 +2241,14 @@ impl Scenario for VendedRestRefreshPem {
         CrossProcessChildEnvironment::default()
     }
 
-    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
-            .context("start isolated REST and MinIO fixture for vended credential refresh")?;
+    fn launch_config_with_fixture_run(
+        &self,
+        scenario_root: &std::path::Path,
+        budget: &novarocks_cluster_harness::fixture_run::RunBudget,
+    ) -> Result<ScenarioLaunchConfig> {
+        let mut rest =
+            IsolatedIcebergRestFixture::start_with_shared_minio(scenario_root, budget)
+                .context("start isolated REST and MinIO fixture for vended credential refresh")?;
         rest.provision_empty_table("vended_refresh_db", "vended_refresh_data")
             .context("provision isolated vended refresh source table")?;
         rest.provision_empty_table("vended_refresh_db", "vended_refresh_target")
@@ -2713,10 +2730,14 @@ impl Scenario for VendedCredentialFaultPem {
         CrossProcessChildEnvironment::default()
     }
 
-    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+    fn launch_config_with_fixture_run(
+        &self,
+        scenario_root: &Path,
+        budget: &novarocks_cluster_harness::fixture_run::RunBudget,
+    ) -> Result<ScenarioLaunchConfig> {
         const DATABASE: &str = "cad2_vended_db";
         const TABLE: &str = "cad2_vended_data";
-        let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
+        let mut rest = IsolatedIcebergRestFixture::start_with_shared_minio(scenario_root, budget)
             .context("start isolated REST and MinIO fixture for credential fault")?;
         rest.provision_empty_table(DATABASE, TABLE)
             .context("provision isolated credential fault table")?;

@@ -953,6 +953,13 @@ mod lifecycle_tests {
             },
         ));
         let ctx = SuiteRunContext {
+            fixture_storage: None,
+            fixture_writers_settled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            namespace_catalogs: crate::namespace_guard::CatalogFacts::default(),
+            fixture_budget: novarocks_cluster_harness::fixture_run::RunBudget::from_environment(
+                3600,
+            )
+            .unwrap(),
             suite_name: "unit".into(),
             controls: None,
             mode: crate::Mode::Verify,
@@ -982,6 +989,9 @@ mod lifecycle_tests {
             results: Some(recorder),
         };
         let case = SqlCase {
+            expected_variables: Default::default(),
+            namespace_rewrites: Default::default(),
+            auto_db: String::new(),
             source_file: sql_dir.join("one.sql"),
             case_id: "one".into(),
             steps: vec![SqlStep {
@@ -1311,6 +1321,11 @@ mod lifecycle_tests {
         fs::write(result_dir.join("one.result"), "0\n1.0\n").unwrap();
         let env_file = root.join("fixture-env.sh");
         fs::write(&env_file, "# Test-owned input; no external services.\n").unwrap();
+        fs::write(
+            root.join("manifest.json"),
+            r#"{"ready":true,"runtime":{"catalog":{"phase":"ready"}}}"#,
+        )
+        .unwrap();
         let values = [
             ("iceberg_rest_uri", "http://127.0.0.1:1"),
             ("iceberg_rest_warehouse", "unit"),

@@ -21,7 +21,7 @@ code-anchors:
 
 ## 背景与执行事实
 
-输入供给、运行实例和数据消费分别有 owner。ADR-0155 固定输入 provision/BOM；ADR-0165 固定按输入版本化的运行实例、原子 worktree publication 和显式数据引用。标准数据还有独立 READY 发布，指向准确 dataset key、manifest、warehouse 与 producer fingerprint。worktree runtime publication 选择连接事实，dataset READY publication 选择要读取的数据事实，两者不是同一个身份。
+输入供给、运行实例和数据消费分别有 owner。ADR-0155 固定输入 provision/BOM；运行层现由ADR-0191固定机器激活与原子worktree publication；ADR-0165保留历史版本化模型。标准数据还有独立 READY 发布，指向准确 dataset key、manifest、warehouse 与 producer fingerprint。worktree runtime publication 选择连接事实，dataset READY publication 选择要读取的数据事实，两者不是同一个身份。
 
 | 入口 | 输入与核验 | 允许的副作用 |
 |---|---|---|

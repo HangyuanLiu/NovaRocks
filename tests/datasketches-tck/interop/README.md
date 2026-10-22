@@ -67,6 +67,8 @@ because a mirror records `<mirror>/trinodb/trino@<digest>` rather than
 rewrite one into the other. A local image that is present but carries a
 different manifest is a hard failure, never a silent substitution.
 
+共享 REST 的 `create-parent` 必须继承调用者的 `NOVA_FIXTURE_RUN_CONTEXT`，namespace 使用该完整 run ID 加不超过五字符的 case suffix；schema、table 与实际 data file location 均核对原 scratch 根。`verify-current` 按传入的现有 namespace 只读核验，不重新命名。临时 Trino 使用 publication 的准确 network、已安装镜像的实际 argv 和原绝对期限；停止与查询都按准确 container ID 执行。
+
 The strongest product path is the native `statistics/trino_rest_puffin_show_stats.sql` regression:
 Trino creates an Iceberg v3 table, writes `{1,2}`, and publishes its parent Puffin with `ANALYZE`;
 NovaRocks enables collect-on-write and appends `{2,3}`; then a new Trino process reads the current
@@ -78,8 +80,8 @@ Run it against the canonical REST fixture and native `1FE+3BE` topology:
 
 ```shell
 docker/iceberg-rest/up.sh
-source docker/iceberg-rest/runtime/current/env.sh
-export NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_RUNTIME_DIR/env.sh"
+fixture_publication="$(python3 -c 'from pathlib import Path; print(Path("docker/iceberg-rest/runtime/current/published").resolve(strict=True))')"
+source "$fixture_publication/env.sh"
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite statistics \

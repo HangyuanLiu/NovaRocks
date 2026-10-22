@@ -31,6 +31,8 @@ runner="$(ci_bound_binary novarocks-system-tests)"
   --only query-lifecycle/distributed-baseline
 ```
 
+`--fixture-budget-secs` 表示整个CLI调用的预算（默认3600），先于scenario launch_config副作用准入；`--timeout-secs`进一步收窄每个scenario工作期限，不延长原完整期限。fixture、FE/BE首次启动/重启/执行、嵌套producer与teardown继承同一run identity和时钟，并通过独立 `NOVA_FIXTURE_RUN_STORAGE` 继承固定运行范围；普通JDBC位置不依赖namespace location，rename与显式/CTAS使用同一归属谓词。运行期到期由原monitor停止并等待真实进程组退出，即使payload原生exit0也保持FAIL；清理使用原完整期限的reserve，清理错误独立保留。每个prepared cluster有唯一deployment ID，重启稳定。vended保留私有REST，只有准确run scope的MinIO共享，真实双STS语义保持；未确认私有writer退出时不清共享IAM/S3。机器维护与TTL边界见 [ADR-0191](../../docs/adr/ADR-0191-machine-shared-fixture-and-bounded-scratch.md)。
+
 CLI package 为 `novarocks-system-test-cli`，原 package `novarocks-system-test-runner` 为库，保留原 `CARGO_MANIFEST_DIR`。完整 `--list` 包括显式与暂停场景；默认 `--list-default` 与无 selector 使用同一集合，排除兼容场景与其它显式专项。Paimon 及 mixed UEA4 暂停项继续显示 DISABLED 并在 fixture/launch 前拒绝显式选择，production provider 仍注册。`performance` launch profile 选择 clean harness 配置，不表示测量实验。
 
 ## 声明与收束材料

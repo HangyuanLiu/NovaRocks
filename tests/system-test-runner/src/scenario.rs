@@ -74,6 +74,16 @@ pub trait Scenario: Send + Sync {
         })
     }
 
+    /// Shared fixture writers receive the original invocation budget before setup.
+    fn launch_config_with_fixture_run(
+        &self,
+        scenario_root: &Path,
+        budget: &novarocks_cluster_harness::fixture_run::RunBudget,
+    ) -> Result<ScenarioLaunchConfig> {
+        budget.check_work()?;
+        self.launch_config(scenario_root)
+    }
+
     /// Selected domain scenarios derive finite intent from their existing exact
     /// inputs before any role spawn. Default scenarios request no authority.
     fn test_session_plan(

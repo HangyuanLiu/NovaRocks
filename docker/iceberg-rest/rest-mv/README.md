@@ -84,8 +84,10 @@ git diff -- docker/iceberg-rest/rest-mv/build/verification-metadata.xml
 
 维护者审查新增依赖、插件、来源与校验和后提交变更。正常 provision 使用严格校验，缺项或不符即失败；BuildKit 的 `/home/gradle/.gradle` 缓存可在严格校验下复用。修改探针或本 README 不改变构建身份；`build/` 中全部文件都属于 lock 的定义输入。
 
-## 0/1 切换与旧实例退出
+## 机器切换与旧实例退出
 
-合入新 lock 后，每台机器 provision 一次，各 worktree rebase 后重新 `up.sh` 并加载新 publication。旧 lock 的 worktree 在 verify 处 BLOCKED（75），不提供多个 lock 的输入并存。已有旧 catalog 可继续运行；其 offline prepare 仍发布原有端点，直到重新 `up.sh` 才出现 MV 端点。对象存储输入与 benchmark contract ID 不变，切换复用原对象存储和标准数据。
+输入仍只有当前lock/BOM。provision先完成全部derived image构建，再更新别名、BOM与READY；构建失败保持旧状态，提交段中断可能留下部分已改写别名，需显式重跑provision恢复。测试/verify不自行供给。
 
-provision 先完成全部 derived image 构建，再更新别名、BOM 与 READY；构建失败保持旧状态。提交段中断仍可能留下部分已改写别名，重跑 provision 恢复。切换不自动删除旧 catalog；确认全部绑定和外部 endpoint 已退出后，使用 [fixture README](../README.md#显式解绑与实例管理) 中的 owner locator 和准确 catalog ID 执行 `fixture-runtime.sh delete <catalog-id>`。回退需要重新 provision 旧 lock，并重新绑定旧版本的 worktree；单独恢复旧代码不会恢复机器的输入状态。
+输入改变后，维护者显式执行 `fixture-runtime.sh upgrade`；worktree普通up只核验同版本ready机器并发布不可变输入，旧lock或定义不符会BLOCKED。机器固定运行stock rest和rest-mv，各有准确SQLite状态卷。维护保存MinIO整卷及benchmark全部对象，撤销旧访问材料并在线清理scratch、切换及健康核验后才提交ready；不按旧catalog ID创建并存栈或执行stop/delete。
+
+旧项目和卷先形成准确保留清单，在维护窗口另行处理，不自动认领或删除。privatelifecycle探针仍只操作自身准确项目；共享contract探针使用本run namespace/location及原预算。回退代码本身不会恢复机器输入、凭证或已清理scratch。详见 [fixture README](../README.md#输入与机器维护) 和 [ADR-0191](../../../docs/adr/ADR-0191-machine-shared-fixture-and-bounded-scratch.md)。

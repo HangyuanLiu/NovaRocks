@@ -28,10 +28,16 @@ repo_root=$(cd "$script_dir/../../../.." && pwd)
 output_dir=$1
 [[ ! -e "$output_dir" ]] || { echo "output directory already exists" >&2; exit 2; }
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 2; }
-command -v mc >/dev/null || { echo "MinIO mc is required" >&2; exit 2; }
 env_file="${NOVA_ENV_REST_ENV_FILE:-$repo_root/docker/iceberg-rest/runtime/current/env.sh}"
 env_file="$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' "$env_file")"
 source "$env_file"
+owns_fixture_run=false
+[[ "${NOVA_FIXTURE_RUN_CONTEXT:-null}" == null ]] && owns_fixture_run=true
+NOVA_FIXTURE_RUN_CONTEXT="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" context --env-file "$env_file")"
+export NOVA_FIXTURE_RUN_CONTEXT
+NOVA_FIXTURE_RUN_STORAGE="$(python3 "$repo_root/docker/iceberg-rest/fixture_run.py" storage --env-file "$env_file")"
+export NOVA_FIXTURE_RUN_STORAGE
+trino_owner=(python3 "$repo_root/docker/iceberg-rest/trino_run.py" --env-file "$env_file")
 
 readonly image_digest=sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534
 readonly image_ref=$image_digest
@@ -45,28 +51,36 @@ mkdir -p "$output_dir"
 output_dir=$(cd "$output_dir" && pwd)
 container="nr-uea4a2-trino-$$"
 schema="uea4a2_writer_$$"
+schema_location=""
+if [[ "$NOVA_FIXTURE_RUN_CONTEXT" != null ]]; then
+  schema="$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["identity"]["run_id"]+"_tr")' "$NOVA_FIXTURE_RUN_CONTEXT")"
+fi
 table=sample
-mc_config=$(mktemp -d)
 cleanup() {
-  if docker inspect "$container" >/dev/null 2>&1; then
-    docker exec "$container" /usr/bin/trino --server http://localhost:8080 \
-      --execute "DROP TABLE IF EXISTS iceberg.$schema.$table" >/dev/null 2>&1 || true
-    docker exec "$container" /usr/bin/trino --server http://localhost:8080 \
-      --execute "DROP SCHEMA IF EXISTS iceberg.$schema" >/dev/null 2>&1 || true
-    docker rm -f "$container" >/dev/null 2>&1 || true
+  local primary=$? cleanup=0
+  trap - EXIT INT TERM
+  if [[ -n "${container_id:-}" ]]; then
+    if [[ "$NOVA_FIXTURE_RUN_CONTEXT" == null ]]; then
+      "${trino_owner[@]}" exec --container "$container_id" -- /usr/bin/trino --server http://localhost:8080 \
+        --execute "DROP TABLE IF EXISTS iceberg.$schema.$table" >/dev/null || cleanup=$?
+      "${trino_owner[@]}" exec --container "$container_id" -- /usr/bin/trino --server http://localhost:8080 \
+        --execute "DROP SCHEMA IF EXISTS iceberg.$schema" >/dev/null || cleanup=$?
+    fi
+    "${trino_owner[@]}" stop --container "$container_id" || cleanup=$?
+    if [[ "$NOVA_FIXTURE_RUN_CONTEXT" != null && "$owns_fixture_run" == true && "$cleanup" == 0 ]]; then
+      NOVA_FIXTURE_CLEANUP_MODE=true python3 "$repo_root/docker/iceberg-rest/fixture_run.py" cleanup-run --env-file "$env_file" \
+        >"$output_dir/cleanup-report.json" || cleanup=$?
+    fi
   fi
-  rm -rf "$mc_config"
+  (( primary == 0 )) || exit "$primary"
+  exit "$cleanup"
 }
-trap cleanup EXIT INT TERM
-
-docker run --detach --rm --pull never \
-  --name "$container" --label org.novarocks.test=uea4a2-writer \
-  --network "${NOVA_ENV_COMPOSE_PROJECT}_iceberg_net" \
-  --env "NOVA_TRINO_REST_WAREHOUSE=$NOVA_ENV_REST_WAREHOUSE_URI" \
-  --env "NOVA_TRINO_S3_ACCESS_KEY=$AWS_S3_ACCESS_KEY_ID" \
-  --env "NOVA_TRINO_S3_SECRET_KEY=$AWS_S3_SECRET_ACCESS_KEY" \
-  --mount "type=bind,src=$repo_root/tests/datasketches-tck/interop/trino/rest-catalog,dst=/etc/trino,readonly" \
-  "$image_ref" >/dev/null
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+container_id="$("${trino_owner[@]}" start --image "$image_ref" --name "$container" \
+  --config-dir "$repo_root/tests/datasketches-tck/interop/trino/rest-catalog")"
+container="$container_id"
 
 healthy=false
 for _ in $(seq 1 120); do
@@ -77,12 +91,14 @@ for _ in $(seq 1 120); do
   sleep 1
 done
 [[ "$healthy" == true ]] || { docker logs "$container" >&2; exit 1; }
-trino() { docker exec "$container" /usr/bin/trino --server http://localhost:8080 "$@"; }
+trino() { "${trino_owner[@]}" exec --container "$container" -- /usr/bin/trino --server http://localhost:8080 "$@"; }
 version=$(trino --output-format TSV --execute 'SELECT version()')
 [[ "$version" == 483 ]] || { echo "unexpected Trino version: $version" >&2; exit 1; }
 
 sql="CREATE TABLE iceberg.$schema.$table WITH (format = 'PARQUET') AS SELECT CAST(id AS BIGINT) AS id, CAST(id % 17 AS INTEGER) AS category, CAST(id * 0.01 AS DECIMAL(12,2)) AS amount, CAST(ARRAY[CAST(id % 5 AS INTEGER), CAST(id % 7 AS INTEGER)] AS ARRAY(INTEGER)) AS nested FROM UNNEST(sequence(0, 4095)) AS t(id)"
-trino --execute "CREATE SCHEMA iceberg.$schema" >/dev/null
+location_clause=""
+[[ -z "$schema_location" ]] || location_clause=" WITH (location = '$schema_location')"
+trino --execute "CREATE SCHEMA iceberg.$schema$location_clause" >/dev/null
 trino --execute "$sql" >/dev/null
 rows=$(trino --output-format TSV --execute "SELECT count(*) FROM iceberg.$schema.$table")
 [[ "$rows" == 4096 ]] || { echo "Trino row oracle failed: $rows" >&2; exit 1; }
@@ -91,9 +107,20 @@ object=$(trino --output-format TSV --execute "SELECT file_path FROM iceberg.$sch
   echo "Trino did not publish exactly one S3 Parquet data file" >&2
   exit 1
 }
-mc --config-dir "$mc_config" alias set task "$AWS_S3_ENDPOINT" \
-  "$AWS_S3_ACCESS_KEY_ID" "$AWS_S3_SECRET_ACCESS_KEY" >/dev/null
-mc --config-dir "$mc_config" cp "task/${object#s3://}" "$output_dir/trino-483.parquet" >/dev/null
+if [[ "$NOVA_FIXTURE_RUN_STORAGE" != null ]]; then
+  python3 - "$repo_root/docker/iceberg-rest" "$NOVA_FIXTURE_RUN_STORAGE" "$object" <<'PYSCOPE'
+import json,sys
+sys.path.insert(0,sys.argv[1])
+from scratch import RunStorageScope
+if not RunStorageScope.from_dict(json.loads(sys.argv[2])).belongs(sys.argv[3]):
+    raise SystemExit("InvalidScratchScope: actual Trino object is outside the original run storage ranges")
+PYSCOPE
+fi
+python3 "$repo_root/docker/iceberg-rest/fixture_run.py" compose --env-file "$env_file" -- \
+  --env-file "$NOVA_ENV_COMPOSE_ENV" -p "$NOVA_ENV_COMPOSE_PROJECT" -f "$NOVA_ENV_COMPOSE_FILE" \
+  run --rm --no-deps --entrypoint /bin/sh mc -c \
+  'mc alias set store http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null && mc cat "$1"' _ \
+  "store/${object#s3://}" > "$output_dir/trino-483.parquet"
 
 TRINO_OUTPUT_DIR="$output_dir" TRINO_IMAGE_DIGEST="$image_digest" \
 TRINO_OBJECT="$object" TRINO_SQL="$sql" python3 - <<'PY'

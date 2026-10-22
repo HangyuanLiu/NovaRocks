@@ -131,3 +131,15 @@ docker/paimon-read/cleanup.sh \
 ```bash
 docker/paimon-read/tests/run.sh
 ```
+
+### 共享机器运行预算
+
+共享消费者通过本次不可变 publication 读取机器事实，继承
+`NOVA_FIXTURE_RUN_CONTEXT` 的 run 身份与原截止时间。嵌套 Spark 调用不会重置
+预算；容器内 owner 负责准确进程组的终止与实际 wait。正常清理失败会返回失败，
+不能以未来 TTL 清扫代替本次清理。私有 publication 保留其原有资源 owner。
+
+此处仅更新运行工具、共享网络和输入绑定；Paimon SQL/System 与原产品测试仍暂停。
+`tests/test_runtime_binding.py` 独立验证预算、准确 scratch scope 和拒绝越界路径。
+
+共享模式下继续 `prepare` 或执行 `cleanup` 会恢复 `state.json` / `manifest.json` 保存的原 run context，沿用同一个绝对期限；过期后拒绝续写或重新准入清理。已完成且目标 stage 不再前进的 READY 只按原 warehouse、definition、input lock 和 inventory 只读复核。此处只说明 runtime tooling，Paimon 产品测试仍保持暂停。

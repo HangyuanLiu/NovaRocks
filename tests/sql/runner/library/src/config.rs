@@ -330,25 +330,53 @@ pub fn apply_suite_placeholder_defaults(variables: &mut HashMap<String, String>,
 pub fn placeholder_variables(
     runner_config: &RunnerConfig,
     suite_name: &str,
-) -> HashMap<String, String> {
-    let generated_run_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let run_id = format!("sqlt_{generated_run_id:x}_{}", std::process::id());
-
+) -> Result<HashMap<String, String>> {
     let mut variables = runner_config.values.clone();
     apply_suite_placeholder_defaults(&mut variables, suite_name);
-    variables.insert("run_id".to_string(), run_id.clone());
-    variables.insert("suite_run_id".to_string(), run_id.clone());
+    runner_config
+        .fixture_names
+        .as_ref()
+        .context("SQL naming requires an admitted invocation")?
+        .extend_suite_variables(suite_name, &mut variables)?;
     variables.insert("suite".to_string(), suite_name.to_string());
-    for idx in 0..10 {
-        let value = format!("{}_{}", run_id, idx);
-        variables.insert(format!("uuid{}", idx), value.clone());
-        variables.insert(format!("suite_uuid{}", idx), value);
+    if let Some(root) = variables.get("__scratch_scope").cloned() {
+        if variables
+            .get("iceberg_catalog_warehouse")
+            .is_some_and(|v| v.starts_with("s3://"))
+        {
+            variables.insert(
+                "iceberg_catalog_warehouse".into(),
+                format!(
+                    "{root}/hadoop/s{}",
+                    variables
+                        .get("__suite_ordinal")
+                        .context("missing suite ordinal")?
+                ),
+            );
+        }
+        // This is a mutable case-author warehouse, separate from READY datasets.
+        if variables
+            .get("iceberg_test_warehouse")
+            .is_some_and(|value| value.starts_with("s3://"))
+        {
+            variables.insert(
+                "iceberg_test_warehouse".into(),
+                format!("{root}/hadoop/extra/s{}", variables["__suite_ordinal"]),
+            );
+        }
+    }
+    // Only the admitted shared REST binding changes explicit CTAS warehouses.
+    // Private fixtures and READY dataset roots retain their actual projection.
+    if let Some(root) = runner_config.values.get("__shared_rest_run_root") {
+        for (name, suffix) in [
+            ("iceberg_rest_warehouse", "rest"),
+            ("iceberg_rest_mv_warehouse", "rest-mv"),
+        ] {
+            variables.insert(name.into(), format!("{root}/{suffix}"));
+        }
     }
     substitute_known_variable_values(&mut variables);
-    variables
+    Ok(variables)
 }
 
 fn substitute_known_variable_values(variables: &mut HashMap<String, String>) {
@@ -386,45 +414,38 @@ pub fn stable_hash_hex(input: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-pub fn case_auto_db_name(case_id: &str) -> String {
-    format!("db_sqlt_{}", stable_hash_hex(case_id))
-}
-
-pub fn case_auto_db_name_n(case_id: &str, n: usize) -> String {
-    if n == 0 {
-        case_auto_db_name(case_id)
-    } else {
-        format!("db_sqlt_{}_{}", stable_hash_hex(case_id), n + 1)
-    }
+pub fn case_auto_db_name(run: &str, ordinal: usize) -> Result<String> {
+    crate::fixture_context::resource(run, 'd', ordinal, 0)
 }
 
 pub fn case_placeholder_variables(
     base_variables: &HashMap<String, String>,
     case_id: &str,
-) -> HashMap<String, String> {
+) -> Result<HashMap<String, String>> {
     let mut variables = base_variables.clone();
-    let suite_run_id = base_variables
+    let run = base_variables
         .get("suite_run_id")
-        .or_else(|| base_variables.get("run_id"))
-        .cloned()
-        .unwrap_or_else(|| "sqlt".to_string());
-    let case_run_id = format!("{}_{}", suite_run_id, stable_hash_hex(case_id));
-    variables.insert("case_id".to_string(), case_id.to_string());
-    variables.insert("run_id".to_string(), case_run_id.clone());
-    variables.insert("suite_run_id".to_string(), suite_run_id);
-    for idx in 0..10 {
-        variables.insert(format!("uuid{}", idx), format!("{}_{}", case_run_id, idx));
-    }
-    // Per-case database placeholders for parallel isolation.
-    let primary_db = case_auto_db_name(case_id);
-    variables.insert("case_db".to_string(), primary_db);
-    for idx in 2..=9 {
+        .context("SQL case omitted admitted run identity")?;
+    let index = base_variables
+        .get(&format!("__case_ordinal.{case_id}"))
+        .context("SQL case omitted its frozen ordinal")?
+        .parse::<usize>()?;
+    variables.insert("case_id".into(), case_id.to_string());
+    variables.insert("run_id".into(), run.clone());
+    for slot in 0..10 {
         variables.insert(
-            format!("case_db_{}", idx),
-            case_auto_db_name_n(case_id, idx - 1),
+            format!("uuid{slot}"),
+            crate::fixture_context::resource(run, 'u', index, slot)?,
         );
     }
-    variables
+    variables.insert("case_db".into(), case_auto_db_name(run, index)?);
+    for slot in 1..9 {
+        variables.insert(
+            format!("case_db_{}", slot + 1),
+            crate::fixture_context::resource(run, 'd', index, slot)?,
+        );
+    }
+    Ok(variables)
 }
 
 pub fn substitute_placeholders(
@@ -741,7 +762,10 @@ oss_endpoint = "http://127.0.0.1:9000"
             "/tmp/novarocks-sql-test/${suite_uuid0}/${run_id}/".to_string(),
         );
 
-        let variables = placeholder_variables(&runner_config, "iceberg");
+        runner_config.fixture_names = Some(std::sync::Arc::new(
+            crate::fixture_context::test_names("iceberg", &["case"]),
+        ));
+        let variables = placeholder_variables(&runner_config, "iceberg").unwrap();
         let warehouse = variables
             .get("iceberg_catalog_warehouse")
             .expect("warehouse");
@@ -755,6 +779,93 @@ oss_endpoint = "http://127.0.0.1:9000"
         assert!(!warehouse.contains("${"));
     }
 
+    #[test]
+    fn mutable_extra_warehouse_uses_run_scope_without_rebinding_ready_datasets() {
+        let mut config = RunnerConfig::default();
+        config.fixture_names = Some(std::sync::Arc::new(crate::fixture_context::test_names(
+            "iceberg",
+            &["case"],
+        )));
+        for (key, value) in [
+            ("iceberg_test_warehouse", "s3://novarocks/legacy-extra"),
+            (
+                "dataset_iceberg_catalog_warehouse",
+                "s3://novarocks/benchmark/ready",
+            ),
+            (
+                "iceberg_rest_warehouse",
+                "s3://novarocks/readonly-server-root",
+            ),
+        ] {
+            config.values.insert(key.into(), value.into());
+        }
+        let values = placeholder_variables(&config, "iceberg").unwrap();
+        assert_eq!(
+            values["iceberg_test_warehouse"],
+            format!("{}/hadoop/extra/s0", values["__scratch_scope"])
+        );
+        assert_eq!(
+            values["dataset_iceberg_catalog_warehouse"],
+            "s3://novarocks/benchmark/ready"
+        );
+        assert_eq!(
+            values["iceberg_rest_warehouse"],
+            "s3://novarocks/readonly-server-root"
+        );
+        assert_eq!(
+            config.values["iceberg_test_warehouse"],
+            "s3://novarocks/legacy-extra"
+        );
+        config
+            .values
+            .insert("iceberg_test_warehouse".into(), "/tmp/private-extra".into());
+        assert_eq!(
+            placeholder_variables(&config, "iceberg").unwrap()["iceberg_test_warehouse"],
+            "/tmp/private-extra"
+        );
+    }
+    #[test]
+    fn shared_rest_ctas_warehouses_use_run_root_without_changing_ready_or_private_bindings() {
+        let mut config = RunnerConfig::default();
+        config.fixture_names = Some(std::sync::Arc::new(crate::fixture_context::test_names(
+            "iceberg",
+            &["case"],
+        )));
+        config.values.insert(
+            "iceberg_rest_warehouse".into(),
+            "s3://warehouse/private/actual".into(),
+        );
+        config.values.insert(
+            "iceberg_rest_mv_warehouse".into(),
+            "s3://warehouse/private/mv".into(),
+        );
+        config.values.insert(
+            "dataset_iceberg_rest_warehouse".into(),
+            "s3://warehouse/ready".into(),
+        );
+        let private = placeholder_variables(&config, "iceberg").unwrap();
+        assert_eq!(
+            private["iceberg_rest_warehouse"],
+            "s3://warehouse/private/actual"
+        );
+        config.values.insert(
+            "__shared_rest_run_root".into(),
+            private["__scratch_scope"].clone(),
+        );
+        let shared = placeholder_variables(&config, "iceberg").unwrap();
+        assert_eq!(
+            shared["iceberg_rest_warehouse"],
+            format!("{}/rest", shared["__scratch_scope"])
+        );
+        assert_eq!(
+            shared["iceberg_rest_mv_warehouse"],
+            format!("{}/rest-mv", shared["__scratch_scope"])
+        );
+        assert_eq!(
+            shared["dataset_iceberg_rest_warehouse"],
+            "s3://warehouse/ready"
+        );
+    }
     #[test]
     fn suite_defaults_never_invent_fixture_endpoints_or_credentials() {
         for suite in [

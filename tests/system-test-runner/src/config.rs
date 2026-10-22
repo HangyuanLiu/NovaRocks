@@ -14,6 +14,7 @@ pub struct RunnerConfig {
     pub artifact_root: PathBuf,
     pub cluster_size: usize,
     pub timeout: Duration,
+    pub fixture_budget: novarocks_cluster_harness::fixture_run::RunBudget,
     pub launch_profile: LaunchProfile,
     pub exact_mysql_execution_binding: Option<PathBuf>,
     pub held_native_execution_binding: Option<PathBuf>,
@@ -56,6 +57,9 @@ impl RunnerConfig {
             artifact_root,
             cluster_size: cli.cluster_size,
             timeout: Duration::from_secs(cli.timeout_secs),
+            fixture_budget: novarocks_cluster_harness::fixture_run::RunBudget::from_environment(
+                cli.fixture_budget_secs,
+            )?,
             launch_profile: cli.launch_profile,
             exact_mysql_execution_binding: cli.exact_mysql_execution_binding.clone(),
             held_native_execution_binding: cli.held_native_execution_binding.clone(),

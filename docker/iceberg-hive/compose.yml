@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# The catalog network is attached only through fixture_runtime consumer APIs.
+# The machine owns the external network; HMS owns only its container and volume.
 x-labels: &labels
   novarocks.fixture.owner: ${NOVA_FIXTURE_OWNER}
   novarocks.fixture.key: ${NOVA_FIXTURE_KEY}
@@ -39,4 +39,5 @@ volumes:
     labels: *labels
 networks:
   default:
-    labels: *labels
+    external: true
+    name: ${NOVA_HMS_SHARED_NETWORK:?machine network required}

@@ -75,11 +75,32 @@ object DeleteApplicabilityFixture {
     require(ns.matches("[a-zA-Z0-9_]+") && namePrefix.matches("[a-zA-Z0-9_]+"))
     spark = session; namespace = ns; prefix = namePrefix
     require(IcebergBuild.version() == "1.11.0", "The oracle requires Iceberg 1.11.0")
+    val scope = spark.conf.getOption("spark.novarocks.fixture.scopeRoot")
+    val run = spark.conf.getOption("spark.novarocks.fixture.runId")
+    require(run.forall(id => ns.startsWith(id + "_") && ns.length <= 63 && ns.substring(id.length + 1).matches("[a-z][a-z0-9]*")), "namespace is outside the original scratch run")
     spark.sql(s"CREATE NAMESPACE IF NOT EXISTS ice_rest.$namespace")
     emit(obj("record" -> "runtime", "iceberg" -> IcebergBuild.fullVersion(),
       "spark" -> spark.version, "java" -> System.getProperty("java.version"),
       "requested_warehouse" -> spark.conf.get("spark.sql.catalog.ice_rest.warehouse", ""),
       "namespace" -> namespace, "prefix" -> prefix))
+  }
+  def ownedLocation(location: String): Boolean = spark.conf.getOption("spark.novarocks.fixture.storage").forall { raw =>
+    val projection = mapper.readTree(raw)
+    val uri = new java.net.URI(location)
+    val key = Option(uri.getRawPath).getOrElse("")
+    require(Set("s3", "s3a").contains(uri.getScheme) && uri.getRawQuery == null && uri.getRawFragment == null &&
+      uri.getRawAuthority == uri.getHost && !key.contains("%") && !key.contains("//") &&
+      !key.split("/").exists(p => p == "." || p == ".."), "noncanonical storage location")
+    val canonical = "s3://" + uri.getHost + key.stripSuffix("/")
+    val root = projection.path("identity").path("scope_root").asText()
+    val run = projection.path("identity").path("run_id").asText()
+    canonical == root || canonical.startsWith(root + "/") || Seq("rest", "rest_mv").exists { name =>
+      val warehouse = projection.path("ranges").path(name).path("warehouse").asText()
+      if (!canonical.startsWith(warehouse)) false else {
+        val ns = canonical.substring(warehouse.length).takeWhile(_ != '/')
+        ns.startsWith(run + "_") && ns.length <= 63 && ns.substring(run.length + 1).matches("[a-z][a-z0-9]*")
+      }
+    }
   }
   def create(name: String, version: Int, partitioned: Boolean = true): Table = {
     val qualified = s"ice_rest.$namespace.${prefix}_$name"
@@ -87,6 +108,7 @@ object DeleteApplicabilityFixture {
     spark.sql(s"CREATE TABLE $qualified (id BIGINT, p INT, value STRING) USING iceberg $partition " +
       s"TBLPROPERTIES ('format-version'='$version', 'write.metadata.metrics.default'='full')")
     val t = Spark3Util.loadIcebergTable(spark, qualified)
+    require(ownedLocation(t.location()), "actual REST table location is outside the original run storage ranges")
     tables += ((qualified, t)); t
   }
   def partition(t: Table, p: Int): StructLike = {

@@ -24,3 +24,5 @@ python3 tests/benchmarks/uea4a4/paimon_fixture.py verify \
 已关闭、仅保留实现的 selector：`uea4/catalog-planning-smoke`、`uea4/catalog-planning-responsibility`、`uea4/catalog-planning-no-fe-quota`、`uea4/iceberg-held-read-cancellation`、`catalog/provider-read-queued-progress`。历史场景使用 clean `--launch-profile performance --cluster-size 3`，验证真实请求、provider进展、精确hold终态/取消与FE/BE owner收敛；profile名称不是性能实验。所有actor失败须cancel、release hold并实际join，原始错误与cleanup错误保留。
 
 原先要求对应修改必跑本功能组的规则随 Paimon 测试一并暂停，当前不执行手工维护轮次或自动调度；后续详细设计再决定恢复范围。共享输入工具与私有 fixture cleanup 继续保留。命令骨架与材料位置见 [system指南](../../system-test-runner/README.md)。
+
+Iceberg fixture 在共享模式使用原 run 的 scratch namespace/location 和累计预算。现有精确 READY 直接复核原 inventory，不因新 CLI 进程生成另一 location；显式 cleanup 恢复 manifest 保存的原 context，只能消费原 deadline 内的 cleanup reserve。过期不会创建新身份来重写或清理旧 scope。Paimon 的暂停状态不变。

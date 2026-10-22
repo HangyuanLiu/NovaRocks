@@ -62,6 +62,10 @@ def definition_sha256(files_per_table: int) -> str:
 
 def scope_for(run_id: str, env_id: str, definition: str) -> str:
     support.validate_run_id(run_id)
+    context = os.environ.get("NOVA_FIXTURE_RUN_CONTEXT")
+    if context and context != "null":
+        identity = support.ScratchIdentity.from_dict(json.loads(context)["identity"])
+        return identity.scope_root.removeprefix("s3://").split("/", 1)[1] + "/uea4a4"
     env = support.slug(env_id, 64)
     run = support.slug(run_id, 48)
     suffix = support.sha256_bytes(
@@ -74,12 +78,12 @@ def scope_for(run_id: str, env_id: str, definition: str) -> str:
 
 
 def validate_location(uri: str) -> str:
-    base = "s3://warehouse/"
+    base = "s3://novarocks/" if uri.startswith("s3://novarocks/") else "s3://warehouse/"
     suffix = "/table"
     if not uri.startswith(base) or not uri.endswith(suffix):
         raise support.FixtureError("Iceberg location is outside the task-private warehouse")
     prefix = uri[len(base):-len(suffix)]
-    if not SCOPE_RE.fullmatch(prefix):
+    if not (SCOPE_RE.fullmatch(prefix) or re.fullmatch(r"[A-Za-z0-9_.-]+/scratch/nr_scratch_[0-9]{13}_[0-9a-f]{32}/uea4a4", prefix)):
         raise support.FixtureError("Iceberg location has an invalid task-private prefix")
     if any(part in ("", ".", "..") for part in prefix.split("/")):
         raise support.FixtureError("Iceberg location has an unsafe path segment")
@@ -87,13 +91,16 @@ def validate_location(uri: str) -> str:
 
 
 def database_for(prefix: str) -> str:
+    for part in prefix.split("/"):
+        if support.resource_run(part):
+            return support.resource_run(part) + "_a4"
     return f"uea4a4_{prefix.rsplit('-', 1)[-1]}"
 
 
 def render_sql(database: str, location: str, files_per_table: int) -> str:
     if not MIN_FILES <= files_per_table <= 128:
         raise support.FixtureError("files-per-table must be between 16 and 128")
-    if not re.fullmatch(r"uea4a4_[0-9a-f]{12}", database):
+    if not (re.fullmatch(r"uea4a4_[0-9a-f]{12}", database) or support.resource_run(database)):
         raise support.FixtureError("Iceberg namespace is not task-private")
     validate_location(location)
     target = f"ice_rest.{database}.{TABLE}"
@@ -121,7 +128,8 @@ def render_sql(database: str, location: str, files_per_table: int) -> str:
 
 def install_verified_images(store: Path, runtime: Any) -> dict[str, Any]:
     support.run_command(
-        [str(REPO / "docker" / "fixture-inputs" / "verify.sh"), "--store", str(store)]
+        [str(REPO / "docker" / "fixture-inputs" / "verify.sh"), "--store", str(store),
+         "--consumer", "iceberg-rest"]
     )
     bom = support.read_json(store / "bom.json")
     try:
@@ -132,7 +140,9 @@ def install_verified_images(store: Path, runtime: Any) -> dict[str, Any]:
     if not isinstance(mc_alias, str) or not re.fullmatch(r"[a-z0-9][a-z0-9./:_-]+", mc_alias):
         raise support.FixtureError("verified MinIO mc alias is invalid")
     os.environ["MINIO_MC_IMAGE"] = mc_alias
-    container = f"{runtime.compose_project}-spark-1"
+    publication = support.read_json(runtime.env_file.with_name("manifest.json"))
+    record = publication["runtime"]["machine"] if publication.get("shared_docker", "catalog" not in publication["runtime"]) else publication["runtime"]["catalog"]
+    container = record["containers"]["spark"]
     image = support.run_command(["docker", "inspect", container, "--format", "{{.Image}}"])
     if image.stdout.strip() != spark_id:
         raise support.FixtureError("running Spark container differs from the verified input BOM")
@@ -148,7 +158,7 @@ set -eu
 /usr/bin/mc alias set minio http://minio:9000 "${MINIO_ROOT_USER:-admin}" "${MINIO_ROOT_PASSWORD:-admin123}" >/dev/null
 /usr/bin/mc ls --recursive --json "$1"
 """.strip(),
-        f"minio/warehouse/{prefix}/table/",
+        "minio/" + location.removeprefix("s3://").rstrip("/") + "/",
     )
     objects: list[dict[str, Any]] = []
     for line in output.splitlines():
@@ -156,7 +166,7 @@ set -eu
             continue
         record = json.loads(line)
         key = str(record.get("key", "")).lstrip("/")
-        for leader in (f"warehouse/{prefix}/table/", f"{prefix}/table/"):
+        for leader in (location.removeprefix("s3://").rstrip("/") + "/", f"{prefix}/table/"):
             if key.startswith(leader):
                 key = key[len(leader):]
                 break
@@ -182,7 +192,7 @@ set -eu
 /usr/bin/mc alias set minio http://minio:9000 "${MINIO_ROOT_USER:-admin}" "${MINIO_ROOT_PASSWORD:-admin123}" >/dev/null
 /usr/bin/mc cat "$1"
 """.strip(),
-        f"minio/warehouse/{prefix}/table/{relative_key}",
+        "minio/" + location.removeprefix("s3://").rstrip("/") + "/" + relative_key,
     )
 
 
@@ -230,6 +240,12 @@ def parse_oracle(output: str, files_per_table: int) -> dict[str, int]:
 
 def remove_prefix(runtime: Any, location: str) -> None:
     prefix = validate_location(location)
+    if getattr(runtime, "run_budget", None) is not None:
+        # Nested producers cannot remove the outer run's catalog entries to
+        # establish its catalog-wide barrier. The original owner or TTL does it.
+        print(json.dumps({"complete":False,"objects_reclaimed":False,
+                          "cleanup_owner":"original-run-or-ttl","location":location}), file=sys.stderr)
+        return
     support.compose_mc(
         runtime,
         """
@@ -237,7 +253,7 @@ set -eu
 /usr/bin/mc alias set minio http://minio:9000 "${MINIO_ROOT_USER:-admin}" "${MINIO_ROOT_PASSWORD:-admin123}" >/dev/null
 /usr/bin/mc rm --recursive --force --quiet "$1"
 """.strip(),
-        f"minio/warehouse/{prefix}/table/",
+        "minio/" + location.removeprefix("s3://").rstrip("/") + "/",
     )
     if inventory(runtime, location, allow_empty=True):
         raise support.FixtureError("task-private Iceberg prefix remains after cleanup")
@@ -283,8 +299,15 @@ def prepare(args: argparse.Namespace) -> int:
     values = support.parse_env_file(env_file)
     runtime = support.load_runtime(env_file)
     definition = definition_sha256(args.files_per_table)
+    if (output_dir / "READY").exists() and not args.dry_run:
+        manifest = verify_ready(output_dir, runtime)
+        if manifest.get("run_id") != args.run_id or manifest.get("definition_sha256") != definition:
+            raise support.FixtureError("exact READY producer binding differs")
+        print(output_dir / "manifest.json")
+        return 0
     prefix = scope_for(args.run_id, runtime.env_id, definition)
-    location = f"s3://warehouse/{prefix}/table"
+    bucket = "novarocks" if "/scratch/nr_scratch_" in prefix else "warehouse"
+    location = f"s3://{bucket}/{prefix}/table"
     database = database_for(prefix)
     rest_uri = support.require_value(values, "NOVAROCKS_ICEBERG_REST_URI")
     rest_warehouse = support.require_value(values, "NOVAROCKS_ICEBERG_REST_WAREHOUSE")
@@ -292,6 +315,8 @@ def prepare(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(json.dumps({"table_location": location, "sql_sha256": support.sha256_bytes(sql.encode()), "ready_published": False}, sort_keys=True))
         return 0
+    if runtime.run_budget is not None:
+        support.governed_run.startup_sweep(env_file, budget=runtime.run_budget)
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / ".fixture.lock").open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -328,6 +353,9 @@ def prepare(args: argparse.Namespace) -> int:
             "schema_version": 1,
             "fixture_kind": KIND,
             "run_id": args.run_id,
+            "run_context": json.loads(os.environ["NOVA_FIXTURE_RUN_CONTEXT"]) if os.environ.get("NOVA_FIXTURE_RUN_CONTEXT") not in (None, "null") else None,
+            "run_storage": json.loads(os.environ["NOVA_FIXTURE_RUN_STORAGE"]) if os.environ.get("NOVA_FIXTURE_RUN_STORAGE") not in (None, "null") else None,
+            "owns_fixture_run": bool(getattr(runtime, "owns_fixture_run", False)),
             "definition_sha256": definition,
             "warehouse_uri": rest_warehouse,
             "table_location": location,
@@ -368,6 +396,11 @@ def verify(args: argparse.Namespace) -> int:
 def cleanup(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir).expanduser().resolve()
     env_file = Path(args.env_file).expanduser().resolve()
+    if support.governed_run.restore_context(output_dir / "manifest.json"):
+        os.environ["NOVA_FIXTURE_CLEANUP_MODE"] = "true"
+    elif (env_file.with_name("manifest.json").is_file()
+          and support.read_json(env_file.with_name("manifest.json")).get("runtime", {}).get("machine")):
+        raise support.FixtureError("shared producer cleanup needs its persisted original run context")
     runtime = support.load_runtime(env_file)
     install_verified_images(Path(args.fixture_store).expanduser().resolve(), runtime)
     with (output_dir / ".fixture.lock").open("a+") as lock:
@@ -375,17 +408,26 @@ def cleanup(args: argparse.Namespace) -> int:
         manifest = verify_ready(output_dir, runtime)
         if manifest.get("run_id") != args.run_id:
             raise support.FixtureError("Iceberg cleanup run ID differs from READY fixture")
-        prefix = scope_for(args.run_id, runtime.env_id, str(manifest["definition_sha256"]))
         location = str(manifest["table_location"])
-        if location != f"s3://warehouse/{prefix}/table" or manifest.get("database") != database_for(prefix):
+        prefix = validate_location(location)
+        if validate_location(location) != prefix or manifest.get("database") != database_for(prefix):
             raise support.FixtureError("Iceberg cleanup target differs from exact task scope")
         sql = f"DROP TABLE IF EXISTS ice_rest.{manifest['database']}.{TABLE};\nDROP NAMESPACE IF EXISTS ice_rest.{manifest['database']};\n"
         sql_path = output_dir / "cleanup.sql"
         support.atomic_write(sql_path, sql.encode())
         spark_build(runtime, env_file, sql_path)
-        remove_prefix(runtime, location)
+        cleanup_report = None
+        if runtime.run_budget is not None and manifest.get("owns_fixture_run") is True:
+            cleanup_report = support.governed_run.cleanup_run(env_file, budget=runtime.run_budget)
+            support.write_json(output_dir / "cleanup-report.json", cleanup_report)
+            if cleanup_report.get("complete") is not True:
+                raise support.FixtureError("original run catalog barrier or object cleanup failed")
+        else:
+            remove_prefix(runtime, location)
         (output_dir / "READY").unlink()
-        support.write_json(output_dir / "CLEANED", {"run_id": args.run_id, "table_location": location})
+        support.write_json(output_dir / "CLEANED", {"run_id": args.run_id, "table_location": location,
+            "objects_reclaimed": runtime.run_budget is None or bool(cleanup_report and cleanup_report.get("complete")),
+            "cleanup_owner": "original-run" if cleanup_report else ("original-run-or-ttl" if runtime.run_budget else "private-producer")})
     return 0
 
 

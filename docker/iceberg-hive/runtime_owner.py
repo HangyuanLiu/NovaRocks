@@ -35,10 +35,11 @@ from xml.sax.saxutils import escape
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "iceberg-rest"))
 import fixture_runtime as runtime
+import machine_runtime as machine
 
 
 class HiveOwner:
-    """HMS owns its project; the fixture owner owns only the catalog attachment."""
+    """HMS owns its project and Derby volume; the machine owns its shared network."""
 
     def __init__(self, owner):
         self.owner = owner
@@ -52,59 +53,46 @@ class HiveOwner:
         if not path.exists():
             return None
         record = runtime.read_json(path)
-        if (record.get("catalog_id") != catalog or record.get("owner_locator") != self.owner.locator
-                or record.get("project") != f"nr-hms-{self.owner.namespace}-{catalog}"):
+        if (record.get("machine_id") != catalog or catalog != self.owner.machine_id
+                or record.get("project") != f"nr-hms-{self.owner.machine_id}"):
             raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "HMS record owner differs")
         return record
 
     def save(self, record):
-        runtime.atomic_json(self.directory(record["catalog_id"]) / "manifest.json", record)
+        runtime.atomic_json(self.directory(record["machine_id"]) / "manifest.json", record)
 
     def prepare(self, manifest, image):
-        catalog = manifest["runtime"]["catalog"]
-        identity = catalog["id"]
+        snapshot = manifest['runtime']['machine']
+        identity = self.owner.machine_id
+        if snapshot['id'] != identity or snapshot['daemon_id'] != self.owner.daemon_id:
+            raise runtime.RuntimeFailure('RuntimeIdentityMismatch', 'HMS publication belongs to another machine')
         directory = self.directory(identity)
         existing = self.read(identity)
         if existing:
+            if existing['machine_generation'] != snapshot['generation']:
+                raise runtime.RuntimeFailure('MachineUnavailable', 'remove the old HMS scratch stack explicitly before attaching a new machine activation')
             return existing
-        # This lock protects HMS reservations across catalog generations. It is
-        # never held while acquiring a fixture catalog/object-store lock.
-        with self.owner.lock("ports"):
-            used = {runtime.read_json(path)["ports"]["hms"] for path in
-                    (self.owner.base / "hms").glob("*/manifest.json")}
-            used.update(port for item in self.owner.records() for port in item["ports"].values())
-            port = None
-            for candidate in range(self.owner.port_start, self.owner.port_end + 1):
-                if candidate in used:
-                    continue
-                with socket.socket() as probe:
-                    try:
-                        probe.bind(("127.0.0.1", candidate))
-                    except OSError:
-                        continue
-                port = candidate
-                break
-            if port is None:
-                raise runtime.RuntimeFailure("PortUnavailable", "HMS port range exhausted")
-            project = f"nr-hms-{self.owner.namespace}-{identity}"
-            warehouse = catalog["server_warehouse"].rstrip("/") + "/hms"
-            record = {
-                "schema": 1, "kind": "hms", "key": identity, "catalog_id": identity,
-                "namespace": self.owner.namespace, "owner_locator": self.owner.locator,
-                "project": project, "network": project + "_default",
-                "rest_network": catalog["network"], "ports": {"hms": port},
-                "compose_file": str(directory / "compose.yml"), "compose_env": str(directory / "compose.env"),
-                "volumes": [project + "_metastore"], "state": "prepared", "container_id": None,
-                "images": {"hms": {"image_id": None, "tag": image}},
-                "service_ports": {"hms": {"9083/tcp": port}},
-                "hms": {"uri": f"thrift://127.0.0.1:{port}", "port": port, "warehouse": warehouse,
-                        "catalog_sql": str(directory / "ice-hms-catalog.sql"),
-                        "spark_defaults": str(directory / "spark-hms-defaults.conf"), "image": image},
-                "minio": manifest["minio"],
-            }
-            directory.mkdir(parents=True, exist_ok=True)
-            self.render(record)
-            self.save(record)
+        project = f'nr-hms-{identity}'
+        port = snapshot['ports']['hms']
+        warehouse = snapshot['server_warehouses']['rest'].rstrip('/') + '/hms'
+        record = {
+            'schema': 2, 'id': identity, 'kind': 'hms', 'key': identity,
+            'machine_id': identity, 'daemon_id': snapshot['daemon_id'],
+            'machine_generation': snapshot['generation'], 'namespace': identity,
+            'project': project, 'network': snapshot['network'], 'network_id': snapshot['network_id'],
+            'network_owned': False, 'rest_network': snapshot['network'], 'ports': {'hms': port},
+            'compose_file': str(directory / 'compose.yml'), 'compose_env': str(directory / 'compose.env'),
+            'volumes': [project + '_metastore'], 'state': 'prepared', 'container_id': None,
+            'images': {'hms': {'image_id': None, 'tag': image}},
+            'service_ports': {'hms': {'9083/tcp': port}},
+            'hms': {'uri': f'thrift://127.0.0.1:{port}', 'port': port, 'warehouse': warehouse,
+                    'catalog_sql': str(directory / 'ice-hms-catalog.sql'),
+                    'spark_defaults': str(directory / 'spark-hms-defaults.conf'), 'image': image},
+            'minio': manifest['minio'],
+        }
+        directory.mkdir(parents=True, exist_ok=True)
+        self.render(record)
+        self.save(record)
         return record
 
     @staticmethod
@@ -117,7 +105,7 @@ class HiveOwner:
         runtime.atomic_bytes(path, content)
 
     def render(self, record, *, pin_image=False):
-        directory = self.directory(record["catalog_id"])
+        directory = self.directory(record["machine_id"])
         credentials = record["minio"]
         user, secret = credentials["access_key_id"], credentials["secret_access_key"]
         if any("\n" in value or "\r" in value for value in (user, secret)):
@@ -126,6 +114,7 @@ class HiveOwner:
             "HMS_IMAGE": record["images"]["hms"]["image_id"] or record["hms"]["image"],
             "NOVA_ENV_HMS_PORT": record["ports"]["hms"], "NOVA_HMS_PROJECT": record["project"],
             "NOVA_FIXTURE_OWNER": record["namespace"], "NOVA_FIXTURE_KEY": record["key"],
+            "NOVA_HMS_SHARED_NETWORK": record["network"],
             "NOVA_HMS_CONFIG": str(directory / "core-site.xml"),
             "NOVA_HMS_WAREHOUSE": record["hms"]["warehouse"].replace("s3://", "s3a://", 1),
         }
@@ -152,7 +141,7 @@ class HiveOwner:
                  ".s3.access-key-id": user, ".s3.secret-access-key": secret, ".s3.region": "us-east-1"}
         self.write_definition(directory / "spark-hms-defaults.conf", "".join(f"spark.sql.catalog.hms_catalog{key} {value}\n" for key, value in props.items()).encode())
         exports = {"NOVA_ENV_HIVE_RUNTIME_DIR": str(directory), "NOVA_ENV_HIVE_MANIFEST": str(directory / "manifest.json"),
-                   "NOVA_ENV_HIVE_CATALOG_ID": record["catalog_id"], "NOVA_ENV_HIVE_COMPOSE_PROJECT": record["project"],
+                   "NOVA_ENV_HIVE_CATALOG_ID": record["machine_id"], "NOVA_ENV_HIVE_COMPOSE_PROJECT": record["project"],
                    "NOVA_ENV_HIVE_COMPOSE_FILE": record["compose_file"], "NOVA_ENV_HIVE_COMPOSE_ENV": record["compose_env"],
                    "NOVA_ENV_HMS_PORT": record["ports"]["hms"], "NOVA_ENV_REST_NETWORK": record["rest_network"],
                    "NOVA_ENV_SHARED_HMS_WAREHOUSE_URI": record["hms"]["warehouse"],
@@ -163,13 +152,16 @@ class HiveOwner:
         self.write_definition(directory / "env.sh", "".join(f"export {key}={shlex.quote(str(value))}\n" for key, value in exports.items()).encode())
 
     def up(self, manifest, image, prepare_only=False):
-        identity = manifest["runtime"]["catalog"]["id"]
-        with self.owner.lock("hms-" + identity):
+        identity = manifest["runtime"]["machine"]["id"]
+        with runtime.file_lock(self.owner.base / "hms.lock"):
             record = self.prepare(manifest, image)
             if record["state"] == "deleting":
                 raise runtime.RuntimeFailure("RuntimeDeleting", identity)
             if prepare_only:
                 return record
+            snapshot = manifest['runtime']['machine']
+            with self.owner.ready_snapshot({'version': snapshot['version']}, expected_generation=snapshot['generation']):
+                pass
             self.owner.assert_live_daemon()
             image_id = self.backend.image_id(record["hms"]["image"])
             saved = record["images"]["hms"]["image_id"]
@@ -190,7 +182,7 @@ class HiveOwner:
                 raise runtime.RuntimeFailure("RuntimeStateUnreadable", "HMS container missing")
             record["container_id"] = container["Id"]
             self.save(record)
-            self.owner.consumer(identity, container["Id"], alias="hms")
+            self.owner.attach_consumer(container["Id"], alias="hms", expected_generation=record["machine_generation"])
             try:
                 self.wait_ready(record)
             except runtime.RuntimeFailure as error:
@@ -234,10 +226,10 @@ class HiveOwner:
         raise runtime.RuntimeFailure("RuntimeNotReady", "HMS listener did not become ready before the deadline")
 
     def down(self, identity, volumes=False):
-        with self.owner.lock("hms-" + identity):
+        with runtime.file_lock(self.owner.base / "hms.lock"):
             record = self.read(identity)
             if not record:
-                return {"catalog_id": identity, "state": "absent"}
+                return {"machine_id": identity, "state": "absent"}
             self.owner.assert_live_daemon()
             # A retry must finish a saved destructive request, never restart an
             # instance whose Derby volume may already have been removed.
@@ -248,26 +240,24 @@ class HiveOwner:
             self.backend.validate_resources(record)
             container = self.backend.container(record, "hms") if record["images"]["hms"]["image_id"] else None
             if container:
-                self.owner.consumer(identity, container["Id"], disconnect=True)
+                self.owner.detach_consumer(container["Id"], record["machine_id"])
             elif record["container_id"]:
-                self.owner.consumer(identity, record["container_id"], disconnect=True)
+                self.owner.detach_consumer(record["container_id"], record["machine_id"])
             if deleting:
-                # HMS records use catalog_id as their identity. The common
-                # resource verifier needs the same identity in its projection.
+                # The machine network remains external to this owned project.
                 self.backend.delete_resources({**record, "id": identity})
                 directory = self.directory(identity)
                 retirement_root = self.owner.base / "retired-hms"
                 retirement_root.mkdir(parents=True, exist_ok=True)
                 retired = retirement_root / f"{identity}-{uuid.uuid4().hex}"
-                # The allocator reads HMS manifests under ports. Retire the
-                # whole saved definition atomically before releasing its port.
-                with self.owner.lock("ports"):
+                # Retire the complete saved definition before a later explicit recreation.
+                with runtime.file_lock(self.owner.base / "hms-retirement.lock"):
                     os.rename(directory, retired)
                     runtime.fsync_directory(directory.parent)
                     runtime.fsync_directory(retirement_root)
                 shutil.rmtree(retired)
                 runtime.fsync_directory(retirement_root)
-                return {"catalog_id": identity, "state": "absent"}
+                return {"machine_id": identity, "state": "absent"}
             self.backend.compose(record, ["down"])
             record.update(state="stopped", container_id=None)
             self.save(record)
@@ -275,14 +265,12 @@ class HiveOwner:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Catalog-scoped Hive Metastore owner")
+    parser = argparse.ArgumentParser(description="Machine-attached Hive Metastore scratch owner")
     parser.add_argument("command", choices=("up", "down", "status"))
     parser.add_argument("--env-file", type=Path)
-    parser.add_argument("--catalog-id")
+    parser.add_argument("--machine-id")
     parser.add_argument("--root", type=Path)
     parser.add_argument("--daemon")
-    parser.add_argument("--port-start", type=int, default=int(os.environ.get("NOVA_ENV_RUNTIME_PORT_START", "28000")))
-    parser.add_argument("--port-end", type=int, default=int(os.environ.get("NOVA_ENV_RUNTIME_PORT_END", "28999")))
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument("--volumes", "-v", action="store_true")
     parser.add_argument("--purge", action="store_true")
@@ -291,28 +279,28 @@ def main():
     runtime.install_signal_handlers()
     path = args.env_file or Path(os.environ.get("NOVA_ENV_REST_ENV_FILE", HERE.parent / "iceberg-rest/runtime/current/env.sh"))
     manifest = None
-    if args.command == "up" or not (args.catalog_id and args.root and args.daemon):
+    if args.command == "up" or not (args.machine_id and args.root and args.daemon):
         publication = path.expanduser().resolve(strict=True).parent
         manifest = runtime.read_json(publication / "manifest.json")
-        if not manifest.get("ready") or not manifest["runtime"].get("owner_locator"):
-            raise runtime.RuntimeFailure("RuntimeNotReady", "bind a shared REST fixture first")
-        locator = manifest["runtime"]["owner_locator"]
+        if not manifest.get('ready') or not manifest['runtime'].get('machine'):
+            raise runtime.RuntimeFailure('MachineUnavailable', 'attach a shared machine fixture first')
+        snapshot = manifest['runtime']['machine']
+        locator = {'control_root': snapshot['control_root'], 'daemon_id': snapshot['daemon_id']}
     else:
-        locator = {"control_root": str(args.root.resolve()), "daemon_id": args.daemon}
-    owner = runtime.RuntimeOwner(args.root or locator["control_root"], daemon=args.daemon or locator["daemon_id"],
-                                 port_start=args.port_start, port_end=args.port_end)
-    if owner.locator != locator:
-        raise runtime.RuntimeFailure("OwnerMismatch", "HMS request differs from publication owner")
+        locator = {'control_root': str(args.root.resolve()), 'daemon_id': args.daemon}
+    owner = machine.MachineOwner(args.root or locator['control_root'], daemon=args.daemon or locator['daemon_id'])
+    if str(owner.root) != locator['control_root'] or owner.daemon_id != locator['daemon_id']:
+        raise runtime.RuntimeFailure('RuntimeIdentityMismatch', 'HMS request differs from publication machine')
     hive = HiveOwner(owner)
-    identity = args.catalog_id or manifest["runtime"]["catalog"]["id"]
+    identity = args.machine_id or manifest["runtime"]["machine"]["id"]
     if args.command == "up":
-        if identity != manifest["runtime"]["catalog"]["id"]:
-            raise runtime.RuntimeFailure("OwnerMismatch", "up catalog differs from publication")
+        if identity != manifest["runtime"]["machine"]["id"]:
+            raise runtime.RuntimeFailure("OwnerMismatch", "HMS request differs from publication machine")
         result = hive.up(manifest, os.environ.get("HMS_IMAGE", "novarocks/hive-metastore:4.0.0"), args.prepare_only)
     elif args.command == "down":
         result = hive.down(identity, args.volumes or args.purge)
     else:
-        result = hive.read(identity) or {"catalog_id": identity, "state": "absent"}
+        result = hive.read(identity) or {"machine_id": identity, "state": "absent"}
     # Credential material stays in the private manifest and generated config.
     print(json.dumps({key: value for key, value in result.items() if key != "minio"}, sort_keys=True))
 

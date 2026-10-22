@@ -28,6 +28,7 @@ mod root_observation_identity;
 
 pub use effective_launch_config::EffectiveLaunchConfigEvidence;
 pub mod delayed_s3;
+pub mod fixture_run;
 pub mod isolated_iceberg_rest;
 pub mod listing_rest;
 pub mod loopback_s3;
@@ -79,7 +80,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml::Value;
 
 const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
-const SYSTEM_NATIVE_TRUST_DEPLOYMENT_ID: &str = "novarocks-system-tests";
 const SYSTEM_NATIVE_TRUST_SECRET_ENV: &str = "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET";
 const MAX_FAILURE_LOG_REDACTION_VALUE_BYTES: usize = 64 * 1024;
 const PREPARATION_DIAGNOSTIC_SECRET_ENV: &str = "NOVAROCKS_PREPARATION_DIAGNOSTIC_SECRET";
@@ -540,6 +540,7 @@ impl NativeTrustFixtureMode {
 /// to the generated TOML or test action log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeTrustFixture {
+    deployment_id: String,
     mode: NativeTrustFixtureMode,
     advertise_host: String,
 }
@@ -553,6 +554,10 @@ impl Default for NativeTrustFixture {
 impl NativeTrustFixture {
     pub fn plaintext_ip() -> Self {
         Self {
+            deployment_id: format!(
+                "novarocks-system-{}",
+                novarocks_types::BackendProcessId::new_v7()
+            ),
             mode: NativeTrustFixtureMode::Plaintext,
             advertise_host: "127.0.0.1".to_string(),
         }
@@ -560,6 +565,10 @@ impl NativeTrustFixture {
 
     pub fn automatic_dns() -> Self {
         Self {
+            deployment_id: format!(
+                "novarocks-system-{}",
+                novarocks_types::BackendProcessId::new_v7()
+            ),
             mode: NativeTrustFixtureMode::Automatic,
             advertise_host: "localhost".to_string(),
         }
@@ -567,6 +576,10 @@ impl NativeTrustFixture {
 
     pub fn pem_ip() -> Self {
         Self {
+            deployment_id: format!(
+                "novarocks-system-{}",
+                novarocks_types::BackendProcessId::new_v7()
+            ),
             mode: NativeTrustFixtureMode::Pem,
             advertise_host: "127.0.0.1".to_string(),
         }
@@ -585,7 +598,7 @@ impl NativeTrustFixture {
         shared_secret: &str,
         identity: NativeProcessIdentity,
     ) -> Result<NativeTrust> {
-        let deployment_id = DeploymentId::parse(SYSTEM_NATIVE_TRUST_DEPLOYMENT_ID)
+        let deployment_id = DeploymentId::parse(&self.deployment_id)
             .map_err(anyhow::Error::msg)
             .context("construct system Native trust probe deployment id")?;
         let secret = ValidatedSharedSecret::new(SecretValue::new(shared_secret))
@@ -643,7 +656,7 @@ impl PreparedNativeTrustFixture {
         let native_trust = table_mut(root, "native_trust");
         native_trust.insert(
             "deployment_id".to_string(),
-            Value::String(SYSTEM_NATIVE_TRUST_DEPLOYMENT_ID.to_string()),
+            Value::String(self.fixture.deployment_id.clone()),
         );
         native_trust.insert(
             "shared_secret".to_string(),
@@ -2247,9 +2260,26 @@ fn assert_excludes_metric_families(body: &str, families: &[&str], endpoint: &str
 /// The harness owns the production-shaped role boundary: every 1FE+NBE start
 /// must prove the process metrics listener did not leak the other role's
 /// registered metric families before a query is admitted.
-fn assert_role_scoped_metrics(runtime: &CrossProcessRuntime) -> Result<()> {
-    let frontend = scrape_prometheus_metrics(runtime.fe_http_port)
-        .context("scrape cross-process FE /metrics")?;
+fn assert_role_scoped_metrics(
+    runtime: &CrossProcessRuntime,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    let scrape = |port| -> Result<String> {
+        match deadline {
+            None => scrape_prometheus_metrics(port),
+            Some(deadline) => {
+                let timeout = remaining_until(deadline, "original role metrics deadline")?
+                    .min(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP);
+                Ok(reqwest::blocking::Client::new()
+                    .get(format!("http://127.0.0.1:{port}/metrics"))
+                    .timeout(timeout)
+                    .send()?
+                    .error_for_status()?
+                    .text()?)
+            }
+        }
+    };
+    let frontend = scrape(runtime.fe_http_port).context("scrape cross-process FE /metrics")?;
     assert_contains_metric_families(
         &frontend,
         &FRONTEND_METRIC_FAMILIES,
@@ -2262,7 +2292,7 @@ fn assert_role_scoped_metrics(runtime: &CrossProcessRuntime) -> Result<()> {
     )?;
 
     for (index, be) in runtime.be.iter().enumerate() {
-        let backend = scrape_prometheus_metrics(be.http)
+        let backend = scrape(be.http)
             .with_context(|| format!("scrape cross-process BE[{index}] /metrics"))?;
         let endpoint = format!("cross-process BE[{index}] /metrics");
         assert_contains_metric_families(&backend, &BACKEND_METRIC_FAMILIES, &endpoint)?;
@@ -3550,6 +3580,7 @@ pub struct CrossProcessServerHandle {
     retain_runtime_artifacts: bool,
     test_sessions: Option<ClusterTestSessionPlan>,
     role_build_information: RoleBuildInformationEvidence,
+    fixture_budget: Option<fixture_run::RunBudget>,
 }
 
 /// Final role build captures outlive successful runtime cleanup. This is a
@@ -3737,7 +3768,7 @@ impl CrossProcessServerHandle {
         options: CrossProcessClusterOptions,
         proxy_config: CrossProcessNativeFaultProxyConfig,
     ) -> Result<Self> {
-        Self::launch_with_native_fault_options(options, proxy_config, None, None, None, None)
+        Self::launch_with_native_fault_options(options, proxy_config, None, None, None, None, None)
     }
 
     /// Harness-only one-shot RootReply fault route. Existing launch/config
@@ -3754,6 +3785,7 @@ impl CrossProcessServerHandle {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -3767,6 +3799,7 @@ impl CrossProcessServerHandle {
             CrossProcessNativeFaultProxyConfig::default(),
             None,
             Some(check),
+            None,
             None,
             None,
         )
@@ -3790,6 +3823,7 @@ impl CrossProcessServerHandle {
             Some(prelaunch_check),
             Some(log_owner_check),
             None,
+            None,
         )
     }
 
@@ -3805,6 +3839,7 @@ impl CrossProcessServerHandle {
             None,
             None,
             Some(plan),
+            None,
         )
     }
 
@@ -3824,6 +3859,28 @@ impl CrossProcessServerHandle {
             prelaunch_check,
             log_owner_check,
             Some(plan),
+            None,
+        )
+    }
+
+    /// Same role owners and capabilities, bounded by a fixture's original clock.
+    pub fn launch_with_fixture_budget(
+        options: CrossProcessClusterOptions,
+        test_sessions: Option<ClusterTestSessionPlan>,
+        proxy_config: CrossProcessNativeFaultProxyConfig,
+        root_reply_fault: Option<CrossProcessRootReplyFaultConfig>,
+        prelaunch_check: Option<&dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>>,
+        log_owner_check: Option<&dyn Fn(&str, &ManagedProcessLogSource) -> Result<()>>,
+        budget: fixture_run::RunBudget,
+    ) -> Result<Self> {
+        Self::launch_with_native_fault_options(
+            options,
+            proxy_config,
+            root_reply_fault,
+            prelaunch_check,
+            log_owner_check,
+            test_sessions,
+            Some(budget),
         )
     }
 
@@ -3834,7 +3891,14 @@ impl CrossProcessServerHandle {
         prelaunch_check: Option<&dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>>,
         log_owner_check: Option<&dyn Fn(&str, &ManagedProcessLogSource) -> Result<()>>,
         mut test_sessions: Option<ClusterTestSessionPlan>,
+        fixture_budget: Option<fixture_run::RunBudget>,
     ) -> Result<Self> {
+        if let Some(budget) = &fixture_budget {
+            budget.check_work()?;
+        }
+        let fixture_deadline = fixture_budget
+            .as_ref()
+            .map(fixture_run::RunBudget::work_deadline);
         let CrossProcessClusterOptions {
             binary: novarocks_bin,
             fe_binary,
@@ -4043,6 +4107,8 @@ impl CrossProcessServerHandle {
             || Instant::now() + startup_timeout,
             ClusterTestSessionPlan::deadline,
         );
+        let initial_deadline =
+            fixture_deadline.map_or(initial_deadline, |end| end.min(initial_deadline));
         let fe_binary = test_sessions.as_ref().map_or_else(
             || Ok(fe_binary.clone()),
             |plan| plan.binary_for_next_launch(RoleSlot::Frontend, &fe_binary),
@@ -4108,7 +4174,12 @@ impl CrossProcessServerHandle {
                 startup_timeout: capped_role_startup_timeout(
                     startup_timeout,
                     test_sessions.as_ref(),
+                    fixture_deadline,
                 )?,
+                payload_lifetime: role_payload_lifetime(
+                    fixture_budget.as_ref(),
+                    test_sessions.as_ref(),
+                ),
                 log_path: runtime_dir.path().join("fe.log"),
                 test_session: fe_declaration.as_deref(),
                 child_environment: &fe_environment,
@@ -4152,7 +4223,12 @@ impl CrossProcessServerHandle {
                     startup_timeout: capped_role_startup_timeout(
                         startup_timeout,
                         test_sessions.as_ref(),
+                        fixture_deadline,
                     )?,
+                    payload_lifetime: role_payload_lifetime(
+                        fixture_budget.as_ref(),
+                        test_sessions.as_ref(),
+                    ),
                     log_path: runtime_dir.path().join(format!("be_{i}.log")),
                     test_session: be_declarations[i].as_deref(),
                     child_environment: &be_environments[i],
@@ -4183,16 +4259,16 @@ impl CrossProcessServerHandle {
                     expected_eligible_backend_count,
                     fe_config_path: &fe_config_path,
                     be_config_paths: &be_config_paths,
-                    timeout: test_sessions.as_ref().map_or(startup_timeout, |plan| {
-                        startup_timeout
-                            .min(plan.deadline().saturating_duration_since(Instant::now()))
-                    }),
+                    timeout: startup_timeout.min(remaining_until(
+                        initial_deadline,
+                        "original cluster topology deadline",
+                    )?),
                 },
                 fe_process,
                 be_processes,
             )
             .context("cross-process backend topology barrier")?;
-            assert_role_scoped_metrics(&runtime)
+            assert_role_scoped_metrics(&runtime, fixture_deadline)
                 .context("cross-process role-scoped metrics barrier")?;
 
             Ok((fe_launch_identity, be_launch_identities))
@@ -4270,6 +4346,7 @@ impl CrossProcessServerHandle {
             retain_runtime_artifacts: false,
             test_sessions,
             role_build_information: RoleBuildInformationEvidence::default(),
+            fixture_budget,
         })
     }
 
@@ -5676,6 +5753,10 @@ impl ServerHandle for CrossProcessServerHandle {
             .test_sessions
             .as_ref()
             .map_or(deadline, |plan| deadline.min(plan.deadline()));
+        let deadline = self
+            .fixture_budget
+            .as_ref()
+            .map_or(deadline, |budget| deadline.min(budget.work_deadline()));
         let old_process_id = self.backend_process_id(index);
         let prior_log = self.be_processes[index]
             .log_contents()
@@ -5738,6 +5819,11 @@ impl ServerHandle for CrossProcessServerHandle {
         }
         apply_child_environment(&mut command, &self.be_environments[index]);
         apply_launch_profile(&mut command, self.launch_profile);
+        if let Some((work, complete)) =
+            role_payload_lifetime(self.fixture_budget.as_ref(), self.test_sessions.as_ref())
+        {
+            command.terminate_at(work, complete);
+        }
         let log_path = self.runtime_dir.join(format!("be_{index}.log"));
         let be_process = self
             .be_processes
@@ -5888,6 +5974,10 @@ impl ServerHandle for CrossProcessServerHandle {
             .test_sessions
             .as_ref()
             .map_or(deadline, |plan| deadline.min(plan.deadline()));
+        let deadline = self
+            .fixture_budget
+            .as_ref()
+            .map_or(deadline, |budget| deadline.min(budget.work_deadline()));
         let controller_cleanup = self
             .test_sessions
             .as_mut()
@@ -5931,6 +6021,11 @@ impl ServerHandle for CrossProcessServerHandle {
         }
         apply_child_environment(&mut command, &self.fe_environment);
         apply_launch_profile(&mut command, self.launch_profile);
+        if let Some((work, complete)) =
+            role_payload_lifetime(self.fixture_budget.as_ref(), self.test_sessions.as_ref())
+        {
+            command.terminate_at(work, complete);
+        }
         self.fe_process
             .restart(
                 command,
@@ -6146,6 +6241,7 @@ struct ProcessLaunch<'a> {
     config_path: &'a Path,
     marker: &'a str,
     startup_timeout: Duration,
+    payload_lifetime: Option<(Instant, Instant)>,
     log_path: PathBuf,
     test_session: Option<&'a Path>,
     child_environment: &'a BTreeMap<String, String>,
@@ -6162,6 +6258,7 @@ fn spawn_novarocks_process(
         config_path,
         marker,
         startup_timeout,
+        payload_lifetime,
         log_path,
         test_session,
         child_environment,
@@ -6174,6 +6271,9 @@ fn spawn_novarocks_process(
     }
     apply_child_environment(&mut command, child_environment);
     apply_launch_profile(&mut command, launch_profile);
+    if let Some((work, complete)) = payload_lifetime {
+        command.terminate_at(work, complete);
+    }
     let result = ManagedProcess::spawn(
         "novarocks".to_string(),
         command,
@@ -6205,10 +6305,60 @@ fn spawn_novarocks_process(
     }
 }
 
+fn role_payload_lifetime(
+    budget: Option<&fixture_run::RunBudget>,
+    plan: Option<&ClusterTestSessionPlan>,
+) -> Option<(Instant, Instant)> {
+    budget.map(|budget| {
+        let work = plan.map_or(budget.work_deadline(), |plan| {
+            budget.work_deadline().min(plan.deadline())
+        });
+        (work, budget.deadline())
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn role_lifetime_keeps_original_complete_clock_and_only_narrows_work() {
+    assert_eq!(role_payload_lifetime(None, None), None);
+    let now = Instant::now();
+    let epoch = 1_800_000_000_000;
+    let identity = fixture_run::ScratchIdentity::create_at(
+        "s3://novarocks/lifetime-test",
+        epoch,
+        "0123456789abcdef0123456789abcdef",
+    )
+    .unwrap();
+    let budget = fixture_run::RunBudget::admit_at(
+        fixture_run::FixturePolicy::default(),
+        identity,
+        600,
+        None,
+        epoch,
+        now,
+    )
+    .unwrap();
+    let complete = budget.deadline();
+    assert_eq!(
+        role_payload_lifetime(Some(&budget), None),
+        Some((now + Duration::from_secs(300), complete))
+    );
+    let narrowed = budget.with_work_deadline_limit(now + Duration::from_secs(20));
+    assert_eq!(
+        role_payload_lifetime(Some(&narrowed), None),
+        Some((now + Duration::from_secs(20), complete))
+    );
+}
+
 fn capped_role_startup_timeout(
     configured: Duration,
     plan: Option<&ClusterTestSessionPlan>,
+    fixture_deadline: Option<Instant>,
 ) -> Result<Duration> {
+    let configured = match fixture_deadline {
+        Some(deadline) => configured.min(remaining_until(deadline, "fixture role startup")?),
+        None => configured,
+    };
     match plan {
         Some(plan) => Ok(configured.min(remaining_until(
             plan.deadline(),
@@ -8130,6 +8280,35 @@ mod tests {
             .context("Native proxy must release its advertised listener on cluster shutdown")?;
         drop(listener);
         Ok(())
+    }
+
+    #[test]
+    fn native_trust_deployment_is_unique_per_cluster_and_stable_for_all_role_renders() {
+        let mut first = rendered_native_trust_fixture();
+        first.shared_secret = "test-only-native-trust-secret-at-least-32-bytes".into();
+        let second = rendered_native_trust_fixture();
+        assert_ne!(first.fixture.deployment_id, second.fixture.deployment_id);
+        let mut fe = toml::map::Map::new();
+        let mut be = toml::map::Map::new();
+        let mut restarted = toml::map::Map::new();
+        first.apply_config(&mut fe);
+        first.apply_config(&mut be);
+        first.clone().apply_config(&mut restarted);
+        let expected = first.fixture.deployment_id.as_str();
+        assert_eq!(fe["native_trust"]["deployment_id"].as_str(), Some(expected));
+        assert_eq!(be["native_trust"]["deployment_id"].as_str(), Some(expected));
+        assert_eq!(
+            restarted["native_trust"]["deployment_id"].as_str(),
+            Some(expected)
+        );
+        let probe = first
+            .fixture
+            .probe_trust(
+                &first.shared_secret,
+                NativeProcessIdentity::Frontend(first.probe_frontend),
+            )
+            .unwrap();
+        assert_eq!(probe.deployment_id().as_str(), expected);
     }
 
     fn rendered_native_trust_fixture() -> PreparedNativeTrustFixture {
