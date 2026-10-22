@@ -83,7 +83,8 @@ use crate::query_execution::attempt_initialization::{
 use crate::query_execution::completion::PreparedLogicalRead;
 use crate::query_execution::contract::{DistributedQueryError, ResolvedQueryOptions};
 use crate::query_execution::internal_consumer::attempt_handoff::{
-    AttemptHandoffOfferPort, AttemptHandoffProducer, AttemptHandoffResources,
+    AttemptHandoffOfferPort, AttemptHandoffProducer, AttemptHandoffReserveView,
+    AttemptHandoffResources,
 };
 use crate::query_execution::lifecycle_plan::QueryInitOptions;
 use crate::query_execution::logical_execution::{
@@ -1152,7 +1153,7 @@ impl FrontendNativeLogicalExecutionLauncher {
             diagnostics,
             initial_credentials,
             replacements: replacements.clone(),
-            handoffs,
+            handoffs: handoffs.map(|offers| offers.reserve_view()),
         };
         let attempts = FrontendNativeAttemptPreparationPort::new(
             template,
@@ -1431,7 +1432,7 @@ struct ProductionDormantAttemptFactory {
     diagnostics: ComputationDiagnostics,
     initial_credentials: Option<Weak<InitialComputationCredentials>>,
     replacements: LogicalReplacementQualificationPort,
-    handoffs: Option<Arc<AttemptHandoffOfferPort>>,
+    handoffs: Option<AttemptHandoffReserveView>,
 }
 
 impl std::fmt::Debug for ProductionDormantAttemptFactory {

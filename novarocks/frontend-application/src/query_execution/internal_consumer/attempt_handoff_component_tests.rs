@@ -371,8 +371,10 @@ impl OriginalAttempt {
 #[tokio::test(flavor = "current_thread")]
 async fn actual_staged_bundle_waits_for_drive_then_claims_once_and_reaches_real_ready() {
     let (offers, claims) = attempt_handoff_mailbox();
+    let view = offers.reserve_view();
+    drop(offers);
     let (mut attempt, resources, activation) = OriginalAttempt::new(1).await;
-    let mut producer = offers.reserve(attempt.root.query_execution_id()).unwrap();
+    let mut producer = view.reserve(attempt.root.query_execution_id()).unwrap();
     producer
         .stage(
             attempt.root.query_execution_id(),

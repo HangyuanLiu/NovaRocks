@@ -18,7 +18,7 @@
 //! A finite, activation-exact handoff between the fixed FA consumer and Native owner.
 
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_coordination_contract::AttemptActivationIdentity;
 use novarocks_execution_contract::{SafeDetail, TaskIdentity, failure::FailureProjection};
@@ -177,7 +177,7 @@ struct Mailbox {
     offer: Mutex<Option<Arc<Cell>>>,
 }
 
-/// Only the production attempt factory receives this endpoint.
+/// Strong custody of the original directory, held by the prepared computation.
 pub(crate) struct AttemptHandoffOfferPort {
     mailbox: Arc<Mailbox>,
 }
@@ -206,6 +206,40 @@ pub(crate) fn attempt_handoff_mailbox() -> (AttemptHandoffOfferPort, AttemptHand
 }
 
 impl AttemptHandoffOfferPort {
+    /// A replayable factory can reserve through the original directory without
+    /// becoming an owner of its staged attempt resources.
+    pub(crate) fn reserve_view(&self) -> AttemptHandoffReserveView {
+        AttemptHandoffReserveView {
+            mailbox: Arc::downgrade(&self.mailbox),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserve(
+        &self,
+        execution: QueryExecutionId,
+    ) -> Result<AttemptHandoffProducer, QueryExecutionError> {
+        self.mailbox.reserve(execution)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AttemptHandoffReserveView {
+    mailbox: Weak<Mailbox>,
+}
+impl AttemptHandoffReserveView {
+    pub(crate) fn reserve(
+        &self,
+        execution: QueryExecutionId,
+    ) -> Result<AttemptHandoffProducer, QueryExecutionError> {
+        self.mailbox
+            .upgrade()
+            .ok_or_else(|| handoff_error("the original handoff directory has exited"))?
+            .reserve(execution)
+    }
+}
+
+impl Mailbox {
     /// Called once by the exact request's dormant factory, before projection makes any
     /// attempt resource live. A later admitted attempt can replace only the
     /// unclaimed directory offer, not a consumer's captured independent cell.
@@ -220,7 +254,6 @@ impl AttemptHandoffOfferPort {
         });
         let previous = {
             let mut offer = self
-                .mailbox
                 .offer
                 .lock()
                 .map_err(|_| handoff_error("internal handoff offer lock was poisoned"))?;
@@ -476,6 +509,23 @@ mod tests {
         })
         .await;
     }
+    #[test]
+    fn a_factory_view_cannot_recreate_an_exited_directory() {
+        let (offers, claims) = attempt_handoff_mailbox();
+        let view = offers.reserve_view();
+        drop(offers);
+        let producer = view.reserve(execution(1)).unwrap();
+        drop(claims);
+        assert!(view.mailbox.upgrade().is_none());
+        assert!(view.reserve(execution(2)).is_err());
+        assert!(matches!(
+            *producer.cell.state.lock().unwrap(),
+            State::Reserved
+        ));
+        // The actual producer retains its independent original cell until exit.
+        drop(producer);
+    }
+
     #[tokio::test]
     async fn producer_drop_wakes_the_exact_unbound_waiter() {
         let (offers, claims) = attempt_handoff_mailbox();
