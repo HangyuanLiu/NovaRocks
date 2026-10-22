@@ -30,14 +30,24 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import select
 import signal
 import subprocess
 import struct
 import sys
 import time
+from typing import NamedTuple
 
 import fixture_runtime as runtime
+
+CLEANUP_TIMEOUT_SECONDS = 5
+
+
+class CommandResult(NamedTuple):
+    code: int
+    timed_out: bool
+    dispatched: bool
 
 
 def process_group_running(group):
@@ -119,14 +129,21 @@ class CommandOwner:
             self.owner_lost = os.read(self.control_fd, 1) == b""
         return not self.owner_lost
 
-    def command(self, args, output, *, creating=False, cleanup=False):
-        deadline = time.monotonic() + 5 if cleanup else self.deadline
+    def command(self, args, output, *, creating=False, cleanup=False, settle_create=False):
+        if settle_create and (not creating or cleanup or args[0] != "create"
+                              or self.request.get("operation") == "control"):
+            raise runtime.RuntimeFailure("InvalidConfiguration", "reply settlement is only available to mc create")
+        deadline = time.monotonic() + CLEANUP_TIMEOUT_SECONDS if cleanup else self.deadline
+        observe_deadline = deadline + CLEANUP_TIMEOUT_SECONDS if settle_create else deadline
         stderr_path = Path(str(output) + ".stderr")
         with Path(output).open("wb") as stdout, stderr_path.open("wb") as stderr:
             os.chmod(output, 0o600)
             os.chmod(stderr_path, 0o600)
-            if not cleanup and time.monotonic() >= deadline:
-                return 124, True
+            if not cleanup:
+                alive = self.alive()
+                expired = time.monotonic() >= deadline
+                if expired or not alive:
+                    return CommandResult(124 if expired else 130, expired, False)
             process = subprocess.Popen(["docker", *args], stdout=stdout, stderr=stderr,
                                        env=self.environment, start_new_session=True)
             # waitid(WNOWAIT) observes without reaping the original leader.
@@ -136,6 +153,9 @@ class CommandOwner:
             while True:
                 now = time.monotonic()
                 owner_alive = self.alive()
+                # Late CREATE completion can only settle resources, never
+                # turn expired work into success or permit a later START.
+                timed_out = timed_out or now >= deadline
                 try:
                     observed = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
                 except OSError as error:
@@ -159,7 +179,7 @@ class CommandOwner:
                         self.fact["group_observation_error"] = getattr(error, "code", type(error).__name__)
                         observation_failed = True
                     timed_out = True
-                if stopping is None and (now >= deadline or observation_failed
+                if stopping is None and (now >= observe_deadline or observation_failed
                         or (not owner_alive and not creating and not cleanup)):
                     timed_out = timed_out or now >= deadline
                     stopping = now
@@ -179,13 +199,14 @@ class CommandOwner:
             result = process.wait()
             self.fact["leader_waited"] = True
             self.save()
-        return result, timed_out
+        return CommandResult(result, timed_out, True)
 
-    def inspect(self):
+    def inspect(self, identity=None):
         path = self.journal.with_suffix(".inspect")
-        code, _ = self.command(["container", "inspect", self.fact["container_name"],
+        target = identity or self.fact.get("container_id") or self.fact["container_name"]
+        result = self.command(["container", "inspect", target,
                                 "--format", "{{json .}}"], path, cleanup=True)
-        if code:
+        if result.code:
             # Missing container and unavailable daemon are not interchangeable.
             stderr = Path(str(path) + ".stderr").read_text(errors="replace").lower()
             if "no such container" in stderr or "no such object" in stderr:
@@ -195,7 +216,8 @@ class CommandOwner:
             info = json.loads(path.read_text())
         except ValueError as error:
             raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "invalid operation inspect result") from error
-        if ((self.fact.get("container_id") and info.get("Id") != self.fact["container_id"])
+        if ((identity is not None and info.get("Id") != identity)
+                or (self.fact.get("container_id") and info.get("Id") != self.fact["container_id"])
                 or info.get("Image") != self.fact["image_id"] or any(
             info.get("Config", {}).get("Labels", {}).get(k) != v for k, v in self.fact["labels"].items()
         )):
@@ -214,10 +236,27 @@ class CommandOwner:
         for key, value in self.fact["labels"].items():
             args += ["--label", f"{key}={value}"]
         args += ["--entrypoint", "/bin/sh", self.fact["image_id"], "-c", self.request["script"]]
-        self.save(phase="creating", create_dispatched=True)
-        code, timed_out = self.command(args, self.journal.with_suffix(".create"), creating=True)
-        self.save(create_exit=code, create_timed_out=timed_out)
-        container = self.inspect()
+        self.save(phase="creating", create_dispatched=True,
+                  create_reply_deadline_monotonic=self.deadline + CLEANUP_TIMEOUT_SECONDS)
+        result = self.command(args, self.journal.with_suffix(".create"), creating=True, settle_create=True)
+        code, timed_out = result.code, result.timed_out
+        self.save(create_exit=code, create_timed_out=timed_out, create_dispatched=result.dispatched)
+        if not result.dispatched:
+            self.save(phase="settled", container_absent=True, command_succeeded=False,
+                      timed_out=timed_out, interrupted=self.owner_lost)
+            return code
+        reply_id = None
+        if code == 0:
+            try:
+                reply = self.journal.with_suffix(".create").read_bytes()
+            except OSError:
+                reply = b""
+            if not re.fullmatch(rb"[0-9a-f]{64}\n?", reply):
+                self.save(phase="create-unknown", error="DockerCreateReplyInvalid", interrupted=self.owner_lost)
+                return 1
+            reply_id = reply.rstrip(b"\n").decode("ascii")
+            self.save(create_reply_id=reply_id)
+        container = self.inspect(reply_id)
         if container is None:
             # A lost create reply is not proof that a late stopped container
             # cannot appear. Retain uncertainty; no start has been dispatched.
@@ -229,17 +268,18 @@ class CommandOwner:
         try:
             if code == 0 and self.alive() and time.monotonic() < self.deadline:
                 self.save(phase="running", start_dispatched=True)
-                command_exit, timed_out = self.command(["start", "--attach", identity],
-                                                       self.journal.with_suffix(".stdout"))
-                self.save(command_exit=command_exit, timed_out=timed_out,
+                started = self.command(["start", "--attach", identity], self.journal.with_suffix(".stdout"))
+                command_exit = started.code
+                timed_out = timed_out or started.timed_out
+                self.save(command_exit=command_exit, timed_out=timed_out, start_dispatched=started.dispatched,
                           interrupted=not self.alive())
             else:
                 timed_out = timed_out or time.monotonic() >= self.deadline
                 self.save(interrupted=not self.alive(), command_exit=None, timed_out=timed_out)
         finally:
-            code, _ = self.command(["container", "rm", "--force", identity],
+            removed = self.command(["container", "rm", "--force", identity],
                                     self.journal.with_suffix(".cleanup"), cleanup=True)
-            if code or self.inspect() is not None:
+            if removed.code or self.inspect() is not None:
                 self.save(phase="cleanup-failed", error="ContainerCleanupFailed")
                 raise runtime.RuntimeFailure("ContainerCleanupFailed", "operation container did not exit")
             self.save(phase="settled", container_absent=True,
@@ -258,10 +298,11 @@ class CommandOwner:
         self.save(phase="running", command_dispatched=True)
         # Complete this one control call even after owner loss. No later call
         # is dispatched, and the inherited lock remains held through CLI exit.
-        code, timed_out = self.command(self.request["args"], self.journal.with_suffix(".stdout"), creating=True)
-        uncertain = (timed_out or code != 0) and self.fact["mutating"]
+        result = self.command(self.request["args"], self.journal.with_suffix(".stdout"), creating=True)
+        code, timed_out = result.code, result.timed_out
+        uncertain = result.dispatched and (timed_out or code != 0) and self.fact["mutating"]
         self.save(phase="command-unknown" if uncertain else "settled",
-                  command_exit=code, timed_out=timed_out, interrupted=not self.alive(),
+                  command_exit=code, timed_out=timed_out, command_dispatched=result.dispatched, interrupted=not self.alive(),
                   command_succeeded=code == 0 and not timed_out)
         return 0 if self.fact["command_succeeded"] else 1
 

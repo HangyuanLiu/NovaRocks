@@ -655,20 +655,30 @@ class MachineDocker(runtime.Docker):
                     or labels.get("novarocks.fixture.control-root") != str(Path(base).parent)
                     or not fact.get("image_id")):
                 raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "operation has no exact machine ownership")
-            container = self.inspect("container", name, absent_ok=True)
+            reply_id, known_id = fact.get("create_reply_id"), fact.get("container_id")
+            if reply_id is not None and (not isinstance(reply_id, str) or not re.fullmatch(r"[0-9a-f]{64}", reply_id)
+                                          or fact.get("create_exit") != 0 or fact.get("create_dispatched") is not True
+                                          or (known_id is not None and known_id != reply_id)):
+                raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "operation reply identity differs from its journal")
+            expected_id = known_id or reply_id
+            container = self.inspect("container", expected_id or name, absent_ok=True)
             if container:
-                if ((fact.get("container_id") and container.get("Id") != fact["container_id"])
+                if ((expected_id and container.get("Id") != expected_id)
                         or container.get("Image") != fact["image_id"] or any(
                     container.get("Config", {}).get("Labels", {}).get(k) != v for k, v in labels.items()
                 )):
                     raise runtime.RuntimeFailure("RuntimeIdentityMismatch", "orphan operation container differs from its journal")
                 identity = container["Id"]
+                fact["container_id"] = identity
+                runtime.atomic_json(path, fact)
                 self.command(["container", "rm", "--force", identity])
                 if self.inspect("container", identity, absent_ok=True):
                     raise runtime.RuntimeFailure("ResourcesStillPresent", "orphan operation did not exit")
-            elif fact.get("create_dispatched") and not fact.get("container_id"):
+            elif fact.get("create_dispatched") and not expected_id:
                 raise runtime.RuntimeFailure("ContainerCleanupUnconfirmed", "unknown create outcome: " + str(path))
-            fact.update(phase="settled", interrupted=True, container_absent=True)
+            if expected_id:
+                fact["container_id"] = expected_id
+            fact.update(phase="settled", interrupted=True, container_absent=True, command_succeeded=False)
             runtime.atomic_json(path, fact)
 
     def remove_rest_state(self, record):
