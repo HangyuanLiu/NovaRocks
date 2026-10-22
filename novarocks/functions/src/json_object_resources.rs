@@ -19,6 +19,7 @@
 //! These facts allocate no payload and grant no host authority. They describe
 //! physical occurrences, including prefixes of unsupported scalar reads.
 
+#[cfg(test)]
 use crate::aggregate_scalar::AggScalarValue;
 #[cfg(test)]
 use crate::scalar_copy_geometry::arrow_default_debug_bytes_upper as type_debug;

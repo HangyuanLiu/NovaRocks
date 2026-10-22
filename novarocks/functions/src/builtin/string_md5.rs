@@ -33,10 +33,7 @@ fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
 }
 
 #[cfg(test)]
-use crate::{
-    FunctionArgumentType,
-    kernel_control::{internal, invalid},
-};
+use crate::kernel_control::{internal, invalid};
 #[cfg(test)]
 use arrow_array::{Array, ArrayRef, StringArray};
 #[cfg(test)]

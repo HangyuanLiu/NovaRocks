@@ -109,10 +109,6 @@ impl PreparedNullSafeComparisonRecipe {
     }
     /// Required child errors are not successful input NULLs. Both addresses,
     /// classes and NULL promises are verified before this total predicate runs.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Keep both original compact/logical source addresses explicit"
-    )]
     pub fn compare_rows(
         &self,
         left: EvaluatedArgument<'_>,

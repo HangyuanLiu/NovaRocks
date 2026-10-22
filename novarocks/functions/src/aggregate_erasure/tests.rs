@@ -2343,11 +2343,9 @@ fn owned_aggregate_state_moves_merges_selected_rows_and_destroys_before_release(
         state.backing_bytes(),
         handle.state_layout().pad_to_align().size()
     );
-    let mut moved = Vec::with_capacity(1);
-    moved.push(state);
-    moved.push(
-        crate::OwnedAggregateState::try_new(handle.clone(), allocator.clone(), &runtime).unwrap(),
-    );
+    let second =
+        crate::OwnedAggregateState::try_new(handle.clone(), allocator.clone(), &runtime).unwrap();
+    let mut moved = vec![state, second];
     let values = value_array();
     let selection = Selection::try_sparse(5, &[1, 4]).unwrap();
     let input = SelectedAggregateMergeInput::try_new(

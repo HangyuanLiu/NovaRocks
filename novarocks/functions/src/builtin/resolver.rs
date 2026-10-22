@@ -424,15 +424,6 @@ fn value_carriers<'a>(
     Ok(ScalarCarriers::from_values(arguments))
 }
 
-fn carrier_matches_observed(
-    sig: &Signature,
-    args: ScalarCarriers<'_>,
-    pass: u8,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<bool, ResolveError> {
-    carrier_matches_with_creation::<std::convert::Infallible>(sig, args, pass, work, None)
-        .map_err(ResolutionFailure::into_pure)
-}
 fn carrier_matches_with_creation<H>(
     sig: &Signature,
     args: ScalarCarriers<'_>,

@@ -607,10 +607,6 @@ fn observe_type_push<H>(
     }
     Ok(())
 }
-#[expect(
-    clippy::too_many_arguments,
-    reason = "actual input type sources remain explicit"
-)]
 pub(crate) fn lower_expressions_with_unions_with_creator<
     H,
     F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
@@ -931,7 +927,7 @@ fn lower_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                     };
                     if !novarocks_type_contract::arrow_data_types_exact_observed::<
                         ExpressionLoweringError,
-                    >(target, &node.ty.data_type(), || {
+                    >(target, node.ty.data_type(), || {
                         work.step().map_err(ExpressionLoweringError::Control)
                     })? {
                         return Err(ExpressionLoweringError::Invalid(
@@ -2086,7 +2082,7 @@ fn prepare_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
                     }
                     if !novarocks_type_contract::arrow_data_types_exact_observed::<
                         ExpressionLoweringError,
-                    >(target, &source.ty.data_type(), || {
+                    >(target, source.ty.data_type(), || {
                         work.step().map_err(ExpressionLoweringError::Control)
                     })? {
                         return Err(ExpressionLoweringError::Invalid(

@@ -78,13 +78,7 @@ pub unsafe fn update_legacy_batch(
     offset: usize,
     bases: &[usize],
 ) -> Result<(), CountVisitError<std::convert::Infallible>> {
-    if array.is_none() || count_all {
-        for &base in bases {
-            let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
-            add_original(slot, 1);
-        }
-    } else {
-        let array = array.unwrap();
+    if let Some(array) = array.filter(|_| !count_all) {
         for (row, &base) in bases.iter().enumerate() {
             if contributes_observed(CountValue { array, row }, &mut |_| {
                 Ok::<(), std::convert::Infallible>(())
@@ -92,6 +86,11 @@ pub unsafe fn update_legacy_batch(
                 let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
                 add_original(slot, 1);
             }
+        }
+    } else {
+        for &base in bases {
+            let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
+            add_original(slot, 1);
         }
     }
     Ok(())

@@ -2238,7 +2238,7 @@ pub(crate) fn validate_writer_aggregates(
         // nothing in it. What the aggregate is, is its type; whether a given
         // row may be written is the target's own answer.
         if let (Some(expected), Some(actual)) = (expected_input, fragment.values().get(&call.input))
-            && !super::value_bindings_match_ignoring_root_nullability(&expected, &actual.ty)
+            && !super::value_bindings_match_ignoring_root_nullability(expected, &actual.ty)
         {
             errors.push(ValidationError::new(
                 path,
@@ -2263,10 +2263,8 @@ pub(crate) fn validate_writer_aggregates(
         // non-null while the phase can produce a null would be read as a value
         // that was never written.
         if let Some(actual) = fragment.values().get(&call.output)
-            && (!super::value_bindings_match_ignoring_root_nullability(
-                &actual.ty,
-                &expected_output,
-            ) || (expected_output.nullable() && !actual.ty.nullable()))
+            && (!super::value_bindings_match_ignoring_root_nullability(&actual.ty, expected_output)
+                || (expected_output.nullable() && !actual.ty.nullable()))
         {
             errors.push(ValidationError::new(
                 path,
@@ -2881,7 +2879,7 @@ pub(crate) fn validate_unpivot_constant(
                     ExprKind::Literal(_) | ExprKind::Constant(_)
                 ) && super::value_bindings_match_ignoring_root_nullability(
                     &expression.ty,
-                    &output_type,
+                    output_type,
                 ),
                 expression.ty.nullable(),
             ),
@@ -3332,7 +3330,7 @@ fn validate_grouped_topn(
             matches!(expr.kind, ExprKind::Value(source) if source == *output)
                 && comparator.supports_value_type(&expr.ty)
                 && novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
-                    .supports_partition_key(&expr.ty.data_type())
+                    .supports_partition_key(expr.ty.data_type())
         });
         if !valid || !keys.insert(*output) {
             errors.push(ValidationError::new(

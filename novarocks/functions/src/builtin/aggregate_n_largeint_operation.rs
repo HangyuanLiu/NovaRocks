@@ -20,7 +20,7 @@ use crate::aggregate_format::AggregateFailureStage;
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
 use crate::aggregate_scalar::ScalarWork;
-use crate::kernel_control::{internal, invalid};
+use crate::kernel_control::invalid;
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::opaque_memory::OpaqueRetainedCharge;
 use crate::{
@@ -109,7 +109,7 @@ pub(super) fn project_failure(
         Ok(data) => data.with_whole_value_source(cause).into(),
         Err(diagnostic) => KernelFailure::from_domain(NDiagnosticFailure {
             origin: cause,
-            diagnostic,
+            _diagnostic: diagnostic,
             stage: domain.stage(),
         })
         .into(),
@@ -151,7 +151,7 @@ pub(super) fn call_unit(
 #[derive(Debug)]
 pub(super) struct NDiagnosticFailure {
     pub(super) origin: KernelFailure,
-    pub(super) diagnostic: KernelFailure,
+    pub(super) _diagnostic: KernelFailure,
     stage: Option<AggregateFailureStage>,
 }
 impl std::fmt::Display for NDiagnosticFailure {

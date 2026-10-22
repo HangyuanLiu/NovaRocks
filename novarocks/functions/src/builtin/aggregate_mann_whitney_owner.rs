@@ -24,7 +24,6 @@ use super::{
     },
     catalogue::BuiltinAggregateResolver,
 };
-use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use crate::kernel_control::{compile_failure, invalid};
 use crate::*;
 use arrow_schema::DataType;

@@ -235,12 +235,9 @@ impl StaticValues {
         control: &dyn PureCompileControl,
     ) -> Result<Self, ValuesCreationFailure<H>> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-        let result = Self::try_new_core(batch, layout, source, creation, Some(&mut work));
-        if result.is_err() {
-            return result;
-        }
+        let value = Self::try_new_core(batch, layout, source, creation, Some(&mut work))?;
         work.finish()?;
-        result
+        Ok(value)
     }
     pub fn try_new_with_cells_with_creator<H>(
         rows: usize,
@@ -252,14 +249,11 @@ impl StaticValues {
         control: &dyn PureCompileControl,
     ) -> Result<Self, ValuesCreationFailure<H>> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-        let result = Self::try_new_cells_core(
+        let value = Self::try_new_cells_core(
             rows, constants, dynamic, layout, source, creation, &mut work,
-        );
-        if result.is_err() {
-            return result;
-        }
+        )?;
         work.finish()?;
-        result
+        Ok(value)
     }
     pub fn batch_projection(&self) -> Option<StaticValueBatch> {
         match &self.backing {

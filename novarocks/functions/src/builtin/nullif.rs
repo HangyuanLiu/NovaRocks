@@ -74,23 +74,23 @@ pub(super) fn validate_profile(contract: &ScalarCallContract) -> Result<(), Kern
         return Err(invalid("nullif requires two exact checked value arguments"));
     };
     let target = contract.result_type();
-    let admitted = match target.data_type() {
+    let admitted = matches!(
+        target.data_type(),
         DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::Float32
-        | DataType::Float64
-        | DataType::Boolean
-        | DataType::Utf8
-        | DataType::Date32
-        | DataType::Decimal128(_, _)
-        | DataType::Timestamp(TimeUnit::Second, None)
-        | DataType::Timestamp(TimeUnit::Millisecond, None)
-        | DataType::Timestamp(TimeUnit::Microsecond, None)
-        | DataType::Timestamp(TimeUnit::Nanosecond, None) => true,
-        _ => false,
-    };
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Boolean
+            | DataType::Utf8
+            | DataType::Date32
+            | DataType::Decimal128(_, _)
+            | DataType::Timestamp(TimeUnit::Second, None)
+            | DataType::Timestamp(TimeUnit::Millisecond, None)
+            | DataType::Timestamp(TimeUnit::Microsecond, None)
+            | DataType::Timestamp(TimeUnit::Nanosecond, None)
+    );
     if !admitted
         || !target.nullable()
         || target.logical_type() != ValueLogicalType::Physical

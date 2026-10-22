@@ -16,7 +16,6 @@
 // under the License.
 
 use super::*;
-use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use novarocks_type_contract::{
     CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
     ExpressionEffectContext, ExpressionUseId, SemanticParameters,

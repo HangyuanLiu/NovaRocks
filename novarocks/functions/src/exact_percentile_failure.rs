@@ -71,7 +71,6 @@ impl<A: ExactPercentileAllocator> fmt::Display for PercentileDataRecipe<'_, A> {
 }
 /// Typed receiver at the original error-construction frontier. It neither
 /// evaluates an argument nor walks a state/type/AST to decide a failure.
-
 pub trait PercentileFailureSink<A: ExactPercentileAllocator> {
     type Error;
     fn data(&mut self, recipe: PercentileDataRecipe<'_, A>) -> Self::Error;

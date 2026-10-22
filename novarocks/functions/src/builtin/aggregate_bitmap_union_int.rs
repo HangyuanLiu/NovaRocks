@@ -246,19 +246,17 @@ fn observed<T>(
     }
     result
 }
+type MappedDomain = (
+    HostAggregateAllocator,
+    HostVec<usize, HostAggregateAllocator>,
+    Arc<dyn AggregateStateAllocator>,
+);
 fn mapped_domain(
     mapping: &[usize],
     selection: Selection<'_>,
     host: Option<Arc<dyn AggregateStateAllocator>>,
     work: &mut EvaluationCheckpoints<'_>,
-) -> Result<
-    (
-        HostAggregateAllocator,
-        HostVec<usize, HostAggregateAllocator>,
-        Arc<dyn AggregateStateAllocator>,
-    ),
-    KernelFailure,
-> {
+) -> Result<MappedDomain, KernelFailure> {
     if mapping.len() != selection.len() {
         return Err(invalid("bitmap mapping differs from actual selection"));
     }

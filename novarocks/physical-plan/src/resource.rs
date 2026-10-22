@@ -142,6 +142,7 @@ impl CutResourcePreflight {
         )?);
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn add_filter_in(
         &mut self,
         filter: &RuntimeFilter,
@@ -2044,7 +2045,7 @@ fn validate_value_type_core<P: TypeValidationPolicy>(
     errors: &mut ValidationContext,
     policy: &mut P,
 ) -> Result<(), P::Error> {
-    validate_data_type_core(&ty.data_type(), path, usage, errors, policy)?;
+    validate_data_type_core(ty.data_type(), path, usage, errors, policy)?;
     if !usage.exhausted() {
         policy.logical(ty, path, errors)?;
     }

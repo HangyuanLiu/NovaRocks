@@ -19,7 +19,7 @@
 use crate::aggregate_scalar::ScalarStateAllocator;
 use crate::builtin::aggregate_ds_hll_failure::*;
 use crate::datasketches_hll::{HllHandle, HllTargetType};
-use crate::datasketches_hll_failure::{HllFailureSink, HllObservation};
+use crate::datasketches_hll_failure::HllObservation;
 use crate::percentile_input::payload_bytes_at_with_failure;
 use crate::sketch_hash::prehash_array_value_with_failure;
 use allocator_api2::vec::Vec as AllocVec;
@@ -53,6 +53,9 @@ pub trait DsHllStorage {
 pub trait DsHllStateAccess {
     type State: DsHllStorage;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn with_state<T>(
         &mut self,
         ordinal: usize,
@@ -62,6 +65,9 @@ pub trait DsHllStateAccess {
 pub trait DsHllStateReadAccess {
     type State: DsHllStorage;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn state(&self, ordinal: usize) -> &Self::State;
 }
 
@@ -114,6 +120,9 @@ impl<T: DsHllStorage> TypedDsHllStorage<RawDsHllFailure> for T {
 pub trait TypedDsHllStateAccess<F: DsHllFailureSink> {
     type State: TypedDsHllStorage<F>;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn source_row(&self, ordinal: usize) -> usize;
     fn with_state<T>(
         &mut self,
@@ -593,6 +602,9 @@ pub trait DsHllEmissionPort<F: DsHllFailureSink> {
 }
 pub trait DsHllEmissionStates {
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn handle(&self, ordinal: usize) -> Option<&HllHandle>;
 }
 impl<S: DsHllStateReadAccess> DsHllEmissionStates for S {

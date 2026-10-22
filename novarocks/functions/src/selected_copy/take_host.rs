@@ -17,8 +17,10 @@
 
 //! ONE selected-copy extent author feeds this opaque take admission. Geometry
 //! is not authority: only the supplied host grants its operation reservation.
+#[cfg(test)]
+use super::ScratchCoverage;
 use super::copy_buffer_peak::CopyBufferPeak;
-use super::{CopyError, CopyMode, ScratchCoverage, add, buffer_extent, mul, zip};
+use super::{CopyError, CopyMode, add, buffer_extent, mul, zip};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::opaque_memory::OpaqueRetainedCharge;
@@ -39,28 +41,10 @@ pub enum CopyIndices {
     UInt64(Arc<UInt64Array>),
 }
 impl CopyIndices {
-    pub(super) fn len(&self) -> usize {
-        match self {
-            Self::UInt32(a) => a.len(),
-            Self::UInt64(a) => a.len(),
-        }
-    }
     pub(super) fn as_array(&self) -> &dyn Array {
         match self {
             Self::UInt32(a) => a.as_ref(),
             Self::UInt64(a) => a.as_ref(),
-        }
-    }
-    pub(super) fn raw_value(&self, row: usize) -> usize {
-        match self {
-            Self::UInt32(a) => a.value(row).as_usize(),
-            Self::UInt64(a) => a.value(row).as_usize(),
-        }
-    }
-    pub(super) fn index_maximum(&self) -> usize {
-        match self {
-            Self::UInt32(_) => u32::MAX as usize,
-            Self::UInt64(_) => usize::MAX,
         }
     }
 }
@@ -631,7 +615,7 @@ pub(super) fn result_node_metadata_upper(
 struct CopySources<C> {
     source: ArrayRef,
     indices: CopyIndices,
-    original_owner: C,
+    _original_owner: C,
 }
 impl<C> crate::arrow_result_custody::CopyInputBacking for CopySources<C> {
     fn source_count(&self) -> usize {
@@ -686,7 +670,7 @@ pub fn take_copy_in<C: Send + Sync + 'static>(
     let sources = CopySources {
         source,
         indices,
-        original_owner,
+        _original_owner: original_owner,
     };
     let observed = KernelControlObservation::new(control);
     observed.checkpoint(0)?;

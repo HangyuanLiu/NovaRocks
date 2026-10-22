@@ -661,10 +661,10 @@ impl ProgramResolvedCalls {
                                 .zip(contract.argument_types())
                             {
                                 slots.check(layout, *slot, ty, work)?;
-                                check_arrow(old_type, &ty.data_type(), work)?;
+                                check_arrow(old_type, ty.data_type(), work)?;
                             }
                             for (old_type, ty) in ret_types.iter().zip(contract.result_types()) {
-                                check_arrow(old_type, &ty.data_type(), work)?;
+                                check_arrow(old_type, ty.data_type(), work)?;
                             }
                             Ok(())
                         },
@@ -772,7 +772,7 @@ fn validate_expression(
                     .node(child.definition)
                     .ok_or(ProgramResolvedCallsError::InvalidSite)?
                     .data_type(),
-                &source.value_type.data_type(),
+                source.value_type.data_type(),
                 work,
             )?;
         }
@@ -798,7 +798,7 @@ fn validate_expression(
                         .node(*definition)
                         .ok_or(ProgramResolvedCallsError::InvalidSite)?
                         .data_type(),
-                    &ty.data_type(),
+                    ty.data_type(),
                     work,
                 )?;
             }
@@ -824,7 +824,7 @@ fn validate_expression(
                         .node(*definition)
                         .ok_or(ProgramResolvedCallsError::InvalidSite)?
                         .data_type(),
-                    &ty.data_type(),
+                    ty.data_type(),
                     work,
                 )?,
                 FunctionArgumentType::Lambda { .. } => {
@@ -878,7 +878,7 @@ fn validate_expression(
                 .node(*body)
                 .ok_or(ProgramResolvedCallsError::InvalidSite)?
                 .data_type(),
-            &contract.body_result_type().data_type(),
+            contract.body_result_type().data_type(),
             work,
         )?;
     }
@@ -896,7 +896,7 @@ fn validate_expression(
             .node(invocation.definition)
             .ok_or(ProgramResolvedCallsError::InvalidSite)?
             .data_type(),
-        &result.data_type(),
+        result.data_type(),
         work,
     )
 }
@@ -1062,18 +1062,14 @@ fn check_aggregate_source(
             .logical_argument_types()
             .chain(contract.order_argument_types()),
     ) {
-        check_arrow(source, &ty.data_type(), work)?;
+        check_arrow(source, ty.data_type(), work)?;
     }
     check_arrow(
         &source.intermediate_type,
-        &contract.intermediate_type().data_type(),
+        contract.intermediate_type().data_type(),
         work,
     )?;
-    check_arrow(
-        &source.output_type,
-        &contract.final_type().data_type(),
-        work,
-    )
+    check_arrow(&source.output_type, contract.final_type().data_type(), work)
 }
 
 fn check_order(
@@ -1125,7 +1121,7 @@ fn check_argument_root(
     let definition = snapshot.roots().arenas()[&ProgramExpressionArena::Main]
         .node(invocation.definition)
         .ok_or(ProgramResolvedCallsError::InvalidSite)?;
-    check_arrow(definition.data_type(), &ty.data_type(), work)
+    check_arrow(definition.data_type(), ty.data_type(), work)
 }
 
 /// Each call carries its own frame and NULL treatment. A legacy call's frame
@@ -1204,7 +1200,7 @@ fn validate_window(
     }
     check_arrow(
         &source.return_type,
-        &contract.result_type().data_type(),
+        contract.result_type().data_type(),
         work,
     )
 }
@@ -1333,7 +1329,7 @@ impl<'a> RequestedSlots<'a> {
             .ok_or(ProgramResolvedCallsError::WrongArguments)?;
         check_arrow(
             layout.schema().field(ordinal).data_type(),
-            &ty.data_type(),
+            ty.data_type(),
             work,
         )
     }

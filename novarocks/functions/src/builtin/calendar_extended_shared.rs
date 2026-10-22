@@ -28,7 +28,9 @@ use crate::{
     EvaluatedArgument, FunctionArgumentType, FunctionValueType, KernelEvaluationControl,
     KernelFailure, ScalarCallInput, Selection,
 };
-use arrow_array::{Array, ArrayRef, StringArray};
+#[cfg(test)]
+use arrow_array::StringArray;
+use arrow_array::{Array, ArrayRef};
 use arrow_schema::DataType;
 use std::{sync::Arc, time::Duration};
 
@@ -96,13 +98,16 @@ pub(super) fn finish_calendar_result<T, E>(
             .map_err(CalendarFailure::Outer),
     }
 }
+pub(super) type CalendarRowErrorPort<'call, E> =
+    Option<&'call dyn Fn(usize, &str) -> Result<crate::RowDataError, E>>;
+
 pub(super) struct CalendarInput<'call, 'batch, E = std::convert::Infallible> {
     pub types: &'call [FunctionArgumentType],
     pub carrier: &'call DataType,
     pub target: &'call FunctionValueType,
     pub arguments: &'batch [EvaluatedArgument<'batch>],
     pub selected: Selection<'batch>,
-    pub row_error_port: Option<&'call dyn Fn(usize, &str) -> Result<crate::RowDataError, E>>,
+    pub row_error_port: CalendarRowErrorPort<'call, E>,
     pub legacy: bool,
 }
 impl<E> Copy for CalendarInput<'_, '_, E> {}

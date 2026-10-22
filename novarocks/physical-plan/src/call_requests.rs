@@ -267,7 +267,7 @@ impl FragmentCallRequests {
         fragment: &Fragment,
         entries: Vec<(PhysicalCallDefinition, PhysicalCallRequest)>,
         storage: novarocks_type_contract::ValueTypeStorageLifetime,
-        mut creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, E>>,
+        creation: Option<&mut novarocks_type_contract::ValueSchemaCreation<'_, E>>,
         work: &mut CompileCheckpoints<'_>,
         validate: impl FnOnce(&Self, &Fragment, &mut CompileCheckpoints<'_>) -> Result<(), E>,
     ) -> Result<Self, E>

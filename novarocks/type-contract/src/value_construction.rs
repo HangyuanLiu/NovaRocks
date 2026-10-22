@@ -70,16 +70,6 @@ impl<E> From<crate::owned_resources::hashmap::HashMapResourceError>
     }
 }
 impl ValueConstructionFailure<std::convert::Infallible> {
-    pub(crate) fn into_pure_string(self) -> String {
-        match self {
-            Self::Rule(error) => error,
-            Self::ValueType(error) => error.to_string(),
-            Self::Observer(never) => match never {},
-            Self::Layout(_) | Self::Vec(_) | Self::HashMap(_) => {
-                unreachable!("pure construction has no allocation model observer")
-            }
-        }
-    }
     pub(crate) fn into_pure(self) -> ExecutionValueTypeError {
         match self {
             Self::ValueType(error) => error,

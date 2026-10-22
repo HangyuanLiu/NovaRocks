@@ -27,8 +27,6 @@ use novarocks_type_contract::{
 };
 
 use super::catalogue::BuiltinScalarResolver;
-#[cfg(test)]
-use crate::FunctionValueType;
 use crate::kernel_control::{compile_failure, invalid};
 use crate::{
     CallEffectInput, FunctionArgument, FunctionArgumentType, FunctionBindingDeclaration,

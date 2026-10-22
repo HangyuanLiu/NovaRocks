@@ -31,7 +31,6 @@ pub mod mv_aggregate_layout;
 pub mod naming;
 pub mod native_compatibility;
 pub mod network;
-mod predicate;
 pub mod primitive;
 pub mod schema;
 pub mod slot_id;

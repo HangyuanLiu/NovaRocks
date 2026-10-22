@@ -71,7 +71,7 @@ pub(super) fn constructor(source: ArrowError) -> KernelFailure {
 #[derive(Debug)]
 pub(super) struct MapDiagnosticFailure {
     pub(super) origin: KernelFailure,
-    pub(super) diagnostic: KernelFailure,
+    pub(super) _diagnostic: KernelFailure,
     pub(super) phase: crate::AggregateInvocationPhase,
 }
 impl fmt::Display for MapDiagnosticFailure {

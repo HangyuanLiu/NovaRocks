@@ -34,14 +34,13 @@ use novarocks_type_contract::{
 /// Unsupported UInt/PhysicalNull are explicit compile shape refusals in Exact
 /// mode; this predicate never changes original SQL/native v1 admission.
 pub fn native_bitnot_source_supported(source: &FunctionValueType) -> bool {
-    match (&source.logical_type(), source.data_type()) {
+    matches!(
+        (&source.logical_type(), source.data_type()),
         (
             ValueLogicalType::Physical,
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
-        ) => true,
-        (ValueLogicalType::LargeInt, DataType::FixedSizeBinary(16)) => true,
-        _ => false,
-    }
+        ) | (ValueLogicalType::LargeInt, DataType::FixedSizeBinary(16))
+    )
 }
 #[derive(Clone, Debug)]
 pub struct PreparedNativeBitNotRecipe {

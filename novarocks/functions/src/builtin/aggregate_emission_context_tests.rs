@@ -355,7 +355,7 @@ fn emission_missing_host_and_original_capacity_guard_precede_diagnostic_work() {
     assert_eq!(host.ledger.lock().unwrap().attempts, attempts);
     assert!(!prepared.published.load(Ordering::SeqCst));
     let handle = PreparedAggregateHandle::from_typed(prepared.clone(), &Compile).unwrap();
-    let mut storage = [std::mem::MaybeUninit::<u8>::uninit(); 0];
+    let mut storage: [std::mem::MaybeUninit<u8>; 0] = [];
     let slot = handle
         .initialize_in(&mut storage, &Control::default())
         .unwrap();

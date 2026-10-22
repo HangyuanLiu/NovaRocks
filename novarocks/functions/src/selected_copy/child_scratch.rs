@@ -127,23 +127,6 @@ impl<T> ChildScratchVec<T> {
             }
         }
     }
-    pub(super) fn try_collect<I: Iterator<Item = Result<T, CopyError>>>(
-        values: I,
-        allocator: Option<&HostAggregateAllocator>,
-    ) -> Result<Self, CopyError> {
-        match allocator {
-            None => values
-                .collect::<Result<Vec<_>, CopyError>>()
-                .map(Self::Original),
-            Some(allocator) => {
-                let mut result = Self::new(Some(allocator));
-                for value in values {
-                    result.try_push(value?)?;
-                }
-                Ok(result)
-            }
-        }
-    }
     pub(super) fn remove(&mut self, index: usize) -> T {
         match self {
             Self::Original(values) => values.remove(index),

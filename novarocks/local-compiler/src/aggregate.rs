@@ -182,7 +182,7 @@ fn lower_core_with_creation<H>(
             .into());
         }
         merging &= !phase.consumes_logical_arguments();
-        functions.push(lower_call(node, call, expressions, work, creation)?);
+        functions.push(lower_call(call, expressions, work, creation)?);
         work.step()?;
     }
     // A finalizing call requires a complete grouping. A node without calls
@@ -346,7 +346,6 @@ pub(crate) fn freeze_binding_with_creation<H>(
 }
 
 pub(crate) fn lower_call<H>(
-    _node: &PhysicalNode,
     call: &AggregateCall,
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     work: &mut CompileCheckpoints<'_>,

@@ -23,9 +23,11 @@
 use std::{collections::BTreeMap, fmt};
 
 use novarocks_connector_contract::{ConnectorReadPublicFacts, ConnectorWriteRecipe};
+#[cfg(test)]
+use novarocks_type_contract::arrow_data_types_exact;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
-    ValueTypeError, arrow_data_types_exact, arrow_fields_exact,
+    ValueTypeError, arrow_fields_exact,
 };
 
 use crate::{
@@ -293,6 +295,7 @@ fn require_field(
     }
 }
 
+#[cfg(test)]
 fn require_carrier(
     expected: &arrow_schema::DataType,
     actual: &FunctionValueType,
@@ -300,7 +303,7 @@ fn require_carrier(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), ProviderLinkError> {
     work.flush()?;
-    let matches = arrow_data_types_exact(expected, &actual.data_type());
+    let matches = arrow_data_types_exact(expected, actual.data_type());
     work.flush()?;
     if matches {
         Ok(())

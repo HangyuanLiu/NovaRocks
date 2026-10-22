@@ -16,11 +16,9 @@
 // under the License.
 
 use super::super::aggregate_mann_whitney_core::{MannWhitneyInput, MannWhitneyState};
-use super::super::aggregate_mann_whitney_resources::MannSourceParams;
 use super::*;
-use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use crate::opaque_memory::OpaqueAllocationHost;
-use crate::source_custody_resources_tests::{measured, measured_live_bytes, without_recording};
+use crate::source_custody_resources_tests::{measured_live_bytes, without_recording};
 use crate::*;
 use arrow_array::{ArrayRef, BooleanArray, Int64Array, StringArray};
 use arrow_schema::DataType;

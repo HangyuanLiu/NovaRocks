@@ -104,25 +104,6 @@ pub(super) fn same_shape_pair(
     )
 }
 
-/// Preserve the source layout and all unchanged semantics while changing the
-/// exact children declared by the selected same-shape conversion. A later ordinary CAST owns widths,
-/// names and NULL widening; this stage grants none of those transformations.
-pub(super) fn same_shape_intermediate(
-    source: &FunctionValueType,
-    target: &FunctionValueType,
-    mode: SameShapeConversion,
-) -> Result<FunctionValueType, FunctionBindingError> {
-    same_shape_intermediate_with_construction(
-        source,
-        target,
-        mode,
-        &mut super::super::scalar_construction::ScalarConstruction::<std::convert::Infallible>::new(
-            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-            None,
-        ),
-    )
-    .map_err(super::super::scalar_construction::OwnerFailure::into_pure)
-}
 pub(super) fn same_shape_intermediate_with_construction<E>(
     source: &FunctionValueType,
     target: &FunctionValueType,

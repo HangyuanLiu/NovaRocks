@@ -29,7 +29,10 @@ use arrow_array::{ArrayRef, StringArray};
 use arrow_buffer::{BooleanBufferBuilder, Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
-use std::{alloc::Layout, sync::Arc};
+use std::alloc::Layout;
+#[cfg(test)]
+use std::sync::Arc;
+
 fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
     let offsets = Layout::array::<i32>(

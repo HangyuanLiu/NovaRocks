@@ -28,28 +28,15 @@ pub(crate) enum ProjectionOperation<'a> {
     FieldNameCopy {
         text: &'a str,
     },
-    Indices {
-        values: &'a StructArray,
-    },
-    IndicesArray {
-        rows: usize,
-    },
+    Indices,
+    IndicesArray,
     Take {
         values: &'a ArrayRef,
         indices: &'a UInt32Array,
     },
-    TargetTypeClone {
-        original: &'a arrow_schema::DataType,
-    },
-    Cast {
-        values: &'a ArrayRef,
-        target: &'a arrow_schema::DataType,
-    },
-    ListResult {
-        list: &'a ListArray,
-        values: &'a ArrayRef,
-        field: &'a arrow_schema::FieldRef,
-    },
+    TargetTypeClone,
+    Cast,
+    ListResult,
 }
 /// The caller owns operation authorization and diagnostics. A port must keep
 /// actual grants through the backing's real Drop; this trait is not a wallet.
@@ -138,9 +125,7 @@ pub(crate) fn project_with_port<P: ProjectionPort>(
     })?;
     let field_col = struct_values.column(field_idx);
 
-    port.before_operation(ProjectionOperation::Indices {
-        values: struct_values,
-    })?;
+    port.before_operation(ProjectionOperation::Indices)?;
     let mut indices = Vec::new();
     indices
         .try_reserve_exact(struct_values.len())
@@ -168,9 +153,7 @@ pub(crate) fn project_with_port<P: ProjectionPort>(
         }
     }
 
-    port.before_operation(ProjectionOperation::IndicesArray {
-        rows: indices.len(),
-    })?;
+    port.before_operation(ProjectionOperation::IndicesArray)?;
     let indices = UInt32Array::from(indices);
     port.after_operation()?;
     port.before_operation(ProjectionOperation::Take {
@@ -202,16 +185,11 @@ pub(crate) fn project_with_port<P: ProjectionPort>(
             }
         },
     };
-    port.before_operation(ProjectionOperation::TargetTypeClone {
-        original: output_field.data_type(),
-    })?;
+    port.before_operation(ProjectionOperation::TargetTypeClone)?;
     let target_item_type = output_field.data_type().clone();
     port.after_operation()?;
     if out_values.data_type() != &target_item_type {
-        port.before_operation(ProjectionOperation::Cast {
-            values: &out_values,
-            target: &target_item_type,
-        })?;
+        port.before_operation(ProjectionOperation::Cast)?;
         out_values = cast(&out_values, &target_item_type).map_err(|source| {
             P::Failure::from(collection_arrow::arrow_failure(
                 "__array_struct_subfield",
@@ -222,11 +200,7 @@ pub(crate) fn project_with_port<P: ProjectionPort>(
         port.after_operation()?;
     }
 
-    port.before_operation(ProjectionOperation::ListResult {
-        list,
-        values: &out_values,
-        field: &output_field,
-    })?;
+    port.before_operation(ProjectionOperation::ListResult)?;
     let out = ListArray::try_new(
         output_field,
         list.offsets().clone(),

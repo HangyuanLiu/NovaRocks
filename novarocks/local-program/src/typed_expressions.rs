@@ -229,7 +229,7 @@ impl ProgramTypedExpressions {
                             return Err(ProgramExpressionTypeError::WrongLambda.into());
                         }
                         validate(result_type, work)?;
-                        same_carrier(definition.data_type(), &result_type.data_type(), work)?;
+                        same_carrier(definition.data_type(), result_type.data_type(), work)?;
                         if let Some(authored) = definition.value_type() {
                             same_value(authored, result_type, false, work)?;
                         }
@@ -249,7 +249,7 @@ impl ProgramTypedExpressions {
                     }
                     (_, FunctionArgumentType::Value(value)) => {
                         validate(value, work)?;
-                        same_carrier(definition.data_type(), &value.data_type(), work)?;
+                        same_carrier(definition.data_type(), value.data_type(), work)?;
                         if let Some(authored) = definition.value_type() {
                             same_value(authored, value, false, work)?;
                         }
@@ -274,7 +274,7 @@ impl ProgramTypedExpressions {
                                     |_| work.step().map_err(ProgramExpressionTypeError::Control),
                                 )?
                                 || !novarocks_type_contract::decimal_error_policy_cast_supported_observed(
-                                    &source.data_type(), &value.data_type(), *decimal_overflow_policy,
+                                    source.data_type(), value.data_type(), *decimal_overflow_policy,
                                     || work.step().map_err(ProgramExpressionTypeError::Control),
                                 )? {
                                 return Err(ProgramExpressionTypeError::TypeMismatch.into());
@@ -283,8 +283,8 @@ impl ProgramTypedExpressions {
                             // this does not require a dead definition to be runtime-installed.
                             if *operation == novarocks_functions::CastOperation::Carrier
                                 && novarocks_functions::carrier_cast_can_produce_null_with_policy(
-                                    &source.data_type(),
-                                    &value.data_type(),
+                                    source.data_type(),
+                                    value.data_type(),
                                     *decimal_overflow_policy,
                                     *allow_throw_exception,
                                 )
@@ -459,7 +459,7 @@ impl ProgramTypedExpressions {
                             if value.logical_type() != expected_domain || !value.nullable() {
                                 return Err(ProgramExpressionTypeError::TypeMismatch.into());
                             }
-                            same_carrier(&value.data_type(), &expected_carrier, work)?;
+                            same_carrier(value.data_type(), &expected_carrier, work)?;
                         }
                         if let Some((_, left, right)) = definition.kind().ordinary_comparison() {
                             validate_comparison_types(left, right, value, entries, work)?;

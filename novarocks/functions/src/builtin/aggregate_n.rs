@@ -24,7 +24,7 @@ use crate::kernel_control::{KernelControlObservation, compile_failure, internal,
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::*;
 use allocator_api2::vec::Vec as HostVec;
-use arrow_array::{Array, ArrayRef, BinaryArray, builder::BinaryBuilder};
+use arrow_array::{Array, ArrayRef, BinaryArray};
 use arrow_schema::DataType;
 use std::sync::Arc;
 #[derive(Debug)]

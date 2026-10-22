@@ -17,7 +17,9 @@
 
 //! Observed exact value types and selected carrier checks shared by lifecycle ABIs.
 
-use crate::kernel_control::{compile_failure, internal, invalid, type_failure};
+#[cfg(test)]
+use crate::kernel_control::internal;
+use crate::kernel_control::{compile_failure, invalid, type_failure};
 use crate::{
     EvaluatedArgument, KernelEvaluationControl, KernelFailure, MAX_UNOBSERVED_KERNEL_WORK,
     Selection,
@@ -87,11 +89,9 @@ impl<'a> EvaluationCheckpoints<'a> {
         if let Some(refusal) = self.refusal {
             return Err(refusal);
         }
-        if result.is_err() {
-            return result;
-        }
+        let value = result?;
         self.control.checkpoint(self.pending)?;
-        result
+        Ok(value)
     }
 }
 

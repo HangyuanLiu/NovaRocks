@@ -237,12 +237,6 @@ impl ValueTypeStorageLifetime {
         ))
     }
 
-    /// Keep the original responsibility for reused scalar parameter storage.
-    /// This combines lifetimes only; it creates no allocation authorization.
-    pub(crate) fn retaining(&self, original: &Self) -> Self {
-        self.retaining_with_construction::<std::convert::Infallible>(original, None)
-            .expect("pure lifetime combination")
-    }
     pub(crate) fn retaining_with_construction<E>(
         &self,
         original: &Self,

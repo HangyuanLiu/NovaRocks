@@ -452,10 +452,6 @@ impl PreparedArithmeticRecipe {
     /// Validate both original addresses before strict SQL NULL. Inherited row
     /// errors must have been excluded by the controller; an unresolved compact
     /// error is rejected rather than misread as a successful NULL.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "Preserve both actual compact/logical addresses and original control"
-    )]
     pub fn evaluate_row(
         &self,
         left: EvaluatedArgument<'_>,

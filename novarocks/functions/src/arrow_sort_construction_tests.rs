@@ -35,40 +35,38 @@ fn columns(rows: usize, count: usize) -> Vec<SortColumn> {
 }
 fn observe(columns: &[SortColumn], limit: Option<usize>) -> (LexsortStructureFacts, usize, usize) {
     let (mut temporary_bytes, mut retained_bytes) = (0, 0);
-    let mut temporary_request = |_: Layout| Ok::<_, Refusal>(());
-    let mut retained_request = |_: Layout| Ok::<_, Refusal>(());
-    let mut temporary_opaque = |bytes| {
-        temporary_bytes += bytes;
-        Ok::<_, Refusal>(())
+    let facts = {
+        let mut temporary_request = |_: Layout| Ok::<_, Refusal>(());
+        let mut retained_request = |_: Layout| Ok::<_, Refusal>(());
+        let mut temporary_opaque = |bytes| {
+            temporary_bytes += bytes;
+            Ok::<_, Refusal>(())
+        };
+        let mut retained_opaque = |bytes| {
+            retained_bytes += bytes;
+            Ok::<_, Refusal>(())
+        };
+        // Pure model probes record the two genuine observation channels. They
+        // claim no BE funding, owner, capacity or physical allocation receipt.
+        let mut temporary = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut temporary_request,
+            &mut temporary_opaque,
+        );
+        let mut retained = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut retained_request,
+            &mut retained_opaque,
+        );
+        preflight_lexsort_structure_construction(
+            columns,
+            limit,
+            &mut temporary,
+            &mut retained,
+            &mut |_| Ok(()),
+        )
+        .unwrap()
     };
-    let mut retained_opaque = |bytes| {
-        retained_bytes += bytes;
-        Ok::<_, Refusal>(())
-    };
-    // Pure model probes record the two genuine observation channels. They
-    // claim no BE funding, owner, capacity or physical allocation receipt.
-    let mut temporary = ValueSchemaCreation::new(
-        ValueTypeStorageLifetime::pure(),
-        &mut temporary_request,
-        &mut temporary_opaque,
-    );
-    let mut retained = ValueSchemaCreation::new(
-        ValueTypeStorageLifetime::pure(),
-        &mut retained_request,
-        &mut retained_opaque,
-    );
-    let facts = preflight_lexsort_structure_construction(
-        columns,
-        limit,
-        &mut temporary,
-        &mut retained,
-        &mut |_| Ok(()),
-    )
-    .unwrap();
-    drop(temporary);
-    drop(retained);
-    drop(temporary_opaque);
-    drop(retained_opaque);
     (facts, temporary_bytes, retained_bytes)
 }
 #[test]
@@ -125,40 +123,42 @@ fn lexsort_structure_preflight_preserves_original_arrow_indices() {
 #[test]
 fn lexsort_structure_first_host_or_work_refusal_is_nominal_without_tail() {
     let columns = columns(9, 2);
-    let mut temporary_request = |_: Layout| Ok::<_, Refusal>(());
-    let mut retained_request =
-        |_: Layout| -> Result<(), Refusal> { panic!("retained request after temporary refusal") };
     let mut temporary_calls = 0;
-    let mut temporary_opaque = |_: usize| {
-        temporary_calls += 1;
-        Err(Refusal(37))
+    let failure = {
+        let mut temporary_request = |_: Layout| Ok::<_, Refusal>(());
+        let mut retained_request = |_: Layout| -> Result<(), Refusal> {
+            panic!("retained request after temporary refusal")
+        };
+        let mut temporary_opaque = |_: usize| {
+            temporary_calls += 1;
+            Err(Refusal(37))
+        };
+        let mut retained_opaque = |_: usize| -> Result<(), Refusal> {
+            panic!("retained callback after temporary refusal")
+        };
+        let mut temporary = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut temporary_request,
+            &mut temporary_opaque,
+        );
+        let mut retained = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut retained_request,
+            &mut retained_opaque,
+        );
+        preflight_lexsort_structure_construction(
+            &columns,
+            None,
+            &mut temporary,
+            &mut retained,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err()
     };
-    let mut retained_opaque =
-        |_: usize| -> Result<(), Refusal> { panic!("retained callback after temporary refusal") };
-    let mut temporary = ValueSchemaCreation::new(
-        ValueTypeStorageLifetime::pure(),
-        &mut temporary_request,
-        &mut temporary_opaque,
-    );
-    let mut retained = ValueSchemaCreation::new(
-        ValueTypeStorageLifetime::pure(),
-        &mut retained_request,
-        &mut retained_opaque,
-    );
-    let failure = preflight_lexsort_structure_construction(
-        &columns,
-        None,
-        &mut temporary,
-        &mut retained,
-        &mut |_| Ok(()),
-    )
-    .unwrap_err();
     assert!(matches!(
         failure,
         CopyConstructionError::Creator(Refusal(37))
     ));
-    drop(temporary);
-    drop(temporary_opaque);
     assert_eq!(temporary_calls, 1);
     let mut any_request =
         |_: Layout| -> Result<(), Refusal> { panic!("request after original work refusal") };
@@ -170,6 +170,16 @@ fn lexsort_structure_first_host_or_work_refusal_is_nominal_without_tail() {
         ValueTypeStorageLifetime::pure(),
         &mut any_request,
         &mut any_opaque,
+    );
+    let mut retained_request =
+        |_: Layout| -> Result<(), Refusal> { panic!("request after original work refusal") };
+    let mut retained_opaque = |_: usize| -> Result<(), Refusal> {
+        panic!("opaque observation after original work refusal")
+    };
+    let mut retained = ValueSchemaCreation::new(
+        ValueTypeStorageLifetime::pure(),
+        &mut retained_request,
+        &mut retained_opaque,
     );
     let failure = preflight_lexsort_structure_construction(
         &columns,

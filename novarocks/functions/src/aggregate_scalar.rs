@@ -17,9 +17,11 @@
 
 //! The original recursive aggregate scalar reader and output builder, shared
 //! by legacy shells and pure owners through their exact state allocator.
+#[cfg(test)]
+use crate::KernelDiagnostic;
+use crate::KernelFailure;
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::largeint;
-use crate::{KernelDiagnostic, KernelFailure};
 use allocator_api2::{alloc::Allocator, vec::Vec as ScalarVec};
 use arrow_array::builder::*;
 use arrow_array::*;
@@ -100,6 +102,16 @@ impl std::fmt::Debug for AggScalarValue {
     }
 }
 
+/// One recursively tracked key/value pair in a map aggregate value.
+#[expect(
+    type_alias_bounds,
+    reason = "The allocator bound is required to form the tracked value types in the alias"
+)]
+pub type TrackedAggScalarMapEntry<A: ScalarStateAllocator> = (
+    Option<TrackedAggScalarValue<A>>,
+    Option<TrackedAggScalarValue<A>>,
+);
+
 /// Aggregate-state-owned scalar whose complete recursive heap graph uses the
 /// query's exact aggregate allocator. Arrow output materialization converts
 /// this value back to `AggScalarValue`; the tracked form never escapes the
@@ -116,15 +128,7 @@ pub enum TrackedAggScalarValue<A: ScalarStateAllocator> {
     Decimal256(i256),
     Binary(ScalarVec<u8, A>),
     Struct(ScalarVec<Option<TrackedAggScalarValue<A>>, A>),
-    Map(
-        ScalarVec<
-            (
-                Option<TrackedAggScalarValue<A>>,
-                Option<TrackedAggScalarValue<A>>,
-            ),
-            A,
-        >,
-    ),
+    Map(ScalarVec<TrackedAggScalarMapEntry<A>, A>),
     List(ScalarVec<Option<TrackedAggScalarValue<A>>, A>),
 }
 

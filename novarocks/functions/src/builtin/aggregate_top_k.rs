@@ -28,7 +28,7 @@ use crate::scalar_output_operation;
 use crate::scalar_output_resources::ScalarOutputResources;
 use crate::*;
 use allocator_api2::vec::Vec as HostVec;
-use arrow_array::{Array, ArrayRef, BinaryArray, builder::BinaryBuilder};
+use arrow_array::{Array, ArrayRef, BinaryArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::CompileCheckpoints;
 use std::sync::Arc;
@@ -262,7 +262,7 @@ fn topk_error(origin: KernelFailure, sink: &mut FailureSink<'_, '_>) -> Evaluati
         EvaluationFailure::Kernel(diagnostic) => {
             KernelFailure::from_domain(TopKDiagnosticFailure {
                 origin,
-                diagnostic,
+                _diagnostic: diagnostic,
                 phase,
             })
             .into()
@@ -272,7 +272,7 @@ fn topk_error(origin: KernelFailure, sink: &mut FailureSink<'_, '_>) -> Evaluati
 #[derive(Debug)]
 struct TopKDiagnosticFailure {
     origin: KernelFailure,
-    diagnostic: KernelFailure,
+    _diagnostic: KernelFailure,
     phase: AggregateInvocationPhase,
 }
 impl std::fmt::Display for TopKDiagnosticFailure {

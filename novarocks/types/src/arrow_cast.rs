@@ -30,14 +30,10 @@ use arrow_array::{
 use arrow_buffer::i256;
 use arrow_cast::cast;
 use arrow_schema::{DataType, TimeUnit};
-use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
-use num_traits::ToPrimitive;
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 
 use crate::largeint;
-use novarocks_functions::calendar_numeric::{
-    numeric_datetime_literal_to_naive as datetime_literal_to_naive_datetime,
-    standardize_numeric_datetime_literal as standardize_date_literal,
-};
+use novarocks_functions::calendar_numeric::numeric_datetime_literal_to_naive as datetime_literal_to_naive_datetime;
 
 #[derive(Debug)]
 pub struct ScalarCastFailure(Box<ScalarCastCause>);

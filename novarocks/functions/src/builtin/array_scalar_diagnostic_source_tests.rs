@@ -18,7 +18,7 @@
 use super::super::array_struct_subfield_core::{project, project_with_port};
 use super::super::scalar_invocation_data::{ScalarInvocationData, ScalarInvocationLatch};
 use super::*;
-use crate::opaque_memory::{OpaqueAllocationHost, OpaqueRetainedCharge};
+use crate::opaque_memory::OpaqueAllocationHost;
 use crate::{
     AggregateStateAllocator, FunctionValueType, KernelDiagnostic, KernelEvaluationControl,
 };

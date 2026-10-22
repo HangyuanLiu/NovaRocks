@@ -856,7 +856,7 @@ pub fn join_key_source_value(arena: &ExprArena, expression: ExprId) -> Option<Va
         ExprKind::Value(value) => Some(*value),
         ExprKind::Cast { expr, target, .. } => {
             let operand = arena.get(*expr)?;
-            widening_keeps_key_identity(&operand.ty.data_type(), target)
+            widening_keeps_key_identity(operand.ty.data_type(), target)
                 .then(|| join_key_source_value(arena, *expr))
                 .flatten()
         }

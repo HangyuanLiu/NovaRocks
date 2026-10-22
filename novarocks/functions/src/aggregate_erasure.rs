@@ -391,7 +391,7 @@ impl AggregateEvaluationBatchInvocation<'_> {
 
 /// Declaration order destroys the pointee and deallocates its actual Box
 /// before returning the helper reservation. The wrapper itself stays inline.
-struct LeasedBatchExecution<'frame> {
+pub(crate) struct LeasedBatchExecution<'frame> {
     inner: Box<dyn BatchExecution + 'frame>,
     _helper_lease: Option<crate::opaque_memory::OpaqueReservation>,
 }

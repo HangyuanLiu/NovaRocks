@@ -25,7 +25,7 @@ use crate::{
     list_cast_core::{self, ListCastError, ListCastObservation},
     selected_copy::{self, CopyError},
 };
-use arrow_array::{Array, ArrayRef, ListArray, UInt64Array};
+use arrow_array::{Array, ListArray, UInt64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use std::{alloc::Layout, cell::RefCell};

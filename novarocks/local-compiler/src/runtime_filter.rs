@@ -357,7 +357,7 @@ pub(crate) fn plan_runtime_filters<H, F: ValueSchemaCreationFactory<H>>(
         if consumers.is_empty() && scan.dynamic_filters().is_empty() {
             continue;
         }
-        let ordered = has_ordered_consumer(&consumers, work)?;
+        let ordered = has_ordered_consumer(consumers, work)?;
         let mut expected = BTreeMap::new();
         for consumer in consumers {
             let value = node.output.columns[consumer.ordinal];
@@ -924,7 +924,7 @@ impl PlannedRuntimeFilters {
                 "runtime-filter consumer scan has no planned channels",
             ))?;
             let mut reads = Vec::new();
-            let ordered = has_ordered_consumer(&consumers, work)?;
+            let ordered = has_ordered_consumer(consumers, work)?;
             if ordered {
                 crate::creation::reserve_vec(
                     &mut reads,

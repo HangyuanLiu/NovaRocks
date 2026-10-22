@@ -72,15 +72,6 @@ impl<'a> ScalarTypeRecipe<'a> {
             ),
         })
     }
-    pub(super) fn materialize_pure(self) -> Result<FunctionValueType, String> {
-        self.materialize_with_construction(&mut super::scalar_construction::ScalarConstruction::<
-            std::convert::Infallible,
-        >::new(
-            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-            None,
-        ))
-        .map_err(super::scalar_construction::pure_string)
-    }
     pub(super) fn materialize_with_construction<E>(
         self,
         creation: &mut super::scalar_construction::ScalarConstruction<'_, E>,

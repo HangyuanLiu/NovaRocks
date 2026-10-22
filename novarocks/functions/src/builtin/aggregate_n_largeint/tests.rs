@@ -995,7 +995,7 @@ fn a_real_null_limit_origin_survives_a_refused_diagnostic_and_keeps_both_typed_s
         while let Some(actual) = source {
             if let Some(actual) = actual.downcast_ref::<NDiagnosticFailure>() {
                 assert_eq!(actual.origin, origin);
-                assert_eq!(actual.diagnostic, KernelFailure::DeadlineExceeded);
+                assert_eq!(actual._diagnostic, KernelFailure::DeadlineExceeded);
                 found = true;
             }
             source = actual.source();

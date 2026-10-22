@@ -19,8 +19,7 @@
 use crate::KernelFailure;
 use novarocks_failure_contract::{
     FailureClass, FailureFact, FailureProjection, FailureReason, OuterFailureProjection,
-    RepresentationBoundary, RepresentationFacts, RepresentationLayout, ResourceDimension,
-    ResourceFacts, domain,
+    RepresentationBoundary, RepresentationFacts, RepresentationLayout, domain,
 };
 use std::{fmt, num::NonZeroU16};
 #[derive(Clone, Copy, Debug)]

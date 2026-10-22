@@ -27,8 +27,8 @@ use crate::{
 use arrow_array::{Array, ArrayRef, StringArray};
 use arrow_schema::DataType;
 use novarocks_type_contract::{
-    CompileControlError, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
-    ExpressionEffectContext, ExpressionUseId, SemanticParameters,
+    DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
+    ExpressionUseId, SemanticParameters,
 };
 use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
 fn owner() -> ParseJsonOwner {

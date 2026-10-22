@@ -242,7 +242,7 @@ fn real_pending_vec_initial_and_branch_exact_layouts_have_independent_goldens() 
         Layout::array::<(&DataType, usize)>(1).unwrap().size()
     );
     let (ty, source) = wide(MAX_DATA_TYPE_NODES - 1);
-    let out = raw(&ty.data_type(), source);
+    let out = raw(ty.data_type(), source);
     assert!(out.errors.is_empty());
     assert_eq!(out.items, 2 * MAX_DATA_TYPE_NODES - 1);
     // The caller policy performs the actual branch reserve_exact(4095),

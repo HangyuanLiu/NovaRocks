@@ -559,7 +559,9 @@ fn mutable_constructor_geometry<E: From<CopyError>>(
                     work.boundary()?;
                     blocks.push(Block {
                         source,
-                        ranges: vec![0..dictionary.len()].into(),
+                        ranges: std::iter::once(0..dictionary.len())
+                            .collect::<Vec<_>>()
+                            .into(),
                         repeats: 1,
                         raw_null: false,
                         raw_outside: 0,
@@ -875,7 +877,7 @@ fn visit<E: From<CopyError>>(
             let width = usize::try_from(*width)
                 .map_err(|_| CopyError::Invalid("copy frozen carrier has a negative width"))?;
             let mut child =
-                selection.map_ranges(work, |source, range, raw_null, mut output, work| {
+                selection.map_ranges(work, |source, range, raw_null, output, work| {
                     let range = if mode.is_raw_take() && raw_null {
                         0..1
                     } else if mode.is_raw_take() && !range.is_empty() {
@@ -887,7 +889,7 @@ fn visit<E: From<CopyError>>(
                             // signed bit pattern is not a representability gate.
                             let start = array.value_offset(row) as u32;
                             if let Some(end) = start.checked_add(width as u32) {
-                                work.push(&mut output, start as usize..end as usize)?;
+                                work.push(output, start as usize..end as usize)?;
                             }
                             // Overflow remains the original start+length panic
                             // (or original release-mode empty range) under the
@@ -902,7 +904,7 @@ fn visit<E: From<CopyError>>(
                         limit(range.end, u32::MAX as usize, CopyLayout::TakeIndex)
                             .map_err(E::from)?;
                     }
-                    work.push(&mut output, range)?;
+                    work.push(output, range)?;
                     Ok(())
                 })?;
             if mode.is_raw_take() {
@@ -1002,23 +1004,18 @@ fn visit<E: From<CopyError>>(
                 }
             } else {
                 for (child_index, (id, _)) in fields.iter().enumerate() {
-                    let mut child = selection.map_ranges(
-                        work,
-                        |source, range, _raw_null, mut output, work| {
+                    let mut child =
+                        selection.map_ranges(work, |source, range, _raw_null, output, work| {
                             let array: &UnionArray = downcast(sources[source])?;
                             for row in range.clone() {
                                 work.step()?;
                                 if array.type_id(row) == id {
                                     let offset = array.value_offset(row);
-                                    work.push(
-                                        &mut output,
-                                        offset..add(offset, 1).map_err(E::from)?,
-                                    )?;
+                                    work.push(output, offset..add(offset, 1).map_err(E::from)?)?;
                                 }
                             }
                             Ok(())
-                        },
-                    )?;
+                        })?;
                     if mode.is_raw_take() {
                         for (original, block) in
                             selection.blocks.iter().zip(child.blocks.iter_mut())
@@ -1147,7 +1144,7 @@ fn offset_selection<O: OffsetSizeTrait, E: From<CopyError>>(
     work: &mut CopyObservation<'_, E>,
     mut offsets: impl for<'a> FnMut(&'a dyn Array) -> Result<&'a [O], CopyError>,
 ) -> Result<Selection, E> {
-    let child = selection.map_ranges(work, |source, range, raw_null, mut output, work| {
+    let child = selection.map_ranges(work, |source, range, raw_null, output, work| {
         if mode.is_raw_take() && raw_null {
             return Ok(());
         }
@@ -1155,7 +1152,7 @@ fn offset_selection<O: OffsetSizeTrait, E: From<CopyError>>(
         let offsets = offsets(array)?;
         if mode == CopyMode::Extend || mode == CopyMode::OriginalConcat {
             work.push(
-                &mut output,
+                output,
                 offset_value(offsets[range.start])?..offset_value(offsets[range.end])?,
             )?;
         } else {
@@ -1165,7 +1162,7 @@ fn offset_selection<O: OffsetSizeTrait, E: From<CopyError>>(
                 // copies offsets/payload even when a copied parent is NULL.
                 if array.is_valid(row) {
                     work.push(
-                        &mut output,
+                        output,
                         offset_value(offsets[row])?..offset_value(offsets[row + 1])?,
                     )?;
                 }
@@ -1251,13 +1248,13 @@ fn list_view<O: OffsetSizeTrait, E: From<CopyError>>(
         }
         return Ok(());
     }
-    let child = selection.map_ranges(work, |source, range, _raw_null, mut output, work| {
+    let child = selection.map_ranges(work, |source, range, _raw_null, output, work| {
         let array: &GenericListViewArray<O> = downcast(sources[source])?;
         for row in range.clone() {
             work.step()?;
             let start = offset_value(array.value_offsets()[row])?;
             let size = offset_value(array.value_sizes()[row])?;
-            work.push(&mut output, start..add(start, size).map_err(E::from)?)?;
+            work.push(output, start..add(start, size).map_err(E::from)?)?;
         }
         Ok(())
     })?;

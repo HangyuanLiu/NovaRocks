@@ -71,10 +71,6 @@ impl From<CompileControlError> for RootAttachmentError {
 /// The sole sequence formerly local to LocalCompiler. Each constructor runs
 /// under the same original control; its first refusal returns without a tail.
 /// Allocation requests and finite storage belong to the actual input authors.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "actual attachment inputs remain explicit"
-)]
 pub fn attach_typed_root_channels_in(
     graph: LocalProgramGraph,
     flows: BTreeMap<ProgramExpressionArena, ProgramControlFlow>,
@@ -106,10 +102,6 @@ pub fn attach_typed_root_channels_in(
 }
 /// Each immutable attachment family gets its own actual scope. Type slices
 /// already carry their separate per-arena creation before entering this body.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "actual attachment sources and factory remain explicit"
-)]
 pub fn attach_typed_root_channels_with_factory_in<
     H,
     F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
@@ -138,10 +130,6 @@ pub fn attach_typed_root_channels_with_factory_in<
 }
 /// Pure caller already owns immutable type slices; preserve their original
 /// backing without re-materializing the declarations into temporary Vecs.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "actual attachment inputs remain explicit"
-)]
 pub fn attach_typed_root_channels_created_in(
     graph: LocalProgramGraph,
     flows: BTreeMap<ProgramExpressionArena, ProgramControlFlow>,
@@ -175,10 +163,6 @@ enum Types {
     Pure(BTreeMap<ProgramExpressionArena, Vec<FunctionArgumentType>>),
     Created(BTreeMap<ProgramExpressionArena, novarocks_type_contract::FunctionArgumentTypes>),
 }
-#[expect(
-    clippy::too_many_arguments,
-    reason = "sole attachment body preserves original sources"
-)]
 fn attach_core<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     graph: LocalProgramGraph,
     flows: BTreeMap<ProgramExpressionArena, ProgramControlFlow>,

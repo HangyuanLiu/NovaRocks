@@ -223,7 +223,7 @@ impl novarocks_failure_contract::FailureProjection for RowFailure {
 #[derive(Debug)]
 struct RequiredAesFailure {
     operation: Operation,
-    ordinal: usize,
+    _ordinal: usize,
     cause: RowFailure,
 }
 impl std::fmt::Display for RequiredAesFailure {
@@ -258,7 +258,7 @@ pub fn evaluate_required_row(
         Row::Value(value) => Ok(value),
         Row::Failure(cause) => Err(crate::KernelFailure::from_domain(RequiredAesFailure {
             operation,
-            ordinal,
+            _ordinal: ordinal,
             cause,
         })),
     }

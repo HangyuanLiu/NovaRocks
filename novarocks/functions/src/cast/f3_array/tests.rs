@@ -186,7 +186,7 @@ fn struct_names_use_complete_by_name_mapping_or_complete_ordinal_mapping() {
         let out = output(&r, &input, Selection::all(2));
         assert_eq!(out.values().data_type(), &target);
         let values = out.values().as_any().downcast_ref::<StructArray>().unwrap();
-        for i in 0..2 {
+        for (i, expected_value) in expected.iter().enumerate() {
             assert_eq!(
                 values
                     .column(i)
@@ -194,7 +194,7 @@ fn struct_names_use_complete_by_name_mapping_or_complete_ordinal_mapping() {
                     .downcast_ref::<Int32Array>()
                     .unwrap()
                     .value(0),
-                expected[i]
+                *expected_value
             );
         }
     }

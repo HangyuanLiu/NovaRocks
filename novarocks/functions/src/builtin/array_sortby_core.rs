@@ -25,56 +25,28 @@ use arrow_array::{
 };
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_cast::cast;
-use arrow_data::{ArrayData, transform::MutableArrayData};
-use arrow_schema::{DataType, FieldRef};
+use arrow_data::transform::MutableArrayData;
+use arrow_schema::DataType;
 use novarocks_failure_contract::{
     BoundedDetail, FailureClass, FailureFact, FailureProjection, FailureReason, domain,
 };
 use std::{cmp::Ordering, fmt, sync::Arc};
 
-pub(crate) enum SortByOperation<'a> {
-    KeyArrays {
-        count: usize,
-    },
-    KeyLists {
-        count: usize,
-    },
-    TargetTypeClone {
-        original: &'a DataType,
-    },
-    Cast {
-        values: &'a ArrayRef,
-        target: &'a DataType,
-    },
-    KeyValues {
-        count: usize,
-    },
-    SourceData {
-        values: &'a ArrayRef,
-    },
-    Mutable {
-        source: &'a ArrayData,
-    },
-    Offsets {
-        rows: usize,
-    },
-    NullBuilder {
-        rows: usize,
-    },
-    KeyStarts {
-        count: usize,
-    },
-    Positions {
-        count: usize,
-    },
-    Extend {
-        source_index: usize,
-    },
+pub(crate) enum SortByOperation {
+    KeyArrays,
+    KeyLists,
+    TargetTypeClone,
+    Cast,
+    KeyValues,
+    SourceData,
+    Mutable,
+    Offsets,
+    NullBuilder,
+    KeyStarts,
+    Positions,
+    Extend,
     Freeze,
-    ListResult {
-        values: &'a ArrayRef,
-        field: &'a FieldRef,
-    },
+    ListResult,
 }
 /// The port supplies original diagnostics and typed operation observations.
 /// Source/result custody is owned by the actual invocation host, not this math.
@@ -82,7 +54,7 @@ pub(crate) trait SortByPort {
     type Failure: From<KernelFailure>;
     fn value_error(&mut self, original: SortByLengthMismatch) -> Self::Failure;
     fn step(&mut self) -> Result<(), Self::Failure>;
-    fn before_operation(&mut self, original: SortByOperation<'_>) -> Result<(), Self::Failure>;
+    fn before_operation(&mut self, original: SortByOperation) -> Result<(), Self::Failure>;
     fn after_operation(&mut self) -> Result<(), Self::Failure>;
 }
 struct RequiredPort<E>(std::marker::PhantomData<E>);
@@ -94,7 +66,7 @@ impl<E: From<KernelFailure>> SortByPort for RequiredPort<E> {
     fn step(&mut self) -> Result<(), E> {
         Ok(())
     }
-    fn before_operation(&mut self, _: SortByOperation<'_>) -> Result<(), E> {
+    fn before_operation(&mut self, _: SortByOperation) -> Result<(), E> {
         Ok(())
     }
     fn after_operation(&mut self) -> Result<(), E> {
@@ -103,6 +75,13 @@ impl<E: From<KernelFailure>> SortByPort for RequiredPort<E> {
 }
 /// An actual source row and key row disagree in element count. This is an
 /// invocation Data error, independently of later outer selection or throw mode.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "The typed failure retains the original row and lengths in its diagnostic source chain."
+    )
+)]
 #[derive(Debug)]
 pub(crate) struct SortByLengthMismatch {
     pub(crate) row: usize,
@@ -350,16 +329,14 @@ pub(crate) fn evaluate_with_port<P: SortByPort>(
         ))
     })?;
     validate_rows(src.len(), rows, "array_sortby source")?;
-    port.before_operation(SortByOperation::KeyArrays { count: key_count })?;
+    port.before_operation(SortByOperation::KeyArrays)?;
     let mut key_arrays = Vec::with_capacity(key_count);
     port.after_operation()?;
     for ordinal in 0..key_count {
         port.step()?;
         key_arrays.push(key(ordinal)?);
     }
-    port.before_operation(SortByOperation::KeyLists {
-        count: key_arrays.len(),
-    })?;
+    port.before_operation(SortByOperation::KeyLists)?;
     let mut key_lists = Vec::with_capacity(key_arrays.len());
     port.after_operation()?;
     for key_arr in &key_arrays {
@@ -394,48 +371,37 @@ pub(crate) fn evaluate_with_port<P: SortByPort>(
             }
         },
     };
-    port.before_operation(SortByOperation::TargetTypeClone {
-        original: output_field.data_type(),
-    })?;
+    port.before_operation(SortByOperation::TargetTypeClone)?;
     let target_item_type = output_field.data_type().clone();
     port.after_operation()?;
 
     let mut src_values = src.values().clone();
     if src_values.data_type() != &target_item_type {
-        port.before_operation(SortByOperation::Cast {
-            values: &src_values,
-            target: &target_item_type,
-        })?;
+        port.before_operation(SortByOperation::Cast)?;
         src_values = cast(&src_values, &target_item_type).map_err(|source| {
             collection_arrow::arrow_failure("array_sortby source", ArrowSite::Cast, source)
         })?;
         port.after_operation()?;
     }
-    port.before_operation(SortByOperation::KeyValues {
-        count: key_lists.len(),
-    })?;
+    port.before_operation(SortByOperation::KeyValues)?;
     let key_values: Vec<ArrayRef> = key_lists.iter().map(|key| key.values().clone()).collect();
     port.after_operation()?;
 
-    port.before_operation(SortByOperation::SourceData {
-        values: &src_values,
-    })?;
+    port.before_operation(SortByOperation::SourceData)?;
     let src_values_data = src_values.to_data();
     port.after_operation()?;
-    port.before_operation(SortByOperation::Mutable {
-        source: &src_values_data,
-    })?;
+    port.before_operation(SortByOperation::Mutable)?;
     let mut mutable = MutableArrayData::new(vec![&src_values_data], false, 0);
     port.after_operation()?;
 
     let src_offsets = src.value_offsets();
-    port.before_operation(SortByOperation::Offsets { rows })?;
+    port.before_operation(SortByOperation::Offsets)?;
     let offset_entries = collection_arrow::list_offset_entries(rows)?;
     let mut out_offsets = Vec::with_capacity(offset_entries);
     port.after_operation()?;
     out_offsets.push(0_i32);
     let mut current = 0i32;
-    port.before_operation(SortByOperation::NullBuilder { rows })?;
+    port.before_operation(SortByOperation::NullBuilder)?;
     let mut null_builder = NullBufferBuilder::new(rows);
     port.after_operation()?;
 
@@ -452,9 +418,7 @@ pub(crate) fn evaluate_with_port<P: SortByPort>(
         let src_end = src_offsets[src_row + 1] as usize;
         let src_len = src_end.saturating_sub(src_start);
 
-        port.before_operation(SortByOperation::KeyStarts {
-            count: key_lists.len(),
-        })?;
+        port.before_operation(SortByOperation::KeyStarts)?;
         let mut key_starts = Vec::with_capacity(key_lists.len());
         port.after_operation()?;
         for key in &key_lists {
@@ -477,16 +441,14 @@ pub(crate) fn evaluate_with_port<P: SortByPort>(
             key_starts.push(Some(key_start));
         }
 
-        port.before_operation(SortByOperation::Positions { count: src_len })?;
+        port.before_operation(SortByOperation::Positions)?;
         let mut positions: Vec<usize> = (0..src_len).collect();
         port.after_operation()?;
         insertion_sort_by_keys(&key_values, &key_starts, &mut positions, port)?;
         for pos in positions {
             let src_idx = src_start + pos;
             port.step()?;
-            port.before_operation(SortByOperation::Extend {
-                source_index: src_idx,
-            })?;
+            port.before_operation(SortByOperation::Extend)?;
             let next = crate::aggregate_scalar::checked_list_output_offset(current, 1)?;
             mutable.extend(0, src_idx, src_idx + 1);
             port.after_operation()?;
@@ -500,10 +462,7 @@ pub(crate) fn evaluate_with_port<P: SortByPort>(
     port.before_operation(SortByOperation::Freeze)?;
     let out_values = make_array(mutable.freeze());
     port.after_operation()?;
-    port.before_operation(SortByOperation::ListResult {
-        values: &out_values,
-        field: &output_field,
-    })?;
+    port.before_operation(SortByOperation::ListResult)?;
     let out = ListArray::try_new(
         output_field,
         OffsetBuffer::new(out_offsets.into()),

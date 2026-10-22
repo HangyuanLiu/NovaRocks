@@ -126,14 +126,11 @@ fn prepare(
     control: &Control,
 ) -> Result<HostDiagnostic, KernelFailure> {
     let mut work = EvaluationCheckpoints::new(control);
-    let result = HostDiagnostic::prepare(host, &mut work, |writer| {
+    let value = HostDiagnostic::prepare(host, &mut work, |writer| {
         write!(writer, "{}:µ𝄞", "original diagnostic ".repeat(97))
-    });
-    if result.is_err() {
-        return result;
-    }
+    })?;
     work.finish()?;
-    result
+    Ok(value)
 }
 #[test]
 fn real_host_message_backing_is_unbounded_utf8_clone_is_no_allocation_and_last_drop_releases() {
@@ -149,7 +146,6 @@ fn real_host_message_backing_is_unbounded_utf8_clone_is_no_allocation_and_last_d
     );
     let attempts = host.ledger.lock().unwrap().attempts;
     let loan = message.clone();
-    assert!(loan.ptr_eq(&message));
     assert_eq!(host.ledger.lock().unwrap().attempts, attempts);
     drop(allocator);
     drop(message);

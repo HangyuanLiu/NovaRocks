@@ -124,7 +124,7 @@ use crate::{
     AggregateStateAllocator, EvaluatedArgument, KernelDiagnostic, ScalarEvaluationInstance,
     Selection,
 };
-use arrow_array::{Array, ArrayRef, BinaryArray, Int64Array, ListArray, StringArray};
+use arrow_array::{Array, ArrayRef, BinaryArray, Int64Array, StringArray};
 use std::{alloc::Layout, ptr::NonNull, sync::Mutex, time::Duration};
 #[derive(Default)]
 struct Control {

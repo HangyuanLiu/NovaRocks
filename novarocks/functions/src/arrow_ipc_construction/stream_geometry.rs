@@ -806,8 +806,8 @@ pub fn observe_stream_logical_size_construction<H>(
 mod retained_carrier_tests {
     use super::*;
     use arrow_array::{ArrayRef, Int32Array};
-    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
-    use arrow_schema::{UnionFields, UnionMode};
+    use arrow_buffer::ScalarBuffer;
+    use arrow_schema::UnionFields;
     use novarocks_type_contract::ValueTypeStorageLifetime;
     use std::sync::{
         Arc,

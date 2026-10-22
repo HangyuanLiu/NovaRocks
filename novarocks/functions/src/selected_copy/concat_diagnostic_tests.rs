@@ -46,7 +46,8 @@ fn by_copy_original_concat_diagnostic_geometry_preserves_all_original_type_forma
         field.clone(),
         Arc::new(Field::new("item", DataType::Decimal128(9, -3), false)),
     ];
-    let union = UnionFields::new(vec![0, 127], fields.clone());
+    let union =
+        UnionFields::try_new(vec![0, 127], fields.clone()).expect("union field IDs are distinct");
     let cases = vec![
         DataType::Null,
         DataType::Int64,

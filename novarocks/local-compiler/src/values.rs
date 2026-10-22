@@ -331,7 +331,7 @@ fn lower_core_with_creation<H>(
             .ty;
         work.flush()?;
         validate_value_type_structure_observed::<crate::FragmentCreationError<H>>(
-            &ty.data_type(),
+            ty.data_type(),
             |visit| {
                 if let ValueTypeVisit::TypeNode(data_type) = visit {
                     validate_arrow_carrier_parameters_observed::<ConstantError>(data_type, || {
@@ -397,7 +397,7 @@ fn lower_core_with_creation<H>(
                 &CompileCopyControl(work.control()),
             )
             .map_err(|error| copy_construction_error(error, node.id))?;
-            let array = new_empty_array(&ty.data_type());
+            let array = new_empty_array(ty.data_type());
             work.flush()?;
             array
         } else {

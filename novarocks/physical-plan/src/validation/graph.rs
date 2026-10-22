@@ -1281,7 +1281,7 @@ pub(crate) fn validate_result_port_fields(
                 || column.name != name
                 || !novarocks_type_contract::result_render_type::render_field_matches_storage(
                     &column.field,
-                    &field.ty.data_type(),
+                    field.ty.data_type(),
                     field.ty.nullable(),
                 )
             {
@@ -1335,7 +1335,7 @@ pub(crate) fn validate_result_port_fields(
                 format!("result value differs at ordinal {ordinal}"),
             ));
         }
-        if !field.domain.matches_storage(&field.ty.data_type()) {
+        if !field.domain.matches_storage(field.ty.data_type()) {
             errors.push(ValidationError::new(
                 "result_port.fields",
                 format!("result logical domain differs from storage at ordinal {ordinal}"),

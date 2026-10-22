@@ -123,8 +123,6 @@ impl NCodecResources for BoundNCodecResources<'_> {
     }
 }
 
-// A typed outer source's safe detail is bounded before the host formats its stage.
-pub(super) const DIAGNOSTIC_TEXT_MAX: usize = novarocks_failure_contract::DIAGNOSTIC_MAX_BYTES;
 /// Two actual checkpoint/cause diagnostics plus one original error String.
 pub(super) fn operation_prefix_bytes() -> Result<usize, KernelFailure> {
     crate::MAX_ROW_ERROR_MESSAGE_BYTES
@@ -303,9 +301,6 @@ impl NEmissionGeometry {
         // its complete stock/metadata transfer, independently of transient peak.
         Ok(NEmissionFacts {
             operation: add(own_peak, library_invoice)?.max(settlement),
-            own_peak,
-            library_invoice,
-            settlement,
         })
     }
 }
@@ -324,9 +319,6 @@ fn default_vector<T>(
 }
 pub(super) struct NEmissionFacts {
     pub(super) operation: usize,
-    pub(super) own_peak: usize,
-    pub(super) library_invoice: usize,
-    pub(super) settlement: usize,
 }
 
 #[cfg(test)]

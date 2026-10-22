@@ -150,14 +150,16 @@ pub(super) enum Row {
     Error(MoneyDataFailure),
 }
 /// Carrier-neutral shared arguments. The shell owns binding and projection.
+/// Optional adapter for promoting a producer-declared string row failure.
+pub type StringErrorBoundary<'call> =
+    Option<&'call dyn for<'error> Fn(usize, StringDataError<'error>) -> Result<(), KernelFailure>>;
+
 #[derive(Clone, Copy)]
 pub struct StringCoreInput<'call, 'a> {
     pub arguments: &'a [EvaluatedArgument<'a>],
     pub selection: Selection<'a>,
     /// Required-call adapters promote only a producer-declared row data failure.
-    pub error_boundary: Option<
-        &'call dyn for<'error> Fn(usize, StringDataError<'error>) -> Result<(), KernelFailure>,
-    >,
+    pub error_boundary: StringErrorBoundary<'call>,
 }
 impl<'a> StringCoreInput<'_, 'a> {
     fn arguments(self) -> &'a [EvaluatedArgument<'a>] {

@@ -21,8 +21,7 @@ use crate::KernelFailure;
 use arrow_schema::ArrowError;
 use novarocks_failure_contract::{
     BoundedDetail, FailureClass, FailureFact, FailureProjection, FailureReason,
-    RepresentationBoundary, RepresentationFacts, RepresentationLayout, ResourceDimension,
-    ResourceFacts, domain,
+    RepresentationBoundary, RepresentationFacts, RepresentationLayout, domain,
 };
 use std::{error::Error, fmt, num::NonZeroU16};
 #[derive(Debug)]

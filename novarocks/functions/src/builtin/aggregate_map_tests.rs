@@ -19,7 +19,7 @@
 use super::*;
 use crate::aggregate_scalar::AggScalarValue as V;
 use arrow_array::StringArray;
-use arrow_schema::{Field, Fields};
+use arrow_schema::Field;
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
     EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
@@ -1229,33 +1229,35 @@ fn map_whole_numeric_origin_survives_real_diagnostic_deadline_and_host_exit() {
         refusal: Some((0, KernelFailure::DeadlineExceeded)),
         ..Default::default()
     };
-    let mut sink = FailureSink {
-        allocator: &allocator,
-        domain: FailureDomain::Mutation {
-            contract: &kernel.contract,
-            phase: AggregateInvocationPhase::Update,
-            selection: Selection::all(1),
-            mapping: &[0],
-        },
-        control: &control,
+    let error = {
+        let mut sink = FailureSink {
+            allocator: &allocator,
+            domain: FailureDomain::Mutation {
+                contract: &kernel.contract,
+                phase: AggregateInvocationPhase::Update,
+                selection: Selection::all(1),
+                mapping: &[0],
+            },
+            control: &control,
+        };
+        let EvaluationFailure::Kernel(error) = sink.scalar(origin) else {
+            panic!("diagnostic cannot complete")
+        };
+        assert_eq!(error.failure_fact(), expected.failure_fact());
+        let KernelFailure::Source(source) = &error else {
+            panic!("both actual sources required")
+        };
+        let source = source
+            .source()
+            .unwrap()
+            .downcast_ref::<super::super::aggregate_map_source_failure::MapDiagnosticFailure>()
+            .unwrap();
+        assert_eq!(source.origin, expected);
+        assert_eq!(source._diagnostic, KernelFailure::DeadlineExceeded);
+        assert_eq!(source.phase, AggregateInvocationPhase::Update);
+        assert_eq!(control.trace.lock().unwrap().len(), 1);
+        error
     };
-    let EvaluationFailure::Kernel(error) = sink.scalar(origin) else {
-        panic!("diagnostic cannot complete")
-    };
-    assert_eq!(error.failure_fact(), expected.failure_fact());
-    let KernelFailure::Source(source) = &error else {
-        panic!("both actual sources required")
-    };
-    let source = source
-        .source()
-        .unwrap()
-        .downcast_ref::<super::super::aggregate_map_source_failure::MapDiagnosticFailure>()
-        .unwrap();
-    assert_eq!(source.origin, expected);
-    assert_eq!(source.diagnostic, KernelFailure::DeadlineExceeded);
-    assert_eq!(source.phase, AggregateInvocationPhase::Update);
-    assert_eq!(control.trace.lock().unwrap().len(), 1);
-    drop(sink);
     drop(allocator);
     assert_eq!(host.ledger.lock().unwrap().bytes, 0);
     drop(host);

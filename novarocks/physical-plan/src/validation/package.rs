@@ -346,7 +346,7 @@ fn validate_package_scans(input: &FragmentPackageInput, errors: &mut ValidationC
                 .all(|(assignment, field)| {
                     novarocks_connector_contract::connector_type_accepts_arrow(
                         assignment.value_type(),
-                        &field.ty.data_type(),
+                        field.ty.data_type(),
                     )
                 })
         {
@@ -465,12 +465,8 @@ fn validate_package_writes(input: &FragmentPackageInput, errors: &mut Validation
                         } else {
                             return None;
                         }
-                    } else if let Some(part) =
-                        legacy_writer_field_difference(field.field(), &target.ty)
-                    {
-                        part
                     } else {
-                        return None;
+                        legacy_writer_field_difference(field.field(), &target.ty)?
                     };
                     Some(format!(".fields[{ordinal}].{part}"))
                 })

@@ -22,7 +22,6 @@ use super::aggregate_mann_whitney_core::{MannResourceEvent, MannStateExtents};
 use crate::arrow_result_custody::{
     FlatByteKind, FlatDirectByteFacts, RequestUpper, direct_flat_byte_facts,
 };
-use crate::builtin::aggregate_mann_whitney_core::MannFailure;
 use crate::scalar_copy_geometry::{
     ScalarCopyDiagnosticGeometry, arrow_default_debug_bytes_upper, scalar_copy_diagnostic_geometry,
 };

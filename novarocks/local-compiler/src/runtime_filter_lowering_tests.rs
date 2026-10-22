@@ -522,10 +522,6 @@ impl Rf {
 
 /// The filter of the build-key producer at `JOIN` in `producer_fragment`
 /// and its one consumer, built from the build-side equality witness.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each endpoint fact is independent"
-)]
 fn join_filter(
     rf: Rf,
     distribution: JoinDistribution,

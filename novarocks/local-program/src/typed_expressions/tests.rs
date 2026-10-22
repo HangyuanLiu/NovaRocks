@@ -799,8 +799,7 @@ fn created_type_table_late_slice_retains_only_its_original_arena_owner() {
         Ok::<_, novarocks_type_contract::owned_resources::layout::LayoutResourceError>(())
     };
     source_request(std::alloc::Layout::array::<FunctionArgumentType>(1).unwrap()).unwrap();
-    let mut entries = Vec::with_capacity(1);
-    entries.push(source_value);
+    let entries = vec![source_value];
     let entries = FunctionArgumentTypes::try_from_boxed_observed(
         entries.into_boxed_slice(),
         ValueTypeStorageLifetime::held(arena_hold.clone()),

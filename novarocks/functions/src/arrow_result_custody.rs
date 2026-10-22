@@ -46,21 +46,21 @@ struct OriginalArray {
 }
 struct OriginalBacking<C> {
     loan: Option<OriginalArray>,
-    custody: C,
+    _custody: C,
 }
 impl<C> OriginalBacking<C> {
     fn new(original: ArrayRef, data: ArrayData, custody: C) -> Self {
         Self {
             loan: Some(OriginalArray { original, data }),
-            custody,
+            _custody: custody,
         }
     }
 }
 /// Each custom buffer pins only its own immutable backing. Declaration order
 /// releases that backing before the last shared custody/grant is released.
 struct BufferCustodian<C> {
-    source: Buffer,
-    owner: HostShared<OriginalBacking<C>>,
+    _source: Buffer,
+    _owner: HostShared<OriginalBacking<C>>,
 }
 // The shared block is immutable. Neither observation nor unwinding changes its
 // custody; its last-reference Drop destroys backing before releasing admission.
@@ -152,6 +152,7 @@ pub(crate) fn custody_type_metadata_upper_bound(nodes: usize) -> Result<usize, K
 
 /// Count only actual Arrow structure. This is not a decoder and does not inspect
 /// a logical value, invent a UTF8 row bound, or change selected row addresses.
+#[cfg(test)]
 pub(crate) fn custody_metadata_upper_bound(
     data: &ArrayData,
     work: &mut EvaluationCheckpoints<'_>,
@@ -482,8 +483,8 @@ fn wrap_buffer<C: Send + Sync + 'static>(
     let offset = source.ptr_offset();
     let length = checked_add(offset, source.len())?;
     let allocation: Arc<dyn arrow_buffer::alloc::Allocation> = Arc::new(BufferCustodian {
-        source: source.clone(),
-        owner: owner.clone(),
+        _source: source.clone(),
+        _owner: owner.clone(),
     });
     // SAFETY: this custodian pins the SAME original immutable Buffer. Its
     // initialized prefix includes offset + len (the exact original Buffer
@@ -724,8 +725,8 @@ fn granted_original_group<C: Send + Sync + 'static>(
 /// New copy backing and already-owned source have distinct owners. Retaining
 /// the source preserves its original lease; it never authorizes fresh payload.
 struct CopiedBacking<C: Send + Sync + 'static> {
-    source: C,
-    charge: OpaqueRetainedCharge,
+    _source: C,
+    _charge: OpaqueRetainedCharge,
 }
 
 pub(crate) struct RetainedCopiedArrowResult {
@@ -892,8 +893,8 @@ pub(crate) fn retain_copied_result_backing<C: CopyInputBacking + Send + Sync + '
         packet.original,
         data,
         CopiedBacking {
-            source: packet.source,
-            charge,
+            _source: packet.source,
+            _charge: charge,
         },
         allocator,
         work,
@@ -1096,8 +1097,8 @@ impl<C: Send + Sync + 'static> SourceBackingOwner<C> {
 /// charge. Each buffer custodian destroys its own payload alias before the
 /// last shared source/metadata custody exits.
 struct SourceCustody<C: Send + Sync + 'static> {
-    source: SourceBackingOwner<C>,
-    metadata: OpaqueRetainedCharge,
+    _source: SourceBackingOwner<C>,
+    _metadata: OpaqueRetainedCharge,
 }
 
 fn source_request_pricing<C: Send + Sync + 'static>() -> SourceRequestPricing {
@@ -1172,8 +1173,8 @@ impl<'source, C: Send + Sync + 'static> PreparedSourceCustody<'source, C> {
                 Arc::clone(self.original),
                 data,
                 SourceCustody {
-                    source: source.clone(),
-                    metadata,
+                    _source: source.clone(),
+                    _metadata: metadata,
                 },
             ),
             source.allocator.clone(),
@@ -1219,8 +1220,8 @@ pub fn retain_source_backing<C: Send + Sync + 'static>(
                 original,
                 data,
                 SourceCustody {
-                    source: source.clone(),
-                    metadata,
+                    _source: source.clone(),
+                    _metadata: metadata,
                 },
             ),
             source.allocator.clone(),
@@ -1390,7 +1391,7 @@ mod primitive_validity_custody_tests {
     }
 
     struct TrackedBuffer {
-        backing: Buffer,
+        _backing: Buffer,
         drops: Arc<AtomicUsize>,
     }
     impl Drop for TrackedBuffer {
@@ -1403,7 +1404,10 @@ mod primitive_validity_custody_tests {
         let offset = backing.ptr_offset();
         let len = offset.checked_add(backing.len()).unwrap();
         let view_len = backing.len();
-        let owner = Arc::new(TrackedBuffer { backing, drops });
+        let owner = Arc::new(TrackedBuffer {
+            _backing: backing,
+            drops,
+        });
         // SAFETY: owner owns exactly the supplied immutable Buffer, whose
         // initialized base prefix is len bytes. No allocation layout, spare
         // capacity, provenance or lifetime is inferred from a raw address.

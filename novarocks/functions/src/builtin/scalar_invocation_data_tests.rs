@@ -177,18 +177,15 @@ fn prepare(
 ) -> Result<ScalarDataSlot, KernelFailure> {
     let reservation = reserve(host, bytes);
     let mut work = EvaluationCheckpoints::new(control);
-    let result = ScalarDataSlot::prepare_for_actual_invocation(
+    let value = ScalarDataSlot::prepare_for_actual_invocation(
         contract,
         selection,
         allocator,
         reservation,
         &mut work,
-    );
-    if result.is_err() {
-        return result;
-    }
+    )?;
     work.finish()?;
-    result
+    Ok(value)
 }
 
 #[test]

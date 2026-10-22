@@ -1001,16 +1001,10 @@ fn wide_merge_semantic_comparison_preserves_mid_work_control_failures() {
             &CompileControl(None),
         )
         .unwrap();
-        for (failure, _expected) in [
-            (CompileControlError::Cancelled, KernelFailure::Cancelled),
-            (
-                CompileControlError::DeadlineExceeded,
-                KernelFailure::DeadlineExceeded,
-            ),
-            (
-                CompileControlError::ResourceExhausted,
-                KernelFailure::ResourceExhausted,
-            ),
+        for failure in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
         ] {
             let control = ThresholdCompileControl {
                 failure,

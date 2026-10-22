@@ -20,7 +20,7 @@
 
 use super::aggregate_count::CountKernel;
 use super::aggregate_count_core::{self as core, CountObservation, CountValue};
-use crate::kernel_control::{KernelControlObservation, compile_failure, internal, invalid};
+use crate::kernel_control::{KernelControlObservation, compile_failure, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::{
     AggregateKernelPhase, KernelEvaluationControl, KernelFailure, PreparedAggregateKernel,

@@ -107,13 +107,14 @@ impl Scope {
             .operation_bytes
             .checked_add(bytes)
             .filter(|bytes| *bytes <= 65536);
-        if self.stop == Some(index) || next.is_none() {
-            Err(PrimaryH {
+        match next {
+            Some(bytes) if self.stop != Some(index) => {
+                self.operation_bytes = bytes;
+                Ok(())
+            }
+            _ => Err(PrimaryH {
                 token: self.h.clone(),
-            })
-        } else {
-            self.operation_bytes = next.unwrap();
-            Ok(())
+            }),
         }
     }
 }

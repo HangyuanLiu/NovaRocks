@@ -91,6 +91,10 @@ impl<'a> NumericArrayView<'a> {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn value_f64(&self, row: usize) -> Option<f64> {
         match self {
             NumericArrayView::Int64(arr) => (!arr.is_null(row)).then(|| arr.value(row) as f64),

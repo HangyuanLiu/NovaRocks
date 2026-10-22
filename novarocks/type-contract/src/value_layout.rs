@@ -305,7 +305,7 @@ impl ValueLayout {
         )
         .map_err(|error| match error {
             LayoutProfileFailure::Caller(error) => error,
-            LayoutProfileFailure::Source(_) => {
+            LayoutProfileFailure::Source => {
                 E::from(crate::owned_resources::layout::LayoutResourceError::SourceModel)
             }
         })?;
@@ -359,11 +359,11 @@ impl Hash for ValueLayout {
 
 enum LayoutProfileFailure<E> {
     Caller(E),
-    Source(ExecutionValueTypeError),
+    Source,
 }
 impl<E> From<ExecutionValueTypeError> for LayoutProfileFailure<E> {
-    fn from(error: ExecutionValueTypeError) -> Self {
-        Self::Source(error)
+    fn from(_: ExecutionValueTypeError) -> Self {
+        Self::Source
     }
 }
 

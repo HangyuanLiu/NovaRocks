@@ -66,9 +66,7 @@ impl std::error::Error for MeasureFailure {
 }
 impl novarocks_failure_contract::FailureProjection for MeasureFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::{
-            FailureClass, FailureFact, FailureProjection, FailureReason, domain,
-        };
+        use novarocks_failure_contract::{FailureClass, FailureFact, FailureReason, domain};
         match self {
             Self::Int32 { .. } => crate::DataFailureReason::NumericOutOfRange.failure_fact(),
             _ => FailureFact::new(

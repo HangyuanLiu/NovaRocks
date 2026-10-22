@@ -132,34 +132,11 @@ impl<H> ProgramCreation<'_, H> {
             .map_err(ProgramCreationFailure::Capacity)?;
         Ok(values)
     }
-    pub(crate) fn boxed<C, T>(
-        &mut self,
-        values: Vec<T>,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<Box<[T]>, ProgramCreationFailure<C, H>> {
-        if values.capacity() != values.len() && !values.is_empty() {
-            self.request(
-                Layout::array::<T>(values.len()).map_err(|_| LayoutResourceError::Arithmetic)?,
-                work,
-            )?;
-        }
-        Ok(values.into_boxed_slice())
-    }
     pub(crate) fn before_arc<C, T>(
         &mut self,
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<(), ProgramCreationFailure<C, H>> {
         self.request(arc_layout(Layout::new::<T>())?, work)
-    }
-    pub(crate) fn before_arc_slice<C, T>(
-        &mut self,
-        count: usize,
-        work: &mut CompileCheckpoints<'_>,
-    ) -> Result<(), ProgramCreationFailure<C, H>> {
-        self.request(
-            arc_layout(Layout::array::<T>(count).map_err(|_| LayoutResourceError::Arithmetic)?)?,
-            work,
-        )
     }
     pub(crate) fn arc<C, T>(
         &mut self,

@@ -401,7 +401,7 @@ fn request_nested_named_semantics_are_checked_against_the_real_admitted_pool() {
     let pool = ConstantPool::try_new(
         Arc::new(ty.try_to_field("request.struct").unwrap()),
         ty.clone(),
-        new_null_array(&ty.data_type(), 2).to_data(),
+        new_null_array(ty.data_type(), 2).to_data(),
         policy(),
         PHASE,
         &Control::default(),

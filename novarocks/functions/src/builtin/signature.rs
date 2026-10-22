@@ -312,17 +312,6 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
 /// Record every type variable reachable from `spec` as "seen but undecided",
 /// so a NULL at this position does not leave the variable unbound while still
 /// letting a later position decide it.
-fn bind_nothing_but_open(spec: &TypeSpec, bindings: &mut Bindings) {
-    bind_nothing_with_construction(
-        spec,
-        bindings,
-        &mut ScalarConstruction::<std::convert::Infallible>::new(
-            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-            None,
-        ),
-    )
-    .expect("pure open binding")
-}
 fn bind_nothing_with_construction<E>(
     spec: &TypeSpec,
     bindings: &mut Bindings,
@@ -465,23 +454,6 @@ impl Bindings {
             .map(|(_, ty)| ty.clone())
     }
 
-    pub(crate) fn bind_value(
-        &mut self,
-        name: &'static str,
-        ty: &FunctionValueType,
-        mode: BindMode,
-    ) -> bool {
-        self.bind_value_with_construction(
-            name,
-            ty,
-            mode,
-            &mut ScalarConstruction::<std::convert::Infallible>::new(
-                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-                None,
-            ),
-        )
-        .expect("pure value binding")
-    }
     fn bind_value_with_construction<E>(
         &mut self,
         name: &'static str,
@@ -520,6 +492,7 @@ impl Bindings {
     /// bindings must agree everywhere either of them has decided a type (so
     /// `T` is consistent across all occurrences). Returns `false` on a
     /// conflicting bind.
+    #[cfg(test)]
     pub(crate) fn bind(&mut self, name: &'static str, dt: &DataType) -> bool {
         self.bind_with_construction(
             name,
@@ -556,16 +529,6 @@ impl Bindings {
         self.entries.push((name, value));
         Ok(true)
     }
-    pub(crate) fn bind_null(&mut self, name: &'static str) {
-        self.bind_null_with_construction(
-            name,
-            &mut ScalarConstruction::<std::convert::Infallible>::new(
-                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-                None,
-            ),
-        )
-        .expect("pure NULL binding")
-    }
     fn bind_null_with_construction<E>(
         &mut self,
         name: &'static str,
@@ -578,17 +541,6 @@ impl Bindings {
             self.entries.push((name, value));
         }
         Ok(())
-    }
-    fn replace(&mut self, name: &str, dt: &DataType) -> bool {
-        self.replace_with_construction(
-            name,
-            dt,
-            &mut ScalarConstruction::<std::convert::Infallible>::new(
-                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-                None,
-            ),
-        )
-        .expect("pure replacement binding")
     }
     fn replace_with_construction<E>(
         &mut self,
@@ -610,17 +562,6 @@ impl Bindings {
             }
         }
         Ok(true)
-    }
-    pub(crate) fn bind_widening(&mut self, name: &'static str, dt: &DataType) -> bool {
-        self.bind_widening_with_construction(
-            name,
-            dt,
-            &mut ScalarConstruction::<std::convert::Infallible>::new(
-                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-                None,
-            ),
-        )
-        .expect("pure widening binding")
     }
     fn bind_widening_with_construction<E>(
         &mut self,
@@ -657,17 +598,6 @@ impl Bindings {
 /// type error while `array_concat([], [1])` was not.
 ///
 /// Returns `None` when the two disagree somewhere both of them have decided.
-fn merge_undecided_types(existing: &DataType, incoming: &DataType) -> Option<DataType> {
-    merge_undecided_types_with_construction(
-        existing,
-        incoming,
-        &mut ScalarConstruction::<std::convert::Infallible>::new(
-            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-            None,
-        ),
-    )
-    .expect("pure undecided merge")
-}
 fn merge_undecided_types_with_construction<E>(
     existing: &DataType,
     incoming: &DataType,
@@ -703,20 +633,6 @@ fn merge_undecided_types_with_construction<E>(
         }
         _ => None,
     })
-}
-fn merge_undecided_fields(
-    existing: &arrow_schema::FieldRef,
-    incoming: &arrow_schema::FieldRef,
-) -> Option<arrow_schema::FieldRef> {
-    merge_undecided_fields_with_construction(
-        existing,
-        incoming,
-        &mut ScalarConstruction::<std::convert::Infallible>::new(
-            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-            None,
-        ),
-    )
-    .expect("pure undecided field merge")
 }
 fn merge_undecided_fields_with_construction<E>(
     existing: &arrow_schema::FieldRef,
@@ -884,23 +800,6 @@ pub(super) fn unify_with_construction<E>(
 /// Merge the actual value identities; NULL remains undecided. Carrier widening
 /// is used only after every already-decided logical domain agrees, or the
 /// exact value conversion owner admits the selected common-domain targets. This API
-/// does not provide a preparation allocation or cooperative-work receipt.
-pub(crate) fn merge_value_types(
-    left: &FunctionValueType,
-    right: &FunctionValueType,
-    widening: bool,
-) -> Option<FunctionValueType> {
-    merge_value_types_with_construction(
-        left,
-        right,
-        widening,
-        &mut ScalarConstruction::<std::convert::Infallible>::new(
-            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-            None,
-        ),
-    )
-    .expect("pure value merge")
-}
 pub(super) fn merge_value_types_with_construction<E>(
     left: &FunctionValueType,
     right: &FunctionValueType,
@@ -998,22 +897,6 @@ fn semantic_domains_agree(
     })
 }
 
-fn declared_collection(
-    kind: novarocks_type_contract::ValueKind,
-    layout: DataType,
-    nullable: bool,
-) -> Result<FunctionValueType, novarocks_type_contract::ValueTypeError> {
-    declared_collection_with_construction(
-        kind,
-        layout,
-        nullable,
-        &mut ScalarConstruction::<std::convert::Infallible>::new(
-            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-            None,
-        ),
-    )
-    .map_err(super::scalar_construction::pure_value)
-}
 fn declared_collection_with_construction<E>(
     kind: novarocks_type_contract::ValueKind,
     layout: DataType,
@@ -1058,6 +941,7 @@ pub(super) fn declared_list_with_construction<E>(
     let layout = DataType::List(creation.field("item", item.data_type().clone(), true)?);
     declared_collection_with_construction(kind, layout, nullable, creation)
 }
+#[cfg(test)]
 pub(crate) fn declared_map(
     key: &FunctionValueType,
     value: &FunctionValueType,
@@ -1097,6 +981,7 @@ pub(super) fn declared_map_with_construction<E>(
     let layout = DataType::Map(creation.field("entries", fields, false)?, false);
     declared_collection_with_construction(kind, layout, nullable, creation)
 }
+#[cfg(test)]
 pub(crate) fn declared_struct(
     fields: Vec<(String, FunctionValueType)>,
     nullable: bool,
@@ -1143,24 +1028,6 @@ pub(super) fn declared_struct_with_construction<E>(
 /// Bind one actual argument against the existing declaration vocabulary.
 /// Coercion targets were admitted by the carrier resolver; logical identities
 /// are checked independently and never inferred from those target carriers.
-pub(crate) fn unify_value(
-    spec: &TypeSpec,
-    ty: &FunctionValueType,
-    bindings: &mut Bindings,
-    mode: BindMode,
-) -> bool {
-    unify_value_with_construction(
-        spec,
-        ty,
-        bindings,
-        mode,
-        &mut ScalarConstruction::<std::convert::Infallible>::new(
-            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-            None,
-        ),
-    )
-    .expect("pure value unification")
-}
 pub(super) fn unify_value_with_construction<E>(
     spec: &TypeSpec,
     ty: &FunctionValueType,
@@ -1288,22 +1155,6 @@ pub(super) fn unify_value_with_construction<E>(
         }
         _ => ty.logical_type() == ValueLogicalType::Physical,
     })
-}
-pub(crate) fn realize_value(
-    spec: &TypeSpec,
-    bindings: &Bindings,
-    nullable: bool,
-) -> Result<FunctionValueType, String> {
-    realize_value_with_construction(
-        spec,
-        bindings,
-        nullable,
-        &mut ScalarConstruction::<std::convert::Infallible>::new(
-            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
-            None,
-        ),
-    )
-    .map_err(super::scalar_construction::pure_string)
 }
 pub(super) fn realize_value_with_construction<E>(
     spec: &TypeSpec,

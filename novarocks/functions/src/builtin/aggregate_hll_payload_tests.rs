@@ -19,7 +19,7 @@
 use super::*;
 use crate::opaque_memory::OpaqueAllocationHost;
 use arrow_array::StringArray;
-use arrow_schema::{Field, Fields};
+use arrow_schema::Field;
 use novarocks_type_contract::{
     CallProofScope, CompileControlError, CompilePhase, DecimalOverflowPolicy, EvaluationDemand,
     EvaluationDomainId, ExpressionEffectContext, ExpressionUseId, PureCompileControl,
@@ -720,7 +720,7 @@ fn hll_payload_empty_update_setup_real_host_and_seven_control_first_causes() {
     let baseline = Control::default();
     let result = hll_payload_empty_unsupported_probe(host.clone(), &baseline);
     let expected_trace = baseline.trace.lock().unwrap().clone();
-    assert_hll_payload_contract(&result.as_ref().unwrap_err());
+    assert_hll_payload_contract(result.as_ref().unwrap_err());
     drop(result);
     empty(&host);
     for cause in causes() {

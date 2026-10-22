@@ -1126,8 +1126,8 @@ impl FunctionDefinition {
     /// aggregate overload already states everything a binding needs - its
     /// identity, what it takes, what it returns, and what its state looks like
     /// - so asking a caller to restate it invites the two halves to disagree,
-    /// and leaving it out produces a function that is named everywhere and
-    /// resolvable nowhere.
+    ///   and leaving it out produces a function that is named everywhere and
+    ///   resolvable nowhere.
     pub fn try_new_parametric_aggregate(
         canonical_name: impl AsRef<str>,
         visibility: FunctionVisibility,

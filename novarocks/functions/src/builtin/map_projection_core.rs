@@ -104,7 +104,7 @@ impl novarocks_failure_contract::FailureProjection for MapProjectionFailure {
         use arrow_schema::ArrowError;
         use novarocks_failure_contract::{
             FailureClass, FailureFact, FailureReason, RepresentationBoundary, RepresentationFacts,
-            RepresentationLayout, ResourceDimension, ResourceFacts, ResourceScope, domain,
+            RepresentationLayout, domain,
         };
         if matches!(self, Self::UnsupportedKey(_)) {
             return crate::DataFailureReason::InvalidValue.failure_fact();

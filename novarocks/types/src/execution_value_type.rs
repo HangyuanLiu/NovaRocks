@@ -917,12 +917,12 @@ mod projection_observer_tests {
     use std::sync::Arc;
     #[derive(Debug)]
     enum Refusal {
-        Projection(ExecutionColumnTypeError),
+        Projection { _error: ExecutionColumnTypeError },
         Original(Arc<()>),
     }
     impl From<ExecutionColumnTypeError> for Refusal {
         fn from(error: ExecutionColumnTypeError) -> Self {
-            Self::Projection(error)
+            Self::Projection { _error: error }
         }
     }
     fn source() -> (DataType, SqlType, TypedValueBinding) {

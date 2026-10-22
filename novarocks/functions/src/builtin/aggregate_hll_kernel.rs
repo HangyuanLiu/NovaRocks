@@ -24,7 +24,6 @@ use crate::*;
 use arrow_array::builder::BinaryBuilder;
 use arrow_array::{Array, ArrayRef, BinaryArray, Int64Array};
 use arrow_schema::DataType;
-use std::fmt::Write;
 use std::sync::Arc;
 #[derive(Debug)]
 pub(super) struct NdvKernel {

@@ -42,6 +42,15 @@ pub trait ExactPercentileAllocator: ScalarStateAllocator {
         operation: &str,
     ) -> Result<Self::ParserReservation, crate::KernelFailure>;
 }
+
+/// A decoded exact-percentile state with values owned by its supplied allocator.
+#[expect(
+    type_alias_bounds,
+    reason = "The allocator bound is required to form the decoded allocator-backed values"
+)]
+pub type DecodedExactPercentileState<A: ExactPercentileAllocator> =
+    (Option<f64>, ScalarVec<TrackedAggScalarValue<A>, A>);
+
 fn scalar_bytes<A: ExactPercentileAllocator>(
     allocator: A,
     bytes: &[u8],
@@ -372,14 +381,14 @@ impl<'de, A: ExactPercentileAllocator> DeserializeSeed<'de> for StateSeed<'_, A>
 pub fn decode_state_into<A: ExactPercentileAllocator>(
     payload: &[u8],
     allocator: &A,
-) -> Result<(Option<f64>, ScalarVec<TrackedAggScalarValue<A>, A>), crate::KernelFailure> {
+) -> Result<DecodedExactPercentileState<A>, crate::KernelFailure> {
     decode_state_into_with_sink(payload, allocator, &mut RequiredPercentileFailure)
 }
 pub fn decode_state_into_with_sink<A: ExactPercentileAllocator, S: PercentileFailureSink<A>>(
     payload: &[u8],
     allocator: &A,
     sink: &mut S,
-) -> Result<(Option<f64>, ScalarVec<TrackedAggScalarValue<A>, A>), S::Error> {
+) -> Result<DecodedExactPercentileState<A>, S::Error> {
     if payload.is_empty() {
         return Ok((None, ScalarVec::new_in(allocator.clone())));
     }

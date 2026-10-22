@@ -174,9 +174,6 @@ impl<A: Allocator + Clone> TDigest<A> {
         self.total_weight()
     }
 
-    fn add(&mut self, value: f32, weight: f32) -> Result<(), crate::KernelFailure> {
-        self.add_with_sink(value, weight, &mut RequiredApproxPercentileFailure)
-    }
     fn add_with_sink<S: ApproxPercentileFailureSink>(
         &mut self,
         value: f32,
@@ -197,9 +194,6 @@ impl<A: Allocator + Clone> TDigest<A> {
         self.process_if_necessary_with_sink(sink)
     }
 
-    fn merge(&mut self, other: &TDigest<A>) -> Result<(), crate::KernelFailure> {
-        self.merge_with_sink(other, &mut RequiredApproxPercentileFailure)
-    }
     fn merge_with_sink<S: ApproxPercentileFailureSink>(
         &mut self,
         other: &TDigest<A>,
@@ -248,6 +242,7 @@ impl<A: Allocator + Clone> TDigest<A> {
         self.update_cumulative_with_sink(sink)
     }
 
+    #[cfg(test)]
     fn quantile(&mut self, q: f32) -> Result<Option<f32>, crate::KernelFailure> {
         self.quantile_with_sink(q, &mut RequiredApproxPercentileFailure)
     }
@@ -266,6 +261,7 @@ impl<A: Allocator + Clone> TDigest<A> {
         self.quantile_processed_with_sink(q, sink)
     }
 
+    #[cfg(test)]
     fn serialize_binary(&self) -> Result<Vec<u8>, crate::KernelFailure> {
         self.serialize_binary_observed(&mut |_| Ok::<_, crate::KernelFailure>(()))
     }
@@ -323,6 +319,7 @@ impl<A: Allocator + Clone> TDigest<A> {
         Ok(out)
     }
 
+    #[cfg(test)]
     fn deserialize_binary_in(payload: &[u8], allocator: A) -> Result<Self, crate::KernelFailure> {
         Self::deserialize_binary_with_sink(payload, allocator, &mut RequiredApproxPercentileFailure)
     }
@@ -487,9 +484,6 @@ impl<A: Allocator + Clone> TDigest<A> {
         self.processed.len() > self.max_processed || self.unprocessed.len() > self.max_unprocessed
     }
 
-    fn process_if_necessary(&mut self) -> Result<(), crate::KernelFailure> {
-        self.process_if_necessary_with_sink(&mut RequiredApproxPercentileFailure)
-    }
     fn process_if_necessary_with_sink<S: ApproxPercentileFailureSink>(
         &mut self,
         sink: &mut S,
@@ -498,10 +492,6 @@ impl<A: Allocator + Clone> TDigest<A> {
             self.process_with_sink(sink)?;
         }
         Ok(())
-    }
-
-    fn process(&mut self) -> Result<(), crate::KernelFailure> {
-        self.process_with_sink(&mut RequiredApproxPercentileFailure)
     }
 
     fn process_with_sink<S: ApproxPercentileFailureSink>(
@@ -628,11 +618,6 @@ impl<A: Allocator + Clone> TDigest<A> {
         self.update_cumulative_with_sink(sink)
     }
 
-    fn quantile_processed(&self, q: f32) -> Option<f32> {
-        self.quantile_processed_with_sink(q, &mut RequiredApproxPercentileFailure)
-            .expect("no fallible observation in original quantile search")
-    }
-
     fn quantile_processed_with_sink<S: ApproxPercentileFailureSink>(
         &self,
         q: f32,
@@ -688,6 +673,7 @@ impl<A: Allocator + Clone> TDigest<A> {
         )))
     }
 
+    #[cfg(test)]
     fn update_cumulative(&mut self) -> Result<(), crate::KernelFailure> {
         self.update_cumulative_with_sink(&mut RequiredApproxPercentileFailure)
     }
@@ -961,7 +947,10 @@ pub fn set_quantiles_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureS
             if same {
                 for (l, r) in existing.iter().zip(quantiles) {
                     sink.observe(WorkObservation::Step)?;
-                    if !((*l - *r).abs() <= QUANTILE_TOLERANCE) {
+                    if !matches!(
+                        (*l - *r).abs().partial_cmp(&QUANTILE_TOLERANCE),
+                        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                    ) {
                         same = false;
                         break;
                     }
@@ -1413,9 +1402,6 @@ pub fn validate_state_with_sink<A: Allocator + Clone, S: ApproxPercentileFailure
     Ok(())
 }
 
-fn validate_quantile(quantile: f64) -> Result<(), crate::KernelFailure> {
-    validate_quantile_with_sink(quantile, &mut RequiredApproxPercentileFailure)
-}
 fn validate_quantile_with_sink<S: ApproxPercentileFailureSink>(
     quantile: f64,
     sink: &mut S,
@@ -1432,13 +1418,6 @@ fn validate_quantile_with_sink<S: ApproxPercentileFailureSink>(
     Ok(())
 }
 
-fn merge_sorted_centroids<A: Allocator + Clone>(
-    left: &[Centroid],
-    right: &[Centroid],
-    allocator: A,
-) -> Result<AllocVec<Centroid, A>, crate::KernelFailure> {
-    merge_sorted_centroids_with_sink(left, right, allocator, &mut RequiredApproxPercentileFailure)
-}
 fn merge_sorted_centroids_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
     left: &[Centroid],
     right: &[Centroid],
@@ -1482,17 +1461,6 @@ fn merge_sorted_centroids_with_sink<A: Allocator + Clone, S: ApproxPercentileFai
         merged.push(*value);
     }
     Ok(merged)
-}
-
-fn decode_state_v4(payload: &[u8]) -> Result<PercentileState, crate::KernelFailure> {
-    decode_state_v4_in(payload, Global)
-}
-
-fn decode_state_v4_in<A: Allocator + Clone>(
-    payload: &[u8],
-    allocator: A,
-) -> Result<PercentileState<A>, crate::KernelFailure> {
-    decode_state_v4_with_sink(payload, allocator, &mut RequiredApproxPercentileFailure)
 }
 
 fn decode_state_v4_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSink>(
@@ -1587,18 +1555,6 @@ fn decode_state_v4_with_sink<A: Allocator + Clone, S: ApproxPercentileFailureSin
     Ok(state)
 }
 
-fn try_copy_slice_in<T: Copy, A: Allocator + Clone>(
-    values: &[T],
-    allocator: A,
-    label: &str,
-) -> Result<AllocVec<T, A>, crate::KernelFailure> {
-    try_copy_slice_with_sink(
-        values,
-        allocator,
-        label,
-        &mut RequiredApproxPercentileFailure,
-    )
-}
 fn try_copy_slice_with_sink<T: Copy, A: Allocator + Clone, S: ApproxPercentileFailureSink>(
     values: &[T],
     allocator: A,
@@ -1638,10 +1594,6 @@ impl PercentileDecodeStorage for Global {
     ) -> Result<AllocVec<T, Self>, S::Error> {
         Ok(values.into_iter().collect())
     }
-}
-
-fn decode_state_v3(payload: &[u8]) -> Result<PercentileState, crate::KernelFailure> {
-    decode_state_v3_with_sink(payload, Global, &mut RequiredApproxPercentileFailure)
 }
 
 fn decode_state_v3_with_sink<A: PercentileDecodeStorage, S: ApproxPercentileFailureSink>(
@@ -1703,10 +1655,6 @@ fn decode_state_v3_with_sink<A: PercentileDecodeStorage, S: ApproxPercentileFail
     })
 }
 
-fn read_u32(payload: &[u8], offset: &mut usize, label: &str) -> Result<u32, crate::KernelFailure> {
-    read_u32_with_sink(payload, offset, label, &mut RequiredApproxPercentileFailure)
-}
-
 fn read_u32_with_sink<S: ApproxPercentileFailureSink>(
     payload: &[u8],
     offset: &mut usize,
@@ -1727,10 +1675,6 @@ fn read_u32_with_sink<S: ApproxPercentileFailureSink>(
         .map_err(|_| sink.encoding(DataRecipe::Arguments(format_args!("{label} decode failed"))))?;
     *offset = end;
     Ok(u32::from_le_bytes(bytes))
-}
-
-fn read_u64(payload: &[u8], offset: &mut usize, label: &str) -> Result<u64, crate::KernelFailure> {
-    read_u64_with_sink(payload, offset, label, &mut RequiredApproxPercentileFailure)
 }
 
 fn read_u64_with_sink<S: ApproxPercentileFailureSink>(
@@ -1755,10 +1699,6 @@ fn read_u64_with_sink<S: ApproxPercentileFailureSink>(
     Ok(u64::from_le_bytes(bytes))
 }
 
-fn read_f32(payload: &[u8], offset: &mut usize, label: &str) -> Result<f32, crate::KernelFailure> {
-    read_f32_with_sink(payload, offset, label, &mut RequiredApproxPercentileFailure)
-}
-
 fn read_f32_with_sink<S: ApproxPercentileFailureSink>(
     payload: &[u8],
     offset: &mut usize,
@@ -1767,10 +1707,6 @@ fn read_f32_with_sink<S: ApproxPercentileFailureSink>(
 ) -> Result<f32, S::Error> {
     let bits = read_u32_with_sink(payload, offset, label, sink)?;
     Ok(f32::from_le_bytes(bits.to_le_bytes()))
-}
-
-fn read_f64(payload: &[u8], offset: &mut usize, label: &str) -> Result<f64, crate::KernelFailure> {
-    read_f64_with_sink(payload, offset, label, &mut RequiredApproxPercentileFailure)
 }
 
 fn read_f64_with_sink<S: ApproxPercentileFailureSink>(

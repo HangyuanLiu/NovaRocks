@@ -75,7 +75,7 @@ impl SortByPort for Port<'_, '_, '_, '_> {
     fn step(&mut self) -> Result<(), Self::Failure> {
         ProjectionPort::step(self.0)
     }
-    fn before_operation(&mut self, _: SortByOperation<'_>) -> Result<(), Self::Failure> {
+    fn before_operation(&mut self, _: SortByOperation) -> Result<(), Self::Failure> {
         // Actual opaque Arrow operations retain original semantics. The current
         // stage adds no guessed payload capacity or retired measurement grant.
         ProjectionPort::after_operation(self.0)

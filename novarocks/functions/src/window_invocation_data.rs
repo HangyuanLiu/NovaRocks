@@ -247,44 +247,6 @@ impl WindowDataSlot {
                 .get()
                 .map_or(0, |data| data.reservation.remaining_bytes())
     }
-    pub(crate) fn publish(
-        &self,
-        phase: WindowInvocationPhase,
-        frame_ordinal: Option<usize>,
-        input_row: Option<usize>,
-        message: String,
-        reservation: OpaqueReservation,
-    ) -> WindowInvocationData {
-        self.publish_with_origin(
-            phase,
-            frame_ordinal,
-            input_row,
-            None,
-            None,
-            message,
-            None,
-            reservation,
-        )
-    }
-    pub(crate) fn publish_frame(
-        &self,
-        phase: WindowInvocationPhase,
-        origin: crate::WindowFrameOrigin,
-        input_row: Option<usize>,
-        message: String,
-        reservation: OpaqueReservation,
-    ) -> WindowInvocationData {
-        self.publish_with_origin(
-            phase,
-            Some(origin.output_row),
-            input_row,
-            None,
-            Some(origin),
-            message,
-            None,
-            reservation,
-        )
-    }
     pub(crate) fn publish_at_output(
         &self,
         phase: WindowInvocationPhase,

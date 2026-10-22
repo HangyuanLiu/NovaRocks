@@ -375,7 +375,7 @@ pub struct ScalarEvaluationInstance {
     retained_upper_bound: usize,
     failed: bool,
     // The instance Box is destroyed before its actual opaque charge.
-    inline_charge: Option<crate::opaque_memory::OpaqueRetainedCharge>,
+    _inline_charge: Option<crate::opaque_memory::OpaqueRetainedCharge>,
 }
 impl ScalarEvaluationInstance {
     pub fn instantiate(prepared: Arc<dyn PreparedScalarKernel>) -> Result<Self, KernelFailure> {
@@ -428,7 +428,7 @@ impl ScalarEvaluationInstance {
             retained_upper_bound,
             instance,
             failed: false,
-            inline_charge,
+            _inline_charge: inline_charge,
         })
     }
     pub fn contract(&self) -> &ScalarCallContract {

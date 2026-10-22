@@ -110,11 +110,17 @@ pub fn repeat_original(plan: RepeatPlan<'_>) -> Option<String> {
 }
 pub trait SourceCharacters {
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn iter(&self) -> impl Iterator<Item = char>;
 }
 pub trait CyclicCharacters {
     type Error;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn get(&mut self, index: usize) -> Result<char, Self::Error>;
 }
 impl SourceCharacters for Vec<char> {

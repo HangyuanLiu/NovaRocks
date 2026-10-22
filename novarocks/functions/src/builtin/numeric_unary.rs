@@ -21,16 +21,17 @@ use crate::math_numeric::{
     MathNumericError, MathNumericObservation, NumericArrayView, cast_output_observed,
 };
 use crate::{
-    EvaluatedArgument, FunctionArgumentType, FunctionValueType, KernelDiagnostic,
-    KernelEvaluationControl, KernelFailure, ScalarCallInput, SelectedValues, Selection,
+    EvaluatedArgument, FunctionArgumentType, FunctionValueType, KernelEvaluationControl,
+    KernelFailure, ScalarCallInput, SelectedValues, Selection,
     kernel_control::{internal, invalid},
     kernel_input::EvaluationCheckpoints,
 };
 use arrow_array::{
-    Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, UInt64Array,
+    Array, ArrayRef, Float64Array, UInt64Array,
     types::{Decimal128Type, validate_decimal_precision_and_scale},
 };
+#[cfg(test)]
+use arrow_array::{Decimal128Array, Float32Array, Int8Array, Int16Array, Int32Array, Int64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 use std::sync::Arc;

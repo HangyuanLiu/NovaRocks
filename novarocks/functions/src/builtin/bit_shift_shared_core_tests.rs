@@ -16,7 +16,7 @@
 // under the License.
 //! Actual observer refusal points for the shared loop/materializers.
 use super::*;
-use crate::{KernelDiagnostic, ScalarEvaluationInstance, Selection};
+use crate::{KernelDiagnostic, ScalarEvaluationInstance};
 use std::{sync::Mutex, time::Duration};
 #[derive(Default)]
 struct Trace {

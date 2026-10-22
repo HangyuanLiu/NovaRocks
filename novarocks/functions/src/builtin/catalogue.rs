@@ -2587,7 +2587,7 @@ fn bind_dynamic_scalar_result_with_creation<H>(
                 cx.array::<Arc<arrow_schema::Field>>(request.arguments.len() / 2)
             })?;
             let mut fields = Vec::with_capacity(request.arguments.len() / 2);
-            for pair in request.arguments.chunks_exact(2) {
+            for pair in request.arguments.as_chunks::<2>().0 {
                 work.step()?;
                 let Some(field_name) = utf8_constant(pair.first(), work)? else {
                     return Err(FunctionBindingError::NoMatchingOverload.into());
@@ -2929,7 +2929,9 @@ fn bind_dynamic_scalar_result_with_creation<H>(
                 })?;
                 request
                     .arguments
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| {
                         work.step()?;
                         let name = utf8_constant(pair.first(), work)?
@@ -5826,13 +5828,6 @@ fn nullable_arguments(
     Ok(all)
 }
 
-fn dynamic_values<'a>(
-    request: FunctionBindingRequest<'a>,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<&'a FunctionValueType>, FunctionBindingError> {
-    dynamic_values_with_creation::<std::convert::Infallible>(request, work, None)
-        .map_err(FunctionBindingCreationFailure::into_pure)
-}
 fn dynamic_values_with_creation<'a, H>(
     request: FunctionBindingRequest<'a>,
     work: &mut CompileCheckpoints<'_>,

@@ -24,8 +24,7 @@ use novarocks_physical_plan::{
     Fragment, FragmentPackage, GroupingOutput, NodeKind, PhysicalNode, ValueId, ValueOrigin,
 };
 use novarocks_type_contract::{
-    CompileCheckpoints, CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
-    ValueTypeError,
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl, ValueTypeError,
 };
 use novarocks_types::SlotId;
 use std::{
@@ -98,29 +97,6 @@ struct Shape<'a> {
     keys: BTreeSet<ValueId>,
     sets: Vec<BTreeSet<ValueId>>,
     outputs: &'a [GroupingOutput],
-}
-
-fn exact_type(
-    left: &FunctionValueType,
-    right: &FunctionValueType,
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<(), RepeatLoweringError> {
-    work.flush()?;
-    let same = left.exactly_equals_observed::<RepeatLoweringError>(right, || {
-        // The shared type walk observes prospective borrowed work; a zero
-        // checkpoint does not mislabel it as completed local work.
-        work.control()
-            .checkpoint(CompilePhase::LowerProgram, 0)
-            .map_err(Into::into)
-    })?;
-    work.flush()?;
-    if same {
-        Ok(())
-    } else {
-        Err(RepeatLoweringError::Invalid(
-            "Repeat complete value types differ",
-        ))
-    }
 }
 
 fn shape<'a>(

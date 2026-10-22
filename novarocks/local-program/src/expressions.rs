@@ -30,6 +30,8 @@ use novarocks_type_contract::{
 };
 use novarocks_types::SlotId;
 
+type QueryGlobalDictionaries = Arc<HashMap<SlotId, Arc<HashMap<i32, Vec<u8>>>>>;
+
 /// Matches the native-v1 expanded-expression budget. This bounds the arena
 /// independently of the encoded descriptor's byte budget.
 pub const MAX_STATIC_EXPRESSIONS: usize = novarocks_type_contract::MAX_CONTROL_DEFINITIONS;
@@ -489,7 +491,7 @@ impl StaticExprNode {
 pub struct ImmutableExpressions {
     nodes: Arc<[StaticExprNode]>,
     allow_throw_exception: bool,
-    query_global_dicts: Arc<HashMap<SlotId, Arc<HashMap<i32, Vec<u8>>>>>,
+    query_global_dicts: QueryGlobalDictionaries,
     session_time_zone: Option<Arc<str>>,
 }
 
@@ -710,7 +712,7 @@ impl ImmutableExpressions {
                 observe(ExpressionObservation::OpaqueBoundary)?;
                 let same = novarocks_type_contract::arrow_data_types_exact(
                     &node.data_type,
-                    &value.value_type().data_type(),
+                    value.value_type().data_type(),
                 );
                 observe(ExpressionObservation::OpaqueBoundary)?;
                 if !same {

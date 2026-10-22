@@ -32,7 +32,7 @@ use crate::{
     KernelEvaluationControl, KernelFailure,
 };
 use allocator_api2::vec::Vec as HostVec;
-use arrow_array::{ArrayRef, builder::BinaryBuilder};
+use arrow_array::ArrayRef;
 use std::sync::Arc;
 
 pub(super) trait NEmissionAccess {
@@ -109,7 +109,7 @@ where
                 })?;
             }
             scalar::build_scalar_array_with_largeint_observation(
-                &contract.final_type().data_type(),
+                contract.final_type().data_type(),
                 values,
                 &mut scalar_work,
             )

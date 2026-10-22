@@ -779,43 +779,43 @@ mod tests {
             let indices = arrow_array::UInt32Array::from(vec![0, 0]);
             let mut temporary_bytes = 0usize;
             let mut retained_bytes = 0usize;
-            let mut exact = |layout: Layout| {
-                temporary_bytes += layout.size();
-                Ok::<_, std::convert::Infallible>(())
-            };
             // Separate accumulators reflect the actual paired request channels.
             let mut opaque_bytes = 0usize;
-            let mut opaque = |bytes| {
-                opaque_bytes += bytes;
-                Ok::<_, std::convert::Infallible>(())
-            };
-            let mut retained_exact =
-                |_: Layout| panic!("result custody uses its sole opaque author");
-            let mut retained_opaque = |bytes| {
-                retained_bytes += bytes;
-                Ok::<_, std::convert::Infallible>(())
-            };
-            let mut temporary =
-                ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
-            let mut retained = ValueSchemaCreation::new(
-                ValueTypeStorageLifetime::pure(),
-                &mut retained_exact,
-                &mut retained_opaque,
-            );
             let mut work = |_| Ok::<_, std::convert::Infallible>(());
-            let paired = super::super::preflight_take_structure_construction(
-                array,
-                super::super::CopyIndexView::UInt32(&indices),
-                &mut temporary,
-                &mut retained,
-                &mut work,
-            )
-            .unwrap();
-            drop(temporary);
-            drop(retained);
-            drop(exact);
-            drop(opaque);
-            drop(retained_opaque);
+            let paired = {
+                let mut exact = |layout: Layout| {
+                    temporary_bytes += layout.size();
+                    Ok::<_, std::convert::Infallible>(())
+                };
+                let mut opaque = |bytes| {
+                    opaque_bytes += bytes;
+                    Ok::<_, std::convert::Infallible>(())
+                };
+                let mut retained_exact =
+                    |_: Layout| panic!("result custody uses its sole opaque author");
+                let mut retained_opaque = |bytes| {
+                    retained_bytes += bytes;
+                    Ok::<_, std::convert::Infallible>(())
+                };
+                let mut temporary = ValueSchemaCreation::new(
+                    ValueTypeStorageLifetime::pure(),
+                    &mut exact,
+                    &mut opaque,
+                );
+                let mut retained = ValueSchemaCreation::new(
+                    ValueTypeStorageLifetime::pure(),
+                    &mut retained_exact,
+                    &mut retained_opaque,
+                );
+                super::super::preflight_take_structure_construction(
+                    array,
+                    super::super::CopyIndexView::UInt32(&indices),
+                    &mut temporary,
+                    &mut retained,
+                    &mut work,
+                )
+                .unwrap()
+            };
             let mut original_exact = |_: Layout| Ok::<_, std::convert::Infallible>(());
             let mut original_opaque = |_: usize| Ok::<_, std::convert::Infallible>(());
             let mut original = ValueSchemaCreation::new(
@@ -997,22 +997,23 @@ mod tests {
     #[test]
     fn borrowed_null_arrow_structure_uses_original_dictionary_constructor() {
         let ty = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
-        let mut exact = |_: Layout| panic!("null structure is an opaque library constructor");
         let mut bytes = 0;
-        let mut opaque = |value| {
-            bytes += value;
-            Ok::<_, std::convert::Infallible>(())
+        let facts = {
+            let mut exact = |_: Layout| panic!("null structure is an opaque library constructor");
+            let mut opaque = |value| {
+                bytes += value;
+                Ok::<_, std::convert::Infallible>(())
+            };
+            let mut creation =
+                ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
+            let mut work = |_| Ok::<_, std::convert::Infallible>(());
+            let facts =
+                preflight_null_arrow_structure_observed(&ty, 3, &mut creation, &mut work).unwrap();
+            let actual = arrow_array::new_null_array(&ty, 3);
+            assert_eq!(actual.data_type(), &ty);
+            assert_eq!(actual.null_count(), 3);
+            facts
         };
-        let mut creation =
-            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut exact, &mut opaque);
-        let mut work = |_| Ok::<_, std::convert::Infallible>(());
-        let facts =
-            preflight_null_arrow_structure_observed(&ty, 3, &mut creation, &mut work).unwrap();
-        let actual = arrow_array::new_null_array(&ty, 3);
-        assert_eq!(actual.data_type(), &ty);
-        assert_eq!(actual.null_count(), 3);
-        drop(creation);
-        drop(opaque);
         assert_eq!(bytes, facts.metadata_upper_bytes());
         assert!(facts.retained_new_backing_upper() > 0);
     }

@@ -17,7 +17,6 @@
 
 //! Actual approximate percentile full-data/host consumers; root runs after owner wiring.
 use super::*;
-use crate::aggregate_scalar::AggScalarValue as V;
 use arrow_array::{BinaryArray, Decimal128Array, Float64Array, Int64Array, ListArray};
 use arrow_schema::{Field, Fields};
 use novarocks_type_contract::{

@@ -223,7 +223,6 @@ impl std::error::Error for DsHllStateFailure {
 }
 impl novarocks_failure_contract::FailureProjection for DsHllStateFailure {
     fn failure_fact(&self) -> novarocks_failure_contract::FailureFact {
-        use novarocks_failure_contract::FailureProjection;
         match self {
             Self::Value(source) => source.failure_fact(),
             Self::Kernel(source) => source.failure_fact(),
@@ -304,9 +303,9 @@ pub trait ScalarSketchPort<F: ScalarStateSink> {
 /// Field order destroys original payload and handle before releasing authority.
 pub struct ProducedState<R, P> {
     bytes: Vec<u8>,
-    handle: HllHandle,
-    reservation: R,
-    port: P,
+    _handle: HllHandle,
+    _reservation: R,
+    _port: P,
 }
 impl<R, P> ProducedState<R, P> {
     pub fn payload(&self) -> &[u8] {
@@ -470,9 +469,9 @@ pub fn produce_row<F: ScalarStateSink, P: ScalarSketchPort<F>>(
     let bytes = handle.serialize_under_reservation_with_failure(&preflight, &reservation, sink)?;
     Ok(Some(ProducedState {
         bytes,
-        handle,
-        reservation,
-        port,
+        _handle: handle,
+        _reservation: reservation,
+        _port: port,
     }))
 }
 struct RawSink;

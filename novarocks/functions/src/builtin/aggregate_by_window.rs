@@ -32,7 +32,7 @@ use crate::window_invocation_data::{
 };
 use crate::window_output_scalars::WindowOutputScalars;
 use crate::*;
-use arrow_array::{Array, ArrayRef};
+use arrow_array::Array;
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 use std::{fmt, sync::Arc};
 

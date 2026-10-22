@@ -20,10 +20,10 @@ use crate::{
     FunctionArgument, FunctionSpecializationFailure, FunctionValueType, ScopedExpressionEffects,
     specialize_scalar,
 };
-use arrow_schema::{DataType, Field};
+use arrow_schema::DataType;
 use novarocks_type_contract::{
     DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId, ExpressionEffectContext,
-    ExpressionUseId, SemanticParameters, ValueLogicalType,
+    ExpressionUseId, SemanticParameters,
 };
 fn owner(name: &str) -> ArrayLiteralOwner {
     let (declaration, resolver) = super::super::catalogue::dynamic_definition_parts(name).unwrap();

@@ -165,7 +165,7 @@ fn checked_if_and_coalesce_guards_join_conservatively_without_rebinding_children
     ];
     for (shape, demand, arguments) in cases {
         let flow = checked_flow(shape, demand, &arguments);
-        for ordinal in 0..arguments.len() {
+        for (ordinal, (_, guard)) in arguments.iter().enumerate() {
             let parent = ScopedExpressionEffects::pure_value(owner(&flow));
             let argument = ScopedExpressionEffects::primitive(child(&flow, ordinal), signals());
             let joined = parent
@@ -174,7 +174,7 @@ fn checked_if_and_coalesce_guards_join_conservatively_without_rebinding_children
             assert_eq!(joined.context(), owner(&flow));
             assert_eq!(joined.for_use(owner(&flow)).unwrap(), signals());
             assert_eq!(argument.context(), child(&flow, ordinal));
-            if arguments[ordinal].1.is_some() {
+            if guard.is_some() {
                 assert_eq!(
                     parent.join_same_domain(argument),
                     Err(EffectContractError::ProofScopeMismatch)

@@ -70,8 +70,10 @@ fn legacy_coupon_union_with_typed_sql_string_is_two_and_replay_is_idempotent() {
         let payload = merged.serialize().unwrap();
         assert_eq!(payload[6], 2);
         let mut coupons: Vec<_> = payload[8..16]
-            .chunks_exact(4)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| u32::from_le_bytes(*bytes))
             .collect();
         coupons.sort_unstable();
         assert_eq!(coupons, vec![0x0695_86f8, 0x1cf5_9c3d]);

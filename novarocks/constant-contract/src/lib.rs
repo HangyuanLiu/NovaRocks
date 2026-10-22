@@ -689,7 +689,7 @@ pub struct ConstantPool(Arc<PoolBacking>);
 #[derive(Clone, Debug)]
 pub struct ConstantArrayProjection {
     array: ArrayRef,
-    source: Option<ConstantSourceOwner>,
+    _source: Option<ConstantSourceOwner>,
     storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
 impl ConstantArrayProjection {
@@ -1049,7 +1049,7 @@ impl ConstantPool {
     pub fn array_projection(&self) -> ConstantArrayProjection {
         ConstantArrayProjection {
             array: self.0.array.clone(),
-            source: self.0.source.clone(),
+            _source: self.0.source.clone(),
             storage: self.0.array_storage.clone(),
         }
     }

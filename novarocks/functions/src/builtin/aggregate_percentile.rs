@@ -28,7 +28,7 @@ use allocator_api2::{
     alloc::{AllocError, Allocator},
     vec::Vec as HostVec,
 };
-use arrow_array::{ArrayRef, builder::BinaryBuilder};
+use arrow_array::ArrayRef;
 use arrow_schema::DataType;
 use novarocks_type_contract::CompileCheckpoints;
 use std::{alloc::Layout, ptr::NonNull, sync::Arc};

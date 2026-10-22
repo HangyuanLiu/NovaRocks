@@ -184,11 +184,9 @@ pub(super) fn evaluate<'a>(
         )
     })();
     // Real resource/control/invariant failure is first cause: no optional footer.
-    if result.is_err() {
-        return result;
-    }
+    let value = result?;
     hash_work.finish()?;
     copy_work.finish()?;
     rows.finish()?;
-    result
+    Ok(value)
 }

@@ -38,6 +38,13 @@ pub struct TopKEntry<A: ScalarStateAllocator> {
     pub count: i64,
 }
 
+/// A borrowed value/count pair from the approximate top-k state.
+#[expect(
+    type_alias_bounds,
+    reason = "The allocator bound is required to form the allocator-backed entry types"
+)]
+pub type SortedTopEntry<'a, A: ScalarStateAllocator> = (&'a ScalarVec<u8, A>, &'a TopKEntry<A>);
+
 pub struct TrackedDecodedTopK<A: ScalarStateAllocator> {
     pub k: usize,
     pub counter_num: usize,
@@ -621,7 +628,7 @@ pub fn deserialize_state_tracked_observed<A: ScalarStateAllocator>(
 pub fn sorted_top_entries_observed<'a, A: ScalarStateAllocator>(
     state: &'a ApproxTopKState<A>,
     work: &mut ScalarWork<'_, '_>,
-) -> Result<Vec<(&'a ScalarVec<u8, A>, &'a TopKEntry<A>)>, KernelFailure> {
+) -> Result<Vec<SortedTopEntry<'a, A>>, KernelFailure> {
     work.flush()?;
     let mut entries = state.counts.iter().collect::<Vec<_>>();
     entries.sort_by(|(lk, lv), (rk, rv)| match rv.count.cmp(&lv.count) {
@@ -891,7 +898,7 @@ pub fn deserialize_state_tracked<A: ScalarStateAllocator>(
 }
 pub fn sorted_top_entries<A: ScalarStateAllocator>(
     state: &ApproxTopKState<A>,
-) -> Result<Vec<(&ScalarVec<u8, A>, &TopKEntry<A>)>, KernelFailure> {
+) -> Result<Vec<SortedTopEntry<'_, A>>, KernelFailure> {
     sorted_top_entries_observed(state, &mut ScalarWork::new(None))
 }
 pub fn output_topk_array<'a, A: ScalarStateAllocator>(

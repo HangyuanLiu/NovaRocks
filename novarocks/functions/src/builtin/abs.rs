@@ -25,11 +25,13 @@ use crate::{
     kernel_input::EvaluationCheckpoints,
 };
 #[cfg(test)]
+use arrow_array::ArrayRef;
+#[cfg(test)]
 use arrow_array::FixedSizeBinaryArray;
 #[cfg(test)]
 use arrow_array::builder::FixedSizeBinaryBuilder;
 use arrow_array::types::{Decimal128Type, DecimalType, validate_decimal_precision_and_scale};
-use arrow_array::{Array, ArrayRef, Decimal128Array, UInt64Array};
+use arrow_array::{Array, Decimal128Array, UInt64Array};
 use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 use std::sync::Arc;

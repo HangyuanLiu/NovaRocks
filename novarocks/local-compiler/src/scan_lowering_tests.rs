@@ -39,7 +39,7 @@ use novarocks_physical_plan::*;
 use novarocks_type_contract::{
     ControlShape, DecimalOverflowPolicy, EvaluationDemand, EvaluationDomainId,
     ExpressionControlFlow, ExpressionEffectContext, ExpressionEvaluationDomain,
-    ExpressionInvocation, ExpressionUseId, ValueLogicalType, control_argument_semantics,
+    ExpressionInvocation, ExpressionUseId, control_argument_semantics,
 };
 use std::{
     collections::{BTreeSet, HashMap},
