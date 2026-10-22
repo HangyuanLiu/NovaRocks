@@ -4727,6 +4727,19 @@ name = "novarocks-user-error"
 version = "0.1.0"
 
 [[package]]
+name = "novarocks-value-arrays"
+version = "0.1.0"
+dependencies = [
+ "allocator-api2",
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "novarocks-failure-contract",
+ "novarocks-type-contract",
+]
+
+[[package]]
 name = "novarocks-version"
 version = "0.1.0"
 dependencies = [
