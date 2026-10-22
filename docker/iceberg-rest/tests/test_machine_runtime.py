@@ -721,9 +721,28 @@ class MachineTests(unittest.TestCase):
     def test_attach_holds_maintenance_lock_until_publication_can_commit(self):
         self.start()
         with self.owner.ready_snapshot(self.definition()):
-            other = machine.MachineOwner(self.owner.root, backend=self.backend, timeout=0.001)
-            self.assert_code("MachineMaintaining", lambda: other.sweep(deadline=time.monotonic()))
+            other = machine.MachineOwner(self.owner.root, backend=self.backend,
+                                         daemon=self.owner.daemon_id, timeout=0.001)
+            with mock.patch.object(self.backend, "daemon_id") as daemon, \
+                    mock.patch.object(self.backend, "settle_operations") as settle, \
+                    mock.patch.object(self.backend, "healthy") as healthy:
+                with self.assertRaises(machine.SweepLockTimeout) as caught:
+                    other.sweep(deadline=time.monotonic())
+            self.assertEqual(caught.exception.code, "MachineMaintaining")
+            daemon.assert_not_called()
+            settle.assert_not_called()
+            healthy.assert_not_called()
         self.assertEqual(self.backend.events, ["ensure"])
+
+    def test_sweep_does_not_reclassify_an_in_lock_timeout_as_unstarted(self):
+        self.start()
+        error = machine.MaintenanceLockTimeout()
+        with mock.patch.object(self.backend, "healthy", side_effect=error):
+            with self.assertRaises(machine.MaintenanceLockTimeout) as caught:
+                self.owner.sweep(deadline=time.monotonic()+1)
+        self.assertIs(caught.exception, error)
+        self.assertNotIsInstance(caught.exception, machine.SweepLockTimeout)
+        self.assertNotIn(("sweep", True), self.backend.events)
 
     def test_startup_sweep_pins_version_and_activation_before_cleanup(self):
         state = self.owner.activate(self.definition())

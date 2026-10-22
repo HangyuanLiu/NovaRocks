@@ -96,13 +96,37 @@ def startup_sweep(env_file, *, budget=None):
     budget = original if original is not None else admitted
     budget.check(work=True)
     record = manifest["runtime"]["machine"]
-    from machine_runtime import MachineOwner
+    from machine_runtime import MachineOwner, SweepLockTimeout
     deadline = min(time.monotonic() + 5, budget.deadline - budget.cleanup_grace_seconds)
     owner = MachineOwner(record["control_root"], daemon=record["daemon_id"],
                          timeout=max(0.001, deadline - time.monotonic()))
     try:
         report = owner.sweep(deadline=deadline, expected_version=record["version"],
                              expected_generation=record["generation"])
+    except SweepLockTimeout:
+        # No GC was dispatched. Ordinary readiness is a separate read-only
+        # admission, bounded by its normal timeout and this same run's work end.
+        report = dict(complete=False, enumeration_complete=False, observations_unavailable=True,
+                      removed=[], errors=[dict(operation="startup-sweep-lock", code="ScratchSweepTimeout")])
+        try:
+            budget.check(work=True)
+            admission = MachineOwner(record["control_root"], daemon=record["daemon_id"])
+            admission_deadline = min(time.monotonic() + admission.timeout,
+                                     budget.deadline - budget.cleanup_grace_seconds)
+            with admission.ready_snapshot({"version": record["version"]},
+                                          deadline=admission_deadline,
+                                          expected_generation=record["generation"]):
+                budget.check(work=True)
+            report["admission_complete"] = True
+        except runtime.RuntimeFailure as error:
+            report["errors"].append(dict(operation="startup-admission", code=error.code))
+            error.report = report
+            raise
+        except OSError as cause:
+            error = runtime.RuntimeFailure("ScratchSweepIOFailed", "startup admission I/O failed; its report is retained")
+            report["errors"].append(dict(operation="startup-admission", code=error.code))
+            error.report = report
+            raise error from cause
     except runtime.RuntimeFailure as error:
         report = dict(complete=False, enumeration_complete=False, observations_unavailable=True, removed=[],
                       errors=[dict(operation="startup-sweep", code=error.code)])

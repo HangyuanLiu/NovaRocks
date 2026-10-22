@@ -50,6 +50,20 @@ BLOCKED = {"FixturePrerequisiteMissing", "MachineUnavailable", "MachineVersionMi
            "MachineMaintaining", "RunBudgetRejected"}
 
 
+class MaintenanceLockTimeout(runtime.RuntimeFailure):
+    """The lock deadline elapsed before this caller acquired the machine lock."""
+
+    def __init__(self):
+        super().__init__("MachineMaintaining", "machine maintenance is in progress")
+
+
+class SweepLockTimeout(runtime.RuntimeFailure):
+    """A sweep exhausted its lock wait without dispatching any sweep operation."""
+
+    def __init__(self):
+        super().__init__("MachineMaintaining", "bounded sweep could not acquire the machine lock")
+
+
 def endpoints(snapshot: dict[str, Any]) -> dict[str, str]:
     ports = snapshot["ports"]
     result = {
@@ -758,7 +772,7 @@ class MachineOwner:
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
-                        raise runtime.RuntimeFailure("MachineMaintaining", "machine maintenance is in progress")
+                        raise MaintenanceLockTimeout()
                     time.sleep(min(0.02, max(0, deadline - time.monotonic())))
             previous_fd = getattr(self.backend, "maintenance_fd", None)
             previous_base = getattr(self.backend, "maintenance_base", None)
@@ -1008,8 +1022,10 @@ class MachineOwner:
         deadline = min(deadline, previous_deadline) if previous_deadline is not None else deadline
         self.backend.operation_deadline = deadline
         observation_only = True
+        lock_acquired = False
         try:
             with self.maintenance_lock(deadline):
+                lock_acquired = True
                 self.assert_live_daemon()
                 state = self.read_saved_state()
                 if not state or state["phase"] != "ready":
@@ -1028,6 +1044,10 @@ class MachineOwner:
                 report = self._sweeper(state).sweep(expired_only=True, deadline=deadline)
                 self._save_scratch_observation(state, report)
                 return report
+        except MaintenanceLockTimeout as error:
+            if not lock_acquired:
+                raise SweepLockTimeout() from error
+            raise
         except runtime.RuntimeFailure as error:
             if (observation_only and error.code == "DockerOperationTimeout"
                     and getattr(error, "readonly_deadline_settled", False) is True
