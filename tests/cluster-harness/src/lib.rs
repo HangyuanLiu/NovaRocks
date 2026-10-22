@@ -79,8 +79,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use toml::Value;
 
-type PrelaunchConfigCheck<'a> = &'a dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>;
-type ProcessLogOwnerCheck<'a> = &'a dyn Fn(&str, &ManagedProcessLogSource) -> Result<()>;
+/// Validates the prepared role configuration before a fixture launches processes.
+pub type PrelaunchConfigCheck<'a> = &'a dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>;
+/// Validates a process log source against the identity captured at spawn time.
+pub type ProcessLogOwnerCheck<'a> = &'a dyn Fn(&str, &ManagedProcessLogSource) -> Result<()>;
 
 const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
 const SYSTEM_NATIVE_TRUST_SECRET_ENV: &str = "NOVAROCKS_SYSTEM_NATIVE_TRUST_SECRET";
@@ -3861,17 +3863,13 @@ impl CrossProcessServerHandle {
     }
 
     /// Preserve existing source/config checks for explicitly selected fixture consumers.
-    #[expect(
-        clippy::type_complexity,
-        reason = "Keep the existing public callback signature stable until P10 can update cross-crate callers together."
-    )]
     pub fn launch_with_test_sessions_and_checks(
         options: CrossProcessClusterOptions,
         plan: ClusterTestSessionPlan,
         proxy_config: CrossProcessNativeFaultProxyConfig,
         root_reply_fault: Option<CrossProcessRootReplyFaultConfig>,
-        prelaunch_check: Option<&dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>>,
-        log_owner_check: Option<&dyn Fn(&str, &ManagedProcessLogSource) -> Result<()>>,
+        prelaunch_check: Option<PrelaunchConfigCheck<'_>>,
+        log_owner_check: Option<ProcessLogOwnerCheck<'_>>,
     ) -> Result<Self> {
         Self::launch_with_native_fault_options(
             options,
@@ -3885,17 +3883,13 @@ impl CrossProcessServerHandle {
     }
 
     /// Same role owners and capabilities, bounded by a fixture's original clock.
-    #[expect(
-        clippy::type_complexity,
-        reason = "Keep the existing public callback signature stable until P10 can update cross-crate callers together."
-    )]
     pub fn launch_with_fixture_budget(
         options: CrossProcessClusterOptions,
         test_sessions: Option<ClusterTestSessionPlan>,
         proxy_config: CrossProcessNativeFaultProxyConfig,
         root_reply_fault: Option<CrossProcessRootReplyFaultConfig>,
-        prelaunch_check: Option<&dyn Fn(&EffectiveLaunchConfigEvidence) -> Result<()>>,
-        log_owner_check: Option<&dyn Fn(&str, &ManagedProcessLogSource) -> Result<()>>,
+        prelaunch_check: Option<PrelaunchConfigCheck<'_>>,
+        log_owner_check: Option<ProcessLogOwnerCheck<'_>>,
         budget: fixture_run::RunBudget,
     ) -> Result<Self> {
         Self::launch_with_native_fault_options(

@@ -541,7 +541,7 @@ fn literal_expr(kind: ast::LiteralKind) -> ast::Expr {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
     use super::*;

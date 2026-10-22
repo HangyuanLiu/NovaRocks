@@ -2781,6 +2781,7 @@ async fn complete_manifest_counts(
 /// A snapshot can hold many manifests that are all ready at once, so each
 /// one parsed spends one unit of `budget`: the walk yields its turn instead
 /// of holding the driver.
+#[cfg(test)]
 async fn read_snapshot_file_rows(
     reader: &mut FrozenMetadataReader<'_>,
     metadata: &TableMetadata,
@@ -2816,6 +2817,7 @@ async fn read_snapshot_file_rows(
 }
 
 /// The partition spec a manifest of the verified metadata was written with.
+#[cfg(test)]
 fn manifest_spec(
     metadata: &TableMetadata,
     manifest_file: &TrinoManifestFile,

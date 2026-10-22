@@ -1119,9 +1119,11 @@ mod tests {
                 ))
             }
         }
+        type RecordedTaskUpdate = (usize, usize, bool, u64, i32);
+
         #[derive(Default)]
         struct Transport {
-            requests: Mutex<Vec<(usize, usize, bool, u64, i32)>>,
+            requests: Mutex<Vec<RecordedTaskUpdate>>,
         }
         impl TaskUpdateTransport for Transport {
             fn begin(
@@ -1207,7 +1209,7 @@ mod tests {
         for _ in 0..4 {
             match round.enumerate_once().unwrap() {
                 RoundSplitEnumeration::Ready(request) => {
-                    let result = RoundSplitAssignment::enumerate_source(request);
+                    let result = RoundSplitAssignment::enumerate_source(*request);
                     if let Some((key, batch)) = round.adopt_enumeration(result).unwrap() {
                         round.deliver(key, batch).unwrap();
                         break;

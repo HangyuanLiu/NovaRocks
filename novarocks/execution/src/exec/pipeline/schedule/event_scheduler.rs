@@ -1321,7 +1321,7 @@ mod tests {
     use crate::exec::pipeline::fragment_context::FragmentContext;
     use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
     use crate::exec::pipeline::input::{PreparedInput, RawInput};
-    use crate::exec::pipeline::operator::{FinishWatch, InputEncodingPolicy};
+    use crate::exec::pipeline::operator::{FinishWatch, InputEncodingPolicy, Operator};
     use crate::exec::pipeline::shape::{
         SinkKernel, SinkStep, Source, SourceKernel, Transform, TransformStart,
     };

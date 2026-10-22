@@ -80,7 +80,7 @@ pub const METRIC_PUBLISH_MIN_INTERVAL: Duration = Duration::from_millis(250);
 /// How one proposed status change was answered.
 #[expect(
     clippy::large_enum_variant,
-    reason = "StatusAdvance is a public Worker transition result; boxing TaskStatusError changes consumer ownership and is queued for coordinated P10 review."
+    reason = "This Worker transition result carries the exact typed TaskStatusError; boxing would change the public contract and allocate on rejection."
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatusAdvance {

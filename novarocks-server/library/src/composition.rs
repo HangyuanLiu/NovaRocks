@@ -344,7 +344,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
 /// Frontend, StateStore, or connector wire sections.
 #[expect(
     clippy::too_many_arguments,
-    reason = "This public role-composition entry point names each frozen BE startup owner explicitly; grouping them changes the Server library API and is queued for coordinated P10 review."
+    reason = "This public BE composition boundary validates independently owned startup inputs; an aggregate request would add a second composition schema without a shared invariant."
 )]
 pub fn compose_backend_server_config(
     config: &NovaRocksConfig,
@@ -547,7 +547,7 @@ type MvManagementContinuation = (
 /// Resolve every Frontend startup input from the application wire configuration.
 #[expect(
     clippy::too_many_arguments,
-    reason = "This public role-composition entry point names each frozen FE startup owner explicitly; grouping them changes the Server library API and is queued for coordinated P10 review."
+    reason = "This public FE composition boundary validates independently owned startup inputs; an aggregate request would add a second composition schema without a shared invariant."
 )]
 pub fn compose_frontend_role_config(
     config: &NovaRocksConfig,

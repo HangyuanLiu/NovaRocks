@@ -22,7 +22,7 @@ use std::{num::NonZeroU64, sync::Arc};
 
 #[expect(
     clippy::large_enum_variant,
-    reason = "TaskConclusion is a shared FE/BE contract; boxing the terminal detail changes its public ownership shape and needs the coordinated P10 contract review."
+    reason = "This shared FE/BE result carries typed terminal detail inline; boxing would change the public contract and allocate when a failure is published."
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskConclusion {

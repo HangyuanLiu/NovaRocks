@@ -1155,12 +1155,12 @@ pub struct BoundedExchangePayload {
 }
 
 impl BoundedExchangePayload {
-    #[expect(
-        clippy::len_without_is_empty,
-        reason = "Adding the shared public API is deferred to the P10 cross-crate queue."
-    )]
     pub fn len(&self) -> usize {
         self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
     }
 
     pub const fn retained_bytes(&self) -> usize {
@@ -2790,11 +2790,20 @@ mod tests {
         let expected = encode_chunks(std::slice::from_ref(&chunk), true).expect("encode payload");
         let packet_cap = expected.len() + 1024;
         let encoded = encode_chunks_bounded(&[chunk], true, packet_cap).expect("bounded encode");
+        assert!(!encoded.is_empty());
         let (payload, retained_bytes) = encoded.into_parts();
 
         assert_eq!(payload.as_ref(), expected.as_slice());
         assert!(retained_bytes >= payload.len());
         assert!(retained_bytes <= packet_cap);
+    }
+
+    #[test]
+    fn bounded_encode_reports_empty_payload() {
+        let encoded = encode_chunks_bounded(&[], true, 0).expect("empty bounded encode");
+
+        assert!(encoded.is_empty());
+        assert_eq!(encoded.retained_bytes(), 0);
     }
 
     #[test]

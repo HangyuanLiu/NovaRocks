@@ -131,14 +131,6 @@ fn payload(
     )
 }
 
-fn relation_payload(binding: &ConnectorReadBinding) -> ConnectorReadRelationPayload {
-    ConnectorReadRelationPayload::new(
-        novarocks_connector_contract::ConnectorReadRelationKind::Table,
-        payload(binding, ConnectorCodecCategory::ReadTable, b"table"),
-        payload(binding, ConnectorCodecCategory::ReadView, b"transaction"),
-    )
-}
-
 fn column_payloads(binding: &ConnectorReadBinding) -> Vec<ConnectorEncodedPayload> {
     [b"column-1" as &'static [u8], b"column-2"]
         .into_iter()

@@ -361,7 +361,7 @@ pub struct BackendChannelInstall {
 impl BackendChannelInstall {
     #[expect(
         clippy::too_many_arguments,
-        reason = "Every argument is a separately frozen runtime-filter install fact; introducing an aggregate input changes this public Worker contract and is queued for coordinated P10 review."
+        reason = "Construction validates each frozen runtime-filter install fact and its cross-field relationships; a second public input schema adds no distinct invariant."
     )]
     pub fn new(
         channel_id: RuntimeFilterChannelId,

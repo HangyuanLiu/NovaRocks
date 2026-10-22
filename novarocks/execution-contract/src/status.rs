@@ -396,7 +396,7 @@ impl fmt::Display for AbortCause {
 /// The cause a non-finished terminal or terminating state must carry.
 #[expect(
     clippy::large_enum_variant,
-    reason = "TerminationDetail is a shared FE/BE contract; boxing TaskFailure changes its public Rust shape and needs the coordinated P10 contract review."
+    reason = "This shared FE/BE status contract carries typed TaskFailure inline; boxing would change status ownership and allocate during failure publication."
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TerminationDetail {
@@ -649,7 +649,7 @@ impl TaskWriterFacts {
 /// Why a status snapshot is not a legal value.
 #[expect(
     clippy::large_enum_variant,
-    reason = "TaskStatusError is a shared FE/BE contract; boxing the mismatch detail changes its public Rust shape and needs the coordinated P10 contract review."
+    reason = "This shared FE/BE validator returns the typed mismatch directly; boxing would change the error contract and allocate on rejection."
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskStatusError {

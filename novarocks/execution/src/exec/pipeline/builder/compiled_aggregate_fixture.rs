@@ -1008,7 +1008,7 @@ pub(crate) fn try_run_with_tracker(
     )
 }
 /// Run the original compiled pipeline with this instance's exact scan operations.
-pub(super) fn try_run_with_scans(
+pub(crate) fn try_run_with_scans(
     program: &Arc<LocalProgram>,
     sink: Box<dyn OperatorFactory>,
     bindings: ExchangeBindings,

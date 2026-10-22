@@ -92,6 +92,7 @@ fn environment(work: &mut CompileCheckpoints<'_>) -> Result<(), TypeCodecError> 
     }
 }
 impl Requests {
+    #[cfg(test)]
     fn exact<T>(
         &mut self,
         capacity: usize,

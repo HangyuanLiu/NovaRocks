@@ -50,7 +50,7 @@ use novarocks_execution_contract::task_execution::task_convergence::{
 /// The facts share one source revision, independent of their protocol versions.
 #[expect(
     clippy::large_enum_variant,
-    reason = "CoveredObservationFact is the public Worker-to-adapter observation contract; boxing TaskStatus changes consumer ownership and is queued for coordinated P10 review."
+    reason = "This Worker-to-adapter fact carries the immutable TaskStatus snapshot by value; boxing would change the consumer contract and allocate per status event."
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoveredObservationFact {
@@ -392,7 +392,7 @@ impl CoveredSubscription {
 /// One immutable observation frame.
 #[expect(
     clippy::large_enum_variant,
-    reason = "TaskStatusEvent is the public Worker-to-adapter observation contract; boxing TaskStatus changes consumer ownership and is queued for coordinated P10 review."
+    reason = "This Worker-to-adapter event carries the immutable TaskStatus snapshot by value; boxing would change the consumer contract and allocate per status event."
 )]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskStatusEvent {

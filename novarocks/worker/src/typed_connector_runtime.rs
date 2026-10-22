@@ -207,7 +207,7 @@ pub struct TypedConnectorScanSource {
 impl TypedConnectorScanSource {
     #[expect(
         clippy::too_many_arguments,
-        reason = "The public BE scan constructor takes each frozen provider, task queue, output layout, filter and stream capability separately; regrouping them changes the cross-crate Worker API and is queued for P10 review."
+        reason = "The public BE scan constructors keep frozen provider, queue, output, filter, and stream capabilities explicit; a new carrier would duplicate the cross-crate input schema."
     )]
     pub fn new(
         descriptor: TypedConnectorReadDescriptor,
@@ -286,7 +286,7 @@ impl TypedConnectorScanSource {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "The public BE scan constructor takes each frozen provider, task queue, output layout, filter and stream capability separately; regrouping them changes the cross-crate Worker API and is queued for P10 review."
+        reason = "The public BE scan constructors keep frozen provider, queue, output, filter, and stream capabilities explicit; a new carrier would duplicate the cross-crate input schema."
     )]
     pub fn new_deferred(
         descriptor: TypedConnectorReadDescriptor,
