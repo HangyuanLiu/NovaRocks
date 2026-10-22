@@ -463,7 +463,6 @@ mod tests {
             IcebergSystemTableType::History,
             IcebergSystemTableType::Refs,
             IcebergSystemTableType::Manifests,
-            IcebergSystemTableType::Partitions,
         ] {
             let relation = system(kind);
             let facts =

@@ -559,6 +559,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             4 => repeated(MapI32String),
             8 => singular(Varint),
             9 => singular(Message(SystemTable)),
+            10 => repeated(PackedVarint),
             _ => return None,
         },
         RelationSplit => match field {
@@ -1968,7 +1969,6 @@ fn encode_system_table(value: &IcebergSystemTableReference) -> dto::IcebergSyste
             IcebergSystemTableType::History => dto::IcebergSystemTableType::History,
             IcebergSystemTableType::Refs => dto::IcebergSystemTableType::Refs,
             IcebergSystemTableType::Manifests => dto::IcebergSystemTableType::Manifests,
-            IcebergSystemTableType::Partitions => dto::IcebergSystemTableType::Partitions,
         } as i32,
         metadata_file_location: value.metadata_file_location().to_string(),
         table_uuid: value.table_uuid().to_string(),
@@ -1990,7 +1990,6 @@ fn decode_system_table(
             Ok(dto::IcebergSystemTableType::History) => IcebergSystemTableType::History,
             Ok(dto::IcebergSystemTableType::Refs) => IcebergSystemTableType::Refs,
             Ok(dto::IcebergSystemTableType::Manifests) => IcebergSystemTableType::Manifests,
-            Ok(dto::IcebergSystemTableType::Partitions) => IcebergSystemTableType::Partitions,
             Ok(dto::IcebergSystemTableType::Unspecified) | Err(_) => {
                 return Err(codec_error(
                     "system_table.system_table_type",
@@ -2869,6 +2868,7 @@ fn encode_files_split(value: &SystemManifestSplit) -> dto::SystemManifestSplit {
         partition_column_type_json: value.partition_column_type_json().map(str::to_string),
         bounds_column_type_json: value.bounds_column_type_json().map(str::to_string),
         encryption_key_id: value.encryption_key_id().map(str::to_string),
+        partition_slot_field_ids: value.partition_slot_field_ids().to_vec(),
     }
 }
 
@@ -2905,6 +2905,7 @@ fn decode_files_split(
                 table_schema_json: copy_string(&raw.table_schema_json, context)?,
                 metadata_table_schema_json: copy_string(&raw.metadata_table_schema_json, context)?,
                 partition_spec_jsons: copy_i32_string_map(&raw.partition_spec_jsons, context)?,
+                partition_slot_field_ids: copy_slice(&raw.partition_slot_field_ids, context)?,
                 partition_column_type_json: raw
                     .partition_column_type_json
                     .as_deref()
@@ -3423,7 +3424,12 @@ mod tests {
             ))])
             .build()
             .unwrap();
-        let spec = crate::iceberg::spec::PartitionSpec::unpartition_spec();
+        let spec: crate::iceberg::spec::PartitionSpec = serde_json::from_value(serde_json::json!({
+            "spec-id":0,"fields":[{"field-id":1000,"source-id":1,"name":"p","transform":"identity"}]
+        }))
+        .unwrap();
+        let partition =
+            crate::partition_row::UnifiedPartitionRow::of(&table_schema, &[spec.clone()]).unwrap();
         let manifest = TrinoManifestFile::try_new(TrinoManifestFileParams {
             path: "s3://warehouse/db/t/metadata/m0.avro".into(),
             length: 1024,
@@ -3458,7 +3464,11 @@ mod tests {
                     metadata_table_schema_json: "{}".into(),
                     partition_spec_jsons: [(spec.spec_id(), serde_json::to_string(&spec).unwrap())]
                         .into(),
-                    partition_column_type_json: None,
+                    partition_column_type_json: Some(
+                        crate::typed_read::derived_row_type_json(&partition.arrow_type().unwrap())
+                            .unwrap(),
+                    ),
+                    partition_slot_field_ids: partition.field_ids(),
                     bounds_column_type_json: None,
                     encryption_key_id: None,
                 })
@@ -3497,6 +3507,11 @@ mod tests {
                     assert_eq!(before.reference(), after.reference());
                     assert_eq!(before.manifest(), after.manifest());
                     assert!(after.table_has_variant_history());
+                    assert_eq!(before.partition_slot_field_ids(), &[1000]);
+                    assert_eq!(
+                        before.partition_slot_field_ids(),
+                        after.partition_slot_field_ids()
+                    );
                 }
                 _ => panic!("metadata work unit kind changed"),
             }

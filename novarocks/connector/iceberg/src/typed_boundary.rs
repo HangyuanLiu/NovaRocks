@@ -130,8 +130,7 @@ const READER_VISIBLE_TABLE_PROPERTIES: [&str; 4] = [
 
 /// One Iceberg system relation reachable as `<table>$<suffix>`.
 ///
-/// The set is closed by the wire contract plus `Partitions`, which is not a
-/// worker-visible reference of its own.
+/// Every relation is assigned through the runtime provider split source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IcebergSystemRelation {
     Files,
@@ -140,13 +139,6 @@ pub enum IcebergSystemRelation {
     History,
     Refs,
     Manifests,
-    /// The aggregation over the very rows `$files` produces for the same
-    /// pinned snapshot. It has its own reference kind rather than borrowing
-    /// FILES: a FILES reference reaching a backend reads as the un-aggregated
-    /// relation, one row per data file instead of one row per partition. Both
-    /// are minted by one resolution, so they cannot describe different
-    /// snapshots.
-    Partitions,
 }
 
 impl IcebergSystemRelation {
@@ -181,10 +173,6 @@ impl IcebergSystemRelation {
             ),
             Self::Manifests => (
                 crate::typed_read::IcebergSystemTableType::Manifests,
-                SystemTableUnitHint::SingleUnit,
-            ),
-            Self::Partitions => (
-                crate::typed_read::IcebergSystemTableType::Partitions,
                 SystemTableUnitHint::SingleUnit,
             ),
         }
@@ -1891,7 +1879,6 @@ impl IcebergTypedBoundary {
                 | crate::typed_read::IcebergSystemTableType::History
                 | crate::typed_read::IcebergSystemTableType::Refs
                 | crate::typed_read::IcebergSystemTableType::Manifests
-                | crate::typed_read::IcebergSystemTableType::Partitions
         ) {
             return Ok(Box::new(RuntimeSystemRelationSource {
                 split: Some(SystemRelationSplit::try_new(reference.clone())?),
@@ -1930,6 +1917,11 @@ impl IcebergTypedBoundary {
                 .as_ref()
                 .map(derived_row_type_json)
                 .transpose()?,
+            partition_slot_field_ids: crate::partition_row::UnifiedPartitionRow::of(
+                &table_schema,
+                &specs,
+            )?
+            .field_ids(),
             bounds_column_type_json: bounds_row_type(&table_schema)?
                 .as_ref()
                 .map(derived_row_type_json)
@@ -2724,7 +2716,6 @@ fn system_relation_of(table_name: &str) -> Option<(String, IcebergSystemRelation
         "HISTORY" => IcebergSystemRelation::History,
         "REFS" => IcebergSystemRelation::Refs,
         "MANIFESTS" => IcebergSystemRelation::Manifests,
-        "PARTITIONS" => IcebergSystemRelation::Partitions,
         _ => return None,
     };
     Some((base_table.to_string(), relation))
@@ -4632,13 +4623,7 @@ mod system_work_unit_tests {
     fn singleton_source_emits_exactly_one_frozen_unit_then_eos() {
         use crate::typed_read::IcebergSystemTableType as Kind;
         let filter = DynamicFilterSnapshot::all_complete();
-        for kind in [
-            Kind::Snapshots,
-            Kind::History,
-            Kind::Refs,
-            Kind::Manifests,
-            Kind::Partitions,
-        ] {
+        for kind in [Kind::Snapshots, Kind::History, Kind::Refs, Kind::Manifests] {
             let reference = reference(kind);
             let mut source = RuntimeSystemRelationSource {
                 split: Some(SystemRelationSplit::try_new(reference.clone()).unwrap()),

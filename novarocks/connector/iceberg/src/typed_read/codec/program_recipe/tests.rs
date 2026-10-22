@@ -554,7 +554,6 @@ fn complete_system_read_uses_actual_metadata_schema_kind_evidence_and_execution_
         IcebergSystemTableType::History,
         IcebergSystemTableType::Refs,
         IcebergSystemTableType::Manifests,
-        IcebergSystemTableType::Partitions,
     ] {
         let fixture = system_fixture(kind);
         assert_eq!(fixture.fields.len(), fixture.columns.len());
@@ -1199,7 +1198,6 @@ fn every_final_relation_kind_publishes_a_schema_its_pure_compiler_accepts() {
         IcebergSystemTableType::History,
         IcebergSystemTableType::Refs,
         IcebergSystemTableType::Manifests,
-        IcebergSystemTableType::Partitions,
     ] {
         let mut fixture = system_fixture(kind);
         // Reordered output with a repeat keeps each column's own field.

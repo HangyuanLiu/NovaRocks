@@ -235,7 +235,8 @@ enum IcebergSystemTableType {
   ICEBERG_SYSTEM_TABLE_TYPE_HISTORY = 4;
   ICEBERG_SYSTEM_TABLE_TYPE_REFS = 5;
   ICEBERG_SYSTEM_TABLE_TYPE_MANIFESTS = 6;
-  ICEBERG_SYSTEM_TABLE_TYPE_PARTITIONS = 7;
+  reserved 7;
+  reserved "ICEBERG_SYSTEM_TABLE_TYPE_PARTITIONS";
 }
 
 message IcebergSystemTableReference {
@@ -429,6 +430,7 @@ message TrinoManifestFile {
 }
 
 message SystemManifestSplit {
+  repeated int32 partition_slot_field_ids = 10;
   IcebergSystemTableReference reference = 9;
   bool table_has_variant_history = 8;
   TrinoManifestFile manifest = 1;

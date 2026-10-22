@@ -70,12 +70,6 @@ pub enum IcebergSystemTableType {
     History,
     Refs,
     Manifests,
-    /// The aggregation over the rows `Files` produces for the same pinned
-    /// snapshot. It is a relation of its own rather than a `Files` reference a
-    /// worker is told to aggregate: a `Files` reference reaching a backend
-    /// reads as the un-aggregated relation, one row per data file instead of
-    /// one row per partition.
-    Partitions,
 }
 
 impl IcebergSystemTableType {
@@ -88,7 +82,6 @@ impl IcebergSystemTableType {
             Self::History => "$history",
             Self::Refs => "$refs",
             Self::Manifests => "$manifests",
-            Self::Partitions => "$partitions",
         }
     }
 
@@ -131,7 +124,7 @@ impl IcebergSystemTableType {
     pub const fn unit_hint(self) -> SystemTableUnitHint {
         match self {
             Self::Files | Self::Entries => SystemTableUnitHint::ManyUnits,
-            Self::Snapshots | Self::History | Self::Refs | Self::Manifests | Self::Partitions => {
+            Self::Snapshots | Self::History | Self::Refs | Self::Manifests => {
                 SystemTableUnitHint::SingleUnit
             }
         }
@@ -145,7 +138,6 @@ impl IcebergSystemTableType {
             Self::History => dto::IcebergSystemTableType::History,
             Self::Refs => dto::IcebergSystemTableType::Refs,
             Self::Manifests => dto::IcebergSystemTableType::Manifests,
-            Self::Partitions => dto::IcebergSystemTableType::Partitions,
         }
     }
 
@@ -162,7 +154,6 @@ impl IcebergSystemTableType {
             dto::IcebergSystemTableType::History => Ok(Self::History),
             dto::IcebergSystemTableType::Refs => Ok(Self::Refs),
             dto::IcebergSystemTableType::Manifests => Ok(Self::Manifests),
-            dto::IcebergSystemTableType::Partitions => Ok(Self::Partitions),
         }
     }
 }
@@ -217,17 +208,6 @@ impl IcebergSystemTableReference {
         // a scheduled task to learn a fact the frontend already had.
         let table_uuid = uuid::Uuid::parse_str(&table_uuid)
             .map_err(|error| invalid(format!("iceberg table uuid is invalid: {error}")))?;
-        if snapshot_id.is_none() && matches!(system_table_type, IcebergSystemTableType::Partitions)
-        {
-            // The temporary provider-owned partitions relation aggregates a
-            // selected snapshot. Files and entries instead enumerate zero
-            // work units when no snapshot exists.
-            return Err(invalid(format!(
-                "iceberg {} requires a selected snapshot id",
-                system_table_type.suffix()
-            )));
-        }
-
         Ok(Self {
             schema_table_name,
             system_table_type,
@@ -624,6 +604,7 @@ pub struct SystemManifestSplitParams {
     /// The schema-derived partition ROW type, absent for an unpartitioned
     /// table.
     pub partition_column_type_json: Option<String>,
+    pub partition_slot_field_ids: Vec<i32>,
     /// The schema-derived lower/upper bounds ROW type, absent when the frozen
     /// projection needs no bounds.
     pub bounds_column_type_json: Option<String>,
@@ -647,6 +628,7 @@ pub struct SystemManifestSplit {
     metadata_table_schema_json: Arc<str>,
     partition_spec_jsons: Arc<BTreeMap<i32, String>>,
     partition_column_type_json: Option<Arc<str>>,
+    partition_slot_field_ids: Arc<[i32]>,
     bounds_column_type_json: Option<Arc<str>>,
     retained_size_in_bytes: u64,
 }
@@ -661,6 +643,7 @@ impl SystemManifestSplit {
             metadata_table_schema_json,
             partition_spec_jsons,
             partition_column_type_json,
+            partition_slot_field_ids,
             bounds_column_type_json,
             encryption_key_id,
         } = params;
@@ -701,6 +684,7 @@ impl SystemManifestSplit {
             partition_spec_jsons: Arc::new(partition_spec_jsons),
             partition_column_type_json: partition_column_type_json
                 .map(|json| Arc::from(json.as_str())),
+            partition_slot_field_ids: Arc::from(partition_slot_field_ids),
             bounds_column_type_json: bounds_column_type_json.map(|json| Arc::from(json.as_str())),
             retained_size_in_bytes: 0,
         };
@@ -732,6 +716,7 @@ impl SystemManifestSplit {
             metadata_table_schema_json: Arc::clone(&self.metadata_table_schema_json),
             partition_spec_jsons: Arc::clone(&self.partition_spec_jsons),
             partition_column_type_json: self.partition_column_type_json.clone(),
+            partition_slot_field_ids: Arc::clone(&self.partition_slot_field_ids),
             bounds_column_type_json: self.bounds_column_type_json.clone(),
             retained_size_in_bytes: 0,
         };
@@ -767,6 +752,10 @@ impl SystemManifestSplit {
         self.partition_column_type_json.as_deref()
     }
 
+    pub fn partition_slot_field_ids(&self) -> &[i32] {
+        &self.partition_slot_field_ids
+    }
+
     pub fn bounds_column_type_json(&self) -> Option<&str> {
         self.bounds_column_type_json.as_deref()
     }
@@ -791,6 +780,7 @@ impl SystemManifestSplit {
             + self.reference.schema_table_name().schema_name().len()
             + self.reference.schema_table_name().table_name().len()
             + self.manifest.retained_size_in_bytes()
+            + std::mem::size_of_val(self.partition_slot_field_ids.as_ref())
             + self.table_schema_json.len()
             + self.metadata_table_schema_json.len()
             + self
@@ -824,6 +814,7 @@ impl SystemManifestSplit {
                 .as_ref()
                 .map(|json| json.to_string()),
             encryption_key_id: None,
+            partition_slot_field_ids: self.partition_slot_field_ids.to_vec(),
         }
     }
 
@@ -844,6 +835,7 @@ impl SystemManifestSplit {
             metadata_table_schema_json: raw.metadata_table_schema_json.clone(),
             partition_spec_jsons: raw.partition_spec_jsons.clone(),
             partition_column_type_json: raw.partition_column_type_json.clone(),
+            partition_slot_field_ids: raw.partition_slot_field_ids.clone(),
             bounds_column_type_json: raw.bounds_column_type_json.clone(),
             encryption_key_id: raw.encryption_key_id.clone(),
         })
@@ -930,6 +922,7 @@ pub struct SystemManifestSplitSourceParams {
     pub metadata_table_schema_json: String,
     pub partition_spec_jsons: BTreeMap<i32, String>,
     pub partition_column_type_json: Option<String>,
+    pub partition_slot_field_ids: Vec<i32>,
     pub bounds_column_type_json: Option<String>,
     pub encryption_key_id: Option<String>,
 }
@@ -957,6 +950,7 @@ impl SystemManifestSplitSource {
             metadata_table_schema_json,
             partition_spec_jsons,
             partition_column_type_json,
+            partition_slot_field_ids,
             bounds_column_type_json,
             encryption_key_id,
         } = params;
@@ -991,6 +985,7 @@ impl SystemManifestSplitSource {
                 metadata_table_schema_json,
                 partition_spec_jsons,
                 partition_column_type_json,
+                partition_slot_field_ids,
                 bounds_column_type_json,
                 encryption_key_id,
             })?),
@@ -1200,6 +1195,7 @@ mod tests {
             metadata_table_schema_json: r#"{"columns":["content","file_path"]}"#.to_string(),
             partition_spec_jsons,
             partition_column_type_json: Some(r#"{"type":"struct"}"#.to_string()),
+            partition_slot_field_ids: spec.fields().iter().map(|field| field.field_id).collect(),
             bounds_column_type_json: None,
             encryption_key_id: None,
         }
@@ -1228,7 +1224,6 @@ mod tests {
             (4, IcebergSystemTableType::History),
             (5, IcebergSystemTableType::Refs),
             (6, IcebergSystemTableType::Manifests),
-            (7, IcebergSystemTableType::Partitions),
         ] {
             assert_eq!(
                 IcebergSystemTableType::from_proto(raw).expect("known type"),
@@ -1237,6 +1232,7 @@ mod tests {
             assert_eq!(expected.to_proto() as i32, raw);
         }
         assert!(IcebergSystemTableType::from_proto(0).is_err());
+        assert!(IcebergSystemTableType::from_proto(7).is_err());
         assert!(IcebergSystemTableType::from_proto(8).is_err());
         assert!(IcebergSystemTableType::from_proto(-1).is_err());
     }
@@ -1287,7 +1283,6 @@ mod tests {
             IcebergSystemTableType::History,
             IcebergSystemTableType::Refs,
             IcebergSystemTableType::Manifests,
-            IcebergSystemTableType::Partitions,
         ] {
             assert_eq!(kind.unit_hint(), SystemTableUnitHint::SingleUnit);
             let split = SystemRelationSplit::try_new(reference(kind)).unwrap();
@@ -1436,8 +1431,6 @@ mod tests {
         assert!(IcebergSystemTableReference::try_new(params.clone()).is_ok());
         params.system_table_type = IcebergSystemTableType::Entries;
         assert!(IcebergSystemTableReference::try_new(params.clone()).is_ok());
-        params.system_table_type = IcebergSystemTableType::Partitions;
-        assert!(IcebergSystemTableReference::try_new(params.clone()).is_err());
         params.system_table_type = IcebergSystemTableType::Refs;
         assert!(IcebergSystemTableReference::try_new(params).is_ok());
     }

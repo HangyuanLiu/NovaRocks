@@ -839,7 +839,9 @@ fn metadata_kind(kind: MetadataTableKind) -> Result<ConnectorReadMetadataKind, S
         MetadataTableKind::Refs => "$refs",
         MetadataTableKind::Files => "$files",
         MetadataTableKind::Manifests => "$manifests",
-        MetadataTableKind::Partitions => "$partitions",
+        MetadataTableKind::Partitions => {
+            return Err("invariant: $partitions is a SQL view over $files".into());
+        }
         MetadataTableKind::Entries => "$entries",
     };
     ConnectorReadMetadataKind::try_new(suffix)
@@ -1215,6 +1217,19 @@ mod tests {
             .expect("allocator")
             .allocate()
             .expect("binding")
+    }
+
+    #[test]
+    fn partitions_cannot_be_frozen_as_a_provider_metadata_relation() {
+        assert!(
+            metadata_kind(MetadataTableKind::Partitions)
+                .unwrap_err()
+                .contains("invariant: $partitions is a SQL view over $files")
+        );
+        assert_eq!(
+            metadata_kind(MetadataTableKind::Files).unwrap().as_str(),
+            "$files"
+        );
     }
 
     #[test]

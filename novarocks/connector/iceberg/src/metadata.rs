@@ -23,7 +23,7 @@
 
 pub(crate) mod existing_serde_projection;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -53,9 +53,8 @@ use novarocks_spi::connector::{
 use serde::{Deserialize, Serialize};
 
 use crate::file_reader::execution_payload::{
-    ICEBERG_SPLIT_V5, IcebergFrozenScanUnitPayload, IcebergMetadataSplitPayloadV1,
-    IcebergScanFactColumnV1, SplitPayload, canonical_split_name_mapping,
-    materialize_local_scan_units, scan_fact_scalar_type,
+    ICEBERG_SPLIT_V5, IcebergFrozenScanUnitPayload, IcebergScanFactColumnV1, SplitPayload,
+    canonical_split_name_mapping, materialize_local_scan_units, scan_fact_scalar_type,
 };
 use crate::manifest::{
     data_file_with_stats_to_iceberg_data_file_info, extract_data_files_with_stats_at_with_control,
@@ -292,7 +291,6 @@ impl IcebergMetadata {
                 serialized_metadata: Some(serde_json::to_string(&metadata).map_err(|error| {
                     corrupt(format!("serialize staged Iceberg table metadata: {error}"))
                 })?),
-                serialized_metadata_rows: None,
             }),
             metadata_columns: metadata_column_names(&metadata),
             metadata_table_type: None,
@@ -672,7 +670,7 @@ impl ConnectorMetadata for IcebergMetadata {
         )
         .map_err(corrupt)?;
         let metadata_columns = metadata_column_names(metadata);
-        let mut table_info =
+        let table_info =
             IcebergTableInfo {
                 catalog: self.descriptor.instance_id.as_str().to_string(),
                 namespace: request.table.namespace.to_string(),
@@ -685,64 +683,7 @@ impl ConnectorMetadata for IcebergMetadata {
                 serialized_metadata: Some(serde_json::to_string(metadata).map_err(|error| {
                     corrupt(format!("serialize Iceberg table metadata: {error}"))
                 })?),
-                serialized_metadata_rows: None,
             };
-        let mut prepared_files = Vec::new();
-        if matches!(metadata_table_type, Some(MetadataTableType::Partitions))
-            && let Some(snapshot_id) = metadata.current_snapshot_id()
-        {
-            let table = loaded.table.clone();
-            let control = request.context.clone();
-            let result = self
-                .runtime
-                .resources()
-                .catalog_runtime()
-                .block_on(async move {
-                    extract_data_files_with_stats_at_with_control(
-                        &table,
-                        snapshot_id,
-                        Some(&control as &dyn ConnectorOperationControl),
-                    )
-                    .await
-                });
-            self.validate_context(&request.context)?;
-            prepared_files = result
-                .map_err(unavailable)?
-                .map_err(unavailable)?
-                .into_iter()
-                .map(data_file_with_stats_to_iceberg_data_file_info)
-                .collect();
-        }
-        if matches!(
-            metadata_table_type,
-            Some(
-                MetadataTableType::Files
-                    | MetadataTableType::Manifests
-                    | MetadataTableType::LogicalIcebergMetadata
-            )
-        ) {
-            let table = loaded.table.clone();
-            let file_io = table.file_io().clone();
-            let metadata_read_type =
-                metadata_read_type(metadata_table_type.expect("metadata table type is present"))?;
-            let control = request.context.clone();
-            let rows = self
-                .runtime
-                .resources()
-                .catalog_runtime()
-                .block_on(async move {
-                    crate::metadata_read::read_metadata_table_rows_with_control(
-                        &table,
-                        &file_io,
-                        metadata_read_type,
-                        Some(&control as &dyn ConnectorOperationControl),
-                    )
-                    .await
-                });
-            self.validate_context(&request.context)?;
-            table_info.serialized_metadata_rows =
-                Some(rows.map_err(unavailable)?.map_err(unavailable)?);
-        }
         let payload = IcebergTablePayload {
             namespace: request.table.namespace.to_string(),
             table: table_name.clone(),
@@ -750,7 +691,7 @@ impl ConnectorMetadata for IcebergMetadata {
             table_info: Some(table_info),
             metadata_columns,
             metadata_table_type,
-            prepared_files,
+            prepared_files: Vec::new(),
             explicit_files: None,
             row_mutation_frozen_source: false,
             hidden_columns,
@@ -1011,7 +952,10 @@ impl ConnectorScanPlanning for IcebergMetadata {
         self.validate_context(&request.context)?;
         let scan = self.scan_payload(scan)?;
         if scan.table.metadata_table_type.is_some() {
-            return self.plan_metadata_splits(scan, request);
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg metadata relations read only through the typed provider split source",
+            ));
         }
         if matches!(scan.mode, IcebergScanModeV1::ChangeWindowAdmission) {
             return Err(ConnectorError::new(
@@ -1186,88 +1130,6 @@ impl ConnectorScanPlanning for IcebergMetadata {
 }
 
 impl IcebergMetadata {
-    fn plan_metadata_splits(
-        &self,
-        scan: IcebergScanPayload,
-        request: ConnectorSplitPlanningRequest,
-    ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
-        let metadata_table_type = scan.table.metadata_table_type.ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg metadata split planning requires a metadata table type",
-            )
-        })?;
-        let table =
-            scan.table.table_info.as_ref().ok_or_else(|| {
-                corrupt("Iceberg metadata split is missing frozen table information")
-            })?;
-        let serialized_table = table.serialized_metadata.clone().ok_or_else(|| {
-            corrupt("Iceberg metadata split is missing serialized table metadata")
-        })?;
-        let serialized_payload = match metadata_table_type {
-            MetadataTableType::Files
-            | MetadataTableType::Manifests
-            | MetadataTableType::LogicalIcebergMetadata => {
-                table.serialized_metadata_rows.clone().ok_or_else(|| {
-                    corrupt("Iceberg metadata split is missing frozen metadata rows")
-                })?
-            }
-            MetadataTableType::Snapshots | MetadataTableType::History | MetadataTableType::Refs => {
-                String::new()
-            }
-            MetadataTableType::Partitions => {
-                partition_metadata_payload(&scan.table.prepared_files).map_err(corrupt)?
-            }
-        };
-        let payload = SplitPayload {
-            version: ICEBERG_SPLIT_V5,
-            owner_instance_id: self.descriptor.instance_id.as_str().to_string(),
-            incarnation: self.incarnation.to_bytes(),
-            namespace: scan.table.namespace,
-            table: scan.table.table,
-            snapshot_id: scan.snapshot_id,
-            table_uuid: scan.table_uuid,
-            schema_id: Some(table.schema_id),
-            units: Vec::new(),
-            projection: scan.projection,
-            limit: scan.limit,
-            physical_predicates: Vec::new(),
-            fact_columns: Vec::new(),
-            name_mapping: None,
-            metadata: Some(IcebergMetadataSplitPayloadV1 {
-                metadata_table_type,
-                serialized_table,
-                serialized_payload,
-            }),
-        };
-        let encoded = encode_payload(
-            &payload,
-            "metadata split",
-            request.context.max_handle_payload_bytes(),
-        )?;
-        if encoded.len() > request.context.max_total_payload_bytes() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "Iceberg metadata split payload exceeds the request budget",
-            ));
-        }
-        let split = ConnectorSplit::try_new(
-            self.descriptor.instance_id.clone(),
-            "iceberg-metadata-0".to_string(),
-            encoded,
-            None,
-        )?;
-        ConnectorSplitPlanningResult::try_new(
-            vec![split],
-            ConnectorSplitPlanningMetrics {
-                candidate_units_considered: 1,
-                candidate_units_pruned: 0,
-                composite_splits_planned: 1,
-                scan_units_planned: 1,
-            },
-        )
-    }
-
     /// Resolve one frozen rewrite cohort's source into the exact file set its
     /// artifact froze. The handle deliberately carries no table metadata: the
     /// artifact, not the current snapshot, is the authority for what a rewrite
@@ -1427,7 +1289,6 @@ pub(crate) fn frozen_copy_on_write_source_payload(
                     "serialize Iceberg copy-on-write source metadata: {error}"
                 ))
             })?),
-            serialized_metadata_rows: None,
         }),
         metadata_columns: metadata_column_names(metadata),
         metadata_table_type: None,
@@ -1544,7 +1405,6 @@ pub(crate) fn frozen_copy_on_write_source_payload_with_original_scope(
             location: metadata.location().to_string(),
             schema,
             serialized_metadata: Some(serialized_metadata),
-            serialized_metadata_rows: None,
         }),
         metadata_columns: metadata_column_names(metadata),
         metadata_table_type: None,
@@ -1881,84 +1741,6 @@ fn projected_metadata_schema(
     Ok(Arc::new(Schema::new(fields)))
 }
 
-fn metadata_read_type(
-    metadata_table_type: MetadataTableType,
-) -> Result<crate::metadata_read::MetadataTableType, ConnectorError> {
-    match metadata_table_type {
-        MetadataTableType::Files => Ok(crate::metadata_read::MetadataTableType::Files),
-        MetadataTableType::Manifests => Ok(crate::metadata_read::MetadataTableType::Manifests),
-        MetadataTableType::LogicalIcebergMetadata => {
-            Ok(crate::metadata_read::MetadataTableType::LogicalIcebergMetadata)
-        }
-        _ => Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "Iceberg metadata manifest walk does not support this alias",
-        )),
-    }
-}
-
-fn partition_metadata_payload(files: &[IcebergDataFileInfo]) -> Result<String, String> {
-    use std::collections::BTreeSet;
-
-    let mut groups =
-        BTreeMap::<(i32, String), (i64, i64, BTreeSet<String>, BTreeSet<String>)>::new();
-    for file in files {
-        let spec_id = file.partition_spec_id.ok_or_else(|| {
-            format!(
-                "iceberg partitions metadata requires partition spec id for data file {}",
-                file.path
-            )
-        })?;
-        let rows = file.row_count.ok_or_else(|| {
-            format!(
-                "iceberg partitions metadata requires record_count for data file {}",
-                file.path
-            )
-        })?;
-        let entry = groups
-            .entry((
-                spec_id,
-                file.partition_key
-                    .clone()
-                    .unwrap_or_else(|| "Struct([])".to_string()),
-            ))
-            .or_default();
-        entry.0 = entry
-            .0
-            .checked_add(rows)
-            .ok_or_else(|| "iceberg partitions metadata record_count overflow".to_string())?;
-        entry.1 = entry
-            .1
-            .checked_add(1)
-            .ok_or_else(|| "iceberg partitions metadata file_count overflow".to_string())?;
-        for delete in &file.delete_files {
-            match delete.file_content {
-                crate::scan_model::IcebergDeleteFileContent::Position => {
-                    entry.2.insert(delete.path.clone());
-                }
-                crate::scan_model::IcebergDeleteFileContent::Equality => {
-                    entry.3.insert(delete.path.clone());
-                }
-            }
-        }
-    }
-    let rows = groups
-        .into_iter()
-        .map(
-            |((_spec_id, _partition), (record_count, file_count, position, equality))| {
-                Ok(serde_json::json!({
-                    "record_count": record_count,
-                    "file_count": file_count,
-                    "position_delete_file_count": i64::try_from(position.len()).map_err(|_| "iceberg partitions metadata position delete count overflow".to_string())?,
-                    "equality_delete_file_count": i64::try_from(equality.len()).map_err(|_| "iceberg partitions metadata equality delete count overflow".to_string())?,
-                }))
-            },
-        )
-        .collect::<Result<Vec<_>, String>>()?;
-    serde_json::to_string(&serde_json::json!({ "version": 1, "rows": rows }))
-        .map_err(|error| format!("serialize Iceberg partitions metadata payload: {error}"))
-}
-
 pub(crate) fn metadata_arrow_fields(names: &[String]) -> Result<Vec<Arc<Field>>, ConnectorError> {
     use crate::typed_read::{
         ALWAYS_BOUND_METADATA_COLUMNS, IcebergMetadataColumn, ROW_LINEAGE_METADATA_COLUMNS,
@@ -2196,7 +1978,6 @@ fn parse_metadata_table_type(value: &str) -> Option<MetadataTableType> {
         "SNAPSHOTS" => Some(MetadataTableType::Snapshots),
         "HISTORY" => Some(MetadataTableType::History),
         "REFS" => Some(MetadataTableType::Refs),
-        "PARTITIONS" => Some(MetadataTableType::Partitions),
         _ => None,
     }
 }
@@ -2626,7 +2407,6 @@ mod plan_splits_pruning_tests {
                 location: "s3://warehouse/db/orders".to_string(),
                 schema: crate::scan_model::IcebergSchemaDef { fields: Vec::new() },
                 serialized_metadata: None,
-                serialized_metadata_rows: None,
             }),
             metadata_columns: Vec::new(),
             metadata_table_type: None,

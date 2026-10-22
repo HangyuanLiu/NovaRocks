@@ -413,10 +413,48 @@ impl<'a> super::AnalyzerContext<'a> {
                             catalog_override.as_deref(),
                             &db_lower,
                             &tbl_lower,
-                            metadata_ty,
+                            if metadata_ty
+                                == crate::planner::table::SqlMetadataTableKind::Partitions
+                            {
+                                crate::planner::table::SqlMetadataTableKind::Files
+                            } else {
+                                metadata_ty
+                            },
                         )
                         .map_err(|error| AnalyzeError::unknown_table(error, name.span))?
                         .planner;
+                    if metadata_ty == crate::planner::table::SqlMetadataTableKind::Partitions {
+                        let partitioned = table_def
+                            .columns
+                            .iter()
+                            .any(|column| column.name.eq_ignore_ascii_case("partition"));
+                        let view = super::iceberg_partitions::partitions_query(name, partitioned);
+                        let query = self.analyze_query(&view)?;
+                        let output_columns =
+                            derived_table_output_columns(&query.output_columns, alias.as_ref())?;
+                        let alias_name = alias
+                            .as_ref()
+                            .map(|alias| alias.name.value.clone())
+                            .unwrap_or_else(|| format!("{tbl_lower}$partitions"));
+                        let mut scope = self.new_scope();
+                        for column in &output_columns {
+                            self.check_control()?;
+                            scope.add_column_with_id(
+                                Some(&alias_name),
+                                &column.name,
+                                column.column_id,
+                                column.value_type.clone(),
+                            );
+                        }
+                        return Ok((
+                            Relation::Subquery {
+                                query: Box::new(query),
+                                alias: alias_name,
+                                output_columns,
+                            },
+                            scope,
+                        ));
+                    }
                     let alias_name = alias.as_ref().map(|a| a.name.value.clone());
 
                     // Metadata aliases are materialized by the application

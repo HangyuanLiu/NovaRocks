@@ -951,7 +951,6 @@ mod tests {
             location: metadata.location().to_string(),
             schema: crate::schema_facts::iceberg_schema_def(metadata.current_schema()),
             serialized_metadata: Some(serde_json::to_string(metadata).expect("metadata JSON")),
-            serialized_metadata_rows: None,
         }
     }
 
