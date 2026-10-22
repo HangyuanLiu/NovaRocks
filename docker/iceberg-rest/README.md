@@ -36,6 +36,8 @@ docker/iceberg-rest/up.sh                     # Attach this worktree only.
 
 普通 `up.sh` 要求机器已经 ready、健康且完整版本匹配，不启动、修复或升级服务。机器未就绪、维护中、输入缺失或版本不符返回 BLOCKED（75）。实际生命周期、身份或执行错误保留失败，准入后的期限耗尽不改称 BLOCKED。CI 仍 verify→attach→读取一次 publication，不自行 provision/upgrade。
 
+共享 REST 与 rest-mv 各自使用独立的 SQLite catalog 卷，并设置 `CATALOG_CLIENTS=1`，让同一 catalog 的 JDBC 操作排队使用一个连接。当前固定镜像在重新打开已有数据库时，初始化查询可能留下活动结果集；多连接会因此持续遇到 `SQLITE_BUSY`，仅延长锁等待或启用 WAL 不能保证恢复。此配置保留 REST 请求与对象存储访问的并发，不修改 Java 实现，也不增加 HTTP 500 的盲重试。模板属于机器 version，已有机器须显式 upgrade 后重新附着。
+
 机器控制目录默认 `${XDG_STATE_HOME:-$HOME/.local/state}/novarocks/fixture-machine`；管理命令支持子命令前的 `--root`，控制目录不是另一个资源命名空间。daemon 上的固定 authority 卷阻止换目录创建第二套。机器配置持久保存在 daemon 对应 machine 目录；公共 status 隐去凭证。
 
 ```bash
